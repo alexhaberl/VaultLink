@@ -11,7 +11,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -21,6 +21,9 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --locked --all-targets
+      - name: Deployment artifacts
+        run: |
+          shellcheck deploy/*.sh
+          systemd-analyze verify deploy/vaultlink.service deploy/vaultlink-cert-renew.service deploy/vaultlink-cert-renew.timer
       - name: Release build
         run: cargo build --locked --release
-

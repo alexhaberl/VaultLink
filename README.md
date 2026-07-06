@@ -116,6 +116,8 @@ make lint
 
 Vor einer Version 1.0 sind ergänzend End-to-End-Browsertests, parallele Multipart-Abbruchtests, Fuzzing von Pfad- und Multipartparsern und Lasttests einzuplanen.
 
+Die ausgelieferten systemd-Schutzoptionen erreichen auf Debian 13 mit `systemd-analyze security` einen Exposure-Wert von 1.5 (`OK`). Die Basiseinheit besitzt keine Linux-Capabilities. Nur das optionale Standalone-Port-443-Drop-in setzt gezielt `CAP_NET_BIND_SERVICE` frei.
+
 ## 10. Debian-Deployment
 
 ```sh
@@ -222,9 +224,11 @@ cargo test --all-targets
 cargo build --release --locked
 ```
 
-### Lokaler Validierungsstatus (6. Juli 2026)
+### Lokaler Validierungsstatus (7. Juli 2026)
 
-`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --all-targets --locked`, `cargo build --release --locked` und `git diff --check` wurden unter Windows erfolgreich ausgeführt. 22 Tests liefen erfolgreich; der zusätzliche Unix-Symlink-Test ist unter Windows per `cfg(unix)` deaktiviert und wird von der Ubuntu-GitHub-CI ausgeführt. Debian/WSL2 ist eingerichtet, benötigt für lokale Linux-Läufe aber noch Rust und `make` gemäß der WSL-Anleitung.
+`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --all-targets --locked`, `cargo build --release --locked` und `git diff --check` wurden unter Windows erfolgreich ausgeführt. 22 Tests liefen erfolgreich; der zusätzliche Unix-Symlink-Test ist unter Windows per `cfg(unix)` deaktiviert.
+
+Auf einer sauberen Debian-13.5-VM wurden Rust stable 1.96.1, Clippy, alle 23 Tests einschließlich Symlink-Escape, Release-Build, ShellCheck und die systemd-Units erfolgreich geprüft. Zusätzlich liefen Admin-Bootstrap, Passwort/TOTP-Login, Session, Logout, CSRF-Ablehnung, Security Headers, Rate-Limit sowie öffentliche Download-only- und Upload-only-Flows Ende-zu-Ende gegen einen realen systemd-Dienst. Uploadinhalt, Dateimodus `0600` und Audit-Einträge wurden auf dem Server verifiziert.
 
 Projektbeschreibung für GitHub: **VaultLink – secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
