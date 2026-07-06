@@ -1,0 +1,33 @@
+[server]
+mode = "reverse_proxy"
+listen_address = "127.0.0.1:8080"
+public_base_url = "https://files.example.com"
+production_mode = true
+
+[storage]
+root_mount_path = "/mnt/storage"
+data_directory = "/var/lib/vaultlink"
+max_upload_size = 1073741824
+blocked_extensions = ["exe", "dll", "com", "bat", "cmd", "ps1", "sh"]
+
+[security]
+session_hours = 12
+login_attempts = 5
+login_window_seconds = 300
+secure_cookie = true
+
+[reverse_proxy]
+enabled = true
+trusted_proxies = ["127.0.0.1", "::1"]
+trust_x_forwarded_headers = true
+
+[tls]
+enabled = false
+hsts_enabled = true
+redirect_http_to_https = false
+reload_on_cert_change = false
+
+[logging]
+level = "info"
+audit_log_path = "/var/log/vaultlink/audit.log"
+

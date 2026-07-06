@@ -1,0 +1,32 @@
+[server]
+mode = "development"
+listen_address = "127.0.0.1:8080"
+public_base_url = "http://localhost:8080"
+production_mode = false
+
+[storage]
+root_mount_path = "dev/mount"
+data_directory = "dev/data"
+max_upload_size = 104857600
+blocked_extensions = ["exe", "dll", "com", "bat", "cmd", "ps1", "sh"]
+
+[security]
+session_hours = 12
+login_attempts = 5
+login_window_seconds = 300
+secure_cookie = false
+
+[reverse_proxy]
+enabled = false
+trusted_proxies = []
+trust_x_forwarded_headers = false
+
+[tls]
+enabled = false
+hsts_enabled = false
+redirect_http_to_https = false
+reload_on_cert_change = false
+
+[logging]
+level = "info,vaultlink=debug"
+
