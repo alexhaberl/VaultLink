@@ -228,7 +228,7 @@ cargo build --release --locked
 
 `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --all-targets --locked`, `cargo build --release --locked` und `git diff --check` wurden unter Windows erfolgreich ausgeführt. 22 Tests liefen erfolgreich; der zusätzliche Unix-Symlink-Test ist unter Windows per `cfg(unix)` deaktiviert.
 
-Auf einer sauberen Debian-13.5-VM wurden Rust stable 1.96.1, Clippy, alle 23 Tests einschließlich Symlink-Escape, Release-Build, ShellCheck und die systemd-Units erfolgreich geprüft. Zusätzlich liefen Admin-Bootstrap, Passwort/TOTP-Login, Session, Logout, CSRF-Ablehnung, Security Headers, Rate-Limit sowie öffentliche Download-only- und Upload-only-Flows Ende-zu-Ende gegen einen realen systemd-Dienst. Uploadinhalt, Dateimodus `0600` und Audit-Einträge wurden auf dem Server verifiziert.
+Auf einer sauberen Debian-13.5-VM wurden Rust stable 1.96.1, Clippy, alle 23 Tests einschließlich Symlink-Escape, Release-Build, ShellCheck und die installierte VaultLink-systemd-Unit erfolgreich geprüft. Die Renewal-Units werden in CI mit sicheren ausführbaren Platzhaltern syntaktisch validiert. Zusätzlich liefen Admin-Bootstrap, Passwort/TOTP-Login, Session, Logout, CSRF-Ablehnung, Security Headers, Rate-Limit sowie öffentliche Download-only- und Upload-only-Flows Ende-zu-Ende gegen einen realen systemd-Dienst. Uploadinhalt, Dateimodus `0600` und Audit-Einträge wurden auf dem Server verifiziert.
 
 Projektbeschreibung für GitHub: **VaultLink – secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 

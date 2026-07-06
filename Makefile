@@ -18,7 +18,6 @@ security-test:
 	cargo test proxy
 	cargo test auth
 	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi
-	@if command -v systemd-analyze >/dev/null; then systemd-analyze verify deploy/vaultlink.service deploy/vaultlink-cert-renew.service deploy/vaultlink-cert-renew.timer; else echo "systemd-analyze nicht installiert; Unit-Prüfung übersprungen"; fi
 
 lint:
 	cargo fmt --all -- --check
