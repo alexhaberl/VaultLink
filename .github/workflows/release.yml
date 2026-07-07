@@ -1,6 +1,7 @@
 name: Release prerelease
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -49,13 +50,12 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           root="VaultLink-${version}-debian13-amd64"
-          test -s release/minisign.pub
           install -d "dist/$root/bin" "dist/$root/config" "dist/$root/deploy"
           install -m 0755 target/release/vaultlink "dist/$root/bin/vaultlink"
           install -m 0644 README.md CHANGELOG.md SECURITY.md LICENSE rust-toolchain.toml "dist/$root/"
           cp config/*.toml "dist/$root/config/"
           cp deploy/* "dist/$root/deploy/"
-          cp release/minisign.pub "dist/$root/"
+          if [ -s release/minisign.pub ]; then cp release/minisign.pub "dist/$root/"; fi
           sbom=$(find . -maxdepth 2 -name '*.cdx.json' -print -quit)
           test -n "$sbom"
           install -m 0644 "$sbom" "dist/$root/vaultlink.cdx.json"
@@ -65,12 +65,14 @@ jobs:
           cd dist
           sha256sum "$root.tar.gz" "$root/bin/vaultlink" > SHA256SUMS
       - name: Sign binary and checksums
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           set -euo pipefail
+          test -s release/minisign.pub
           test -n "$MINISIGN_SECRET_KEY"
           key=$(mktemp)
           trap 'rm -f "$key"' EXIT
@@ -83,6 +85,7 @@ jobs:
           minisign -V -p release/minisign.pub -m "dist/$root/bin/vaultlink" -x dist/vaultlink.minisig
           minisign -V -p release/minisign.pub -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
       - name: Create private prerelease
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -90,3 +93,12 @@ jobs:
           root="VaultLink-${version}-debian13-amd64"
           gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --title "VaultLink $GITHUB_REF_NAME" --notes-file CHANGELOG.md \
             "dist/$root.tar.gz" dist/vaultlink.cdx.json dist/SHA256SUMS dist/SHA256SUMS.minisig dist/vaultlink.minisig
+      - name: Upload dry-run artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultlink-release-dry-run
+          path: |
+            dist/*.tar.gz
+            dist/vaultlink.cdx.json
+            dist/SHA256SUMS
