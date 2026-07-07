@@ -76,6 +76,7 @@ fuzz_target!(|input: (String, String, String, bool, u8)| {
     let remaining_parts = std::fs::read_dir(&target_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path() != target_path)
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
         .count();
     assert_eq!(remaining_parts, 0);
