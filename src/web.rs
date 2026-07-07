@@ -532,13 +532,49 @@ async fn shares_page(
             state.config.security.share_password_max_bytes,
         );
     }
-    let selected = q.path.unwrap_or_default();
+    let selected_raw = q.path.unwrap_or_default();
+    let selected = if selected_raw.is_empty() {
+        None
+    } else {
+        let rel = path_security::validate_relative(&selected_raw)
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let secure_root = state.secure_root.clone();
+        let metadata_path = rel.clone();
+        let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
+            .await
+            .map_err(internal)?
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
+        Some((rel, metadata.is_dir()))
+    };
+    let create_section = if let Some((selected, is_dir)) = selected {
+        let permissions = if is_dir {
+            r#"<option value="download_only">Download only</option><option value="upload_only">Upload only</option><option value="download_upload">Download + Upload</option>"#
+        } else {
+            r#"<option value="download_only">Download only</option>"#
+        };
+        let upload_hint = if is_dir {
+            String::new()
+        } else {
+            r#"<p class="muted">Upload-Rechte sind nur für Ordnerlinks verfügbar. Für Uploads bitte im Dateibrowser einen Zielordner auswählen.</p>"#.into()
+        };
+        format!(
+            r#"<section><h1>Link erstellen</h1><p>Ausgewähltes Ziel: <code>/{}</code> <span class="muted">({})</span></p>{}<p><a href="/admin">Anderen Pfad im Dateibrowser auswählen</a></p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label>Berechtigung<br><select name="permission">{}</select></label><label>Alias (optional)<br><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}"></label><label>Ablauf RFC3339 (optional)<br><input name="expires_at" placeholder="2027-01-01T00:00:00Z"></label><label>Max. Downloads<br><input name="max_downloads" type="number" min="1"></label><label>Passwort (optional)<br><input name="password" type="password" minlength="{}" maxlength="{}"></label><label>Passwort bestätigen<br><input name="password_confirm" type="password"></label><button>Erstellen</button></form></section>"#,
+            esc(&selected),
+            if is_dir { "Ordner" } else { "Datei" },
+            upload_hint,
+            esc(&s.csrf_token),
+            esc(&selected),
+            permissions,
+            state.config.security.share_password_min_length,
+            state.config.security.share_password_max_bytes,
+        )
+    } else {
+        r#"<section><h1>Link erstellen</h1><p>Bitte zuerst im Dateibrowser eine Datei oder einen Ordner auswählen.</p><p><a href="/admin">Pfad im Dateibrowser auswählen</a></p></section>"#.into()
+    };
     let body = format!(
-        r#"<section><h1>Link erstellen</h1><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Relativer Pfad<br><input name="path" value="{}" required></label><label>Berechtigung<br><select name="permission"><option value="download_only">Download only</option><option value="upload_only">Upload only</option><option value="download_upload">Download + Upload</option></select></label><label>Alias (optional)<br><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}"></label><label>Ablauf RFC3339 (optional)<br><input name="expires_at" placeholder="2027-01-01T00:00:00Z"></label><label>Max. Downloads<br><input name="max_downloads" type="number" min="1"></label><label>Passwort (optional)<br><input name="password" type="password" minlength="{}" maxlength="{}"></label><label>Passwort bestätigen<br><input name="password_confirm" type="password"></label><button>Erstellen</button></form></section><section><h1>Freigaben</h1><table><tr><th>Pfad</th><th>Recht</th><th>Status</th><th>Downloads</th><th>Aktionen</th></tr>{}</table></section>"#,
-        esc(&s.csrf_token),
-        esc(&selected),
-        state.config.security.share_password_min_length,
-        state.config.security.share_password_max_bytes,
+        r#"{create_section}<section><h1>Freigaben</h1><table><tr><th>Pfad</th><th>Recht</th><th>Status</th><th>Downloads</th><th>Aktionen</th></tr>{}</table></section>"#,
         rows
     );
     Ok(Html(page("Links", &body)))
@@ -1208,6 +1244,13 @@ mod tests {
         ));
         request
     }
+
+    async fn response_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
     #[test]
     fn html_is_escaped() {
         assert_eq!(esc("<script>&\""), "&lt;script&gt;&amp;&quot;");
@@ -1387,6 +1430,46 @@ mod tests {
             StatusCode::SEE_OTHER
         );
         assert!(state.db.session(&session_token).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn share_creation_page_uses_browser_selected_path() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.txt"), b"file").unwrap();
+        std::fs::create_dir(root.path().join("uploads")).unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_session(
+                "session-token",
+                1,
+                "csrf-token",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap();
+        state.db.verify_mfa("session-token").unwrap();
+        let app = router(state);
+        let cookie = HeaderValue::from_static("vaultlink_session=session-token");
+
+        let mut folder_request = request(Method::GET, "/admin/shares?path=uploads", "");
+        folder_request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let folder = response_text(app.clone().oneshot(folder_request).await.unwrap()).await;
+        assert!(folder.contains(r#"Ausgewähltes Ziel: <code>/uploads</code>"#));
+        assert!(folder.contains(r#"<input type="hidden" name="path" value="uploads">"#));
+        assert!(folder.contains(r#"<option value="upload_only">Upload only</option>"#));
+
+        let mut file_request = request(Method::GET, "/admin/shares?path=file.txt", "");
+        file_request.headers_mut().insert(header::COOKIE, cookie);
+        let file = response_text(app.oneshot(file_request).await.unwrap()).await;
+        assert!(file.contains(r#"Ausgewähltes Ziel: <code>/file.txt</code>"#));
+        assert!(file.contains(r#"<input type="hidden" name="path" value="file.txt">"#));
+        assert!(file.contains(r#"<option value="download_only">Download only</option>"#));
+        assert!(!file.contains(r#"<option value="upload_only">Upload only</option>"#));
+        assert!(file.contains("Upload-Rechte sind nur"));
     }
 
     #[tokio::test]
