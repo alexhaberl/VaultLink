@@ -38,6 +38,7 @@ mod tests {
             },
             reverse_proxy: ReverseProxy {
                 enabled: true,
+                allow_non_loopback: false,
                 trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
                 trust_x_forwarded_headers: true,
             },

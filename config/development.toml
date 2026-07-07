@@ -18,6 +18,7 @@ secure_cookie = false
 
 [reverse_proxy]
 enabled = false
+allow_non_loopback = false
 trusted_proxies = []
 trust_x_forwarded_headers = false
 
@@ -29,4 +30,3 @@ reload_on_cert_change = false
 
 [logging]
 level = "info,vaultlink=debug"
-

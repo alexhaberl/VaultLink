@@ -58,6 +58,8 @@ pub struct ReverseProxy {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub allow_non_loopback: bool,
+    #[serde(default)]
     pub trusted_proxies: Vec<IpAddr>,
     #[serde(default)]
     pub trust_x_forwarded_headers: bool,
@@ -185,9 +187,21 @@ impl Config {
                         "reverse_proxy mode requires enabled=true and trusted_proxies".into(),
                     ));
                 }
-                if !listen.ip().is_loopback() {
+                if !listen.ip().is_loopback() && !self.reverse_proxy.allow_non_loopback {
                     return Err(ConfigError::Invalid(
-                        "reverse_proxy mode must bind to a loopback address".into(),
+                        "non-loopback reverse proxy binding requires allow_non_loopback=true"
+                            .into(),
+                    ));
+                }
+                if !listen.ip().is_loopback()
+                    && !self
+                        .reverse_proxy
+                        .trusted_proxies
+                        .iter()
+                        .any(|proxy| !proxy.is_loopback())
+                {
+                    return Err(ConfigError::Invalid(
+                        "non-loopback binding requires a non-loopback trusted proxy".into(),
                     ));
                 }
                 if self.tls.enabled {
@@ -287,6 +301,21 @@ mod tests {
         c.reverse_proxy.enabled = true;
         c.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn remote_reverse_proxy_requires_explicit_opt_in() {
+        let mut c = base();
+        c.server.mode = ServerMode::ReverseProxy;
+        c.server.production_mode = true;
+        c.server.listen_address = "0.0.0.0:8080".into();
+        c.server.public_base_url = "https://vaultlink.example".into();
+        c.security.secure_cookie = true;
+        c.reverse_proxy.enabled = true;
+        c.reverse_proxy.trusted_proxies = vec!["192.0.2.10".parse().unwrap()];
+        assert!(c.validate().is_err());
+        c.reverse_proxy.allow_non_loopback = true;
+        assert!(c.validate().is_ok());
     }
     #[test]
     fn hsts_rejected_in_development() {

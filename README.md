@@ -100,6 +100,34 @@ sudo install -m 0644 deploy/Caddyfile /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
+Läuft der Reverse Proxy auf einem anderen Host, muss der LAN-Bind ausdrücklich freigeschaltet und zusätzlich auf Betriebssystemebene begrenzt werden:
+
+```toml
+[server]
+mode = "reverse_proxy"
+listen_address = "0.0.0.0:8080"
+public_base_url = "https://vaultlink.example.com"
+production_mode = true
+
+[reverse_proxy]
+enabled = true
+allow_non_loopback = true
+trusted_proxies = ["192.0.2.10"]
+trust_x_forwarded_headers = true
+```
+
+Die Vorlage [`deploy/vaultlink-external-proxy-network.conf`](deploy/vaultlink-external-proxy-network.conf) wird mit der echten Proxy-IP nach `/etc/systemd/system/vaultlink.service.d/external-proxy-network.conf` installiert. Sie blockiert Portzugriff für alle anderen Quelladressen über systemd-cgroup-BPF. Nach Änderungen sind `systemctl daemon-reload` und ein VaultLink-Neustart erforderlich. `allow_non_loopback=true` ohne diese Netzwerkbegrenzung ist nicht als sicherer Produktionsbetrieb vorgesehen.
+
+Für Nginx Proxy Manager: Scheme `http`, Forward Hostname/IP auf die VaultLink-VM, Forward Port `8080`, SSL-Zertifikat aktivieren und „Force SSL“ einschalten. Für große Streaming-Uploads im Advanced-Block:
+
+```nginx
+client_max_body_size 1g;
+proxy_request_buffering off;
+proxy_buffering off;
+```
+
+Nginx muss `X-Forwarded-For`, `X-Forwarded-Proto` und `X-Forwarded-Host` setzen. VaultLink wertet Forwarded-Clientdaten ausschließlich aus, wenn der direkte TCP-Peer in `trusted_proxies` steht; öffentliche URLs werden immer aus `public_base_url` erzeugt.
+
 ### Standalone TLS
 
 Rustls liest Fullchain und Key beim Prozessstart. Das MVP implementiert bewusst keinen SIGHUP-Hot-Reload; der atomare Deploy-Hook führt nach erfolgreichem Zertifikatswechsel einen kurzen systemd-Neustart aus. Für Port 443 wird nur im Standalone-Modus das Drop-in `vaultlink-standalone-capability.conf` installiert. Alternativ bindet VaultLink auf 8443 und die Firewall leitet weiter. Ein zusätzlicher HTTP-Redirect-Listener ist im MVP nicht implementiert; Port 80 sollte durch Firewall/Proxy auf HTTPS umgeleitet werden.
@@ -226,9 +254,9 @@ cargo build --release --locked
 
 ### Lokaler Validierungsstatus (7. Juli 2026)
 
-`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --all-targets --locked`, `cargo build --release --locked` und `git diff --check` wurden unter Windows erfolgreich ausgeführt. 22 Tests liefen erfolgreich; der zusätzliche Unix-Symlink-Test ist unter Windows per `cfg(unix)` deaktiviert.
+`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --all-targets --locked`, `cargo build --release --locked` und `git diff --check` wurden unter Windows erfolgreich ausgeführt. 23 Tests liefen erfolgreich; der zusätzliche Unix-Symlink-Test ist unter Windows per `cfg(unix)` deaktiviert.
 
-Auf einer sauberen Debian-13.5-VM wurden Rust stable 1.96.1, Clippy, alle 23 Tests einschließlich Symlink-Escape, Release-Build, ShellCheck und die installierte VaultLink-systemd-Unit erfolgreich geprüft. Die Renewal-Units werden in CI mit sicheren ausführbaren Platzhaltern syntaktisch validiert. Zusätzlich liefen Admin-Bootstrap, Passwort/TOTP-Login, Session, Logout, CSRF-Ablehnung, Security Headers, Rate-Limit sowie öffentliche Download-only- und Upload-only-Flows Ende-zu-Ende gegen einen realen systemd-Dienst. Uploadinhalt, Dateimodus `0600` und Audit-Einträge wurden auf dem Server verifiziert.
+Auf einer sauberen Debian-13.5-VM wurden Rust stable 1.96.1, Clippy, alle 24 Tests einschließlich Symlink-Escape, Release-Build, ShellCheck und die installierte VaultLink-systemd-Unit erfolgreich geprüft. Die Renewal-Units werden in CI mit sicheren ausführbaren Platzhaltern syntaktisch validiert. Zusätzlich liefen Admin-Bootstrap, Passwort/TOTP-Login, Session, Logout, CSRF-Ablehnung, Security Headers, Rate-Limit sowie öffentliche Download-only- und Upload-only-Flows Ende-zu-Ende gegen einen realen systemd-Dienst. Uploadinhalt, Dateimodus `0600` und Audit-Einträge wurden auf dem Server verifiziert.
 
 Projektbeschreibung für GitHub: **VaultLink – secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 

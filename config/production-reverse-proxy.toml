@@ -18,6 +18,7 @@ secure_cookie = true
 
 [reverse_proxy]
 enabled = true
+allow_non_loopback = false
 trusted_proxies = ["127.0.0.1", "::1"]
 trust_x_forwarded_headers = true
 
@@ -30,4 +31,3 @@ reload_on_cert_change = false
 [logging]
 level = "info"
 audit_log_path = "/var/log/vaultlink/audit.log"
-
