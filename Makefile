@@ -1,4 +1,4 @@
-.PHONY: dev-setup sample-data test security-test lint build run
+.PHONY: dev-setup sample-data test security-test fuzz lint build run
 
 CONFIG ?= config/development.toml
 
@@ -15,9 +15,17 @@ test:
 
 security-test:
 	cargo test path_security
+	cargo test secure_fs
+	cargo test range
+	cargo test db::tests::migrates_unversioned_installation_without_losing_data
 	cargo test proxy
 	cargo test auth
 	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi
+
+fuzz:
+	cargo fuzz run path_normalization -- -max_total_time=600
+	cargo fuzz run byte_range -- -max_total_time=600
+	cargo fuzz run filename -- -max_total_time=600
 
 lint:
 	cargo fmt --all -- --check

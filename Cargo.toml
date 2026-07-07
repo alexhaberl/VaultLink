@@ -1,6 +1,6 @@
 [package]
 name = "vaultlink"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2021"
 license = "MIT"
 description = "Secure file sharing for an existing Linux mountpoint"
@@ -8,7 +8,7 @@ description = "Secure file sharing for an existing Linux mountpoint"
 [dependencies]
 argon2 = "0.5"
 axum = { version = "0.8", features = ["multipart"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 data-encoding = "2.6"
@@ -33,8 +33,6 @@ tower-http = { version = "0.6", features = ["catch-panic", "limit", "request-id"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-
-[dev-dependencies]
 tempfile = "3"
 
 [profile.release]

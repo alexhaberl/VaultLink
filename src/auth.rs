@@ -47,21 +47,24 @@ pub fn verify_totp(secret: &str, code: &str, now: u64) -> bool {
         if step < 0 {
             return false;
         }
-        let key = match BASE32_NOPAD.decode(secret.to_ascii_uppercase().as_bytes()) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        let mut mac = Hmac::<Sha1>::new_from_slice(&key).expect("HMAC key");
-        mac.update(&(step as u64).to_be_bytes());
-        let out = mac.finalize().into_bytes();
-        let o = (out[19] & 15) as usize;
-        let n = ((u32::from(out[o]) & 0x7f) << 24)
-            | u32::from(out[o + 1]) << 16
-            | u32::from(out[o + 2]) << 8
-            | u32::from(out[o + 3]);
-        let candidate = format!("{:06}", n % 1_000_000);
-        candidate.as_bytes().ct_eq(wanted).into()
+        totp_code(secret, step as u64)
+            .is_some_and(|candidate| candidate.as_bytes().ct_eq(wanted).into())
     })
+}
+
+pub(crate) fn totp_code(secret: &str, step: u64) -> Option<String> {
+    let key = BASE32_NOPAD
+        .decode(secret.to_ascii_uppercase().as_bytes())
+        .ok()?;
+    let mut mac = Hmac::<Sha1>::new_from_slice(&key).ok()?;
+    mac.update(&step.to_be_bytes());
+    let out = mac.finalize().into_bytes();
+    let offset = (out[19] & 15) as usize;
+    let number = ((u32::from(out[offset]) & 0x7f) << 24)
+        | u32::from(out[offset + 1]) << 16
+        | u32::from(out[offset + 2]) << 8
+        | u32::from(out[offset + 3]);
+    Some(format!("{:06}", number % 1_000_000))
 }
 pub fn verify_totp_now(secret: &str, code: &str) -> bool {
     verify_totp(

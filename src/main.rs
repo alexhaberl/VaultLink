@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Admin created. Add this secret to the authenticator exactly once:\n{secret}\notpauth://totp/VaultLink:{username}?secret={secret}&issuer=VaultLink");
         return Ok(());
     }
-    let addr = config.server.listen_address.parse()?;
+    let addr: std::net::SocketAddr = config.server.listen_address.parse()?;
     let app = web::router(state);
     tracing::info!(%addr,mode=?config.server.mode,"VaultLink starting");
     match config.server.mode {
@@ -50,6 +50,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &config.tls.key_file,
             )
             .await?;
+            #[cfg(unix)]
+            if config.tls.reload_on_cert_change {
+                let reload = tls.clone();
+                let cert_file = config.tls.cert_file.clone();
+                let key_file = config.tls.key_file.clone();
+                tokio::spawn(async move {
+                    let Ok(mut signal) =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                    else {
+                        tracing::error!("cannot install SIGHUP handler");
+                        return;
+                    };
+                    while signal.recv().await.is_some() {
+                        match reload.reload_from_pem_file(&cert_file, &key_file).await {
+                            Ok(()) => tracing::info!("TLS certificate reloaded after SIGHUP"),
+                            Err(error) => {
+                                tracing::error!(%error, "TLS certificate reload failed; previous certificate remains active")
+                            }
+                        }
+                    }
+                });
+            }
             axum_server::bind_rustls(addr, tls)
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;

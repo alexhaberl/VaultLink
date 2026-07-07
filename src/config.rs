@@ -9,6 +9,7 @@ use thiserror::Error;
 use url::Url;
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: Server,
     pub storage: Storage,
@@ -31,6 +32,7 @@ pub enum ServerMode {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Server {
     pub mode: ServerMode,
     pub listen_address: String,
@@ -40,6 +42,7 @@ pub struct Server {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Storage {
     pub root_mount_path: PathBuf,
     pub data_directory: PathBuf,
@@ -54,6 +57,7 @@ fn default_upload_size() -> u64 {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReverseProxy {
     #[serde(default)]
     pub enabled: bool,
@@ -66,6 +70,7 @@ pub struct ReverseProxy {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tls {
     #[serde(default)]
     pub enabled: bool,
@@ -76,12 +81,11 @@ pub struct Tls {
     #[serde(default)]
     pub hsts_enabled: bool,
     #[serde(default)]
-    pub redirect_http_to_https: bool,
-    #[serde(default)]
     pub reload_on_cert_change: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Security {
     #[serde(default = "default_session_hours")]
     pub session_hours: i64,
@@ -91,6 +95,14 @@ pub struct Security {
     pub login_window_seconds: u64,
     #[serde(default = "yes")]
     pub secure_cookie: bool,
+    #[serde(default = "default_share_password_min")]
+    pub share_password_min_length: usize,
+    #[serde(default = "default_share_password_max")]
+    pub share_password_max_bytes: usize,
+    #[serde(default = "default_share_unlock_minutes")]
+    pub share_unlock_minutes: i64,
+    #[serde(default = "default_attempts")]
+    pub share_password_attempts: usize,
 }
 impl Default for Security {
     fn default() -> Self {
@@ -99,6 +111,10 @@ impl Default for Security {
             login_attempts: default_attempts(),
             login_window_seconds: default_window(),
             secure_cookie: true,
+            share_password_min_length: default_share_password_min(),
+            share_password_max_bytes: default_share_password_max(),
+            share_unlock_minutes: default_share_unlock_minutes(),
+            share_password_attempts: default_attempts(),
         }
     }
 }
@@ -114,18 +130,26 @@ fn default_window() -> u64 {
 fn yes() -> bool {
     true
 }
+fn default_share_password_min() -> usize {
+    12
+}
+fn default_share_password_max() -> usize {
+    256
+}
+fn default_share_unlock_minutes() -> i64 {
+    60
+}
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Logging {
     #[serde(default = "default_level")]
     pub level: String,
-    pub audit_log_path: Option<PathBuf>,
 }
 impl Default for Logging {
     fn default() -> Self {
         Self {
             level: default_level(),
-            audit_log_path: None,
         }
     }
 }
@@ -251,10 +275,23 @@ impl Config {
                 "HSTS is invalid in development mode".into(),
             ));
         }
+        if self.tls.reload_on_cert_change && !matches!(self.server.mode, ServerMode::StandaloneTls)
+        {
+            return Err(ConfigError::Invalid(
+                "reload_on_cert_change is valid only in standalone_tls mode".into(),
+            ));
+        }
         if self.storage.max_upload_size == 0 {
             return Err(ConfigError::Invalid(
                 "max_upload_size must be positive".into(),
             ));
+        }
+        if self.security.share_password_min_length < 8
+            || self.security.share_password_max_bytes < self.security.share_password_min_length
+            || self.security.share_unlock_minutes <= 0
+            || self.security.share_password_attempts == 0
+        {
+            return Err(ConfigError::Invalid("invalid share password policy".into()));
         }
         Ok(())
     }

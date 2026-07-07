@@ -1,0 +1,92 @@
+name: Release prerelease
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository_visibility == 'private'
+    runs-on: ubuntu-24.04
+    container: debian:13.1-slim
+    env:
+      CARGO_TERM_COLOR: always
+      SOURCE_DATE_EPOCH: "0"
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config libssl-dev clang git gh minisign xz-utils
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install release gates
+        run: |
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-cyclonedx --version 0.5.9
+      - name: Quality and dependency gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets
+          cargo audit --deny warnings
+      - name: Build and SBOM
+        run: |
+          cargo build --locked --release
+          cargo cyclonedx --format json
+      - name: Assemble deterministic archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          root="VaultLink-${version}-debian13-amd64"
+          test -s release/minisign.pub
+          install -d "dist/$root/bin" "dist/$root/config" "dist/$root/deploy"
+          install -m 0755 target/release/vaultlink "dist/$root/bin/vaultlink"
+          install -m 0644 README.md CHANGELOG.md SECURITY.md LICENSE rust-toolchain.toml "dist/$root/"
+          cp config/*.toml "dist/$root/config/"
+          cp deploy/* "dist/$root/deploy/"
+          cp release/minisign.pub "dist/$root/"
+          sbom=$(find . -maxdepth 2 -name '*.cdx.json' -print -quit)
+          test -n "$sbom"
+          install -m 0644 "$sbom" "dist/$root/vaultlink.cdx.json"
+          install -m 0644 "$sbom" dist/vaultlink.cdx.json
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -C dist -cf "dist/$root.tar" "$root"
+          gzip -n -9 "dist/$root.tar"
+          cd dist
+          sha256sum "$root.tar.gz" "$root/bin/vaultlink" > SHA256SUMS
+      - name: Sign binary and checksums
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$MINISIGN_SECRET_KEY"
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          chmod 0600 "$key"
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$key"
+          version="${GITHUB_REF_NAME#v}"
+          root="VaultLink-${version}-debian13-amd64"
+          minisign -S -s "$key" -m "dist/$root/bin/vaultlink" -x dist/vaultlink.minisig
+          minisign -S -s "$key" -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
+          minisign -V -p release/minisign.pub -m "dist/$root/bin/vaultlink" -x dist/vaultlink.minisig
+          minisign -V -p release/minisign.pub -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
+      - name: Create private prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          root="VaultLink-${version}-debian13-amd64"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --title "VaultLink $GITHUB_REF_NAME" --notes-file CHANGELOG.md \
+            "dist/$root.tar.gz" dist/vaultlink.cdx.json dist/SHA256SUMS dist/SHA256SUMS.minisig dist/vaultlink.minisig

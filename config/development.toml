@@ -15,6 +15,10 @@ session_hours = 12
 login_attempts = 5
 login_window_seconds = 300
 secure_cookie = false
+share_password_min_length = 12
+share_password_max_bytes = 256
+share_unlock_minutes = 60
+share_password_attempts = 5
 
 [reverse_proxy]
 enabled = false
@@ -25,7 +29,6 @@ trust_x_forwarded_headers = false
 [tls]
 enabled = false
 hsts_enabled = false
-redirect_http_to_https = false
 reload_on_cert_change = false
 
 [logging]

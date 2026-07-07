@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+const SCHEMA_VERSION: i64 = 2;
+
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
 
@@ -68,6 +70,7 @@ pub struct Share {
     pub max_downloads: Option<u64>,
     pub download_count: u64,
     pub active: bool,
+    pub password_hash: Option<String>,
 }
 
 fn token_hash(token: &str) -> String {
@@ -77,7 +80,7 @@ fn token_hash(token: &str) -> String {
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let path = path.as_ref();
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         #[cfg(unix)]
         if path != Path::new(":memory:") {
             use std::os::unix::fs::PermissionsExt;
@@ -85,7 +88,19 @@ impl Database {
         }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(r#"
+        migrate(&mut conn)?;
+        Ok(Self(Arc::new(Mutex::new(conn))))
+    }
+}
+
+fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let tx = conn.transaction()?;
+    if version < 1 {
+        tx.execute_batch(r#"
 CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, totp_secret TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE, csrf_token TEXT NOT NULL, mfa_verified INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS shares(id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, token TEXT NOT NULL, alias TEXT UNIQUE, relative_path TEXT NOT NULL, is_directory INTEGER NOT NULL, permission TEXT NOT NULL, expires_at TEXT, max_downloads INTEGER, download_count INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_by INTEGER NOT NULL REFERENCES admins(id), created_at TEXT NOT NULL);
@@ -93,8 +108,33 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, occurred_at TEXT NOT NU
 CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_shares_alias ON shares(alias);
 "#)?;
-        Ok(Self(Arc::new(Mutex::new(conn))))
+        tx.pragma_update(None, "user_version", 1)?;
     }
+    if version < 2 {
+        let has_password: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('shares') WHERE name='password_hash')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_password {
+            tx.execute("ALTER TABLE shares ADD COLUMN password_hash TEXT", [])?;
+        }
+        tx.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS public_unlock_sessions(
+    token_hash TEXT PRIMARY KEY,
+    share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_unlock_exp ON public_unlock_sessions(expires_at);
+"#,
+        )?;
+        tx.pragma_update(None, "user_version", 2)?;
+    }
+    tx.commit()
+}
+
+impl Database {
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().expect("database mutex poisoned")
     }
@@ -176,9 +216,10 @@ CREATE INDEX IF NOT EXISTS idx_shares_alias ON shares(alias);
         expires: Option<DateTime<Utc>>,
         max: Option<u64>,
         admin: i64,
+        password_hash: Option<&str>,
     ) -> rusqlite::Result<i64> {
         let c = self.conn();
-        c.execute("INSERT INTO shares(token_hash,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,created_by,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![token_hash(token),token,alias,path,is_dir as i64,permission.as_str(),expires.map(|v|v.to_rfc3339()),max,admin,Utc::now().to_rfc3339()])?;
+        c.execute("INSERT INTO shares(token_hash,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,created_by,created_at,password_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![token_hash(token),token,alias,path,is_dir as i64,permission.as_str(),expires.map(|v|v.to_rfc3339()),max,admin,Utc::now().to_rfc3339(),password_hash])?;
         Ok(c.last_insert_rowid())
     }
     fn map_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
@@ -197,17 +238,18 @@ CREATE INDEX IF NOT EXISTS idx_shares_alias ON shares(alias);
             max_downloads: r.get(7)?,
             download_count: r.get(8)?,
             active: r.get::<_, i64>(9)? != 0,
+            password_hash: r.get(10)?,
         })
     }
     pub fn share_by_token(&self, token: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,download_count,active FROM shares WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
+        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,download_count,active,password_hash FROM shares WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
     }
     pub fn share_by_alias(&self, alias: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,download_count,active FROM shares WHERE alias=?1",[alias],Self::map_share).optional()
+        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,download_count,active,password_hash FROM shares WHERE alias=?1",[alias],Self::map_share).optional()
     }
     pub fn list_shares(&self) -> rusqlite::Result<Vec<Share>> {
         let c = self.conn();
-        let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,download_count,active FROM shares ORDER BY id DESC")?;
+        let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,download_count,active,password_hash FROM shares ORDER BY id DESC")?;
         let shares = s
             .query_map([], Self::map_share)?
             .filter_map(Result::ok)
@@ -229,6 +271,37 @@ CREATE INDEX IF NOT EXISTS idx_shares_alias ON shares(alias);
     pub fn count_download(&self, id: i64) -> rusqlite::Result<bool> {
         Ok(self.conn().execute("UPDATE shares SET download_count=download_count+1 WHERE id=?1 AND active=1 AND (expires_at IS NULL OR expires_at>?2) AND (max_downloads IS NULL OR download_count<max_downloads)",params![id,Utc::now().to_rfc3339()])?==1)
     }
+    pub fn set_share_password(&self, id: i64, hash: Option<&str>) -> rusqlite::Result<bool> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE shares SET password_hash=?2 WHERE id=?1",
+            params![id, hash],
+        )? == 1;
+        transaction.execute("DELETE FROM public_unlock_sessions WHERE share_id=?1", [id])?;
+        transaction.commit()?;
+        Ok(changed)
+    }
+    pub fn create_unlock_session(
+        &self,
+        token: &str,
+        share_id: i64,
+        expires: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
+        let c = self.conn();
+        c.execute(
+            "DELETE FROM public_unlock_sessions WHERE expires_at<=?1",
+            [Utc::now().to_rfc3339()],
+        )?;
+        c.execute(
+            "INSERT INTO public_unlock_sessions(token_hash,share_id,expires_at) VALUES(?1,?2,?3)",
+            params![token_hash(token), share_id, expires.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+    pub fn unlock_session(&self, token: &str, share_id: i64) -> rusqlite::Result<bool> {
+        self.conn().query_row("SELECT EXISTS(SELECT 1 FROM public_unlock_sessions WHERE token_hash=?1 AND share_id=?2 AND expires_at>?3)", params![token_hash(token), share_id, Utc::now().to_rfc3339()], |row| row.get(0))
+    }
     pub fn audit(
         &self,
         actor: &str,
@@ -240,6 +313,7 @@ CREATE INDEX IF NOT EXISTS idx_shares_alias ON shares(alias);
             "INSERT INTO audit(occurred_at,actor,action,object_id,detail) VALUES(?1,?2,?3,?4,?5)",
             params![Utc::now().to_rfc3339(), actor, action, object, detail],
         )?;
+        tracing::info!(target: "vaultlink::audit", actor, action, object_id = object.unwrap_or(""), detail = detail.unwrap_or(""), "audit event");
         Ok(())
     }
 }
@@ -261,6 +335,7 @@ mod tests {
                 None,
                 Some(1),
                 1,
+                None,
             )
             .unwrap();
         assert!(d.count_download(id).unwrap());
@@ -279,6 +354,7 @@ mod tests {
             None,
             None,
             1,
+            None,
         )
         .unwrap();
         assert!(d
@@ -290,7 +366,8 @@ mod tests {
                 &Permission::DownloadOnly,
                 None,
                 None,
-                1
+                1,
+                None,
             )
             .is_err());
     }
@@ -329,11 +406,117 @@ mod tests {
                 None,
                 None,
                 1,
+                None,
             )
             .unwrap();
         d.set_share_active(id, false).unwrap();
         assert!(!d.share_by_token("token").unwrap().unwrap().active);
         d.delete_share(id).unwrap();
         assert!(d.share_by_token("token").unwrap().is_none());
+    }
+
+    #[test]
+    fn migrates_unversioned_installation_without_losing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(r#"
+CREATE TABLE admins(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, totp_secret TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE sessions(token_hash TEXT PRIMARY KEY, admin_id INTEGER NOT NULL REFERENCES admins(id), csrf_token TEXT NOT NULL, mfa_verified INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL);
+CREATE TABLE shares(id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, token TEXT NOT NULL, alias TEXT UNIQUE, relative_path TEXT NOT NULL, is_directory INTEGER NOT NULL, permission TEXT NOT NULL, expires_at TEXT, max_downloads INTEGER, download_count INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_by INTEGER NOT NULL REFERENCES admins(id), created_at TEXT NOT NULL);
+CREATE TABLE audit(id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object_id TEXT, detail TEXT);
+INSERT INTO admins VALUES(1,'admin','hash','secret','2026-01-01T00:00:00Z');
+INSERT INTO sessions VALUES('session-hash',1,'csrf',1,'2099-01-01T00:00:00Z');
+INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','download_only');
+"#).unwrap();
+            connection.execute("INSERT INTO shares VALUES(1,?1,'share-token','alias','folder',1,'download_only',NULL,7,3,1,1,'2026-01-01T00:00:00Z')", [token_hash("share-token")]).unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        assert_eq!(
+            database
+                .conn()
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let share = database.share_by_token("share-token").unwrap().unwrap();
+        assert_eq!(share.download_count, 3);
+        assert_eq!(share.max_downloads, Some(7));
+        assert!(share.password_hash.is_none());
+        assert_eq!(
+            database
+                .conn()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM audit", [], |row| row.get(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_newer_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("future.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+        assert!(Database::open(path).is_err());
+    }
+
+    #[test]
+    fn unlock_sessions_are_hashed_and_cascade_with_share() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = database
+            .create_share(
+                "share",
+                None,
+                "folder",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                1,
+                Some("password-hash"),
+            )
+            .unwrap();
+        database
+            .create_unlock_session(
+                "unlock-secret",
+                share_id,
+                Utc::now() + chrono::Duration::minutes(60),
+            )
+            .unwrap();
+        assert!(database.unlock_session("unlock-secret", share_id).unwrap());
+        let stored: String = database
+            .conn()
+            .query_row("SELECT token_hash FROM public_unlock_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_ne!(stored, "unlock-secret");
+        database
+            .set_share_password(share_id, Some("new-password-hash"))
+            .unwrap();
+        assert!(!database.unlock_session("unlock-secret", share_id).unwrap());
+        database
+            .create_unlock_session(
+                "new-unlock-secret",
+                share_id,
+                Utc::now() + chrono::Duration::minutes(60),
+            )
+            .unwrap();
+        database.delete_share(share_id).unwrap();
+        assert_eq!(
+            database
+                .conn()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM public_unlock_sessions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            0
+        );
     }
 }

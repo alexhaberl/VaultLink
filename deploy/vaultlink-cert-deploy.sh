@@ -18,5 +18,4 @@ install -o root -g vaultlink -m 0640 "$src_cert" "$dest/.fullchain.pem.new"
 install -o root -g vaultlink -m 0640 "$src_key" "$dest/.privkey.pem.new"
 mv -f "$dest/.fullchain.pem.new" "$dest/fullchain.pem"
 mv -f "$dest/.privkey.pem.new" "$dest/privkey.pem"
-systemctl try-restart vaultlink.service
-
+systemctl reload-or-restart vaultlink.service

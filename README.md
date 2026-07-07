@@ -2,7 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Webanwendung, die einen bereits gemounteten Ordner sicher über zeitlich begrenzbare Download- und Upload-Links freigibt. Ziel ist Debian Linux; Entwicklung und Tests funktionieren ebenso unter Debian/Ubuntu in WSL. VaultLink verwendet keine Cloud- oder externen Laufzeitdienste.
 
-> Status: sicherheitsorientiertes MVP. Vor öffentlichem Produktivbetrieb sollten ein unabhängiger Security-Review, Lasttests und ein Backup-/Restore-Test erfolgen.
+> Status: `0.1.0-beta.1`-Kandidat für ein privates Debian-13-amd64-Prerelease. Ein Tag wird erst nach den Gates in [`docs/RELEASE-CHECKLIST.md`](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 ## 1. Architekturentscheidung: Rust
 
@@ -12,18 +12,16 @@ Stack: Rust stable, Axum/Tokio, Tower-Middleware, Rusqlite/SQLite, Argon2id, sel
 
 ## 2. Sicherheitskonzept
 
-- Der Storage-Root wird beim Start kanonisiert. Relative Nutzpfade verbieten absolute Pfade, `..`, Backslashes, NUL, doppelte Prozentkodierung und ungültiges UTF-8. Bestehende Ziele werden kanonisiert und müssen unterhalb des Roots liegen. Symlinks nach außen werden verworfen.
-- Uploadnamen dürfen keine Separatoren oder Steuerzeichen enthalten. Uploads landen nur in kanonisierten Freigabeordnern, nutzen exklusives `create_new`, überschreiben nie und unvollständige/zu große Dateien werden entfernt.
+- Linux-Dateizugriffe sind descriptor-relativ. `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` bindet Listing, Metadaten, Download und Upload an den beim Start geöffneten Root-Descriptor; ein Kernel ohne `openat2` wird mit verständlichem Startfehler abgewiesen. Relative Nutzpfade verbieten absolute Pfade, `..`, Backslashes, NUL, doppelte Prozentkodierung und ungültiges UTF-8.
+- Uploadnamen dürfen keine Separatoren oder Steuerzeichen enthalten. Uploads werden als zufällige `0600`-Temporärdatei im bereits geöffneten Zielordner geschrieben, geflusht und per `fsync` gesichert. `renameat2(RENAME_NOREPLACE)` veröffentlicht atomar ohne Überschreiben; Drop/Abbruch entfernt `.part`-Dateien.
 - Adminpasswörter verwenden Argon2id mit zufälligem Salt. Nach dem Passwort ist TOTP zwingend. Undurchsichtige Sessiontokens werden nur SHA-256-gehasht indiziert, serverseitig gespeichert und als `HttpOnly`, `SameSite=Strict` sowie produktiv `Secure` gesetzt.
 - Login-Limits gelten pro effektiver Client-IP und Benutzername. Forwarded-Header werden ausschließlich im Reverse-Proxy-Modus und nur von explizit vertrauenswürdigen Peer-Adressen ausgewertet.
 - Alle mutierenden Adminaktionen verlangen ein sitzungsgebundenes CSRF-Token. CSP, `nosniff`, Frame-Schutz, Referrer-/Permissions-Policy und – nur bei echtem HTTPS – HSTS werden gesetzt.
-- Share-Tokens besitzen 192 Bit Entropie. Ablauf, Status und Downloadlimit werden bei jedem Zugriff geprüft; das Heraufzählen eines Downloads erfolgt atomar in SQLite.
-- Audit-Ereignisse liegen in SQLite und enthalten keine Passwörter, TOTP-Secrets, Sessiontokens oder Share-Tokens. Die SQLite-Datei ist als Secret zu behandeln.
+- Share-Tokens besitzen 192 Bit Entropie. Optionale Share-Passwörter sind Argon2id-gehasht; Freischaltungen verwenden gehashte, share-spezifische Ein-Stunden-Tokens und fünf Versuche pro Share/IP in fünf Minuten. Ablauf, Status und Downloadlimit werden bei jedem Zugriff geprüft; das Heraufzählen eines Downloads erfolgt atomar in SQLite.
+- Audit-Ereignisse liegen in SQLite und werden strukturiert an journald gespiegelt. Sie enthalten keine Passwörter, TOTP-Secrets, Sessiontokens oder Share-Tokens. Die SQLite-Datei ist als Secret zu behandeln.
 - VaultLink führt Dateien nie aus. Der empfohlene systemd-Sandbox schützt das restliche System. Der Mount selbst darf keine vom Service-User ausführbaren Programme in Systempfade bringen.
 
-Die Boundary-Prüfung schützt gegen normale und webbasierte Angreifer. Wenn ein anderer lokaler Prozess gleichzeitig Verzeichnisstrukturen im Mount böswillig austauschen kann, bleiben klassische Dateisystem-TOCTOU-Rennen möglich. Der Mount und seine lokalen Schreiber müssen daher administrativ vertrauenswürdig sein; für ein adversariales Multi-Writer-Dateisystem wäre eine Linux-`openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)`-Schicht erforderlich.
-
-MVP-Grenzen: Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner, weil sichere Dateiversionierung und Überschreibregeln nicht Teil des MVP sind. ZIP-Downloads, Passwortschutz und Suche sind noch nicht enthalten. Ein Alias (`/s/name`) ist bereits verfügbar. Das optionale Config-Feld `audit_log_path` ist für eine spätere JSONL-Spiegelung reserviert; die maßgebliche Auditquelle ist derzeit SQLite.
+Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner; VaultLink ersetzt keine vorhandenen Dateien. ZIP-Downloads, Suche und Audit-Dashboard sind nicht Teil dieses Releases. Ein Alias (`/s/name`) und Passwortschutz sind enthalten.
 
 ## 3. Projektstruktur
 
@@ -35,27 +33,29 @@ VaultLink/
 │   ├── auth.rs             Argon2id, TOTP, Rate Limit
 │   ├── db.rs               Schema, Sessions, Shares, Audit
 │   ├── path_security.rs    Pfad- und Symlink-Grenzen
+│   ├── secure_fs.rs        openat2/renameat2 und atomare Uploads
+│   ├── range.rs            einzelner HTTP-Byte-Range-Parser
 │   ├── proxy.rs            vertrauenswürdige Proxy-Header
 │   └── web.rs              Routen, HTML, Upload/Download
 ├── config/                 drei Beispielkonfigurationen
 ├── deploy/                 systemd, Caddy, ACME-Hook
+├── docs/                   Upgrade, Rollback, Release-Gates
+├── fuzz/                   Pfad-, Range- und Dateinamen-Fuzzing
 ├── Makefile
 └── Cargo.toml
 ```
 
 ## 4. Daten- und Persistenzmodell
 
-SQLite ist JSON/TOML-Dateien mit Locking vorzuziehen: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `audit`; das Schema wird beim Start idempotent angelegt. Die Datenbank liegt standardmäßig in `/var/lib/vaultlink/data.sqlite` und muss `vaultlink:vaultlink 0600` gehören.
+SQLite ist JSON/TOML-Dateien mit Locking vorzuziehen: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `audit`. Transaktionsmigrationen verwenden `PRAGMA user_version`; ein unbekanntes neueres Schema verweigert den Start. Die Datenbank liegt standardmäßig in `/var/lib/vaultlink/data.sqlite` und muss `vaultlink:vaultlink 0600` gehören.
 
-Backup bei gestopptem Dienst:
+Upgrade mit Backup bei gestopptem Dienst:
 
 ```sh
-sudo systemctl stop vaultlink
-sudo install -m 0600 -o root -g root /var/lib/vaultlink/data.sqlite /var/backups/vaultlink-$(date +%F).sqlite
-sudo systemctl start vaultlink
+sudo deploy/vaultlink-upgrade.sh /pfad/zum/neuen/vaultlink
 ```
 
-Für Online-Backups ist `sqlite3 /var/lib/vaultlink/data.sqlite '.backup /sicheres/ziel.sqlite'` zu verwenden. Restore zuerst auf eine separate Datei testen. Der Mountpoint wird unabhängig gesichert.
+Das Skript nutzt SQLite `.backup`, prüft `PRAGMA integrity_check` und bewahrt Binary und Datenbank unter `/var/lib/vaultlink/backups/` auf. Restore und manuelles Rollback beschreibt [`docs/UPGRADE-ROLLBACK.md`](docs/UPGRADE-ROLLBACK.md). Der Mountpoint wird unabhängig gesichert.
 
 ## 5. Konfigurationsmodell
 
@@ -73,9 +73,11 @@ Eine separate `session_secret` ist nicht nötig: Sessions sind zufällige server
 | `/admin` | GET | Root-begrenzter Dateibrowser |
 | `/admin/shares` | GET/POST | Links auflisten/erstellen |
 | `/admin/shares/:id/toggle` | POST | aktivieren/deaktivieren |
+| `/admin/shares/:id/password` | POST | Passwort setzen/ersetzen/entfernen |
 | `/admin/shares/:id/delete` | POST | löschen |
 | `/v/:token` | GET | öffentliche Datei-/Ordnerseite |
-| `/v/:token/download` | GET | gestreamter Download |
+| `/v/:token/unlock` | POST | passwortgeschützte Freigabe entsperren |
+| `/v/:token/download` | GET/HEAD | Streaming, einzelner Byte-Range, `206`/`416` |
 | `/v/:token/upload` | POST | exklusiver Ordnerupload |
 | `/s/:alias` | GET | validierter Kurzlink |
 
@@ -83,7 +85,7 @@ Es gibt absichtlich keine öffentliche JSON-API. Interne absolute Pfade werden n
 
 ## 7. UI und UX
 
-Login, MFA, Dateibrowser, Linkformular/-liste sowie öffentliche Download-/Uploadseiten sind responsiv. Berechtigungen und Status sind sichtbar. Ein kleines, statisch ausgeliefertes und durch `script-src 'self'` begrenztes Script stellt den Copy-Button bereit; es gibt keine externe Frontend-Abhängigkeit. Verzeichnisse sind auf 1000 Einträge pro Ansicht begrenzt, um unkontrolliertes Rendering zu vermeiden.
+Login, MFA, Dateibrowser, Linkformular/-liste sowie öffentliche Download-/Uploadseiten sind responsiv. Berechtigungen, Passwortschutz und Status sind sichtbar; Hashes und Klartextpasswörter nie. Ein kleines, statisch ausgeliefertes und durch `script-src 'self'` begrenztes Script stellt den Copy-Button bereit; es gibt keine externe Frontend-Abhängigkeit. Verzeichnisse liefern descriptor-relativ höchstens 100 Einträge pro Seite.
 
 ## 8. HTTPS- und Betriebsmodi
 
@@ -130,11 +132,11 @@ Nginx muss `X-Forwarded-For`, `X-Forwarded-Proto` und `X-Forwarded-Host` setzen.
 
 ### Standalone TLS
 
-Rustls liest Fullchain und Key beim Prozessstart. Das MVP implementiert bewusst keinen SIGHUP-Hot-Reload; der atomare Deploy-Hook führt nach erfolgreichem Zertifikatswechsel einen kurzen systemd-Neustart aus. Für Port 443 wird nur im Standalone-Modus das Drop-in `vaultlink-standalone-capability.conf` installiert. Alternativ bindet VaultLink auf 8443 und die Firewall leitet weiter. Ein zusätzlicher HTTP-Redirect-Listener ist im MVP nicht implementiert; Port 80 sollte durch Firewall/Proxy auf HTTPS umgeleitet werden.
+Rustls liest Fullchain und Key beim Prozessstart. Mit `reload_on_cert_change=true` lädt `systemctl reload vaultlink` die PEM-Dateien per SIGHUP; ein fehlerhaftes neues Zertifikat lässt die bisherige TLS-Konfiguration aktiv. Der Deploy-Hook nutzt `reload-or-restart`. Für Port 443 wird nur im Standalone-Modus das Drop-in `vaultlink-standalone-capability.conf` installiert. Alternativ bindet VaultLink auf 8443 und die Firewall leitet weiter. HTTP→HTTPS bleibt Aufgabe von Reverse Proxy oder Firewall.
 
 ## 9. Testkonzept
 
-Unit-Tests decken Argon2, den offiziellen RFC-TOTP-Vektor, Rate-Limit, Traversal/Encoding, Dateinamen, Unix-Symlink-Escape, Proxy-Vertrauen, Config-Modi, Berechtigungen, Alias-Eindeutigkeit und atomare Downloadlimits ab. Sie nutzen In-Memory-SQLite bzw. `tempfile`, verändern keinen Produktionsmount und benötigen nach dem Dependency-Fetch kein Netzwerk.
+Unit- und HTTP-Integrationstests decken Argon2, RFC-TOTP, Login/MFA/Logout, Session/CSRF, Rate-Limits, Security Headers, Passwort-Unlock, Share-Rechte, Range/HEAD, Migrationserhalt, atomare Downloadlimits, Upload-Noclobber/-Cleanup/-Parallelität, Traversal/Encoding, Linux-Symlink-Races, Proxy-Vertrauen und Config-Modi ab. Sie nutzen In-Memory-SQLite bzw. `tempfile`, verändern keinen Produktionsmount und benötigen nach dem Dependency-Fetch kein Netzwerk.
 
 ```sh
 make test
@@ -142,7 +144,7 @@ make security-test
 make lint
 ```
 
-Vor einer Version 1.0 sind ergänzend End-to-End-Browsertests, parallele Multipart-Abbruchtests, Fuzzing von Pfad- und Multipartparsern und Lasttests einzuplanen.
+Die Fuzz-Ziele liegen unter `fuzz/`; vor dem Tag läuft jedes Ziel zehn Minuten. Dependency-, Last- und 72-Stunden-Soak-Gates stehen in [`docs/RELEASE-CHECKLIST.md`](docs/RELEASE-CHECKLIST.md).
 
 Die ausgelieferten systemd-Schutzoptionen erreichen auf Debian 13 mit `systemd-analyze security` einen Exposure-Wert von 1.5 (`OK`). Die Basiseinheit besitzt keine Linux-Capabilities. Nur das optionale Standalone-Port-443-Drop-in setzt gezielt `CAP_NET_BIND_SERVICE` frei.
 
@@ -169,7 +171,7 @@ sudo -u vaultlink /opt/vaultlink/vaultlink init-admin --config /etc/vaultlink/co
 sudo systemctl enable --now vaultlink
 ```
 
-Firewall: bei Reverse Proxy nur 80/443 für Caddy/Nginx öffnen und 8080 auf Loopback lassen. Bei Standalone nur 443 öffnen. Updates über neues Binary, `systemctl restart vaultlink`, Logs prüfen, dann altes Binary kontrolliert entfernen. `journalctl -u vaultlink` enthält strukturierte Betriebslogs, aber keine Credentials.
+Firewall: bei Reverse Proxy nur 80/443 für Caddy/Nginx öffnen und 8080 auf Loopback lassen. Bei Standalone nur 443 öffnen. Updates erfolgen mit `deploy/vaultlink-upgrade.sh`, niemals durch Überschreiben des laufenden Binarys. `journalctl -u vaultlink` enthält strukturierte Betriebs- und Auditlogs, aber keine Credentials.
 
 ## ZeroSSL Auto-Renewal Setup
 
@@ -218,7 +220,7 @@ sudo systemctl status vaultlink-cert-renew.service
 sudo systemctl list-timers vaultlink-cert-renew.timer
 ```
 
-`acme.sh --cron` entscheidet täglich selbst, ob erneuert wird. Der Hook prüft nichtleere Quelldateien, installiert beide PEMs mit `root:vaultlink 0640`, tauscht sie atomar innerhalb des Zielverzeichnisses und startet VaultLink nur nach erfolgreichem Deploy neu. Troubleshooting: `journalctl -u vaultlink-cert-renew`, DNS/Firewall und acme.sh-Domainpfade prüfen. EAB-Werte niemals in Logs kopieren. Die Timer-Unit bekommt keinen EAB-Wert als Kommandozeilenargument; EAB wird nur bei Accountregistrierung benötigt.
+`acme.sh --cron` entscheidet täglich selbst, ob erneuert wird. Der Hook prüft nichtleere Quelldateien, installiert beide PEMs mit `root:vaultlink 0640`, tauscht sie atomar innerhalb des Zielverzeichnisses und führt danach `systemctl reload-or-restart vaultlink` aus. Troubleshooting: `journalctl -u vaultlink-cert-renew`, DNS/Firewall und acme.sh-Domainpfade prüfen. EAB-Werte niemals in Logs kopieren. Die Timer-Unit bekommt keinen EAB-Wert als Kommandozeilenargument; EAB wird nur bei Accountregistrierung benötigt.
 
 ## 11. WSL-Entwicklung
 
@@ -238,7 +240,7 @@ make run
 ## Troubleshooting
 
 - **Start verweigert:** Config-Modus, HTTPS-URL, Loopback/Trusted Proxies, PEM-Pfade und Storage-Root prüfen.
-- **403 bei Datei:** kanonisierter Zielpfad oder Symlink verlässt den Root; das ist beabsichtigt.
+- **403 bei Datei:** Der validierte Pfad oder ein Symlink verlässt den per Descriptor geöffneten Root; das ist beabsichtigt.
 - **Upload 409:** VaultLink überschreibt nie. Datei umbenennen oder administrativ entfernen.
 - **Login gesperrt:** fünf Fehler innerhalb fünf Minuten; Fenster abwarten. Neustart leert nur den in-memory Rate-Limiter, nicht Sessions.
 - **TLS nach Renewal alt:** `systemctl status vaultlink`, PEM-Rechte und Journal des Renewal-Service prüfen.
@@ -254,9 +256,7 @@ cargo build --release --locked
 
 ### Lokaler Validierungsstatus (7. Juli 2026)
 
-`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --all-targets --locked`, `cargo build --release --locked` und `git diff --check` wurden unter Windows erfolgreich ausgeführt. 25 Tests liefen erfolgreich; der zusätzliche Unix-Symlink-Test ist unter Windows per `cfg(unix)` deaktiviert.
-
-Auf einer sauberen Debian-13.5-VM wurden Rust stable 1.96.1, Clippy, alle 26 Tests einschließlich Symlink-Escape, Release-Build, ShellCheck und die installierte VaultLink-systemd-Unit erfolgreich geprüft. Die Renewal-Units werden in CI mit sicheren ausführbaren Platzhaltern syntaktisch validiert. Zusätzlich liefen Admin-Bootstrap, Passwort/TOTP-Login, Session, Logout, CSRF-Ablehnung, Security Headers, Rate-Limit sowie öffentliche Download-only- und Upload-only-Flows Ende-zu-Ende gegen einen realen systemd-Dienst. Uploadinhalt, Dateimodus `0600` und Audit-Einträge wurden auf dem Server verifiziert. Der externe Nginx-HTTPS-Pfad wurde einschließlich HSTS/Security Headers und Login-Redirect öffentlich validiert.
+Für den aktuellen Beta-Code sind Windows-Formatierung, Clippy mit `-D warnings`, 35 Tests einschließlich HTTP-Login/MFA/CSRF/Logout, Passwort-Unlock, Range/HEAD, Uploadlimit/-Konflikt/-Cleanup, Migration und parallelem Upload-Noclobber sowie `cargo-audit 0.22.2 --deny warnings` grün. Die Linux-spezifischen `openat2`-/`renameat2`-Tests, Fuzz-, Last-, öffentlicher Nginx- und 72-Stunden-Soak-Gates müssen vor dem Tag noch vollständig grün sein; maßgeblich ist die Release-Checkliste.
 
 Projektbeschreibung für GitHub: **VaultLink – secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 

@@ -3,6 +3,8 @@ pub mod config;
 pub mod db;
 pub mod path_security;
 pub mod proxy;
+pub mod range;
+pub mod secure_fs;
 pub mod web;
 
 use std::sync::Arc;
@@ -15,16 +17,17 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub db: Database,
     pub root: Arc<std::path::PathBuf>,
+    pub secure_root: secure_fs::SecureRoot,
     pub limiter: auth::LoginLimiter,
+    pub share_limiter: auth::LoginLimiter,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         config.validate()?;
-        let root = std::fs::canonicalize(&config.storage.root_mount_path)?;
-        if !root.is_dir() {
-            return Err("root_mount_path is not a directory".into());
-        }
+        let secure_root = secure_fs::SecureRoot::open(&config.storage.root_mount_path)
+            .map_err(|error| format!("cannot initialize secure storage access (openat2 is required on Linux): {error}"))?;
+        let root = secure_root.display_root().to_path_buf();
         std::fs::create_dir_all(&config.storage.data_directory)?;
         let db = Database::open(config.storage.data_directory.join("data.sqlite"))?;
         Ok(Self {
@@ -32,9 +35,14 @@ impl AppState {
                 config.security.login_attempts,
                 std::time::Duration::from_secs(config.security.login_window_seconds),
             ),
+            share_limiter: auth::LoginLimiter::new(
+                config.security.share_password_attempts,
+                std::time::Duration::from_secs(300),
+            ),
             config: Arc::new(config),
             db,
             root: Arc::new(root),
+            secure_root,
         })
     }
 }
