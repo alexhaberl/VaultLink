@@ -4,6 +4,7 @@
 
 - Linux storage access is descriptor-relative through `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_MAGICLINKS`.
 - Uploads use private temporary files, `fsync`, and `renameat2(RENAME_NOREPLACE)` publication.
+- Added per-share upload conflict strategy: default uploads still reject name conflicts, while upload-capable folder links can allow explicit per-upload replacement.
 - Added password-protected shares with Argon2id, one-hour unlock sessions, and per-share/IP throttling.
 - Added paginated directory views, `HEAD`, and single-range downloads (`206`/`416`).
 - Added local loopback-only setup UI for initial config and first admin bootstrap.

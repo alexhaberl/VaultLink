@@ -187,6 +187,12 @@ impl PendingUpload {
         self.published = true;
         Ok(())
     }
+    pub fn publish_replace(&mut self, name: &str) -> io::Result<()> {
+        linux::rename_replace(&self.directory, &self.temporary_name, name)?;
+        self.directory.sync_all()?;
+        self.published = true;
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -225,6 +231,11 @@ impl PendingUpload {
             .persist_noclobber(self.directory.join(name))
             .map(|_| ())
             .map_err(|error| error.error)
+    }
+    pub fn publish_replace(&mut self, name: &str) -> io::Result<()> {
+        let temporary = self.temporary.take().expect("upload already published");
+        temporary.persist(self.directory.join(name))?;
+        Ok(())
     }
 }
 
@@ -349,6 +360,27 @@ mod linux {
         }
     }
 
+    pub fn rename_replace(directory: &File, old: &str, new: &str) -> io::Result<()> {
+        let old = c_path(old)?;
+        let new = c_path(new)?;
+        // SAFETY: both C strings and the directory descriptor are valid. flags=0 is atomic
+        // same-directory rename and replaces an existing non-directory destination.
+        let result = unsafe {
+            renameat2(
+                directory.as_raw_fd(),
+                old.as_ptr(),
+                directory.as_raw_fd(),
+                new.as_ptr(),
+                0,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     pub fn unlink(directory: &File, name: &str) -> io::Result<()> {
         let name = c_path(name)?;
         // SAFETY: C string and descriptor are valid; flags=0 removes files only.
@@ -397,6 +429,32 @@ mod tests {
             std::fs::read(directory.path().join("complete.txt")).unwrap(),
             b"complete"
         );
+    }
+
+    #[test]
+    fn upload_publish_replace_is_atomic_and_cleans_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("existing.txt"), b"original").unwrap();
+
+        let mut upload = root.begin_upload("").unwrap();
+        let mut file = upload.take_file();
+        file.write_all(b"replacement").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        upload.publish_replace("existing.txt").unwrap();
+        drop(upload);
+
+        assert_eq!(
+            std::fs::read(directory.path().join("existing.txt")).unwrap(),
+            b"replacement"
+        );
+        let remaining_parts = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+            .count();
+        assert_eq!(remaining_parts, 0);
     }
 
     #[test]

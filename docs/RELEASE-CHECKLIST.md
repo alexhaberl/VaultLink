@@ -13,6 +13,7 @@ Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt 
 - [x] Optionaler Kurzlink-Alias.
 - [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`.
 - [x] Sichere Uploads mit temporaerer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
+- [x] Optionales Upload-Ueberschreiben pro Upload-Ordnerlink; Default bleibt No-Replace und Public-Uploader muessen Replace pro Upload bestaetigen.
 - [x] Upload in navigierten Unterordnern fuer `download_upload`-Ordnerlinks.
 - [x] Upload-only-Freigaben listen keine Ordnerinhalte und erlauben keine Preview/Downloads.
 - [x] ZIP-Download fuer Ordnerfreigaben mit Datei- und Groessenlimits.
@@ -44,8 +45,8 @@ Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt 
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - [x] `cargo test --locked --all-targets`
-  - Ergebnis: 45 Tests bestanden.
-  - Enthalten: Setup-UI, Admin-Anlage, Runtime-Settings, Text-/Bild-/PDF-Preview, Raw-Preview-Token, ZIP, Suche, Upload in Unterordner, Share-Rechte, Auth, Migrationen, Upload-Cleanup.
+  - Ergebnis: 46 Tests bestanden.
+  - Enthalten: Setup-UI, Admin-Anlage, Runtime-Settings, Text-/Bild-/PDF-Preview, Raw-Preview-Token, ZIP, Suche, Upload in Unterordner, Upload-No-Replace/-Replace, Share-Rechte, Auth, Migrationen, Upload-Cleanup.
 - [x] `cargo check --manifest-path fuzz/Cargo.toml --locked`
   - Fuzz-Crate inklusive `zip_search_preview_paths` kompiliert.
 - [x] `cargo audit --deny warnings`
@@ -118,6 +119,7 @@ Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt 
   - PDFpreview,
   - Raw-Preview Range/HEAD,
   - Upload in Subfolder,
+  - Upload-Replace nur bei Linkrecht plus Public-Bestaetigung,
   - Download/Range/HEAD,
   - Upload-only darf nicht listen/downloaden/previewen,
   - Revoke/Expiry/Downloadlimit.

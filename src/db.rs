@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
@@ -64,6 +64,31 @@ impl Permission {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadConflictStrategy {
+    Reject,
+    OverwriteAllowed,
+}
+impl UploadConflictStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::OverwriteAllowed => "overwrite_allowed",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "reject" => Some(Self::Reject),
+            "overwrite_allowed" => Some(Self::OverwriteAllowed),
+            _ => None,
+        }
+    }
+    pub fn can_overwrite(&self) -> bool {
+        matches!(self, Self::OverwriteAllowed)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Share {
     pub id: i64,
@@ -78,6 +103,7 @@ pub struct Share {
     pub download_count: u64,
     pub active: bool,
     pub password_hash: Option<String>,
+    pub upload_conflict_strategy: UploadConflictStrategy,
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +209,20 @@ CREATE INDEX IF NOT EXISTS idx_preview_exp ON public_preview_sessions(expires_at
 "#,
         )?;
         tx.pragma_update(None, "user_version", 4)?;
+    }
+    if version < 5 {
+        let has_conflict_strategy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('shares') WHERE name='upload_conflict_strategy')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_conflict_strategy {
+            tx.execute(
+                "ALTER TABLE shares ADD COLUMN upload_conflict_strategy TEXT NOT NULL DEFAULT 'reject'",
+                [],
+            )?;
+        }
+        tx.pragma_update(None, "user_version", 5)?;
     }
     tx.commit()
 }
@@ -291,9 +331,10 @@ impl Database {
         upload_max: Option<u64>,
         admin: i64,
         password_hash: Option<&str>,
+        upload_conflict_strategy: &UploadConflictStrategy,
     ) -> rusqlite::Result<i64> {
         let c = self.conn();
-        c.execute("INSERT INTO shares(token_hash,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,created_by,created_at,password_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![token_hash(token),token,alias,path,is_dir as i64,permission.as_str(),expires.map(|v|v.to_rfc3339()),max,upload_max,admin,Utc::now().to_rfc3339(),password_hash])?;
+        c.execute("INSERT INTO shares(token_hash,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,created_by,created_at,password_hash,upload_conflict_strategy) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![token_hash(token),token,alias,path,is_dir as i64,permission.as_str(),expires.map(|v|v.to_rfc3339()),max,upload_max,admin,Utc::now().to_rfc3339(),password_hash,upload_conflict_strategy.as_str()])?;
         Ok(c.last_insert_rowid())
     }
     fn map_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
@@ -314,17 +355,19 @@ impl Database {
             download_count: r.get(9)?,
             active: r.get::<_, i64>(10)? != 0,
             password_hash: r.get(11)?,
+            upload_conflict_strategy: UploadConflictStrategy::parse(&r.get::<_, String>(12)?)
+                .ok_or(rusqlite::Error::InvalidQuery)?,
         })
     }
     pub fn share_by_token(&self, token: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash FROM shares WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
+        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy FROM shares WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
     }
     pub fn share_by_alias(&self, alias: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash FROM shares WHERE alias=?1",[alias],Self::map_share).optional()
+        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy FROM shares WHERE alias=?1",[alias],Self::map_share).optional()
     }
     pub fn list_shares(&self) -> rusqlite::Result<Vec<Share>> {
         let c = self.conn();
-        let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash FROM shares ORDER BY id DESC")?;
+        let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy FROM shares ORDER BY id DESC")?;
         let shares = s
             .query_map([], Self::map_share)?
             .filter_map(Result::ok)
@@ -337,6 +380,16 @@ impl Database {
             params![id, active as i64],
         )?;
         Ok(())
+    }
+    pub fn set_upload_conflict_strategy(
+        &self,
+        id: i64,
+        strategy: &UploadConflictStrategy,
+    ) -> rusqlite::Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE shares SET upload_conflict_strategy=?2 WHERE id=?1",
+            params![id, strategy.as_str()],
+        )? == 1)
     }
     pub fn delete_share(&self, id: i64) -> rusqlite::Result<()> {
         self.conn()
@@ -499,6 +552,7 @@ mod tests {
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         assert!(d.count_download(id).unwrap());
@@ -519,6 +573,7 @@ mod tests {
             None,
             1,
             None,
+            &UploadConflictStrategy::Reject,
         )
         .unwrap();
         assert!(d
@@ -533,6 +588,7 @@ mod tests {
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
             )
             .is_err());
     }
@@ -573,6 +629,7 @@ mod tests {
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         d.set_share_active(id, false).unwrap();
@@ -611,6 +668,10 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
         assert_eq!(share.max_downloads, Some(7));
         assert!(share.password_hash.is_none());
         assert_eq!(
+            share.upload_conflict_strategy,
+            UploadConflictStrategy::Reject
+        );
+        assert_eq!(
             database
                 .conn()
                 .query_row::<i64, _, _>("SELECT COUNT(*) FROM audit", [], |row| row.get(0))
@@ -647,6 +708,7 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
                 None,
                 1,
                 Some("password-hash"),
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         database
@@ -703,6 +765,7 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         database

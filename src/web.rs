@@ -24,7 +24,7 @@ use tower_http::{
 
 use crate::{
     auth,
-    db::{Database, Permission, Session, Share},
+    db::{Database, Permission, Session, Share, UploadConflictStrategy},
     path_security, proxy,
     range::parse_byte_range,
     runtime::RuntimeSettings,
@@ -69,6 +69,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/shares", get(shares_page).post(create_share))
         .route("/admin/shares/{id}/toggle", post(toggle_share))
+        .route(
+            "/admin/shares/{id}/upload-conflict",
+            post(set_share_upload_conflict),
+        )
         .route("/admin/shares/{id}/password", post(set_share_password))
         .route("/admin/shares/{id}/delete", post(delete_share))
         .route("/admin/admins", get(admins_page).post(create_admin_ui))
@@ -1259,6 +1263,27 @@ async fn shares_page(
             .max_upload_size
             .map(human)
             .unwrap_or_else(|| format!("global ({})", human(settings.max_upload_size)));
+        let upload_conflict = match sh.upload_conflict_strategy {
+            UploadConflictStrategy::Reject => "Konflikt: ablehnen",
+            UploadConflictStrategy::OverwriteAllowed => "Konflikt: Ueberschreiben erlaubt",
+        };
+        let upload_conflict_form = if sh.is_directory && sh.permission.can_upload() {
+            let (next, label) = if sh.upload_conflict_strategy.can_overwrite() {
+                ("reject", "Ueberschreiben deaktivieren")
+            } else {
+                ("overwrite_allowed", "Ueberschreiben erlauben")
+            };
+            format!(
+                r#"<form method="post" action="/admin/shares/{}/upload-conflict" style="display:inline"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="strategy" value="{}"><button>{}</button></form>"#,
+                sh.id,
+                esc(&s.csrf_token),
+                next,
+                label
+            )
+        } else {
+            String::new()
+        };
+        let upload_limit = format!("{upload_limit}; {upload_conflict}");
         rows += &format!(
             r#"<tr><td><code>{}</code><br><small>{}</small></td><td>{}</td><td>{}<br>{}<br><small>Uploadlimit: {}</small></td><td>{}/{}</td><td><a href="{}">Öffnen</a> <button type="button" data-copy="{}">Kopieren</button><form method="post" action="/admin/shares/{}/toggle" style="display:inline"><input type="hidden" name="csrf" value="{}"><button>{}</button></form><form method="post" action="/admin/shares/{}/delete" style="display:inline"><input type="hidden" name="csrf" value="{}"><button>Löschen</button></form><form method="post" action="/admin/shares/{}/password" class="row"><input type="hidden" name="csrf" value="{}"><input type="password" name="password" minlength="{}" maxlength="{}" placeholder="Passwort ersetzen"><input type="password" name="password_confirm" placeholder="Bestätigen"><button>Setzen</button><button name="remove" value="1">Entfernen</button></form></td></tr>"#,
             esc(&sh.relative_path),
@@ -1291,6 +1316,12 @@ async fn shares_page(
             settings.share_password_min_length,
             settings.share_password_max_bytes,
         );
+        if !upload_conflict_form.is_empty() {
+            rows += &format!(
+                r#"<tr><td colspan="5"><span class="muted">{}</span> {}</td></tr>"#,
+                upload_conflict, upload_conflict_form
+            );
+        }
     }
     let selected_raw = q.path.unwrap_or_default();
     let selected = if selected_raw.is_empty() {
@@ -1320,7 +1351,7 @@ async fn shares_page(
             r#"<p class="muted">Upload-Rechte sind nur für Ordnerlinks verfügbar. Für Uploads bitte im Dateibrowser einen Zielordner auswählen.</p>"#.into()
         };
         format!(
-            r#"<section><h1>Link erstellen</h1><p>Ausgewähltes Ziel: <code>/{}</code> <span class="muted">({})</span></p>{}<p><a href="/admin">Anderen Pfad im Dateibrowser auswählen</a></p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label>Berechtigung<br><select name="permission">{}</select></label><label>Alias (optional)<br><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}"></label><label>Ablauf RFC3339 (optional)<br><input name="expires_at" placeholder="2027-01-01T00:00:00Z"></label><label>Max. Downloads<br><input name="max_downloads" type="number" min="1"></label><label>Uploadlimit Bytes (optional)<br><input name="max_upload_size" type="number" min="1" placeholder="global: {}"></label><label>Passwort (optional)<br><input name="password" type="password" minlength="{}" maxlength="{}"></label><label>Passwort bestätigen<br><input name="password_confirm" type="password"></label><button>Erstellen</button></form></section>"#,
+            r#"<section><h1>Link erstellen</h1><p>Ausgewähltes Ziel: <code>/{}</code> <span class="muted">({})</span></p>{}<p><a href="/admin">Anderen Pfad im Dateibrowser auswählen</a></p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label>Berechtigung<br><select name="permission">{}</select></label><label>Alias (optional)<br><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}"></label><label>Ablauf RFC3339 (optional)<br><input name="expires_at" placeholder="2027-01-01T00:00:00Z"></label><label>Max. Downloads<br><input name="max_downloads" type="number" min="1"></label><label>Uploadlimit Bytes (optional)<br><input name="max_upload_size" type="number" min="1" placeholder="global: {}"></label><label><input type="checkbox" name="overwrite_allowed" value="1"> Überschreiben für Uploads erlauben</label><label>Passwort (optional)<br><input name="password" type="password" minlength="{}" maxlength="{}"></label><label>Passwort bestätigen<br><input name="password_confirm" type="password"></label><button>Erstellen</button></form></section>"#,
             esc(&selected),
             if is_dir { "Ordner" } else { "Datei" },
             upload_hint,
@@ -1351,6 +1382,7 @@ struct CreateShare {
     max_upload_size: Option<String>,
     password: Option<String>,
     password_confirm: Option<String>,
+    overwrite_allowed: Option<String>,
 }
 async fn create_share(
     State(state): State<AppState>,
@@ -1453,6 +1485,12 @@ async fn create_share(
             "Uploadlimit muss mindestens 1 Byte sein",
         ));
     }
+    let upload_conflict_strategy =
+        if f.overwrite_allowed.as_deref() == Some("1") && is_directory && permission.can_upload() {
+            UploadConflictStrategy::OverwriteAllowed
+        } else {
+            UploadConflictStrategy::Reject
+        };
     let admin_id = s.admin_id;
     let id = database(state.db.clone(), move |db| {
         db.create_share(
@@ -1466,6 +1504,7 @@ async fn create_share(
             max_upload_size,
             admin_id,
             password_hash.as_deref(),
+            &upload_conflict_strategy,
         )
     })
     .await
@@ -1503,6 +1542,54 @@ async fn toggle_share(
         "share_toggled",
         Some(id.to_string()),
         None,
+    )
+    .await;
+    Ok(Redirect::to("/admin/shares"))
+}
+
+#[derive(Deserialize)]
+struct UploadConflictForm {
+    csrf: String,
+    strategy: String,
+}
+
+async fn set_share_upload_conflict(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<i64>,
+    Form(form): Form<UploadConflictForm>,
+) -> Result<Redirect> {
+    let (_, session) = session(&state, &headers, true).await?;
+    csrf(&session, &form.csrf)?;
+    let strategy = UploadConflictStrategy::parse(&form.strategy).ok_or(AppError(
+        StatusCode::BAD_REQUEST,
+        "Ungueltige Upload-Konfliktstrategie",
+    ))?;
+    let share = database(state.db.clone(), |db| db.list_shares())
+        .await?
+        .into_iter()
+        .find(|share| share.id == id)
+        .ok_or(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"))?;
+    if !share.is_directory || !share.permission.can_upload() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Ueberschreiben ist nur fuer Ordnerlinks mit Uploadrecht erlaubt",
+        ));
+    }
+    let stored_strategy = strategy.clone();
+    let changed = database(state.db.clone(), move |db| {
+        db.set_upload_conflict_strategy(id, &stored_strategy)
+    })
+    .await?;
+    if !changed {
+        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+    }
+    audit(
+        &state,
+        session.username,
+        "share_upload_conflict_updated",
+        Some(id.to_string()),
+        Some(strategy.as_str().to_string()),
     )
     .await;
     Ok(Redirect::to("/admin/shares"))
@@ -2146,10 +2233,16 @@ async fn public_page(
         } else {
             String::new()
         };
+        let overwrite_checkbox = if sh.upload_conflict_strategy.can_overwrite() {
+            r#"<label><input type="checkbox" name="overwrite_existing" value="1"> Bestehende Datei mit gleichem Namen ersetzen</label>"#
+        } else {
+            ""
+        };
         body += &format!(
-            r#"<h2>Upload</h2><p class="muted">Zielordner: /{}</p><form method="post" enctype="multipart/form-data" action="/v/{token}/upload"><input type="hidden" name="path" value="{}"><input type="file" name="file" required><button>Hochladen</button></form>"#,
+            r#"<h2>Upload</h2><p class="muted">Zielordner: /{}</p><form method="post" enctype="multipart/form-data" action="/v/{token}/upload"><input type="hidden" name="path" value="{}">{}<input type="file" name="file" required><button>Hochladen</button></form>"#,
             esc(&upload_path),
-            esc(&upload_path)
+            esc(&upload_path),
+            overwrite_checkbox
         );
     } else if sh.is_directory && sh.permission == Permission::UploadOnly {
         body += "<p class=\"muted\">Upload-only-Freigaben listen keine Ordnerinhalte.</p>";
@@ -2575,6 +2668,7 @@ async fn upload(
     let settings = runtime_settings(&state);
     let maximum = sh.max_upload_size.unwrap_or(settings.max_upload_size);
     let mut upload_subdir = String::new();
+    let mut overwrite_existing = false;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -2592,6 +2686,14 @@ async fn upload(
                     .to_string_lossy()
                     .replace('\\', "/");
             }
+            continue;
+        }
+        if field_name == "overwrite_existing" {
+            let value = field
+                .text()
+                .await
+                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Upload"))?;
+            overwrite_existing = value == "1";
             continue;
         }
         if field_name != "file" {
@@ -2643,20 +2745,32 @@ async fn upload(
         output.sync_all().await.map_err(internal)?;
         drop(output);
         let publish_name = name.clone();
-        tokio::task::spawn_blocking(move || pending.publish(&publish_name))
-            .await
-            .map_err(internal)?
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    AppError(StatusCode::CONFLICT, "Datei existiert bereits")
-                } else {
-                    internal(error)
-                }
-            })?;
+        let allow_replace = sh.upload_conflict_strategy.can_overwrite() && overwrite_existing;
+        let replaced = allow_replace;
+        tokio::task::spawn_blocking(move || {
+            if allow_replace {
+                pending.publish_replace(&publish_name)
+            } else {
+                pending.publish(&publish_name)
+            }
+        })
+        .await
+        .map_err(internal)?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                AppError(StatusCode::CONFLICT, "Datei existiert bereits")
+            } else {
+                internal(error)
+            }
+        })?;
         audit(
             &state,
             "public".into(),
-            "upload",
+            if replaced {
+                "upload_replaced"
+            } else {
+                "upload"
+            },
             Some(sh.id.to_string()),
             Some(name),
         )
@@ -2766,12 +2880,30 @@ mod tests {
         content: &[u8],
         path: Option<&str>,
     ) -> Request {
+        multipart_request_with_options(uri, name, content, path, false)
+    }
+
+    fn multipart_request_with_options(
+        uri: &str,
+        name: &str,
+        content: &[u8],
+        path: Option<&str>,
+        overwrite_existing: bool,
+    ) -> Request {
         let boundary = "vaultlink-test-boundary";
         let mut body = Vec::new();
         if let Some(path) = path {
             body.extend_from_slice(
                 format!(
                     "--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n{path}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        if overwrite_existing {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite_existing\"\r\n\r\n1\r\n"
                 )
                 .as_bytes(),
             );
@@ -2879,6 +3011,7 @@ mod tests {
             download_count: 0,
             active,
             password_hash: None,
+            upload_conflict_strategy: UploadConflictStrategy::Reject,
         };
         assert!(usable(&share(false, None)).is_err());
         assert!(usable(&share(true, Some(Utc::now() - Duration::seconds(1)))).is_err());
@@ -3104,6 +3237,7 @@ mod tests {
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         state
@@ -3119,6 +3253,7 @@ mod tests {
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         let password_hash = auth::hash_password("share password 123").unwrap();
@@ -3135,6 +3270,7 @@ mod tests {
                 None,
                 1,
                 Some(password_hash.as_str()),
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         let app = router(state.clone());
@@ -3295,6 +3431,7 @@ mod tests {
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         state
@@ -3310,6 +3447,7 @@ mod tests {
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         let media_id = state
@@ -3325,6 +3463,7 @@ mod tests {
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
             )
             .unwrap();
         let app = router(state.clone());
@@ -3526,9 +3665,43 @@ mod tests {
                 None,
                 1,
                 None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        state
+            .db
+            .create_share(
+                "replace",
+                None,
+                "uploads",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::OverwriteAllowed,
             )
             .unwrap();
         let app = router(state);
+
+        let replace_page = response_text(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/replace", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(replace_page.contains("Bestehende Datei mit gleichem Namen ersetzen"));
+        let upload_page = response_text(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/upload", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!upload_page.contains("Bestehende Datei mit gleichem Namen ersetzen"));
 
         let uploaded = app
             .clone()
@@ -3547,6 +3720,30 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::CONFLICT
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(multipart_request("/v/replace/upload", "ok.txt", b"new"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let replaced = app
+            .clone()
+            .oneshot(multipart_request_with_options(
+                "/v/replace/upload",
+                "ok.txt",
+                b"new",
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replaced.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            std::fs::read(root.path().join("uploads/ok.txt")).unwrap(),
+            b"new"
         );
         assert_eq!(
             app.clone()

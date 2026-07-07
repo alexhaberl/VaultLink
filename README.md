@@ -16,7 +16,7 @@ Stack: Rust stable, Axum/Tokio, Tower-Middleware, Rusqlite/SQLite, Argon2id, RFC
 
 - Dateizugriffe sind Linux descriptor-relativ. `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` bindet Listing, Metadaten, Download, ZIP und Upload an den beim Start geoeffneten Root-Descriptor. Ein Kernel ohne `openat2` wird mit verstaendlichem Startfehler abgewiesen.
 - Relative Nutzpfade verbieten absolute Pfade, `..`, Backslashes, NUL, doppelte Prozentkodierung und ungueltiges UTF-8.
-- Uploads werden als zufaellige `0600`-Temporaerdateien im Zielordner geschrieben, geflusht, per `fsync` gesichert und mit `renameat2(RENAME_NOREPLACE)` atomar ohne Ueberschreiben veroeffentlicht.
+- Uploads werden als zufaellige `0600`-Temporaerdateien im Zielordner geschrieben, geflusht und per `fsync` gesichert. Default ist atomarer No-Replace-Publish mit `renameat2(RENAME_NOREPLACE)`; optional kann pro Upload-Ordnerlink ein explizit bestaetigtes atomisches Ersetzen erlaubt werden.
 - Adminpasswoerter verwenden Argon2id. Nach dem Passwort ist TOTP zwingend. Sessions sind zufaellige serverseitige Bearer-Tokens, deren Hash in SQLite liegt.
 - Cookies sind `HttpOnly`, `SameSite=Strict` und in Production `Secure`.
 - Mutierende Adminaktionen verlangen CSRF. Login und Share-Unlock sind rate-limitiert.
@@ -24,7 +24,7 @@ Stack: Rust stable, Axum/Tokio, Tower-Middleware, Rusqlite/SQLite, Argon2id, RFC
 - Security Header: CSP, `X-Content-Type-Options: nosniff`, Frame-Schutz, Referrer-Policy, Permissions-Policy und HSTS nur bei HTTPS.
 - Audit liegt in SQLite und wird strukturiert an journald gespiegelt. Passwoerter, TOTP-Secrets, Sessiontokens und Share-Tokens werden nicht geloggt.
 
-Datei-Links sind nur `download_only`. Uploadrechte gelten fuer Ordner; VaultLink ersetzt keine vorhandenen Dateien. Ordnerfreigaben unterstuetzen ZIP-Download mit Limits, Suche, Upload in navigierten Unterordnern und Preview bei Downloadrecht. Upload-only-Freigaben listen keine Inhalte und erlauben keine Preview/Downloads.
+Datei-Links sind nur `download_only`. Uploadrechte gelten fuer Ordner. VaultLink ersetzt vorhandene Dateien nur, wenn ein Admin dies fuer den konkreten Upload-Link erlaubt und der Public-Uploader das Ersetzen beim Upload aktiv bestaetigt. Ordnerfreigaben unterstuetzen ZIP-Download mit Limits, Suche, Upload in navigierten Unterordnern und Preview bei Downloadrecht. Upload-only-Freigaben listen keine Inhalte und erlauben keine Preview/Downloads.
 
 ## 3. Projektstruktur
 
@@ -210,7 +210,7 @@ Der Hook installiert PEMs nach `/etc/vaultlink/tls/` mit `root:vaultlink 0640` u
 
 ## 9. Testkonzept
 
-Unit- und HTTP-Integrationstests decken Argon2, TOTP, Login/MFA/Logout, Session/CSRF, Rate-Limits, Security Headers, Setup-UI, Admin-Anlage, Runtime-Settings, Passwort-Unlock, Share-Rechte, Suche, ZIP, Text-/Bild-/PDF-Preview, Raw-Preview-Token, Range/HEAD, Migrationserhalt, atomare Downloadlimits, Upload-Noclobber/-Cleanup/-Parallelitaet, Upload in Unterordner, Traversal/Encoding, Proxy-Vertrauen und Config-Modi ab.
+Unit- und HTTP-Integrationstests decken Argon2, TOTP, Login/MFA/Logout, Session/CSRF, Rate-Limits, Security Headers, Setup-UI, Admin-Anlage, Runtime-Settings, Passwort-Unlock, Share-Rechte, Suche, ZIP, Text-/Bild-/PDF-Preview, Raw-Preview-Token, Range/HEAD, Migrationserhalt, atomare Downloadlimits, Upload-Noclobber/-Replace/-Cleanup/-Parallelitaet, Upload in Unterordner, Traversal/Encoding, Proxy-Vertrauen und Config-Modi ab.
 
 ```sh
 make test
@@ -269,7 +269,7 @@ make run
 - Start verweigert: Config-Modus, HTTPS-URL, Loopback/Trusted Proxies, PEM/ACME-Einstellungen und Storage-Root pruefen.
 - Built-in ACME scheitert: DNS muss auf den Server zeigen, VaultLink muss selbst Port 443 terminieren, Nginx/Caddy darf nicht davor laufen.
 - 403 bei Datei: Pfadvalidierung oder Symlink-Grenze greift.
-- Upload 409: VaultLink ueberschreibt nie.
+- Upload 409: Standard ist no-overwrite. Falls Ersetzen gewuenscht ist, muss der Admin es pro Upload-Link erlauben und der Uploader die Replace-Checkbox setzen.
 - TLS nach Renewal alt: `systemctl status vaultlink`, PEM-Rechte und Journal pruefen.
 
 ## Lizenz
