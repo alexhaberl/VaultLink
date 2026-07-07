@@ -28,21 +28,33 @@ if grep -Eq '\[(5[0-9][0-9])\]' "$work/hey.txt"; then
 fi
 
 downloads=0
+download_pids=""
 while [ "$downloads" -lt 40 ]; do
     curl --fail --silent --show-error --range 0-1073741823 \
         "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download" -o /dev/null &
+    download_pids="$download_pids $!"
     downloads=$((downloads + 1))
 done
-wait
+download_failed=0
+for pid in $download_pids; do
+    wait "$pid" || download_failed=1
+done
+[ "$download_failed" -eq 0 ] || { echo "download stream gate failed" >&2; exit 1; }
 
 uploads=0
+upload_pids=""
 while [ "$uploads" -lt 10 ]; do
     curl --fail --silent --show-error \
         -F "file=@$work/upload.bin;filename=load-$uploads.bin" \
         "$VAULTLINK_BASE_URL/v/$UPLOAD_TOKEN/upload" -o /dev/null &
+    upload_pids="$upload_pids $!"
     uploads=$((uploads + 1))
 done
-wait
+upload_failed=0
+for pid in $upload_pids; do
+    wait "$pid" || upload_failed=1
+done
+[ "$upload_failed" -eq 0 ] || { echo "upload stream gate failed" >&2; exit 1; }
 
 if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
     rss_after=$(awk '/VmRSS:/ { print $2 * 1024 }' "/proc/$pid/status")
