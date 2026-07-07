@@ -29,12 +29,23 @@ fi
 install -o root -g root -m 0755 "$new_binary" "$install_dir/.vaultlink.new"
 mv -f "$install_dir/.vaultlink.new" "$install_dir/vaultlink"
 
-if ! systemctl start vaultlink.service; then
+rollback() {
     echo "upgrade failed; restoring $backup_dir" >&2
+    systemctl stop vaultlink.service || true
     [ ! -f "$backup_dir/vaultlink" ] || install -o root -g root -m 0755 "$backup_dir/vaultlink" "$install_dir/vaultlink"
-    [ ! -f "$backup_dir/data.sqlite" ] || install -o vaultlink -g vaultlink -m 0600 "$backup_dir/data.sqlite" "$data"
+    if [ -f "$backup_dir/data.sqlite" ]; then
+        rm -f "$data-wal" "$data-shm"
+        install -o vaultlink -g vaultlink -m 0600 "$backup_dir/data.sqlite" "$data"
+    fi
     systemctl start vaultlink.service || true
     exit 1
+}
+
+if ! systemctl start vaultlink.service; then
+    rollback
 fi
+sleep 2
+systemctl --quiet is-active vaultlink.service || rollback
+sqlite3 "$data" "PRAGMA integrity_check" | grep -qx ok || rollback
 
 echo "$backup_dir"
