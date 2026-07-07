@@ -591,7 +591,7 @@ struct CreateShare {
     permission: String,
     alias: Option<String>,
     expires_at: Option<String>,
-    max_downloads: Option<u64>,
+    max_downloads: Option<String>,
     password: Option<String>,
     password_confirm: Option<String>,
 }
@@ -667,7 +667,20 @@ async fn create_share(
     };
     let permission_detail = permission.as_str().to_string();
     let is_directory = target_metadata.is_dir();
-    let max_downloads = f.max_downloads;
+    let max_downloads = f
+        .max_downloads
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige maximale Downloadanzahl"))?;
+    if max_downloads == Some(0) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Maximale Downloadanzahl muss mindestens 1 sein",
+        ));
+    }
     let admin_id = s.admin_id;
     let id = database(state.db.clone(), move |db| {
         db.create_share(
@@ -1455,7 +1468,7 @@ mod tests {
             )
             .unwrap();
         state.db.verify_mfa("session-token").unwrap();
-        let app = router(state);
+        let app = router(state.clone());
         let cookie = HeaderValue::from_static("vaultlink_session=session-token");
 
         let mut browser_root = request(Method::GET, "/admin", "");
@@ -1485,12 +1498,30 @@ mod tests {
 
         let mut file_request = request(Method::GET, "/admin/shares?path=file.txt", "");
         file_request.headers_mut().insert(header::COOKIE, cookie);
-        let file = response_text(app.oneshot(file_request).await.unwrap()).await;
+        let file = response_text(app.clone().oneshot(file_request).await.unwrap()).await;
         assert!(file.contains(r#"Ausgewähltes Ziel: <code>/file.txt</code>"#));
         assert!(file.contains(r#"<input type="hidden" name="path" value="file.txt">"#));
         assert!(file.contains(r#"<option value="download_only">Download only</option>"#));
         assert!(!file.contains(r#"<option value="upload_only">Upload only</option>"#));
         assert!(file.contains("Upload-Rechte sind nur"));
+
+        let mut create_request = request(
+            Method::POST,
+            "/admin/shares",
+            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&expires_at=&max_downloads=&password=&password_confirm=",
+        );
+        create_request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=session-token"),
+        );
+        assert_eq!(
+            app.oneshot(create_request).await.unwrap().status(),
+            StatusCode::SEE_OTHER
+        );
+        let shares = state.db.list_shares().unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].relative_path, "uploads");
+        assert_eq!(shares[0].max_downloads, None);
     }
 
     #[tokio::test]
