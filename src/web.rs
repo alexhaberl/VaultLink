@@ -421,6 +421,11 @@ async fn admin_browser(
     }
     let encoded_path =
         percent_encoding::utf8_percent_encode(&raw, percent_encoding::NON_ALPHANUMERIC);
+    let current_folder_target = if raw.is_empty() {
+        ".".to_string()
+    } else {
+        encoded_path.to_string()
+    };
     let previous = if page_number > 0 {
         format!(
             "<a href=\"/admin?path={encoded_path}&page={}\">Zurück</a>",
@@ -437,7 +442,7 @@ async fn admin_browser(
     } else {
         String::new()
     };
-    let body=format!("<section><h1>Dateibrowser</h1><p class=muted>Relativer Pfad: /{}</p><table><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th></th></tr></thead><tbody>{}</tbody></table><p>{} {}</p><p class=muted>100 Einträge pro Seite.</p></section><section><form method=post action=/logout><input type=hidden name=csrf value=\"{}\"><button>Abmelden</button></form></section>",esc(&rel),rows,previous,next,esc(&s.csrf_token));
+    let body=format!("<section><h1>Dateibrowser</h1><p class=muted>Relativer Pfad: /{}</p><p><a href=\"/admin/shares?path={}\">Aktuellen Ordner freigeben</a></p><table><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th></th></tr></thead><tbody>{}</tbody></table><p>{} {}</p><p class=muted>100 Einträge pro Seite.</p></section><section><form method=post action=/logout><input type=hidden name=csrf value=\"{}\"><button>Abmelden</button></form></section>",esc(&rel),current_folder_target,rows,previous,next,esc(&s.csrf_token));
     Ok(Html(page("Dateien", &body)))
 }
 fn human(n: u64) -> String {
@@ -1452,6 +1457,22 @@ mod tests {
         state.db.verify_mfa("session-token").unwrap();
         let app = router(state);
         let cookie = HeaderValue::from_static("vaultlink_session=session-token");
+
+        let mut browser_root = request(Method::GET, "/admin", "");
+        browser_root
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let browser_root = response_text(app.clone().oneshot(browser_root).await.unwrap()).await;
+        assert!(browser_root.contains("Aktuellen Ordner freigeben"));
+        assert!(browser_root.contains(r#"/admin/shares?path=."#));
+
+        let mut browser_folder = request(Method::GET, "/admin?path=uploads", "");
+        browser_folder
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let browser_folder =
+            response_text(app.clone().oneshot(browser_folder).await.unwrap()).await;
+        assert!(browser_folder.contains(r#"/admin/shares?path=uploads"#));
 
         let mut folder_request = request(Method::GET, "/admin/shares?path=uploads", "");
         folder_request
