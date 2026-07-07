@@ -11,6 +11,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = arg(&args, "--config")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
+    if args.get(1).is_some_and(|value| value == "setup") {
+        let listen = arg(&args, "--listen").unwrap_or("127.0.0.1:8090");
+        let listen: std::net::SocketAddr = listen.parse()?;
+        return vaultlink::setup::run(config_path, listen).await;
+    }
     let config = Config::load(&config_path)?;
     let filter = tracing_subscriber::EnvFilter::try_new(&config.logging.level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));

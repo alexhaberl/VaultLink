@@ -1,4 +1,5 @@
 /target/
+/fuzz/target/
 /dev/data/
 /dev/mount/
 /config.toml
@@ -6,4 +7,3 @@
 *.sqlite-shm
 *.sqlite-wal
 .env
-

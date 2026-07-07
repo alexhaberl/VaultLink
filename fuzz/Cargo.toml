@@ -31,3 +31,10 @@ path = "fuzz_targets/filename.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "zip_search_preview_paths"
+path = "fuzz_targets/zip_search_preview_paths.rs"
+test = false
+doc = false
+bench = false

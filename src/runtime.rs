@@ -1,0 +1,239 @@
+use crate::config::Config;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeSettings {
+    pub public_base_url: String,
+    pub max_upload_size: u64,
+    pub blocked_extensions: Vec<String>,
+    pub share_password_min_length: usize,
+    pub share_password_max_bytes: usize,
+    pub share_unlock_minutes: i64,
+    pub max_zip_size: u64,
+    pub max_zip_files: usize,
+    pub max_search_entries: usize,
+    pub max_search_results: usize,
+    pub max_preview_size: u64,
+    pub preview_extensions: Vec<String>,
+}
+
+impl RuntimeSettings {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            public_base_url: config.server.public_base_url.clone(),
+            max_upload_size: config.storage.max_upload_size,
+            blocked_extensions: normalize_extensions(&config.storage.blocked_extensions),
+            share_password_min_length: config.security.share_password_min_length,
+            share_password_max_bytes: config.security.share_password_max_bytes,
+            share_unlock_minutes: config.security.share_unlock_minutes,
+            max_zip_size: config.storage.max_zip_size,
+            max_zip_files: config.storage.max_zip_files,
+            max_search_entries: config.storage.max_search_entries,
+            max_search_results: config.storage.max_search_results,
+            max_preview_size: config.storage.max_preview_size,
+            preview_extensions: normalize_extensions(&config.storage.preview_extensions),
+        }
+    }
+
+    pub fn apply(&mut self, key: &str, value: &str) -> Result<(), String> {
+        match key {
+            "public_base_url" => {
+                let value = value.trim().trim_end_matches('/').to_string();
+                if value.is_empty() || url::Url::parse(&value).is_err() {
+                    return Err("public_base_url must be a valid absolute URL".into());
+                }
+                self.public_base_url = value;
+            }
+            "max_upload_size" => self.max_upload_size = parse_u64(key, value)?,
+            "blocked_extensions" => {
+                self.blocked_extensions = parse_extension_list(value)?;
+            }
+            "share_password_min_length" => {
+                self.share_password_min_length = parse_usize(key, value)?;
+            }
+            "share_password_max_bytes" => {
+                self.share_password_max_bytes = parse_usize(key, value)?;
+            }
+            "share_unlock_minutes" => {
+                self.share_unlock_minutes = parse_i64(key, value)?;
+            }
+            "max_zip_size" => self.max_zip_size = parse_u64(key, value)?,
+            "max_zip_files" => self.max_zip_files = parse_usize(key, value)?,
+            "max_search_entries" => self.max_search_entries = parse_usize(key, value)?,
+            "max_search_results" => self.max_search_results = parse_usize(key, value)?,
+            "max_preview_size" => self.max_preview_size = parse_u64(key, value)?,
+            "preview_extensions" => {
+                let extensions = parse_extension_list(value)?;
+                if extensions.is_empty() {
+                    return Err("preview_extensions must not be empty".into());
+                }
+                self.preview_extensions = extensions;
+            }
+            _ => return Err(format!("unknown runtime setting: {key}")),
+        }
+        self.validate()
+    }
+
+    pub fn apply_many<'a>(
+        &mut self,
+        entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<(), String> {
+        for (key, value) in entries {
+            self.apply(key, value)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_upload_size == 0
+            || self.max_zip_size == 0
+            || self.max_zip_files == 0
+            || self.max_search_entries == 0
+            || self.max_search_results == 0
+            || self.max_preview_size == 0
+        {
+            return Err("runtime limits must be positive".into());
+        }
+        if self.share_password_min_length < 8
+            || self.share_password_max_bytes < self.share_password_min_length
+            || self.share_unlock_minutes <= 0
+        {
+            return Err("invalid share password policy".into());
+        }
+        validate_extensions(&self.blocked_extensions)?;
+        validate_extensions(&self.preview_extensions)?;
+        if self.preview_extensions.is_empty() {
+            return Err("preview_extensions must not be empty".into());
+        }
+        Ok(())
+    }
+
+    pub fn pairs(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("public_base_url", self.public_base_url.clone()),
+            ("max_upload_size", self.max_upload_size.to_string()),
+            ("blocked_extensions", self.blocked_extensions.join(",")),
+            (
+                "share_password_min_length",
+                self.share_password_min_length.to_string(),
+            ),
+            (
+                "share_password_max_bytes",
+                self.share_password_max_bytes.to_string(),
+            ),
+            (
+                "share_unlock_minutes",
+                self.share_unlock_minutes.to_string(),
+            ),
+            ("max_zip_size", self.max_zip_size.to_string()),
+            ("max_zip_files", self.max_zip_files.to_string()),
+            ("max_search_entries", self.max_search_entries.to_string()),
+            ("max_search_results", self.max_search_results.to_string()),
+            ("max_preview_size", self.max_preview_size.to_string()),
+            ("preview_extensions", self.preview_extensions.join(",")),
+        ]
+    }
+}
+
+fn parse_u64(key: &str, value: &str) -> Result<u64, String> {
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("{key} must be an unsigned integer"))
+}
+
+fn parse_usize(key: &str, value: &str) -> Result<usize, String> {
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{key} must be an unsigned integer"))
+}
+
+fn parse_i64(key: &str, value: &str) -> Result<i64, String> {
+    value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("{key} must be an integer"))
+}
+
+pub fn parse_extension_list(value: &str) -> Result<Vec<String>, String> {
+    let extensions = value
+        .split([',', '\n', '\r', ' ', '\t'])
+        .filter_map(|part| {
+            let cleaned = part.trim().trim_start_matches('.').to_ascii_lowercase();
+            (!cleaned.is_empty()).then_some(cleaned)
+        })
+        .collect::<Vec<_>>();
+    validate_extensions(&extensions)?;
+    Ok(extensions)
+}
+
+fn normalize_extensions(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|value| {
+            let cleaned = value.trim().trim_start_matches('.').to_ascii_lowercase();
+            (!cleaned.is_empty()).then_some(cleaned)
+        })
+        .collect()
+}
+
+fn validate_extensions(values: &[String]) -> Result<(), String> {
+    if values.iter().any(|extension| {
+        extension.is_empty()
+            || extension.contains('/')
+            || extension.contains('\\')
+            || extension.contains('\0')
+            || extension.chars().any(char::is_control)
+    }) {
+        return Err("extensions must be safe extension names without path separators".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage, Tls,
+    };
+
+    fn config() -> Config {
+        Config {
+            server: Server {
+                mode: ServerMode::Development,
+                listen_address: "127.0.0.1:8080".into(),
+                public_base_url: "http://localhost:8080".into(),
+                production_mode: false,
+            },
+            storage: Storage {
+                root_mount_path: ".".into(),
+                data_directory: ".".into(),
+                max_upload_size: 10,
+                max_zip_size: 20,
+                max_zip_files: 30,
+                max_search_entries: 40,
+                max_search_results: 5,
+                max_preview_size: 6,
+                preview_extensions: vec!["txt".into(), ".MD".into()],
+                blocked_extensions: vec!["exe".into()],
+            },
+            reverse_proxy: ReverseProxy::default(),
+            tls: Tls::default(),
+            security: Security::default(),
+            logging: Logging::default(),
+        }
+    }
+
+    #[test]
+    fn settings_overlay_validates_lists_and_numbers() {
+        let mut settings = RuntimeSettings::from_config(&config());
+        settings.apply("max_upload_size", "50").unwrap();
+        settings
+            .apply("preview_extensions", ".txt, log\njson")
+            .unwrap();
+        assert_eq!(settings.max_upload_size, 50);
+        assert_eq!(settings.preview_extensions, ["txt", "log", "json"]);
+        assert!(settings.apply("blocked_extensions", "../x").is_err());
+        assert!(settings.apply("max_zip_files", "0").is_err());
+    }
+}

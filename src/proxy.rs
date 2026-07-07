@@ -34,6 +34,12 @@ mod tests {
                 root_mount_path: PathBuf::from("."),
                 data_directory: PathBuf::from("."),
                 max_upload_size: 1,
+                max_zip_size: 1024,
+                max_zip_files: 10,
+                max_search_entries: 100,
+                max_search_results: 10,
+                max_preview_size: 1024,
+                preview_extensions: vec!["txt".into()],
                 blocked_extensions: vec![],
             },
             reverse_proxy: ReverseProxy {

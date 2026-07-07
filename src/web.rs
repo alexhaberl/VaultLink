@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::Path};
+use std::{collections::VecDeque, io::Read, net::SocketAddr, path::Path};
 
 use axum::{
     body::Body,
@@ -27,10 +27,13 @@ use crate::{
     db::{Database, Permission, Session, Share},
     path_security, proxy,
     range::parse_byte_range,
+    runtime::RuntimeSettings,
+    secure_fs::Entry,
     AppState,
 };
 
 const COOKIE: &str = "vaultlink_session";
+const HARD_MULTIPART_LIMIT: u64 = 128 * 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct AppError(StatusCode, &'static str);
@@ -52,25 +55,26 @@ impl IntoResponse for AppError {
 type Result<T> = std::result::Result<T, AppError>;
 
 pub fn router(state: AppState) -> Router {
-    let limit = (state
-        .config
-        .storage
-        .max_upload_size
-        .saturating_add(1024 * 1024))
-    .min(usize::MAX as u64) as usize;
+    let limit = HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize;
     Router::new()
         .route("/", get(|| async { Redirect::to("/admin") }))
         .route("/login", get(login_page).post(login))
         .route("/mfa", get(mfa_page).post(mfa))
         .route("/logout", post(logout))
         .route("/admin", get(admin_browser))
+        .route("/admin/preview", get(admin_preview))
         .route("/admin/shares", get(shares_page).post(create_share))
         .route("/admin/shares/{id}/toggle", post(toggle_share))
         .route("/admin/shares/{id}/password", post(set_share_password))
         .route("/admin/shares/{id}/delete", post(delete_share))
+        .route("/admin/admins", get(admins_page).post(create_admin_ui))
+        .route("/admin/settings", get(settings_page).post(update_settings))
+        .route("/admin/audit", get(audit_page))
         .route("/v/{token}", get(public_page))
+        .route("/v/{token}/preview", get(public_preview))
         .route("/v/{token}/unlock", post(unlock_share))
         .route("/v/{token}/download", get(download).head(download))
+        .route("/v/{token}/download.zip", get(download_zip))
         .route("/v/{token}/upload", post(upload))
         .route("/s/{alias}", get(short_redirect))
         .route("/assets/app.js", get(app_js))
@@ -122,7 +126,7 @@ fn esc(s: &str) -> String {
 }
 fn page(title: &str, body: &str) -> String {
     format!(
-        r#"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><style>:root{{--bg:#0b1020;--card:#151c31;--text:#edf2ff;--muted:#9eabc7;--accent:#6ea8fe;--bad:#ff7b86}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:16px system-ui,sans-serif}}nav,main{{max-width:1100px;margin:auto;padding:1rem}}nav{{display:flex;justify-content:space-between}}a{{color:var(--accent)}}section{{background:var(--card);padding:1.25rem;border-radius:12px;margin:1rem 0;overflow:auto}}input,select,button{{font:inherit;padding:.65rem;border-radius:7px;border:1px solid #46516d;background:#0e1528;color:var(--text)}}button{{cursor:pointer;background:#264f94}}label{{display:block;margin:.7rem 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:.65rem;border-bottom:1px solid #303a55;text-align:left}}.row{{display:flex;gap:.7rem;flex-wrap:wrap;align-items:end}}.muted{{color:var(--muted)}}.bad{{color:var(--bad)}}code{{overflow-wrap:anywhere}}@media(max-width:650px){{th:nth-child(3),td:nth-child(3){{display:none}}}}</style><script src="/assets/app.js" defer></script></head><body><nav><strong>VaultLink</strong><span><a href="/admin">Dateien</a> · <a href="/admin/shares">Links</a></span></nav><main>{}</main></body></html>"#,
+        r#"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><style>:root{{--bg:#0b1020;--card:#151c31;--text:#edf2ff;--muted:#9eabc7;--accent:#6ea8fe;--bad:#ff7b86}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:16px system-ui,sans-serif}}nav,main{{max-width:1280px;margin:auto;padding:1rem}}nav{{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap}}nav span{{display:flex;gap:.75rem;flex-wrap:wrap}}a{{color:var(--accent)}}section{{background:var(--card);padding:1.25rem;border-radius:12px;margin:1rem 0;overflow:auto}}input,select,button,textarea{{font:inherit;padding:.65rem;border-radius:7px;border:1px solid #46516d;background:#0e1528;color:var(--text)}}button{{cursor:pointer;background:#264f94}}label{{display:block;margin:.7rem 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:.65rem;border-bottom:1px solid #303a55;text-align:left;vertical-align:top}}.row{{display:flex;gap:.7rem;flex-wrap:wrap;align-items:end}}.muted{{color:var(--muted)}}.bad{{color:var(--bad)}}code,pre{{overflow-wrap:anywhere}}pre{{white-space:pre-wrap;background:#0e1528;border:1px solid #303a55;border-radius:10px;padding:1rem}}.crumbs{{display:flex;gap:.35rem;flex-wrap:wrap}}.actions{{display:flex;gap:.5rem;flex-wrap:wrap}}@media(max-width:650px){{th:nth-child(3),td:nth-child(3){{display:none}}}}</style><script src="/assets/app.js" defer></script></head><body><nav><strong>VaultLink</strong><span><a href="/admin">Dateien</a><a href="/admin/shares">Links</a><a href="/admin/admins">Admins</a><a href="/admin/settings">Einstellungen</a><a href="/admin/audit">Audit</a></span></nav><main>{}</main></body></html>"#,
         esc(title),
         body
     )
@@ -174,6 +178,14 @@ async fn audit(
     .await;
 }
 
+fn runtime_settings(state: &AppState) -> RuntimeSettings {
+    state
+        .runtime
+        .read()
+        .expect("runtime settings lock poisoned")
+        .clone()
+}
+
 async fn share_is_unlocked(state: &AppState, headers: &HeaderMap, share: &Share) -> Result<bool> {
     if share.password_hash.is_none() {
         return Ok(true);
@@ -190,12 +202,13 @@ async fn share_is_unlocked(state: &AppState, headers: &HeaderMap, share: &Share)
     .await
 }
 fn make_unlock_cookie(state: &AppState, share: &Share, token: &str) -> String {
+    let settings = runtime_settings(state);
     format!(
         "{}={}; Path=/v/{}; HttpOnly; SameSite=Strict; Max-Age={};{}",
         unlock_cookie_name(share.id),
         token,
         share.token,
-        state.config.security.share_unlock_minutes * 60,
+        settings.share_unlock_minutes * 60,
         if state.config.security.secure_cookie {
             " Secure"
         } else {
@@ -373,6 +386,7 @@ async fn logout(
 struct BrowseQuery {
     path: Option<String>,
     page: Option<usize>,
+    q: Option<String>,
 }
 async fn admin_browser(
     State(state): State<AppState>,
@@ -380,70 +394,190 @@ async fn admin_browser(
     Query(q): Query<BrowseQuery>,
 ) -> Result<Html<String>> {
     let (_, s) = session(&state, &headers, true).await?;
+    let settings = runtime_settings(&state);
     let raw = q.path.unwrap_or_default();
     let page_number = q.page.unwrap_or(0).min(1_000_000);
+    let search =
+        q.q.map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty());
     let rel = path_security::validate_relative(&raw)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
         .to_string_lossy()
         .replace('\\', "/");
     let secure_root = state.secure_root.clone();
-    let listing_path = raw.clone();
-    let entries = tokio::task::spawn_blocking(move || {
-        secure_root.list(&listing_path, page_number.saturating_mul(100), 101)
-    })
-    .await
-    .map_err(internal)?
-    .map_err(internal)?;
-    let has_next = entries.len() > 100;
     let mut rows = String::new();
-    for entry in entries.into_iter().take(100) {
-        let name = entry.name;
-        let is_dir = entry.is_dir;
-        let size = entry.len;
-        let modified = entry.modified;
-        let child = if rel.is_empty() {
-            name.clone()
-        } else {
-            format!("{rel}/{name}")
-        };
-        let target =
-            percent_encoding::utf8_percent_encode(&child, percent_encoding::NON_ALPHANUMERIC);
-        let display = if is_dir {
-            format!("📁 <a href=\"/admin?path={target}\">{}</a>", esc(&name))
-        } else {
-            format!("📄 {}", esc(&name))
-        };
-        let modified = modified
-            .map(DateTime::<Utc>::from)
-            .map(|v| v.format("%Y-%m-%d %H:%M UTC").to_string())
-            .unwrap_or_else(|| "—".into());
-        rows+=&format!("<tr><td>{display}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/admin/shares?path={}\">Freigeben</a></td></tr>",if is_dir{"Ordner"}else{"Datei"},if is_dir{"—".into()}else{human(size)},modified,target);
+    let mut has_next = false;
+    if let Some(search) = search.clone() {
+        let base = rel.clone();
+        let search_settings = settings.clone();
+        let hits = tokio::task::spawn_blocking(move || {
+            search_tree(secure_root, &base, &search, &search_settings)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+        for hit in hits {
+            let target = encoded(&hit.relative_path);
+            let name = esc(&hit.relative_path);
+            let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings) {
+                format!(r#"<a href="/admin/preview?path={target}">Ansehen</a> "#)
+            } else {
+                String::new()
+            };
+            let modified = hit
+                .entry
+                .modified
+                .map(DateTime::<Utc>::from)
+                .map(|v| v.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "—".into());
+            rows += &format!(
+                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}<a href="/admin/shares?path={}">Freigeben</a></td></tr>"#,
+                if hit.entry.is_dir {
+                    format!(r#"📁 <a href="/admin?path={target}">{name}</a>"#)
+                } else {
+                    format!("📄 {name}")
+                },
+                if hit.entry.is_dir { "Ordner" } else { "Datei" },
+                if hit.entry.is_dir {
+                    "—".into()
+                } else {
+                    human(hit.entry.len)
+                },
+                modified,
+                preview,
+                target
+            );
+        }
+    } else {
+        let listing_path = rel.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            secure_root.list(&listing_path, page_number.saturating_mul(100), 101)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+        has_next = entries.len() > 100;
+        for entry in entries.into_iter().take(100) {
+            let name = entry.name;
+            let is_dir = entry.is_dir;
+            let size = entry.len;
+            let modified = entry.modified;
+            let child = join_display(&rel, &name);
+            let target = encoded(&child);
+            let display = if is_dir {
+                format!("📁 <a href=\"/admin?path={target}\">{}</a>", esc(&name))
+            } else {
+                format!("📄 {}", esc(&name))
+            };
+            let preview = if !is_dir && preview_allowed(&child, &settings) {
+                format!(r#"<a href="/admin/preview?path={target}">Ansehen</a> "#)
+            } else {
+                String::new()
+            };
+            let modified = modified
+                .map(DateTime::<Utc>::from)
+                .map(|v| v.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "—".into());
+            rows += &format!(
+                r#"<tr><td>{display}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}<a href="/admin/shares?path={}">Freigeben</a></td></tr>"#,
+                if is_dir { "Ordner" } else { "Datei" },
+                if is_dir { "—".into() } else { human(size) },
+                modified,
+                preview,
+                target
+            );
+        }
     }
-    let encoded_path =
-        percent_encoding::utf8_percent_encode(&raw, percent_encoding::NON_ALPHANUMERIC);
+    let encoded_path = encoded(&rel);
     let current_folder_target = if raw.is_empty() {
         ".".to_string()
     } else {
-        encoded_path.to_string()
+        encoded_path.clone()
+    };
+    let search_value = search.as_deref().unwrap_or("");
+    let search_param = if search_value.is_empty() {
+        String::new()
+    } else {
+        format!("&q={}", encoded(search_value))
     };
     let previous = if page_number > 0 {
         format!(
-            "<a href=\"/admin?path={encoded_path}&page={}\">Zurück</a>",
-            page_number - 1
+            "<a href=\"/admin?path={encoded_path}&page={}{}\">Zurück</a>",
+            page_number - 1,
+            search_param
         )
     } else {
         String::new()
     };
     let next = if has_next {
         format!(
-            "<a href=\"/admin?path={encoded_path}&page={}\">Weiter</a>",
-            page_number + 1
+            "<a href=\"/admin?path={encoded_path}&page={}{}\">Weiter</a>",
+            page_number + 1,
+            search_param
         )
     } else {
         String::new()
     };
-    let body=format!("<section><h1>Dateibrowser</h1><p class=muted>Relativer Pfad: /{}</p><p><a href=\"/admin/shares?path={}\">Aktuellen Ordner freigeben</a></p><table><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th></th></tr></thead><tbody>{}</tbody></table><p>{} {}</p><p class=muted>100 Einträge pro Seite.</p></section><section><form method=post action=/logout><input type=hidden name=csrf value=\"{}\"><button>Abmelden</button></form></section>",esc(&rel),current_folder_target,rows,previous,next,esc(&s.csrf_token));
+    let up = parent_path(&rel)
+        .map(|parent| {
+            format!(
+                r#"<p><a href="/admin?path={}">Hoch</a></p>"#,
+                encoded(&parent)
+            )
+        })
+        .unwrap_or_default();
+    let body = format!(
+        r#"<section><h1>Dateibrowser</h1>{}<p class=muted>Relativer Pfad: /{}</p>{}<form method="get" class="row"><input type="hidden" name="path" value="{}"><label>Suche<br><input name="q" value="{}" placeholder="Dateiname"></label><button>Suchen</button></form><p><a href="/admin/shares?path={}">Aktuellen Ordner freigeben</a></p><table><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th></th></tr></thead><tbody>{}</tbody></table><p>{} {}</p><p class=muted>100 Einträge pro Seite. Suche ist limitiert und läuft innerhalb des aktuellen Ordners.</p></section><section><form method=post action=/logout><input type=hidden name=csrf value="{}"><button>Abmelden</button></form></section>"#,
+        breadcrumbs(&rel, "/admin"),
+        esc(&rel),
+        up,
+        esc(&rel),
+        esc(search_value),
+        current_folder_target,
+        rows,
+        previous,
+        next,
+        esc(&s.csrf_token)
+    );
     Ok(Html(page("Dateien", &body)))
+}
+
+async fn admin_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ShareQuery>,
+) -> Result<Html<String>> {
+    session(&state, &headers, true).await?;
+    let raw = q
+        .path
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
+    let rel = path_security::validate_relative(&raw)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let settings = runtime_settings(&state);
+    let secure_root = state.secure_root.clone();
+    let preview_path = rel.clone();
+    let content =
+        tokio::task::spawn_blocking(move || read_preview(secure_root, &preview_path, &settings))
+            .await
+            .map_err(internal)?
+            .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;
+    let body = match content {
+        PreviewContent::TooLarge { size } => format!(
+            r#"<section><h1>Vorschau</h1><p><code>/{}</code></p><p class="muted">Datei ist mit {} größer als das Preview-Limit. Bitte über eine Freigabe herunterladen oder Limit anpassen.</p><p><a href="/admin?path={}">Zurück zum Ordner</a></p></section>"#,
+            esc(&rel),
+            human(size),
+            encoded(parent_path(&rel).as_deref().unwrap_or(""))
+        ),
+        PreviewContent::Text(text) => format!(
+            r#"<section><h1>Vorschau</h1><p><code>/{}</code></p><pre>{}</pre><p><a href="/admin?path={}">Zurück zum Ordner</a></p></section>"#,
+            esc(&rel),
+            esc(&text),
+            encoded(parent_path(&rel).as_deref().unwrap_or(""))
+        ),
+    };
+    Ok(Html(page("Vorschau", &body)))
 }
 fn human(n: u64) -> String {
     if n >= 1_073_741_824 {
@@ -475,9 +609,9 @@ fn add_upload_bytes(total: u64, chunk: usize, maximum: u64) -> Option<u64> {
         .filter(|new_total| *new_total <= maximum)
 }
 
-fn validate_share_password(config: &crate::config::Security, password: &str) -> Result<()> {
-    if password.chars().count() < config.share_password_min_length
-        || password.len() > config.share_password_max_bytes
+fn validate_share_password(settings: &RuntimeSettings, password: &str) -> Result<()> {
+    if password.chars().count() < settings.share_password_min_length
+        || password.len() > settings.share_password_max_bytes
     {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
@@ -485,6 +619,313 @@ fn validate_share_password(config: &crate::config::Security, password: &str) -> 
         ));
     }
     Ok(())
+}
+
+fn encoded(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+fn join_display(base: &str, child: &str) -> String {
+    if base.is_empty() || base == "." {
+        child.to_string()
+    } else {
+        format!("{base}/{child}")
+    }
+}
+
+fn parent_path(path: &str) -> Option<String> {
+    let clean = path.trim_matches('/');
+    if clean.is_empty() {
+        return None;
+    }
+    clean
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .or_else(|| Some(String::new()))
+}
+
+fn breadcrumbs(path: &str, base_url: &str) -> String {
+    let clean = path.trim_matches('/');
+    let mut html = String::from(r#"<p class="crumbs"><a href=""#);
+    html.push_str(base_url);
+    html.push_str(r#"">/</a>"#);
+    if clean.is_empty() {
+        html.push_str("</p>");
+        return html;
+    }
+    let mut current = String::new();
+    for part in clean.split('/') {
+        current = join_display(&current, part);
+        html.push_str(" / ");
+        html.push_str(&format!(
+            r#"<a href="{}?path={}">{}</a>"#,
+            base_url,
+            encoded(&current),
+            esc(part)
+        ));
+    }
+    html.push_str("</p>");
+    html
+}
+
+fn public_breadcrumbs(token: &str, path: &str) -> String {
+    breadcrumbs(path, &format!("/v/{token}"))
+}
+
+fn preview_allowed(path: &str, settings: &RuntimeSettings) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            settings
+                .preview_extensions
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(extension.trim_start_matches('.')))
+        })
+}
+
+#[derive(Debug)]
+struct SearchHit {
+    relative_path: String,
+    entry: Entry,
+}
+
+fn search_tree(
+    secure_root: crate::secure_fs::SecureRoot,
+    base: &str,
+    query: &str,
+    settings: &RuntimeSettings,
+) -> std::io::Result<Vec<SearchHit>> {
+    let needle = query.to_ascii_lowercase();
+    let mut visited = 0usize;
+    let mut results = Vec::new();
+    let mut queue = VecDeque::from([base.to_string()]);
+    while let Some(directory) = queue.pop_front() {
+        let mut offset = 0usize;
+        loop {
+            let entries = secure_root.list(&directory, offset, 100)?;
+            if entries.is_empty() {
+                break;
+            }
+            offset += entries.len();
+            for entry in entries {
+                visited += 1;
+                if visited > settings.max_search_entries {
+                    return Ok(results);
+                }
+                let relative_path = join_display(&directory, &entry.name);
+                if entry.name.to_ascii_lowercase().contains(&needle)
+                    && results.len() < settings.max_search_results
+                {
+                    results.push(SearchHit {
+                        relative_path: relative_path.clone(),
+                        entry: Entry {
+                            name: entry.name.clone(),
+                            is_dir: entry.is_dir,
+                            len: entry.len,
+                            modified: entry.modified,
+                        },
+                    });
+                }
+                if entry.is_dir {
+                    queue.push_back(relative_path);
+                }
+                if results.len() >= settings.max_search_results {
+                    return Ok(results);
+                }
+            }
+            if offset == 0 || !offset.is_multiple_of(100) {
+                break;
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+struct ZipEntry {
+    name: String,
+    crc: u32,
+    size: u32,
+    local_offset: u32,
+}
+
+fn write_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_zip_file(out: &mut Vec<u8>, entries: &mut Vec<ZipEntry>, name: &str, bytes: &[u8]) {
+    let crc = crc32(bytes);
+    let local_offset = out.len() as u32;
+    let name_bytes = name.as_bytes();
+    write_u32(out, 0x0403_4b50);
+    write_u16(out, 20);
+    write_u16(out, 0x0800);
+    write_u16(out, 0);
+    write_u16(out, 0);
+    write_u16(out, 33);
+    write_u32(out, crc);
+    write_u32(out, bytes.len() as u32);
+    write_u32(out, bytes.len() as u32);
+    write_u16(out, name_bytes.len() as u16);
+    write_u16(out, 0);
+    out.extend_from_slice(name_bytes);
+    out.extend_from_slice(bytes);
+    entries.push(ZipEntry {
+        name: name.to_string(),
+        crc,
+        size: bytes.len() as u32,
+        local_offset,
+    });
+}
+
+fn finish_zip(mut out: Vec<u8>, entries: &[ZipEntry]) -> Vec<u8> {
+    let central_offset = out.len() as u32;
+    for entry in entries {
+        let name_bytes = entry.name.as_bytes();
+        write_u32(&mut out, 0x0201_4b50);
+        write_u16(&mut out, 20);
+        write_u16(&mut out, 20);
+        write_u16(&mut out, 0x0800);
+        write_u16(&mut out, 0);
+        write_u16(&mut out, 0);
+        write_u16(&mut out, 33);
+        write_u32(&mut out, entry.crc);
+        write_u32(&mut out, entry.size);
+        write_u32(&mut out, entry.size);
+        write_u16(&mut out, name_bytes.len() as u16);
+        write_u16(&mut out, 0);
+        write_u16(&mut out, 0);
+        write_u16(&mut out, 0);
+        write_u16(&mut out, 0);
+        write_u32(&mut out, 0);
+        write_u32(&mut out, entry.local_offset);
+        out.extend_from_slice(name_bytes);
+    }
+    let central_size = out.len() as u32 - central_offset;
+    write_u32(&mut out, 0x0605_4b50);
+    write_u16(&mut out, 0);
+    write_u16(&mut out, 0);
+    write_u16(&mut out, entries.len() as u16);
+    write_u16(&mut out, entries.len() as u16);
+    write_u32(&mut out, central_size);
+    write_u32(&mut out, central_offset);
+    write_u16(&mut out, 0);
+    out
+}
+
+fn build_zip(
+    secure_root: crate::secure_fs::SecureRoot,
+    root_path: &str,
+    settings: RuntimeSettings,
+) -> std::io::Result<Vec<u8>> {
+    let mut queue = VecDeque::from([(root_path.to_string(), String::new())]);
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    while let Some((directory, zip_prefix)) = queue.pop_front() {
+        let mut offset = 0usize;
+        loop {
+            let entries = secure_root.list(&directory, offset, 100)?;
+            if entries.is_empty() {
+                break;
+            }
+            offset += entries.len();
+            for entry in entries {
+                let fs_path = join_display(&directory, &entry.name);
+                let zip_name = join_display(&zip_prefix, &entry.name);
+                if entry.is_dir {
+                    queue.push_back((fs_path, zip_name));
+                    continue;
+                }
+                files.push((fs_path, zip_name, entry.len));
+                if files.len() > settings.max_zip_files {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "zip file count limit exceeded",
+                    ));
+                }
+                total = total.checked_add(entry.len).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "zip size overflow")
+                })?;
+                if total > settings.max_zip_size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "zip size limit exceeded",
+                    ));
+                }
+            }
+            if offset == 0 || !offset.is_multiple_of(100) {
+                break;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(total.min(settings.max_zip_size) as usize);
+    let mut zip_entries = Vec::new();
+    for (fs_path, zip_name, _) in files {
+        let mut file = secure_root.open_file(&fs_path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        push_zip_file(&mut out, &mut zip_entries, &zip_name, &bytes);
+    }
+    Ok(finish_zip(out, &zip_entries))
+}
+
+enum PreviewContent {
+    TooLarge { size: u64 },
+    Text(String),
+}
+
+fn read_preview(
+    secure_root: crate::secure_fs::SecureRoot,
+    path: &str,
+    settings: &RuntimeSettings,
+) -> std::io::Result<PreviewContent> {
+    if !preview_allowed(path, settings) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preview extension is not allowed",
+        ));
+    }
+    let metadata = secure_root.metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preview target is not a file",
+        ));
+    }
+    if metadata.len() > settings.max_preview_size {
+        return Ok(PreviewContent::TooLarge {
+            size: metadata.len(),
+        });
+    }
+    let file = secure_root.open_file(path)?;
+    let mut bytes = Vec::new();
+    file.take(settings.max_preview_size + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "binary content is not previewed",
+        ));
+    }
+    Ok(PreviewContent::Text(
+        String::from_utf8_lossy(&bytes).into_owned(),
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -497,16 +938,21 @@ async fn shares_page(
     Query(q): Query<ShareQuery>,
 ) -> Result<Html<String>> {
     let (_, s) = session(&state, &headers, true).await?;
+    let settings = runtime_settings(&state);
     let mut rows = String::new();
     let shares = database(state.db.clone(), |db| db.list_shares()).await?;
     for sh in shares {
         let url = format!(
             "{}/v/{}",
-            state.config.server.public_base_url.trim_end_matches('/'),
+            settings.public_base_url.trim_end_matches('/'),
             sh.token
         );
+        let upload_limit = sh
+            .max_upload_size
+            .map(human)
+            .unwrap_or_else(|| format!("global ({})", human(settings.max_upload_size)));
         rows += &format!(
-            r#"<tr><td><code>{}</code><br><small>{}</small></td><td>{}</td><td>{}<br>{}</td><td>{}/{}</td><td><a href="{}">Öffnen</a> <button type="button" data-copy="{}">Kopieren</button><form method="post" action="/admin/shares/{}/toggle" style="display:inline"><input type="hidden" name="csrf" value="{}"><button>{}</button></form><form method="post" action="/admin/shares/{}/delete" style="display:inline"><input type="hidden" name="csrf" value="{}"><button>Löschen</button></form><form method="post" action="/admin/shares/{}/password" class="row"><input type="hidden" name="csrf" value="{}"><input type="password" name="password" minlength="{}" maxlength="{}" placeholder="Passwort ersetzen"><input type="password" name="password_confirm" placeholder="Bestätigen"><button>Setzen</button><button name="remove" value="1">Entfernen</button></form></td></tr>"#,
+            r#"<tr><td><code>{}</code><br><small>{}</small></td><td>{}</td><td>{}<br>{}<br><small>Uploadlimit: {}</small></td><td>{}/{}</td><td><a href="{}">Öffnen</a> <button type="button" data-copy="{}">Kopieren</button><form method="post" action="/admin/shares/{}/toggle" style="display:inline"><input type="hidden" name="csrf" value="{}"><button>{}</button></form><form method="post" action="/admin/shares/{}/delete" style="display:inline"><input type="hidden" name="csrf" value="{}"><button>Löschen</button></form><form method="post" action="/admin/shares/{}/password" class="row"><input type="hidden" name="csrf" value="{}"><input type="password" name="password" minlength="{}" maxlength="{}" placeholder="Passwort ersetzen"><input type="password" name="password_confirm" placeholder="Bestätigen"><button>Setzen</button><button name="remove" value="1">Entfernen</button></form></td></tr>"#,
             esc(&sh.relative_path),
             esc(&url),
             esc(sh.permission.as_str()),
@@ -516,6 +962,7 @@ async fn shares_page(
             } else {
                 "ohne Passwort"
             },
+            esc(&upload_limit),
             sh.download_count,
             sh.max_downloads
                 .map(|v| v.to_string())
@@ -533,8 +980,8 @@ async fn shares_page(
             esc(&s.csrf_token),
             sh.id,
             esc(&s.csrf_token),
-            state.config.security.share_password_min_length,
-            state.config.security.share_password_max_bytes,
+            settings.share_password_min_length,
+            settings.share_password_max_bytes,
         );
     }
     let selected_raw = q.path.unwrap_or_default();
@@ -565,15 +1012,16 @@ async fn shares_page(
             r#"<p class="muted">Upload-Rechte sind nur für Ordnerlinks verfügbar. Für Uploads bitte im Dateibrowser einen Zielordner auswählen.</p>"#.into()
         };
         format!(
-            r#"<section><h1>Link erstellen</h1><p>Ausgewähltes Ziel: <code>/{}</code> <span class="muted">({})</span></p>{}<p><a href="/admin">Anderen Pfad im Dateibrowser auswählen</a></p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label>Berechtigung<br><select name="permission">{}</select></label><label>Alias (optional)<br><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}"></label><label>Ablauf RFC3339 (optional)<br><input name="expires_at" placeholder="2027-01-01T00:00:00Z"></label><label>Max. Downloads<br><input name="max_downloads" type="number" min="1"></label><label>Passwort (optional)<br><input name="password" type="password" minlength="{}" maxlength="{}"></label><label>Passwort bestätigen<br><input name="password_confirm" type="password"></label><button>Erstellen</button></form></section>"#,
+            r#"<section><h1>Link erstellen</h1><p>Ausgewähltes Ziel: <code>/{}</code> <span class="muted">({})</span></p>{}<p><a href="/admin">Anderen Pfad im Dateibrowser auswählen</a></p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label>Berechtigung<br><select name="permission">{}</select></label><label>Alias (optional)<br><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}"></label><label>Ablauf RFC3339 (optional)<br><input name="expires_at" placeholder="2027-01-01T00:00:00Z"></label><label>Max. Downloads<br><input name="max_downloads" type="number" min="1"></label><label>Uploadlimit Bytes (optional)<br><input name="max_upload_size" type="number" min="1" placeholder="global: {}"></label><label>Passwort (optional)<br><input name="password" type="password" minlength="{}" maxlength="{}"></label><label>Passwort bestätigen<br><input name="password_confirm" type="password"></label><button>Erstellen</button></form></section>"#,
             esc(&selected),
             if is_dir { "Ordner" } else { "Datei" },
             upload_hint,
             esc(&s.csrf_token),
             esc(&selected),
             permissions,
-            state.config.security.share_password_min_length,
-            state.config.security.share_password_max_bytes,
+            settings.max_upload_size,
+            settings.share_password_min_length,
+            settings.share_password_max_bytes,
         )
     } else {
         r#"<section><h1>Link erstellen</h1><p>Bitte zuerst im Dateibrowser eine Datei oder einen Ordner auswählen.</p><p><a href="/admin">Pfad im Dateibrowser auswählen</a></p></section>"#.into()
@@ -592,6 +1040,7 @@ struct CreateShare {
     alias: Option<String>,
     expires_at: Option<String>,
     max_downloads: Option<String>,
+    max_upload_size: Option<String>,
     password: Option<String>,
     password_confirm: Option<String>,
 }
@@ -642,6 +1091,7 @@ async fn create_share(
             "Ablaufdatum liegt in der Vergangenheit",
         ));
     }
+    let settings = runtime_settings(&state);
     let token = auth::random_token(24);
     let password = f.password.filter(|value| !value.is_empty());
     if password.as_deref()
@@ -655,7 +1105,7 @@ async fn create_share(
         ));
     }
     let password_hash = if let Some(password) = password {
-        validate_share_password(&state.config.security, &password)?;
+        validate_share_password(&settings, &password)?;
         Some(
             tokio::task::spawn_blocking(move || auth::hash_password(&password))
                 .await
@@ -681,6 +1131,20 @@ async fn create_share(
             "Maximale Downloadanzahl muss mindestens 1 sein",
         ));
     }
+    let max_upload_size = f
+        .max_upload_size
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Uploadlimit"))?;
+    if max_upload_size == Some(0) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Uploadlimit muss mindestens 1 Byte sein",
+        ));
+    }
     let admin_id = s.admin_id;
     let id = database(state.db.clone(), move |db| {
         db.create_share(
@@ -691,6 +1155,7 @@ async fn create_share(
             &permission,
             exp,
             max_downloads,
+            max_upload_size,
             admin_id,
             password_hash.as_deref(),
         )
@@ -769,7 +1234,8 @@ async fn set_share_password(
                 "Passwörter stimmen nicht überein",
             ));
         }
-        validate_share_password(&state.config.security, &password)?;
+        let settings = runtime_settings(&state);
+        validate_share_password(&settings, &password)?;
         Some(
             tokio::task::spawn_blocking(move || auth::hash_password(&password))
                 .await
@@ -811,6 +1277,273 @@ async fn delete_share(
     )
     .await;
     Ok(Redirect::to("/admin/shares"))
+}
+
+fn valid_username(username: &str) -> bool {
+    username.len() >= 3
+        && username.len() <= 64
+        && username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+async fn admins_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
+    let (_, session) = session(&state, &headers, true).await?;
+    let admins = database(state.db.clone(), |db| db.list_admins()).await?;
+    let mut rows = String::new();
+    for admin in admins {
+        rows += &format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+            admin.id,
+            esc(&admin.username),
+            esc(&admin.created_at)
+        );
+    }
+    let body = format!(
+        r#"<section><h1>Admins</h1><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th></tr>{rows}</table><p class="muted">Admin-Löschen ist in beta1 bewusst nicht enthalten, damit Audit-/Share-Bezüge stabil bleiben.</p></section><section><h2>Admin erstellen</h2><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Benutzername<br><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label>Passwort<br><input name="password" type="password" minlength="14" required></label><label>Passwort bestätigen<br><input name="password_confirm" type="password" required></label><button>Erstellen</button></form></section>"#,
+        esc(&session.csrf_token)
+    );
+    Ok(Html(page("Admins", &body)))
+}
+
+#[derive(Deserialize)]
+struct CreateAdminUiForm {
+    csrf: String,
+    username: String,
+    password: String,
+    password_confirm: String,
+}
+
+async fn create_admin_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateAdminUiForm>,
+) -> Result<Html<String>> {
+    let (_, session) = session(&state, &headers, true).await?;
+    csrf(&session, &form.csrf)?;
+    if !valid_username(&form.username) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Benutzername muss 3-64 sichere ASCII-Zeichen enthalten",
+        ));
+    }
+    if form.password != form.password_confirm {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Passwörter stimmen nicht überein",
+        ));
+    }
+    if form.password.chars().count() < 14 {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Passwort muss mindestens 14 Zeichen enthalten",
+        ));
+    }
+    let username = form.username.clone();
+    let secret = auth::new_totp_secret();
+    let password = form.password;
+    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&password))
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+    let created_username = username.clone();
+    let created_secret = secret.clone();
+    database(state.db.clone(), move |db| {
+        db.create_admin(&created_username, &hash, &created_secret)
+    })
+    .await
+    .map_err(|_| AppError(StatusCode::CONFLICT, "Benutzername existiert bereits"))?;
+    audit(
+        &state,
+        session.username,
+        "admin_created",
+        Some(username.clone()),
+        None,
+    )
+    .await;
+    let otpauth = format!(
+        "otpauth://totp/VaultLink:{}?secret={}&issuer=VaultLink",
+        username, secret
+    );
+    let body = format!(
+        r#"<section><h1>Admin erstellt</h1><p>Dieses TOTP-Secret wird nur jetzt angezeigt.</p><p><strong>{}</strong></p><p><code>{}</code></p><p><code>{}</code></p><p><a href="/admin/admins">Zur Adminliste</a></p></section>"#,
+        esc(&username),
+        esc(&secret),
+        esc(&otpauth)
+    );
+    Ok(Html(page("Admin erstellt", &body)))
+}
+
+#[derive(Deserialize)]
+struct SettingsForm {
+    csrf: String,
+    public_base_url: String,
+    max_upload_size: String,
+    blocked_extensions: String,
+    share_password_min_length: String,
+    share_password_max_bytes: String,
+    share_unlock_minutes: String,
+    max_zip_size: String,
+    max_zip_files: String,
+    max_search_entries: String,
+    max_search_results: String,
+    max_preview_size: String,
+    preview_extensions: String,
+}
+
+async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
+    let (_, session) = session(&state, &headers, true).await?;
+    let settings = runtime_settings(&state);
+    let body = settings_form(&session, &settings, "");
+    Ok(Html(page("Einstellungen", &body)))
+}
+
+fn settings_form(session: &Session, settings: &RuntimeSettings, message: &str) -> String {
+    let message = if message.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<p class="muted">{}</p>"#, esc(message))
+    };
+    format!(
+        r#"<section><h1>Einstellungen</h1>{message}<p class="muted">Runtime-Policy wird in SQLite gespeichert. Servermodus, Bind-Adresse, TLS-Dateien, Trusted Proxies, Root-Mount und Data-Dir bleiben file-/restart-basiert.</p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label>Globales Uploadlimit Bytes<br><input name="max_upload_size" type="number" min="1" value="{}" required></label><label>Blockierte Endungen<br><input name="blocked_extensions" value="{}"></label><label>Share-Passwort Min.-Länge<br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label>Share-Passwort Max. Bytes<br><input name="share_password_max_bytes" type="number" min="8" value="{}" required></label><label>Unlock Minuten<br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label>ZIP Max. Bytes<br><input name="max_zip_size" type="number" min="1" value="{}" required></label><label>ZIP Max. Dateien<br><input name="max_zip_files" type="number" min="1" value="{}" required></label><label>Suche Max. Einträge<br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label>Suche Max. Treffer<br><input name="max_search_results" type="number" min="1" value="{}" required></label><label>Preview Max. Bytes<br><input name="max_preview_size" type="number" min="1" value="{}" required></label><label>Preview-Endungen<br><input name="preview_extensions" value="{}" required></label><button>Speichern</button></form></section>"#,
+        esc(&session.csrf_token),
+        esc(&settings.public_base_url),
+        settings.max_upload_size,
+        esc(&settings.blocked_extensions.join(",")),
+        settings.share_password_min_length,
+        settings.share_password_max_bytes,
+        settings.share_unlock_minutes,
+        settings.max_zip_size,
+        settings.max_zip_files,
+        settings.max_search_entries,
+        settings.max_search_results,
+        settings.max_preview_size,
+        esc(&settings.preview_extensions.join(",")),
+    )
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SettingsForm>,
+) -> Result<Html<String>> {
+    let (_, session) = session(&state, &headers, true).await?;
+    csrf(&session, &form.csrf)?;
+    let mut next = runtime_settings(&state);
+    let entries = [
+        ("public_base_url", form.public_base_url.as_str()),
+        ("max_upload_size", form.max_upload_size.as_str()),
+        ("blocked_extensions", form.blocked_extensions.as_str()),
+        (
+            "share_password_min_length",
+            form.share_password_min_length.as_str(),
+        ),
+        (
+            "share_password_max_bytes",
+            form.share_password_max_bytes.as_str(),
+        ),
+        ("share_unlock_minutes", form.share_unlock_minutes.as_str()),
+        ("max_zip_size", form.max_zip_size.as_str()),
+        ("max_zip_files", form.max_zip_files.as_str()),
+        ("max_search_entries", form.max_search_entries.as_str()),
+        ("max_search_results", form.max_search_results.as_str()),
+        ("max_preview_size", form.max_preview_size.as_str()),
+        ("preview_extensions", form.preview_extensions.as_str()),
+    ];
+    next.apply_many(entries)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
+    if state.config.server.production_mode
+        && url::Url::parse(&next.public_base_url)
+            .ok()
+            .is_none_or(|url| url.scheme() != "https")
+    {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Production public_base_url muss HTTPS verwenden",
+        ));
+    }
+    let pairs = next.pairs();
+    let admin_id = session.admin_id;
+    database(state.db.clone(), move |db| {
+        for (key, value) in pairs {
+            db.set_runtime_setting(key, &value, admin_id)?;
+        }
+        Ok(())
+    })
+    .await?;
+    {
+        let mut current = state
+            .runtime
+            .write()
+            .expect("runtime settings lock poisoned");
+        *current = next.clone();
+    }
+    let actor = session.username.clone();
+    audit(&state, actor, "settings_updated", None, None).await;
+    Ok(Html(page(
+        "Einstellungen",
+        &settings_form(&session, &next, "Einstellungen gespeichert."),
+    )))
+}
+
+#[derive(Default, Deserialize)]
+struct AuditQuery {
+    page: Option<usize>,
+    action: Option<String>,
+}
+
+async fn audit_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> Result<Html<String>> {
+    session(&state, &headers, true).await?;
+    let page_number = query.page.unwrap_or(0).min(1_000_000);
+    let action = query
+        .action
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    let action_for_db = action.clone();
+    let events = database(state.db.clone(), move |db| {
+        db.list_audit(action_for_db.as_deref(), 101, page_number * 100)
+    })
+    .await?;
+    let has_next = events.len() > 100;
+    let mut rows = String::new();
+    for event in events.into_iter().take(100) {
+        rows += &format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            esc(&event.occurred_at),
+            esc(&event.actor),
+            esc(&event.action),
+            event.object_id.as_deref().map(esc).unwrap_or_default(),
+            event.detail.as_deref().map(esc).unwrap_or_default()
+        );
+    }
+    let filter_value = action.as_deref().unwrap_or("");
+    let encoded_filter =
+        percent_encoding::utf8_percent_encode(filter_value, percent_encoding::NON_ALPHANUMERIC);
+    let previous = if page_number > 0 {
+        format!(
+            r#"<a href="/admin/audit?action={encoded_filter}&page={}">Zurück</a>"#,
+            page_number - 1
+        )
+    } else {
+        String::new()
+    };
+    let next = if has_next {
+        format!(
+            r#"<a href="/admin/audit?action={encoded_filter}&page={}">Weiter</a>"#,
+            page_number + 1
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        r#"<section><h1>Audit</h1><form method="get" class="row"><label>Action-Filter<br><input name="action" value="{}"></label><button>Filtern</button></form><table><tr><th>Zeit</th><th>Actor</th><th>Aktion</th><th>Objekt</th><th>Detail</th></tr>{rows}</table><p>{previous} {next}</p></section>"#,
+        esc(filter_value)
+    );
+    Ok(Html(page("Audit", &body)))
 }
 
 fn usable(sh: &Share) -> Result<()> {
@@ -877,7 +1610,7 @@ async fn unlock_share(
     let unlock_token = auth::random_token(32);
     let stored_unlock_token = unlock_token.clone();
     let share_id = share.id;
-    let expires = Utc::now() + Duration::minutes(state.config.security.share_unlock_minutes);
+    let expires = Utc::now() + Duration::minutes(runtime_settings(&state).share_unlock_minutes);
     database(state.db.clone(), move |db| {
         db.create_unlock_session(&stored_unlock_token, share_id, expires)
     })
@@ -903,6 +1636,7 @@ async fn public_page(
     Query(q): Query<BrowseQuery>,
 ) -> Result<Html<String>> {
     let sh = get_share(&state, &token).await?;
+    let settings = runtime_settings(&state);
     if !share_is_unlocked(&state, &headers, &sh).await? {
         let body = format!(
             r#"<section><h1>Geschützte Freigabe</h1><form method="post" action="/v/{}/unlock"><label>Passwort<br><input type="password" name="password" autocomplete="current-password" required></label><button>Entsperren</button></form></section>"#,
@@ -915,52 +1649,151 @@ async fn public_page(
         esc(sh.permission.as_str())
     );
     if sh.is_directory && sh.permission.can_download() {
-        let sub = q.path.unwrap_or_default();
+        let sub = q.path.clone().unwrap_or_default();
         let page_number = q.page.unwrap_or(0).min(1_000_000);
-        let relative_dir = joined_relative(&sh.relative_path, &sub)?;
+        let search =
+            q.q.map(|value| value.trim().to_string())
+                .filter(|v| !v.is_empty());
+        let clean_sub = path_security::validate_relative(&sub)
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let relative_dir = joined_relative(&sh.relative_path, &clean_sub)?;
+        body += &public_breadcrumbs(&token, &clean_sub);
+        if let Some(parent) = parent_path(&clean_sub) {
+            body += &format!(
+                r#"<p><a href="/v/{token}?path={}">Hoch</a></p>"#,
+                encoded(&parent)
+            );
+        }
+        body += &format!(
+            r#"<form method="get" class="row"><input type="hidden" name="path" value="{}"><label>Suche<br><input name="q" value="{}" placeholder="Dateiname"></label><button>Suchen</button></form><p class="actions"><a href="/v/{token}/download.zip?path={}">Ordner als ZIP herunterladen</a></p>"#,
+            esc(&clean_sub),
+            esc(search.as_deref().unwrap_or("")),
+            encoded(&clean_sub)
+        );
         let secure_root = state.secure_root.clone();
-        let entries = tokio::task::spawn_blocking(move || {
-            secure_root.list(&relative_dir, page_number.saturating_mul(100), 101)
-        })
-        .await
-        .map_err(internal)?
-        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
-        let has_next = entries.len() > 100;
-        body += "<table><tr><th>Name</th><th>Aktion</th></tr>";
-        for entry in entries.into_iter().take(100) {
-            let rel = joined_relative(&sub, &entry.name)?;
-            let name = esc(&entry.name);
-            if entry.is_dir {
-                body += &format!(
-                    "<tr><td>📁 {name}</td><td><a href=\"/v/{token}?path={}\">Öffnen</a></td></tr>",
-                    percent_encoding::utf8_percent_encode(&rel, percent_encoding::NON_ALPHANUMERIC)
+        let mut rows = String::new();
+        let mut has_next = false;
+        if let Some(search) = search.clone() {
+            let search_settings = settings.clone();
+            let hits = tokio::task::spawn_blocking(move || {
+                search_tree(secure_root, &relative_dir, &search, &search_settings)
+            })
+            .await
+            .map_err(internal)?
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+            for hit in hits {
+                let share_rel = hit
+                    .relative_path
+                    .strip_prefix(&sh.relative_path)
+                    .unwrap_or(&hit.relative_path)
+                    .trim_start_matches('/')
+                    .to_string();
+                let target = encoded(&share_rel);
+                let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings)
+                {
+                    format!(r#"<a href="/v/{token}/preview?path={target}">Ansehen</a> "#)
+                } else {
+                    String::new()
+                };
+                rows += &format!(
+                    r#"<tr><td>{}</td><td class="actions">{}{}</td></tr>"#,
+                    if hit.entry.is_dir {
+                        format!(
+                            r#"📁 <a href="/v/{token}?path={target}">{}</a>"#,
+                            esc(&share_rel)
+                        )
+                    } else {
+                        format!("📄 {}", esc(&share_rel))
+                    },
+                    if hit.entry.is_dir {
+                        String::new()
+                    } else {
+                        format!(r#"<a href="/v/{token}/download?path={target}">Download</a> "#)
+                    },
+                    preview
                 );
-            } else {
-                body+=&format!("<tr><td>📄 {name}</td><td><a href=\"/v/{token}/download?path={}\">Download</a></td></tr>",percent_encoding::utf8_percent_encode(&rel,percent_encoding::NON_ALPHANUMERIC));
+            }
+        } else {
+            let entries = tokio::task::spawn_blocking(move || {
+                secure_root.list(&relative_dir, page_number.saturating_mul(100), 101)
+            })
+            .await
+            .map_err(internal)?
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+            has_next = entries.len() > 100;
+            for entry in entries.into_iter().take(100) {
+                let rel = joined_relative(&clean_sub, &entry.name)?;
+                let name = esc(&entry.name);
+                let target = encoded(&rel);
+                if entry.is_dir {
+                    rows += &format!(
+                        r#"<tr><td>📁 <a href="/v/{token}?path={target}">{name}</a></td><td class="actions"><a href="/v/{token}?path={target}">Öffnen</a></td></tr>"#
+                    );
+                } else {
+                    let preview =
+                        if preview_allowed(&joined_relative(&sh.relative_path, &rel)?, &settings) {
+                            format!(r#"<a href="/v/{token}/preview?path={target}">Ansehen</a> "#)
+                        } else {
+                            String::new()
+                        };
+                    rows += &format!(
+                        r#"<tr><td>📄 {name}</td><td class="actions">{}<a href="/v/{token}/download?path={target}">Download</a></td></tr>"#,
+                        preview
+                    );
+                }
             }
         }
+        body += "<table><tr><th>Name</th><th>Aktion</th></tr>";
+        body += &rows;
         body += "</table>";
-        let encoded_sub =
-            percent_encoding::utf8_percent_encode(&sub, percent_encoding::NON_ALPHANUMERIC);
+        let encoded_sub = encoded(&clean_sub);
+        let search_param = search
+            .as_deref()
+            .map(|value| format!("&q={}", encoded(value)))
+            .unwrap_or_default();
         if page_number > 0 {
             body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&page={}\">Zurück</a>",
-                page_number - 1
+                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\">Zurück</a>",
+                page_number - 1,
+                search_param
             );
         }
         if has_next {
             body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&page={}\">Weiter</a>",
-                page_number + 1
+                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\">Weiter</a>",
+                page_number + 1,
+                search_param
             );
         }
     } else if !sh.is_directory && sh.permission.can_download() {
-        body += &format!("<p><a href=\"/v/{token}/download\">Datei herunterladen</a></p>");
+        let preview = if preview_allowed(&sh.relative_path, &settings) {
+            format!(r#"<a href="/v/{token}/preview">Im Browser ansehen</a> "#)
+        } else {
+            String::new()
+        };
+        body += &format!(
+            r#"<p class="actions">{}<a href="/v/{token}/download">Datei herunterladen</a></p>"#,
+            preview
+        );
     }
     if sh.is_directory && sh.permission.can_upload() {
+        let upload_path = if sh.permission.can_download() {
+            path_security::validate_relative(q.path.as_deref().unwrap_or_default())
+                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
+                .to_string_lossy()
+                .replace('\\', "/")
+        } else {
+            String::new()
+        };
         body += &format!(
-            r#"<h2>Upload</h2><form method="post" enctype="multipart/form-data" action="/v/{token}/upload"><input type="file" name="file" required><button>Hochladen</button></form>"#
+            r#"<h2>Upload</h2><p class="muted">Zielordner: /{}</p><form method="post" enctype="multipart/form-data" action="/v/{token}/upload"><input type="hidden" name="path" value="{}"><input type="file" name="file" required><button>Hochladen</button></form>"#,
+            esc(&upload_path),
+            esc(&upload_path)
         );
+    } else if sh.is_directory && sh.permission == Permission::UploadOnly {
+        body += "<p class=\"muted\">Upload-only-Freigaben listen keine Ordnerinhalte.</p>";
     }
     body += "</section>";
     Ok(Html(page("Freigabe", &body)))
@@ -973,6 +1806,127 @@ fn joined_relative(base: &str, child: &str) -> Result<String> {
             .map_err(|_| AppError(StatusCode::FORBIDDEN, "Ungültiger Pfad"))?,
     );
     Ok(path.to_string_lossy().replace('\\', "/"))
+}
+
+async fn public_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxPath(token): AxPath<String>,
+    Query(q): Query<BrowseQuery>,
+) -> Result<Html<String>> {
+    let sh = get_share(&state, &token).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    if !sh.permission.can_download() {
+        return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
+    }
+    let requested_path = q.path.clone().unwrap_or_default();
+    let relative_file = if sh.is_directory {
+        if requested_path.is_empty() {
+            return Err(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"));
+        }
+        joined_relative(&sh.relative_path, &requested_path)?
+    } else {
+        sh.relative_path.clone()
+    };
+    let settings = runtime_settings(&state);
+    let secure_root = state.secure_root.clone();
+    let preview_path = relative_file.clone();
+    let content =
+        tokio::task::spawn_blocking(move || read_preview(secure_root, &preview_path, &settings))
+            .await
+            .map_err(internal)?
+            .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;
+    let share_id = sh.id;
+    if !database(state.db.clone(), move |db| db.count_download(share_id)).await? {
+        return Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"));
+    }
+    audit(
+        &state,
+        "public".into(),
+        "preview",
+        Some(sh.id.to_string()),
+        None,
+    )
+    .await;
+    let share_rel = if sh.is_directory {
+        requested_path
+    } else {
+        String::new()
+    };
+    let download_link = if sh.is_directory {
+        format!(r#"/v/{token}/download?path={}"#, encoded(&share_rel))
+    } else {
+        format!("/v/{token}/download")
+    };
+    let body = match content {
+        PreviewContent::TooLarge { size } => format!(
+            r#"<section><h1>Vorschau</h1><p class="muted">Datei ist mit {} größer als das Preview-Limit.</p><p><a href="{}">Herunterladen</a></p></section>"#,
+            human(size),
+            esc(&download_link)
+        ),
+        PreviewContent::Text(text) => format!(
+            r#"<section><h1>Vorschau</h1><pre>{}</pre><p><a href="{}">Herunterladen</a></p></section>"#,
+            esc(&text),
+            esc(&download_link)
+        ),
+    };
+    Ok(Html(page("Vorschau", &body)))
+}
+
+async fn download_zip(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxPath(token): AxPath<String>,
+    Query(q): Query<BrowseQuery>,
+) -> Result<Response> {
+    let sh = get_share(&state, &token).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    if !sh.is_directory || !sh.permission.can_download() {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            "ZIP-Download nicht erlaubt",
+        ));
+    }
+    let sub = q.path.unwrap_or_default();
+    let relative_dir = joined_relative(&sh.relative_path, &sub)?;
+    let settings = runtime_settings(&state);
+    let secure_root = state.secure_root.clone();
+    let zip = tokio::task::spawn_blocking(move || build_zip(secure_root, &relative_dir, settings))
+        .await
+        .map_err(internal)?
+        .map_err(|_| AppError(StatusCode::PAYLOAD_TOO_LARGE, "ZIP-Limit erreicht"))?;
+    let share_id = sh.id;
+    if !database(state.db.clone(), move |db| db.count_download(share_id)).await? {
+        return Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"));
+    }
+    audit(
+        &state,
+        "public".into(),
+        "zip_download",
+        Some(sh.id.to_string()),
+        None,
+    )
+    .await;
+    let name = Path::new(&sh.relative_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("vaultlink");
+    let filename = encoded(&format!("{name}.zip"));
+    let mut response = Response::new(Body::from(zip));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{filename}"))
+            .map_err(internal)?,
+    );
+    Ok(response)
 }
 
 async fn download(
@@ -1103,73 +2057,103 @@ async fn upload(
     if !sh.is_directory || !sh.permission.can_upload() {
         return Err(AppError(StatusCode::FORBIDDEN, "Upload nicht erlaubt"));
     }
-    let field = multipart
+    let settings = runtime_settings(&state);
+    let maximum = sh.max_upload_size.unwrap_or(settings.max_upload_size);
+    let mut upload_subdir = String::new();
+    while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Upload"))?
-        .ok_or(AppError(StatusCode::BAD_REQUEST, "Datei fehlt"))?;
-    let name = path_security::safe_filename(
-        field
-            .file_name()
-            .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateiname fehlt"))?,
-    )
-    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Dateiname"))?
-    .to_string();
-    if extension_is_blocked(&name, &state.config.storage.blocked_extensions) {
-        return Err(AppError(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Dateityp blockiert",
-        ));
-    }
-    let secure_root = state.secure_root.clone();
-    let upload_directory = sh.relative_path.clone();
-    let mut pending =
-        tokio::task::spawn_blocking(move || secure_root.begin_upload(&upload_directory))
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        if field_name == "path" {
+            let value = field
+                .text()
+                .await
+                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Uploadpfad"))?;
+            if sh.permission == Permission::DownloadUpload {
+                upload_subdir = path_security::validate_relative(&value)
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Uploadpfad"))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+            }
+            continue;
+        }
+        if field_name != "file" {
+            continue;
+        }
+        let name = path_security::safe_filename(
+            field
+                .file_name()
+                .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateiname fehlt"))?,
+        )
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Dateiname"))?
+        .to_string();
+        if extension_is_blocked(&name, &settings.blocked_extensions) {
+            return Err(AppError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Dateityp blockiert",
+            ));
+        }
+        let secure_root = state.secure_root.clone();
+        let upload_directory = if upload_subdir.is_empty() {
+            sh.relative_path.clone()
+        } else {
+            joined_relative(&sh.relative_path, &upload_subdir)?
+        };
+        let mut pending =
+            tokio::task::spawn_blocking(move || secure_root.begin_upload(&upload_directory))
+                .await
+                .map_err(internal)?
+                .map_err(|_| AppError(StatusCode::NOT_FOUND, "Zielordner nicht verfügbar"))?;
+        let mut output = tokio::fs::File::from_std(pending.take_file());
+        let mut total = 0u64;
+        let stream = field;
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|_| AppError(StatusCode::BAD_REQUEST, "Upload abgebrochen"))?;
+            let Some(new_total) = add_upload_bytes(total, chunk.len(), maximum) else {
+                return Err(AppError(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Upload ist zu groß",
+                ));
+            };
+            total = new_total;
+            if let Err(e) = output.write_all(&chunk).await {
+                return Err(internal(e));
+            }
+        }
+        output.flush().await.map_err(internal)?;
+        output.sync_all().await.map_err(internal)?;
+        drop(output);
+        let publish_name = name.clone();
+        tokio::task::spawn_blocking(move || pending.publish(&publish_name))
             .await
             .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Zielordner nicht verfügbar"))?;
-    let mut output = tokio::fs::File::from_std(pending.take_file());
-    let mut total = 0u64;
-    let stream = field;
-    tokio::pin!(stream);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| AppError(StatusCode::BAD_REQUEST, "Upload abgebrochen"))?;
-        let Some(new_total) =
-            add_upload_bytes(total, chunk.len(), state.config.storage.max_upload_size)
-        else {
-            return Err(AppError(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Upload ist zu groß",
-            ));
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AppError(StatusCode::CONFLICT, "Datei existiert bereits")
+                } else {
+                    internal(error)
+                }
+            })?;
+        audit(
+            &state,
+            "public".into(),
+            "upload",
+            Some(sh.id.to_string()),
+            Some(name),
+        )
+        .await;
+        let target = if upload_subdir.is_empty() {
+            format!("/v/{token}")
+        } else {
+            format!("/v/{token}?path={}", encoded(&upload_subdir))
         };
-        total = new_total;
-        if let Err(e) = output.write_all(&chunk).await {
-            return Err(internal(e));
-        }
+        return Ok(Redirect::to(&target));
     }
-    output.flush().await.map_err(internal)?;
-    output.sync_all().await.map_err(internal)?;
-    drop(output);
-    let publish_name = name.clone();
-    tokio::task::spawn_blocking(move || pending.publish(&publish_name))
-        .await
-        .map_err(internal)?
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                AppError(StatusCode::CONFLICT, "Datei existiert bereits")
-            } else {
-                internal(error)
-            }
-        })?;
-    audit(
-        &state,
-        "public".into(),
-        "upload",
-        Some(sh.id.to_string()),
-        Some(name),
-    )
-    .await;
-    Ok(Redirect::to(&format!("/v/{token}")))
+    Err(AppError(StatusCode::BAD_REQUEST, "Datei fehlt"))
 }
 async fn short_redirect(
     State(state): State<AppState>,
@@ -1214,6 +2198,12 @@ mod tests {
                 root_mount_path: root.into(),
                 data_directory: data.into(),
                 max_upload_size,
+                max_zip_size: 1024 * 1024,
+                max_zip_files: 100,
+                max_search_entries: 1000,
+                max_search_results: 100,
+                max_preview_size: 1024,
+                preview_extensions: vec!["txt".into(), "log".into(), "md".into()],
                 blocked_extensions: vec!["exe".into()],
             },
             reverse_proxy: ReverseProxy::default(),
@@ -1241,11 +2231,28 @@ mod tests {
     }
 
     fn multipart_request(uri: &str, name: &str, content: &[u8]) -> Request {
+        multipart_request_with_path(uri, name, content, None)
+    }
+
+    fn multipart_request_with_path(
+        uri: &str,
+        name: &str,
+        content: &[u8],
+        path: Option<&str>,
+    ) -> Request {
         let boundary = "vaultlink-test-boundary";
-        let mut body = format!(
+        let mut body = Vec::new();
+        if let Some(path) = path {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n{path}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-        )
-        .into_bytes();
+        ).as_bytes());
         body.extend_from_slice(content);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let mut request = Request::builder()
@@ -1317,6 +2324,7 @@ mod tests {
             permission: Permission::DownloadOnly,
             expires_at,
             max_downloads: None,
+            max_upload_size: None,
             download_count: 0,
             active,
             password_hash: None,
@@ -1542,6 +2550,7 @@ mod tests {
                 &Permission::DownloadOnly,
                 None,
                 None,
+                None,
                 1,
                 None,
             )
@@ -1554,6 +2563,7 @@ mod tests {
                 "uploads",
                 true,
                 &Permission::UploadOnly,
+                None,
                 None,
                 None,
                 1,
@@ -1571,8 +2581,9 @@ mod tests {
                 &Permission::DownloadOnly,
                 None,
                 None,
+                None,
                 1,
-                Some(&password_hash),
+                Some(password_hash.as_str()),
             )
             .unwrap();
         let app = router(state.clone());
@@ -1653,6 +2664,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_ui_creates_admin_and_updates_runtime_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_session(
+                "session-token",
+                1,
+                "csrf-token",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap();
+        state.db.verify_mfa("session-token").unwrap();
+        let app = router(state.clone());
+        let cookie = HeaderValue::from_static("vaultlink_session=session-token");
+
+        let mut create_admin = request(
+            Method::POST,
+            "/admin/admins",
+            "csrf=csrf-token&username=ops&password=another%20long%20password&password_confirm=another%20long%20password",
+        );
+        create_admin
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let response = app.clone().oneshot(create_admin).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.db.admin("ops").unwrap().is_some());
+
+        let mut settings_request = request(
+            Method::POST,
+            "/admin/settings",
+            "csrf=csrf-token&public_base_url=http%3A%2F%2Flocalhost%3A9999&max_upload_size=16&blocked_extensions=exe%2Cbat&share_password_min_length=12&share_password_max_bytes=128&share_unlock_minutes=30&max_zip_size=2048&max_zip_files=20&max_search_entries=200&max_search_results=20&max_preview_size=64&preview_extensions=txt%2Clog",
+        );
+        settings_request
+            .headers_mut()
+            .insert(header::COOKIE, cookie);
+        let response = app.clone().oneshot(settings_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let runtime = state.runtime.read().unwrap().clone();
+        assert_eq!(runtime.public_base_url, "http://localhost:9999");
+        assert_eq!(runtime.max_upload_size, 16);
+        assert_eq!(runtime.blocked_extensions, ["exe", "bat"]);
+        assert!(state
+            .db
+            .runtime_settings()
+            .unwrap()
+            .iter()
+            .any(|(key, value)| key == "max_preview_size" && value == "64"));
+    }
+
+    #[tokio::test]
+    async fn public_folder_preview_zip_search_and_subfolder_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs/sub")).unwrap();
+        std::fs::write(root.path().join("docs/note.txt"), b"<b>hello</b>").unwrap();
+        std::fs::write(root.path().join("docs/bad.html"), b"<script>x</script>").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "du",
+                None,
+                "docs",
+                true,
+                &Permission::DownloadUpload,
+                None,
+                None,
+                None,
+                1,
+                None,
+            )
+            .unwrap();
+        state
+            .db
+            .create_share(
+                "uo",
+                None,
+                "docs",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+            )
+            .unwrap();
+        let app = router(state.clone());
+
+        let listing = response_text(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/du?q=note", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(listing.contains("note.txt"));
+        assert!(listing.contains("download.zip"));
+
+        let preview = response_text(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/du/preview?path=note.txt", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(preview.contains("&lt;b&gt;hello&lt;/b&gt;"));
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/du/preview?path=bad.html", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        let zip = app
+            .clone()
+            .oneshot(request(Method::GET, "/v/du/download.zip", ""))
+            .await
+            .unwrap();
+        assert_eq!(zip.status(), StatusCode::OK);
+        assert_eq!(
+            zip.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/zip"
+        );
+
+        let uploaded = app
+            .clone()
+            .oneshot(multipart_request_with_path(
+                "/v/du/upload",
+                "new.txt",
+                b"new",
+                Some("sub"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            std::fs::read(root.path().join("docs/sub/new.txt")).unwrap(),
+            b"new"
+        );
+
+        let upload_only_page = response_text(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/uo", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!upload_only_page.contains("note.txt"));
+        assert_eq!(
+            app.oneshot(request(Method::GET, "/v/uo/preview?path=note.txt", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
     async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -1667,6 +2843,7 @@ mod tests {
                 "uploads",
                 true,
                 &Permission::UploadOnly,
+                None,
                 None,
                 None,
                 1,

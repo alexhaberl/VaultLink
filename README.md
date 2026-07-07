@@ -21,7 +21,7 @@ Stack: Rust stable, Axum/Tokio, Tower-Middleware, Rusqlite/SQLite, Argon2id, sel
 - Audit-Ereignisse liegen in SQLite und werden strukturiert an journald gespiegelt. Sie enthalten keine Passwörter, TOTP-Secrets, Sessiontokens oder Share-Tokens. Die SQLite-Datei ist als Secret zu behandeln.
 - VaultLink führt Dateien nie aus. Der empfohlene systemd-Sandbox schützt das restliche System. Der Mount selbst darf keine vom Service-User ausführbaren Programme in Systempfade bringen.
 
-Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner; VaultLink ersetzt keine vorhandenen Dateien. ZIP-Downloads, Suche und Audit-Dashboard sind nicht Teil dieses Releases. Ein Alias (`/s/name`) und Passwortschutz sind enthalten.
+Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner; VaultLink ersetzt keine vorhandenen Dateien. Ordnerfreigaben unterstützen ZIP-Download mit Limits, begrenzte Dateinamensuche und – bei Downloadrecht – sichere Textvorschau für allowlistete Endungen. Upload-only-Freigaben listen keine Inhalte. Ein Alias (`/s/name`) und Passwortschutz sind enthalten.
 
 ## 3. Projektstruktur
 
@@ -36,7 +36,9 @@ VaultLink/
 │   ├── secure_fs.rs        openat2/renameat2 und atomare Uploads
 │   ├── range.rs            einzelner HTTP-Byte-Range-Parser
 │   ├── proxy.rs            vertrauenswürdige Proxy-Header
-│   └── web.rs              Routen, HTML, Upload/Download
+│   ├── runtime.rs          SQLite-Overrides für Policy-Settings
+│   ├── setup.rs            lokales Bootstrap-Setup-UI
+│   └── web.rs              Routen, HTML, Upload/Download/ZIP/Preview
 ├── config/                 drei Beispielkonfigurationen
 ├── deploy/                 systemd, Caddy, ACME-Hook
 ├── docs/                   Upgrade, Rollback, Release-Gates
@@ -47,7 +49,7 @@ VaultLink/
 
 ## 4. Daten- und Persistenzmodell
 
-SQLite ist JSON/TOML-Dateien mit Locking vorzuziehen: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `audit`. Transaktionsmigrationen verwenden `PRAGMA user_version`; ein unbekanntes neueres Schema verweigert den Start. Die Datenbank liegt standardmäßig in `/var/lib/vaultlink/data.sqlite` und muss `vaultlink:vaultlink 0600` gehören.
+SQLite ist JSON/TOML-Dateien mit Locking vorzuziehen: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `runtime_settings`, `audit`. `shares.max_upload_size` ist optional; leer nutzt das globale Runtime-Limit. Transaktionsmigrationen verwenden `PRAGMA user_version`; ein unbekanntes neueres Schema verweigert den Start. Die Datenbank liegt standardmäßig in `/var/lib/vaultlink/data.sqlite` und muss `vaultlink:vaultlink 0600` gehören.
 
 Upgrade mit Backup bei gestopptem Dienst:
 
@@ -65,19 +67,35 @@ Beim Start gelten harte Regeln: Development bindet nur Loopback und HTTP; Revers
 
 Eine separate `session_secret` ist nicht nötig: Sessions sind zufällige serverseitige Bearer-Tokens, deren Hash in SQLite liegt. Eine Datenbankkopie allein offenbart keine aktiven Cookies. TLS-Key und SQLite bleiben dennoch schützenswerte Secrets.
 
+Initiales lokales Setup ist ohne laufenden Produktionsservice möglich:
+
+```sh
+vaultlink setup --config /etc/vaultlink/config.toml --listen 127.0.0.1:8090
+```
+
+Der Setup-Modus bindet ausschließlich Loopback und druckt einen einmaligen Token-Link in die Konsole. Die UI schreibt eine initiale TOML-Konfiguration atomar und legt genau den ersten Admin mit Argon2id-Passwort und TOTP-Secret an. Im normalen Servicebetrieb schreibt VaultLink nicht in `/etc/vaultlink/config.toml`; runtime-editierbare Policy-Werte liegen in SQLite.
+
+Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadlimit, blockierte Endungen, Share-Passwortpolitik, Unlock-Dauer, ZIP-/Search-/Preview-Limits und Preview-Endungen. Servermodus, Bind-Adresse, TLS-Pfade, Trusted Proxies, Root-Mount und Data-Dir bleiben file-/restart-basiert.
+
 ## 6. Routen- und API-Design
 
 | Route | Methode | Zweck |
 |---|---:|---|
 | `/login`, `/mfa`, `/logout` | GET/POST | zweistufige Adminauthentifizierung |
 | `/admin` | GET | Root-begrenzter Dateibrowser |
+| `/admin/preview` | GET | escaped Textvorschau für Admins |
 | `/admin/shares` | GET/POST | Links auflisten/erstellen |
 | `/admin/shares/:id/toggle` | POST | aktivieren/deaktivieren |
 | `/admin/shares/:id/password` | POST | Passwort setzen/ersetzen/entfernen |
 | `/admin/shares/:id/delete` | POST | löschen |
+| `/admin/admins` | GET/POST | Admins anzeigen und zusätzliche Admins anlegen |
+| `/admin/settings` | GET/POST | runtime-editierbare Policy-Settings |
+| `/admin/audit` | GET | paginiertes Audit-Dashboard |
 | `/v/:token` | GET | öffentliche Datei-/Ordnerseite |
 | `/v/:token/unlock` | POST | passwortgeschützte Freigabe entsperren |
+| `/v/:token/preview` | GET | sichere öffentliche Textvorschau, zählt als Downloadzugriff |
 | `/v/:token/download` | GET/HEAD | Streaming, einzelner Byte-Range, `206`/`416` |
+| `/v/:token/download.zip` | GET | limitierter ZIP-Download für Ordnerfreigaben |
 | `/v/:token/upload` | POST | exklusiver Ordnerupload |
 | `/s/:alias` | GET | validierter Kurzlink |
 
@@ -85,7 +103,7 @@ Es gibt absichtlich keine öffentliche JSON-API. Interne absolute Pfade werden n
 
 ## 7. UI und UX
 
-Login, MFA, Dateibrowser, Linkformular/-liste sowie öffentliche Download-/Uploadseiten sind responsiv. Berechtigungen, Passwortschutz und Status sind sichtbar; Hashes und Klartextpasswörter nie. Ein kleines, statisch ausgeliefertes und durch `script-src 'self'` begrenztes Script stellt den Copy-Button bereit; es gibt keine externe Frontend-Abhängigkeit. Verzeichnisse liefern descriptor-relativ höchstens 100 Einträge pro Seite.
+Login, MFA, Dateibrowser, Linkformular/-liste, Adminverwaltung, Einstellungen, Audit sowie öffentliche Download-/Uploadseiten sind responsiv. Der Dateibrowser bietet Breadcrumbs, Hoch-Link, aktuellen Ordner freigeben, Pagination und begrenzte Suche. Öffentliche Download-Ordnerfreigaben bieten Breadcrumbs, Suche, ZIP-Link, Vorschau-Links und Upload in den aktuell navigierten Unterordner, wenn `download_upload` gesetzt ist. Berechtigungen, Passwortschutz, Status und Uploadlimits sind sichtbar; Hashes und Klartextpasswörter nie. Ein kleines, statisch ausgeliefertes und durch `script-src 'self'` begrenztes Script stellt den Copy-Button bereit; es gibt keine externe Frontend-Abhängigkeit. Verzeichnisse liefern descriptor-relativ höchstens 100 Einträge pro Seite.
 
 ## 8. HTTPS- und Betriebsmodi
 
@@ -136,7 +154,7 @@ Rustls liest Fullchain und Key beim Prozessstart. Mit `reload_on_cert_change=tru
 
 ## 9. Testkonzept
 
-Unit- und HTTP-Integrationstests decken Argon2, RFC-TOTP, Login/MFA/Logout, Session/CSRF, Rate-Limits, Security Headers, Passwort-Unlock, Share-Rechte, Range/HEAD, Migrationserhalt, atomare Downloadlimits, Upload-Noclobber/-Cleanup/-Parallelität, Traversal/Encoding, Linux-Symlink-Races, Proxy-Vertrauen und Config-Modi ab. Sie nutzen In-Memory-SQLite bzw. `tempfile`, verändern keinen Produktionsmount und benötigen nach dem Dependency-Fetch kein Netzwerk.
+Unit- und HTTP-Integrationstests decken Argon2, RFC-TOTP, Login/MFA/Logout, Session/CSRF, Rate-Limits, Security Headers, Setup-UI, Admin-Anlage, Runtime-Settings, Passwort-Unlock, Share-Rechte, Suche, ZIP, Textvorschau, Range/HEAD, Migrationserhalt, atomare Downloadlimits, Upload-Noclobber/-Cleanup/-Parallelität, Upload in Unterordner, Traversal/Encoding, Linux-Symlink-Races, Proxy-Vertrauen und Config-Modi ab. Sie nutzen In-Memory-SQLite bzw. `tempfile`, verändern keinen Produktionsmount und benötigen nach dem Dependency-Fetch kein Netzwerk.
 
 ```sh
 make test

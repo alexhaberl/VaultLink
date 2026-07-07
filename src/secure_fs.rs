@@ -55,7 +55,11 @@ impl SecureRoot {
     pub fn open_file(&self, relative: &str) -> io::Result<File> {
         let relative = validated(relative)?;
         #[cfg(target_os = "linux")]
-        return linux::openat2(self.root.as_ref(), &relative, linux::O_RDONLY);
+        return linux::openat2(
+            self.root.as_ref(),
+            &relative,
+            linux::O_RDONLY | linux::O_NOFOLLOW,
+        );
         #[cfg(not(target_os = "linux"))]
         return File::open(
             path_security::resolve_existing(&self.display_root, &relative).map_err(path_error)?,
@@ -65,7 +69,12 @@ impl SecureRoot {
     pub fn metadata(&self, relative: &str) -> io::Result<std::fs::Metadata> {
         let relative = validated(relative)?;
         #[cfg(target_os = "linux")]
-        return linux::openat2(self.root.as_ref(), &relative, linux::O_PATH)?.metadata();
+        return linux::openat2(
+            self.root.as_ref(),
+            &relative,
+            linux::O_PATH | linux::O_NOFOLLOW,
+        )?
+        .metadata();
         #[cfg(not(target_os = "linux"))]
         return std::fs::metadata(
             path_security::resolve_existing(&self.display_root, &relative).map_err(path_error)?,
@@ -79,7 +88,7 @@ impl SecureRoot {
             let directory = linux::openat2(
                 self.root.as_ref(),
                 &relative,
-                linux::O_RDONLY | linux::O_DIRECTORY,
+                linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
             )?;
             linux::list(&directory, offset, limit)
         }
@@ -111,7 +120,7 @@ impl SecureRoot {
             let dir = linux::openat2(
                 self.root.as_ref(),
                 &directory,
-                linux::O_RDONLY | linux::O_DIRECTORY,
+                linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
             )?;
             PendingUpload::new(dir)
         }
@@ -238,6 +247,7 @@ mod linux {
     pub const O_WRONLY: u64 = 1;
     pub const O_CREAT: u64 = 0o100;
     pub const O_EXCL: u64 = 0o200;
+    pub const O_NOFOLLOW: u64 = 0o400000;
     pub const O_DIRECTORY: u64 = 0o200000;
     pub const O_PATH: u64 = 0o10000000;
     const O_CLOEXEC: u64 = 0o2000000;
@@ -305,7 +315,7 @@ mod linux {
             .filter_map(|item| {
                 let item = item.ok()?;
                 let name = item.file_name();
-                let child = openat2(directory, &name, O_PATH).ok()?;
+                let child = openat2(directory, &name, O_PATH | O_NOFOLLOW).ok()?;
                 let metadata = child.metadata().ok()?;
                 Some(Entry {
                     name: name.to_string_lossy().into_owned(),

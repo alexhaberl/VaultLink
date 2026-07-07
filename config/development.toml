@@ -8,6 +8,12 @@ production_mode = false
 root_mount_path = "dev/mount"
 data_directory = "dev/data"
 max_upload_size = 104857600
+max_zip_size = 1073741824
+max_zip_files = 10000
+max_search_entries = 50000
+max_search_results = 500
+max_preview_size = 1048576
+preview_extensions = ["txt", "log", "md", "csv", "json", "toml", "yaml", "yml", "ini", "conf"]
 blocked_extensions = ["exe", "dll", "com", "bat", "cmd", "ps1", "sh"]
 
 [security]

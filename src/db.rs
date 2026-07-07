@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
@@ -18,6 +18,12 @@ pub struct Admin {
     pub username: String,
     pub password_hash: String,
     pub totp_secret: String,
+}
+#[derive(Clone, Debug)]
+pub struct AdminSummary {
+    pub id: i64,
+    pub username: String,
+    pub created_at: String,
 }
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -68,9 +74,19 @@ pub struct Share {
     pub permission: Permission,
     pub expires_at: Option<DateTime<Utc>>,
     pub max_downloads: Option<u64>,
+    pub max_upload_size: Option<u64>,
     pub download_count: u64,
     pub active: bool,
     pub password_hash: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditEvent {
+    pub occurred_at: String,
+    pub actor: String,
+    pub action: String,
+    pub object_id: Option<String>,
+    pub detail: Option<String>,
 }
 
 fn token_hash(token: &str) -> String {
@@ -131,6 +147,29 @@ CREATE INDEX IF NOT EXISTS idx_unlock_exp ON public_unlock_sessions(expires_at);
         )?;
         tx.pragma_update(None, "user_version", 2)?;
     }
+    if version < 3 {
+        let has_upload_limit: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('shares') WHERE name='max_upload_size')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_upload_limit {
+            tx.execute("ALTER TABLE shares ADD COLUMN max_upload_size INTEGER", [])?;
+        }
+        tx.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS runtime_settings(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_by INTEGER NOT NULL REFERENCES admins(id),
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_time ON audit(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit(action);
+"#,
+        )?;
+        tx.pragma_update(None, "user_version", 3)?;
+    }
     tx.commit()
 }
 
@@ -170,6 +209,26 @@ impl Database {
                 },
             )
             .optional()
+    }
+    pub fn admin_count(&self) -> rusqlite::Result<i64> {
+        self.conn()
+            .query_row("SELECT COUNT(*) FROM admins", [], |row| row.get(0))
+    }
+    pub fn list_admins(&self) -> rusqlite::Result<Vec<AdminSummary>> {
+        let c = self.conn();
+        let mut statement = c.prepare(
+            "SELECT id,username,created_at FROM admins ORDER BY username COLLATE NOCASE",
+        )?;
+        let admins = statement
+            .query_map([], |row| {
+                Ok(AdminSummary {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?
+            .collect();
+        admins
     }
     pub fn create_session(
         &self,
@@ -215,11 +274,12 @@ impl Database {
         permission: &Permission,
         expires: Option<DateTime<Utc>>,
         max: Option<u64>,
+        upload_max: Option<u64>,
         admin: i64,
         password_hash: Option<&str>,
     ) -> rusqlite::Result<i64> {
         let c = self.conn();
-        c.execute("INSERT INTO shares(token_hash,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,created_by,created_at,password_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![token_hash(token),token,alias,path,is_dir as i64,permission.as_str(),expires.map(|v|v.to_rfc3339()),max,admin,Utc::now().to_rfc3339(),password_hash])?;
+        c.execute("INSERT INTO shares(token_hash,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,created_by,created_at,password_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![token_hash(token),token,alias,path,is_dir as i64,permission.as_str(),expires.map(|v|v.to_rfc3339()),max,upload_max,admin,Utc::now().to_rfc3339(),password_hash])?;
         Ok(c.last_insert_rowid())
     }
     fn map_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
@@ -236,20 +296,21 @@ impl Database {
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|d| d.with_timezone(&Utc)),
             max_downloads: r.get(7)?,
-            download_count: r.get(8)?,
-            active: r.get::<_, i64>(9)? != 0,
-            password_hash: r.get(10)?,
+            max_upload_size: r.get(8)?,
+            download_count: r.get(9)?,
+            active: r.get::<_, i64>(10)? != 0,
+            password_hash: r.get(11)?,
         })
     }
     pub fn share_by_token(&self, token: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,download_count,active,password_hash FROM shares WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
+        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash FROM shares WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
     }
     pub fn share_by_alias(&self, alias: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,download_count,active,password_hash FROM shares WHERE alias=?1",[alias],Self::map_share).optional()
+        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash FROM shares WHERE alias=?1",[alias],Self::map_share).optional()
     }
     pub fn list_shares(&self) -> rusqlite::Result<Vec<Share>> {
         let c = self.conn();
-        let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,download_count,active,password_hash FROM shares ORDER BY id DESC")?;
+        let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash FROM shares ORDER BY id DESC")?;
         let shares = s
             .query_map([], Self::map_share)?
             .filter_map(Result::ok)
@@ -316,6 +377,63 @@ impl Database {
         tracing::info!(target: "vaultlink::audit", actor, action, object_id = object.unwrap_or(""), detail = detail.unwrap_or(""), "audit event");
         Ok(())
     }
+    pub fn runtime_settings(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let c = self.conn();
+        let mut statement = c.prepare("SELECT key,value FROM runtime_settings ORDER BY key")?;
+        let settings = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect();
+        settings
+    }
+    pub fn set_runtime_setting(&self, key: &str, value: &str, admin: i64) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "INSERT INTO runtime_settings(key,value,updated_by,updated_at) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+            params![key, value, admin, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+    pub fn list_audit(
+        &self,
+        action: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<AuditEvent>> {
+        let c = self.conn();
+        if let Some(action) = action {
+            let mut statement = c.prepare(
+                "SELECT occurred_at,actor,action,object_id,detail FROM audit WHERE action=?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
+            )?;
+            let events = statement
+                .query_map(params![action, limit as i64, offset as i64], |row| {
+                    Ok(AuditEvent {
+                        occurred_at: row.get(0)?,
+                        actor: row.get(1)?,
+                        action: row.get(2)?,
+                        object_id: row.get(3)?,
+                        detail: row.get(4)?,
+                    })
+                })?
+                .collect();
+            events
+        } else {
+            let mut statement = c.prepare(
+                "SELECT occurred_at,actor,action,object_id,detail FROM audit ORDER BY id DESC LIMIT ?1 OFFSET ?2",
+            )?;
+            let events = statement
+                .query_map(params![limit as i64, offset as i64], |row| {
+                    Ok(AuditEvent {
+                        occurred_at: row.get(0)?,
+                        actor: row.get(1)?,
+                        action: row.get(2)?,
+                        object_id: row.get(3)?,
+                        detail: row.get(4)?,
+                    })
+                })?
+                .collect();
+            events
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +452,7 @@ mod tests {
                 &Permission::DownloadOnly,
                 None,
                 Some(1),
+                None,
                 1,
                 None,
             )
@@ -353,6 +472,7 @@ mod tests {
             &Permission::DownloadOnly,
             None,
             None,
+            None,
             1,
             None,
         )
@@ -364,6 +484,7 @@ mod tests {
                 "y",
                 false,
                 &Permission::DownloadOnly,
+                None,
                 None,
                 None,
                 1,
@@ -403,6 +524,7 @@ mod tests {
                 "file",
                 false,
                 &Permission::DownloadOnly,
+                None,
                 None,
                 None,
                 1,
@@ -476,6 +598,7 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
                 "folder",
                 true,
                 &Permission::DownloadOnly,
+                None,
                 None,
                 None,
                 1,

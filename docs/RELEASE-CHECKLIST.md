@@ -1,71 +1,137 @@
 # v0.1.0-beta.1 release checklist
 
-Stand: 2026-07-07 15:19 Europe/Vienna.
+Stand: 2026-07-07 nach Feature-Complete-Implementierung.
 
-Aktueller Repository-Stand: `main` bei `941f547`. Die VM läuft mit dem aus `a349794` gebauten Binary; `941f547` ändert nur CI, Makefile und Dokumentation und hat keine Runtime-Codeänderung.
+Ziel: privates GitHub-Prerelease für Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschließlich bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
-## Bereits grün
+## Feature-Scope für beta1
 
-- [x] `main` war vor dieser Checklisten-Konsolidierung sauber; CI für `941f547` war grün.
-- [x] Formatting, Clippy, Unit-Tests, HTTP-Integrationstests, Migrationstests und Release-Build laufen in CI mit `--locked`.
-  - GitHub Actions: `CI` Run `28866453280`, erfolgreich.
-- [x] Shellcheck ist in CI und Release-Dry-Run für `deploy/*.sh` und `tools/*.sh` erzwungen.
-  - GitHub Actions: `CI` Run `28866453280`, erfolgreich.
-- [x] Fuzz-Gate: Path-Normalisierung, Byte-Range-Parser und Dateinamen je zehn Minuten ohne Findings.
-  - GitHub Actions: `Fuzz release gate` Run `28866884860`, erfolgreich.
-- [x] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings`.
-  - GitHub Actions: `Release prerelease` Dry-Run `28866884894`, erfolgreich.
-- [x] Debian-13-amd64 Lastprofil auf der VM gegen `127.0.0.1:8080`.
-  - 100 parallele Metadata-Nutzer: p95 `0.0303s`.
-  - 40 parallele Range-Downloadstreams: erfolgreich.
-  - 10 parallele Uploadstreams: erfolgreich.
-  - Zusätzlicher RSS: `22,863,872` Bytes, deutlich unter 256 MiB.
-  - Keine 5xx im Metadata-Profil.
-- [x] Öffentlicher Nginx-Pfad `vaultlink.haberl.tech` geprüft.
-  - HTTP→HTTPS Redirect: `301` auf `https://vaultlink.haberl.tech/login`.
-  - HTTPS/Login-Header: CSP, HSTS, X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy.
-  - Passwortgeschützte Freigabe: gesperrte Landingpage, falsches Passwort `401`, erfolgreiches Unlock `303`.
-  - Unlock-Cookie: `Secure`, `HttpOnly`, `SameSite=Strict`.
-  - `HEAD`, `Accept-Ranges`, `206` Range-Download: erfolgreich.
-  - Upload-only-Link: Upload erfolgreich, Download `403`.
-  - Revoke und Expiry: jeweils `410`.
-- [x] Release-Dry-Run baut Artefakte im gepinnten Debian-13-Container.
-  - GitHub Actions: `Release prerelease` Run `28866884894`, erfolgreich.
-  - Enthalten: Binary, README, LICENSE, Konfigurationen, systemd/deploy-Dateien, SHA-256-Datei, CycloneDX-SBOM, deterministisches `tar.gz`.
-  - Signatur- und Release-Schritte sind im Dry-Run bewusst übersprungen, weil sie nur auf einem Tag laufen.
-- [x] Laufender VM-Dienst nach Gates stabil.
-  - `vaultlink.service`: `active`, `NRestarts=0`.
-  - SQLite: `PRAGMA integrity_check = ok`.
-  - Soak-Monitor schreibt weiter Evidenz nach `/var/log/vaultlink/soak.csv`.
+- [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
+- [x] Root-begrenzter Dateibrowser mit Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der Oberfläche.
+- [x] Linkverwaltung für Datei-/Ordnerlinks mit `download_only`, `upload_only`, `download_upload`.
+- [x] Passwortgeschützte Shares mit Argon2id, Unlock-Cookies und Rate-Limit.
+- [x] Optionaler Kurzlink-Alias.
+- [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`.
+- [x] Sichere Uploads mit temporärer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
+- [x] Upload in navigierten Unterordnern für `download_upload`-Ordnerlinks.
+- [x] Upload-only-Freigaben listen keine Ordnerinhalte und erlauben keine Preview/Downloads.
+- [x] ZIP-Download für Ordnerfreigaben mit Datei- und Größenlimits.
+- [x] Begrenzte case-insensitive Dateinamensuche.
+- [x] Sichere Browser-Textvorschau für allowlistete Endungen; escaped HTML in `<pre>`, kein Inline-User-MIME.
+- [x] Admin-UI für zusätzliche Admins; TOTP-Secret wird genau einmal angezeigt.
+- [x] Runtime-editierbare Policy-Settings in SQLite, nicht in `/etc/vaultlink/config.toml`.
+- [x] Audit-Dashboard mit Pagination und Action-Filter.
+- [x] Loopback-only Setup-UI: `vaultlink setup --config <path> --listen 127.0.0.1:8090`.
+- [x] Reverse-Proxy-Modus, Standalone-TLS-Modus, SIGHUP-Zertifikatsreload.
+- [x] ZeroSSL/acme.sh Renewal-Dokumentation und systemd-Beispiele.
 
-## Offen vor dem Tag
+## Bewusste Nicht-Ziele für beta1
 
-- [ ] Feature-Freeze für `v0.1.0-beta.1` bestätigen.
-  - Ab diesem Punkt keine Code-, Config- oder systemd-Änderungen mehr außer Release-Blockern.
-- [ ] Finalen Release-Candidate deployen, falls nach dieser Datei noch Runtime-Code geändert wird.
-  - Falls nur Dokumentation/CI geändert wird, ist kein VM-Redeploy nötig.
-- [ ] Upgrade und Rollback einmal bewusst testen.
-  - Upgrade ist mehrfach erfolgreich gelaufen.
-  - Rollback muss noch mit einem Backup unter `/var/lib/vaultlink/backups/` geprüft werden.
-  - Dieser Test startet den Dienst neu und gehört deshalb vor den finalen 72h-Soak.
-- [ ] Finalen 72h-Soak nach dem letzten Runtime-Deploy starten und vollständig abwarten.
-  - Gate: keine ungeplanten Restarts, `PRAGMA integrity_check = ok`, kein kontinuierliches RSS-Wachstum über 15 %.
-  - Lange Soaks werden nicht nach reinen UI-/Doku-/CI-Änderungen neu gestartet; ein neues Binary-Deploy setzt den Soak zurück.
-- [ ] Nach bestandenem Soak final prüfen:
-  - sauberer Worktree,
-  - grüner CI-Run auf finalem `main`,
-  - `cargo-audit`/Release-Dry-Run weiterhin grün,
-  - `vaultlink.haberl.tech` Smoke-Test weiterhin grün.
-- [ ] Annotierten Tag `v0.1.0-beta.1` nur bei sauberem Worktree und vollständig grünen Gates erstellen.
-- [ ] Tag-Release-Workflow prüfen.
-  - Binary und `SHA256SUMS` müssen mit Minisign gegen `release/minisign.pub` verifizieren.
-  - GitHub Release muss `private/prerelease` sein und ausschließlich CI-produzierte Artefakte enthalten.
-
-## Bewusste Nicht-Ziele für `v0.1.0-beta.1`
-
-- ZIP-Download für Ordner.
-- Suche.
-- Audit-Dashboard.
 - DEB-Paket.
 - ARM64-Build.
 - Öffentliches Repository.
+- Öffentliche JSON-API.
+- Inline-Preview für HTML, SVG, PDF, Bilder, Office-Dateien oder Medien.
+- Unbounded/streaming ZIP für sehr große Ordner; ZIP wird limitiert und bei Überschreitung abgelehnt.
+- Admin-Löschen.
+
+## Lokal in dieser Arbeitskopie grün
+
+- [x] `cargo check --locked`
+- [x] `cargo test --locked --all-targets`
+  - Ergebnis: 41 Tests bestanden.
+  - Enthalten: Setup-UI, Admin-Anlage, Runtime-Settings, Preview, ZIP, Suche, Upload in Unterordner, Share-Rechte, Auth, Migrationen, Upload-Cleanup.
+- [x] `cargo check --manifest-path fuzz/Cargo.toml --locked`
+  - Fuzz-Crate inklusive `zip_search_preview_paths` kompiliert.
+- [x] `cargo audit --deny warnings`
+  - `cargo-audit 0.22.2`, keine bekannten Vulnerabilities/Warnings.
+- [x] Debian-13-VM `192.168.1.240`, temporärer Build in `/tmp/vaultlink-feature-check`
+  - OS: Debian GNU/Linux 13.5, amd64, Kernel 6.12.
+  - `cargo fmt --all -- --check`: grün.
+  - `cargo test --locked --all-targets`: 43 Tests bestanden, inklusive Linux-`openat2`/Symlink-Tests.
+  - `cargo clippy --locked --all-targets -- -D warnings`: grün.
+  - `cargo build --release --locked`: grün.
+  - `cargo check --manifest-path fuzz/Cargo.toml --locked`: grün.
+
+## Erneut auszuführen, weil Runtime-Code geändert wurde
+
+- [ ] `cargo fmt --check`
+- [ ] `cargo clippy --locked --all-targets -- -D warnings`
+- [ ] `cargo test --locked --all-targets` final wiederholen.
+- [ ] Fuzz-Gate jeweils zehn Minuten:
+  - Pfadnormalisierung,
+  - Byte-Range-Parser,
+  - Dateinamen,
+  - ZIP/Search/Preview-Pfadfälle.
+- [x] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings`.
+- [ ] GitHub Actions CI auf finalem `main` grün.
+- [ ] Release-Dry-Run im gepinnten Debian-13-amd64-Container mit `--locked` grün.
+- [ ] Artefakte prüfen:
+  - Binary,
+  - README,
+  - LICENSE,
+  - Beispielkonfigurationen,
+  - systemd/deploy-Dateien,
+  - SHA-256-Prüfsummen,
+  - CycloneDX-SBOM,
+  - deterministisches `tar.gz`,
+  - Minisign-Signatur nur beim Tag-Release.
+
+## VM-/Public-Gates vor finalem Soak
+
+- [ ] Finalen Release-Candidate auf der Debian-VM bauen/deployen.
+- [ ] SQLite-Backup vor Upgrade bei gestopptem Dienst erstellen.
+- [ ] Upgrade-Test durchführen.
+- [ ] Rollback-Test durchführen:
+  - Dienst stoppen,
+  - vorheriges Binary und SQLite-Backup wiederherstellen,
+  - Dienst starten,
+  - Smoke-Test ausführen.
+- [ ] Debian-13-amd64 Lastprofil erneut:
+  - 100 parallele Nutzer,
+  - 40 Downloadstreams,
+  - Sparse-Datei mit 50 GiB,
+  - parallele Uploadstreams,
+  - keine 5xx,
+  - keine korrupten Dateien,
+  - p95 Metadatenseiten < 750 ms,
+  - maximal 256 MiB zusätzlicher RSS bei 40 Streams.
+- [ ] Öffentlicher Nginx-Pfad `vaultlink.haberl.tech` erneut prüfen:
+  - TLS und HTTP→HTTPS Redirect,
+  - Security Header,
+  - Secure/SameSite/HttpOnly Cookies,
+  - Login, MFA, Logout,
+  - Admins,
+  - Settings,
+  - Audit,
+  - Linkerstellung mit Passwort und per-Share-Uploadlimit,
+  - Suche,
+  - ZIP,
+  - Textpreview,
+  - Upload in Subfolder,
+  - Download/Range/HEAD,
+  - Upload-only darf nicht listen/downloaden/previewen,
+  - Revoke/Expiry/Downloadlimit.
+
+## Finaler 72h-Soak
+
+- [ ] Erst nach dem letzten Runtime-Deploy starten.
+- [ ] Gate:
+  - keine ungeplanten Restarts,
+  - `PRAGMA integrity_check = ok`,
+  - kein kontinuierliches RSS-Wachstum > 15 %,
+  - keine auffälligen 5xx-/Panic-/DB-Fehler im Journal.
+- [ ] Lange Soaks werden nach reinen Doku-/CI-Änderungen nicht neu gestartet; jedes neue Binary-Deploy setzt den Soak zurück.
+
+## Tag-Freigabe
+
+- [ ] Sauberer Worktree.
+- [ ] Grüner CI-Run auf finalem `main`.
+- [ ] Release-Dry-Run und `cargo-audit` weiterhin grün.
+- [ ] VM- und Public-Gates grün.
+- [ ] 72h-Soak bestanden.
+- [ ] Annotierten Tag `v0.1.0-beta.1` erstellen.
+- [ ] Tag-Release-Workflow prüfen:
+  - GitHub Release ist privat/prerelease,
+  - Artefakte stammen ausschließlich aus CI,
+  - Binary und `SHA256SUMS` verifizieren mit Minisign gegen `release/minisign.pub`.

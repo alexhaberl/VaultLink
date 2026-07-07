@@ -4,11 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: Server,
@@ -23,7 +23,7 @@ pub struct Config {
     pub logging: Logging,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerMode {
     Development,
@@ -31,7 +31,7 @@ pub enum ServerMode {
     StandaloneTls,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
     pub mode: ServerMode,
@@ -41,13 +41,25 @@ pub struct Server {
     pub production_mode: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Storage {
     pub root_mount_path: PathBuf,
     pub data_directory: PathBuf,
     #[serde(default = "default_upload_size")]
     pub max_upload_size: u64,
+    #[serde(default = "default_zip_size")]
+    pub max_zip_size: u64,
+    #[serde(default = "default_zip_files")]
+    pub max_zip_files: usize,
+    #[serde(default = "default_search_entries")]
+    pub max_search_entries: usize,
+    #[serde(default = "default_search_results")]
+    pub max_search_results: usize,
+    #[serde(default = "default_preview_size")]
+    pub max_preview_size: u64,
+    #[serde(default = "default_preview_extensions")]
+    pub preview_extensions: Vec<String>,
     #[serde(default)]
     pub blocked_extensions: Vec<String>,
 }
@@ -55,8 +67,31 @@ pub struct Storage {
 fn default_upload_size() -> u64 {
     100 * 1024 * 1024
 }
+fn default_zip_size() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_zip_files() -> usize {
+    10_000
+}
+fn default_search_entries() -> usize {
+    50_000
+}
+fn default_search_results() -> usize {
+    500
+}
+fn default_preview_size() -> u64 {
+    1024 * 1024
+}
+fn default_preview_extensions() -> Vec<String> {
+    [
+        "txt", "log", "md", "csv", "json", "toml", "yaml", "yml", "ini", "conf",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReverseProxy {
     #[serde(default)]
@@ -69,7 +104,7 @@ pub struct ReverseProxy {
     pub trust_x_forwarded_headers: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
     #[serde(default)]
@@ -84,7 +119,7 @@ pub struct Tls {
     pub reload_on_cert_change: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Security {
     #[serde(default = "default_session_hours")]
@@ -140,7 +175,7 @@ fn default_share_unlock_minutes() -> i64 {
     60
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Logging {
     #[serde(default = "default_level")]
@@ -286,6 +321,27 @@ impl Config {
                 "max_upload_size must be positive".into(),
             ));
         }
+        if self.storage.max_zip_size == 0
+            || self.storage.max_zip_files == 0
+            || self.storage.max_search_entries == 0
+            || self.storage.max_search_results == 0
+            || self.storage.max_preview_size == 0
+        {
+            return Err(ConfigError::Invalid(
+                "storage limits must be positive".into(),
+            ));
+        }
+        if self.storage.preview_extensions.iter().any(|extension| {
+            extension.is_empty()
+                || extension.contains('/')
+                || extension.contains('\\')
+                || extension.contains('\0')
+                || extension.chars().any(char::is_control)
+        }) {
+            return Err(ConfigError::Invalid(
+                "preview_extensions must contain safe extensions".into(),
+            ));
+        }
         if self.security.share_password_min_length < 8
             || self.security.share_password_max_bytes < self.security.share_password_min_length
             || self.security.share_unlock_minutes <= 0
@@ -312,6 +368,12 @@ mod tests {
                 root_mount_path: ".".into(),
                 data_directory: ".".into(),
                 max_upload_size: 10,
+                max_zip_size: 1024,
+                max_zip_files: 10,
+                max_search_entries: 100,
+                max_search_results: 10,
+                max_preview_size: 1024,
+                preview_extensions: vec!["txt".into()],
                 blocked_extensions: vec![],
             },
             reverse_proxy: ReverseProxy::default(),

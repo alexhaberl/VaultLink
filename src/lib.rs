@@ -4,13 +4,16 @@ pub mod db;
 pub mod path_security;
 pub mod proxy;
 pub mod range;
+pub mod runtime;
 pub mod secure_fs;
+pub mod setup;
 pub mod web;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use config::Config;
 use db::Database;
+use runtime::RuntimeSettings;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,6 +22,7 @@ pub struct AppState {
     pub secure_root: secure_fs::SecureRoot,
     pub limiter: auth::LoginLimiter,
     pub share_limiter: auth::LoginLimiter,
+    pub runtime: Arc<RwLock<RuntimeSettings>>,
 }
 
 impl AppState {
@@ -28,6 +32,12 @@ impl AppState {
             .map_err(|error| format!("cannot initialize secure storage access (openat2 is required on Linux): {error}"))?;
         std::fs::create_dir_all(&config.storage.data_directory)?;
         let db = Database::open(config.storage.data_directory.join("data.sqlite"))?;
+        let mut runtime = RuntimeSettings::from_config(&config);
+        for (key, value) in db.runtime_settings()? {
+            runtime
+                .apply(&key, &value)
+                .map_err(|error| format!("invalid runtime setting {key}: {error}"))?;
+        }
         Ok(Self {
             limiter: auth::LoginLimiter::new(
                 config.security.login_attempts,
@@ -40,6 +50,7 @@ impl AppState {
             config: Arc::new(config),
             db,
             secure_root,
+            runtime: Arc::new(RwLock::new(runtime)),
         })
     }
 }
