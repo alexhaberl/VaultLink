@@ -81,7 +81,7 @@ impl SecureRoot {
                 &relative,
                 linux::O_RDONLY | linux::O_DIRECTORY,
             )?;
-            return linux::list(&directory, offset, limit);
+            linux::list(&directory, offset, limit)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -113,7 +113,7 @@ impl SecureRoot {
                 &directory,
                 linux::O_RDONLY | linux::O_DIRECTORY,
             )?;
-            return PendingUpload::new(dir);
+            PendingUpload::new(dir)
         }
         #[cfg(not(target_os = "linux"))]
         {
