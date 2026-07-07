@@ -23,6 +23,9 @@ pub fn validate_relative(raw: &str) -> Result<PathBuf, PathError> {
     let decoded = percent_encoding::percent_decode_str(raw)
         .decode_utf8()
         .map_err(|_| PathError::Invalid)?;
+    if decoded.contains('\0') || decoded.contains('\\') {
+        return Err(PathError::Invalid);
+    }
     if decoded.contains('%') {
         return Err(PathError::Invalid);
     } // reject ambiguous/double encoding
@@ -81,7 +84,15 @@ mod tests {
     use super::*;
     #[test]
     fn rejects_traversal_and_encoding() {
-        for p in ["../etc", "%2e%2e/etc", "%252e%252e/etc", "/etc", "a\\..\\b"] {
+        for p in [
+            "../etc",
+            "%2e%2e/etc",
+            "%252e%252e/etc",
+            "/etc",
+            "a\\..\\b",
+            "a%5cb",
+            "a%00b",
+        ] {
             assert!(validate_relative(p).is_err(), "{p}");
         }
     }
