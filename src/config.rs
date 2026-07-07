@@ -124,6 +124,7 @@ pub struct ReverseProxy {
 pub enum CertificateSource {
     #[default]
     Files,
+    #[serde(rename = "letsencrypt", alias = "lets_encrypt")]
     LetsEncrypt,
 }
 
@@ -621,6 +622,26 @@ mod tests {
         c.reverse_proxy.enabled = true;
         c.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn certificate_source_accepts_documented_letsencrypt_value() {
+        #[derive(Deserialize, Serialize)]
+        struct Wrapper {
+            certificate_source: CertificateSource,
+        }
+
+        let documented: Wrapper = toml::from_str("certificate_source = \"letsencrypt\"").unwrap();
+        assert_eq!(
+            documented.certificate_source,
+            CertificateSource::LetsEncrypt
+        );
+
+        let legacy: Wrapper = toml::from_str("certificate_source = \"lets_encrypt\"").unwrap();
+        assert_eq!(legacy.certificate_source, CertificateSource::LetsEncrypt);
+
+        let serialized = toml::to_string(&documented).unwrap();
+        assert!(serialized.contains("certificate_source = \"letsencrypt\""));
     }
 
     #[test]
