@@ -23,7 +23,7 @@ jobs:
         run: cargo test --locked --all-targets
       - name: Deployment artifacts
         run: |
-          shellcheck deploy/*.sh
+          shellcheck deploy/*.sh tools/*.sh
           sudo install -d /opt/vaultlink /root/.acme.sh /var/lib/vaultlink /var/log/vaultlink /mnt/storage
           sudo install -m 0755 /bin/true /opt/vaultlink/vaultlink
           sudo install -m 0755 /bin/true /root/.acme.sh/acme.sh

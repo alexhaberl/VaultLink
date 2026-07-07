@@ -21,7 +21,7 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config libssl-dev clang git gh minisign xz-utils
+          apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config libssl-dev clang git gh minisign xz-utils shellcheck
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -39,6 +39,7 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets
+          shellcheck deploy/*.sh tools/*.sh
           cargo audit --deny warnings
       - name: Build and SBOM
         run: |

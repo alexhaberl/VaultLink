@@ -20,7 +20,7 @@ security-test:
 	cargo test db::tests::migrates_unversioned_installation_without_losing_data
 	cargo test proxy
 	cargo test auth
-	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi
+	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh tools/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi
 
 fuzz:
 	cargo +nightly-2026-07-01 fuzz run path_normalization -- -max_total_time=600

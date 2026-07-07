@@ -256,7 +256,7 @@ cargo build --release --locked
 
 ### Lokaler Validierungsstatus (7. Juli 2026)
 
-Für den aktuellen Beta-Code sind Windows-Formatierung, Clippy mit `-D warnings`, 35 Tests einschließlich HTTP-Login/MFA/CSRF/Logout, Passwort-Unlock, Range/HEAD, Uploadlimit/-Konflikt/-Cleanup, Migration und parallelem Upload-Noclobber sowie `cargo-audit 0.22.2 --deny warnings` grün. Die Linux-spezifischen `openat2`-/`renameat2`-Tests, Fuzz-, Last-, öffentlicher Nginx- und 72-Stunden-Soak-Gates müssen vor dem Tag noch vollständig grün sein; maßgeblich ist die Release-Checkliste.
+Für den aktuellen Beta-Code sind Windows-Formatierung, Clippy mit `-D warnings`, 36 Tests einschließlich HTTP-Login/MFA/CSRF/Logout, Passwort-Unlock, Range/HEAD, Uploadlimit/-Konflikt/-Cleanup, Migration und parallelem Upload-Noclobber sowie `cargo-audit 0.22.2 --deny warnings` grün. Die Linux-spezifischen `openat2`-/`renameat2`-Tests, Fuzz-, Last-, öffentlicher Nginx- und 72-Stunden-Soak-Gates müssen vor dem Tag noch vollständig grün sein; maßgeblich ist die Release-Checkliste.
 
 Projektbeschreibung für GitHub: **VaultLink – secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
