@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+tempfile = "3.27"
 vaultlink = { path = ".." }
 
 [[bin]]
@@ -35,6 +36,13 @@ bench = false
 [[bin]]
 name = "zip_search_preview_paths"
 path = "fuzz_targets/zip_search_preview_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "upload_overwrite_policy"
+path = "fuzz_targets/upload_overwrite_policy.rs"
 test = false
 doc = false
 bench = false
