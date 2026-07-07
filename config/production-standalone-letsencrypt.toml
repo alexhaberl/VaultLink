@@ -1,6 +1,6 @@
 [server]
-mode = "reverse_proxy"
-listen_address = "127.0.0.1:8080"
+mode = "standalone_tls"
+listen_address = "0.0.0.0:443"
 public_base_url = "https://files.example.com"
 production_mode = true
 
@@ -30,16 +30,19 @@ share_unlock_minutes = 60
 share_password_attempts = 5
 
 [reverse_proxy]
-enabled = true
+enabled = false
 allow_non_loopback = false
-trusted_proxies = ["127.0.0.1", "::1"]
-trust_x_forwarded_headers = true
+trusted_proxies = []
+trust_x_forwarded_headers = false
 
 [tls]
-enabled = false
-certificate_source = "files"
+enabled = true
+certificate_source = "letsencrypt"
 hsts_enabled = true
 reload_on_cert_change = false
+letsencrypt_contact_email = "admin@example.com"
+letsencrypt_cache_dir = "acme"
+letsencrypt_staging = true
 
 [logging]
 level = "info"

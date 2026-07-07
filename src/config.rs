@@ -1,7 +1,7 @@
 use std::{
     fs,
     net::IpAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,12 @@ pub struct Storage {
     pub max_preview_size: u64,
     #[serde(default = "default_preview_extensions")]
     pub preview_extensions: Vec<String>,
+    #[serde(default = "default_image_preview_extensions")]
+    pub image_preview_extensions: Vec<String>,
+    #[serde(default = "yes")]
+    pub pdf_preview_enabled: bool,
+    #[serde(default = "default_media_preview_size")]
+    pub max_media_preview_size: u64,
     #[serde(default)]
     pub blocked_extensions: Vec<String>,
 }
@@ -90,6 +96,15 @@ fn default_preview_extensions() -> Vec<String> {
     .map(str::to_string)
     .collect()
 }
+fn default_image_preview_extensions() -> Vec<String> {
+    ["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+fn default_media_preview_size() -> u64 {
+    100 * 1024 * 1024
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -104,11 +119,21 @@ pub struct ReverseProxy {
     pub trust_x_forwarded_headers: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificateSource {
+    #[default]
+    Files,
+    LetsEncrypt,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub certificate_source: CertificateSource,
     #[serde(default)]
     pub cert_file: PathBuf,
     #[serde(default)]
@@ -117,6 +142,16 @@ pub struct Tls {
     pub hsts_enabled: bool,
     #[serde(default)]
     pub reload_on_cert_change: bool,
+    #[serde(default)]
+    pub letsencrypt_contact_email: String,
+    #[serde(default = "default_letsencrypt_cache_dir")]
+    pub letsencrypt_cache_dir: PathBuf,
+    #[serde(default = "yes")]
+    pub letsencrypt_staging: bool,
+}
+
+fn default_letsencrypt_cache_dir() -> PathBuf {
+    PathBuf::from("acme")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -268,6 +303,12 @@ impl Config {
                         "reverse_proxy mode must not enable application TLS".into(),
                     ));
                 }
+                if self.tls.certificate_source == CertificateSource::LetsEncrypt {
+                    return Err(ConfigError::Invalid(
+                        "letsencrypt certificate_source is valid only in standalone_tls mode"
+                            .into(),
+                    ));
+                }
             }
             ServerMode::StandaloneTls => {
                 if !self.server.production_mode || url.scheme() != "https" || !self.tls.enabled {
@@ -275,23 +316,19 @@ impl Config {
                         "standalone_tls requires production_mode, HTTPS URL and TLS enabled".into(),
                     ));
                 }
-                for p in [&self.tls.cert_file, &self.tls.key_file] {
-                    if !p.is_file() {
-                        return Err(ConfigError::Invalid(format!(
-                            "TLS file does not exist: {}",
-                            p.display()
-                        )));
+                match self.tls.certificate_source {
+                    CertificateSource::Files => validate_tls_files(&self.tls)?,
+                    CertificateSource::LetsEncrypt => {
+                        validate_letsencrypt(&url, &self.storage, &self.tls)?
                     }
                 }
-                #[cfg(unix)]
+                if self.tls.reload_on_cert_change
+                    && self.tls.certificate_source != CertificateSource::Files
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = fs::metadata(&self.tls.key_file)?.permissions().mode();
-                    if mode & 0o007 != 0 {
-                        return Err(ConfigError::Invalid(
-                            "TLS private key must not be accessible to other users".into(),
-                        ));
-                    }
+                    return Err(ConfigError::Invalid(
+                        "reload_on_cert_change is valid only for certificate_source=\"files\""
+                            .into(),
+                    ));
                 }
                 if self.reverse_proxy.enabled {
                     return Err(ConfigError::Invalid(
@@ -299,6 +336,13 @@ impl Config {
                     ));
                 }
             }
+        }
+        if self.tls.certificate_source == CertificateSource::LetsEncrypt
+            && !matches!(self.server.mode, ServerMode::StandaloneTls)
+        {
+            return Err(ConfigError::Invalid(
+                "letsencrypt certificate_source is valid only in standalone_tls mode".into(),
+            ));
         }
         if self.server.production_mode && !self.security.secure_cookie {
             return Err(ConfigError::Invalid(
@@ -326,20 +370,33 @@ impl Config {
             || self.storage.max_search_entries == 0
             || self.storage.max_search_results == 0
             || self.storage.max_preview_size == 0
+            || self.storage.max_media_preview_size == 0
         {
             return Err(ConfigError::Invalid(
                 "storage limits must be positive".into(),
             ));
         }
-        if self.storage.preview_extensions.iter().any(|extension| {
-            extension.is_empty()
-                || extension.contains('/')
-                || extension.contains('\\')
-                || extension.contains('\0')
-                || extension.chars().any(char::is_control)
-        }) {
+        validate_extensions("preview_extensions", &self.storage.preview_extensions)?;
+        validate_extensions(
+            "image_preview_extensions",
+            &self.storage.image_preview_extensions,
+        )?;
+        if self
+            .storage
+            .image_preview_extensions
+            .iter()
+            .any(|extension| {
+                matches!(
+                    extension
+                        .trim_start_matches('.')
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "svg" | "html" | "htm" | "xml" | "xhtml"
+                )
+            })
+        {
             return Err(ConfigError::Invalid(
-                "preview_extensions must contain safe extensions".into(),
+                "image_preview_extensions must not include active content types".into(),
             ));
         }
         if self.security.share_password_min_length < 8
@@ -351,6 +408,113 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn validate_tls_files(tls: &Tls) -> Result<(), ConfigError> {
+    for p in [&tls.cert_file, &tls.key_file] {
+        if !p.is_file() {
+            return Err(ConfigError::Invalid(format!(
+                "TLS file does not exist: {}",
+                p.display()
+            )));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&tls.key_file)?.permissions().mode();
+        if mode & 0o007 != 0 {
+            return Err(ConfigError::Invalid(
+                "TLS private key must not be accessible to other users".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn letsencrypt_cache_dir(storage: &Storage, tls: &Tls) -> Result<PathBuf, ConfigError> {
+    validate_acme_cache_path(&storage.data_directory, &tls.letsencrypt_cache_dir)?;
+    if tls.letsencrypt_cache_dir.is_absolute() {
+        Ok(tls.letsencrypt_cache_dir.clone())
+    } else {
+        Ok(storage.data_directory.join(&tls.letsencrypt_cache_dir))
+    }
+}
+
+fn validate_letsencrypt(url: &Url, storage: &Storage, tls: &Tls) -> Result<(), ConfigError> {
+    let host = url.host_str().ok_or_else(|| {
+        ConfigError::Invalid("letsencrypt requires a public_base_url host".into())
+    })?;
+    if host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok()
+        || !host.contains('.')
+        || host
+            .split('.')
+            .any(|label| label.is_empty() || label.starts_with('-') || label.ends_with('-'))
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return Err(ConfigError::Invalid(
+            "letsencrypt requires a DNS domain in public_base_url".into(),
+        ));
+    }
+    if !tls.letsencrypt_contact_email.contains('@')
+        || tls.letsencrypt_contact_email.contains('\n')
+        || tls.letsencrypt_contact_email.contains('\r')
+        || tls.letsencrypt_contact_email.starts_with("mailto:")
+    {
+        return Err(ConfigError::Invalid(
+            "letsencrypt_contact_email must be a plain email address".into(),
+        ));
+    }
+    letsencrypt_cache_dir(storage, tls).map(|_| ())
+}
+
+fn validate_acme_cache_path(data_directory: &Path, cache_dir: &Path) -> Result<(), ConfigError> {
+    if cache_dir.as_os_str().is_empty() {
+        return Err(ConfigError::Invalid(
+            "letsencrypt_cache_dir must not be empty".into(),
+        ));
+    }
+    if cache_dir
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(ConfigError::Invalid(
+            "letsencrypt_cache_dir must stay inside data_directory".into(),
+        ));
+    }
+    if cache_dir.is_absolute() {
+        if !data_directory.is_absolute() || !cache_dir.starts_with(data_directory) {
+            return Err(ConfigError::Invalid(
+                "absolute letsencrypt_cache_dir must be inside absolute data_directory".into(),
+            ));
+        }
+    } else if cache_dir
+        .components()
+        .any(|component| matches!(component, Component::RootDir))
+    {
+        return Err(ConfigError::Invalid(
+            "relative letsencrypt_cache_dir must not contain a root component".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_extensions(name: &str, values: &[String]) -> Result<(), ConfigError> {
+    if values.iter().any(|extension| {
+        extension.is_empty()
+            || extension.contains('/')
+            || extension.contains('\\')
+            || extension.contains('\0')
+            || extension.chars().any(char::is_control)
+    }) {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must contain safe extensions"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -374,6 +538,9 @@ mod tests {
                 max_search_results: 10,
                 max_preview_size: 1024,
                 preview_extensions: vec!["txt".into()],
+                image_preview_extensions: vec!["jpg".into(), "png".into()],
+                pdf_preview_enabled: true,
+                max_media_preview_size: 1024,
                 blocked_extensions: vec![],
             },
             reverse_proxy: ReverseProxy::default(),
@@ -433,6 +600,44 @@ mod tests {
         c.tls.enabled = true;
         c.tls.cert_file = "missing-cert.pem".into();
         c.tls.key_file = "missing-key.pem".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn standalone_letsencrypt_validates_domain_contact_and_mode() {
+        let mut c = base();
+        c.server.mode = ServerMode::StandaloneTls;
+        c.server.production_mode = true;
+        c.server.listen_address = "0.0.0.0:443".into();
+        c.server.public_base_url = "https://files.example.test".into();
+        c.security.secure_cookie = true;
+        c.tls.enabled = true;
+        c.tls.certificate_source = CertificateSource::LetsEncrypt;
+        c.tls.letsencrypt_contact_email = "admin@example.test".into();
+        c.tls.letsencrypt_cache_dir = "acme".into();
+        assert!(c.validate().is_ok());
+
+        c.server.mode = ServerMode::ReverseProxy;
+        c.reverse_proxy.enabled = true;
+        c.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn letsencrypt_rejects_localhost_and_unsafe_cache() {
+        let mut c = base();
+        c.server.mode = ServerMode::StandaloneTls;
+        c.server.production_mode = true;
+        c.server.listen_address = "0.0.0.0:443".into();
+        c.server.public_base_url = "https://localhost".into();
+        c.security.secure_cookie = true;
+        c.tls.enabled = true;
+        c.tls.certificate_source = CertificateSource::LetsEncrypt;
+        c.tls.letsencrypt_contact_email = "admin@example.test".into();
+        c.tls.letsencrypt_cache_dir = "acme".into();
+        assert!(c.validate().is_err());
+        c.server.public_base_url = "https://files.example.test".into();
+        c.tls.letsencrypt_cache_dir = "../acme".into();
         assert!(c.validate().is_err());
     }
 }

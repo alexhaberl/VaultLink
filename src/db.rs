@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
@@ -169,6 +169,20 @@ CREATE INDEX IF NOT EXISTS idx_audit_action ON audit(action);
 "#,
         )?;
         tx.pragma_update(None, "user_version", 3)?;
+    }
+    if version < 4 {
+        tx.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS public_preview_sessions(
+    token_hash TEXT PRIMARY KEY,
+    share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+    relative_path TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_preview_exp ON public_preview_sessions(expires_at);
+"#,
+        )?;
+        tx.pragma_update(None, "user_version", 4)?;
     }
     tx.commit()
 }
@@ -362,6 +376,36 @@ impl Database {
     }
     pub fn unlock_session(&self, token: &str, share_id: i64) -> rusqlite::Result<bool> {
         self.conn().query_row("SELECT EXISTS(SELECT 1 FROM public_unlock_sessions WHERE token_hash=?1 AND share_id=?2 AND expires_at>?3)", params![token_hash(token), share_id, Utc::now().to_rfc3339()], |row| row.get(0))
+    }
+    pub fn create_preview_session(
+        &self,
+        token: &str,
+        share_id: i64,
+        relative_path: &str,
+        expires: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
+        let c = self.conn();
+        c.execute(
+            "DELETE FROM public_preview_sessions WHERE expires_at<=?1",
+            [Utc::now().to_rfc3339()],
+        )?;
+        c.execute(
+            "INSERT INTO public_preview_sessions(token_hash,share_id,relative_path,expires_at) VALUES(?1,?2,?3,?4)",
+            params![token_hash(token), share_id, relative_path, expires.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+    pub fn preview_session(
+        &self,
+        token: &str,
+        share_id: i64,
+        relative_path: &str,
+    ) -> rusqlite::Result<bool> {
+        self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM public_preview_sessions WHERE token_hash=?1 AND share_id=?2 AND relative_path=?3 AND expires_at>?4)",
+            params![token_hash(token), share_id, relative_path, Utc::now().to_rfc3339()],
+            |row| row.get(0),
+        )
     }
     pub fn audit(
         &self,
@@ -641,5 +685,51 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn preview_sessions_are_hashed_share_and_path_bound() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = database
+            .create_share(
+                "share",
+                None,
+                "folder",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+            )
+            .unwrap();
+        database
+            .create_preview_session(
+                "preview-secret",
+                share_id,
+                "folder/image.png",
+                Utc::now() + chrono::Duration::minutes(5),
+            )
+            .unwrap();
+        assert!(database
+            .preview_session("preview-secret", share_id, "folder/image.png")
+            .unwrap());
+        assert!(!database
+            .preview_session("preview-secret", share_id, "folder/other.png")
+            .unwrap());
+        assert!(!database
+            .preview_session("wrong", share_id, "folder/image.png")
+            .unwrap());
+        let stored: String = database
+            .conn()
+            .query_row(
+                "SELECT token_hash FROM public_preview_sessions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(stored, "preview-secret");
     }
 }

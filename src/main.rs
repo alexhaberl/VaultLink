@@ -1,7 +1,8 @@
+use futures_util::StreamExt;
 use std::{env, path::PathBuf};
 use vaultlink::{
     auth,
-    config::{Config, ServerMode},
+    config::{self, CertificateSource, Config, ServerMode},
     web, AppState,
 };
 
@@ -49,39 +50,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = web::router(state);
     tracing::info!(%addr,mode=?config.server.mode,"VaultLink starting");
     match config.server.mode {
-        ServerMode::StandaloneTls => {
-            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                &config.tls.cert_file,
-                &config.tls.key_file,
-            )
-            .await?;
-            #[cfg(unix)]
-            if config.tls.reload_on_cert_change {
-                let reload = tls.clone();
-                let cert_file = config.tls.cert_file.clone();
-                let key_file = config.tls.key_file.clone();
+        ServerMode::StandaloneTls => match config.tls.certificate_source {
+            CertificateSource::Files => {
+                let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                    &config.tls.cert_file,
+                    &config.tls.key_file,
+                )
+                .await?;
+                #[cfg(unix)]
+                install_sighup_handler_for_files(&config, tls.clone());
+                axum_server::bind_rustls(addr, tls)
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .await?;
+            }
+            CertificateSource::LetsEncrypt => {
+                #[cfg(unix)]
+                install_noop_sighup_handler("ACME manages certificate renewal internally");
+                let public_url = url::Url::parse(&config.server.public_base_url)?;
+                let domain = public_url
+                    .host_str()
+                    .ok_or("public_base_url must contain a DNS host")?
+                    .to_string();
+                let cache_dir = config::letsencrypt_cache_dir(&config.storage, &config.tls)?;
+                std::fs::create_dir_all(&cache_dir)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700))?;
+                }
+                let contact = format!("mailto:{}", config.tls.letsencrypt_contact_email);
+                let mut acme_state = rustls_acme::AcmeConfig::new([domain.clone()])
+                    .contact_push(contact)
+                    .cache(rustls_acme::caches::DirCache::new(cache_dir))
+                    .directory_lets_encrypt(!config.tls.letsencrypt_staging)
+                    .state();
+                let acceptor = acme_state.axum_acceptor(acme_state.default_rustls_config());
                 tokio::spawn(async move {
-                    let Ok(mut signal) =
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                    else {
-                        tracing::error!("cannot install SIGHUP handler");
-                        return;
-                    };
-                    while signal.recv().await.is_some() {
-                        match reload.reload_from_pem_file(&cert_file, &key_file).await {
-                            Ok(()) => tracing::info!("TLS certificate reloaded after SIGHUP"),
-                            Err(error) => {
-                                tracing::error!(%error, "TLS certificate reload failed; previous certificate remains active")
-                            }
+                    while let Some(event) = acme_state.next().await {
+                        match event {
+                            Ok(event) => tracing::info!(?event, "ACME event"),
+                            Err(error) => tracing::error!(?error, "ACME error"),
                         }
                     }
                 });
+                tracing::info!(
+                    %domain,
+                    staging = config.tls.letsencrypt_staging,
+                    "Standalone TLS uses Let's Encrypt ACME tls-alpn-01"
+                );
+                axum_server::bind(addr)
+                    .acceptor(acceptor)
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    .await?;
             }
-            axum_server::bind_rustls(addr, tls)
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await?;
-        }
+        },
         _ => {
+            #[cfg(unix)]
+            install_noop_sighup_handler("no reloadable TLS configuration in this mode");
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(
                 listener,
@@ -92,6 +117,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+#[cfg(unix)]
+fn install_sighup_handler_for_files(config: &Config, tls: axum_server::tls_rustls::RustlsConfig) {
+    if !config.tls.reload_on_cert_change {
+        install_noop_sighup_handler("reload_on_cert_change is disabled");
+        return;
+    }
+    let cert_file = config.tls.cert_file.clone();
+    let key_file = config.tls.key_file.clone();
+    tokio::spawn(async move {
+        let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            tracing::error!("cannot install SIGHUP handler");
+            return;
+        };
+        while signal.recv().await.is_some() {
+            match tls.reload_from_pem_file(&cert_file, &key_file).await {
+                Ok(()) => tracing::info!("TLS certificate reloaded after SIGHUP"),
+                Err(error) => {
+                    tracing::error!(%error, "TLS certificate reload failed; previous certificate remains active")
+                }
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+fn install_noop_sighup_handler(reason: &'static str) {
+    tokio::spawn(async move {
+        let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            tracing::error!("cannot install SIGHUP handler");
+            return;
+        };
+        while signal.recv().await.is_some() {
+            tracing::info!(reason, "SIGHUP received; no reload action configured");
+        }
+    });
+}
+
 fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter()
         .position(|v| v == name)

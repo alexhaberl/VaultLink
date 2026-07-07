@@ -40,6 +40,9 @@ mod tests {
                 max_search_results: 10,
                 max_preview_size: 1024,
                 preview_extensions: vec!["txt".into()],
+                image_preview_extensions: vec!["jpg".into(), "png".into()],
+                pdf_preview_enabled: true,
+                max_media_preview_size: 1024,
                 blocked_extensions: vec![],
             },
             reverse_proxy: ReverseProxy {

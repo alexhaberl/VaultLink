@@ -14,6 +14,9 @@ pub struct RuntimeSettings {
     pub max_search_results: usize,
     pub max_preview_size: u64,
     pub preview_extensions: Vec<String>,
+    pub image_preview_extensions: Vec<String>,
+    pub pdf_preview_enabled: bool,
+    pub max_media_preview_size: u64,
 }
 
 impl RuntimeSettings {
@@ -31,6 +34,11 @@ impl RuntimeSettings {
             max_search_results: config.storage.max_search_results,
             max_preview_size: config.storage.max_preview_size,
             preview_extensions: normalize_extensions(&config.storage.preview_extensions),
+            image_preview_extensions: normalize_extensions(
+                &config.storage.image_preview_extensions,
+            ),
+            pdf_preview_enabled: config.storage.pdf_preview_enabled,
+            max_media_preview_size: config.storage.max_media_preview_size,
         }
     }
 
@@ -68,6 +76,11 @@ impl RuntimeSettings {
                 }
                 self.preview_extensions = extensions;
             }
+            "image_preview_extensions" => {
+                self.image_preview_extensions = parse_extension_list(value)?;
+            }
+            "pdf_preview_enabled" => self.pdf_preview_enabled = parse_bool(key, value)?,
+            "max_media_preview_size" => self.max_media_preview_size = parse_u64(key, value)?,
             _ => return Err(format!("unknown runtime setting: {key}")),
         }
         self.validate()
@@ -90,6 +103,7 @@ impl RuntimeSettings {
             || self.max_search_entries == 0
             || self.max_search_results == 0
             || self.max_preview_size == 0
+            || self.max_media_preview_size == 0
         {
             return Err("runtime limits must be positive".into());
         }
@@ -101,8 +115,20 @@ impl RuntimeSettings {
         }
         validate_extensions(&self.blocked_extensions)?;
         validate_extensions(&self.preview_extensions)?;
+        validate_extensions(&self.image_preview_extensions)?;
         if self.preview_extensions.is_empty() {
             return Err("preview_extensions must not be empty".into());
+        }
+        if self.image_preview_extensions.iter().any(|extension| {
+            matches!(
+                extension
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "svg" | "html" | "htm" | "xml" | "xhtml"
+            )
+        }) {
+            return Err("image_preview_extensions must not include active content types".into());
         }
         Ok(())
     }
@@ -130,6 +156,15 @@ impl RuntimeSettings {
             ("max_search_results", self.max_search_results.to_string()),
             ("max_preview_size", self.max_preview_size.to_string()),
             ("preview_extensions", self.preview_extensions.join(",")),
+            (
+                "image_preview_extensions",
+                self.image_preview_extensions.join(","),
+            ),
+            ("pdf_preview_enabled", self.pdf_preview_enabled.to_string()),
+            (
+                "max_media_preview_size",
+                self.max_media_preview_size.to_string(),
+            ),
         ]
     }
 }
@@ -153,6 +188,14 @@ fn parse_i64(key: &str, value: &str) -> Result<i64, String> {
         .trim()
         .parse::<i64>()
         .map_err(|_| format!("{key} must be an integer"))
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!("{key} must be a boolean")),
+    }
 }
 
 pub fn parse_extension_list(value: &str) -> Result<Vec<String>, String> {
@@ -215,6 +258,9 @@ mod tests {
                 max_search_results: 5,
                 max_preview_size: 6,
                 preview_extensions: vec!["txt".into(), ".MD".into()],
+                image_preview_extensions: vec!["jpg".into(), "png".into()],
+                pdf_preview_enabled: true,
+                max_media_preview_size: 1024,
                 blocked_extensions: vec!["exe".into()],
             },
             reverse_proxy: ReverseProxy::default(),

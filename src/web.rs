@@ -63,6 +63,10 @@ pub fn router(state: AppState) -> Router {
         .route("/logout", post(logout))
         .route("/admin", get(admin_browser))
         .route("/admin/preview", get(admin_preview))
+        .route(
+            "/admin/preview/raw",
+            get(admin_preview_raw).head(admin_preview_raw),
+        )
         .route("/admin/shares", get(shares_page).post(create_share))
         .route("/admin/shares/{id}/toggle", post(toggle_share))
         .route("/admin/shares/{id}/password", post(set_share_password))
@@ -72,6 +76,10 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/audit", get(audit_page))
         .route("/v/{token}", get(public_page))
         .route("/v/{token}/preview", get(public_preview))
+        .route(
+            "/v/{token}/preview/raw",
+            get(public_preview_raw).head(public_preview_raw),
+        )
         .route("/v/{token}/unlock", post(unlock_share))
         .route("/v/{token}/download", get(download).head(download))
         .route("/v/{token}/download.zip", get(download_zip))
@@ -542,7 +550,8 @@ async fn admin_browser(
     Ok(Html(page("Dateien", &body)))
 }
 
-async fn admin_preview(
+#[allow(dead_code)]
+async fn admin_preview_legacy(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<ShareQuery>,
@@ -576,9 +585,136 @@ async fn admin_preview(
             esc(&text),
             encoded(parent_path(&rel).as_deref().unwrap_or(""))
         ),
+        PreviewContent::Media { .. } => String::new(),
     };
     Ok(Html(page("Vorschau", &body)))
 }
+
+async fn admin_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ShareQuery>,
+) -> Result<Html<String>> {
+    session(&state, &headers, true).await?;
+    let raw = q
+        .path
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
+    let rel = path_security::validate_relative(&raw)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungueltiger Pfad"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let settings = runtime_settings(&state);
+    let secure_root = state.secure_root.clone();
+    let preview_path = rel.clone();
+    let content =
+        tokio::task::spawn_blocking(move || read_preview(secure_root, &preview_path, &settings))
+            .await
+            .map_err(internal)?
+            .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;
+    let body = match content {
+        PreviewContent::TooLarge { size } => preview_too_large_body(
+            &rel,
+            size,
+            "Datei ist groesser als das Preview-Limit.",
+            None,
+        ),
+        PreviewContent::Text(text) => format!(
+            r#"<section><h1>Vorschau</h1><p><code>/{}</code></p><pre>{}</pre><p><a href="/admin?path={}">Zurueck zum Ordner</a></p></section>"#,
+            esc(&rel),
+            esc(&text),
+            encoded(parent_path(&rel).as_deref().unwrap_or(""))
+        ),
+        PreviewContent::Media { kind, size } => admin_media_preview_body(&rel, kind, size),
+    };
+    Ok(Html(page("Vorschau", &body)))
+}
+
+async fn admin_preview_raw(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    Query(q): Query<ShareQuery>,
+) -> Result<Response> {
+    session(&state, &headers, true).await?;
+    let raw = q
+        .path
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
+    let rel = path_security::validate_relative(&raw)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungueltiger Pfad"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let settings = runtime_settings(&state);
+    let kind = preview_kind(&rel, &settings)
+        .filter(|kind| kind.is_media())
+        .ok_or(AppError(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Vorschau nicht erlaubt",
+        ))?;
+    raw_preview_response(
+        state.secure_root.clone(),
+        method,
+        headers,
+        rel,
+        kind,
+        settings.max_media_preview_size,
+    )
+    .await
+}
+
+fn admin_media_preview_body(path: &str, kind: PreviewKind, size: u64) -> String {
+    let raw = format!("/admin/preview/raw?path={}", encoded(path));
+    let viewer = media_viewer(kind, &raw);
+    format!(
+        r#"<section><h1>Vorschau</h1><p><code>/{}</code> <span class="muted">{}</span></p>{}<p><a href="/admin?path={}">Zurueck zum Ordner</a></p></section>"#,
+        esc(path),
+        human(size),
+        viewer,
+        encoded(parent_path(path).as_deref().unwrap_or(""))
+    )
+}
+
+fn media_viewer(kind: PreviewKind, raw_url: &str) -> String {
+    match kind {
+        PreviewKind::Image(_) => format!(
+            r#"<img src="{}" alt="Vorschau" style="max-width:100%;height:auto">"#,
+            esc(raw_url)
+        ),
+        PreviewKind::Pdf => format!(
+            r#"<iframe src="{}" title="PDF-Vorschau" style="width:100%;height:75vh;border:1px solid #303a55;border-radius:10px"></iframe>"#,
+            esc(raw_url)
+        ),
+        PreviewKind::Text => String::new(),
+    }
+}
+
+fn preview_too_large_body(
+    path: &str,
+    size: u64,
+    message: &str,
+    download_link: Option<&str>,
+) -> String {
+    let is_public = download_link.is_some();
+    let download = download_link
+        .map(|link| format!(r#"<p><a href="{}">Herunterladen</a></p>"#, esc(link)))
+        .unwrap_or_default();
+    let back = if is_public {
+        String::new()
+    } else {
+        format!(
+            r#"<p><a href="/admin?path={}">Zurueck</a></p>"#,
+            encoded(parent_path(path).as_deref().unwrap_or(""))
+        )
+    };
+    format!(
+        r#"<section><h1>Vorschau</h1><p><code>/{}</code></p><p class="muted">{} Groesse: {}.</p>{}{}</section>"#,
+        esc(path),
+        esc(message),
+        human(size),
+        download,
+        back
+    )
+}
+
 fn human(n: u64) -> String {
     if n >= 1_073_741_824 {
         format!("{:.1} GiB", n as f64 / 1_073_741_824.)
@@ -672,16 +808,67 @@ fn public_breadcrumbs(token: &str, path: &str) -> String {
     breadcrumbs(path, &format!("/v/{token}"))
 }
 
-fn preview_allowed(path: &str, settings: &RuntimeSettings) -> bool {
-    Path::new(path)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewKind {
+    Text,
+    Image(&'static str),
+    Pdf,
+}
+
+impl PreviewKind {
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Text => "text/plain; charset=utf-8",
+            Self::Image(content_type) => content_type,
+            Self::Pdf => "application/pdf",
+        }
+    }
+
+    fn is_media(self) -> bool {
+        matches!(self, Self::Image(_) | Self::Pdf)
+    }
+}
+
+fn preview_kind(path: &str, settings: &RuntimeSettings) -> Option<PreviewKind> {
+    let extension = Path::new(path)
         .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|extension| {
-            settings
-                .preview_extensions
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(extension.trim_start_matches('.')))
-        })
+        .and_then(|value| value.to_str())?
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if settings
+        .preview_extensions
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&extension))
+    {
+        return Some(PreviewKind::Text);
+    }
+    if settings.pdf_preview_enabled && extension == "pdf" {
+        return Some(PreviewKind::Pdf);
+    }
+    if settings
+        .image_preview_extensions
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&extension))
+    {
+        return image_content_type(&extension).map(PreviewKind::Image);
+    }
+    None
+}
+
+fn preview_allowed(path: &str, settings: &RuntimeSettings) -> bool {
+    preview_kind(path, settings).is_some()
+}
+
+fn image_content_type(extension: &str) -> Option<&'static str> {
+    match extension {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "avif" => Some("image/avif"),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -888,6 +1075,7 @@ fn build_zip(
 enum PreviewContent {
     TooLarge { size: u64 },
     Text(String),
+    Media { kind: PreviewKind, size: u64 },
 }
 
 fn read_preview(
@@ -895,18 +1083,29 @@ fn read_preview(
     path: &str,
     settings: &RuntimeSettings,
 ) -> std::io::Result<PreviewContent> {
-    if !preview_allowed(path, settings) {
-        return Err(std::io::Error::new(
+    let kind = preview_kind(path, settings).ok_or_else(|| {
+        std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "preview extension is not allowed",
-        ));
-    }
+        )
+    })?;
     let metadata = secure_root.metadata(path)?;
     if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "preview target is not a file",
         ));
+    }
+    if kind.is_media() {
+        if metadata.len() > settings.max_media_preview_size {
+            return Ok(PreviewContent::TooLarge {
+                size: metadata.len(),
+            });
+        }
+        return Ok(PreviewContent::Media {
+            kind,
+            size: metadata.len(),
+        });
     }
     if metadata.len() > settings.max_preview_size {
         return Ok(PreviewContent::TooLarge {
@@ -928,9 +1127,107 @@ fn read_preview(
     ))
 }
 
+async fn raw_preview_response(
+    secure_root: crate::secure_fs::SecureRoot,
+    method: Method,
+    headers: HeaderMap,
+    relative_file: String,
+    kind: PreviewKind,
+    max_size: u64,
+) -> Result<Response> {
+    let open_path = relative_file.clone();
+    let file = tokio::task::spawn_blocking(move || secure_root.open_file(&open_path))
+        .await
+        .map_err(internal)?
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfuegbar"))?;
+    if !file.metadata().map_err(internal)?.is_file() {
+        return Err(AppError(StatusCode::BAD_REQUEST, "Keine Datei"));
+    }
+    let mut f = tokio::fs::File::from_std(file);
+    let length = f.metadata().await.map_err(internal)?.len();
+    if length > max_size {
+        return Err(AppError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Vorschau-Limit erreicht",
+        ));
+    }
+    let range = match headers.get(header::RANGE) {
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(|value| parse_byte_range(value, length).ok())
+        {
+            Some(range) => Some(range),
+            None => {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+                response
+                    .headers_mut()
+                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                response.headers_mut().insert(
+                    header::CONTENT_RANGE,
+                    HeaderValue::from_str(&format!("bytes */{length}")).map_err(internal)?,
+                );
+                return Ok(response);
+            }
+        },
+        None => None,
+    };
+    let (start, end) = range.unwrap_or((0, length.saturating_sub(1)));
+    let response_length = if length == 0 { 0 } else { end - start + 1 };
+    if start > 0 {
+        f.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(internal)?;
+    }
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from_stream(ReaderStream::new(f.take(response_length)))
+    };
+    let mut r = Response::new(body);
+    if range.is_some() {
+        *r.status_mut() = StatusCode::PARTIAL_CONTENT;
+        r.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{length}")).map_err(internal)?,
+        );
+    }
+    let name = Path::new(&relative_file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("preview");
+    let filename = percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC);
+    r.headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    r.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&response_length.to_string()).map_err(internal)?,
+    );
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(kind.content_type()),
+    );
+    r.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("inline; filename*=UTF-8''{filename}")).map_err(internal)?,
+    );
+    r.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(r)
+}
+
 #[derive(Default, Deserialize)]
 struct ShareQuery {
     path: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct PreviewRawQuery {
+    path: Option<String>,
+    preview_token: Option<String>,
 }
 async fn shares_page(
     State(state): State<AppState>,
@@ -1389,6 +1686,9 @@ struct SettingsForm {
     max_search_results: String,
     max_preview_size: String,
     preview_extensions: String,
+    image_preview_extensions: String,
+    pdf_preview_enabled: Option<String>,
+    max_media_preview_size: String,
 }
 
 async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
@@ -1398,7 +1698,8 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     Ok(Html(page("Einstellungen", &body)))
 }
 
-fn settings_form(session: &Session, settings: &RuntimeSettings, message: &str) -> String {
+#[allow(dead_code)]
+fn settings_form_legacy(session: &Session, settings: &RuntimeSettings, message: &str) -> String {
     let message = if message.is_empty() {
         String::new()
     } else {
@@ -1419,6 +1720,37 @@ fn settings_form(session: &Session, settings: &RuntimeSettings, message: &str) -
         settings.max_search_results,
         settings.max_preview_size,
         esc(&settings.preview_extensions.join(",")),
+    )
+}
+
+fn settings_form(session: &Session, settings: &RuntimeSettings, message: &str) -> String {
+    let message = if message.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<p class="muted">{}</p>"#, esc(message))
+    };
+    format!(
+        r#"<section><h1>Einstellungen</h1>{message}<p class="muted">Runtime-Policy wird in SQLite gespeichert. Servermodus, Bind-Adresse, TLS-Dateien, Trusted Proxies, Root-Mount und Data-Dir bleiben file-/restart-basiert.</p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label>Globales Uploadlimit Bytes<br><input name="max_upload_size" type="number" min="1" value="{}" required></label><label>Blockierte Endungen<br><input name="blocked_extensions" value="{}"></label><label>Share-Passwort Min.-Laenge<br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label>Share-Passwort Max. Bytes<br><input name="share_password_max_bytes" type="number" min="8" value="{}" required></label><label>Unlock Minuten<br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label>ZIP Max. Bytes<br><input name="max_zip_size" type="number" min="1" value="{}" required></label><label>ZIP Max. Dateien<br><input name="max_zip_files" type="number" min="1" value="{}" required></label><label>Suche Max. Eintraege<br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label>Suche Max. Treffer<br><input name="max_search_results" type="number" min="1" value="{}" required></label><label>Text-Preview Max. Bytes<br><input name="max_preview_size" type="number" min="1" value="{}" required></label><label>Text-Preview-Endungen<br><input name="preview_extensions" value="{}" required></label><label>Media-Preview Max. Bytes<br><input name="max_media_preview_size" type="number" min="1" value="{}" required></label><label>Bild-Preview-Endungen<br><input name="image_preview_extensions" value="{}"></label><label><input type="checkbox" name="pdf_preview_enabled" {}> PDF-Preview aktiv</label><button>Speichern</button></form></section>"#,
+        esc(&session.csrf_token),
+        esc(&settings.public_base_url),
+        settings.max_upload_size,
+        esc(&settings.blocked_extensions.join(",")),
+        settings.share_password_min_length,
+        settings.share_password_max_bytes,
+        settings.share_unlock_minutes,
+        settings.max_zip_size,
+        settings.max_zip_files,
+        settings.max_search_entries,
+        settings.max_search_results,
+        settings.max_preview_size,
+        esc(&settings.preview_extensions.join(",")),
+        settings.max_media_preview_size,
+        esc(&settings.image_preview_extensions.join(",")),
+        if settings.pdf_preview_enabled {
+            "checked"
+        } else {
+            ""
+        },
     )
 }
 
@@ -1449,6 +1781,22 @@ async fn update_settings(
         ("max_search_results", form.max_search_results.as_str()),
         ("max_preview_size", form.max_preview_size.as_str()),
         ("preview_extensions", form.preview_extensions.as_str()),
+        (
+            "image_preview_extensions",
+            form.image_preview_extensions.as_str(),
+        ),
+        (
+            "pdf_preview_enabled",
+            if form.pdf_preview_enabled.is_some() {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+        (
+            "max_media_preview_size",
+            form.max_media_preview_size.as_str(),
+        ),
     ];
     next.apply_many(entries)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
@@ -1808,7 +2156,8 @@ fn joined_relative(base: &str, child: &str) -> Result<String> {
     Ok(path.to_string_lossy().replace('\\', "/"))
 }
 
-async fn public_preview(
+#[allow(dead_code)]
+async fn public_preview_legacy(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
@@ -1871,8 +2220,163 @@ async fn public_preview(
             esc(&text),
             esc(&download_link)
         ),
+        PreviewContent::Media { .. } => String::new(),
     };
     Ok(Html(page("Vorschau", &body)))
+}
+
+async fn public_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxPath(token): AxPath<String>,
+    Query(q): Query<BrowseQuery>,
+) -> Result<Html<String>> {
+    let sh = get_share(&state, &token).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    if !sh.permission.can_download() {
+        return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
+    }
+    let requested_path = q.path.clone().unwrap_or_default();
+    let relative_file = if sh.is_directory {
+        if requested_path.is_empty() {
+            return Err(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"));
+        }
+        joined_relative(&sh.relative_path, &requested_path)?
+    } else {
+        sh.relative_path.clone()
+    };
+    let settings = runtime_settings(&state);
+    let secure_root = state.secure_root.clone();
+    let preview_path = relative_file.clone();
+    let content =
+        tokio::task::spawn_blocking(move || read_preview(secure_root, &preview_path, &settings))
+            .await
+            .map_err(internal)?
+            .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;
+    let share_id = sh.id;
+    if !database(state.db.clone(), move |db| db.count_download(share_id)).await? {
+        return Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"));
+    }
+    audit(
+        &state,
+        "public".into(),
+        "preview",
+        Some(sh.id.to_string()),
+        None,
+    )
+    .await;
+    let share_rel = if sh.is_directory {
+        requested_path
+    } else {
+        String::new()
+    };
+    let download_link = if sh.is_directory {
+        format!(r#"/v/{token}/download?path={}"#, encoded(&share_rel))
+    } else {
+        format!("/v/{token}/download")
+    };
+    let body = match content {
+        PreviewContent::TooLarge { size } => preview_too_large_body(
+            &share_rel,
+            size,
+            "Datei ist groesser als das Preview-Limit.",
+            Some(&download_link),
+        ),
+        PreviewContent::Text(text) => format!(
+            r#"<section><h1>Vorschau</h1><pre>{}</pre><p><a href="{}">Herunterladen</a></p></section>"#,
+            esc(&text),
+            esc(&download_link)
+        ),
+        PreviewContent::Media { kind, size } => {
+            let preview_token = auth::random_token(32);
+            let stored_preview_token = preview_token.clone();
+            let share_id = sh.id;
+            let token_path = relative_file.clone();
+            let expires = Utc::now() + Duration::minutes(5);
+            database(state.db.clone(), move |db| {
+                db.create_preview_session(&stored_preview_token, share_id, &token_path, expires)
+            })
+            .await?;
+            let raw_url = if sh.is_directory {
+                format!(
+                    "/v/{token}/preview/raw?path={}&preview_token={}",
+                    encoded(&share_rel),
+                    encoded(&preview_token)
+                )
+            } else {
+                format!(
+                    "/v/{token}/preview/raw?preview_token={}",
+                    encoded(&preview_token)
+                )
+            };
+            let viewer = media_viewer(kind, &raw_url);
+            format!(
+                r#"<section><h1>Vorschau</h1><p class="muted">{} - Raw-Token laeuft nach wenigen Minuten ab.</p>{}<p><a href="{}">Herunterladen</a></p></section>"#,
+                human(size),
+                viewer,
+                esc(&download_link)
+            )
+        }
+    };
+    Ok(Html(page("Vorschau", &body)))
+}
+
+async fn public_preview_raw(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    AxPath(token): AxPath<String>,
+    Query(q): Query<PreviewRawQuery>,
+) -> Result<Response> {
+    let sh = get_share(&state, &token).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    if !sh.permission.can_download() {
+        return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
+    }
+    let requested_path = q.path.clone().unwrap_or_default();
+    let relative_file = if sh.is_directory {
+        if requested_path.is_empty() {
+            return Err(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"));
+        }
+        joined_relative(&sh.relative_path, &requested_path)?
+    } else {
+        sh.relative_path.clone()
+    };
+    let preview_token = q
+        .preview_token
+        .ok_or(AppError(StatusCode::FORBIDDEN, "Preview-Token fehlt"))?;
+    let share_id = sh.id;
+    let token_path = relative_file.clone();
+    let token_valid = database(state.db.clone(), move |db| {
+        db.preview_session(&preview_token, share_id, &token_path)
+    })
+    .await?;
+    if !token_valid {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            "Preview-Token ungueltig oder abgelaufen",
+        ));
+    }
+    let settings = runtime_settings(&state);
+    let kind = preview_kind(&relative_file, &settings)
+        .filter(|kind| kind.is_media())
+        .ok_or(AppError(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Vorschau nicht erlaubt",
+        ))?;
+    raw_preview_response(
+        state.secure_root.clone(),
+        method,
+        headers,
+        relative_file,
+        kind,
+        settings.max_media_preview_size,
+    )
+    .await
 }
 
 async fn download_zip(
@@ -2204,6 +2708,17 @@ mod tests {
                 max_search_results: 100,
                 max_preview_size: 1024,
                 preview_extensions: vec!["txt".into(), "log".into(), "md".into()],
+                image_preview_extensions: vec![
+                    "jpg".into(),
+                    "jpeg".into(),
+                    "png".into(),
+                    "gif".into(),
+                    "webp".into(),
+                    "bmp".into(),
+                    "avif".into(),
+                ],
+                pdf_preview_enabled: true,
+                max_media_preview_size: 1024 * 1024,
                 blocked_extensions: vec!["exe".into()],
             },
             reverse_proxy: ReverseProxy::default(),
@@ -2275,6 +2790,31 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn preview_token_from(html: &str) -> String {
+        let marker = "preview_token=";
+        let start = html.find(marker).expect("preview token in html") + marker.len();
+        let encoded = html[start..]
+            .chars()
+            .take_while(|c| *c != '"' && *c != '&')
+            .collect::<String>();
+        percent_encoding::percent_decode_str(&encoded)
+            .decode_utf8()
+            .unwrap()
+            .into_owned()
+    }
+
+    fn range_request(method: Method, uri: &str, range: Option<&str>) -> Request {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(range) = range {
+            builder = builder.header(header::RANGE, range);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        request
     }
     #[test]
     fn html_is_escaped() {
@@ -2697,7 +3237,7 @@ mod tests {
         let mut settings_request = request(
             Method::POST,
             "/admin/settings",
-            "csrf=csrf-token&public_base_url=http%3A%2F%2Flocalhost%3A9999&max_upload_size=16&blocked_extensions=exe%2Cbat&share_password_min_length=12&share_password_max_bytes=128&share_unlock_minutes=30&max_zip_size=2048&max_zip_files=20&max_search_entries=200&max_search_results=20&max_preview_size=64&preview_extensions=txt%2Clog",
+            "csrf=csrf-token&public_base_url=http%3A%2F%2Flocalhost%3A9999&max_upload_size=16&blocked_extensions=exe%2Cbat&share_password_min_length=12&share_password_max_bytes=128&share_unlock_minutes=30&max_zip_size=2048&max_zip_files=20&max_search_entries=200&max_search_results=20&max_preview_size=64&preview_extensions=txt%2Clog&image_preview_extensions=jpg%2Cpng&pdf_preview_enabled=on&max_media_preview_size=4096",
         );
         settings_request
             .headers_mut()
@@ -2723,9 +3263,15 @@ mod tests {
         std::fs::create_dir_all(root.path().join("docs/sub")).unwrap();
         std::fs::write(root.path().join("docs/note.txt"), b"<b>hello</b>").unwrap();
         std::fs::write(root.path().join("docs/bad.html"), b"<script>x</script>").unwrap();
+        std::fs::write(
+            root.path().join("docs/image.png"),
+            b"\x89PNG\r\n\x1a\npreview",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("docs/file.pdf"), b"%PDF-1.7\npreview").unwrap();
         let state = test_state(root.path(), data.path());
         state.db.create_admin("admin", "hash", "secret").unwrap();
-        state
+        let du_id = state
             .db
             .create_share(
                 "du",
@@ -2750,6 +3296,21 @@ mod tests {
                 &Permission::UploadOnly,
                 None,
                 None,
+                None,
+                1,
+                None,
+            )
+            .unwrap();
+        let media_id = state
+            .db
+            .create_share(
+                "media",
+                None,
+                "docs",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
                 None,
                 1,
                 None,
@@ -2782,6 +3343,112 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        let image_preview = response_text(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/media/preview?path=image.png", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(image_preview.contains("<img"));
+        let image_token = preview_token_from(&image_preview);
+        assert!(!image_token.is_empty());
+        assert!(state
+            .db
+            .preview_session(&image_token, media_id, "docs/image.png")
+            .unwrap());
+        let raw_image_uri =
+            format!("/v/media/preview/raw?path=image.png&preview_token={image_token}");
+        let raw_image = app
+            .clone()
+            .oneshot(range_request(
+                Method::GET,
+                &raw_image_uri,
+                Some("bytes=0-3"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(raw_image.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            raw_image.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            raw_image
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .unwrap(),
+            "inline; filename*=UTF-8''image%2Epng"
+        );
+        assert_eq!(
+            raw_image.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        let head_image = app
+            .clone()
+            .oneshot(range_request(Method::HEAD, &raw_image_uri, None))
+            .await
+            .unwrap();
+        assert_eq!(head_image.status(), StatusCode::OK);
+        let bad_range = app
+            .clone()
+            .oneshot(range_request(
+                Method::GET,
+                &raw_image_uri,
+                Some("bytes=999-1000"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/media/preview?path=image.png", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
+        );
+
+        let pdf_preview = response_text(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/du/preview?path=file.pdf", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(pdf_preview.contains("<iframe"));
+        let pdf_token = preview_token_from(&pdf_preview);
+        assert!(state
+            .db
+            .preview_session(&pdf_token, du_id, "docs/file.pdf")
+            .unwrap());
+        let raw_pdf = app
+            .clone()
+            .oneshot(range_request(
+                Method::GET,
+                &format!("/v/du/preview/raw?path=file.pdf&preview_token={pdf_token}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(raw_pdf.status(), StatusCode::OK);
+        assert_eq!(
+            raw_pdf.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/pdf"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    Method::GET,
+                    "/v/du/preview/raw?path=image.png&preview_token=wrong",
+                    "",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
         );
 
         let zip = app

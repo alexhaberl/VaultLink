@@ -14,6 +14,9 @@ max_search_entries = 50000
 max_search_results = 500
 max_preview_size = 1048576
 preview_extensions = ["txt", "log", "md", "csv", "json", "toml", "yaml", "yml", "ini", "conf"]
+image_preview_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"]
+pdf_preview_enabled = true
+max_media_preview_size = 104857600
 blocked_extensions = ["exe", "dll", "com", "bat", "cmd", "ps1", "sh"]
 
 [security]
@@ -34,6 +37,7 @@ trust_x_forwarded_headers = false
 
 [tls]
 enabled = false
+certificate_source = "files"
 hsts_enabled = false
 reload_on_cert_change = false
 
