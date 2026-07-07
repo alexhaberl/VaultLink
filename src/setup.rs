@@ -408,7 +408,6 @@ mod tests {
         form.tls_enabled = Some("on".into());
         form.certificate_source = "letsencrypt".into();
         form.letsencrypt_contact_email = "admin@example.test".into();
-        form.hsts_enabled = Some("on".into());
         let result = build_and_store(&config_path, form).await.unwrap();
         assert!(!result.totp_secret.is_empty());
         let config = Config::load(&config_path).unwrap();

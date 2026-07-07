@@ -171,14 +171,14 @@ enabled = false
 [tls]
 enabled = true
 certificate_source = "letsencrypt"
-hsts_enabled = true
+hsts_enabled = false
 reload_on_cert_change = false
 letsencrypt_contact_email = "admin@example.com"
 letsencrypt_cache_dir = "acme"
 letsencrypt_staging = true
 ```
 
-Erst mit `letsencrypt_staging = true` testen. Fuer Production auf `false` setzen. Dieser Modus funktioniert nur, wenn VaultLink selbst aus dem Internet auf Port 443 erreichbar ist.
+Erst mit `letsencrypt_staging = true` und `hsts_enabled = false` testen. Staging-Zertifikate sind absichtlich nicht browser-vertrauenswuerdig; HSTS darf dabei nicht aktiv sein. Fuer Production auf `letsencrypt_staging = false` setzen und danach `hsts_enabled = true` aktivieren. Dieser Modus funktioniert nur, wenn VaultLink selbst aus dem Internet auf Port 443 erreichbar ist.
 
 ### ZeroSSL Auto-Renewal Setup
 

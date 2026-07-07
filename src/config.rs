@@ -355,6 +355,14 @@ impl Config {
                 "HSTS is invalid in development mode".into(),
             ));
         }
+        if self.tls.hsts_enabled
+            && self.tls.certificate_source == CertificateSource::LetsEncrypt
+            && self.tls.letsencrypt_staging
+        {
+            return Err(ConfigError::Invalid(
+                "HSTS must be disabled while letsencrypt_staging is true".into(),
+            ));
+        }
         if self.tls.reload_on_cert_change && !matches!(self.server.mode, ServerMode::StandaloneTls)
         {
             return Err(ConfigError::Invalid(
@@ -622,6 +630,26 @@ mod tests {
         c.reverse_proxy.enabled = true;
         c.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn letsencrypt_staging_rejects_hsts() {
+        let mut c = base();
+        c.server.mode = ServerMode::StandaloneTls;
+        c.server.production_mode = true;
+        c.server.listen_address = "0.0.0.0:443".into();
+        c.server.public_base_url = "https://files.example.test".into();
+        c.security.secure_cookie = true;
+        c.tls.enabled = true;
+        c.tls.certificate_source = CertificateSource::LetsEncrypt;
+        c.tls.letsencrypt_contact_email = "admin@example.test".into();
+        c.tls.letsencrypt_cache_dir = "acme".into();
+        c.tls.letsencrypt_staging = true;
+        c.tls.hsts_enabled = true;
+        assert!(c.validate().is_err());
+
+        c.tls.hsts_enabled = false;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

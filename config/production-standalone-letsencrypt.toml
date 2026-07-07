@@ -38,7 +38,7 @@ trust_x_forwarded_headers = false
 [tls]
 enabled = true
 certificate_source = "letsencrypt"
-hsts_enabled = true
+hsts_enabled = false
 reload_on_cert_change = false
 letsencrypt_contact_email = "admin@example.com"
 letsencrypt_cache_dir = "acme"
