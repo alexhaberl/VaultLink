@@ -23,9 +23,9 @@ security-test:
 	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi
 
 fuzz:
-	cargo fuzz run path_normalization -- -max_total_time=600
-	cargo fuzz run byte_range -- -max_total_time=600
-	cargo fuzz run filename -- -max_total_time=600
+	cargo +nightly-2026-07-01 fuzz run path_normalization -- -max_total_time=600
+	cargo +nightly-2026-07-01 fuzz run byte_range -- -max_total_time=600
+	cargo +nightly-2026-07-01 fuzz run filename -- -max_total_time=600
 
 lint:
 	cargo fmt --all -- --check

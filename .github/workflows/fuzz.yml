@@ -11,12 +11,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-01
       - name: Install cargo-fuzz
         run: cargo install --locked cargo-fuzz
       - name: Path normalization (10 minutes)
-        run: cargo fuzz run path_normalization -- -max_total_time=600
+        run: cargo +nightly-2026-07-01 fuzz run path_normalization -- -max_total_time=600
       - name: Byte ranges (10 minutes)
-        run: cargo fuzz run byte_range -- -max_total_time=600
+        run: cargo +nightly-2026-07-01 fuzz run byte_range -- -max_total_time=600
       - name: Filenames (10 minutes)
-        run: cargo fuzz run filename -- -max_total_time=600
+        run: cargo +nightly-2026-07-01 fuzz run filename -- -max_total_time=600
