@@ -34,6 +34,9 @@ const COOKIE: &str = "vaultlink_session";
 pub struct AppError(StatusCode, &'static str);
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if self.0.is_redirection() {
+            return Redirect::to(self.1).into_response();
+        }
         (
             self.0,
             Html(page(
@@ -138,13 +141,12 @@ fn cookie(headers: &HeaderMap) -> Option<&str> {
         })
 }
 fn session(state: &AppState, headers: &HeaderMap, mfa: bool) -> Result<(String, Session)> {
-    let token =
-        cookie(headers).ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+    let token = cookie(headers).ok_or(AppError(StatusCode::SEE_OTHER, "/login"))?;
     let s = state
         .db
         .session(token)
         .map_err(internal)?
-        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sitzung abgelaufen"))?;
+        .ok_or(AppError(StatusCode::SEE_OTHER, "/login"))?;
     if mfa && !s.mfa_verified {
         return Err(AppError(
             StatusCode::FORBIDDEN,
@@ -757,6 +759,20 @@ mod tests {
     #[test]
     fn html_is_escaped() {
         assert_eq!(esc("<script>&\""), "&lt;script&gt;&amp;&quot;");
+    }
+
+    #[test]
+    fn missing_session_error_redirects_to_login() {
+        let response = AppError(StatusCode::SEE_OTHER, "/login").into_response();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+
+    #[test]
+    fn invalid_credentials_remain_an_error() {
+        let response = AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten").into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(header::LOCATION).is_none());
     }
     #[test]
     fn permissions() {
