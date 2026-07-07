@@ -36,8 +36,8 @@ while [ "$downloads" -lt 40 ]; do
     downloads=$((downloads + 1))
 done
 download_failed=0
-for pid in $download_pids; do
-    wait "$pid" || download_failed=1
+for wait_pid in $download_pids; do
+    wait "$wait_pid" || download_failed=1
 done
 [ "$download_failed" -eq 0 ] || { echo "download stream gate failed" >&2; exit 1; }
 
@@ -51,8 +51,8 @@ while [ "$uploads" -lt 10 ]; do
     uploads=$((uploads + 1))
 done
 upload_failed=0
-for pid in $upload_pids; do
-    wait "$pid" || upload_failed=1
+for wait_pid in $upload_pids; do
+    wait "$wait_pid" || upload_failed=1
 done
 [ "$upload_failed" -eq 0 ] || { echo "upload stream gate failed" >&2; exit 1; }
 
