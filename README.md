@@ -231,7 +231,7 @@ cargo run -- init-admin --config config/development.toml --username admin
 make run
 ```
 
-`make sample-data` erzeugt `dev/mount` und `dev/data`. WSL braucht kein systemd und kein TLS.
+`make sample-data` erzeugt `dev/mount` und `dev/data`. WSL braucht kein systemd und kein TLS. Wenn Docker in WSL verfügbar ist, prüft `make docker-setup-smoke` das lokale Setup-UI in einem frischen Debian-Container.
 
 ## Troubleshooting
 

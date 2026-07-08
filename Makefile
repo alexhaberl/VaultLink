@@ -1,4 +1,4 @@
-.PHONY: dev-setup sample-data test security-test fuzz lint build run
+.PHONY: dev-setup sample-data test security-test fuzz lint build run docker-setup-smoke
 
 CONFIG ?= config/development.toml
 
@@ -36,3 +36,8 @@ build:
 
 run: sample-data
 	cargo run -- --config $(CONFIG)
+
+docker-setup-smoke:
+	@docker version >/dev/null 2>&1 || (echo "Docker fehlt oder WSL-Integration ist nicht aktiv" && exit 1)
+	docker build -f deploy/docker/Dockerfile.setup-smoke -t vaultlink:setup-smoke .
+	docker run --rm vaultlink:setup-smoke

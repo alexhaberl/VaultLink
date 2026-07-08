@@ -1,0 +1,7 @@
+.git
+target
+fuzz/target
+dev
+*.tmp
+*.tar
+*.tar.gz

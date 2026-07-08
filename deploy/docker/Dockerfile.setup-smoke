@@ -1,0 +1,17 @@
+ARG BASE_IMAGE=rust:1-trixie
+FROM ${BASE_IMAGE}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        pkg-config \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+COPY . /work
+
+RUN cargo build --release --locked
+
+CMD ["bash", "deploy/docker/setup-smoke.sh"]
