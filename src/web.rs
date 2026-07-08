@@ -256,7 +256,7 @@ struct DiskStats {
 fn disk_stats(path: &Path) -> Option<DiskStats> {
     #[cfg(unix)]
     {
-        return disk_stats_unix(path);
+        disk_stats_unix(path)
     }
     #[cfg(not(unix))]
     {
