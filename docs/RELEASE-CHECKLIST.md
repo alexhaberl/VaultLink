@@ -55,19 +55,19 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] `cargo audit --deny warnings`
   - `cargo-audit 0.22.2`, keine bekannten Vulnerabilities/Warnings.
 
-## Bereits auf Debian-13-VM geprÜft, vor finalem Runtime-Deploy erneut auszufÜhren
+## Bereits auf Debian 13 geprüft, vor finalem Runtime-Deploy erneut auszuführen
 
-- [x] Debian-13-VM `192.168.1.240`, temporärer Build in `/tmp/vaultlink-feature-check`
+- [x] Debian-13-amd64-Testsystem, temporärer Build in einem nicht versionierten Arbeitsverzeichnis
   - OS: Debian GNU/Linux 13.5, amd64, Kernel 6.12.
   - `cargo fmt --all -- --check`: grün.
   - `cargo test --locked --all-targets`: grün, inklusive Linux-`openat2`/Symlink-Tests.
   - `cargo clippy --locked --all-targets -- -D warnings`: grün.
   - `cargo build --release --locked`: grün.
   - `cargo check --manifest-path fuzz/Cargo.toml --locked`: grün.
-- [x] Nach diesem Feature-Update erneut auf `192.168.1.240` bauen/deployen und Public-Nginx-Smoke ausfÜhren.
-- [x] Cloud-/Standalone-VM `10.10.10.237` erneut bauen/deployen und Public-HTTPS-Smoke ausfÜhren.
+- [x] Nach diesem Feature-Update erneut auf dem Reverse-Proxy-Testsystem bauen/deployen und Public-Smoke ausführen.
+- [x] Standalone-Testsystem erneut bauen/deployen und Public-HTTPS-Smoke ausführen.
 
-## Noch auszufÜhrende Release-Gates
+## Noch auszuführende Release-Gates
 
 - [ ] Fuzz-Gate jeweils zehn Minuten:
   - Pfadnormalisierung,
@@ -85,21 +85,21 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
   - LICENSE,
   - Beispielkonfigurationen,
   - systemd/deploy-Dateien,
-  - SHA-256-PrÜfsummen,
+  - SHA-256-Prüfsummen,
   - CycloneDX-SBOM,
   - deterministisches `tar.gz`,
   - Minisign-Signatur nur beim Tag-Release.
 
-## VM-/Public-Gates vor finalem Soak
+## Staging- und Public-Gates vor finalem Soak
 
-- [ ] Finalen Release-Candidate auf der Debian-VM bauen/deployen.
+- [ ] Finalen Release-Candidate auf dem Staging-System bauen/deployen.
 - [ ] SQLite-Backup vor Upgrade bei gestopptem Dienst erstellen.
-- [ ] Upgrade-Test durchfÜhren.
-- [ ] Rollback-Test durchfÜhren:
+- [ ] Upgrade-Test durchführen.
+- [ ] Rollback-Test durchführen:
   - Dienst stoppen,
   - vorheriges Binary und SQLite-Backup wiederherstellen,
   - Dienst starten,
-  - Smoke-Test ausfÜhren.
+  - Smoke-Test ausführen.
 - [ ] Debian-13-amd64 Lastprofil erneut:
   - 100 parallele Nutzer,
   - 40 Downloadstreams,
@@ -109,7 +109,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
   - keine korrupten Dateien,
   - p95 Metadatenseiten < 750 ms,
   - maximal 256 MiB zusätzlicher RSS bei 40 Streams.
-- [ ] Öffentlicher Nginx-Pfad `vaultlink.haberl.tech` erneut prüfen:
+- [ ] Konfigurierten öffentlichen Reverse-Proxy-Endpunkt erneut prüfen:
   - TLS und HTTP->HTTPS Redirect,
   - Security Header,
   - Secure/SameSite/HttpOnly Cookies,
@@ -129,7 +129,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
   - Download/Range/HEAD,
   - Upload-only darf nicht listen/downloaden/previewen,
   - Revoke/Expiry/Downloadlimit.
-- [ ] Standalone Auto-TLS nur mit Let's-Encrypt-Staging auf direkt erreichbarer Test-IP/Domain prüfen; nicht auf der aktuellen Nginx-VM.
+- [ ] Standalone Auto-TLS nur mit Let's-Encrypt-Staging auf einem direkt erreichbaren Standalone-Testendpunkt prüfen; nicht hinter einem Reverse Proxy.
 
 ## Finaler 72h-Soak
 
@@ -144,9 +144,9 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 ## Tag-Freigabe
 
 - [ ] Sauberer Worktree.
-- [ ] GrÜner CI-Run auf finalem `main`.
+- [ ] Grüner CI-Run auf finalem `main`.
 - [ ] Release-Dry-Run und `cargo-audit` weiterhin grün.
-- [ ] VM- und Public-Gates grün.
+- [ ] Staging- und Public-Gates grün.
 - [ ] 72h-Soak bestanden.
 - [ ] Annotierten Tag `v0.2.0` erstellen.
 - [ ] Tag-Release-Workflow prüfen:
