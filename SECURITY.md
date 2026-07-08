@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-`0.1.0-beta.1` is a private prerelease. Security fixes are made only on the latest prerelease.
+`0.2.0` is a private release. Security fixes are made only on the latest private release.
 
 ## Reporting a vulnerability
 

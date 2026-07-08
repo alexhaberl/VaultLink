@@ -71,10 +71,10 @@ pub struct Storage {
 }
 
 fn default_upload_size() -> u64 {
-    100 * 1024 * 1024
+    100_000_000
 }
 fn default_zip_size() -> u64 {
-    1024 * 1024 * 1024
+    1_000_000_000
 }
 fn default_zip_files() -> usize {
     10_000
@@ -86,7 +86,7 @@ fn default_search_results() -> usize {
     500
 }
 fn default_preview_size() -> u64 {
-    1024 * 1024
+    1_000_000
 }
 fn default_preview_extensions() -> Vec<String> {
     [
@@ -103,7 +103,7 @@ fn default_image_preview_extensions() -> Vec<String> {
         .collect()
 }
 fn default_media_preview_size() -> u64 {
-    100 * 1024 * 1024
+    100_000_000
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

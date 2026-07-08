@@ -6,7 +6,7 @@ pub struct RuntimeSettings {
     pub max_upload_size: u64,
     pub blocked_extensions: Vec<String>,
     pub share_password_min_length: usize,
-    pub share_password_max_bytes: usize,
+    pub share_password_max_length: usize,
     pub share_unlock_minutes: i64,
     pub max_zip_size: u64,
     pub max_zip_files: usize,
@@ -26,7 +26,7 @@ impl RuntimeSettings {
             max_upload_size: config.storage.max_upload_size,
             blocked_extensions: normalize_extensions(&config.storage.blocked_extensions),
             share_password_min_length: config.security.share_password_min_length,
-            share_password_max_bytes: config.security.share_password_max_bytes,
+            share_password_max_length: config.security.share_password_max_bytes,
             share_unlock_minutes: config.security.share_unlock_minutes,
             max_zip_size: config.storage.max_zip_size,
             max_zip_files: config.storage.max_zip_files,
@@ -58,8 +58,8 @@ impl RuntimeSettings {
             "share_password_min_length" => {
                 self.share_password_min_length = parse_usize(key, value)?;
             }
-            "share_password_max_bytes" => {
-                self.share_password_max_bytes = parse_usize(key, value)?;
+            "share_password_max_length" | "share_password_max_bytes" => {
+                self.share_password_max_length = parse_usize(key, value)?;
             }
             "share_unlock_minutes" => {
                 self.share_unlock_minutes = parse_i64(key, value)?;
@@ -108,7 +108,7 @@ impl RuntimeSettings {
             return Err("runtime limits must be positive".into());
         }
         if self.share_password_min_length < 8
-            || self.share_password_max_bytes < self.share_password_min_length
+            || self.share_password_max_length < self.share_password_min_length
             || self.share_unlock_minutes <= 0
         {
             return Err("invalid share password policy".into());
@@ -143,8 +143,8 @@ impl RuntimeSettings {
                 self.share_password_min_length.to_string(),
             ),
             (
-                "share_password_max_bytes",
-                self.share_password_max_bytes.to_string(),
+                "share_password_max_length",
+                self.share_password_max_length.to_string(),
             ),
             (
                 "share_unlock_minutes",
@@ -208,6 +208,18 @@ pub fn parse_extension_list(value: &str) -> Result<Vec<String>, String> {
         .collect::<Vec<_>>();
     validate_extensions(&extensions)?;
     Ok(extensions)
+}
+
+pub fn extension_is_blocked(name: &str, blocked: &[String]) -> bool {
+    let extension = std::path::Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    blocked.iter().any(|value| {
+        value
+            .trim_start_matches('.')
+            .eq_ignore_ascii_case(extension)
+    })
 }
 
 fn normalize_extensions(values: &[String]) -> Vec<String> {
@@ -281,5 +293,9 @@ mod tests {
         assert_eq!(settings.preview_extensions, ["txt", "log", "json"]);
         assert!(settings.apply("blocked_extensions", "../x").is_err());
         assert!(settings.apply("max_zip_files", "0").is_err());
+        let blocked = parse_extension_list("exe,.SH").unwrap();
+        assert!(extension_is_blocked("payload.ExE", &blocked));
+        assert!(extension_is_blocked("script.sh", &blocked));
+        assert!(!extension_is_blocked("report.pdf", &blocked));
     }
 }

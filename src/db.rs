@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
@@ -18,12 +18,14 @@ pub struct Admin {
     pub username: String,
     pub password_hash: String,
     pub totp_secret: String,
+    pub active: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AdminSummary {
     pub id: i64,
     pub username: String,
     pub created_at: String,
+    pub active: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -224,6 +226,20 @@ CREATE INDEX IF NOT EXISTS idx_preview_exp ON public_preview_sessions(expires_at
         }
         tx.pragma_update(None, "user_version", 5)?;
     }
+    if version < 6 {
+        let has_active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('admins') WHERE name='active')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_active {
+            tx.execute(
+                "ALTER TABLE admins ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+        tx.pragma_update(None, "user_version", 6)?;
+    }
     tx.commit()
 }
 
@@ -238,7 +254,7 @@ impl Database {
         totp_secret: &str,
     ) -> rusqlite::Result<()> {
         self.conn().execute(
-            "INSERT INTO admins(username,password_hash,totp_secret,created_at) VALUES(?1,?2,?3,?4)",
+            "INSERT INTO admins(username,password_hash,totp_secret,created_at,active) VALUES(?1,?2,?3,?4,1)",
             params![
                 username,
                 password_hash,
@@ -251,7 +267,7 @@ impl Database {
     pub fn admin(&self, username: &str) -> rusqlite::Result<Option<Admin>> {
         self.conn()
             .query_row(
-                "SELECT id,username,password_hash,totp_secret FROM admins WHERE username=?1",
+                "SELECT id,username,password_hash,totp_secret,active FROM admins WHERE username=?1 AND active=1",
                 [username],
                 |r| {
                     Ok(Admin {
@@ -259,6 +275,7 @@ impl Database {
                         username: r.get(1)?,
                         password_hash: r.get(2)?,
                         totp_secret: r.get(3)?,
+                        active: r.get::<_, i64>(4)? != 0,
                     })
                 },
             )
@@ -268,10 +285,16 @@ impl Database {
         self.conn()
             .query_row("SELECT COUNT(*) FROM admins", [], |row| row.get(0))
     }
+    pub fn active_admin_count(&self) -> rusqlite::Result<i64> {
+        self.conn()
+            .query_row("SELECT COUNT(*) FROM admins WHERE active=1", [], |row| {
+                row.get(0)
+            })
+    }
     pub fn list_admins(&self) -> rusqlite::Result<Vec<AdminSummary>> {
         let c = self.conn();
         let mut statement = c.prepare(
-            "SELECT id,username,created_at FROM admins ORDER BY username COLLATE NOCASE",
+            "SELECT id,username,created_at,active FROM admins ORDER BY username COLLATE NOCASE",
         )?;
         let admins = statement
             .query_map([], |row| {
@@ -279,10 +302,24 @@ impl Database {
                     id: row.get(0)?,
                     username: row.get(1)?,
                     created_at: row.get(2)?,
+                    active: row.get::<_, i64>(3)? != 0,
                 })
             })?
             .collect();
         admins
+    }
+    pub fn set_admin_active(&self, id: i64, active: bool) -> rusqlite::Result<bool> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE admins SET active=?2 WHERE id=?1",
+            params![id, active as i64],
+        )? == 1;
+        if changed && !active {
+            transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
+        }
+        transaction.commit()?;
+        Ok(changed)
     }
     pub fn create_session(
         &self,
@@ -303,7 +340,7 @@ impl Database {
         Ok(())
     }
     pub fn session(&self, token: &str) -> rusqlite::Result<Option<Session>> {
-        self.conn().query_row("SELECT a.id,a.username,s.csrf_token,s.mfa_verified FROM sessions s JOIN admins a ON a.id=s.admin_id WHERE s.token_hash=?1 AND s.expires_at>?2",params![token_hash(token),Utc::now().to_rfc3339()],|r|Ok(Session{admin_id:r.get(0)?,username:r.get(1)?,csrf_token:r.get(2)?,mfa_verified:r.get::<_,i64>(3)?!=0})).optional()
+        self.conn().query_row("SELECT a.id,a.username,s.csrf_token,s.mfa_verified FROM sessions s JOIN admins a ON a.id=s.admin_id WHERE s.token_hash=?1 AND s.expires_at>?2 AND a.active=1",params![token_hash(token),Utc::now().to_rfc3339()],|r|Ok(Session{admin_id:r.get(0)?,username:r.get(1)?,csrf_token:r.get(2)?,mfa_verified:r.get::<_,i64>(3)?!=0})).optional()
     }
     pub fn verify_mfa(&self, token: &str) -> rusqlite::Result<bool> {
         Ok(self.conn().execute(

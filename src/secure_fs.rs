@@ -288,7 +288,7 @@ mod linux {
     #[cfg(target_arch = "x86_64")]
     const SYS_OPENAT2: c_long = 437;
     #[cfg(not(target_arch = "x86_64"))]
-    compile_error!("VaultLink v0.1.0-beta.1 Linux release supports amd64 only");
+    compile_error!("VaultLink v0.2.0 Linux release supports amd64 only");
 
     fn c_path(path: impl AsRef<Path>) -> io::Result<CString> {
         CString::new(path.as_ref().as_os_str().as_bytes())

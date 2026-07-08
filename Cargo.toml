@@ -1,6 +1,6 @@
 [package]
 name = "vaultlink"
-version = "0.1.0-beta.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Secure file sharing for an existing Linux mountpoint"
@@ -20,6 +20,7 @@ percent-encoding = "2"
 rand = "0.8"
 rpassword = "7"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rustix = { version = "1", features = ["fs"] }
 rustls-acme = { version = "0.15.3", features = ["axum"] }
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"

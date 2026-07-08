@@ -46,3 +46,10 @@ path = "fuzz_targets/upload_overwrite_policy.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "upload_validation_policy"
+path = "fuzz_targets/upload_validation_policy.rs"
+test = false
+doc = false
+bench = false

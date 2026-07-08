@@ -1,10 +1,10 @@
-# v0.1.0-beta.1 release checklist
+# v0.2.0 release checklist
 
-Stand: 2026-07-07 nach PDF-/Bildpreview und Built-in-Let's-Encrypt-Standalone-TLS.
+Stand: 2026-07-08 nach UI-/Upload-Polish, Built-in-Let's-Encrypt-Standalone-TLS und Upload-Fuzzing.
 
-Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschliesslich bei sauberem Worktree und vollstaendig gruenen Gates gesetzt.
+Ziel: privates GitHub-Release fuer Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschliesslich bei sauberem Worktree und vollstaendig gruenen Gates gesetzt.
 
-## Feature-Scope fuer beta1
+## Feature-Scope fuer 0.2.0
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
 - [x] Root-begrenzter Dateibrowser mit Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der Oberflaeche.
@@ -27,8 +27,11 @@ Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt 
 - [x] Reverse-Proxy-Modus, Standalone-TLS-Modus, SIGHUP-Zertifikatsreload fuer PEM-Dateien.
 - [x] Optionaler Built-in-Let's-Encrypt-Standalone-TLS-Modus ueber `tls-alpn-01` und `rustls-acme`.
 - [x] ZeroSSL/acme.sh Renewal-Dokumentation und systemd-Beispiele.
+- [x] UI-/UX-Polish mit getrennten Auth/Public/Admin-Shells, Logo/Favicon, deutschem Date-Time-Picker, decimalen MB/GB-Einheiten und konsistenten Buttons/Switches.
+- [x] Public Upload-Fehlerseiten fuer validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Groessenlimits, fehlende Dateinamen und Speicherfehler.
+- [x] Upload-Fuzzing fuer Overwrite- und Validierungslogik.
 
-## Bewusste Nicht-Ziele fuer beta1
+## Bewusste Nicht-Ziele fuer 0.2.0
 
 - DEB-Paket.
 - ARM64-Build.
@@ -37,7 +40,7 @@ Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt 
 - Inline-Preview fuer HTML, SVG, Office-Dateien, Audio oder Video.
 - Built-in ACME hinter Nginx/Caddy; Auto-TLS ist ausschliesslich fuer echten Standalone-Port-443-Betrieb.
 - Unbounded/streaming ZIP fuer sehr grosse Ordner; ZIP wird limitiert und bei Ueberschreitung abgelehnt.
-- Admin-Loeschen.
+- Admin-Loeschen; Admins koennen deaktiviert/reaktiviert werden.
 
 ## Lokal in dieser Arbeitskopie gruen
 
@@ -45,10 +48,10 @@ Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt 
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - [x] `cargo test --locked --all-targets`
-  - Ergebnis: 46 Tests bestanden.
+  - Ergebnis: 55 Tests bestanden.
   - Enthalten: Setup-UI, Admin-Anlage, Runtime-Settings, Text-/Bild-/PDF-Preview, Raw-Preview-Token, ZIP, Suche, Upload in Unterordner, Upload-No-Replace/-Replace, Share-Rechte, Auth, Migrationen, Upload-Cleanup.
 - [x] `cargo check --manifest-path fuzz/Cargo.toml --locked`
-  - Fuzz-Crate inklusive `zip_search_preview_paths` kompiliert.
+  - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy` und `upload_validation_policy` kompiliert.
 - [x] `cargo audit --deny warnings`
   - `cargo-audit 0.22.2`, keine bekannten Vulnerabilities/Warnings.
 
@@ -61,7 +64,8 @@ Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt 
   - `cargo clippy --locked --all-targets -- -D warnings`: gruen.
   - `cargo build --release --locked`: gruen.
   - `cargo check --manifest-path fuzz/Cargo.toml --locked`: gruen.
-- [ ] Nach diesem Feature-Update erneut auf `192.168.1.240` bauen/deployen und Public-Nginx-Smoke ausfuehren.
+- [x] Nach diesem Feature-Update erneut auf `192.168.1.240` bauen/deployen und Public-Nginx-Smoke ausfuehren.
+- [x] Cloud-/Standalone-VM `10.10.10.237` erneut bauen/deployen und Public-HTTPS-Smoke ausfuehren.
 
 ## Noch auszufuehrende Release-Gates
 
@@ -69,7 +73,9 @@ Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt 
   - Pfadnormalisierung,
   - Byte-Range-Parser,
   - Dateinamen,
-  - ZIP/Search/Preview-Pfadfaelle inklusive Media-Preview.
+  - ZIP/Search/Preview-Pfadfaelle inklusive Media-Preview,
+  - Upload-Overwrite-Policy,
+  - Upload-Validierungslogik.
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
 - [ ] GitHub Actions CI auf finalem `main` gruen.
 - [ ] Release-Dry-Run im gepinnten Debian-13-amd64-Container mit `--locked` gruen.
@@ -142,8 +148,8 @@ Ziel: privates GitHub-Prerelease fuer Debian 13 amd64. Arbeiten erfolgen direkt 
 - [ ] Release-Dry-Run und `cargo-audit` weiterhin gruen.
 - [ ] VM- und Public-Gates gruen.
 - [ ] 72h-Soak bestanden.
-- [ ] Annotierten Tag `v0.1.0-beta.1` erstellen.
+- [ ] Annotierten Tag `v0.2.0` erstellen.
 - [ ] Tag-Release-Workflow pruefen:
-  - GitHub Release ist privat/prerelease,
+  - GitHub Release ist privat,
   - Artefakte stammen ausschliesslich aus CI,
   - Binary und `SHA256SUMS` verifizieren mit Minisign gegen `release/minisign.pub`.

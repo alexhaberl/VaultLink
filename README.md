@@ -2,7 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Webanwendung, die einen bereits gemounteten Linux-Ordner sicher ueber oeffentliche Download- und Upload-Links freigibt. Zielplattform ist Debian Linux; Entwicklung und Tests funktionieren auch unter Debian/Ubuntu in WSL.
 
-Status: `0.1.0-beta.1`-Kandidat fuer ein privates Debian-13-amd64-Prerelease. Der Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
+Status: `0.2.0`-Kandidat fuer ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
@@ -45,7 +45,7 @@ VaultLink/
 ├── config/                 Beispielkonfigurationen
 ├── deploy/                 systemd, Caddy, ACME-Hook
 ├── docs/                   Upgrade, Rollback, Release-Gates
-├── fuzz/                   Pfad-, Range- und Dateinamen-Fuzzing
+├── fuzz/                   Pfad-, Range-, Dateinamen-, Preview- und Upload-Fuzzing
 ├── Makefile
 └── Cargo.toml
 ```
@@ -210,7 +210,7 @@ Der Hook installiert PEMs nach `/etc/vaultlink/tls/` mit `root:vaultlink 0640` u
 
 ## 9. Testkonzept
 
-Unit- und HTTP-Integrationstests decken Argon2, TOTP, Login/MFA/Logout, Session/CSRF, Rate-Limits, Security Headers, Setup-UI, Admin-Anlage, Runtime-Settings, Passwort-Unlock, Share-Rechte, Suche, ZIP, Text-/Bild-/PDF-Preview, Raw-Preview-Token, Range/HEAD, Migrationserhalt, atomare Downloadlimits, Upload-Noclobber/-Replace/-Cleanup/-Parallelitaet, Upload in Unterordner, Traversal/Encoding, Proxy-Vertrauen und Config-Modi ab.
+Unit- und HTTP-Integrationstests decken Argon2, TOTP, Login/MFA/Logout, Session/CSRF, Rate-Limits, Security Headers, Setup-UI, Admin-Anlage, Runtime-Settings, Passwort-Unlock, Share-Rechte, Suche, ZIP, Text-/Bild-/PDF-Preview, Raw-Preview-Token, Range/HEAD, Migrationserhalt, atomare Downloadlimits, Upload-Noclobber/-Replace/-Cleanup/-Parallelitaet, Upload in Unterordner, Traversal/Encoding, Proxy-Vertrauen und Config-Modi ab. Fuzz-Targets decken Pfadnormalisierung, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite und Upload-Validierungslogik ab.
 
 ```sh
 make test
