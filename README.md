@@ -6,13 +6,7 @@ Status: `0.2.0`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
-## 1. Architekturentscheidung: Rust
-
-Rust wurde Go vorgezogen. Beide liefern einzelne Linux-Binaries und gute HTTP-Server. Für VaultLinks kritischste Bereiche - Pfad- und Dateiverarbeitung, nebenläufige Zähler, Multipart-Streaming und langlebige Sessions - bietet Rust zusätzliche Speicher- und Typensicherheit ohne Garbage-Collector.
-
-Stack: Rust stable, Axum/Tokio, Tower-Middleware, Rusqlite/SQLite, Argon2id, RFC-6238-TOTP, Rustls, `rustls-acme`, `tracing`. HTML wird bewusst serverseitig erzeugt; es gibt keine Frontend-Buildchain.
-
-## 2. Sicherheitskonzept
+## 1. Sicherheitskonzept
 
 - Dateizugriffe sind Linux descriptor-relativ. `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` bindet Listing, Metadaten, Download, ZIP und Upload an den beim Start geöffneten Root-Descriptor. Ein Kernel ohne `openat2` wird mit verständlichem Startfehler abgewiesen.
 - Relative Nutzpfade verbieten absolute Pfade, `..`, Backslashes, NUL, doppelte Prozentkodierung und ungültiges UTF-8.
@@ -26,7 +20,7 @@ Stack: Rust stable, Axum/Tokio, Tower-Middleware, Rusqlite/SQLite, Argon2id, RFC
 
 Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner. VaultLink ersetzt vorhandene Dateien nur, wenn ein Admin dies für den konkreten Upload-Link erlaubt und der Public-Uploader das Ersetzen beim Upload aktiv bestätigt. Ordnerfreigaben unterstützen ZIP-Download mit Limits, Suche, Upload in navigierten Unterordnern und Preview bei Downloadrecht. Upload-only-Freigaben listen keine Inhalte und erlauben keine Preview/Downloads.
 
-## 3. Projektstruktur
+## 2. Projektstruktur
 
 ```text
 VaultLink/
@@ -50,7 +44,7 @@ VaultLink/
 └── Cargo.toml
 ```
 
-## 4. Daten- und Persistenzmodell
+## 3. Daten- und Persistenzmodell
 
 SQLite ist bewusst gewählt: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `runtime_settings`, `audit`.
 
@@ -64,7 +58,7 @@ sudo deploy/vaultlink-upgrade.sh /pfad/zum/neuen/vaultlink
 
 Restore und Rollback: [docs/UPGRADE-ROLLBACK.md](docs/UPGRADE-ROLLBACK.md).
 
-## 5. Konfigurationsmodell
+## 4. Konfigurationsmodell
 
 Beispiele:
 
@@ -82,7 +76,7 @@ Startregeln:
 
 Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadlimit, blockierte Endungen, Share-Passwortpolitik, Unlock-Dauer, ZIP-/Search-/Text-/Media-Preview-Limits, Text-/Bild-Preview-Endungen und PDF-Preview-Status. Servermodus, Bind-Adresse, TLS-Pfade, Trusted Proxies, Root-Mount, Data-Dir und ACME-Modus bleiben file-/restart-basiert.
 
-## 6. Routen- und API-Design
+## 5. Routen- und API-Design
 
 | Route | Methode | Zweck |
 |---|---:|---|
@@ -108,7 +102,7 @@ Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadli
 
 Es gibt absichtlich keine öffentliche JSON-API. Interne absolute Pfade werden nie gerendert.
 
-## 7. UI und UX
+## 6. UI und UX
 
 Die Admin-UI bietet Login, MFA, Dateibrowser, Linkverwaltung, Admin-Anlage, Einstellungen und Audit. Der Dateibrowser hat Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der aktuellen Auswahl.
 
@@ -119,14 +113,10 @@ Preview:
 - Text: nur allowlistete Endungen (`txt`, `log`, `md`, `csv`, `json`, `toml`, `yaml`, `yml`, `ini`, `conf` per Default), escaped HTML in `<pre>`.
 - Bilder: nur allowlistete Rasterformate (`jpg`, `jpeg`, `png`, `gif`, `webp`, `bmp`, `avif` per Default), feste Content-Types, `nosniff`.
 - PDF: `application/pdf`, `inline`, `nosniff`, kein serverseitiges Rendering.
-- HTML, SVG, Office, Audio und Video bleiben blockiert.
+- Alle anderen Dateitypen bleiben blockiert.
 - Public Media-Raw-Preview benötigt einen kurzlebigen, share- und pfadgebundenen Preview-Token. Die Preview-Seite zählt genau einmal als Downloadzugriff; PDF-Range-Requests umgehen Downloadlimits nicht mehrfach.
 
-## 8. HTTPS- und Betriebsmodi
-
-### Development
-
-Nur `127.0.0.1`, HTTP, kein Secure-Cookie und kein HSTS. Dies ist kein Internetmodus.
+## 7. HTTPS- und Betriebsmodi
 
 ### Reverse Proxy (empfohlen)
 
@@ -137,8 +127,6 @@ client_max_body_size 1g;
 proxy_request_buffering off;
 proxy_buffering off;
 ```
-
-Die aktuelle Staging-VM `192.168.1.240` läuft hinter Nginx; Built-in-ACME darf dort nicht aktiviert werden, solange Nginx Port 443 terminiert.
 
 ### Standalone TLS mit PEM-Dateien
 
@@ -208,26 +196,7 @@ sudo systemctl enable --now vaultlink-cert-renew.timer
 
 Der Hook installiert PEMs nach `/etc/vaultlink/tls/` mit `root:vaultlink 0640` und ruft `systemctl reload-or-restart vaultlink` auf.
 
-## 9. Testkonzept
-
-Unit- und HTTP-Integrationstests decken Argon2, TOTP, Login/MFA/Logout, Session/CSRF, Rate-Limits, Security Headers, Setup-UI, Admin-Anlage, Runtime-Settings, Passwort-Unlock, Share-Rechte, Suche, ZIP, Text-/Bild-/PDF-Preview, Raw-Preview-Token, Range/HEAD, Migrationserhalt, atomare Downloadlimits, Upload-Noclobber/-Replace/-Cleanup/-Parallelität, Upload in Unterordner, Traversal/Encoding, Proxy-Vertrauen und Config-Modi ab. Fuzz-Targets decken Pfadnormalisierung, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite und Upload-Validierungslogik ab.
-
-```sh
-make test
-make security-test
-make lint
-```
-
-Aktueller lokaler Stand am 2026-07-07:
-
-- `cargo check --locked`: grün
-- `cargo fmt --all -- --check`: grün
-- `cargo clippy --locked --all-targets --all-features -- -D warnings`: grün
-- `cargo test --locked --all-targets`: 45 Tests bestanden
-
-Fuzz-, VM-, Public-Nginx-, Last- und 72h-Soak-Gates stehen in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md).
-
-## 10. Debian-Deployment
+## 8. Debian-Deployment
 
 ```sh
 sudo apt update && sudo apt install -y build-essential pkg-config
@@ -251,7 +220,7 @@ sudo systemctl enable --now vaultlink
 
 Firewall: bei Reverse Proxy nur 80/443 für Caddy/Nginx öffnen und VaultLink auf Loopback lassen. Bei Standalone nur 443 öffnen.
 
-## 11. WSL-Entwicklung
+## 9. WSL-Entwicklung
 
 ```sh
 sudo apt update && sudo apt install -y build-essential curl pkg-config
