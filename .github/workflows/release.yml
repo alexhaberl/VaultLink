@@ -55,7 +55,7 @@ jobs:
           install -m 0755 target/release/vaultlink "dist/$root/bin/vaultlink"
           install -m 0644 README.md CHANGELOG.md SECURITY.md LICENSE rust-toolchain.toml "dist/$root/"
           cp config/*.toml "dist/$root/config/"
-          cp deploy/* "dist/$root/deploy/"
+          cp -R deploy/. "dist/$root/deploy/"
           if [ -s release/minisign.pub ]; then cp release/minisign.pub "dist/$root/"; fi
           sbom=$(find . -maxdepth 2 -name '*.cdx.json' -print -quit)
           test -n "$sbom"
