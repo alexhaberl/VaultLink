@@ -900,28 +900,12 @@ fn upload_limit_label(bytes: u64) -> String {
     format!("{} GB", display_limit_unit_floor(bytes, GB))
 }
 
-fn display_limit_unit(bytes: u64, unit: u64) -> String {
-    format_unit(bytes, unit)
-}
-
 fn display_limit_unit_floor(bytes: u64, unit: u64) -> String {
     format_unit_floor(bytes, unit)
 }
 
 fn expiry_picker_html() -> &'static str {
     r#"<label>Ablauf (optional)<br><div class="datetime-picker" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="TT.MM.JJJJ HH:MM" autocomplete="off" inputmode="numeric"><button class="secondary calendar-button" type="button" data-datetime-toggle aria-label="Kalender öffnen">📅</button><div class="datetime-popover" data-datetime-popover hidden><div class="picker-grid"><label>Jahr<br><select data-dt-year></select></label><label>Monat<br><select data-dt-month data-pad="2"></select></label><label>Tag<br><select data-dt-day data-pad="2"></select></label><label>Stunde<br><select data-dt-hour data-pad="2"></select></label><label>Minute<br><select data-dt-minute data-pad="2"></select></label></div><div class="picker-actions"><button class="secondary small" type="button" data-datetime-clear>Löschen</button><button class="small" type="button" data-datetime-apply>Übernehmen</button></div></div></div><small class="muted">Format: TT.MM.JJJJ HH:MM</small></label>"#
-}
-
-fn format_unit(bytes: u64, unit: u64) -> String {
-    let value = bytes as f64 / unit as f64;
-    let mut text = format!("{value:.3}");
-    while text.contains('.') && text.ends_with('0') {
-        text.pop();
-    }
-    if text.ends_with('.') {
-        text.pop();
-    }
-    text
 }
 
 fn format_unit_floor(bytes: u64, unit: u64) -> String {
@@ -2313,13 +2297,13 @@ fn settings_form(session: &Session, settings: &RuntimeSettings, message: &str) -
         settings.share_password_min_length,
         settings.share_password_max_length,
         settings.share_unlock_minutes,
-        display_limit_unit(settings.max_zip_size, GB),
+        display_limit_unit_floor(settings.max_zip_size, GB),
         settings.max_zip_files,
         settings.max_search_entries,
         settings.max_search_results,
-        display_limit_unit(settings.max_preview_size, MB),
+        display_limit_unit_floor(settings.max_preview_size, MB),
         esc(&settings.preview_extensions.join(",")),
-        display_limit_unit(settings.max_media_preview_size, MB),
+        display_limit_unit_floor(settings.max_media_preview_size, MB),
         esc(&settings.image_preview_extensions.join(",")),
         if settings.pdf_preview_enabled {
             "checked"
@@ -3662,7 +3646,6 @@ mod tests {
         assert_eq!(add_upload_bytes(5, 6, 10), None);
         assert_eq!(add_upload_bytes(u64::MAX, 1, u64::MAX), None);
         assert_eq!(human(1_500_000_000), "1.5 GB");
-        assert_eq!(format_unit(1_500_000_000, GB), "1.5");
         assert_eq!(format_unit_floor(53_687_091_200, GB), "53");
         assert_eq!(display_limit_unit_floor(1_073_741_824, GB), "1");
         assert_eq!(
@@ -3713,9 +3696,9 @@ mod tests {
         let state = test_state(root.path(), data.path());
         let mut settings = runtime_settings(&state);
         settings.max_upload_size = 53_687_091_200;
-        settings.max_zip_size = 1_073_741_824;
-        settings.max_preview_size = 1_048_576;
-        settings.max_media_preview_size = 104_857_600;
+        settings.max_zip_size = 1_000_000_000;
+        settings.max_preview_size = 1_000_000;
+        settings.max_media_preview_size = 100_000_000;
 
         let html = settings_form(&session, &settings, "");
         assert!(
@@ -3729,6 +3712,12 @@ mod tests {
             r#"name="max_media_preview_size_mb" type="number" min="1" step="1" value="100""#
         ));
         assert!(html.contains("Suche Max. Einträge"));
+        for broken in ["Ã", "Â", "â", "ðŸ", "�"] {
+            assert!(
+                !html.contains(broken),
+                "settings form contains broken UTF-8 marker {broken:?}"
+            );
+        }
         assert!(!html.contains("Media-Preview Max. GB"));
     }
 
