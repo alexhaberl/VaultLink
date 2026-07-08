@@ -17,6 +17,7 @@ http = "1"
 futures-util = "0.3"
 mime_guess = "2"
 percent-encoding = "2"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.8"
 rpassword = "7"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }

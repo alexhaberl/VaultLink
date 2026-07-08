@@ -293,9 +293,8 @@ impl Database {
     }
     pub fn list_admins(&self) -> rusqlite::Result<Vec<AdminSummary>> {
         let c = self.conn();
-        let mut statement = c.prepare(
-            "SELECT id,username,created_at,active FROM admins ORDER BY username COLLATE NOCASE",
-        )?;
+        let mut statement =
+            c.prepare("SELECT id,username,created_at,active FROM admins ORDER BY id ASC")?;
         let admins = statement
             .query_map([], |row| {
                 Ok(AdminSummary {
@@ -320,6 +319,37 @@ impl Database {
         }
         transaction.commit()?;
         Ok(changed)
+    }
+    pub fn reset_admin_password(&self, id: i64, password_hash: &str) -> rusqlite::Result<bool> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE admins SET password_hash=?2 WHERE id=?1",
+            params![id, password_hash],
+        )? == 1;
+        if changed {
+            transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+    pub fn reset_admin_totp(&self, id: i64, totp_secret: &str) -> rusqlite::Result<Option<String>> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction()?;
+        let username = transaction
+            .query_row("SELECT username FROM admins WHERE id=?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if username.is_some() {
+            transaction.execute(
+                "UPDATE admins SET totp_secret=?2 WHERE id=?1",
+                params![id, totp_secret],
+            )?;
+            transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
+        }
+        transaction.commit()?;
+        Ok(username)
     }
     pub fn create_session(
         &self,
@@ -678,7 +708,7 @@ mod tests {
     #[test]
     fn migrates_unversioned_installation_without_losing_data() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("legacy.sqlite");
+        let path = directory.path().join("old_schema.sqlite");
         {
             let connection = Connection::open(&path).unwrap();
             connection.execute_batch(r#"

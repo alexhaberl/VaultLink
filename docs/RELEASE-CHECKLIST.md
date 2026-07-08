@@ -2,47 +2,47 @@
 
 Stand: 2026-07-08 nach UI-/Upload-Polish, Built-in-Let's-Encrypt-Standalone-TLS und Upload-Fuzzing.
 
-Ziel: privates GitHub-Release fuer Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschliesslich bei sauberem Worktree und vollstaendig gruenen Gates gesetzt.
+Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschließlich bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
-## Feature-Scope fuer 0.2.0
+## Feature-Scope für 0.2.0
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
-- [x] Root-begrenzter Dateibrowser mit Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der Oberflaeche.
-- [x] Linkverwaltung fuer Datei-/Ordnerlinks mit `download_only`, `upload_only`, `download_upload`.
-- [x] Passwortgeschuetzte Shares mit Argon2id, Unlock-Cookies und Rate-Limit.
+- [x] Root-begrenzter Dateibrowser mit Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der Oberfläche.
+- [x] Linkverwaltung für Datei-/Ordnerlinks mit `download_only`, `upload_only`, `download_upload`.
+- [x] Passwortgeschützte Shares mit Argon2id, Unlock-Cookies und Rate-Limit.
 - [x] Optionaler Kurzlink-Alias.
 - [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`.
-- [x] Sichere Uploads mit temporaerer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
-- [x] Optionales Upload-Ueberschreiben pro Upload-Ordnerlink; Default bleibt No-Replace und Public-Uploader muessen Replace pro Upload bestaetigen.
-- [x] Upload in navigierten Unterordnern fuer `download_upload`-Ordnerlinks.
+- [x] Sichere Uploads mit temporärer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
+- [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink; Default bleibt No-Replace und Public-Uploader müssen Replace pro Upload bestätigen.
+- [x] Upload in navigierten Unterordnern für `download_upload`-Ordnerlinks.
 - [x] Upload-only-Freigaben listen keine Ordnerinhalte und erlauben keine Preview/Downloads.
-- [x] ZIP-Download fuer Ordnerfreigaben mit Datei- und Groessenlimits.
+- [x] ZIP-Download für Ordnerfreigaben mit Datei- und Größenlimits.
 - [x] Begrenzte case-insensitive Dateinamensuche.
-- [x] Sichere Browser-Textvorschau fuer allowlistete Endungen; escaped HTML in `<pre>`, kein Inline-User-MIME.
-- [x] Sichere Browser-Vorschau fuer allowlistete Rasterbilder und PDFs ueber Raw-Preview-Routen mit `inline`, `nosniff`, `HEAD`, `206` und `416`.
-- [x] Admin-UI fuer zusaetzliche Admins; TOTP-Secret wird genau einmal angezeigt.
+- [x] Sichere Browser-Textvorschau für allowlistete Endungen; escaped HTML in `<pre>`, kein Inline-User-MIME.
+- [x] Sichere Browser-Vorschau für allowlistete Rasterbilder und PDFs über Raw-Preview-Routen mit `inline`, `nosniff`, `HEAD`, `206` und `416`.
+- [x] Admin-UI für zusätzliche Admins; TOTP-Secret wird genau einmal angezeigt.
 - [x] Runtime-editierbare Policy-Settings in SQLite, nicht in `/etc/vaultlink/config.toml`.
 - [x] Audit-Dashboard mit Pagination und Action-Filter.
 - [x] Loopback-only Setup-UI: `vaultlink setup --config <path> --listen 127.0.0.1:8090`.
-- [x] Reverse-Proxy-Modus, Standalone-TLS-Modus, SIGHUP-Zertifikatsreload fuer PEM-Dateien.
-- [x] Optionaler Built-in-Let's-Encrypt-Standalone-TLS-Modus ueber `tls-alpn-01` und `rustls-acme`.
+- [x] Reverse-Proxy-Modus, Standalone-TLS-Modus, SIGHUP-Zertifikatsreload für PEM-Dateien.
+- [x] Optionaler Built-in-Let's-Encrypt-Standalone-TLS-Modus über `tls-alpn-01` und `rustls-acme`.
 - [x] ZeroSSL/acme.sh Renewal-Dokumentation und systemd-Beispiele.
 - [x] UI-/UX-Polish mit getrennten Auth/Public/Admin-Shells, Logo/Favicon, deutschem Date-Time-Picker, decimalen MB/GB-Einheiten und konsistenten Buttons/Switches.
-- [x] Public Upload-Fehlerseiten fuer validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Groessenlimits, fehlende Dateinamen und Speicherfehler.
-- [x] Upload-Fuzzing fuer Overwrite- und Validierungslogik.
+- [x] Public Upload-Fehlerseiten für validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Größenlimits, fehlende Dateinamen und Speicherfehler.
+- [x] Upload-Fuzzing für Overwrite- und Validierungslogik.
 
-## Bewusste Nicht-Ziele fuer 0.2.0
+## Bewusste Nicht-Ziele für 0.2.0
 
 - DEB-Paket.
 - ARM64-Build.
-- Oeffentliches Repository.
-- Oeffentliche JSON-API.
-- Inline-Preview fuer HTML, SVG, Office-Dateien, Audio oder Video.
-- Built-in ACME hinter Nginx/Caddy; Auto-TLS ist ausschliesslich fuer echten Standalone-Port-443-Betrieb.
-- Unbounded/streaming ZIP fuer sehr grosse Ordner; ZIP wird limitiert und bei Ueberschreitung abgelehnt.
-- Admin-Loeschen; Admins koennen deaktiviert/reaktiviert werden.
+- Öffentliches Repository.
+- Öffentliche JSON-API.
+- Inline-Preview für HTML, SVG, Office-Dateien, Audio oder Video.
+- Built-in ACME hinter Nginx/Caddy; Auto-TLS ist ausschließlich für echten Standalone-Port-443-Betrieb.
+- Unbounded/streaming ZIP für sehr große Ordner; ZIP wird limitiert und bei Überschreitung abgelehnt.
+- Admin-Löschen; Admins können deaktiviert/reaktiviert werden.
 
-## Lokal in dieser Arbeitskopie gruen
+## Lokal in dieser Arbeitskopie grün
 
 - [x] `cargo check --locked`
 - [x] `cargo fmt --all -- --check`
@@ -55,37 +55,37 @@ Ziel: privates GitHub-Release fuer Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] `cargo audit --deny warnings`
   - `cargo-audit 0.22.2`, keine bekannten Vulnerabilities/Warnings.
 
-## Bereits auf Debian-13-VM geprueft, vor finalem Runtime-Deploy erneut auszufuehren
+## Bereits auf Debian-13-VM geprÜft, vor finalem Runtime-Deploy erneut auszufÜhren
 
-- [x] Debian-13-VM `192.168.1.240`, temporaerer Build in `/tmp/vaultlink-feature-check`
+- [x] Debian-13-VM `192.168.1.240`, temporärer Build in `/tmp/vaultlink-feature-check`
   - OS: Debian GNU/Linux 13.5, amd64, Kernel 6.12.
-  - `cargo fmt --all -- --check`: gruen.
-  - `cargo test --locked --all-targets`: gruen, inklusive Linux-`openat2`/Symlink-Tests.
-  - `cargo clippy --locked --all-targets -- -D warnings`: gruen.
-  - `cargo build --release --locked`: gruen.
-  - `cargo check --manifest-path fuzz/Cargo.toml --locked`: gruen.
-- [x] Nach diesem Feature-Update erneut auf `192.168.1.240` bauen/deployen und Public-Nginx-Smoke ausfuehren.
-- [x] Cloud-/Standalone-VM `10.10.10.237` erneut bauen/deployen und Public-HTTPS-Smoke ausfuehren.
+  - `cargo fmt --all -- --check`: grün.
+  - `cargo test --locked --all-targets`: grün, inklusive Linux-`openat2`/Symlink-Tests.
+  - `cargo clippy --locked --all-targets -- -D warnings`: grün.
+  - `cargo build --release --locked`: grün.
+  - `cargo check --manifest-path fuzz/Cargo.toml --locked`: grün.
+- [x] Nach diesem Feature-Update erneut auf `192.168.1.240` bauen/deployen und Public-Nginx-Smoke ausfÜhren.
+- [x] Cloud-/Standalone-VM `10.10.10.237` erneut bauen/deployen und Public-HTTPS-Smoke ausfÜhren.
 
-## Noch auszufuehrende Release-Gates
+## Noch auszufÜhrende Release-Gates
 
 - [ ] Fuzz-Gate jeweils zehn Minuten:
   - Pfadnormalisierung,
   - Byte-Range-Parser,
   - Dateinamen,
-  - ZIP/Search/Preview-Pfadfaelle inklusive Media-Preview,
+  - ZIP/Search/Preview-Pfadfälle inklusive Media-Preview,
   - Upload-Overwrite-Policy,
   - Upload-Validierungslogik.
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
-- [ ] GitHub Actions CI auf finalem `main` gruen.
-- [ ] Release-Dry-Run im gepinnten Debian-13-amd64-Container mit `--locked` gruen.
-- [ ] Artefakte pruefen:
+- [ ] GitHub Actions CI auf finalem `main` grün.
+- [ ] Release-Dry-Run im gepinnten Debian-13-amd64-Container mit `--locked` grün.
+- [ ] Artefakte prüfen:
   - Binary,
   - README,
   - LICENSE,
   - Beispielkonfigurationen,
   - systemd/deploy-Dateien,
-  - SHA-256-Pruefsummen,
+  - SHA-256-PrÜfsummen,
   - CycloneDX-SBOM,
   - deterministisches `tar.gz`,
   - Minisign-Signatur nur beim Tag-Release.
@@ -94,12 +94,12 @@ Ziel: privates GitHub-Release fuer Debian 13 amd64. Arbeiten erfolgen direkt auf
 
 - [ ] Finalen Release-Candidate auf der Debian-VM bauen/deployen.
 - [ ] SQLite-Backup vor Upgrade bei gestopptem Dienst erstellen.
-- [ ] Upgrade-Test durchfuehren.
-- [ ] Rollback-Test durchfuehren:
+- [ ] Upgrade-Test durchfÜhren.
+- [ ] Rollback-Test durchfÜhren:
   - Dienst stoppen,
   - vorheriges Binary und SQLite-Backup wiederherstellen,
   - Dienst starten,
-  - Smoke-Test ausfuehren.
+  - Smoke-Test ausfÜhren.
 - [ ] Debian-13-amd64 Lastprofil erneut:
   - 100 parallele Nutzer,
   - 40 Downloadstreams,
@@ -108,8 +108,8 @@ Ziel: privates GitHub-Release fuer Debian 13 amd64. Arbeiten erfolgen direkt auf
   - keine 5xx,
   - keine korrupten Dateien,
   - p95 Metadatenseiten < 750 ms,
-  - maximal 256 MiB zusaetzlicher RSS bei 40 Streams.
-- [ ] Oeffentlicher Nginx-Pfad `vaultlink.haberl.tech` erneut pruefen:
+  - maximal 256 MiB zusätzlicher RSS bei 40 Streams.
+- [ ] Öffentlicher Nginx-Pfad `vaultlink.haberl.tech` erneut prüfen:
   - TLS und HTTP->HTTPS Redirect,
   - Security Header,
   - Secure/SameSite/HttpOnly Cookies,
@@ -125,11 +125,11 @@ Ziel: privates GitHub-Release fuer Debian 13 amd64. Arbeiten erfolgen direkt auf
   - PDFpreview,
   - Raw-Preview Range/HEAD,
   - Upload in Subfolder,
-  - Upload-Replace nur bei Linkrecht plus Public-Bestaetigung,
+  - Upload-Replace nur bei Linkrecht plus Public-Bestätigung,
   - Download/Range/HEAD,
   - Upload-only darf nicht listen/downloaden/previewen,
   - Revoke/Expiry/Downloadlimit.
-- [ ] Standalone Auto-TLS nur mit Let's-Encrypt-Staging auf direkt erreichbarer Test-IP/Domain pruefen; nicht auf der aktuellen Nginx-VM.
+- [ ] Standalone Auto-TLS nur mit Let's-Encrypt-Staging auf direkt erreichbarer Test-IP/Domain prüfen; nicht auf der aktuellen Nginx-VM.
 
 ## Finaler 72h-Soak
 
@@ -138,18 +138,18 @@ Ziel: privates GitHub-Release fuer Debian 13 amd64. Arbeiten erfolgen direkt auf
   - keine ungeplanten Restarts,
   - `PRAGMA integrity_check = ok`,
   - kein kontinuierliches RSS-Wachstum > 15 %,
-  - keine auffaelligen 5xx-/Panic-/DB-Fehler im Journal.
-- [ ] Lange Soaks werden nach reinen Doku-/CI-Aenderungen nicht neu gestartet; jedes neue Binary-Deploy setzt den Soak zurueck.
+  - keine auffälligen 5xx-/Panic-/DB-Fehler im Journal.
+- [ ] Lange Soaks werden nach reinen Doku-/CI-Änderungen nicht neu gestartet; jedes neue Binary-Deploy setzt den Soak zurück.
 
 ## Tag-Freigabe
 
 - [ ] Sauberer Worktree.
-- [ ] Gruener CI-Run auf finalem `main`.
-- [ ] Release-Dry-Run und `cargo-audit` weiterhin gruen.
-- [ ] VM- und Public-Gates gruen.
+- [ ] GrÜner CI-Run auf finalem `main`.
+- [ ] Release-Dry-Run und `cargo-audit` weiterhin grün.
+- [ ] VM- und Public-Gates grün.
 - [ ] 72h-Soak bestanden.
 - [ ] Annotierten Tag `v0.2.0` erstellen.
-- [ ] Tag-Release-Workflow pruefen:
+- [ ] Tag-Release-Workflow prüfen:
   - GitHub Release ist privat,
-  - Artefakte stammen ausschliesslich aus CI,
+  - Artefakte stammen ausschließlich aus CI,
   - Binary und `SHA256SUMS` verifizieren mit Minisign gegen `release/minisign.pub`.

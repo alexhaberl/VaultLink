@@ -124,7 +124,7 @@ pub struct ReverseProxy {
 pub enum CertificateSource {
     #[default]
     Files,
-    #[serde(rename = "letsencrypt", alias = "lets_encrypt")]
+    #[serde(rename = "letsencrypt")]
     LetsEncrypt,
 }
 
@@ -664,9 +664,6 @@ mod tests {
             documented.certificate_source,
             CertificateSource::LetsEncrypt
         );
-
-        let legacy: Wrapper = toml::from_str("certificate_source = \"lets_encrypt\"").unwrap();
-        assert_eq!(legacy.certificate_source, CertificateSource::LetsEncrypt);
 
         let serialized = toml::to_string(&documented).unwrap();
         assert!(serialized.contains("certificate_source = \"letsencrypt\""));

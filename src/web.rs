@@ -13,6 +13,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use futures_util::StreamExt;
+use qrcode::{render::svg, QrCode};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
@@ -76,9 +77,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/shares/{id}/password", post(set_share_password))
         .route("/admin/shares/{id}/delete", post(delete_share))
-        .route("/admin/admins", get(admins_page).post(create_admin_ui))
+        .route("/admin/admins", get(admins_page_v3).post(create_admin_ui))
         .route("/admin/admins/{id}/deactivate", post(deactivate_admin))
         .route("/admin/admins/{id}/activate", post(activate_admin))
+        .route("/admin/admins/{id}/password", post(reset_admin_password))
+        .route("/admin/admins/{id}/totp", post(reset_admin_totp))
         .route("/admin/settings", get(settings_page).post(update_settings))
         .route("/admin/audit", get(audit_page))
         .route("/v/{token}", get(public_page))
@@ -151,8 +154,10 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.ap
 section,.panel{background:linear-gradient(180deg,rgba(21,31,54,.96),rgba(15,23,42,.96));border:1px solid rgba(255,255,255,.08);box-shadow:var(--shadow);padding:1.25rem;border-radius:22px;margin:1rem 0;overflow:auto}.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;background:linear-gradient(135deg,rgba(90,167,255,.16),rgba(124,92,255,.10)),linear-gradient(180deg,rgba(26,39,66,.98),rgba(17,26,46,.98))}.hero h1,.panel h1,section h1{margin:.15rem 0 .65rem;font-size:clamp(1.8rem,3vw,3rem);line-height:1.08}.eyebrow{margin:0;color:#91c7ff;text-transform:uppercase;letter-spacing:.12em;font-size:.78rem;font-weight:800}.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.8rem;margin:1rem 0}.stat-card{padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:18px;background:rgba(255,255,255,.045)}.stat-card strong{display:block;font-size:1.45rem}.stat-card span{color:var(--muted);font-size:.9rem}
 input,select,button,textarea{font:inherit;padding:.72rem .8rem;border-radius:12px;border:1px solid var(--line2);background:#0b1326;color:var(--text);max-width:100%}input:focus,select:focus,textarea:focus{outline:2px solid rgba(90,167,255,.35);border-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;cursor:pointer;padding:.78rem 1rem;border-radius:12px;background:linear-gradient(135deg,#2f67bd,#4e7de2);border:1px solid rgba(255,255,255,.1);color:white;box-shadow:0 10px 24px rgba(47,103,189,.22);font-weight:750;line-height:1.1;text-decoration:none;white-space:nowrap}button:hover,.button:hover{text-decoration:none;filter:brightness(1.08)}.button.secondary,button.secondary{background:rgba(90,167,255,.12);border-color:rgba(90,167,255,.35);box-shadow:none;color:#dbeafe}.button.danger,button.danger{background:rgba(255,123,134,.16);border-color:rgba(255,123,134,.34);box-shadow:none;color:#ffd6db}.button.small,button.small{padding:.55rem .75rem;border-radius:10px;font-size:.92rem}label{display:block;margin:.7rem 0;color:var(--soft);font-weight:650}label input,label select,label textarea{margin-top:.25rem;width:100%}.datetime-picker{position:relative;display:flex;gap:.45rem;align-items:center}.datetime-picker input{margin-top:.25rem}.datetime-picker .calendar-button{margin-top:.25rem;padding:.72rem .8rem}.datetime-popover{position:absolute;z-index:20;top:calc(100% + .45rem);left:0;min-width:min(360px,90vw);padding:.9rem;border:1px solid rgba(90,167,255,.28);border-radius:16px;background:linear-gradient(180deg,#121d34,#0c1428);box-shadow:0 24px 60px rgba(0,0,0,.48)}.datetime-popover[hidden]{display:none}.datetime-popover .picker-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.65rem}.datetime-popover label{margin:0}.datetime-popover .picker-actions{display:flex;gap:.5rem;justify-content:flex-end;margin-top:.8rem}table{width:100%;border-collapse:separate;border-spacing:0 .35rem}th{padding:.65rem .8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;font-size:.78rem;text-align:left}td{padding:.85rem .8rem;border-top:1px solid rgba(255,255,255,.07);border-bottom:1px solid rgba(255,255,255,.07);background:rgba(11,19,38,.55);vertical-align:top}td:first-child{border-left:1px solid rgba(255,255,255,.07);border-radius:14px 0 0 14px}td:last-child{border-right:1px solid rgba(255,255,255,.07);border-radius:0 14px 14px 0}.row{display:flex;gap:.8rem;flex-wrap:wrap;align-items:end}.row label{min-width:220px;flex:1}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.8rem;align-items:end}.form-grid label{margin:0}.form-actions{display:flex;gap:.55rem;align-items:end}.muted{color:var(--muted)}.bad{color:var(--bad)}.good{color:var(--good)}.notice{padding:.85rem 1rem;border-radius:14px;background:rgba(85,214,154,.09);border:1px solid rgba(85,214,154,.2);color:#c8f8df}code,pre{overflow-wrap:anywhere}code{padding:.15rem .35rem;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(0,0,0,.18);color:#dbe9ff}pre{white-space:pre-wrap;background:#0b1326;border:1px solid var(--line);border-radius:16px;padding:1rem}.crumbs,.actions,.button-group,.preview-actions{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center}.crumbs{padding:.75rem .9rem;border-radius:14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07)}.actions form,.button-group form{display:inline-flex;gap:.45rem;flex-wrap:wrap;margin:0}.pill{display:inline-flex;align-items:center;gap:.35rem;padding:.25rem .55rem;border-radius:999px;border:1px solid rgba(90,167,255,.22);color:#cfe5ff;background:rgba(90,167,255,.10)}.split{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:1rem;align-items:start}.side-panel{padding:1rem;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.045)}.form-card,.share-card{padding:1rem;border:1px solid rgba(90,167,255,.16);border-radius:18px;background:rgba(90,167,255,.045);margin:.9rem 0}.form-card h2,.share-card h2{margin:0 0 .75rem;font-size:1rem;color:#cfe5ff}.share-card{display:grid;gap:.9rem}.share-main{display:grid;grid-template-columns:minmax(220px,1.3fr) minmax(150px,.6fr) minmax(150px,.7fr) minmax(120px,.45fr) minmax(280px,1fr);gap:1rem;align-items:start}.share-actions,.password-actions{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center}.password-actions{padding-top:.75rem;margin-top:.75rem;border-top:1px solid rgba(255,255,255,.08)}.password-actions input{min-width:180px;flex:1}.overwrite-panel{padding:.85rem;border:1px solid rgba(255,255,255,.08);border-radius:16px;background:rgba(255,255,255,.035)}img{border-radius:16px}iframe{background:#0b1326}
 .actions a,.preview-actions a,td:last-child>a,section>p>a[href="/admin"],section>p>a[href^="/admin?"],section>p>a[href^="/v/"]{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;padding:.55rem .75rem;border-radius:10px;background:rgba(90,167,255,.12);border:1px solid rgba(90,167,255,.35);color:#dbeafe;text-decoration:none;font-weight:750;line-height:1.1}.actions a:hover,.preview-actions a:hover,td:last-child>a:hover,section>p>a:hover{text-decoration:none;filter:brightness(1.08)}.row>button{align-self:end;margin-bottom:.7rem}
+.qr-card{display:inline-block;margin:.9rem 0;padding:1rem;border-radius:18px;background:#f8fbff;color:#081226;border:1px solid rgba(90,167,255,.28);box-shadow:0 18px 44px rgba(0,0,0,.20)}.qr-card svg{display:block;width:220px;height:220px;border-radius:10px}.secret-block{display:grid;gap:.45rem;max-width:860px}.secret-block code{display:block;padding:.55rem .7rem}
+.admin-columns{display:grid;grid-template-columns:1fr;gap:1rem;align-items:start}.admin-column{padding:1rem;border:1px solid rgba(90,167,255,.16);border-radius:18px;background:rgba(90,167,255,.045)}.admin-column summary{cursor:pointer;font-size:1.1rem;font-weight:800;color:#dbeafe;margin-bottom:.7rem}.admin-column summary::marker{color:var(--accent)}.admin-column table{margin-top:.6rem}.admin-actions{display:grid;gap:.65rem;min-width:520px}.admin-actions .button-group{gap:.5rem}.admin-reset-form{display:grid;grid-template-columns:minmax(180px,1fr) minmax(180px,1fr) auto;gap:.55rem;align-items:end;padding-top:.65rem;border-top:1px solid rgba(255,255,255,.08)}.admin-reset-form label{margin:0}.admin-reset-form input{width:100%}
 .toggle-card{display:flex;align-items:center;gap:.85rem;width:100%;min-width:260px;padding:.9rem 1rem;border:1px solid rgba(90,167,255,.22);border-radius:16px;background:rgba(90,167,255,.07);cursor:pointer}.toggle-card input{position:absolute;opacity:0;width:1px;height:1px}.toggle-card .switch-ui{flex:0 0 auto;width:54px;height:30px;border-radius:999px;background:#1f2b45;border:1px solid var(--line2);position:relative;box-shadow:inset 0 1px 4px rgba(0,0,0,.28)}.toggle-card .switch-ui::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:999px;background:#dbeafe;transition:transform .18s ease,background .18s ease}.toggle-card input:checked+.switch-ui{background:linear-gradient(135deg,#2f67bd,#4e7de2);border-color:rgba(255,255,255,.18)}.toggle-card input:checked+.switch-ui::after{transform:translateX(24px);background:#fff}.toggle-card .switch-copy{display:grid;gap:.15rem;color:var(--text)}.toggle-card small{display:block;color:var(--muted);font-weight:600;line-height:1.35}.toggle-card:focus-within{outline:2px solid rgba(90,167,255,.35)}.toggle-card>input+span{position:relative;display:grid;gap:.15rem;padding-left:68px;color:var(--text)}.toggle-card>input+span::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);width:54px;height:30px;border-radius:999px;background:#1f2b45;border:1px solid var(--line2);box-shadow:inset 0 1px 4px rgba(0,0,0,.28)}.toggle-card>input+span::after{content:"";position:absolute;left:4px;top:50%;transform:translateY(-50%);width:22px;height:22px;border-radius:999px;background:#dbeafe;transition:transform .18s ease,background .18s ease}.toggle-card>input:checked+span::before{background:linear-gradient(135deg,#2f67bd,#4e7de2);border-color:rgba(255,255,255,.18)}.toggle-card>input:checked+span::after{transform:translate(24px,-50%);background:#fff}
-@media(max-width:980px){.app-shell{display:block}.sidebar{position:relative;height:auto;border-right:0;border-bottom:1px solid rgba(255,255,255,.08)}.sidebar-foot{display:none}.nav-group{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}.content{padding:1rem}.split{grid-template-columns:1fr}}@media(max-width:650px){th:nth-child(3),td:nth-child(3){display:none}.topbar{display:block}.hero{display:block}}
+@media(max-width:980px){.app-shell{display:block}.sidebar{position:relative;height:auto;border-right:0;border-bottom:1px solid rgba(255,255,255,.08)}.sidebar-foot{display:none}.nav-group{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}.content{padding:1rem}.split,.admin-columns{grid-template-columns:1fr}}@media(max-width:650px){th:nth-child(3),td:nth-child(3){display:none}.topbar{display:block}.hero{display:block}}
 "#
 }
 
@@ -337,6 +342,13 @@ fn format_audit_time(value: &str) -> String {
         })
         .unwrap_or_else(|_| value.to_string())
 }
+
+fn format_file_time(value: std::time::SystemTime) -> String {
+    DateTime::<Utc>::from(value)
+        .format("%d.%m.%Y %H:%M UTC")
+        .to_string()
+}
+
 fn cookie(headers: &HeaderMap) -> Option<&str> {
     named_cookie(headers, COOKIE)
 }
@@ -630,8 +642,7 @@ async fn admin_browser(
             let modified = hit
                 .entry
                 .modified
-                .map(DateTime::<Utc>::from)
-                .map(|v| v.format("%Y-%m-%d %H:%M UTC").to_string())
+                .map(format_file_time)
                 .unwrap_or_else(|| "—".into());
             rows += &format!(
                 r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}<a class="button secondary small" href="/admin/shares?path={}">Freigeben</a></td></tr>"#,
@@ -679,10 +690,7 @@ async fn admin_browser(
             } else {
                 String::new()
             };
-            let modified = modified
-                .map(DateTime::<Utc>::from)
-                .map(|v| v.format("%Y-%m-%d %H:%M UTC").to_string())
-                .unwrap_or_else(|| "—".into());
+            let modified = modified.map(format_file_time).unwrap_or_else(|| "—".into());
             rows += &format!(
                 r#"<tr><td>{display}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}<a class="button secondary small" href="/admin/shares?path={}">Freigeben</a></td></tr>"#,
                 if is_dir { "Ordner" } else { "Datei" },
@@ -893,24 +901,15 @@ fn upload_limit_label(bytes: u64) -> String {
 }
 
 fn display_limit_unit(bytes: u64, unit: u64) -> String {
-    format_unit(normalize_legacy_default_limit(bytes), unit)
+    format_unit(bytes, unit)
 }
 
 fn display_limit_unit_floor(bytes: u64, unit: u64) -> String {
-    format_unit_floor(normalize_legacy_default_limit(bytes), unit)
+    format_unit_floor(bytes, unit)
 }
 
 fn expiry_picker_html() -> &'static str {
     r#"<label>Ablauf (optional)<br><div class="datetime-picker" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="TT.MM.JJJJ HH:MM" autocomplete="off" inputmode="numeric"><button class="secondary calendar-button" type="button" data-datetime-toggle aria-label="Kalender öffnen">📅</button><div class="datetime-popover" data-datetime-popover hidden><div class="picker-grid"><label>Jahr<br><select data-dt-year></select></label><label>Monat<br><select data-dt-month data-pad="2"></select></label><label>Tag<br><select data-dt-day data-pad="2"></select></label><label>Stunde<br><select data-dt-hour data-pad="2"></select></label><label>Minute<br><select data-dt-minute data-pad="2"></select></label></div><div class="picker-actions"><button class="secondary small" type="button" data-datetime-clear>Löschen</button><button class="small" type="button" data-datetime-apply>Übernehmen</button></div></div></div><small class="muted">Format: TT.MM.JJJJ HH:MM</small></label>"#
-}
-
-fn normalize_legacy_default_limit(bytes: u64) -> u64 {
-    match bytes {
-        1_073_741_824 => 1_000_000_000,
-        1_048_576 => 1_000_000,
-        104_857_600 => 100_000_000,
-        other => other,
-    }
 }
 
 fn format_unit(bytes: u64, unit: u64) -> String {
@@ -946,7 +945,6 @@ fn parse_unit_to_bytes(value: &str, unit: u64, label: &'static str) -> Result<u6
 }
 
 fn parse_expiry(
-    legacy_rfc3339: Option<&str>,
     local: Option<&str>,
     offset_minutes: Option<&str>,
 ) -> Result<Option<DateTime<Utc>>> {
@@ -966,12 +964,7 @@ fn parse_expiry(
             utc_naive, Utc,
         )));
     }
-    legacy_rfc3339
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| DateTime::parse_from_rfc3339(value).map(|d| d.with_timezone(&Utc)))
-        .transpose()
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"))
+    Ok(None)
 }
 
 fn extension_is_blocked(name: &str, blocked: &[String]) -> bool {
@@ -1000,6 +993,26 @@ fn validate_share_password(settings: &RuntimeSettings, password: &str) -> Result
 
 fn encoded(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+fn otpauth_url(username: &str, secret: &str) -> String {
+    format!(
+        "otpauth://totp/{}:{}?secret={}&issuer={}",
+        encoded("VaultLink"),
+        encoded(username),
+        encoded(secret),
+        encoded("VaultLink")
+    )
+}
+
+fn qr_svg(data: &str) -> Result<String> {
+    let code = QrCode::new(data.as_bytes()).map_err(internal)?;
+    Ok(code
+        .render::<svg::Color<'_>>()
+        .min_dimensions(220, 220)
+        .dark_color(svg::Color("#081226"))
+        .light_color(svg::Color("#f8fbff"))
+        .build())
 }
 
 fn join_display(base: &str, child: &str) -> String {
@@ -1609,7 +1622,6 @@ struct CreateShare {
     path: String,
     permission: String,
     alias: Option<String>,
-    expires_at: Option<String>,
     expires_local: Option<String>,
     expires_tz_offset_minutes: Option<String>,
     max_downloads: Option<String>,
@@ -1654,24 +1666,10 @@ async fn create_share(
     }) {
         return Err(AppError(StatusCode::BAD_REQUEST, "Ungültiger Alias"));
     }
-    let exp = if f
-        .expires_local
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        parse_expiry(
-            None,
-            f.expires_local.as_deref(),
-            f.expires_tz_offset_minutes.as_deref(),
-        )?
-    } else {
-        f.expires_at
-            .filter(|v| !v.is_empty())
-            .map(|v| DateTime::parse_from_rfc3339(&v).map(|d| d.with_timezone(&Utc)))
-            .transpose()
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"))?;
-        None
-    };
+    let exp = parse_expiry(
+        f.expires_local.as_deref(),
+        f.expires_tz_offset_minutes.as_deref(),
+    )?;
     if exp.is_some_and(|e| e <= Utc::now()) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
@@ -1945,35 +1943,71 @@ fn valid_username(username: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-async fn admins_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
+async fn admins_page_v3(
+    State(state): State<AppState>,
+    Query(query): Query<AdminNoticeQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true).await?;
     let admins = database(state.db.clone(), |db| db.list_admins()).await?;
-    let mut rows = String::new();
+    let mut active_rows = String::new();
+    let mut inactive_rows = String::new();
     for admin in admins {
-        let action = if admin.active {
-            format!(
-                r#"<form method="post" action="/admin/admins/{}/deactivate"><input type="hidden" name="csrf" value="{}"><button>Stilllegen</button></form>"#,
-                admin.id,
-                esc(&session.csrf_token)
-            )
+        let action = if admin.id == session.admin_id {
+            r#"<div class="admin-actions"><span class="pill">Aktueller Admin</span><small class="muted">Eigene Passwort- und MFA-Änderungen erfolgen später über „Mein Konto“.</small></div>"#
+                .to_string()
         } else {
+            let status_action = if admin.active {
+                format!(
+                    r#"<form method="post" action="/admin/admins/{}/deactivate"><input type="hidden" name="csrf" value="{}"><button class="secondary">Stilllegen</button></form>"#,
+                    admin.id,
+                    esc(&session.csrf_token)
+                )
+            } else {
+                format!(
+                    r#"<form method="post" action="/admin/admins/{}/activate"><input type="hidden" name="csrf" value="{}"><button>Aktivieren</button></form>"#,
+                    admin.id,
+                    esc(&session.csrf_token)
+                )
+            };
             format!(
-                r#"<form method="post" action="/admin/admins/{}/activate"><input type="hidden" name="csrf" value="{}"><button>Aktivieren</button></form>"#,
+                r#"<div class="admin-actions"><div class="button-group">{}<form method="post" action="/admin/admins/{}/totp"><input type="hidden" name="csrf" value="{}"><button class="secondary">MFA zurücksetzen</button></form></div><form method="post" action="/admin/admins/{}/password" class="admin-reset-form"><input type="hidden" name="csrf" value="{}"><label>Neues Passwort<input name="password" type="password" minlength="14" required></label><label>Bestätigen<input name="password_confirm" type="password" minlength="14" required></label><button>Passwort setzen</button></form></div>"#,
+                status_action,
+                admin.id,
+                esc(&session.csrf_token),
                 admin.id,
                 esc(&session.csrf_token)
             )
         };
-        rows += &format!(
-            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class="button-group">{}</td></tr>"#,
+        let row = format!(
+            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
             admin.id,
             esc(&admin.username),
-            if admin.active { "aktiv" } else { "stillgelegt" },
             esc(&format_audit_time(&admin.created_at)),
             action
         );
+        if admin.active {
+            active_rows.push_str(&row);
+        } else {
+            inactive_rows.push_str(&row);
+        }
     }
+    if active_rows.is_empty() {
+        active_rows
+            .push_str(r#"<tr><td colspan="4" class="muted">Keine aktiven Admins.</td></tr>"#);
+    }
+    if inactive_rows.is_empty() {
+        inactive_rows
+            .push_str(r#"<tr><td colspan="4" class="muted">Keine stillgelegten Admins.</td></tr>"#);
+    }
+    let notice = match query.notice.as_deref() {
+        Some("password_reset") => {
+            r#"<p class="notice">Passwort wurde gesetzt. Bestehende Sessions dieses Admins wurden beendet.</p>"#
+        }
+        _ => "",
+    };
     let body = format!(
-        r#"<section><h1>Admins</h1><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th></tr>{rows}</table><p class="muted">Admin-Löschen ist bewusst nicht enthalten, damit Audit-/Share-Bezüge stabil bleiben.</p></section><section><h2>Admin erstellen</h2><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Benutzername<br><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label>Passwort<br><input name="password" type="password" minlength="14" required></label><label>Passwort bestätigen<br><input name="password_confirm" type="password" required></label><button>Erstellen</button></form></section>"#,
+        r#"<section><h1>Admins</h1>{notice}<div class="admin-columns"><details class="admin-column" open><summary>Aktive Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{active_rows}</table></details><details class="admin-column" open><summary>Stillgelegte Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{inactive_rows}</table></details></div><p class="muted">Admin-Löschen ist bewusst nicht enthalten, damit Audit-/Share-Bezüge stabil bleiben.</p></section><section><h2>Admin erstellen</h2><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Benutzername<br><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label>Passwort<br><input name="password" type="password" minlength="14" required></label><label>Passwort bestätigen<br><input name="password_confirm" type="password" required></label><button>Erstellen</button></form></section>"#,
         esc(&session.csrf_token)
     );
     Ok(Html(admin_page(
@@ -1991,6 +2025,18 @@ struct CreateAdminUiForm {
     username: String,
     password: String,
     password_confirm: String,
+}
+
+#[derive(Deserialize)]
+struct ResetAdminPasswordForm {
+    csrf: String,
+    password: String,
+    password_confirm: String,
+}
+
+#[derive(Deserialize, Default)]
+struct AdminNoticeQuery {
+    notice: Option<String>,
 }
 
 async fn create_admin_ui(
@@ -2040,19 +2086,114 @@ async fn create_admin_ui(
         None,
     )
     .await;
-    let otpauth = format!(
-        "otpauth://totp/VaultLink:{}?secret={}&issuer=VaultLink",
-        username, secret
-    );
+    let otpauth = otpauth_url(&username, &secret);
+    let qr = qr_svg(&otpauth)?;
     let body = format!(
-        r#"<section><h1>Admin erstellt</h1><p>Dieses TOTP-Secret wird nur jetzt angezeigt.</p><p><strong>{}</strong></p><p><code>{}</code></p><p><code>{}</code></p><p><a href="/admin/admins">Zur Adminliste</a></p></section>"#,
+        r#"<section><h1>Admin erstellt</h1><p>Dieses TOTP-Secret wird nur jetzt angezeigt. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins">Zur Adminliste</a></p></section>"#,
         esc(&username),
+        qr,
         esc(&secret),
         esc(&otpauth)
     );
     Ok(Html(admin_page(
         &state,
         "Admin erstellt",
+        &body,
+        false,
+        &session.csrf_token,
+    )))
+}
+
+async fn reset_admin_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<i64>,
+    Form(form): Form<ResetAdminPasswordForm>,
+) -> Result<Redirect> {
+    let (_, session) = session(&state, &headers, true).await?;
+    csrf(&session, &form.csrf)?;
+    if id == session.admin_id {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Eigenes Passwort kann hier nicht zurückgesetzt werden",
+        ));
+    }
+    if form.password != form.password_confirm {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Passwörter stimmen nicht überein",
+        ));
+    }
+    if form.password.chars().count() < 14 {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Passwort muss mindestens 14 Zeichen enthalten",
+        ));
+    }
+    let password = form.password;
+    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&password))
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+    let changed = database(state.db.clone(), move |db| {
+        db.reset_admin_password(id, &hash)
+    })
+    .await?;
+    if !changed {
+        return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
+    }
+    audit(
+        &state,
+        session.username,
+        "admin_password_reset",
+        Some(id.to_string()),
+        None,
+    )
+    .await;
+    Ok(Redirect::to("/admin/admins?notice=password_reset"))
+}
+
+async fn reset_admin_totp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Html<String>> {
+    let (_, session) = session(&state, &headers, true).await?;
+    csrf(&session, &form.csrf)?;
+    if id == session.admin_id {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Eigene MFA kann hier nicht zurückgesetzt werden",
+        ));
+    }
+    let secret = auth::new_totp_secret();
+    let reset_secret = secret.clone();
+    let username = database(state.db.clone(), move |db| {
+        db.reset_admin_totp(id, &reset_secret)
+    })
+    .await?
+    .ok_or(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"))?;
+    audit(
+        &state,
+        session.username,
+        "admin_totp_reset",
+        Some(id.to_string()),
+        None,
+    )
+    .await;
+    let otpauth = otpauth_url(&username, &secret);
+    let qr = qr_svg(&otpauth)?;
+    let body = format!(
+        r#"<section><h1>MFA zurückgesetzt</h1><p>Dieses neue TOTP-Secret wird nur jetzt angezeigt. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins">Zur Adminliste</a></p></section>"#,
+        esc(&username),
+        qr,
+        esc(&secret),
+        esc(&otpauth)
+    );
+    Ok(Html(admin_page(
+        &state,
+        "MFA zurückgesetzt",
         &body,
         false,
         &session.csrf_token,
@@ -3529,14 +3670,14 @@ mod tests {
             1_500_000_000
         );
         assert_eq!(
-            parse_expiry(None, Some("2026-07-07T20:32"), Some("-120"))
+            parse_expiry(Some("2026-07-07T20:32"), Some("-120"))
                 .unwrap()
                 .unwrap()
                 .to_rfc3339(),
             "2026-07-07T18:32:00+00:00"
         );
         assert_eq!(
-            parse_expiry(None, Some("07.07.2026 20:32"), Some("-120"))
+            parse_expiry(Some("07.07.2026 20:32"), Some("-120"))
                 .unwrap()
                 .unwrap()
                 .to_rfc3339(),
@@ -3603,8 +3744,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_setup_form_and_browser_rewrite_are_removed() {
-        assert!(!include_str!("setup.rs").contains("setup_form_legacy"));
+    fn file_time_uses_german_date_order() {
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(60 * 60 * 20 + 32 * 60);
+        assert_eq!(format_file_time(time), "01.01.1970 20:32 UTC");
+    }
+
+    #[test]
+    fn removed_setup_form_and_browser_rewrite_stay_removed() {
+        assert!(!include_str!("setup.rs").contains(concat!("setup_form_", "legacy")));
         assert!(!include_str!("web.rs").contains(concat!("body.", "replace(")));
     }
 
@@ -3798,7 +3945,7 @@ mod tests {
         let mut create_request = request(
             Method::POST,
             "/admin/shares",
-            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&expires_at=&max_downloads=&password=&password_confirm=",
+            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&max_downloads=&password=&password_confirm=",
         );
         create_request.headers_mut().insert(
             header::COOKIE,
@@ -3988,6 +4135,11 @@ mod tests {
             .insert(header::COOKIE, cookie.clone());
         let response = app.clone().oneshot(create_admin).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let created_admin_page = response_text(response).await;
+        assert!(created_admin_page.contains("TOTP QR-Code"));
+        assert!(created_admin_page.contains("<svg"));
+        assert!(created_admin_page.contains("otpauth://totp/VaultLink:ops"));
+        assert!(created_admin_page.contains(r#"class="button secondary" href="/admin/admins""#));
         assert!(state.db.admin("ops").unwrap().is_some());
 
         let mut deactivate = request(
@@ -4025,6 +4177,97 @@ mod tests {
             app.clone().oneshot(self_deactivate).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
+        state.db.create_admin("later", "hash", "secret").unwrap();
+        let mut admin_list = request(Method::GET, "/admin/admins", "");
+        admin_list
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let admin_list_html = response_text(app.clone().oneshot(admin_list).await.unwrap()).await;
+        assert!(admin_list_html.contains("Aktive Admins"));
+        assert!(admin_list_html.contains("Stillgelegte Admins"));
+        assert!(admin_list_html.contains("Admin-Löschen ist bewusst nicht enthalten"));
+        assert!(admin_list_html.contains("Aktueller Admin"));
+        assert_eq!(admin_list_html.matches("Passwort setzen").count(), 2);
+        assert!(
+            admin_list_html.find("<td>1</td>").unwrap()
+                < admin_list_html.find("<td>3</td>").unwrap()
+        );
+        assert!(
+            admin_list_html.find("Aktive Admins").unwrap()
+                < admin_list_html.find("Stillgelegte Admins").unwrap()
+        );
+        assert!(admin_list_html.contains("MFA zurücksetzen"));
+        assert!(admin_list_html.contains("Passwort setzen"));
+        state
+            .db
+            .create_session(
+                "later-session",
+                3,
+                "later-csrf",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap();
+        state.db.verify_mfa("later-session").unwrap();
+        let mut reset_password = request(
+            Method::POST,
+            "/admin/admins/3/password",
+            "csrf=csrf-token&password=new%20long%20password&password_confirm=new%20long%20password",
+        );
+        reset_password
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let reset_password_response = app.clone().oneshot(reset_password).await.unwrap();
+        assert_eq!(reset_password_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            reset_password_response
+                .headers()
+                .get(header::LOCATION)
+                .unwrap(),
+            "/admin/admins?notice=password_reset"
+        );
+        let mut notice_page = request(Method::GET, "/admin/admins?notice=password_reset", "");
+        notice_page
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let notice_html = response_text(app.clone().oneshot(notice_page).await.unwrap()).await;
+        assert!(notice_html.contains("Passwort wurde gesetzt"));
+        assert!(state.db.session("later-session").unwrap().is_none());
+        let login_with_new_password = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/login",
+                "username=later&password=new%20long%20password",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(login_with_new_password.status(), StatusCode::SEE_OTHER);
+        let mut self_password_reset = request(
+            Method::POST,
+            "/admin/admins/1/password",
+            "csrf=csrf-token&password=new%20long%20password&password_confirm=new%20long%20password",
+        );
+        self_password_reset
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(self_password_reset)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut reset_totp = request(Method::POST, "/admin/admins/3/totp", "csrf=csrf-token");
+        reset_totp
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let reset_totp_response = app.clone().oneshot(reset_totp).await.unwrap();
+        assert_eq!(reset_totp_response.status(), StatusCode::OK);
+        let reset_totp_html = response_text(reset_totp_response).await;
+        assert!(reset_totp_html.contains("MFA zurückgesetzt"));
+        assert!(reset_totp_html.contains("TOTP QR-Code"));
+        assert!(reset_totp_html.contains("otpauth://totp/VaultLink:later"));
 
         let mut settings_request = request(
             Method::POST,
