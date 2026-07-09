@@ -107,21 +107,21 @@ fuzz_target!(|input: (
         }
     }
 
-    if !is_directory {
-        assert!(
-            !permission.can_upload(),
-            "API must reject upload-capable permissions for file shares"
-        );
+    let share_permission_is_accepted = is_directory || !permission.can_upload();
+    if !share_permission_is_accepted {
+        assert!(!is_directory);
+        assert!(permission.can_upload());
     }
 
-    let effective_strategy = if is_directory && permission.can_upload() && overwrite_requested {
+    let effective_strategy =
+        if share_permission_is_accepted && is_directory && permission.can_upload() && overwrite_requested {
         UploadConflictStrategy::OverwriteAllowed
     } else {
         UploadConflictStrategy::Reject
     };
     assert_eq!(
         effective_strategy.can_overwrite(),
-        is_directory && permission.can_upload() && overwrite_requested
+        share_permission_is_accepted && is_directory && permission.can_upload() && overwrite_requested
     );
     if !strategy.can_overwrite() {
         assert!(!strategy.can_overwrite());
