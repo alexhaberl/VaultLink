@@ -2,7 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Zielplattform ist Debian Linux; Entwicklung und Tests funktionieren auch unter Debian/Ubuntu in WSL.
 
-Status: `0.2.0`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
+Status: `0.3.0`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
@@ -27,8 +27,10 @@ VaultLink/
 ├── src/
 │   ├── main.rs             CLI, Serverstart, TLS/ACME
 │   ├── config.rs           TOML und Startvalidierung
+│   ├── api.rs              session-basierte JSON-API unter /api/v1
 │   ├── auth.rs             Argon2id, TOTP, Rate Limit
 │   ├── db.rs               Schema, Sessions, Shares, Audit
+│   ├── http_auth.rs        gemeinsame Session-, Cookie-, CSRF- und Audit-Helfer
 │   ├── path_security.rs    Pfadvalidierung
 │   ├── secure_fs.rs        openat2/renameat2 und atomare Uploads
 │   ├── range.rs            einzelner HTTP-Byte-Range-Parser
@@ -39,7 +41,7 @@ VaultLink/
 ├── config/                 Beispielkonfigurationen
 ├── deploy/                 systemd, Caddy, ACME-Hook
 ├── docs/                   Upgrade, Rollback, Release-Gates
-├── fuzz/                   Pfad-, Range-, Dateinamen-, Preview- und Upload-Fuzzing
+├── fuzz/                   Pfad-, Range-, Dateinamen-, Preview-, Upload- und API-Policy-Fuzzing
 ├── Makefile
 └── Cargo.toml
 ```
@@ -100,7 +102,39 @@ Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadli
 | `/v/:token/upload` | POST | exklusiver Ordnerupload |
 | `/s/:alias` | GET | validierter Kurzlink |
 
-Es gibt absichtlich keine öffentliche JSON-API. Interne absolute Pfade werden nie gerendert.
+Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.3.0` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
+
+Wichtige API-Routen:
+
+| Route | Methode | Zweck |
+|---|---:|---|
+| `/api/v1/health` | GET | Health/Version |
+| `/api/v1/session/login` | POST | Passwortprüfung, setzt Session-Cookie |
+| `/api/v1/session/mfa` | POST | TOTP-Verifikation |
+| `/api/v1/session/logout` | POST | Session löschen |
+| `/api/v1/session/me` | GET | aktuelle Session |
+| `/api/v1/files` | GET | Dateibrowser als JSON |
+| `/api/v1/shares` | GET/POST | Freigaben listen/erstellen |
+| `/api/v1/shares/:id` | PATCH/DELETE | Freigabe ändern/löschen |
+| `/api/v1/admins` | GET/POST | Admins listen/anlegen |
+| `/api/v1/settings` | GET/PUT | Runtime-Settings lesen/schreiben |
+| `/api/v1/audit` | GET | Audit-Events paginiert |
+| `/api/v1/public/shares/:token` | GET | Public-Freigabe-Metadaten |
+| `/api/v1/public/shares/:token/unlock` | POST | passwortgeschützte Freigabe entsperren |
+| `/api/v1/public/shares/:token/download` | GET/HEAD | delegiert auf sichere Streaming-Downloadlogik |
+| `/api/v1/public/shares/:token/upload` | POST | delegiert auf sichere Uploadlogik |
+| `/api/v1/public/shares/:token/preview` | GET | delegiert auf sichere Previewlogik |
+| `/api/v1/public/shares/:token/download.zip` | GET | delegiert auf sichere ZIP-Logik |
+
+JSON-Fehler haben die Form:
+
+```json
+{ "error": { "code": "forbidden", "message": "..." } }
+```
+
+Auch delegierte API-Routen für Download, Upload, Preview und ZIP normalisieren Fehler auf dieses JSON-Format. Erfolgreiche Streaming-Antworten bleiben Binärdaten.
+
+Interne absolute Pfade, Passwort-Hashes, Session-Hashes, Unlock-/Preview-Session-Hashes und TOTP-Secrets werden nicht ausgegeben. TOTP-Secrets erscheinen nur einmalig bei Admin-Erstellung oder MFA-Reset.
 
 ## 6. UI und UX
 
@@ -231,7 +265,7 @@ cargo run -- init-admin --config config/development.toml --username admin
 make run
 ```
 
-`make sample-data` erzeugt `dev/mount` und `dev/data`. WSL braucht kein systemd und kein TLS. Wenn Docker in WSL verfügbar ist, prüft `make docker-setup-smoke` das lokale Setup-UI in einem frischen Debian-Container.
+`make sample-data` erzeugt `dev/mount` und `dev/data`. WSL braucht kein systemd und kein TLS. Wenn Docker in WSL verfügbar ist, prüft `make docker-setup-smoke` das lokale Setup-UI in einem frischen Debian-Container. `make docker-api-smoke` startet zusätzlich eine frische Setup-Installation und testet die session-basierte JSON-API inklusive Login, MFA, CSRF, Dateibrowser, Share-Erstellung und Public-Upload-Fehlern als JSON.
 
 ## Troubleshooting
 

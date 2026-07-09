@@ -1,6 +1,8 @@
+pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod http_auth;
 pub mod path_security;
 pub mod proxy;
 pub mod range;

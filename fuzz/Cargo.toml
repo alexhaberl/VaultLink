@@ -53,3 +53,10 @@ path = "fuzz_targets/upload_validation_policy.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "api_request_policy"
+path = "fuzz_targets/api_request_policy.rs"
+test = false
+doc = false
+bench = false

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 — 2026-07-09
+
+- Added session-based JSON API under `/api/v1` for automated feature tests and future CLI integration.
+- Extracted shared HTTP auth helpers for sessions, cookies, CSRF, runtime settings, blocking SQLite work, share unlock cookies, and audit logging.
+- API and UI now share the same session/MFA/CSRF basis instead of maintaining duplicate authentication logic.
+- Added API integration tests for login/MFA/session/CSRF, share creation, secret redaction, admin creation, and CSRF enforcement.
+- Public API download/upload/preview/ZIP routes delegate to the existing secure streaming handlers to avoid duplicated filesystem and permission logic.
+- Delegated API errors are normalized to JSON while successful streaming responses remain binary.
+- Added API request policy fuzz target and manual GitHub fuzz gate.
+
 ## 0.2.0 — 2026-07-08
 
 - Linux storage access is descriptor-relative through `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_MAGICLINKS`.

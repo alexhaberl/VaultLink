@@ -1,0 +1,214 @@
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
+
+use crate::{
+    db::{Database, Session, Share},
+    runtime::RuntimeSettings,
+    AppState,
+};
+
+pub const SESSION_COOKIE: &str = "vaultlink_session";
+
+#[derive(Debug, Clone, Copy)]
+pub enum MissingSession {
+    RedirectToLogin,
+    Unauthorized,
+}
+
+#[derive(Debug)]
+pub struct HttpAuthError {
+    pub status: StatusCode,
+    pub message: &'static str,
+    pub redirect: Option<&'static str>,
+}
+
+impl HttpAuthError {
+    pub fn status(status: StatusCode, message: &'static str) -> Self {
+        Self {
+            status,
+            message,
+            redirect: None,
+        }
+    }
+
+    pub fn redirect(location: &'static str) -> Self {
+        Self {
+            status: StatusCode::SEE_OTHER,
+            message: location,
+            redirect: Some(location),
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, HttpAuthError>;
+
+pub fn internal<T>(_: T) -> HttpAuthError {
+    HttpAuthError::status(StatusCode::INTERNAL_SERVER_ERROR, "Interner Fehler")
+}
+
+pub async fn database<T, F>(database: Database, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Database) -> rusqlite::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(database))
+        .await
+        .map_err(internal)?
+        .map_err(internal)
+}
+
+pub async fn audit(
+    state: &AppState,
+    actor: String,
+    action: &'static str,
+    object: Option<String>,
+    detail: Option<String>,
+) {
+    let _ = database(state.db.clone(), move |db| {
+        db.audit(&actor, action, object.as_deref(), detail.as_deref())
+    })
+    .await;
+}
+
+pub fn runtime_settings(state: &AppState) -> RuntimeSettings {
+    state
+        .runtime
+        .read()
+        .expect("runtime settings lock poisoned")
+        .clone()
+}
+
+pub fn named_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|p| {
+            let (k, v) = p.trim().split_once('=')?;
+            (k == name).then_some(v)
+        })
+}
+
+pub fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+    named_cookie(headers, SESSION_COOKIE)
+}
+
+pub async fn session(
+    state: &AppState,
+    headers: &HeaderMap,
+    require_mfa: bool,
+    missing: MissingSession,
+) -> Result<(String, Session)> {
+    let token = session_cookie(headers).ok_or_else(|| match missing {
+        MissingSession::RedirectToLogin => HttpAuthError::redirect("/login"),
+        MissingSession::Unauthorized => {
+            HttpAuthError::status(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich")
+        }
+    })?;
+    let session_token = token.to_string();
+    let session = database(state.db.clone(), move |db| db.session(&session_token))
+        .await?
+        .ok_or_else(|| match missing {
+            MissingSession::RedirectToLogin => HttpAuthError::redirect("/login"),
+            MissingSession::Unauthorized => {
+                HttpAuthError::status(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich")
+            }
+        })?;
+    if require_mfa && !session.mfa_verified {
+        return Err(HttpAuthError::status(
+            StatusCode::FORBIDDEN,
+            "MFA-Verifikation erforderlich",
+        ));
+    }
+    Ok((token.to_string(), session))
+}
+
+pub fn csrf(session: &Session, value: &str) -> Result<()> {
+    if session.csrf_token.as_bytes() != value.as_bytes() {
+        return Err(HttpAuthError::status(
+            StatusCode::FORBIDDEN,
+            "Ungültiges CSRF-Token",
+        ));
+    }
+    Ok(())
+}
+
+pub fn csrf_header(session: &Session, headers: &HeaderMap) -> Result<()> {
+    let value = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| HttpAuthError::status(StatusCode::FORBIDDEN, "CSRF-Token fehlt"))?;
+    csrf(session, value)
+}
+
+pub fn make_session_cookie(state: &AppState, token: &str) -> String {
+    format!(
+        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={};{}",
+        state.config.security.session_hours * 3600,
+        if state.config.security.secure_cookie {
+            " Secure"
+        } else {
+            ""
+        }
+    )
+}
+
+pub fn clear_session_cookie(state: &AppState) -> String {
+    format!(
+        "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0;{}",
+        if state.config.security.secure_cookie {
+            " Secure"
+        } else {
+            ""
+        }
+    )
+}
+
+pub fn redirect_with_cookie(to: &str, value: String) -> Response {
+    let mut response = Redirect::to(to).into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, HeaderValue::from_str(&value).unwrap());
+    response
+}
+
+pub fn unlock_cookie_name(share_id: i64) -> String {
+    format!("vaultlink_unlock_{share_id}")
+}
+
+pub async fn share_is_unlocked(
+    state: &AppState,
+    headers: &HeaderMap,
+    share: &Share,
+) -> Result<bool> {
+    if share.password_hash.is_none() {
+        return Ok(true);
+    }
+    let name = unlock_cookie_name(share.id);
+    let Some(token) = named_cookie(headers, &name) else {
+        return Ok(false);
+    };
+    let token = token.to_string();
+    let share_id = share.id;
+    database(state.db.clone(), move |db| {
+        db.unlock_session(&token, share_id)
+    })
+    .await
+}
+
+pub fn make_unlock_cookie(state: &AppState, share: &Share, token: &str) -> String {
+    let settings = runtime_settings(state);
+    format!(
+        "{}={}; Path=/v/{}; HttpOnly; SameSite=Strict; Max-Age={};{}",
+        unlock_cookie_name(share.id),
+        token,
+        share.token,
+        settings.share_unlock_minutes * 60,
+        if state.config.security.secure_cookie {
+            " Secure"
+        } else {
+            ""
+        }
+    )
+}

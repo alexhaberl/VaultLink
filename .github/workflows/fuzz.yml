@@ -28,3 +28,5 @@ jobs:
         run: cargo +nightly-2026-07-01 fuzz run upload_overwrite_policy -- -max_total_time=600
       - name: Upload validation policy (10 minutes)
         run: cargo +nightly-2026-07-01 fuzz run upload_validation_policy -- -max_total_time=600
+      - name: API request policy (10 minutes)
+        run: cargo +nightly-2026-07-01 fuzz run api_request_policy -- -max_total_time=600
