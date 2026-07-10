@@ -142,6 +142,7 @@ pub async fn delete(
     let _guard = state.storage_mutation.lock().await;
     let secure_root = state.secure_root.clone();
     let cleanup_root = secure_root.clone();
+    let cleanup_lock = state.storage_cleanup.clone();
     let database = state.db.clone();
     let result = tokio::task::spawn_blocking(move || {
         let staged = secure_root.stage_delete(&path).map_err(map_io)?;
@@ -167,7 +168,7 @@ pub async fn delete(
     })
     .await??;
     if let Some(tombstone_path) = result.1 {
-        spawn_deletion_cleanup(cleanup_root, tombstone_path);
+        spawn_deletion_cleanup(cleanup_root, cleanup_lock, tombstone_path);
     }
     Ok(result.0)
 }
@@ -240,9 +241,14 @@ fn map_io(error: io::Error) -> FileOperationError {
     }
 }
 
-fn spawn_deletion_cleanup(secure_root: SecureRoot, tombstone_path: String) {
+fn spawn_deletion_cleanup(
+    secure_root: SecureRoot,
+    cleanup_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    tombstone_path: String,
+) {
     tokio::spawn(async move {
         loop {
+            let cleanup_guard = cleanup_lock.lock().await;
             let start_root = secure_root.clone();
             let start_path = tombstone_path.clone();
             let cleanup = tokio::task::spawn_blocking(move || {
@@ -255,11 +261,13 @@ fn spawn_deletion_cleanup(secure_root: SecureRoot, tombstone_path: String) {
                 Ok(Ok(cleanup)) => cleanup,
                 Ok(Err(error)) => {
                     tracing::warn!(%error, %tombstone_path, "could not start deletion cleanup");
+                    drop(cleanup_guard);
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     continue;
                 }
                 Err(error) => {
                     tracing::warn!(%error, %tombstone_path, "deletion cleanup task failed to start");
+                    drop(cleanup_guard);
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     continue;
                 }
@@ -267,6 +275,7 @@ fn spawn_deletion_cleanup(secure_root: SecureRoot, tombstone_path: String) {
             if run_cleanup(cleanup, &tombstone_path).await {
                 return;
             }
+            drop(cleanup_guard);
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     });

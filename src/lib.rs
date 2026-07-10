@@ -28,6 +28,7 @@ pub struct AppState {
     pub share_limiter: auth::LoginLimiter,
     pub runtime: Arc<RwLock<RuntimeSettings>>,
     pub storage_mutation: Arc<tokio::sync::Mutex<()>>,
+    pub storage_cleanup: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     pub upload_directory_sync_failure: Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>,
 }
@@ -65,6 +66,7 @@ impl AppState {
             secure_root,
             runtime: Arc::new(RwLock::new(runtime)),
             storage_mutation: Arc::new(tokio::sync::Mutex::new(())),
+            storage_cleanup: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             upload_directory_sync_failure: Arc::new(std::sync::Mutex::new(None)),
         })

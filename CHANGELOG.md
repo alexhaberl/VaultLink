@@ -6,6 +6,7 @@
 - Added permanent recursive deletion with exact-name confirmation for non-empty directories, immediate tombstoning, bounded background cleanup, and restart recovery.
 - Kept share paths consistent across renames and automatically deactivated active shares below deleted paths.
 - Serialized storage mutations with share creation and upload publication, added audit events, and expanded Windows/Linux, database, UI, API, and cleanup coverage.
+- Added exact-name delete-button gating with autofocus and serialized all background tombstone/startup cleanup through one global worker slot to avoid storage I/O bursts.
 - Added filename/private-namespace and file-mutation/share-subtree fuzz coverage, executed as eight parallel targets on the self-hosted runner.
 
 ## 0.3.1 — 2026-07-10

@@ -8,8 +8,8 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
 - [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.3.2.
-- [x] Admin-Dateiverwaltung zum Erstellen von Ordnern, No-Clobber-Umbenennen und permanenten rekursiven Löschen mit Bestätigung.
-- [x] Begrenzte, neustartfähige Tombstone-Bereinigung und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
+- [x] Admin-Dateiverwaltung zum Erstellen von Ordnern, No-Clobber-Umbenennen und permanenten rekursiven Löschen mit serverseitiger Bestätigung sowie clientseitigem Exact-Match-Gating.
+- [x] Begrenzte, neustartfähige Tombstone-Bereinigung mit global serialisierten Cleanup-Workern und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
 - [x] API und UI teilen Auth-, Session-, CSRF-, SecureFS-, SQLite-, Runtime-Settings- und Audit-Logik.
 - [x] API-Fehler werden als JSON normalisiert; Streaming-Routen liefern nur bei Erfolg Binärdaten.
 - [x] Root-begrenzter Dateibrowser mit Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der Oberfläche.
@@ -56,7 +56,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - [x] `cargo test --locked --all-targets`
-  - Ergebnis: 110 Tests unter Windows bestanden; zusätzlich 118 Tests im final neu gebauten Rust-1.97.0-/Debian-13-Container.
+  - Ergebnis: 119 Tests unter Windows bestanden; zusätzlich 126 Tests im final neu gebauten Rust-1.97.0-/Debian-13-Container.
   - Enthalten: API Login/MFA/Session/CSRF, API-URL-/Listen-Restart-Sicherheit, API-scoped Unlock/Media-Preview, Share-Erstellung, Secret-Redaction, Admin-/Settings-API, delegierte API-Uploadfehler als JSON, Setup-UI/-Recovery, UTF-8-Response-/Source-Guards, transaktionale Admin-/Runtime-Pfade, Text-/Bild-/PDF-Preview, Transfer-Grant/Abort/Range-Resume einschließlich HTTP/1-`Content-Length`, Raw-Preview-Token, inkrementelles ZIP, rohe Scanbudgets, Multipart-Präambel/-Header, Body-Limits, `%`-Dateinamens-Roundtrip, Upload-No-Replace/-Replace/-Durability, Share-Rechte, Migrationen und resumierbares Upload-Cleanup.
 - [x] `cargo check --manifest-path fuzz/Cargo.toml --locked`
   - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy` und `api_request_policy` kompiliert.
@@ -66,8 +66,16 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
   - Externe Actions auf volle Commit-SHAs und Container auf Digests gepinnt; Stable-Rust-Version und Smoke-/Release-Image synchron; Cargo-CI-Tools versioniert; Docker-Secret-Ausschlüsse vorhanden.
 - [x] `make docker-smoke`
   - Da GNU Make auf dem Windows-Host nicht installiert ist, wurden die identischen Docker-Build-/Run-Befehle direkt ausgeführt.
-  - Ergebnis auf dem final neu gebauten, digest-gepinnten Rust-1.97.0-/Debian-13-Image: Setup-UI, API Login/MFA/CSRF/Files/Share/Public-Upload-JSON-Fehler sowie sechs isolierte Upgrade-/Rollback-Erfolgs- und Fehlerpfade erfolgreich mit `--network none` geprüft.
-  - Zusätzlich im selben Image grün: Linux-Rustfmt, Clippy über alle Targets/Features mit `-D warnings`, 118/118 Tests inklusive `openat2`-/Symlink-/FIFO-Schutz, Release-Build, Fuzz-Crate-Check, ShellCheck und Supply-Chain-Policy.
+  - Ergebnis auf dem final neu gebauten, digest-gepinnten Rust-1.97.0-/Debian-13-Image: Setup-UI, API Login/MFA/CSRF/Files/Share/Public-Upload-JSON-Fehler sowie isolierte Upgrade-/Rollback-Erfolgs- und Fehlerpfade erfolgreich mit `--network none` geprüft.
+  - Zusätzlich im selben Image grün: Linux-Rustfmt, Clippy über alle Targets/Features mit `-D warnings`, 126/126 Tests inklusive `openat2`-/Symlink-/FIFO-Schutz, Release-Build, Fuzz-Crate-Check, ShellCheck und Supply-Chain-Policy.
+
+## Beobachtung vor dem 0.3.2-Upgrade
+
+- [x] Bestehendes `0.3.0`-Binary auf beiden Testsystemen vor jeder Änderung geprüft; identischer SHA-256 `d6def1640bf8c93ddb5f30689731c4f3f2efb62d13c949b75a0012bd0cfb2946`.
+- [x] Reverse-Proxy-Testsystem nach 10 h 11 min und Standalone-TLS-Testsystem nach 10 h 08 min weiterhin `active/running`, jeweils `NRestarts=0` und ohne fehlgeschlagene systemd-Units.
+- [x] `PRAGMA integrity_check = ok`, leere WAL-Dateien sowie erfolgreiche lokale beziehungsweise öffentliche `/api/v1/health`-Antworten mit Version `0.3.0`.
+- [x] Aktueller RSS 10.5 MiB auf dem Reverse-Proxy-System und 13.0 MiB auf dem Standalone-TLS-System; im ausgewerteten Dienstjournal keine VaultLink-Warnungen, Panics oder Fehler.
+- [ ] Diese Beobachtung ist kein formaler Soak-Gate: Es lief weder `soak-monitor.sh` noch das Lastprofil. Der finale 72h-Soak wurde bewusst noch nicht gestartet.
 
 ## Debian-13-/Docker-Verifikation und noch offene Runtime-Deploys
 
@@ -79,8 +87,13 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
   - `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
   - `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh`
   - `sh tools/check-supply-chain-policy.sh`
-- [ ] Nach diesem Feature-Update erneut auf dem Reverse-Proxy-Testsystem bauen/deployen und Public-Smoke ausführen.
-- [ ] Standalone-Testsystem erneut bauen/deployen und Public-HTTPS-Smoke ausführen.
+- [x] Nach diesem Feature-Update erneut auf dem Reverse-Proxy-Testsystem bauen/deployen und Public-Smoke ausführen.
+  - Transaktionales Upgrade auf `0.3.2` mit verifiziertem Backup `/var/lib/vaultlink/backups/20260710T173328Z` erfolgreich.
+  - Binary-SHA-256 `d382903ff9d238cbc44f616c6af39c9d27d6afb61e1bea5d1ac3706e55fa6e2c`, `NRestarts=0`, SQLite `ok`, lokale und öffentliche Health-Antwort exakt `{"ok":true,"version":"0.3.2"}`, öffentlicher Login HTTP 200.
+- [x] Standalone-Testsystem erneut bauen/deployen und Public-HTTPS-Smoke ausführen.
+  - Transaktionales Upgrade auf `0.3.2` mit verifiziertem Backup `/var/lib/vaultlink/backups/20260710T173409Z` erfolgreich.
+  - Identischer Binary-SHA-256, `NRestarts=0`, SQLite `ok`, öffentliche HTTPS-Health-Antwort exakt `{"ok":true,"version":"0.3.2"}`, Login HTTP 200 und gecachtes Let's-Encrypt-Zertifikat erfolgreich geladen.
+- [x] Erweiterten isolierten Runtime-Smoke auf beiden Debian-13-Systemen ausgeführt: Setup, Login/MFA/CSRF, Exact-Match-Lösch-UI, Ordnererstellung, Share-Erstellung, Share-Pfadänderung nach Umbenennung, Bestätigungspflicht, permanente Teilbaumlöschung, Share-Deaktivierung und Tombstone-Wiederaufnahme nach Prozessneustart.
 
 ## Noch auszuführende Release-Gates
 

@@ -140,6 +140,7 @@ fn start_upload_fragment_cleanup(state: &AppState) {
     const CLEANUP_BATCH_ENTRIES: usize = 4096;
 
     let secure_root = state.secure_root.clone();
+    let cleanup_lock = state.storage_cleanup.clone();
     let mut cleanup = match secure_root.start_upload_fragment_cleanup() {
         Ok(cleanup) => cleanup,
         Err(error) => {
@@ -148,6 +149,7 @@ fn start_upload_fragment_cleanup(state: &AppState) {
         }
     };
     tokio::spawn(async move {
+        let mut cleanup_guard = Some(cleanup_lock.lock().await);
         let mut scanned = 0usize;
         let mut removed = 0usize;
         let mut failed = 0usize;
@@ -187,7 +189,9 @@ fn start_upload_fragment_cleanup(state: &AppState) {
                 if failed == 0 {
                     return;
                 }
+                cleanup_guard.take();
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                cleanup_guard = Some(cleanup_lock.lock().await);
                 let restart_root = secure_root.clone();
                 cleanup = match tokio::task::spawn_blocking(move || {
                     restart_root.start_upload_fragment_cleanup()

@@ -2317,6 +2317,7 @@ mod tests {
             .contains("confirmation_required"));
         assert!(root.path().join("tree").exists());
 
+        let cleanup_guard = state.storage_cleanup.lock().await;
         let mut confirmed = json_request(
             Method::DELETE,
             "/api/v1/files",
@@ -2328,6 +2329,22 @@ mod tests {
             StatusCode::ACCEPTED
         );
         assert!(!root.path().join("tree").exists());
+        let tombstone_exists = || {
+            std::fs::read_dir(root.path()).unwrap().any(|entry| {
+                crate::secure_fs::is_deletion_tombstone_name(&entry.unwrap().file_name())
+            })
+        };
+        assert!(tombstone_exists());
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(tombstone_exists());
+        drop(cleanup_guard);
+        for _ in 0..100 {
+            if !tombstone_exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!tombstone_exists());
         assert!(
             !state
                 .db

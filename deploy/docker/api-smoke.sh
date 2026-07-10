@@ -204,6 +204,87 @@ curl -sS -f -b "$COOKIE_JAR" "http://$APP_ADDR/api/v1/session/me" | grep -q '"us
 curl -sS -f -b "$COOKIE_JAR" "http://$APP_ADDR/api/v1/files?path=" | grep -q '"readme.txt"' \
     || fail "files API did not list readme.txt"
 
+CREATE_DIRECTORY_JSON="$(
+    curl -sS -f -b "$COOKIE_JAR" \
+        -H "content-type: application/json" \
+        -H "x-csrf-token: $CSRF" \
+        -X POST "http://$APP_ADDR/api/v1/files/directories" \
+        -d '{"parent":"","name":"managed"}'
+)"
+printf '%s' "$CREATE_DIRECTORY_JSON" | grep -q '"path":"managed"' \
+    || fail "directory create did not return the managed path"
+printf '%s\n' 'managed mutation smoke file' > "$ROOT_DIR/managed/child.txt"
+
+DELETE_CONFIRMATION_HTML="$(
+    curl -sS -f -b "$COOKIE_JAR" \
+        "http://$APP_ADDR/admin/files/delete?path=managed"
+)"
+printf '%s' "$DELETE_CONFIRMATION_HTML" | grep -q 'data-confirm-input autofocus' \
+    || fail "delete confirmation did not autofocus the exact-name input"
+printf '%s' "$DELETE_CONFIRMATION_HTML" | grep -q 'data-delete-confirmation data-required-name="managed"' \
+    || fail "delete confirmation did not expose the exact required name"
+printf '%s' "$DELETE_CONFIRMATION_HTML" | grep -q 'data-confirm-delete disabled' \
+    || fail "delete confirmation button was not initially disabled"
+
+MUTATION_SHARE_JSON="$(
+    curl -sS -f -b "$COOKIE_JAR" \
+        -H "content-type: application/json" \
+        -H "x-csrf-token: $CSRF" \
+        -X POST "http://$APP_ADDR/api/v1/shares" \
+        -d '{"path":"managed/child.txt","permission":"download_only"}'
+)"
+MUTATION_SHARE_TOKEN="$(printf '%s' "$MUTATION_SHARE_JSON" | json_get token)"
+[[ -n "$MUTATION_SHARE_TOKEN" ]] || fail "mutation share create did not return token"
+
+RENAME_JSON="$(
+    curl -sS -f -b "$COOKIE_JAR" \
+        -H "content-type: application/json" \
+        -H "x-csrf-token: $CSRF" \
+        -X PATCH "http://$APP_ADDR/api/v1/files" \
+        -d '{"path":"managed","name":"renamed"}'
+)"
+printf '%s' "$RENAME_JSON" | grep -q '"path":"renamed"' \
+    || fail "directory rename did not return the renamed path"
+printf '%s' "$RENAME_JSON" | grep -q '"updated_shares":1' \
+    || fail "directory rename did not update the affected share"
+curl -sS -f "http://$APP_ADDR/api/v1/public/shares/$MUTATION_SHARE_TOKEN" \
+    | grep -q '"path":"renamed/child.txt"' \
+    || fail "renamed share did not expose its updated path"
+curl -sS -f "http://$APP_ADDR/api/v1/public/shares/$MUTATION_SHARE_TOKEN/download" \
+    -o "$WORK_DIR/renamed-child.txt"
+cmp "$WORK_DIR/renamed-child.txt" "$ROOT_DIR/renamed/child.txt" \
+    || fail "renamed share download returned unexpected content"
+
+UNCONFIRMED_DELETE_STATUS="$(
+    curl -sS -o "$WORK_DIR/unconfirmed-delete.json" -w '%{http_code}' \
+        -b "$COOKIE_JAR" \
+        -H "content-type: application/json" \
+        -H "x-csrf-token: $CSRF" \
+        -X DELETE "http://$APP_ADDR/api/v1/files" \
+        -d '{"path":"renamed"}'
+)"
+[[ "$UNCONFIRMED_DELETE_STATUS" == "409" ]] \
+    || fail "unconfirmed tree delete returned $UNCONFIRMED_DELETE_STATUS instead of 409"
+assert_json_error "$WORK_DIR/unconfirmed-delete.json" "confirmation_required"
+
+DELETE_JSON="$(
+    curl -sS -f -b "$COOKIE_JAR" \
+        -H "content-type: application/json" \
+        -H "x-csrf-token: $CSRF" \
+        -X DELETE "http://$APP_ADDR/api/v1/files" \
+        -d '{"path":"renamed","confirm_name":"renamed"}'
+)"
+printf '%s' "$DELETE_JSON" | grep -q '"cleanup_pending":true' \
+    || fail "non-empty tree delete was not queued for background cleanup"
+[[ ! -e "$ROOT_DIR/renamed" ]] || fail "deleted tree remained visible"
+INACTIVE_SHARE_STATUS="$(
+    curl -sS -o "$WORK_DIR/inactive-share.json" -w '%{http_code}' \
+        "http://$APP_ADDR/api/v1/public/shares/$MUTATION_SHARE_TOKEN"
+)"
+[[ "$INACTIVE_SHARE_STATUS" == "410" ]] \
+    || fail "deleted tree share returned $INACTIVE_SHARE_STATUS instead of 410"
+assert_json_error "$WORK_DIR/inactive-share.json" "share_inactive"
+
 DOWNLOAD_SHARE_JSON="$(
     curl -sS -f -b "$COOKIE_JAR" \
         -H "content-type: application/json" \
@@ -260,5 +341,21 @@ assert_json_error "$WORK_DIR/upload-error.json" "unsupported_media_type"
 if grep -Fq "$ADMIN_PASSWORD" "$SETUP_LOG" "$APP_LOG"; then
     fail "logs contain sensitive setup data"
 fi
+
+TOMBSTONE="$ROOT_DIR/.vaultlink-delete-AAAAAAAAAAAAAAAAAAAAAAAA.tombstone"
+mkdir -p "$TOMBSTONE/nested"
+printf '%s\n' 'restart cleanup' > "$TOMBSTONE/nested/child.txt"
+kill "$APP_PID"
+wait "$APP_PID"
+unset APP_PID
+
+"$BIN" --config "$CONFIG_PATH" >>"$APP_LOG" 2>&1 &
+APP_PID="$!"
+wait_http "http://$APP_ADDR/login" "200"
+for _ in $(seq 1 100); do
+    [[ -e "$TOMBSTONE" ]] || break
+    sleep 0.02
+done
+[[ ! -e "$TOMBSTONE" ]] || fail "startup did not resume tombstone cleanup"
 
 echo "VaultLink Docker API smoke passed"
