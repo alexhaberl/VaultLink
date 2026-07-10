@@ -1291,6 +1291,9 @@ mod tests {
             }
         });
         started_receiver.recv().unwrap();
+        #[cfg(target_os = "linux")]
+        active.insert(active_key);
+        #[cfg(not(target_os = "linux"))]
         active.insert(active_key.clone());
         drop(active);
 

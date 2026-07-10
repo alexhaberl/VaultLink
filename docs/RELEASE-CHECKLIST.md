@@ -54,7 +54,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - [x] `cargo test --locked --all-targets`
-  - Ergebnis: 107 Tests unter Windows bestanden; der finale Linux-/Containerlauf folgt nach Abschluss dieses Updates erneut.
+  - Ergebnis: 107 Tests unter Windows bestanden; zusätzlich 115 Tests im final neu gebauten Debian-13-Container.
   - Enthalten: API Login/MFA/Session/CSRF, API-URL-/Listen-Restart-Sicherheit, API-scoped Unlock/Media-Preview, Share-Erstellung, Secret-Redaction, Admin-/Settings-API, delegierte API-Uploadfehler als JSON, Setup-UI/-Recovery, transaktionale Admin-/Runtime-Pfade, Text-/Bild-/PDF-Preview, Transfer-Grant/Abort/Range-Resume einschließlich HTTP/1-`Content-Length`, Raw-Preview-Token, inkrementelles ZIP, rohe Scanbudgets, Multipart-Präambel/-Header, Body-Limits, `%`-Dateinamens-Roundtrip, Upload-No-Replace/-Replace/-Durability, Share-Rechte, Migrationen und resumierbares Upload-Cleanup.
 - [x] `cargo check --manifest-path fuzz/Cargo.toml --locked`
   - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy` und `api_request_policy` kompiliert.
@@ -63,16 +63,20 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] `make policy-check`
   - Externe Actions auf volle Commit-SHAs und Container auf Digests gepinnt; Cargo-CI-Tools versioniert; Docker-Secret-Ausschlüsse vorhanden.
 - [x] `make docker-smoke`
-  - Ergebnis vor dem letzten Source-Hardening: digest-gepinntes Debian/Rust-Image gebaut; Setup-UI, API Login/MFA/CSRF/Files/Share/Public-Upload-JSON-Fehler sowie isolierte Upgrade-/Rollback-Fehlerpfade erfolgreich und ohne externes Runtime-Netzwerk geprüft. Der erneute finale Lauf bleibt bis zur unten dokumentierten Verifikation offen.
+  - Da GNU Make auf dem Windows-Host nicht installiert ist, wurden die identischen Docker-Build-/Run-Befehle direkt ausgeführt.
+  - Ergebnis auf dem final neu gebauten, digest-gepinnten Debian/Rust-Image: Setup-UI, API Login/MFA/CSRF/Files/Share/Public-Upload-JSON-Fehler sowie sechs isolierte Upgrade-/Rollback-Erfolgs- und Fehlerpfade erfolgreich mit `--network none` geprüft.
+  - Zusätzlich im selben Image grün: Linux-Rustfmt, Clippy über alle Targets/Features mit `-D warnings`, 115/115 Tests inklusive `openat2`-/Symlink-/FIFO-Schutz, Release-Build, Fuzz-Crate-Check, ShellCheck und Supply-Chain-Policy.
 
-## Bereits auf Debian 13 geprüft, vor finalem Runtime-Deploy erneut auszuführen
+## Debian-13-/Docker-Verifikation und noch offene Runtime-Deploys
 
-- [ ] Debian-13-amd64-Testsystem, temporärer Build in einem nicht versionierten Arbeitsverzeichnis:
+- [x] Digest-gepinntes Debian-13-amd64-Testimage, Build im Container und read-only Workspace-Mount nur für Fuzz-/Shell-Checks:
   - `cargo fmt --all -- --check`
   - `cargo test --locked --all-targets`
-  - `cargo clippy --locked --all-targets -- -D warnings`
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings`
   - `cargo build --release --locked`
-  - `cargo check --manifest-path fuzz/Cargo.toml --locked`
+  - `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
+  - `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh`
+  - `sh tools/check-supply-chain-policy.sh`
 - [ ] Nach diesem Feature-Update erneut auf dem Reverse-Proxy-Testsystem bauen/deployen und Public-Smoke ausführen.
 - [ ] Standalone-Testsystem erneut bauen/deployen und Public-HTTPS-Smoke ausführen.
 
