@@ -60,6 +60,22 @@ pub enum TransferLeaseBeginOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferAvailabilityOutcome {
+    Available,
+    AlreadyCounted,
+    LimitReached,
+    ShareUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransferAccessState {
+    Available,
+    ExistingGrant { grant_id: i64, counted: bool },
+    LimitReached,
+    ShareUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferLeaseCompleteOutcome {
     Counted,
     AlreadyCounted,
@@ -341,6 +357,58 @@ fn cleanup_transfer_state(transaction: &Transaction<'_>, now: &str) -> rusqlite:
         [now],
     )?;
     Ok(())
+}
+
+fn transfer_access_state(
+    connection: &Connection,
+    session_token_hash: &str,
+    share_id: i64,
+    resource_key: &str,
+    action: &str,
+    now: &str,
+) -> rusqlite::Result<TransferAccessState> {
+    let share = connection
+        .query_row(
+            "SELECT max_downloads,download_count FROM shares
+             WHERE id=?1 AND active=1 AND (expires_at IS NULL OR expires_at>?2)
+               AND permission IN ('download_only','download_upload')",
+            params![share_id, now],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((max_downloads, download_count)) = share else {
+        return Ok(TransferAccessState::ShareUnavailable);
+    };
+
+    let existing_grant = connection
+        .query_row(
+            "SELECT id,counted FROM public_transfer_grants
+             WHERE session_token_hash=?1 AND share_id=?2
+               AND resource_key=?3 AND action=?4 AND expires_at>?5",
+            params![session_token_hash, share_id, resource_key, action, now],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .optional()?;
+    if let Some((grant_id, counted)) = existing_grant {
+        return Ok(TransferAccessState::ExistingGrant { grant_id, counted });
+    }
+
+    let pending_grants: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM public_transfer_grants grants
+         WHERE grants.share_id=?1 AND grants.counted=0 AND grants.expires_at>?2
+           AND EXISTS(
+               SELECT 1 FROM public_transfer_leases leases
+               WHERE leases.grant_id=grants.id AND leases.expires_at>?2
+           )",
+        params![share_id, now],
+        |row| row.get(0),
+    )?;
+    if max_downloads.is_some_and(|maximum| download_count.saturating_add(pending_grants) >= maximum)
+    {
+        Ok(TransferAccessState::LimitReached)
+    } else {
+        Ok(TransferAccessState::Available)
+    }
 }
 
 impl Database {
@@ -654,66 +722,44 @@ impl Database {
         let mut connection = self.conn();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state(&transaction, &now)?;
-
-        let share = transaction
-            .query_row(
-                "SELECT max_downloads,download_count FROM shares
-                 WHERE id=?1 AND active=1 AND (expires_at IS NULL OR expires_at>?2)
-                   AND permission IN ('download_only','download_upload')",
-                params![share_id, now],
-                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .optional()?;
-        let Some((max_downloads, download_count)) = share else {
-            transaction.commit()?;
-            return Ok(TransferLeaseBeginOutcome::ShareUnavailable);
-        };
-
-        let existing_grant = transaction
-            .query_row(
-                "SELECT id,counted FROM public_transfer_grants
-                 WHERE session_token_hash=?1 AND share_id=?2
-                   AND resource_key=?3 AND action=?4 AND expires_at>?5",
-                params![session_token_hash, share_id, resource_key, action, now],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
-            )
-            .optional()?;
-
-        if let Some((grant_id, counted)) = existing_grant {
-            if !counted {
-                transaction.execute(
-                    "UPDATE public_transfer_grants SET expires_at=?2 WHERE id=?1",
-                    params![grant_id, expires],
-                )?;
-            }
-            transaction.execute(
-                "INSERT INTO public_transfer_leases(token_hash,grant_id,created_at,heartbeat_at,expires_at)
-                 VALUES(?1,?2,?3,?3,?4)",
-                params![lease_token_hash, grant_id, now, expires],
-            )?;
-            transaction.commit()?;
-            return Ok(if counted {
-                TransferLeaseBeginOutcome::AlreadyCounted
-            } else {
-                TransferLeaseBeginOutcome::NewLease
-            });
-        }
-
-        let pending_grants: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM public_transfer_grants grants
-             WHERE grants.share_id=?1 AND grants.counted=0 AND grants.expires_at>?2
-               AND EXISTS(
-                   SELECT 1 FROM public_transfer_leases leases
-                   WHERE leases.grant_id=grants.id AND leases.expires_at>?2
-               )",
-            params![share_id, now],
-            |row| row.get(0),
+        let access = transfer_access_state(
+            &transaction,
+            &session_token_hash,
+            share_id,
+            resource_key,
+            action,
+            &now,
         )?;
-        if max_downloads
-            .is_some_and(|maximum| download_count.saturating_add(pending_grants) >= maximum)
-        {
-            transaction.commit()?;
-            return Ok(TransferLeaseBeginOutcome::LimitReached);
+
+        match access {
+            TransferAccessState::ExistingGrant { grant_id, counted } => {
+                if !counted {
+                    transaction.execute(
+                        "UPDATE public_transfer_grants SET expires_at=?2 WHERE id=?1",
+                        params![grant_id, expires],
+                    )?;
+                }
+                transaction.execute(
+                    "INSERT INTO public_transfer_leases(token_hash,grant_id,created_at,heartbeat_at,expires_at)
+                     VALUES(?1,?2,?3,?3,?4)",
+                    params![lease_token_hash, grant_id, now, expires],
+                )?;
+                transaction.commit()?;
+                return Ok(if counted {
+                    TransferLeaseBeginOutcome::AlreadyCounted
+                } else {
+                    TransferLeaseBeginOutcome::NewLease
+                });
+            }
+            TransferAccessState::LimitReached => {
+                transaction.commit()?;
+                return Ok(TransferLeaseBeginOutcome::LimitReached);
+            }
+            TransferAccessState::ShareUnavailable => {
+                transaction.commit()?;
+                return Ok(TransferLeaseBeginOutcome::ShareUnavailable);
+            }
+            TransferAccessState::Available => {}
         }
 
         transaction.execute(
@@ -737,6 +783,42 @@ impl Database {
         )?;
         transaction.commit()?;
         Ok(TransferLeaseBeginOutcome::NewLease)
+    }
+
+    /// Checks whether the same logical transfer could start without reserving or
+    /// counting quota. This is used by bodyless HTTP methods such as HEAD.
+    pub fn check_transfer_availability(
+        &self,
+        session_token: &str,
+        share_id: i64,
+        resource_key: &str,
+        action: &str,
+    ) -> rusqlite::Result<TransferAvailabilityOutcome> {
+        let (now, _) = transfer_deadlines();
+        let session_token_hash = token_hash(session_token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_transfer_state(&transaction, &now)?;
+        let outcome = match transfer_access_state(
+            &transaction,
+            &session_token_hash,
+            share_id,
+            resource_key,
+            action,
+            &now,
+        )? {
+            TransferAccessState::Available => TransferAvailabilityOutcome::Available,
+            TransferAccessState::ExistingGrant { counted: true, .. } => {
+                TransferAvailabilityOutcome::AlreadyCounted
+            }
+            TransferAccessState::ExistingGrant { counted: false, .. } => {
+                TransferAvailabilityOutcome::Available
+            }
+            TransferAccessState::LimitReached => TransferAvailabilityOutcome::LimitReached,
+            TransferAccessState::ShareUnavailable => TransferAvailabilityOutcome::ShareUnavailable,
+        };
+        transaction.commit()?;
+        Ok(outcome)
     }
 
     /// Completes one request lease. The first successful request for a pending
@@ -1472,6 +1554,13 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
 
         assert_eq!(
             database
+                .check_transfer_availability("client", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferAvailabilityOutcome::Available
+        );
+
+        assert_eq!(
+            database
                 .begin_transfer_lease("client", "lease-one", share_id, "file.bin", "download")
                 .unwrap(),
             TransferLeaseBeginOutcome::NewLease
@@ -1483,6 +1572,18 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             TransferLeaseBeginOutcome::NewLease
         );
         assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 1);
+        assert_eq!(
+            database
+                .check_transfer_availability("client", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferAvailabilityOutcome::Available
+        );
+        assert_eq!(
+            database
+                .check_transfer_availability("other", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferAvailabilityOutcome::LimitReached
+        );
         assert_eq!(
             database
                 .begin_transfer_lease("other", "blocked", share_id, "file.bin", "download")
@@ -1504,6 +1605,18 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
         assert_eq!(
             database.complete_transfer_lease("lease-two").unwrap(),
             TransferLeaseCompleteOutcome::AlreadyCounted
+        );
+        assert_eq!(
+            database
+                .check_transfer_availability("client", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferAvailabilityOutcome::AlreadyCounted
+        );
+        assert_eq!(
+            database
+                .check_transfer_availability("other", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferAvailabilityOutcome::LimitReached
         );
         assert_eq!(
             database

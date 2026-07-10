@@ -36,8 +36,9 @@ use tower_http::{
 use crate::{
     auth,
     db::{
-        AdminDeactivationOutcome, Database, Permission, Session, Share, TransferLeaseBeginOutcome,
-        TransferLeaseCompleteOutcome, UploadConflictStrategy,
+        AdminDeactivationOutcome, Database, Permission, Session, Share,
+        TransferAvailabilityOutcome, TransferLeaseBeginOutcome, TransferLeaseCompleteOutcome,
+        UploadConflictStrategy,
     },
     http_auth::{
         audit, clear_session_cookie, commit_runtime_settings, csrf, database, make_session_cookie,
@@ -470,6 +471,34 @@ async fn begin_public_transfer(
     }
 }
 
+async fn check_public_transfer_availability(
+    state: &AppState,
+    headers: &HeaderMap,
+    share: &Share,
+    resource_key: String,
+    action: &'static str,
+) -> Result<()> {
+    let session_token = transfer_cookie(headers, share.id)
+        .map(str::to_string)
+        .unwrap_or_else(|| auth::random_token(32));
+    let share_id = share.id;
+    let outcome = database(state.db.clone(), move |database| {
+        database.check_transfer_availability(&session_token, share_id, &resource_key, action)
+    })
+    .await?;
+    match outcome {
+        TransferAvailabilityOutcome::Available | TransferAvailabilityOutcome::AlreadyCounted => {
+            Ok(())
+        }
+        TransferAvailabilityOutcome::LimitReached => {
+            Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"))
+        }
+        TransferAvailabilityOutcome::ShareUnavailable => {
+            Err(AppError(StatusCode::GONE, "Freigabe nicht verfügbar"))
+        }
+    }
+}
+
 fn transfer_complete_future(
     database: Database,
     lease_token: String,
@@ -681,6 +710,11 @@ fn upload_io_error(error: std::io::Error) -> AppError {
     }
 }
 
+enum PendingUploadFileError {
+    Begin,
+    Take(std::io::Error),
+}
+
 async fn limited_multipart_text(
     mut field: axum::extract::multipart::Field<'_>,
     maximum: usize,
@@ -805,7 +839,7 @@ async fn login(
     Ok(redirect_with_cookie(
         "/mfa",
         make_session_cookie(&state, &token),
-    ))
+    )?)
 }
 async fn mfa_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
     session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
@@ -858,7 +892,10 @@ async fn logout(
     csrf(&s, &form.csrf)?;
     database(state.db.clone(), move |db| db.delete_session(&token)).await?;
     audit(&state, s.username, "logout", None, None).await;
-    Ok(redirect_with_cookie("/login", clear_session_cookie(&state)))
+    Ok(redirect_with_cookie(
+        "/login",
+        clear_session_cookie(&state),
+    )?)
 }
 
 #[derive(Default, Deserialize)]
@@ -1373,7 +1410,7 @@ fn public_preview_error(error: io::Error) -> AppError {
     // descriptor-bound share or follow a forbidden final symlink. Keep that
     // security boundary indistinguishable from a missing public file.
     if matches!(error.raw_os_error(), Some(18 | 40)) {
-        return AppError(StatusCode::NOT_FOUND, "Datei nicht verfuegbar");
+        return AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar");
     }
     match error.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
@@ -2034,7 +2071,7 @@ async fn raw_preview_response<D: DirectoryAccess>(
     let file = tokio::task::spawn_blocking(move || secure_root.open_regular_file(&open_path))
         .await
         .map_err(internal)?
-        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfuegbar"))?;
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
     raw_preview_opened_response(file, method, headers, relative_file, kind, max_size).await
 }
 
@@ -3240,7 +3277,7 @@ async fn unlock_share(
     Ok(redirect_with_cookie(
         &format!("/v/{token}"),
         make_unlock_cookie(&state, &share, &unlock_token, UnlockCookieScope::Web),
-    ))
+    )?)
 }
 
 async fn public_page(
@@ -3764,6 +3801,15 @@ pub(crate) async fn download_zip(
         .secure_root
         .bind_directory(&sh.relative_path)
         .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+    let resource_key = if sub.is_empty() {
+        ".".to_string()
+    } else {
+        sub.clone()
+    };
+    let transfer =
+        begin_public_transfer(&state, &headers, &uri, &sh, resource_key, "zip_download").await?;
+    let transfer_cookie_value = transfer.cookie.clone();
+    let mut transfer = Some(transfer);
     let plan_scope = secure_root.clone();
     let plan_path = sub.clone();
     let plan_settings = settings.clone();
@@ -3772,12 +3818,6 @@ pub(crate) async fn download_zip(
             .await
             .map_err(internal)?
             .map_err(zip_error)?;
-    let resource_key = if sub.is_empty() { ".".to_string() } else { sub };
-    let transfer =
-        begin_public_transfer(&state, &headers, &uri, &sh, resource_key, "zip_download").await;
-    let transfer = transfer?;
-    let transfer_cookie_value = transfer.cookie.clone();
-    let mut transfer = Some(transfer);
     let mut content_length = None;
     let body = if let Some(reservation) = ZipTempReservation::acquire(plan.estimated_archive_size) {
         let temp_scope = secure_root.clone();
@@ -3888,6 +3928,16 @@ pub(crate) async fn download(
     } else {
         sh.relative_path.clone()
     };
+    if method == Method::HEAD {
+        check_public_transfer_availability(
+            &state,
+            &headers,
+            &sh,
+            relative_file.clone(),
+            "download",
+        )
+        .await?;
+    }
     let secure_root = state.secure_root.clone();
     let open_path = relative_file.clone();
     let share_path = sh.relative_path.clone();
@@ -4172,22 +4222,28 @@ pub(crate) async fn upload(
         }
         let secure_root = share_scope.clone();
         let upload_directory = upload_subdir.clone();
-        let mut pending =
-            match tokio::task::spawn_blocking(move || secure_root.begin_upload(&upload_directory))
-                .await
-                .map_err(internal)?
-            {
-                Ok(pending) => pending,
-                Err(_) => {
-                    return Ok(public_upload_error(
-                        &token,
-                        &upload_subdir,
-                        StatusCode::NOT_FOUND,
-                        "Zielordner nicht verfügbar",
-                    ))
-                }
-            };
-        let mut output = tokio::fs::File::from_std(pending.take_file());
+        let pending_file = tokio::task::spawn_blocking(move || {
+            let mut pending = secure_root
+                .begin_upload(&upload_directory)
+                .map_err(|_| PendingUploadFileError::Begin)?;
+            let file = pending.take_file().map_err(PendingUploadFileError::Take)?;
+            Ok::<_, PendingUploadFileError>((pending, file))
+        })
+        .await
+        .map_err(internal)?;
+        let (mut pending, file) = match pending_file {
+            Ok(value) => value,
+            Err(PendingUploadFileError::Begin) => {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::NOT_FOUND,
+                    "Zielordner nicht verfügbar",
+                ))
+            }
+            Err(PendingUploadFileError::Take(error)) => return Err(upload_io_error(error)),
+        };
+        let mut output = tokio::fs::File::from_std(file);
         let mut total = 0u64;
         let stream = field;
         tokio::pin!(stream);
@@ -5314,6 +5370,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("file.txt"), b"abcdef").unwrap();
+        std::fs::create_dir(root.path().join("zipdocs")).unwrap();
+        std::fs::write(root.path().join("zipdocs/one.txt"), b"one").unwrap();
+        std::fs::write(root.path().join("zipdocs/two.txt"), b"two").unwrap();
         let state = test_state(root.path(), data.path());
         state.db.create_admin("admin", "hash", "secret").unwrap();
         let _share_id = state
@@ -5381,7 +5440,102 @@ mod tests {
                 &UploadConflictStrategy::Reject,
             )
             .unwrap();
+        let exhausted_zip_id = state
+            .db
+            .create_share(
+                "zip-exhausted",
+                None,
+                "zipdocs",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let failing_zip_id = state
+            .db
+            .create_share(
+                "zip-failing",
+                None,
+                "zipdocs",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        assert!(state.db.count_download(exhausted_zip_id).unwrap());
+        state.runtime.write().unwrap().max_search_entries = 1;
         let app = router(state.clone());
+
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/zip-exhausted/download.zip", "",))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/zip-failing/download.zip", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        for _ in 0..100 {
+            if state
+                .db
+                .active_transfer_reservations(failing_zip_id)
+                .unwrap()
+                == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            state
+                .db
+                .active_transfer_reservations(failing_zip_id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            state
+                .db
+                .share_by_token("zip-failing")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            0
+        );
+
+        let available_head = app
+            .clone()
+            .oneshot(request(Method::HEAD, "/v/limited/download", ""))
+            .await
+            .unwrap();
+        assert_eq!(available_head.status(), StatusCode::OK);
+        assert_eq!(available_head.headers()[header::CONTENT_LENGTH], "6");
+        assert_eq!(
+            state
+                .db
+                .share_by_token("limited")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            0
+        );
 
         let first = app
             .clone()
@@ -5403,6 +5557,14 @@ mod tests {
             .next()
             .unwrap()
             .to_string();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::HEAD, "/v/limited/download", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
+        );
         assert_eq!(response_text(first).await, "abc");
         for _ in 0..100 {
             if state
@@ -5425,6 +5587,27 @@ mod tests {
                 .unwrap()
                 .download_count,
             1
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::HEAD, "/v/limited/download", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
+        );
+        let mut counted_session_head = request(Method::HEAD, "/v/limited/download", "");
+        counted_session_head.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&transfer_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(counted_session_head)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
         );
 
         // HTTP/1 stops polling a response body after exactly Content-Length bytes.

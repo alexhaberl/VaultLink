@@ -1375,16 +1375,6 @@ fn usable(share: &Share) -> ApiResult<()> {
             "Freigabe ist abgelaufen",
         ));
     }
-    if share
-        .max_downloads
-        .is_some_and(|max| share.download_count >= max)
-    {
-        return Err(ApiError::new(
-            StatusCode::GONE,
-            "download_limit_reached",
-            "Downloadlimit erreicht",
-        ));
-    }
     Ok(())
 }
 
@@ -1885,14 +1875,14 @@ mod tests {
                 false,
                 &Permission::DownloadOnly,
                 None,
-                None,
+                Some(1),
                 None,
                 1,
                 Some(&password_hash),
                 &UploadConflictStrategy::Reject,
             )
             .unwrap();
-        let app = crate::web::router(state);
+        let app = crate::web::router(state.clone());
         let unlock = app
             .clone()
             .oneshot(json_request(
@@ -1922,7 +1912,7 @@ mod tests {
             header::COOKIE,
             HeaderValue::from_str(&unlock_cookie).unwrap(),
         );
-        let download = app.oneshot(download).await.unwrap();
+        let download = app.clone().oneshot(download).await.unwrap();
         assert_eq!(download.status(), StatusCode::OK);
         assert!(download
             .headers()
@@ -1933,6 +1923,31 @@ mod tests {
                 .unwrap()
                 .contains("Path=/api/v1/public/shares/protected-token")));
         assert_eq!(response_text(download).await, "protected content");
+        for _ in 0..100 {
+            if state
+                .db
+                .share_by_token("protected-token")
+                .unwrap()
+                .unwrap()
+                .download_count
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let metadata = app
+            .oneshot(json_request(
+                Method::GET,
+                "/api/v1/public/shares/protected-token",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::OK);
+        assert!(response_text(metadata)
+            .await
+            .contains(r#""download_count":1"#));
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Linkverwaltung für Datei-/Ordnerlinks mit `download_only`, `upload_only`, `download_upload`.
 - [x] Passwortgeschützte Shares mit Argon2id, Unlock-Cookies und Rate-Limit.
 - [x] Optionaler Kurzlink-Alias.
-- [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`; feste Transfer-Grants zählen erst vollständige Antworten und fassen Range-Resumes ohne Sliding-Expiry zusammen.
+- [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`; HEAD prüft die verfügbare Quote ohne Reservierung oder Zählung, feste Transfer-Grants zählen erst vollständige Antworten und fassen Range-Resumes ohne Sliding-Expiry zusammen.
 - [x] Sichere Uploads mit temporärer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
 - [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink; Default bleibt No-Replace und Public-Uploader müssen Replace pro Upload bestätigen.
 - [x] Upload in navigierten Unterordnern für `download_upload`-Ordnerlinks.
