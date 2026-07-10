@@ -806,8 +806,18 @@ pub const STYLESHEET: &str = r#"
   .vl-data-table tbody tr:hover { background: rgba(90,167,255,.045); }
   .vl-table-wrap { min-width: 0; overflow-x: auto; }
 
+  @media (min-width: 45.01rem) {
+    .vl-audit-layout .vl-data-table { table-layout: fixed; }
+    .vl-audit-layout .vl-data-table th:nth-child(1) { width: 9rem; }
+    .vl-audit-layout .vl-data-table th:nth-child(2) { width: 5rem; }
+    .vl-audit-layout .vl-data-table th:nth-child(3) { width: 9rem; }
+    .vl-audit-layout .vl-data-table th:nth-child(4) { width: 4.5rem; }
+    .vl-audit-layout .vl-data-table td:nth-child(3) code { white-space: nowrap; overflow-wrap: normal; word-break: normal; }
+    .vl-audit-layout .vl-data-table td:nth-child(5) { overflow-wrap: anywhere; word-break: break-word; }
+  }
+
   .vl-file-select { display: block; color: var(--vl-text); font-weight: 650; cursor: pointer; }
-  .vl-file-select > input { position: absolute; opacity: 0; }
+  .vl-file-select > input { position: absolute; width: 1px; height: 1px; margin: 0; opacity: 0; overflow: hidden; }
   .vl-file-select > span { display: inline-flex; gap: var(--vl-space-3); align-items: center; min-height: 2.75rem; }
   .vl-button--small, .vl-ui button.vl-button--small { min-height: 2.75rem; }
   .vl-media-preview { display: block; max-width: 100%; }

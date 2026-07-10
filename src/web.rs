@@ -1963,7 +1963,7 @@ fn human(n: u64) -> String {
 }
 
 fn upload_limit_label(bytes: u64) -> String {
-    format!("{} GB", display_limit_unit_floor(bytes, GB))
+    human(bytes)
 }
 
 fn display_limit_unit_floor(bytes: u64, unit: u64) -> String {
@@ -3040,6 +3040,14 @@ async fn share_index_page(
         database.transfer_statistics_started_at()
     })
     .await?;
+    let statistics_started_label = DateTime::parse_from_rfc3339(&statistics_started_at)
+        .map(|value| {
+            value
+                .with_timezone(&Utc)
+                .format("%d.%m.%Y %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or(statistics_started_at);
     let active_count = all_shares
         .iter()
         .filter(|share| share_is_available(share))
@@ -3140,12 +3148,7 @@ async fn share_index_page(
         let upload_limit = share
             .max_upload_size
             .map(upload_limit_label)
-            .unwrap_or_else(|| {
-                format!(
-                    "global {} GB",
-                    display_limit_unit_floor(settings.max_upload_size, GB)
-                )
-            });
+            .unwrap_or_else(|| format!("global {}", human(settings.max_upload_size)));
         share_rows += &format!(
             r#"<article class="vl-share-row"><div class="vl-share-identity"><span class="vl-file-kind" aria-hidden="true"></span><div><strong>{}</strong><span class="vl-muted">/{}</span></div></div><div class="vl-share-url"><code>{}</code><button class="vl-icon-button" type="button" data-copy="{}" aria-label="Link kopieren">Kopieren</button></div><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span><span class="vl-badge vl-badge--{}">{}</span>{}</div><div class="vl-share-quota"><span>{} / {} gezählte Übertragungen</span>{}<small class="vl-muted">Uploadlimit: {}</small></div><details class="vl-action-details"><summary class="vl-icon-button">Aktionen</summary><div class="vl-action-panel"><a class="vl-button vl-button--ghost" href="{}">Öffnen</a><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--ghost">{}</button></form><details><summary>Passwort ändern</summary><form method="post" action="/admin/shares/{}/password" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field">Neues Passwort<input type="password" name="password" minlength="{}" maxlength="{}"></label><label class="vl-field">Bestätigen<input type="password" name="password_confirm"></label><div class="vl-inline-actions"><button class="vl-button">Setzen</button><button class="vl-button vl-button--secondary" name="remove" value="1">Entfernen</button></div></form></details>{}<form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--danger">Löschen</button></form></div></details></article>"#,
             esc(display_name),
@@ -3190,7 +3193,7 @@ async fn share_index_page(
         esc(&monthly.month),
         monthly.preview,
         esc(&monthly.month),
-        esc(&statistics_started_at),
+        esc(&statistics_started_label),
         esc(&query),
         selected(status, "all"),
         selected(status, "active"),
@@ -3315,12 +3318,7 @@ async fn share_create_page_legacy(
         let upload_limit = sh
             .max_upload_size
             .map(upload_limit_label)
-            .unwrap_or_else(|| {
-                format!(
-                    "global ({} GB)",
-                    display_limit_unit_floor(settings.max_upload_size, GB)
-                )
-            });
+            .unwrap_or_else(|| format!("global ({})", human(settings.max_upload_size)));
         let upload_conflict = match sh.upload_conflict_strategy {
             UploadConflictStrategy::Reject => "Konflikt: ablehnen",
             UploadConflictStrategy::OverwriteAllowed => "Konflikt: Überschreiben erlaubt",
@@ -4273,16 +4271,7 @@ async fn update_settings(
     let previous = runtime_settings(&state);
     commit_runtime_settings(&state, next.clone(), admin_id).await?;
     let actor = session.username.clone();
-    let mut changed = Vec::new();
-    if previous.public_base_url != next.public_base_url {
-        changed.push("public_base_url");
-    }
-    if previous.audit_client_ip_enabled != next.audit_client_ip_enabled {
-        changed.push("audit_client_ip_enabled");
-    }
-    if previous != next && changed.is_empty() {
-        changed.push("runtime_policy");
-    }
+    let changed = previous.changed_keys(&next);
     audit(
         &state,
         actor,

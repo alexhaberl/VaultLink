@@ -21,6 +21,34 @@ pub struct RuntimeSettings {
 }
 
 impl RuntimeSettings {
+    pub fn changed_keys(&self, other: &Self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        macro_rules! changed {
+            ($field:ident) => {
+                if self.$field != other.$field {
+                    keys.push(stringify!($field));
+                }
+            };
+        }
+        changed!(public_base_url);
+        changed!(max_upload_size);
+        changed!(blocked_extensions);
+        changed!(share_password_min_length);
+        changed!(share_password_max_length);
+        changed!(share_unlock_minutes);
+        changed!(max_zip_size);
+        changed!(max_zip_files);
+        changed!(max_search_entries);
+        changed!(max_search_results);
+        changed!(max_preview_size);
+        changed!(preview_extensions);
+        changed!(image_preview_extensions);
+        changed!(pdf_preview_enabled);
+        changed!(max_media_preview_size);
+        changed!(audit_client_ip_enabled);
+        keys
+    }
+
     pub fn from_config(config: &Config) -> Self {
         Self {
             public_base_url: config.server.public_base_url.clone(),
@@ -358,6 +386,24 @@ mod tests {
         assert!(settings
             .pairs()
             .contains(&("audit_client_ip_enabled", "false".to_string())));
+    }
+
+    #[test]
+    fn changed_keys_reports_each_runtime_field_by_its_persisted_name() {
+        let original = RuntimeSettings::from_config(&config());
+        let mut changed = original.clone();
+        changed.max_upload_size += 1;
+        changed.blocked_extensions.push("bat".into());
+        changed.audit_client_ip_enabled = true;
+        assert_eq!(
+            original.changed_keys(&changed),
+            [
+                "max_upload_size",
+                "blocked_extensions",
+                "audit_client_ip_enabled"
+            ]
+        );
+        assert!(original.changed_keys(&original).is_empty());
     }
 
     #[test]

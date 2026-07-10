@@ -806,6 +806,25 @@ async fn create_share(
     } else {
         UploadConflictStrategy::Reject
     };
+    let audit_detail = format!(
+        "path={rel};permission={};alias={};expires_at={};transfer_limit={};upload_limit={};password_protected={};overwrite_allowed={}",
+        request.permission.as_str(),
+        alias.as_deref().unwrap_or(""),
+        request
+            .expires_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_default(),
+        request
+            .max_downloads
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        request
+            .max_upload_size
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        password_hash.is_some(),
+        strategy.can_overwrite(),
+    );
     let token = auth::random_token(32);
     let token_for_db = token.clone();
     let rel_for_db = rel.clone();
@@ -837,7 +856,7 @@ async fn create_share(
         session_data.username,
         "share_created",
         Some(share_id.to_string()),
-        Some(rel),
+        Some(audit_detail),
     )
     .await;
     let share = database(state.db.clone(), move |db| db.share_by_token(&token))
@@ -1294,7 +1313,8 @@ async fn update_settings(
 ) -> ApiResult<Json<SettingsBody>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    let mut next = runtime_settings(&state);
+    let current = runtime_settings(&state);
+    let mut next = current.clone();
     let max_upload_size = body.max_upload_size.to_string();
     let blocked_extensions = body.blocked_extensions.join(",");
     let share_password_min_length = body.share_password_min_length.to_string();
@@ -1344,13 +1364,14 @@ async fn update_settings(
     next.validate()
         .map_err(|_| ApiError::bad_request("Ungültige Einstellung"))?;
     let admin_id = session_data.admin_id;
+    let changed_keys = current.changed_keys(&next).join(",");
     commit_runtime_settings(&state, next.clone(), admin_id).await?;
     audit(
         &state,
         session_data.username,
         "settings_updated",
         None,
-        None,
+        Some(format!("changed_keys={changed_keys}")),
     )
     .await;
     Ok(Json(settings_body(next)))
@@ -1964,6 +1985,14 @@ mod tests {
         assert!(body.contains(r#""password_protected":true"#));
         assert!(body.contains(r#""upload_conflict_strategy":"overwrite_allowed""#));
         assert!(!body.contains("password_hash"));
+        let audit_events = state.db.list_audit(Some("share_created"), 10, 0).unwrap();
+        let detail = audit_events[0].detail.as_deref().unwrap();
+        assert!(detail.contains("path=docs"));
+        assert!(detail.contains("permission=download_upload"));
+        assert!(detail.contains("alias=docsapi"));
+        assert!(detail.contains("transfer_limit=5"));
+        assert!(detail.contains("password_protected=true"));
+        assert!(detail.contains("overwrite_allowed=true"));
 
         let mut list = json_request(Method::GET, "/api/v1/shares", "");
         list.headers_mut().insert(
