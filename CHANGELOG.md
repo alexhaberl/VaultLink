@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 — 2026-07-10
+
+- Fixed UTF-8 mojibake in the admin and setup interfaces so German labels, punctuation, and icons render correctly.
+- Added rendered-response and source-level regression checks for UTF-8 metadata and common Windows-1252/UTF-8 corruption patterns.
+- Updated the pinned GitHub workflow actions to `checkout` v7 and `upload-artifact` v7.0.1, aligned the stable Rust, CI, Docker, and release toolchains on Rust 1.97.0, and added a policy check that keeps the stable image pins synchronized.
+- Fixed release dry-runs on branch names containing slashes by deriving artifact versions from `Cargo.toml`, and validated every required dry-run output before artifact upload.
+
 ## 0.3.0 — 2026-07-10
 
 - Added session-based JSON API under `/api/v1` for automated feature tests and future CLI integration.
