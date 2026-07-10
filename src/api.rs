@@ -7,7 +7,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -127,6 +127,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/admins/{id}/totp/reset", post(reset_admin_totp))
         .route("/settings", get(get_settings).put(update_settings))
         .route("/audit", get(list_audit))
+        .route("/audit/client-ips", delete(delete_audit_client_ips))
         .route("/public/shares/{token}", get(public_share))
         .route("/public/shares/{token}/unlock", post(unlock_share))
         .route(
@@ -765,7 +766,7 @@ async fn create_share(
     }
     if request.max_downloads == Some(0) {
         return Err(ApiError::bad_request(
-            "Maximale Downloadanzahl muss mindestens 1 sein",
+            "Das Übertragungslimit muss mindestens 1 sein",
         ));
     }
     if request.max_upload_size == Some(0) {
@@ -1253,6 +1254,8 @@ struct SettingsBody {
     image_preview_extensions: Vec<String>,
     pdf_preview_enabled: bool,
     max_media_preview_size: u64,
+    #[serde(default)]
+    audit_client_ip_enabled: Option<bool>,
 }
 
 fn settings_body(settings: RuntimeSettings) -> SettingsBody {
@@ -1272,6 +1275,7 @@ fn settings_body(settings: RuntimeSettings) -> SettingsBody {
         image_preview_extensions: settings.image_preview_extensions,
         pdf_preview_enabled: settings.pdf_preview_enabled,
         max_media_preview_size: settings.max_media_preview_size,
+        audit_client_ip_enabled: Some(settings.audit_client_ip_enabled),
     }
 }
 
@@ -1305,6 +1309,10 @@ async fn update_settings(
     let image_preview_extensions = body.image_preview_extensions.join(",");
     let pdf_preview_enabled = body.pdf_preview_enabled.to_string();
     let max_media_preview_size = body.max_media_preview_size.to_string();
+    let audit_client_ip_enabled = body
+        .audit_client_ip_enabled
+        .unwrap_or(next.audit_client_ip_enabled)
+        .to_string();
     next.apply_many([
         ("public_base_url", body.public_base_url.as_str()),
         ("max_upload_size", max_upload_size.as_str()),
@@ -1330,6 +1338,7 @@ async fn update_settings(
         ),
         ("pdf_preview_enabled", pdf_preview_enabled.as_str()),
         ("max_media_preview_size", max_media_preview_size.as_str()),
+        ("audit_client_ip_enabled", audit_client_ip_enabled.as_str()),
     ])
     .map_err(|_| ApiError::bad_request("Invalid runtime setting"))?;
     next.validate()
@@ -1357,6 +1366,7 @@ struct AuditQuery {
 struct AuditResponse {
     page: usize,
     has_next: bool,
+    client_ip_enabled: bool,
     events: Vec<AuditEventResponse>,
 }
 
@@ -1367,16 +1377,23 @@ struct AuditEventResponse {
     action: String,
     object_id: Option<String>,
     detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_ip: Option<String>,
 }
 
-impl From<AuditEvent> for AuditEventResponse {
-    fn from(value: AuditEvent) -> Self {
+impl AuditEventResponse {
+    fn from_event(value: AuditEvent, client_ip_enabled: bool) -> Self {
         Self {
             occurred_at: value.occurred_at,
             actor: value.actor,
             action: value.action,
             object_id: value.object_id,
             detail: value.detail,
+            client_ip: if client_ip_enabled {
+                value.client_ip
+            } else {
+                None
+            },
         }
     }
 }
@@ -1389,21 +1406,89 @@ async fn list_audit(
     session(&state, &headers, true, MissingSession::Unauthorized).await?;
     let page = query.page.unwrap_or(0).min(1_000_000);
     let action = query.action.filter(|value| !value.trim().is_empty());
-    let events = database(state.db.clone(), move |db| {
-        db.list_audit(action.as_deref(), 101, page * 100)
+    let runtime = state.runtime.clone();
+    let (client_ip_enabled, events) = database(state.db.clone(), move |db| {
+        let client_ip_enabled = runtime
+            .read()
+            .map(|settings| settings.audit_client_ip_enabled)
+            .unwrap_or(false);
+        let events = db.list_audit(action.as_deref(), 101, page * 100)?;
+        Ok((client_ip_enabled, events))
     })
     .await?;
     let mut events = events
         .into_iter()
-        .map(AuditEventResponse::from)
+        .map(|event| AuditEventResponse::from_event(event, client_ip_enabled))
         .collect::<Vec<_>>();
     let has_next = events.len() > 100;
     events.truncate(100);
     Ok(Json(AuditResponse {
         page,
         has_next,
+        client_ip_enabled,
         events,
     }))
+}
+
+enum AuditClientIpDeletion {
+    LoggingEnabled,
+    Deleted(usize),
+}
+
+#[derive(Serialize)]
+struct DeletedAuditClientIpsResponse {
+    deleted: usize,
+}
+
+#[derive(Deserialize)]
+struct DeleteAuditClientIpsRequest {
+    confirmation: String,
+}
+
+async fn delete_audit_client_ips(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DeleteAuditClientIpsRequest>,
+) -> ApiResult<Json<DeletedAuditClientIpsResponse>> {
+    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
+    csrf_header(&session_data, &headers)?;
+    if request.confirmation != "IP-DATEN LÖSCHEN" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "confirmation_required",
+            "Exakte Bestätigung IP-DATEN LÖSCHEN erforderlich",
+        ));
+    }
+    let runtime = state.runtime.clone();
+    let outcome = database(state.db.clone(), move |db| {
+        let logging_enabled = runtime
+            .read()
+            .map(|settings| settings.audit_client_ip_enabled)
+            .unwrap_or(true);
+        if logging_enabled {
+            Ok(AuditClientIpDeletion::LoggingEnabled)
+        } else {
+            db.delete_audit_client_ips()
+                .map(AuditClientIpDeletion::Deleted)
+        }
+    })
+    .await?;
+    let AuditClientIpDeletion::Deleted(deleted) = outcome else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "client_ip_logging_enabled",
+            "Client-IP-Logging muss vor dem Löschen deaktiviert werden",
+        ));
+    };
+    audit(
+        &state,
+        session_data.username,
+        "audit_client_ips_deleted",
+        None,
+        Some(format!("deleted={deleted}")),
+    )
+    .await;
+    Ok(Json(DeletedAuditClientIpsResponse { deleted }))
 }
 
 #[derive(Default, Deserialize)]
@@ -1435,9 +1520,14 @@ async fn public_share(
     }
     let share = get_share(&state, &token).await?;
     let unlocked = share_is_unlocked(&state, &headers, &share).await?;
+    let public_path = if share.permission == Permission::UploadOnly {
+        String::new()
+    } else {
+        share.relative_path.clone()
+    };
     Ok(Json(PublicShareResponse {
         token: share.token,
-        path: share.relative_path,
+        path: public_path,
         is_directory: share.is_directory,
         permission: share.permission,
         locked: !unlocked,
@@ -1965,6 +2055,7 @@ mod tests {
         let mut valid_body = settings_body(runtime_settings(&state));
         valid_body.public_base_url = "http://localhost:8080/".into();
         valid_body.blocked_extensions = vec!["EXE, .SH".into()];
+        valid_body.audit_client_ip_enabled = Some(true);
         let valid_json = serde_json::to_string(&valid_body).unwrap();
         let mut valid = json_request(Method::PUT, "/api/v1/settings", &valid_json);
         valid.headers_mut().insert(
@@ -1974,13 +2065,38 @@ mod tests {
         valid
             .headers_mut()
             .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
-        assert_eq!(
-            app.clone().oneshot(valid).await.unwrap().status(),
-            StatusCode::OK
-        );
+        let response = app.clone().oneshot(valid).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response_text(response)
+            .await
+            .contains(r#""audit_client_ip_enabled":true"#));
         let current = runtime_settings(&state);
         assert_eq!(current.public_base_url, "http://localhost:8080");
         assert_eq!(current.blocked_extensions, ["exe", "sh"]);
+        assert!(current.audit_client_ip_enabled);
+
+        let mut legacy_json = serde_json::to_value(settings_body(current)).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("audit_client_ip_enabled");
+        let mut legacy_update = json_request(
+            Method::PUT,
+            "/api/v1/settings",
+            &serde_json::to_string(&legacy_json).unwrap(),
+        );
+        legacy_update.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        legacy_update
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.clone().oneshot(legacy_update).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(runtime_settings(&state).audit_client_ip_enabled);
 
         drop(app);
         drop(state);
@@ -1988,6 +2104,123 @@ mod tests {
         let restarted = runtime_settings(&restarted);
         assert_eq!(restarted.public_base_url, "http://localhost:8080");
         assert_eq!(restarted.blocked_extensions, ["exe", "sh"]);
+        assert!(restarted.audit_client_ip_enabled);
+    }
+
+    #[tokio::test]
+    async fn api_audit_client_ips_are_opt_in_and_can_be_deleted_only_when_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let secret = auth::new_totp_secret();
+        let hash = auth::hash_password("correct horse battery staple").unwrap();
+        state.db.create_admin("admin", &hash, &secret).unwrap();
+        let (session_cookie, csrf) = api_login(&state, &secret).await;
+        state
+            .db
+            .audit_with_client_ip("admin", "client_ip_test", None, None, Some("203.0.113.10"))
+            .unwrap();
+        assert_eq!(state.db.count_audit_client_ips().unwrap(), 1);
+        let app = crate::web::router(state.clone());
+
+        let mut list_disabled = json_request(Method::GET, "/api/v1/audit", "");
+        list_disabled.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        let response = app.clone().oneshot(list_disabled).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains(r#""client_ip_enabled":false"#));
+        assert!(!body.contains(r#""client_ip":"#));
+        assert!(!body.contains("203.0.113.10"));
+
+        state.runtime.write().unwrap().audit_client_ip_enabled = true;
+        let mut list_enabled = json_request(Method::GET, "/api/v1/audit", "");
+        list_enabled.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        let response = app.clone().oneshot(list_enabled).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains(r#""client_ip_enabled":true"#));
+        assert!(body.contains(r#""client_ip":"203.0.113.10""#));
+
+        let mut wrong_confirmation = json_request(
+            Method::DELETE,
+            "/api/v1/audit/client-ips",
+            r#"{"confirmation":"LÖSCHEN"}"#,
+        );
+        wrong_confirmation.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        wrong_confirmation
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        let response = app.clone().oneshot(wrong_confirmation).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response_text(response)
+            .await
+            .contains("confirmation_required"));
+        assert_eq!(state.db.count_audit_client_ips().unwrap(), 1);
+
+        let mut delete_enabled = json_request(
+            Method::DELETE,
+            "/api/v1/audit/client-ips",
+            r#"{"confirmation":"IP-DATEN LÖSCHEN"}"#,
+        );
+        delete_enabled.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        delete_enabled
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        let response = app.clone().oneshot(delete_enabled).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response_text(response)
+            .await
+            .contains("client_ip_logging_enabled"));
+        assert_eq!(state.db.count_audit_client_ips().unwrap(), 1);
+
+        state.runtime.write().unwrap().audit_client_ip_enabled = false;
+        let mut delete_without_csrf = json_request(
+            Method::DELETE,
+            "/api/v1/audit/client-ips",
+            r#"{"confirmation":"IP-DATEN LÖSCHEN"}"#,
+        );
+        delete_without_csrf.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(delete_without_csrf)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(state.db.count_audit_client_ips().unwrap(), 1);
+
+        let mut delete = json_request(
+            Method::DELETE,
+            "/api/v1/audit/client-ips",
+            r#"{"confirmation":"IP-DATEN LÖSCHEN"}"#,
+        );
+        delete.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        delete
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        let response = app.oneshot(delete).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response_text(response).await.contains(r#""deleted":1"#));
+        assert_eq!(state.db.count_audit_client_ips().unwrap(), 0);
     }
 
     #[tokio::test]

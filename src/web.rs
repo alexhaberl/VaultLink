@@ -5,14 +5,17 @@ use std::{
     net::SocketAddr,
     path::Path,
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     task::{Context, Poll},
 };
 
 use axum::{
     body::{Body, Bytes},
     extract::{
-        ConnectInfo, DefaultBodyLimit, Form, Multipart, OriginalUri, Path as AxPath, Query,
+        ConnectInfo, DefaultBodyLimit, Form, Json, Multipart, OriginalUri, Path as AxPath, Query,
         Request, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
@@ -24,7 +27,7 @@ use axum::{
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use futures_util::{Stream, StreamExt};
 use qrcode::{render::svg, QrCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use tower_http::{
@@ -42,15 +45,16 @@ use crate::{
     },
     file_ops,
     http_auth::{
-        audit, clear_session_cookie, commit_runtime_settings, csrf, database, make_session_cookie,
-        make_transfer_cookie, make_unlock_cookie, redirect_with_cookie, runtime_settings, session,
-        share_is_unlocked, transfer_cookie, MissingSession, TransferCookieScope, UnlockCookieScope,
+        audit, clear_session_cookie, commit_runtime_settings, csrf, current_audit_client_ip,
+        database, make_session_cookie, make_transfer_cookie, make_unlock_cookie,
+        redirect_with_cookie, runtime_settings, session, share_is_unlocked, transfer_cookie,
+        with_audit_client_ip, MissingSession, TransferCookieScope, UnlockCookieScope,
     },
     path_security, proxy,
     range::parse_byte_range,
     runtime,
     runtime::RuntimeSettings,
-    secure_fs::{DirectoryScan, Entry, SecureDirectory, SecureFile, SecureRoot},
+    secure_fs::{DirectoryScan, Entry, PendingUpload, SecureDirectory, SecureFile, SecureRoot},
     AppState,
 };
 
@@ -99,6 +103,18 @@ pub fn router(state: AppState) -> Router {
         .route("/logout", post(logout))
         .route("/admin", get(admin_browser))
         .route("/admin/files/directories", post(create_directory_ui))
+        .route(
+            "/admin/files/upload",
+            post(admin_upload)
+                .layer(DefaultBodyLimit::max(limit))
+                .layer(middleware::from_fn(guard_multipart_upload)),
+        )
+        .route(
+            "/admin/files/upload/queue",
+            post(admin_upload_queue)
+                .layer(DefaultBodyLimit::max(limit))
+                .layer(middleware::from_fn(guard_multipart_upload)),
+        )
         .route("/admin/files/rename", post(rename_file_ui))
         .route(
             "/admin/files/delete",
@@ -109,7 +125,8 @@ pub fn router(state: AppState) -> Router {
             "/admin/preview/raw",
             get(admin_preview_raw).head(admin_preview_raw),
         )
-        .route("/admin/shares", get(shares_page).post(create_share))
+        .route("/admin/shares", get(share_index_page).post(create_share))
+        .route("/admin/shares/new", get(share_create_page))
         .route("/admin/shares/{id}/toggle", post(toggle_share))
         .route(
             "/admin/shares/{id}/upload-conflict",
@@ -123,6 +140,10 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/admins/{id}/password", post(reset_admin_password))
         .route("/admin/admins/{id}/totp", post(reset_admin_totp))
         .route("/admin/settings", get(settings_page).post(update_settings))
+        .route(
+            "/admin/settings/audit-ips/delete",
+            get(audit_ips_delete_confirmation).post(delete_audit_ips_ui),
+        )
         .route("/admin/audit", get(audit_page))
         .route("/v/{token}", get(public_page))
         .route("/v/{token}/preview", get(public_preview))
@@ -139,7 +160,14 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(limit))
                 .layer(middleware::from_fn(guard_multipart_upload)),
         )
+        .route(
+            "/v/{token}/upload/queue",
+            post(upload_queue)
+                .layer(DefaultBodyLimit::max(limit))
+                .layer(middleware::from_fn(guard_multipart_upload)),
+        )
         .route("/s/{alias}", get(short_redirect))
+        .route("/assets/vaultlink.css", get(stylesheet_asset))
         .route("/assets/app.js", get(app_js))
         .route("/assets/vaultlink-logo.svg", get(logo_svg))
         .route("/assets/favicon.svg", get(favicon_svg))
@@ -155,15 +183,33 @@ pub fn router(state: AppState) -> Router {
         .layer(CatchPanicLayer::new())
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            audit_client_ip_context,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             security_headers,
         ))
         .with_state(state)
 }
 
+async fn audit_client_ip_context(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let client_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| {
+            proxy::effective_client_ip(peer.ip(), req.headers(), &state.config)
+        });
+    with_audit_client_ip(client_ip, next.run(req)).await
+}
+
 async fn security_headers(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;
     let h = response.headers_mut();
-    h.insert("content-security-policy",HeaderValue::from_static("default-src 'self'; style-src 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
+    h.insert("content-security-policy",HeaderValue::from_static("default-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
     h.insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
@@ -213,21 +259,38 @@ input,select,button,textarea{font:inherit;padding:.72rem .8rem;border-radius:12p
 "#
 }
 
+async fn stylesheet_asset() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        format!(
+            "@layer vl-legacy, vl-reset, vl-tokens, vl-base, vl-components, vl-layouts, vl-utilities;\n@layer vl-legacy {{{}}}\n{}",
+            app_css(),
+            crate::ui::APP_CSS
+        ),
+    )
+}
+
 async fn app_js() -> impl IntoResponse {
     (
         [(
             header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
         )],
-        r#"document.addEventListener('click',async e=>{const b=e.target.closest('[data-copy]');if(!b)return;try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='Kopiert';}catch(_){b.textContent='Kopieren fehlgeschlagen';}});
+        format!(
+            "{}\n{}",
+            r#"document.addEventListener('click',async e=>{const b=e.target.closest('[data-copy]');if(!b)return;try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='Kopiert';}catch(_){b.textContent='Kopieren fehlgeschlagen';}});
 const pad=n=>String(n).padStart(2,'0');
 function fillSelect(select,from,to,current){select.innerHTML='';for(let i=from;i<=to;i++){const o=document.createElement('option');o.value=String(i);o.textContent=String(i).padStart(select.dataset.pad||0,'0');if(i===current)o.selected=true;select.appendChild(o);}}
 function daysInMonth(y,m){return new Date(y,m,0).getDate();}
 function initDateTimePicker(picker){const input=picker.querySelector('[data-datetime-input]');const pop=picker.querySelector('[data-datetime-popover]');const year=picker.querySelector('[data-dt-year]');const month=picker.querySelector('[data-dt-month]');const day=picker.querySelector('[data-dt-day]');const hour=picker.querySelector('[data-dt-hour]');const minute=picker.querySelector('[data-dt-minute]');const now=new Date();fillSelect(year,now.getFullYear(),now.getFullYear()+5,now.getFullYear());fillSelect(month,1,12,now.getMonth()+1);fillSelect(hour,0,23,23);fillSelect(minute,0,59,0);function syncDays(){const selected=Number(day.value)||now.getDate();fillSelect(day,1,daysInMonth(Number(year.value),Number(month.value)),Math.min(selected,daysInMonth(Number(year.value),Number(month.value))))}syncDays();[year,month].forEach(s=>s.addEventListener('change',syncDays));picker.querySelector('[data-datetime-toggle]').addEventListener('click',()=>{pop.hidden=!pop.hidden;});picker.querySelector('[data-datetime-apply]').addEventListener('click',()=>{input.value=`${pad(day.value)}.${pad(month.value)}.${year.value} ${pad(hour.value)}:${pad(minute.value)}`;pop.hidden=true;});picker.querySelector('[data-datetime-clear]').addEventListener('click',()=>{input.value='';pop.hidden=true;});}
 function initDeleteConfirmation(form){const input=form.querySelector('[data-confirm-input]');const button=form.querySelector('[data-confirm-delete]');if(!input||!button)return;const sync=()=>{button.disabled=input.value!==form.dataset.requiredName;};input.addEventListener('input',sync);sync();input.focus();}
-document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);});
 document.addEventListener('click',e=>{document.querySelectorAll('[data-datetime-picker]').forEach(p=>{if(!p.contains(e.target)){const pop=p.querySelector('[data-datetime-popover]');if(pop)pop.hidden=true;}});});
+function initFileSelection(){const bar=document.querySelector('[data-selection-bar]');const link=bar?.querySelector('[data-selection-share]');const name=bar?.querySelector('[data-selection-name]');if(!bar||!link||!name)return;document.querySelectorAll('[data-file-select]').forEach(input=>input.addEventListener('change',()=>{if(!input.checked)return;name.textContent=`${input.value||'/'} ausgewählt`;link.href=`/admin/shares/new?path=${encodeURIComponent(input.value)}`;bar.hidden=false;}));}
+function initShareReview(){const form=document.querySelector('[data-share-create]');if(!form)return;const review=form.parentElement.querySelector('[data-share-review]');const passwordToggle=form.querySelector('[data-password-toggle]');const passwordFields=form.querySelector('[data-password-fields]');const uploadRules=form.querySelector('[data-upload-rules]');const permissionLabels={download_only:'Nur Download',upload_only:'Nur Upload',download_upload:'Download + Upload'};const sync=()=>{const permission=form.querySelector('[name="permission"]:checked')?.value||form.querySelector('[name="permission"]')?.value||'download_only';const alias=form.elements.alias?.value.trim();const maximum=form.elements.max_downloads?.value.trim();const protectedShare=Boolean(passwordToggle?.checked);if(review){review.querySelector('[data-review-permission]').textContent=permissionLabels[permission]||permission;review.querySelector('[data-review-password]').textContent=protectedShare?'Passwort geschützt':'Ohne Passwort';review.querySelector('[data-review-limit]').textContent=maximum?`${maximum} Übertragungen`:'Unbegrenzt';const url=review.querySelector('[data-review-url]');if(url){const base=url.textContent.split('/v/')[0].split('/s/')[0];url.textContent=alias?`${base}/s/${alias}`:`${base}/v/••••••••`;}}if(passwordFields){passwordFields.hidden=!protectedShare;passwordFields.querySelectorAll('input').forEach(input=>{input.disabled=!protectedShare;input.required=protectedShare;});}if(uploadRules)uploadRules.hidden=permission==='download_only';};form.addEventListener('input',sync);form.addEventListener('change',sync);sync();}
+document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);initFileSelection();initShareReview();});
 document.addEventListener('submit',e=>{e.target.querySelectorAll('[data-tz-offset]').forEach(i=>{i.value=String(new Date().getTimezoneOffset())})});"#,
+            crate::ui::UPLOAD_QUEUE_JAVASCRIPT
+        ),
     )
 }
 
@@ -263,11 +326,22 @@ const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
 
 fn plain_page(title: &str, body: &str) -> String {
     format!(
-        r#"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><style>{}</style><script src="/assets/app.js" defer></script></head><body><div class="public-shell"><main><div class="public-brand"><img src="/assets/vaultlink-logo.svg" alt="VaultLink Logo"><div>VaultLink<small>Secure file links</small></div></div>{}</main></div></body></html>"#,
+        r##"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/app.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">Zum Inhalt springen</a><div class="vl-public-shell"><header class="vl-public-header">{}</header><main id="main-content" class="vl-public-main">{}</main></div></body></html>"##,
         esc(title),
-        app_css(),
+        crate::ui::brand_lockup("Secure file links"),
         body
     )
+}
+
+fn current_nav(title: &str) -> &'static str {
+    match title {
+        "Dateien" | "Vorschau" | "Löschen" | "Löschen bestätigen" => "files",
+        "Links" | "Link erstellen" => "links",
+        "Admins" | "Admin MFA" | "Admin erstellt" | "MFA zurückgesetzt" => "admins",
+        "Einstellungen" => "settings",
+        "Audit" | "Audit & Sicherheit" => "audit",
+        _ => "",
+    }
 }
 
 fn admin_page(
@@ -278,18 +352,59 @@ fn admin_page(
     csrf_token: &str,
 ) -> String {
     let create_link = if show_create_link {
-        r#"<a class="button" href="/admin/shares">Link erstellen</a>"#
+        format!(
+            r#"<a class="vl-button" href="/admin/shares/new">{} Link erstellen</a>"#,
+            crate::ui::icon(crate::ui::Icon::Link)
+        )
     } else {
-        ""
+        String::new()
     };
+    let active = current_nav(title);
+    let nav = [
+        crate::ui::nav_link(
+            "/admin",
+            "Dateien",
+            crate::ui::Icon::Folder,
+            active == "files",
+        ),
+        crate::ui::nav_link(
+            "/admin/shares",
+            "Links",
+            crate::ui::Icon::Link,
+            active == "links",
+        ),
+        crate::ui::nav_link(
+            "/admin/admins",
+            "Admins",
+            crate::ui::Icon::Users,
+            active == "admins",
+        ),
+        crate::ui::nav_link(
+            "/admin/settings",
+            "Einstellungen",
+            crate::ui::Icon::Settings,
+            active == "settings",
+        ),
+        crate::ui::nav_link(
+            "/admin/audit",
+            "Audit",
+            crate::ui::Icon::Audit,
+            active == "audit",
+        ),
+    ]
+    .join("");
+    let body = body.replacen("<h1>", "<h2>", usize::MAX);
+    let body = body.replacen("</h1>", "</h2>", usize::MAX);
     format!(
-        r#"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><style>{}</style><script src="/assets/app.js" defer></script></head><body><div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/assets/vaultlink-logo.svg" alt="VaultLink Logo"><div>VaultLink<small>Secure file links</small></div></div><nav class="nav-group" aria-label="Hauptnavigation"><a class="nav-link" href="/admin">📁 Dateien</a><a class="nav-link" href="/admin/shares">🔗 Links</a><a class="nav-link" href="/admin/admins">👥 Admins</a><a class="nav-link" href="/admin/settings">⚙️ Einstellungen</a><a class="nav-link" href="/admin/audit">🛡️ Audit</a></nav><div class="sidebar-foot"><strong class="good">● System</strong><br><span>{}</span></div></aside><div class="content"><header class="topbar"><div class="topbar-title"><p>VaultLink Admin</p><h1>{}</h1></div><div class="topbar-actions">{}<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button class="secondary">Abmelden</button></form></div></header><main>{}</main></div></div></body></html>"#,
+        r##"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/app.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">Zum Inhalt springen</a><div class="vl-app-shell"><aside class="vl-sidebar">{}<nav class="vl-nav" aria-label="Hauptnavigation">{}</nav><div class="vl-system-card"><strong><span aria-hidden="true">●</span> VaultLink erreichbar</strong><span>{}</span></div></aside><div class="vl-content"><header class="vl-topbar"><div><p class="vl-eyebrow">VaultLink Admin</p><h1>{}</h1></div><div class="vl-topbar-actions">{}<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--secondary">{} Abmelden</button></form></div></header><main id="main-content" class="vl-main">{}</main></div></div></body></html>"##,
         esc(title),
-        app_css(),
+        crate::ui::brand_lockup("Secure file links"),
+        nav,
         system_panel(state),
         esc(title),
         create_link,
         esc(csrf_token),
+        crate::ui::icon(crate::ui::Icon::Logout),
         body
     )
 }
@@ -356,16 +471,24 @@ struct PublicTransferLease {
     cookie: String,
     heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
     database: Database,
+    client_ip: Option<String>,
 }
 
 impl PublicTransferLease {
-    fn into_stream_parts(mut self) -> (String, Option<tokio::sync::oneshot::Sender<()>>) {
+    fn into_stream_parts(
+        mut self,
+    ) -> (
+        String,
+        Option<tokio::sync::oneshot::Sender<()>>,
+        Option<String>,
+    ) {
         let lease_token = self
             .lease_token
             .take()
             .expect("public transfer lease token");
         let heartbeat_stop = self.heartbeat_stop.take();
-        (lease_token, heartbeat_stop)
+        let client_ip = self.client_ip.take();
+        (lease_token, heartbeat_stop, client_ip)
     }
 }
 
@@ -468,10 +591,15 @@ async fn begin_public_transfer(
                 lease_token: Some(lease_token),
                 cookie: make_transfer_cookie(state, share, &session_token, transfer_scope(uri)),
                 database: state.db.clone(),
+                client_ip: runtime_settings(state)
+                    .audit_client_ip_enabled
+                    .then(current_audit_client_ip)
+                    .flatten()
+                    .map(|ip| ip.to_string()),
             })
         }
         TransferLeaseBeginOutcome::LimitReached => {
-            Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"))
+            Err(AppError(StatusCode::GONE, "Übertragungslimit erreicht"))
         }
         TransferLeaseBeginOutcome::ShareUnavailable => {
             Err(AppError(StatusCode::GONE, "Freigabe nicht verfügbar"))
@@ -499,7 +627,7 @@ async fn check_public_transfer_availability(
             Ok(())
         }
         TransferAvailabilityOutcome::LimitReached => {
-            Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"))
+            Err(AppError(StatusCode::GONE, "Übertragungslimit erreicht"))
         }
         TransferAvailabilityOutcome::ShareUnavailable => {
             Err(AppError(StatusCode::GONE, "Freigabe nicht verfügbar"))
@@ -509,20 +637,29 @@ async fn check_public_transfer_availability(
 
 fn transfer_complete_future(
     database: Database,
+    runtime: Arc<RwLock<RuntimeSettings>>,
     lease_token: String,
     action: &'static str,
     share_id: i64,
+    client_ip: Option<String>,
 ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
     Box::pin(async move {
+        let client_ip = runtime
+            .read()
+            .ok()
+            .is_some_and(|settings| settings.audit_client_ip_enabled)
+            .then_some(client_ip)
+            .flatten();
         let result = tokio::task::spawn_blocking(move || {
             let outcome = database.complete_transfer_lease(&lease_token)?;
             let audit_failed = outcome == TransferLeaseCompleteOutcome::Counted
                 && database
-                    .audit(
+                    .audit_with_client_ip(
                         "public",
                         action,
                         Some(&share_id.to_string()),
                         Some("completed transfer session"),
+                        client_ip.as_deref(),
                     )
                     .is_err();
             Ok::<_, rusqlite::Error>(audit_failed)
@@ -554,7 +691,9 @@ fn spawn_transfer_cancel(database: Database, lease_token: String) {
 struct TransferBodyStream {
     inner: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
     database: Database,
+    runtime: Arc<RwLock<RuntimeSettings>>,
     lease_token: Option<String>,
+    client_ip: Option<String>,
     action: &'static str,
     share_id: i64,
     heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -600,9 +739,11 @@ impl Stream for TransferBodyStream {
                     if let Some(token) = self.lease_token.take() {
                         self.finalize = Some(transfer_complete_future(
                             self.database.clone(),
+                            self.runtime.clone(),
                             token,
                             self.action,
                             self.share_id,
+                            self.client_ip.take(),
                         ));
                         continue;
                     }
@@ -636,9 +777,11 @@ impl Stream for TransferBodyStream {
                                 self.pending_final_chunk = Some(chunk);
                                 self.finalize = Some(transfer_complete_future(
                                     self.database.clone(),
+                                    self.runtime.clone(),
                                     token,
                                     self.action,
                                     self.share_id,
+                                    self.client_ip.take(),
                                 ));
                                 continue;
                             }
@@ -672,11 +815,13 @@ fn transfer_body<S>(
 where
     S: Stream<Item = io::Result<Bytes>> + Send + 'static,
 {
-    let (lease_token, heartbeat_stop) = transfer.into_stream_parts();
+    let (lease_token, heartbeat_stop, client_ip) = transfer.into_stream_parts();
     Body::from_stream(TransferBodyStream {
         inner: Box::pin(stream),
         database: state.db.clone(),
+        runtime: state.runtime.clone(),
         lease_token: Some(lease_token),
+        client_ip,
         action,
         share_id,
         heartbeat_stop,
@@ -692,11 +837,18 @@ async fn complete_transfer_without_body(
     action: &'static str,
     share_id: i64,
 ) -> Result<()> {
-    let (lease_token, heartbeat_stop) = transfer.into_stream_parts();
+    let (lease_token, heartbeat_stop, client_ip) = transfer.into_stream_parts();
     drop(heartbeat_stop);
-    transfer_complete_future(state.db.clone(), lease_token, action, share_id)
-        .await
-        .map_err(internal)
+    transfer_complete_future(
+        state.db.clone(),
+        state.runtime.clone(),
+        lease_token,
+        action,
+        share_id,
+        client_ip,
+    )
+    .await
+    .map_err(internal)
 }
 
 fn set_transfer_cookie(response: &mut Response, cookie: &str) -> Result<()> {
@@ -1077,6 +1229,321 @@ async fn delete_file_ui(
     Ok(Redirect::to(&browser_redirect(&parent, notice)))
 }
 
+struct AdminUploadSuccess {
+    file: String,
+    outcome: String,
+    directory: String,
+}
+
+async fn stage_admin_upload(
+    state: &AppState,
+    directory: &str,
+    field: axum::extract::multipart::Field<'_>,
+    maximum: u64,
+    blocked_extensions: &[String],
+) -> Result<(PendingUpload, String, u64)> {
+    let file_name = field
+        .file_name()
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateiname fehlt"))?;
+    let name = path_security::safe_filename(file_name)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Dateiname"))?
+        .to_string();
+    if crate::secure_fs::is_upload_fragment_name(std::ffi::OsStr::new(&name)) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Dateiname ist für interne Uploadfragmente reserviert",
+        ));
+    }
+    if extension_is_blocked(&name, blocked_extensions) {
+        return Err(AppError(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Dateityp blockiert",
+        ));
+    }
+
+    let secure_root = state.secure_root.clone();
+    let upload_directory = directory.to_string();
+    let pending_file = tokio::task::spawn_blocking(move || {
+        let mut pending = secure_root
+            .begin_upload(&upload_directory)
+            .map_err(|_| PendingUploadFileError::Begin)?;
+        let file = pending.take_file().map_err(PendingUploadFileError::Take)?;
+        Ok::<_, PendingUploadFileError>((pending, file))
+    })
+    .await
+    .map_err(internal)?;
+    let (pending, file) = match pending_file {
+        Ok(value) => value,
+        Err(PendingUploadFileError::Begin) => {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                "Zielordner nicht verfügbar",
+            ))
+        }
+        Err(PendingUploadFileError::Take(error)) => return Err(upload_io_error(error)),
+    };
+
+    let mut output = tokio::fs::File::from_std(file);
+    let mut total = 0u64;
+    let stream = field;
+    tokio::pin!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| AppError(StatusCode::BAD_REQUEST, "Upload abgebrochen"))?;
+        let Some(new_total) = add_upload_bytes(total, chunk.len(), maximum) else {
+            return Err(AppError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Upload ist zu groß",
+            ));
+        };
+        if !storage_has_room(state.secure_root.display_root(), chunk.len() as u64) {
+            return Err(AppError(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "Nicht genug freier Speicher",
+            ));
+        }
+        total = new_total;
+        output.write_all(&chunk).await.map_err(upload_io_error)?;
+    }
+    output.flush().await.map_err(upload_io_error)?;
+    output.sync_all().await.map_err(upload_io_error)?;
+    drop(output);
+    Ok((pending, name, total))
+}
+
+async fn process_admin_upload(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut multipart: Multipart,
+) -> Result<AdminUploadSuccess> {
+    let (_, admin) = session(state, headers, true, MissingSession::RedirectToLogin).await?;
+    let settings = runtime_settings(state);
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| !storage_has_room(state.secure_root.display_root(), length))
+    {
+        return Err(AppError(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Nicht genug freier Speicher",
+        ));
+    }
+
+    let mut directory: Option<String> = None;
+    let mut csrf_value: Option<String> = None;
+    let mut overwrite_existing = false;
+    let mut saw_overwrite = false;
+    let mut staged: Option<(PendingUpload, String, u64)> = None;
+    let mut fields_seen = 0usize;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Upload"))?
+    {
+        fields_seen += 1;
+        if fields_seen > 5 {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "Zu viele Multipart-Felder",
+            ));
+        }
+        let field_name = field.name().unwrap_or("").to_string();
+        match field_name.as_str() {
+            "path" => {
+                if directory.is_some() || staged.is_some() {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "Uploadpfad wurde mehrfach oder zu spät übermittelt",
+                    ));
+                }
+                let value = limited_multipart_text(field, MAX_UPLOAD_PATH_FIELD_BYTES)
+                    .await
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Uploadpfad"))?;
+                let value = path_security::validate_relative(&value)
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Uploadpfad"))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                directory = Some(value);
+            }
+            "csrf" => {
+                if csrf_value.is_some() || staged.is_some() {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "CSRF-Nachweis wurde mehrfach oder zu spät übermittelt",
+                    ));
+                }
+                let value = limited_multipart_text(field, 512)
+                    .await
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger CSRF-Nachweis"))?;
+                csrf(&admin, &value)?;
+                csrf_value = Some(value);
+            }
+            "overwrite_existing" => {
+                if std::mem::replace(&mut saw_overwrite, true) || staged.is_some() {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "Uploadoption wurde mehrfach oder zu spät übermittelt",
+                    ));
+                }
+                let value = limited_multipart_text(field, MAX_UPLOAD_OPTION_FIELD_BYTES)
+                    .await
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Uploadoption"))?;
+                overwrite_existing = value == "1";
+            }
+            "file" => {
+                if staged.is_some() {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "Pro Request ist genau eine Datei erlaubt",
+                    ));
+                }
+                let target = directory.as_deref().ok_or(AppError(
+                    StatusCode::BAD_REQUEST,
+                    "Uploadpfad muss vor der Datei übermittelt werden",
+                ))?;
+                if csrf_value.is_none() {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "CSRF-Nachweis muss vor der Datei übermittelt werden",
+                    ));
+                }
+                staged = Some(
+                    stage_admin_upload(
+                        state,
+                        target,
+                        field,
+                        settings.max_upload_size,
+                        &settings.blocked_extensions,
+                    )
+                    .await?,
+                );
+            }
+            _ => {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    "Unbekanntes Multipart-Feld",
+                ))
+            }
+        }
+    }
+
+    let directory = directory.ok_or(AppError(StatusCode::BAD_REQUEST, "Uploadpfad fehlt"))?;
+    if csrf_value.is_none() {
+        return Err(AppError(StatusCode::FORBIDDEN, "CSRF-Nachweis fehlt"));
+    }
+    let (mut pending, name, total) = staged.ok_or(AppError(
+        StatusCode::BAD_REQUEST,
+        "Pro Request ist genau eine Datei erforderlich",
+    ))?;
+    let destination = join_display(&directory, &name);
+    let publish_name = name.clone();
+    #[cfg(test)]
+    if let Some(kind) = state
+        .upload_directory_sync_failure
+        .lock()
+        .expect("upload sync fault lock")
+        .take()
+    {
+        pending.fail_next_directory_sync(kind);
+    }
+    let _storage_guard = state.storage_mutation.lock().await;
+    let existed = match state.secure_root.metadata(&destination) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(internal(error)),
+    };
+    let publish_result = tokio::task::spawn_blocking(move || {
+        if overwrite_existing {
+            pending.publish_replace(&publish_name)
+        } else {
+            pending.publish(&publish_name)
+        }
+    })
+    .await
+    .map_err(internal)?;
+    let publish_outcome = match publish_result {
+        Ok(outcome) => outcome,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(AppError(
+                StatusCode::CONFLICT,
+                "Datei existiert bereits; Ersetzen muss für diese Datei bestätigt werden",
+            ))
+        }
+        Err(error) => return Err(upload_io_error(error)),
+    };
+    let replaced = overwrite_existing && existed;
+    let durability_uncertain = !publish_outcome.is_durable();
+    let detail = format!("file={name};bytes={total};path={destination}");
+    if let Some(error) = publish_outcome.sync_error() {
+        tracing::warn!(file = %name, %error, "admin upload published but directory fsync failed");
+        audit(
+            state,
+            admin.username.clone(),
+            "admin_upload_durability_uncertain",
+            Some(destination.clone()),
+            Some(detail.clone()),
+        )
+        .await;
+    }
+    audit(
+        state,
+        admin.username,
+        if replaced {
+            "admin_upload_replaced"
+        } else {
+            "admin_upload"
+        },
+        Some(destination),
+        Some(detail),
+    )
+    .await;
+    let outcome = match (replaced, durability_uncertain) {
+        (true, true) => "replaced_uncertain",
+        (false, true) => "created_uncertain",
+        (true, false) => "replaced",
+        (false, false) => "created",
+    };
+    Ok(AdminUploadSuccess {
+        file: name,
+        outcome: outcome.to_string(),
+        directory,
+    })
+}
+
+async fn admin_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Response> {
+    let success = process_admin_upload(&state, &headers, multipart).await?;
+    let mut response =
+        Redirect::to(&browser_redirect(&success.directory, "upload_ok")).into_response();
+    response.headers_mut().insert(
+        "x-vaultlink-upload-file",
+        HeaderValue::from_str(&encoded(&success.file)).map_err(internal)?,
+    );
+    response.headers_mut().insert(
+        "x-vaultlink-upload-outcome",
+        HeaderValue::from_str(&success.outcome).map_err(internal)?,
+    );
+    Ok(response)
+}
+
+async fn admin_upload_queue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    match process_admin_upload(&state, &headers, multipart).await {
+        Ok(success) => Json(UploadQueueSuccess {
+            file: success.file,
+            outcome: success.outcome,
+        })
+        .into_response(),
+        Err(AppError(status, message)) => upload_queue_error_response(status, message),
+    }
+}
+
 fn browser_redirect(path: &str, notice: &str) -> String {
     format!("/admin?path={}&notice={notice}", encoded(path))
 }
@@ -1102,12 +1569,35 @@ fn file_operation_app_error(error: file_ops::FileOperationError) -> AppError {
 
 fn file_row_actions(path: &str, name: &str, csrf_token: &str) -> String {
     format!(
-        r#"<a class="button secondary small" href="/admin/shares?path={}">Freigeben</a><details><summary class="button secondary small">Umbenennen</summary><form method="post" action="/admin/files/rename" class="row"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label>Neuer Name<input name="name" value="{}" maxlength="255" required></label><button class="small">Speichern</button></form></details><a class="button danger small" href="/admin/files/delete?path={}">Löschen</a>"#,
+        r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/shares/new?path={}">Freigeben</a><details class="vl-action-details"><summary class="vl-icon-button" aria-label="Weitere Aktionen">{}</summary><div class="vl-action-panel"><form method="post" action="/admin/files/rename" class="vl-stack"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label class="vl-field">Neuer Name<input name="name" value="{}" maxlength="255" required></label><button class="vl-button vl-button--small">Umbenennen</button></form><a class="vl-button vl-button--danger vl-button--small" href="/admin/files/delete?path={}">{} Löschen</a></div></details>"#,
         encoded(path),
+        crate::ui::icon(crate::ui::Icon::More),
         esc(csrf_token),
         esc(path),
         esc(name),
         encoded(path),
+        crate::ui::icon(crate::ui::Icon::Trash),
+    )
+}
+
+fn file_name_cell(path: &str, display_name: &str, is_directory: bool) -> String {
+    let target = encoded(path);
+    let icon = crate::ui::icon(if is_directory {
+        crate::ui::Icon::Folder
+    } else {
+        crate::ui::Icon::File
+    });
+    let label = if is_directory {
+        format!(
+            r#"<a href="/admin?path={target}">{}</a>"#,
+            esc(display_name)
+        )
+    } else {
+        esc(display_name)
+    };
+    format!(
+        r#"<label class="vl-file-select"><input type="radio" name="selected_path" value="{}" data-file-select><span>{icon}{label}</span></label>"#,
+        esc(path)
     )
 }
 
@@ -1118,6 +1608,21 @@ async fn admin_browser(
 ) -> Result<Html<String>> {
     let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let settings = runtime_settings(&state);
+    let disk = disk_stats(state.secure_root.display_root());
+    let used_storage = disk
+        .as_ref()
+        .map(|stats| stats.total.saturating_sub(stats.free))
+        .map(human)
+        .unwrap_or_else(|| "n/v".into());
+    let free_storage = disk
+        .as_ref()
+        .map(|stats| human(stats.free))
+        .unwrap_or_else(|| "n/v".into());
+    let active_links = database(state.db.clone(), |database| database.list_shares())
+        .await?
+        .into_iter()
+        .filter(share_is_available)
+        .count();
     let raw = q.path.unwrap_or_default();
     let page_number = q.page.unwrap_or(0).min(1_000_000);
     let search =
@@ -1141,11 +1646,10 @@ async fn admin_browser(
         .map_err(internal)?;
         for hit in hits {
             let target = encoded(&hit.relative_path);
-            let name = esc(&hit.relative_path);
             let actions = file_row_actions(&hit.relative_path, &hit.entry.name, &s.csrf_token);
             let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings) {
                 format!(
-                    r#"<a class="button secondary small" href="/admin/preview?path={target}">Ansehen</a> "#
+                    r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/preview?path={target}">Ansehen</a> "#
                 )
             } else {
                 String::new()
@@ -1156,12 +1660,8 @@ async fn admin_browser(
                 .map(format_file_time)
                 .unwrap_or_else(|| "—".into());
             rows += &format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}{}</td></tr>"#,
-                if hit.entry.is_dir {
-                    format!(r#"📁 <a href="/admin?path={target}">{name}</a>"#)
-                } else {
-                    format!("📄 {name}")
-                },
+                r#"<tr><td data-label="Name">{}</td><td data-label="Typ">{}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion" class="actions">{}{}</td></tr>"#,
+                file_name_cell(&hit.relative_path, &hit.relative_path, hit.entry.is_dir),
                 if hit.entry.is_dir { "Ordner" } else { "Datei" },
                 if hit.entry.is_dir {
                     "—".into()
@@ -1191,21 +1691,17 @@ async fn admin_browser(
             let child = join_display(&rel, &name);
             let target = encoded(&child);
             let actions = file_row_actions(&child, &name, &s.csrf_token);
-            let display = if is_dir {
-                format!("📁 <a href=\"/admin?path={target}\">{}</a>", esc(&name))
-            } else {
-                format!("📄 {}", esc(&name))
-            };
+            let display = file_name_cell(&child, &name, is_dir);
             let preview = if !is_dir && preview_allowed(&child, &settings) {
                 format!(
-                    r#"<a class="button secondary small" href="/admin/preview?path={target}">Ansehen</a> "#
+                    r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/preview?path={target}">Ansehen</a> "#
                 )
             } else {
                 String::new()
             };
             let modified = modified.map(format_file_time).unwrap_or_else(|| "—".into());
             rows += &format!(
-                r#"<tr><td>{display}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}{}</td></tr>"#,
+                r#"<tr><td data-label="Name">{display}</td><td data-label="Typ">{}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion" class="actions">{}{}</td></tr>"#,
                 if is_dir { "Ordner" } else { "Datei" },
                 if is_dir { "—".into() } else { human(size) },
                 modified,
@@ -1250,21 +1746,24 @@ async fn admin_browser(
     let up = parent_path(&rel)
         .map(|parent| {
             format!(
-                r#"<p><a class="button secondary" href="/admin?path={}">Hoch</a></p>"#,
+                r#"<a class="vl-button vl-button--ghost" href="/admin?path={}">Hoch</a>"#,
                 encoded(&parent)
             )
         })
         .unwrap_or_default();
     let notice = match q.notice.as_deref() {
-        Some("directory_created") => "<p class=\"notice\">Ordner wurde erstellt.</p>",
-        Some("path_renamed") => "<p class=\"notice\">Eintrag wurde umbenannt.</p>",
-        Some("path_deleted") => "<p class=\"notice\">Eintrag wurde permanent gelöscht.</p>",
+        Some("directory_created") => "<p class=\"vl-notice vl-notice--success\">Ordner wurde erstellt.</p>",
+        Some("path_renamed") => "<p class=\"vl-notice vl-notice--success\">Eintrag wurde umbenannt.</p>",
+        Some("path_deleted") => "<p class=\"vl-notice vl-notice--success\">Eintrag wurde permanent gelöscht.</p>",
         Some("path_delete_queued") => {
-            "<p class=\"notice\">Eintrag wurde entfernt; die Bereinigung läuft im Hintergrund.</p>"
+            "<p class=\"vl-notice vl-notice--success\">Eintrag wurde entfernt; die Bereinigung läuft im Hintergrund.</p>"
+        }
+        Some("upload_ok") => {
+            "<p class=\"vl-notice vl-notice--success\">Datei wurde erfolgreich hochgeladen.</p>"
         }
         _ => "",
     };
-    let listing = format!(
+    let _legacy_listing = format!(
         r#"<section class="hero"><div><p class="eyebrow">VaultLink Admin</p><h1>Dateibrowser</h1>{}<p class=muted>Relativer Pfad: /{}</p></div><div class="side-panel"><strong>Schnellaktion</strong><p class="muted">Aktuellen Ordner sicher freigeben oder per Suche eingrenzen.</p><p><a class="button" href="/admin/shares?path={}">Aktuellen Ordner freigeben</a></p></div></section><section>{}<form method="get" class="row"><input type="hidden" name="path" value="{}"><label>Suche<br><input name="q" value="{}" placeholder="Dateiname"></label><button>Suchen</button></form><table><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th></th></tr></thead><tbody>{}</tbody></table><p>{} {}</p><p class=muted>100 Einträge pro Seite. Suche ist limitiert und läuft innerhalb des aktuellen Ordners.</p></section>"#,
         breadcrumbs(&rel, "/admin"),
         esc(&rel),
@@ -1277,14 +1776,32 @@ async fn admin_browser(
         next
     );
     let create_form = format!(
-        r#"<form method="post" action="/admin/files/directories"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="parent" value="{}"><label>Neuer Ordner<input name="name" maxlength="255" required></label><button>Ordner erstellen</button></form>"#,
+        r#"<details class="vl-create-folder"><summary class="vl-button vl-button--secondary">Neuer Ordner</summary><form method="post" action="/admin/files/directories" class="vl-inline-actions"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="parent" value="{}"><label class="vl-field">Ordnername<input name="name" maxlength="255" required></label><button class="vl-button">Ordner erstellen</button></form></details>"#,
         esc(&s.csrf_token),
         esc(&rel),
     );
-    let listing = listing.replacen(
-        "</div></section><section>",
-        &format!("{create_form}</div></section><section>"),
-        1,
+    let upload_form = format!(
+        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} Dateien hochladen</summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><label class="vl-checkbox"><input type="checkbox" name="overwrite_existing" value="1"> Nur die jeweils betroffene Datei nach Konflikt ersetzen</label><label class="vl-upload-dropzone" data-upload-dropzone><strong>Datei hier ablegen</strong><span class="vl-muted">Ohne JavaScript ist genau eine Datei pro Upload möglich.</span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>Upload starten</button></form></details>"#,
+        crate::ui::icon(crate::ui::Icon::Upload),
+        esc(&rel),
+        esc(&s.csrf_token),
+    );
+    let listing = format!(
+        r#"<section class="vl-stat-strip" aria-label="Speicherübersicht"><div><strong>{}</strong><span>belegt</span></div><div><strong>{}</strong><span>frei</span></div><div><strong>{}</strong><span>aktive Links</span></div></section><section class="vl-panel"><div class="vl-browser-head"><div>{}<p class="vl-muted">Relativer Pfad: /{}</p></div><div class="vl-inline-actions">{}{}{}<a class="vl-button" href="/admin/shares/new?path={}">Aktuellen Ordner freigeben</a></div></div><form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only">Dateien durchsuchen</span><input name="q" value="{}" placeholder="Dateien durchsuchen"></label><button class="vl-button">Suchen</button></form><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th>Aktion</th></tr></thead><tbody>{}</tbody></table></div><nav class="vl-pagination" aria-label="Dateiseiten">{} {}</nav><p class="vl-muted">100 Einträge pro Seite. Die Suche bleibt auf den aktuellen Ordner begrenzt.</p></section><div class="vl-selection-bar" data-selection-bar hidden><span data-selection-name>Ein Ziel ausgewählt</span><a class="vl-button" data-selection-share href="/admin/shares/new">Link für Auswahl erstellen</a></div>"#,
+        esc(&used_storage),
+        esc(&free_storage),
+        active_links,
+        breadcrumbs(&rel, "/admin"),
+        esc(&rel),
+        up,
+        create_form,
+        upload_form,
+        current_folder_target,
+        esc(&rel),
+        esc(search_value),
+        rows,
+        previous,
+        next,
     );
     let body = format!("{notice}{listing}");
     Ok(Html(admin_page(
@@ -1317,6 +1834,19 @@ async fn admin_preview(
             .await
             .map_err(internal)?
             .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;
+    let preview_detail = match &content {
+        PreviewContent::TooLarge { size } => format!("kind=too_large;bytes={size}"),
+        PreviewContent::Text(text) => format!("kind=text;bytes={}", text.len()),
+        PreviewContent::Media { kind, size } => format!("kind={kind:?};bytes={size}"),
+    };
+    audit(
+        &state,
+        session.username.clone(),
+        "admin_preview",
+        Some(rel.clone()),
+        Some(preview_detail),
+    )
+    .await;
     let body = match content {
         PreviewContent::TooLarge { size } => {
             preview_too_large_body(&rel, size, "Datei ist größer als das Preview-Limit.", None)
@@ -1385,11 +1915,11 @@ fn admin_media_preview_body(path: &str, kind: PreviewKind, size: u64) -> String 
 fn media_viewer(kind: PreviewKind, raw_url: &str) -> String {
     match kind {
         PreviewKind::Image(_) => format!(
-            r#"<img src="{}" alt="Vorschau" style="max-width:100%;height:auto">"#,
+            r#"<img class="vl-media-preview vl-media-preview--image" src="{}" alt="Vorschau">"#,
             esc(raw_url)
         ),
         PreviewKind::Pdf => format!(
-            r#"<iframe src="{}" title="PDF-Vorschau" style="width:100%;height:75vh;border:1px solid #303a55;border-radius:10px"></iframe>"#,
+            r#"<iframe class="vl-media-preview vl-media-preview--pdf" src="{}" title="PDF-Vorschau"></iframe>"#,
             esc(raw_url)
         ),
         PreviewKind::Text => String::new(),
@@ -1440,8 +1970,11 @@ fn display_limit_unit_floor(bytes: u64, unit: u64) -> String {
     format_unit_floor(bytes, unit)
 }
 
-fn expiry_picker_html() -> &'static str {
-    r#"<label>Ablauf (optional)<br><div class="datetime-picker" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="TT.MM.JJJJ HH:MM" autocomplete="off" inputmode="numeric"><button class="secondary calendar-button" type="button" data-datetime-toggle aria-label="Kalender öffnen">📅</button><div class="datetime-popover" data-datetime-popover hidden><div class="picker-grid"><label>Jahr<br><select data-dt-year></select></label><label>Monat<br><select data-dt-month data-pad="2"></select></label><label>Tag<br><select data-dt-day data-pad="2"></select></label><label>Stunde<br><select data-dt-hour data-pad="2"></select></label><label>Minute<br><select data-dt-minute data-pad="2"></select></label></div><div class="picker-actions"><button class="secondary small" type="button" data-datetime-clear>Löschen</button><button class="small" type="button" data-datetime-apply>Übernehmen</button></div></div></div><small class="muted">Format: TT.MM.JJJJ HH:MM</small></label>"#
+fn expiry_picker_html() -> String {
+    format!(
+        r#"<label class="vl-field">Ablauf (optional)<div class="datetime-picker vl-input-action" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="TT.MM.JJJJ HH:MM" autocomplete="off" inputmode="numeric"><button class="vl-button vl-button--secondary calendar-button" type="button" data-datetime-toggle aria-label="Kalender öffnen">{}</button><div class="datetime-popover" data-datetime-popover hidden><div class="picker-grid"><label>Jahr<select data-dt-year></select></label><label>Monat<select data-dt-month data-pad="2"></select></label><label>Tag<select data-dt-day data-pad="2"></select></label><label>Stunde<select data-dt-hour data-pad="2"></select></label><label>Minute<select data-dt-minute data-pad="2"></select></label></div><div class="picker-actions"><button class="vl-button vl-button--secondary vl-button--small" type="button" data-datetime-clear>Löschen</button><button class="vl-button vl-button--small" type="button" data-datetime-apply>Übernehmen</button></div></div></div><small>Format: TT.MM.JJJJ HH:MM</small></label>"#,
+        crate::ui::icon(crate::ui::Icon::Calendar)
+    )
 }
 
 fn format_unit_floor(bytes: u64, unit: u64) -> String {
@@ -2412,6 +2945,10 @@ async fn raw_preview_opened_response(
 #[derive(Default, Deserialize)]
 struct ShareQuery {
     path: Option<String>,
+    q: Option<String>,
+    status: Option<String>,
+    sort: Option<String>,
+    page: Option<usize>,
 }
 
 #[derive(Default, Deserialize)]
@@ -2419,7 +2956,348 @@ pub(crate) struct PreviewRawQuery {
     path: Option<String>,
     preview_token: Option<String>,
 }
-async fn shares_page(
+
+fn share_permission_label(permission: &Permission) -> &'static str {
+    match permission {
+        Permission::DownloadOnly => "Nur Download",
+        Permission::UploadOnly => "Nur Upload",
+        Permission::DownloadUpload => "Download + Upload",
+    }
+}
+
+fn share_is_expired(share: &Share) -> bool {
+    share
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
+}
+
+fn share_limit_reached(share: &Share) -> bool {
+    share
+        .max_downloads
+        .is_some_and(|maximum| share.download_count >= maximum)
+}
+
+fn share_is_available(share: &Share) -> bool {
+    share.active && !share_is_expired(share) && !share_limit_reached(share)
+}
+
+fn share_primary_status(share: &Share) -> (&'static str, &'static str) {
+    if !share.active {
+        ("Deaktiviert", "neutral")
+    } else if share_is_expired(share) {
+        ("Abgelaufen", "warning")
+    } else if share_limit_reached(share) {
+        ("Limit erreicht", "warning")
+    } else {
+        ("Aktiv", "success")
+    }
+}
+
+fn share_public_url(settings: &RuntimeSettings, share: &Share) -> String {
+    let base = settings.public_base_url.trim_end_matches('/');
+    match share.alias.as_deref() {
+        Some(alias) => format!("{base}/s/{alias}"),
+        None => format!("{base}/v/{}", share.token),
+    }
+}
+
+fn selected(current: &str, value: &str) -> &'static str {
+    if current == value {
+        "selected"
+    } else {
+        ""
+    }
+}
+
+fn share_list_url(query: &str, status: &str, sort: &str, page: usize) -> String {
+    format!(
+        "/admin/shares?q={}&status={}&sort={}&page={page}",
+        encoded(query),
+        encoded(status),
+        encoded(sort)
+    )
+}
+
+async fn share_index_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ShareQuery>,
+) -> Result<Response> {
+    let (_, session_data) =
+        session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    if let Some(path) = q.path.as_deref().filter(|path| !path.is_empty()) {
+        return Ok(
+            Redirect::to(&format!("/admin/shares/new?path={}", encoded(path))).into_response(),
+        );
+    }
+    let settings = runtime_settings(&state);
+    let all_shares = database(state.db.clone(), |database| database.list_shares()).await?;
+    let monthly = database(state.db.clone(), |database| {
+        database.current_transfer_monthly_counts()
+    })
+    .await?;
+    let statistics_started_at = database(state.db.clone(), |database| {
+        database.transfer_statistics_started_at()
+    })
+    .await?;
+    let active_count = all_shares
+        .iter()
+        .filter(|share| share_is_available(share))
+        .count();
+    let protected_count = all_shares
+        .iter()
+        .filter(|share| share.password_hash.is_some())
+        .count();
+    let query = q.q.as_deref().unwrap_or("").trim().to_string();
+    let query_lower = query.to_lowercase();
+    let status = match q.status.as_deref().unwrap_or("all") {
+        value @ ("active" | "protected" | "expired" | "limit" | "inactive") => value,
+        _ => "all",
+    };
+    let sort = if q.sort.as_deref() == Some("oldest") {
+        "oldest"
+    } else {
+        "newest"
+    };
+    let mut shares = all_shares
+        .into_iter()
+        .filter(|share| {
+            let matches_query = query_lower.is_empty()
+                || share.relative_path.to_lowercase().contains(&query_lower)
+                || share
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.to_lowercase().contains(&query_lower));
+            let matches_status = match status {
+                "active" => share_is_available(share),
+                "protected" => share.password_hash.is_some(),
+                "expired" => share_is_expired(share),
+                "limit" => share_limit_reached(share),
+                "inactive" => !share.active,
+                _ => true,
+            };
+            matches_query && matches_status
+        })
+        .collect::<Vec<_>>();
+    if sort == "oldest" {
+        shares.reverse();
+    }
+    const PAGE_SIZE: usize = 50;
+    let total = shares.len();
+    let total_pages = total.div_ceil(PAGE_SIZE).max(1);
+    let page = q
+        .page
+        .unwrap_or(0)
+        .min(1_000_000)
+        .min(total_pages.saturating_sub(1));
+    let start = page.saturating_mul(PAGE_SIZE).min(total);
+    let end = start.saturating_add(PAGE_SIZE).min(total);
+    let mut share_rows = String::new();
+    for share in &shares[start..end] {
+        let url = share_public_url(&settings, share);
+        let display_name = share
+            .alias
+            .as_deref()
+            .or_else(|| share.relative_path.rsplit('/').next())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Freigabe");
+        let (status_label, status_tone) = share_primary_status(share);
+        let password_badge = if share.password_hash.is_some() {
+            r#"<span class="vl-badge vl-badge--neutral">Passwort</span>"#
+        } else {
+            ""
+        };
+        let maximum = share
+            .max_downloads
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "∞".into());
+        let progress = share
+            .max_downloads
+            .map(|maximum| {
+                let value = share
+                    .download_count
+                    .saturating_mul(100)
+                    .saturating_div(maximum.max(1))
+                    .min(100);
+                format!(r#"<progress max="100" value="{value}">{value}%</progress>"#)
+            })
+            .unwrap_or_default();
+        let upload_settings = if share.is_directory && share.permission.can_upload() {
+            let checked = if share.upload_conflict_strategy.can_overwrite() {
+                "checked"
+            } else {
+                ""
+            };
+            format!(
+                r#"<details><summary>Upload-Regeln</summary><form method="post" action="/admin/shares/{}/upload-conflict" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1" {}><span>Überschreiben erlauben<small>Uploader bestätigen jedes Ersetzen zusätzlich.</small></span></label><button class="vl-button vl-button--secondary">Übernehmen</button></form></details>"#,
+                share.id,
+                esc(&session_data.csrf_token),
+                checked
+            )
+        } else {
+            String::new()
+        };
+        let upload_limit = share
+            .max_upload_size
+            .map(upload_limit_label)
+            .unwrap_or_else(|| {
+                format!(
+                    "global {} GB",
+                    display_limit_unit_floor(settings.max_upload_size, GB)
+                )
+            });
+        share_rows += &format!(
+            r#"<article class="vl-share-row"><div class="vl-share-identity"><span class="vl-file-kind" aria-hidden="true"></span><div><strong>{}</strong><span class="vl-muted">/{}</span></div></div><div class="vl-share-url"><code>{}</code><button class="vl-icon-button" type="button" data-copy="{}" aria-label="Link kopieren">Kopieren</button></div><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span><span class="vl-badge vl-badge--{}">{}</span>{}</div><div class="vl-share-quota"><span>{} / {} gezählte Übertragungen</span>{}<small class="vl-muted">Uploadlimit: {}</small></div><details class="vl-action-details"><summary class="vl-icon-button">Aktionen</summary><div class="vl-action-panel"><a class="vl-button vl-button--ghost" href="{}">Öffnen</a><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--ghost">{}</button></form><details><summary>Passwort ändern</summary><form method="post" action="/admin/shares/{}/password" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field">Neues Passwort<input type="password" name="password" minlength="{}" maxlength="{}"></label><label class="vl-field">Bestätigen<input type="password" name="password_confirm"></label><div class="vl-inline-actions"><button class="vl-button">Setzen</button><button class="vl-button vl-button--secondary" name="remove" value="1">Entfernen</button></div></form></details>{}<form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--danger">Löschen</button></form></div></details></article>"#,
+            esc(display_name),
+            esc(&share.relative_path),
+            esc(&url),
+            esc(&url),
+            esc(share_permission_label(&share.permission)),
+            status_tone,
+            status_label,
+            password_badge,
+            share.download_count,
+            maximum,
+            progress,
+            esc(&upload_limit),
+            esc(&url),
+            share.id,
+            esc(&session_data.csrf_token),
+            if share.active {
+                "Deaktivieren"
+            } else {
+                "Aktivieren"
+            },
+            share.id,
+            esc(&session_data.csrf_token),
+            settings.share_password_min_length,
+            settings.share_password_max_length,
+            upload_settings,
+            share.id,
+            esc(&session_data.csrf_token),
+        );
+    }
+    if share_rows.is_empty() {
+        share_rows = r#"<div class="vl-empty"><strong>Keine Links gefunden</strong><p class="vl-muted">Passe Suche oder Filter an oder erstelle einen neuen Link.</p></div>"#.into();
+    }
+    let previous = (page > 0).then(|| share_list_url(&query, status, sort, page - 1));
+    let next = (page + 1 < total_pages).then(|| share_list_url(&query, status, sort, page + 1));
+    let body = format!(
+        r#"<section class="vl-stat-strip" aria-label="Linkübersicht"><div><strong>{active_count}</strong><span>aktive Links</span></div><div><strong>{protected_count}</strong><span>passwortgeschützt</span></div><div><strong>{}</strong><span>Datei · {}</span></div><div><strong>{}</strong><span>ZIP · {}</span></div><div><strong>{}</strong><span>Vorschau · {}</span></div></section><p class="vl-muted">Monatswerte in UTC, Erfassung seit {}.</p><section class="vl-panel"><form method="get" class="vl-toolbar"><label class="vl-field vl-search"><span class="vl-sr-only">Links durchsuchen</span><input name="q" value="{}" placeholder="Links durchsuchen"></label><label class="vl-field"><span class="vl-sr-only">Status</span><select name="status"><option value="all" {}>Alle</option><option value="active" {}>Aktiv</option><option value="protected" {}>Geschützt</option><option value="expired" {}>Abgelaufen</option><option value="limit" {}>Limit erreicht</option><option value="inactive" {}>Deaktiviert</option></select></label><label class="vl-field"><span class="vl-sr-only">Sortierung</span><select name="sort"><option value="newest" {}>Neueste zuerst</option><option value="oldest" {}>Älteste zuerst</option></select></label><button class="vl-button">Filtern</button></form><div class="vl-share-list">{share_rows}</div><nav class="vl-pagination" aria-label="Seitennavigation">{}<span>Seite {} von {}</span>{}</nav></section>"#,
+        monthly.download,
+        esc(&monthly.month),
+        monthly.zip_download,
+        esc(&monthly.month),
+        monthly.preview,
+        esc(&monthly.month),
+        esc(&statistics_started_at),
+        esc(&query),
+        selected(status, "all"),
+        selected(status, "active"),
+        selected(status, "protected"),
+        selected(status, "expired"),
+        selected(status, "limit"),
+        selected(status, "inactive"),
+        selected(sort, "newest"),
+        selected(sort, "oldest"),
+        previous
+            .map(|url| format!(
+                r#"<a class="vl-button vl-button--ghost" href="{}">Zurück</a>"#,
+                esc(&url)
+            ))
+            .unwrap_or_default(),
+        page + 1,
+        total_pages,
+        next.map(|url| format!(
+            r#"<a class="vl-button vl-button--ghost" href="{}">Weiter</a>"#,
+            esc(&url)
+        ))
+        .unwrap_or_default(),
+    );
+    Ok(Html(admin_page(
+        &state,
+        "Links",
+        &body,
+        true,
+        &session_data.csrf_token,
+    ))
+    .into_response())
+}
+
+async fn share_create_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ShareQuery>,
+) -> Result<Html<String>> {
+    let (_, session_data) =
+        session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let settings = runtime_settings(&state);
+    let Some(raw_path) = query.path.as_deref().filter(|path| !path.is_empty()) else {
+        let body = r#"<section class="vl-panel vl-empty"><strong>Wähle zuerst ein Ziel aus</strong><p class="vl-muted">Öffne den Dateibrowser und wähle eine Datei oder einen Ordner für die Freigabe.</p><a class="vl-button" href="/admin">Zum Dateibrowser</a></section>"#;
+        return Ok(Html(admin_page(
+            &state,
+            "Link erstellen",
+            body,
+            false,
+            &session_data.csrf_token,
+        )));
+    };
+    let relative_path = path_security::validate_relative(raw_path)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let secure_root = state.secure_root.clone();
+    let metadata_path = relative_path.clone();
+    let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
+        .await
+        .map_err(internal)?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
+    let is_directory = metadata.is_dir();
+    let permission_fields = if is_directory {
+        r#"<div class="vl-segmented" role="radiogroup" aria-label="Berechtigung"><label><input type="radio" name="permission" value="download_only" checked><span>Nur Download</span></label><label><input type="radio" name="permission" value="upload_only"><span>Nur Upload</span></label><label><input type="radio" name="permission" value="download_upload"><span>Download + Upload</span></label></div>"#
+    } else {
+        r#"<input type="hidden" name="permission" value="download_only"><span class="vl-badge vl-badge--accent">Nur Download</span><p class="vl-muted">Uploadrechte sind ausschließlich für Ordner verfügbar.</p>"#
+    };
+    let upload_rules = if is_directory {
+        format!(
+            r#"<section class="vl-form-section" data-upload-rules><h2>4. Upload-Regeln</h2><div class="vl-form-grid"><label class="vl-field">Max. Dateigröße in GB<input name="max_upload_size_gb" type="number" min="1" step="1" placeholder="Global: {} GB"><small>Leer verwendet das globale Limit.</small></label><label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1"><span>Bestehende Dateien dürfen ersetzt werden<small>Uploader müssen jede Ersetzung zusätzlich bestätigen.</small></span></label></div></section>"#,
+            display_limit_unit_floor(settings.max_upload_size, GB)
+        )
+    } else {
+        String::new()
+    };
+    let url_preview = format!(
+        "{}/v/••••••••",
+        settings.public_base_url.trim_end_matches('/')
+    );
+    let body = format!(
+        r#"<div class="vl-create-layout"><form method="post" action="/admin/shares" class="vl-panel vl-stack" data-share-create><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><section class="vl-target-card"><div><span class="vl-eyebrow">Ausgewähltes Ziel</span><strong>/{}</strong><small class="vl-muted">{}</small></div><a class="vl-button vl-button--ghost" href="/admin">Ziel ändern</a></section><section class="vl-form-section"><h2>1. Berechtigung</h2>{permission_fields}</section><section class="vl-form-section"><h2>2. Link &amp; Zugriff</h2><div class="vl-form-grid"><label class="vl-field">Kurzer Alias<input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}" data-share-alias><small>Optional, 3–32 Zeichen.</small></label>{}<label class="vl-field">Max. gezählte Übertragungen<input name="max_downloads" type="number" min="1"><small>Leer bedeutet unbegrenzt.</small></label></div></section><section class="vl-form-section"><h2>3. Schutz</h2><label class="vl-switch"><input type="checkbox" data-password-toggle><span>Passwortschutz<small>Aktiviert die beiden Passwortfelder.</small></span></label><div class="vl-form-grid" data-password-fields><label class="vl-field">Passwort<input name="password" type="password" minlength="{}" maxlength="{}" autocomplete="new-password"></label><label class="vl-field">Passwort bestätigen<input name="password_confirm" type="password" autocomplete="new-password"></label></div></section>{upload_rules}<button class="vl-button vl-button--primary" type="submit">Sicheren Link erstellen</button></form><aside class="vl-panel vl-review-card" data-share-review><h2>Freigabe prüfen</h2><dl class="vl-review-list"><div><dt>Ziel</dt><dd>/{}</dd></div><div><dt>Berechtigung</dt><dd data-review-permission>Nur Download</dd></div><div><dt>Passwort</dt><dd data-review-password>Ohne Passwort</dd></div><div><dt>Limit</dt><dd data-review-limit>Unbegrenzt</dd></div></dl><div class="vl-field"><span>Vorschau der URL</span><code data-review-url>{}</code></div><p class="vl-muted">Die Erstellung wird im Audit protokolliert.</p></aside></div>"#,
+        esc(&session_data.csrf_token),
+        esc(&relative_path),
+        esc(&relative_path),
+        if is_directory { "Ordner" } else { "Datei" },
+        expiry_picker_html(),
+        settings.share_password_min_length,
+        settings.share_password_max_length,
+        esc(&relative_path),
+        esc(&url_preview),
+    );
+    let body = body.replacen(
+        r#"type="checkbox" data-password-toggle"#,
+        r#"type="checkbox" name="password_enabled" value="1" data-password-toggle"#,
+        1,
+    );
+    Ok(Html(admin_page(
+        &state,
+        "Link erstellen",
+        &body,
+        false,
+        &session_data.csrf_token,
+    )))
+}
+
+#[allow(dead_code)]
+async fn share_create_page_legacy(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<ShareQuery>,
@@ -2565,6 +3443,7 @@ struct CreateShare {
     max_upload_size_gb: Option<String>,
     password: Option<String>,
     password_confirm: Option<String>,
+    password_enabled: Option<String>,
     overwrite_allowed: Option<String>,
 }
 async fn create_share(
@@ -2616,16 +3495,23 @@ async fn create_share(
     let settings = runtime_settings(&state);
     let token = auth::random_token(24);
     let password = f.password.filter(|value| !value.is_empty());
-    if password.as_deref()
-        != f.password_confirm
-            .as_deref()
-            .filter(|value| !value.is_empty())
-    {
+    let password_confirm = f.password_confirm.filter(|value| !value.is_empty());
+    let password_requested = f.password_enabled.as_deref() == Some("1")
+        || password.is_some()
+        || password_confirm.is_some();
+    if password_requested && (password.is_none() || password_confirm.is_none()) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Passwort und Bestätigung sind für den Passwortschutz verpflichtend",
+        ));
+    }
+    if password != password_confirm {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
             "Passwörter stimmen nicht überein",
         ));
     }
+    let password_protected = password.is_some();
     let password_hash = if let Some(password) = password {
         validate_share_password(&settings, &password)?;
         Some(
@@ -2646,11 +3532,11 @@ async fn create_share(
         .filter(|value| !value.is_empty())
         .map(|value| value.parse::<u64>())
         .transpose()
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige maximale Downloadanzahl"))?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Übertragungslimit"))?;
     if max_downloads == Some(0) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Maximale Downloadanzahl muss mindestens 1 sein",
+            "Das Übertragungslimit muss mindestens 1 sein",
         ));
     }
     let max_upload_size = if let Some(value) = f
@@ -2683,6 +3569,14 @@ async fn create_share(
         } else {
             UploadConflictStrategy::Reject
         };
+    let audit_detail = format!(
+        "path={rel};permission={permission_detail};alias={};expires_at={};transfer_limit={};upload_limit={};password_protected={password_protected};overwrite_allowed={}",
+        alias.as_deref().unwrap_or(""),
+        exp.map(|value| value.to_rfc3339()).unwrap_or_default(),
+        max_downloads.map(|value| value.to_string()).unwrap_or_default(),
+        max_upload_size.map(|value| value.to_string()).unwrap_or_default(),
+        upload_conflict_strategy.can_overwrite(),
+    );
     let admin_id = s.admin_id;
     let id = database(state.db.clone(), move |db| {
         db.create_share(
@@ -2706,7 +3600,7 @@ async fn create_share(
         s.username,
         "share_created",
         Some(id.to_string()),
-        Some(permission_detail),
+        Some(audit_detail),
     )
     .await;
     Ok(Redirect::to("/admin/shares"))
@@ -3222,12 +4116,14 @@ struct SettingsForm {
     max_media_preview_size_mb: Option<String>,
     max_media_preview_size_gb: Option<String>,
     max_media_preview_size: Option<String>,
+    audit_client_ip_enabled: Option<String>,
 }
 
 async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let settings = runtime_settings(&state);
-    let body = settings_form(&session, &settings, "");
+    let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
+    let body = settings_form(&session, &settings, ip_count, "");
     Ok(Html(admin_page(
         &state,
         "Einstellungen",
@@ -3237,14 +4133,27 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     )))
 }
 
-fn settings_form(session: &Session, settings: &RuntimeSettings, message: &str) -> String {
+fn settings_form(
+    session: &Session,
+    settings: &RuntimeSettings,
+    audit_ip_count: u64,
+    message: &str,
+) -> String {
     let message = if message.is_empty() {
         String::new()
     } else {
         format!(r#"<p class="muted">{}</p>"#, esc(message))
     };
+    let purge_link = if !settings.audit_client_ip_enabled && audit_ip_count > 0 {
+        format!(
+            r#"<p><a class="vl-button vl-button--danger" href="/admin/settings/audit-ips/delete">{} gespeicherte IP-Adressen löschen</a></p>"#,
+            audit_ip_count
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<section><h1>Einstellungen</h1>{message}<p class="muted">Runtime-Policy wird in SQLite gespeichert. Servermodus, Bind-Adresse, TLS-Dateien, Trusted Proxies, Root-Mount und Data-Dir bleiben file-/restart-basiert.</p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label>Globales Uploadlimit GB<br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label>Blockierte Endungen<br><input name="blocked_extensions" value="{}"></label><label>Share-Passwort Min. Zeichen<br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label>Share-Passwort Max. Zeichen<br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label>Unlock Minuten<br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label>ZIP Max. GB<br><input name="max_zip_size_gb" type="number" min="1" step="1" value="{}" required></label><label>ZIP Max. Dateien<br><input name="max_zip_files" type="number" min="1" value="{}" required></label><label>Suche Max. Einträge<br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label>Suche Max. Treffer<br><input name="max_search_results" type="number" min="1" value="{}" required></label><label>Text-Preview Max. MB<br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Text-Preview-Endungen<br><input name="preview_extensions" value="{}" required></label><label>Media-Preview Max. MB<br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Bild-Preview-Endungen<br><input name="image_preview_extensions" value="{}"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" {}><span>PDF-Preview aktiv<small>PDFs werden inline mit sicheren Headern angezeigt.</small></span></label><button>Speichern</button></form></section>"#,
+        r#"<section class="vl-panel"><h2>Runtime-Einstellungen</h2>{message}<p class="vl-muted">Runtime-Policy wird in SQLite gespeichert. Servermodus, Bind-Adresse, TLS-Dateien, Trusted Proxies, Root-Mount und Data-Dir bleiben file-/restart-basiert.</p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label>Globales Uploadlimit GB<br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label>Blockierte Endungen<br><input name="blocked_extensions" value="{}"></label><label>Share-Passwort Min. Zeichen<br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label>Share-Passwort Max. Zeichen<br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label>Unlock Minuten<br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label>ZIP Max. GB<br><input name="max_zip_size_gb" type="number" min="1" step="1" value="{}" required></label><label>ZIP Max. Dateien<br><input name="max_zip_files" type="number" min="1" value="{}" required></label><label>Suche Max. Einträge<br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label>Suche Max. Treffer<br><input name="max_search_results" type="number" min="1" value="{}" required></label><label>Text-Preview Max. MB<br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Text-Preview-Endungen<br><input name="preview_extensions" value="{}" required></label><label>Media-Preview Max. MB<br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Bild-Preview-Endungen<br><input name="image_preview_extensions" value="{}"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" {}><span>PDF-Preview aktiv<small>PDFs werden inline mit sicheren Headern angezeigt.</small></span></label><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled" {}><span>Client-IP im Audit erfassen<small>Standardmäßig aus. Bei Aktivierung wird die aufgelöste vollständige IP in SQLite gespeichert, nicht zusätzlich ins Serverlog geschrieben.</small></span></label><button>Speichern</button></form>{purge_link}</section>"#,
         esc(&session.csrf_token),
         esc(&settings.public_base_url),
         display_limit_unit_floor(settings.max_upload_size, GB),
@@ -3261,6 +4170,11 @@ fn settings_form(session: &Session, settings: &RuntimeSettings, message: &str) -
         display_limit_unit_floor(settings.max_media_preview_size, MB),
         esc(&settings.image_preview_extensions.join(",")),
         if settings.pdf_preview_enabled {
+            "checked"
+        } else {
+            ""
+        },
+        if settings.audit_client_ip_enabled {
             "checked"
         } else {
             ""
@@ -3334,6 +4248,14 @@ async fn update_settings(
             },
         ),
         ("max_media_preview_size", max_media_preview_size.as_str()),
+        (
+            "audit_client_ip_enabled",
+            if form.audit_client_ip_enabled.is_some() {
+                "true"
+            } else {
+                "false"
+            },
+        ),
     ];
     next.apply_many(entries)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
@@ -3348,16 +4270,97 @@ async fn update_settings(
         ));
     }
     let admin_id = session.admin_id;
+    let previous = runtime_settings(&state);
     commit_runtime_settings(&state, next.clone(), admin_id).await?;
     let actor = session.username.clone();
-    audit(&state, actor, "settings_updated", None, None).await;
+    let mut changed = Vec::new();
+    if previous.public_base_url != next.public_base_url {
+        changed.push("public_base_url");
+    }
+    if previous.audit_client_ip_enabled != next.audit_client_ip_enabled {
+        changed.push("audit_client_ip_enabled");
+    }
+    if previous != next && changed.is_empty() {
+        changed.push("runtime_policy");
+    }
+    audit(
+        &state,
+        actor,
+        "settings_updated",
+        None,
+        Some(format!("changed_keys={}", changed.join(","))),
+    )
+    .await;
+    let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
     Ok(Html(admin_page(
         &state,
         "Einstellungen",
-        &settings_form(&session, &next, "Einstellungen gespeichert."),
+        &settings_form(&session, &next, ip_count, "Einstellungen gespeichert."),
         false,
         &session.csrf_token,
     )))
+}
+
+#[derive(Deserialize)]
+struct DeleteAuditIpsForm {
+    csrf: String,
+    confirmation: String,
+}
+
+async fn audit_ips_delete_confirmation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>> {
+    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    if runtime_settings(&state).audit_client_ip_enabled {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "IP-Erfassung muss vor dem Löschen deaktiviert werden",
+        ));
+    }
+    let count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
+    let body = format!(
+        r#"<section class="vl-panel vl-confirm-card"><h2>Audit-IP-Daten löschen?</h2><p>Es werden <strong>{count}</strong> gespeicherte Client-IP-Werte permanent entfernt. Andere Auditdaten bleiben erhalten.</p><form method="post" action="/admin/settings/audit-ips/delete" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field">Zur Bestätigung <code>IP-DATEN LÖSCHEN</code> eingeben<input name="confirmation" autocomplete="off" required></label><div class="vl-inline-actions"><button class="vl-button vl-button--danger">IP-Daten löschen</button><a class="vl-button vl-button--secondary" href="/admin/settings">Abbrechen</a></div></form></section>"#,
+        esc(&session.csrf_token),
+    );
+    Ok(Html(admin_page(
+        &state,
+        "Einstellungen",
+        &body,
+        false,
+        &session.csrf_token,
+    )))
+}
+
+async fn delete_audit_ips_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteAuditIpsForm>,
+) -> Result<Redirect> {
+    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&session, &form.csrf)?;
+    if form.confirmation != "IP-DATEN LÖSCHEN" {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Exakte Bestätigung IP-DATEN LÖSCHEN erforderlich",
+        ));
+    }
+    if runtime_settings(&state).audit_client_ip_enabled {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "IP-Erfassung muss vor dem Löschen deaktiviert werden",
+        ));
+    }
+    let deleted = database(state.db.clone(), |db| db.delete_audit_client_ips()).await?;
+    audit(
+        &state,
+        session.username,
+        "audit_client_ips_deleted",
+        None,
+        Some(format!("deleted={deleted}")),
+    )
+    .await;
+    Ok(Redirect::to("/admin/settings"))
 }
 
 #[derive(Default, Deserialize)]
@@ -3372,6 +4375,8 @@ async fn audit_page(
     Query(query): Query<AuditQuery>,
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let settings = runtime_settings(&state);
+    let client_ip_enabled = settings.audit_client_ip_enabled;
     let page_number = query.page.unwrap_or(0).min(1_000_000);
     let action = query
         .action
@@ -3385,8 +4390,16 @@ async fn audit_page(
     let has_next = events.len() > 100;
     let mut rows = String::new();
     for event in events.into_iter().take(100) {
+        let client_ip = if client_ip_enabled {
+            format!(
+                r#"<td data-label="Client-IP">{}</td>"#,
+                event.client_ip.as_deref().map(esc).unwrap_or_default()
+            )
+        } else {
+            String::new()
+        };
         rows += &format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            r#"<tr><td data-label="Zeit">{}</td><td data-label="Akteur">{}</td><td data-label="Aktion"><code>{}</code></td><td data-label="Objekt">{}</td><td data-label="Detail">{}</td>{client_ip}</tr>"#,
             esc(&format_audit_time(&event.occurred_at)),
             esc(&event.actor),
             esc(&event.action),
@@ -3413,13 +4426,31 @@ async fn audit_page(
     } else {
         String::new()
     };
+    let ip_header = if client_ip_enabled {
+        "<th>Client-IP</th>"
+    } else {
+        ""
+    };
+    let url_scheme = url::Url::parse(&settings.public_base_url)
+        .ok()
+        .map(|url| url.scheme().to_uppercase())
+        .unwrap_or_else(|| "unbekannt".into());
+    let trusted_proxy_count = state.config.reverse_proxy.trusted_proxies.len();
     let body = format!(
-        r#"<section><h1>Audit</h1><form method="get" class="row"><label>Action-Filter<br><input name="action" value="{}"></label><button>Filtern</button></form><table><tr><th>Zeit</th><th>Actor</th><th>Aktion</th><th>Objekt</th><th>Detail</th></tr>{rows}</table><p>{previous} {next}</p></section>"#,
-        esc(filter_value)
+        r#"<div class="vl-audit-layout"><section class="vl-panel"><div class="vl-panel-head"><div><p class="vl-eyebrow">Nachvollziehbarkeit</p><h2>Audit-Ereignisse</h2></div><form method="get" class="vl-inline-actions"><label class="vl-field"><span class="vl-sr-only">Action-Filter</span><input name="action" value="{}" placeholder="Action filtern"></label><button class="vl-button">Filtern</button></form></div><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th>Zeit</th><th>Akteur</th><th>Aktion</th><th>Objekt</th><th>Detail</th>{ip_header}</tr></thead><tbody>{rows}</tbody></table></div><nav class="vl-pagination" aria-label="Audit-Seiten">{previous} {next}</nav></section><aside class="vl-panel vl-security-facts"><p class="vl-eyebrow">Security-Status</p><h2>Belegte Konfiguration</h2><dl><div><dt>MFA</dt><dd>Für Admin-Sitzungen verpflichtend</dd></div><div><dt>Servermodus</dt><dd>{:?}</dd></div><div><dt>Öffentliches URL-Schema</dt><dd>{}</dd></div><div><dt>Trusted Proxies</dt><dd>{}</dd></div><div><dt>Audit-IP-Erfassung</dt><dd>{}</dd></div><div><dt>Protokollierung</dt><dd>SQLite + strukturiertes Serverlog</dd></div></dl></aside></div>"#,
+        esc(filter_value),
+        state.config.server.mode,
+        esc(&url_scheme),
+        trusted_proxy_count,
+        if client_ip_enabled {
+            "aktiv"
+        } else {
+            "deaktiviert"
+        },
     );
     Ok(Html(admin_page(
         &state,
-        "Audit",
+        "Audit & Sicherheit",
         &body,
         false,
         &session.csrf_token,
@@ -3519,14 +4550,58 @@ async fn public_page(
     let settings = runtime_settings(&state);
     if !share_is_unlocked(&state, &headers, &sh).await? {
         let body = format!(
-            r#"<section><h1>Geschützte Freigabe</h1><form method="post" action="/v/{}/unlock"><label>Passwort<br><input type="password" name="password" autocomplete="current-password" required></label><button>Entsperren</button></form></section>"#,
-            esc(&token)
+            r#"<section class="vl-panel vl-auth-card"><p class="vl-eyebrow">Sichere Freigabe</p><h1>Geschützte Freigabe</h1><p class="vl-muted">Gib das Freigabepasswort ein, um fortzufahren.</p><form method="post" action="/v/{0}/unlock" class="vl-stack"><label class="vl-field">Passwort<input type="password" name="password" autocomplete="current-password" required></label><button class="vl-button">{1} Entsperren</button></form></section>"#,
+            esc(&token),
+            crate::ui::icon(crate::ui::Icon::Lock),
         );
         return Ok(Html(plain_page("Geschützte Freigabe", &body)));
     }
+    let display_name = if sh.permission == Permission::UploadOnly {
+        "Datei hochladen".to_string()
+    } else {
+        sh.relative_path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Freigabe")
+            .to_string()
+    };
+    let secure_transport = url::Url::parse(&settings.public_base_url)
+        .ok()
+        .is_some_and(|url| url.scheme() == "https");
+    let expiry_badge = sh
+        .expires_at
+        .map(|expires_at| {
+            format!(
+                r#"<span class="vl-badge">Gültig bis {}</span>"#,
+                expires_at.format("%d.%m.%Y")
+            )
+        })
+        .unwrap_or_else(|| r#"<span class="vl-badge">Kein Ablauf</span>"#.into());
+    let password_badge = if sh.password_hash.is_some() {
+        r#"<span class="vl-badge vl-badge--neutral">Passwort geschützt</span>"#
+    } else {
+        ""
+    };
+    let quota = sh.max_downloads.map(|maximum| {
+        let value = sh
+            .download_count
+            .saturating_mul(100)
+            .saturating_div(maximum.max(1))
+            .min(100);
+        format!(r#"<div class="vl-public-quota"><span>{} von {} gezählten Übertragungen verwendet</span><progress class="vl-public-progress" max="100" value="{value}">{value}%</progress></div>"#, sh.download_count, maximum)
+    }).unwrap_or_default();
     let mut body = format!(
-        "<section><h1>Öffentliche Freigabe</h1><p>Berechtigung: <strong>{}</strong></p>",
-        esc(sh.permission.as_str())
+        r#"<section class="vl-panel vl-public-hero"><div><p class="vl-eyebrow">Sichere Freigabe</p><h1>{}</h1><p class="vl-muted">Bereitgestellt über {}</p><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span>{password_badge}{expiry_badge}</div></div><div>{}<p class="vl-muted">{}</p></div></section>"#,
+        esc(&display_name),
+        esc(&settings.public_base_url),
+        esc(share_permission_label(&sh.permission)),
+        quota,
+        if secure_transport {
+            "HTTPS · sicher übertragen"
+        } else {
+            "Lokale HTTP-Verbindung"
+        },
     );
     if let Some(upload_status) = q.upload.as_deref() {
         let message = match upload_status {
@@ -3541,8 +4616,15 @@ async fn public_page(
             _ => "",
         };
         if !message.is_empty() {
-            body += &format!(r#"<p class="notice">{message}</p>"#);
+            body += &format!(r#"<p class="vl-notice vl-notice--success">{message}</p>"#);
         }
+    }
+    let split_layout =
+        sh.is_directory && sh.permission.can_download() && sh.permission.can_upload();
+    if split_layout {
+        body += r#"<div class="vl-public-share-layout"><section class="vl-panel">"#;
+    } else if sh.is_directory && sh.permission.can_download() {
+        body += r#"<section class="vl-panel">"#;
     }
     if sh.is_directory && sh.permission.can_download() {
         let sub = q.path.clone().unwrap_or_default();
@@ -3567,7 +4649,7 @@ async fn public_page(
             );
         }
         body += &format!(
-            r#"<form method="get" class="row"><input type="hidden" name="path" value="{}"><label>Suche<br><input name="q" value="{}" placeholder="Dateiname"></label><button>Suchen</button></form><p class="actions"><a class="button" href="/v/{token}/download.zip?path={}">Ordner als ZIP herunterladen</a></p>"#,
+            r#"<form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only">Dateien durchsuchen</span><input name="q" value="{}" placeholder="Dateien durchsuchen"></label><button class="vl-button">Suchen</button><a class="vl-button vl-button--secondary" href="/v/{token}/download.zip?path={}">Ordner als ZIP</a></form>"#,
             esc(&clean_sub),
             esc(search.as_deref().unwrap_or("")),
             encoded(&clean_sub)
@@ -3588,26 +4670,46 @@ async fn public_page(
                 let target = encoded(&share_rel);
                 let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings)
                 {
-                    format!(r#"<a href="/v/{token}/preview?path={target}">Ansehen</a> "#)
+                    format!(
+                        r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}/preview?path={target}">Ansehen</a> "#
+                    )
                 } else {
                     String::new()
                 };
+                let modified = hit
+                    .entry
+                    .modified
+                    .map(format_file_time)
+                    .unwrap_or_else(|| "—".into());
+                let name = if hit.entry.is_dir {
+                    format!(
+                        r#"{} <a href="/v/{token}?path={target}">{}</a>"#,
+                        crate::ui::icon(crate::ui::Icon::Folder),
+                        esc(&share_rel)
+                    )
+                } else {
+                    format!(
+                        "{} {}",
+                        crate::ui::icon(crate::ui::Icon::File),
+                        esc(&share_rel)
+                    )
+                };
                 rows += &format!(
-                    r#"<tr><td>{}</td><td class="actions">{}{}</td></tr>"#,
+                    r#"<tr><td data-label="Name">{name}</td><td data-label="Größe">{}</td><td data-label="Geändert">{modified}</td><td data-label="Aktion" class="vl-inline-actions">{}{preview}</td></tr>"#,
+                    if hit.entry.is_dir {
+                        "—".into()
+                    } else {
+                        human(hit.entry.len)
+                    },
                     if hit.entry.is_dir {
                         format!(
-                            r#"📁 <a href="/v/{token}?path={target}">{}</a>"#,
-                            esc(&share_rel)
+                            r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}">Öffnen</a>"#
                         )
                     } else {
-                        format!("📄 {}", esc(&share_rel))
+                        format!(
+                            r#"<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}">Download</a>"#
+                        )
                     },
-                    if hit.entry.is_dir {
-                        String::new()
-                    } else {
-                        format!(r#"<a href="/v/{token}/download?path={target}">Download</a> "#)
-                    },
-                    preview
                 );
             }
         } else {
@@ -3625,27 +4727,40 @@ async fn public_page(
                 let target = encoded(&rel);
                 if entry.is_dir {
                     rows += &format!(
-                        r#"<tr><td>📁 <a href="/v/{token}?path={target}">{name}</a></td><td class="actions"><a href="/v/{token}?path={target}">Öffnen</a></td></tr>"#
+                        r#"<tr><td data-label="Name">{} <a href="/v/{token}?path={target}">{name}</a></td><td data-label="Größe">—</td><td data-label="Geändert">{}</td><td data-label="Aktion"><a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}">Öffnen</a></td></tr>"#,
+                        crate::ui::icon(crate::ui::Icon::Folder),
+                        entry
+                            .modified
+                            .map(format_file_time)
+                            .unwrap_or_else(|| "—".into())
                     );
                 } else {
                     let preview = if preview_allowed(&rel, &settings) {
-                        format!(r#"<a href="/v/{token}/preview?path={target}">Ansehen</a> "#)
+                        format!(
+                            r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}/preview?path={target}">Ansehen</a> "#
+                        )
                     } else {
                         String::new()
                     };
                     rows += &format!(
-                        r#"<tr><td>📄 {name}</td><td class="actions">{}<a href="/v/{token}/download?path={target}">Download</a></td></tr>"#,
-                        preview
+                        r#"<tr><td data-label="Name">{} {name}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion" class="vl-inline-actions">{}<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}">Download</a></td></tr>"#,
+                        crate::ui::icon(crate::ui::Icon::File),
+                        human(entry.len),
+                        entry
+                            .modified
+                            .map(format_file_time)
+                            .unwrap_or_else(|| "—".into()),
+                        preview,
                     );
                 }
             }
             if truncated {
-                rows += r#"<tr><td colspan="2" class="muted">Verzeichnis-Scanlimit erreicht; weitere Einträge werden aus Sicherheitsgründen nicht gelesen.</td></tr>"#;
+                rows += r#"<tr><td colspan="4" class="vl-muted">Verzeichnis-Scanlimit erreicht; weitere Einträge werden aus Sicherheitsgründen nicht gelesen.</td></tr>"#;
             }
         }
-        body += "<table><tr><th>Name</th><th>Aktion</th></tr>";
+        body += "<div class=\"vl-table-wrap\"><table class=\"vl-data-table\"><thead><tr><th>Name</th><th>Größe</th><th>Geändert</th><th>Aktion</th></tr></thead><tbody>";
         body += &rows;
-        body += "</table>";
+        body += "</tbody></table></div>";
         let encoded_sub = encoded(&clean_sub);
         let search_param = search
             .as_deref()
@@ -3665,15 +4780,29 @@ async fn public_page(
                 search_param
             );
         }
+        body += "</section>";
     } else if !sh.is_directory && sh.permission.can_download() {
+        let secure_root = state.secure_root.clone();
+        let metadata_path = sh.relative_path.clone();
+        let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
+            .await
+            .map_err(internal)?
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabedatei nicht verfügbar"))?;
         let preview = if preview_allowed(&sh.relative_path, &settings) {
-            format!(r#"<a href="/v/{token}/preview">Im Browser ansehen</a> "#)
+            format!(
+                r#"<a class="vl-button vl-button--secondary" href="/v/{token}/preview">Im Browser ansehen</a> "#
+            )
         } else {
             String::new()
         };
         body += &format!(
-            r#"<p class="actions">{}<a href="/v/{token}/download">Datei herunterladen</a></p>"#,
-            preview
+            r#"<section class="vl-panel"><p class="vl-muted">{} · geändert {}</p><div class="vl-inline-actions">{}<a class="vl-button" href="/v/{token}/download">Datei herunterladen</a></div></section>"#,
+            human(metadata.len()),
+            metadata
+                .modified()
+                .map(format_file_time)
+                .unwrap_or_else(|_| "—".into()),
+            preview,
         );
     }
     if sh.is_directory && sh.permission.can_upload() {
@@ -3686,20 +4815,35 @@ async fn public_page(
             String::new()
         };
         let overwrite_checkbox = if sh.upload_conflict_strategy.can_overwrite() {
-            r#"<label class="toggle-card"><input type="checkbox" name="overwrite_existing" value="1"><span>Bestehende Datei mit gleichem Namen ersetzen<small>Nur aktivieren, wenn die vorhandene Datei bewusst ersetzt werden soll.</small></span></label>"#
+            r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span>Bestehende Datei ersetzen<small>Nur für die konkrete Datei und nach ausdrücklicher Bestätigung.</small></span></label>"#
         } else {
             ""
         };
+        let target_hint = if sh.permission == Permission::UploadOnly {
+            r#"<p class="vl-notice"><strong>Vorhandene Dateien und Ordner bleiben verborgen.</strong></p>"#.to_string()
+        } else {
+            format!(
+                r#"<p class="vl-muted">Zielordner innerhalb der Freigabe: /{}</p>"#,
+                esc(&upload_path)
+            )
+        };
+        let panel_tag = if split_layout { "aside" } else { "section" };
         body += &format!(
-            r#"<h2>Upload</h2><p class="muted">Zielordner: /{}</p><form method="post" enctype="multipart/form-data" action="/v/{token}/upload"><input type="hidden" name="path" value="{}">{}<input type="file" name="file" required><button>Hochladen</button></form>"#,
+            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong>Datei hier ablegen</strong><span class="vl-muted">oder über den Dateidialog auswählen</span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label>{}<div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>{} Sicher hochladen</button><p class="vl-muted">Vorhandene Dateien werden standardmäßig nicht ersetzt. Erfolgreiche Uploads werden protokolliert.</p></form></{panel_tag}>"#,
+            if sh.permission == Permission::UploadOnly {
+                "Datei hochladen"
+            } else {
+                "Dateien hochladen"
+            },
             esc(&upload_path),
-            esc(&upload_path),
-            overwrite_checkbox
+            crate::ui::icon(crate::ui::Icon::Upload),
+            overwrite_checkbox,
+            crate::ui::icon(crate::ui::Icon::Upload),
         );
-    } else if sh.is_directory && sh.permission == Permission::UploadOnly {
-        body += "<p class=\"muted\">Upload-only-Freigaben listen keine Ordnerinhalte.</p>";
     }
-    body += "</section>";
+    if split_layout {
+        body += "</div>";
+    }
     Ok(Html(plain_page("Freigabe", &body)))
 }
 fn joined_relative(base: &str, child: &str) -> Result<String> {
@@ -4327,6 +5471,7 @@ pub(crate) async fn upload(
     let mut fields_seen = 0usize;
     let mut saw_path = false;
     let mut saw_overwrite = false;
+    let mut prepared_upload: Option<(PendingUpload, String, u64)> = None;
     while let Some(field) = match multipart.next_field().await {
         Ok(field) => field,
         Err(_) => {
@@ -4349,12 +5494,12 @@ pub(crate) async fn upload(
         }
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "path" {
-            if std::mem::replace(&mut saw_path, true) {
+            if std::mem::replace(&mut saw_path, true) || prepared_upload.is_some() {
                 return Ok(public_upload_error(
                     &token,
                     &upload_subdir,
                     StatusCode::BAD_REQUEST,
-                    "Uploadpfad wurde mehrfach übermittelt",
+                    "Uploadpfad wurde mehrfach oder zu spät übermittelt",
                 ));
             }
             let value = match limited_multipart_text(field, MAX_UPLOAD_PATH_FIELD_BYTES).await {
@@ -4414,6 +5559,14 @@ pub(crate) async fn upload(
                 "Unbekanntes Multipart-Feld",
             ));
         }
+        if prepared_upload.is_some() {
+            return Ok(public_upload_error(
+                &token,
+                &upload_subdir,
+                StatusCode::BAD_REQUEST,
+                "Pro Request ist genau eine Datei erlaubt",
+            ));
+        }
         let Some(file_name) = field.file_name() else {
             return Ok(public_upload_error(
                 &token,
@@ -4460,7 +5613,7 @@ pub(crate) async fn upload(
         })
         .await
         .map_err(internal)?;
-        let (mut pending, file) = match pending_file {
+        let (pending, file) = match pending_file {
             Ok(value) => value,
             Err(PendingUploadFileError::Begin) => {
                 return Ok(public_upload_error(
@@ -4543,104 +5696,209 @@ pub(crate) async fn upload(
             };
         }
         drop(output);
-        let publish_name = name.clone();
-        let allow_replace = sh.upload_conflict_strategy.can_overwrite() && overwrite_existing;
-        let replaced = allow_replace;
-        #[cfg(test)]
-        if let Some(kind) = state
-            .upload_directory_sync_failure
-            .lock()
-            .expect("upload sync fault lock")
-            .take()
-        {
-            pending.fail_next_directory_sync(kind);
+        prepared_upload = Some((pending, name, total));
+    }
+    let Some((mut pending, name, total)) = prepared_upload else {
+        return Ok(public_upload_error(
+            &token,
+            &upload_subdir,
+            StatusCode::BAD_REQUEST,
+            "Datei fehlt",
+        ));
+    };
+    let publish_name = name.clone();
+    let allow_replace = sh.upload_conflict_strategy.can_overwrite() && overwrite_existing;
+    #[cfg(test)]
+    if let Some(kind) = state
+        .upload_directory_sync_failure
+        .lock()
+        .expect("upload sync fault lock")
+        .take()
+    {
+        pending.fail_next_directory_sync(kind);
+    }
+    let _storage_guard = state.storage_mutation.lock().await;
+    let destination = join_display(&upload_subdir, &name);
+    let existed = match share_scope.metadata(&destination) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(internal(error)),
+    };
+    let replaced = allow_replace && existed;
+    let publish_result = tokio::task::spawn_blocking(move || {
+        if allow_replace {
+            pending.publish_replace(&publish_name)
+        } else {
+            pending.publish(&publish_name)
         }
-        let _storage_guard = state.storage_mutation.lock().await;
-        let publish_result = tokio::task::spawn_blocking(move || {
-            if allow_replace {
-                pending.publish_replace(&publish_name)
+    })
+    .await
+    .map_err(internal)?;
+    let publish_outcome = match publish_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::CONFLICT,
+                    "Datei existiert bereits.",
+                ));
+            }
+            return if storage_full_error(&error) {
+                Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "Nicht genug freier Speicher",
+                ))
             } else {
-                pending.publish(&publish_name)
-            }
-        })
-        .await
-        .map_err(internal)?;
-        let publish_outcome = match publish_result {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    return Ok(public_upload_error(
-                        &token,
-                        &upload_subdir,
-                        StatusCode::CONFLICT,
-                        "Datei existiert bereits.",
-                    ));
-                }
-                return if storage_full_error(&error) {
-                    Ok(public_upload_error(
-                        &token,
-                        &upload_subdir,
-                        StatusCode::INSUFFICIENT_STORAGE,
-                        "Nicht genug freier Speicher",
-                    ))
-                } else {
-                    Err(internal(error))
-                };
-            }
-        };
-        let durability_uncertain = !publish_outcome.is_durable();
-        if let Some(error) = publish_outcome.sync_error() {
-            tracing::warn!(share_id = sh.id, file = %name, %error, "upload published but directory fsync failed");
-            audit(
-                &state,
-                "public".into(),
-                "upload_durability_uncertain",
-                Some(sh.id.to_string()),
-                Some(name.clone()),
-            )
-            .await;
+                Err(internal(error))
+            };
         }
+    };
+    let durability_uncertain = !publish_outcome.is_durable();
+    let audit_detail = format!("file={name};bytes={total}");
+    if let Some(error) = publish_outcome.sync_error() {
+        tracing::warn!(share_id = sh.id, file = %name, %error, "upload published but directory fsync failed");
         audit(
             &state,
             "public".into(),
-            if replaced {
-                "upload_replaced"
-            } else {
-                "upload"
-            },
+            "upload_durability_uncertain",
             Some(sh.id.to_string()),
-            Some(name),
+            Some(audit_detail.clone()),
         )
         .await;
-        let upload_status = match (replaced, durability_uncertain) {
-            (true, true) => "replaced_uncertain",
-            (false, true) => "uncertain",
-            (true, false) => "replaced",
-            (false, false) => "ok",
-        };
-        let public_route = public_share_route(&uri, &token);
-        let target = if upload_subdir.is_empty() {
-            format!("{public_route}?upload={upload_status}")
-        } else {
-            format!(
-                "{public_route}?path={}&upload={upload_status}",
-                encoded(&upload_subdir)
-            )
-        };
-        let mut response = Redirect::to(&target).into_response();
-        if durability_uncertain {
-            response.headers_mut().insert(
-                "x-vaultlink-durability",
-                HeaderValue::from_static("uncertain"),
-            );
-        }
-        return Ok(response);
     }
-    Ok(public_upload_error(
-        &token,
-        &upload_subdir,
-        StatusCode::BAD_REQUEST,
-        "Datei fehlt",
+    audit(
+        &state,
+        "public".into(),
+        if replaced {
+            "upload_replaced"
+        } else {
+            "upload"
+        },
+        Some(sh.id.to_string()),
+        Some(audit_detail),
+    )
+    .await;
+    let upload_status = match (replaced, durability_uncertain) {
+        (true, true) => "replaced_uncertain",
+        (false, true) => "uncertain",
+        (true, false) => "replaced",
+        (false, false) => "ok",
+    };
+    let public_route = public_share_route(&uri, &token);
+    let target = if upload_subdir.is_empty() {
+        format!("{public_route}?upload={upload_status}")
+    } else {
+        format!(
+            "{public_route}?path={}&upload={upload_status}",
+            encoded(&upload_subdir)
+        )
+    };
+    let outcome = match upload_status {
+        "replaced_uncertain" => "replaced_uncertain",
+        "uncertain" => "created_uncertain",
+        "replaced" => "replaced",
+        _ => "created",
+    };
+    let mut response = Redirect::to(&target).into_response();
+    response.headers_mut().insert(
+        "x-vaultlink-upload-file",
+        HeaderValue::from_str(&encoded(&name)).map_err(internal)?,
+    );
+    response.headers_mut().insert(
+        "x-vaultlink-upload-outcome",
+        HeaderValue::from_static(outcome),
+    );
+    if durability_uncertain {
+        response.headers_mut().insert(
+            "x-vaultlink-durability",
+            HeaderValue::from_static("uncertain"),
+        );
+    }
+    Ok(response)
+}
+
+#[derive(Serialize)]
+struct UploadQueueSuccess {
+    file: String,
+    outcome: String,
+}
+
+#[derive(Serialize)]
+struct UploadQueueErrorEnvelope {
+    error: UploadQueueError,
+}
+
+#[derive(Serialize)]
+struct UploadQueueError {
+    code: String,
+    message: String,
+}
+
+fn upload_queue_error_response(status: StatusCode, message: &str) -> Response {
+    let code = match status {
+        StatusCode::BAD_REQUEST => "invalid_upload",
+        StatusCode::UNAUTHORIZED => "share_locked",
+        StatusCode::FORBIDDEN => "upload_forbidden",
+        StatusCode::NOT_FOUND => "target_not_found",
+        StatusCode::CONFLICT => "file_exists",
+        StatusCode::PAYLOAD_TOO_LARGE => "upload_too_large",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "blocked_extension",
+        StatusCode::INSUFFICIENT_STORAGE => "insufficient_storage",
+        _ => "upload_failed",
+    };
+    (
+        status,
+        Json(UploadQueueErrorEnvelope {
+            error: UploadQueueError {
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+async fn upload_queue(
+    state: State<AppState>,
+    uri: OriginalUri,
+    headers: HeaderMap,
+    token: AxPath<String>,
+    multipart: Multipart,
+) -> Result<Response> {
+    let response = match upload(state, uri, headers, token, multipart).await {
+        Ok(response) => response,
+        Err(AppError(status, message)) => {
+            return Ok(upload_queue_error_response(status, message));
+        }
+    };
+    if response.status().is_redirection() {
+        let file = response
+            .headers()
+            .get("x-vaultlink-upload-file")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                percent_encoding::percent_decode_str(value)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default();
+        let outcome = response
+            .headers()
+            .get("x-vaultlink-upload-outcome")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("created")
+            .to_string();
+        return Ok(Json(UploadQueueSuccess { file, outcome }).into_response());
+    }
+
+    let status = response.status();
+    Ok(upload_queue_error_response(
+        status,
+        status.canonical_reason().unwrap_or("Upload fehlgeschlagen"),
     ))
 }
 async fn short_redirect(
@@ -4980,6 +6238,55 @@ mod tests {
         request
     }
 
+    fn admin_multipart_request(
+        uri: &str,
+        path: &str,
+        csrf: &str,
+        name: &str,
+        content: &[u8],
+        overwrite_existing: bool,
+    ) -> Request {
+        let boundary = "vaultlink-admin-upload-boundary";
+        let mut body = Vec::new();
+        for (field, value) in [("path", path), ("csrf", csrf)] {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        if overwrite_existing {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite_existing\"\r\n\r\n1\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        request
+    }
+
     async fn response_text(response: Response) -> String {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -5141,6 +6448,7 @@ mod tests {
             active,
             password_hash: None,
             upload_conflict_strategy: UploadConflictStrategy::Reject,
+            created_at: Utc::now().to_rfc3339(),
         };
         assert!(usable(&share(false, None)).is_err());
         assert!(usable(&share(true, Some(Utc::now() - Duration::seconds(1)))).is_err());
@@ -5186,12 +6494,13 @@ mod tests {
         let state = test_state(root.path(), data.path());
         let html = admin_page(&state, "Dateien", "<section></section>", true, "csrf");
         assert!(html.contains("<title>Dateien · VaultLink</title>"));
-        assert!(html.contains("📁 Dateien"));
-        assert!(html.contains("🔗 Links"));
-        assert!(html.contains("👥 Admins"));
-        assert!(html.contains("⚙️ Einstellungen"));
-        assert!(html.contains("🛡️ Audit"));
-        assert!(html.contains("● System"));
+        for label in ["Dateien", "Links", "Admins", "Einstellungen", "Audit"] {
+            assert!(html.contains(&format!("<span>{label}</span>")));
+        }
+        assert!(html.contains("vl-icon"));
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1);
+        assert!(!html.contains('📁'));
+        assert!(html.contains("VaultLink erreichbar"));
         assert_no_mojibake("admin shell", &html);
         assert!(!html.contains("Secure Mode"));
     }
@@ -5207,6 +6516,26 @@ mod tests {
         assert!(html.contains("<meta charset=\"utf-8\">"));
         assert!(html.contains("<title>Login · VaultLink</title>"));
         assert_no_mojibake("login page", &html);
+    }
+
+    #[tokio::test]
+    async fn csp_requires_self_hosted_styles_and_pages_have_no_inline_styles() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let response = router(test_state(root.path(), data.path()))
+            .oneshot(request(Method::GET, "/login", ""))
+            .await
+            .unwrap();
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("style-src 'self'"));
+        assert!(!csp.contains("unsafe-inline"));
+        assert!(!include_str!("web.rs").contains(concat!("style", "=")));
+        assert!(!include_str!("setup.rs").contains(concat!("style", "=")));
     }
 
     #[test]
@@ -5241,7 +6570,7 @@ mod tests {
         settings.max_preview_size = 1_000_000;
         settings.max_media_preview_size = 100_000_000;
 
-        let html = settings_form(&session, &settings, "");
+        let html = settings_form(&session, &settings, 0, "");
         assert!(
             html.contains(r#"name="max_upload_size_gb" type="number" min="1" step="1" value="53""#)
         );
@@ -5449,7 +6778,7 @@ mod tests {
             .insert(header::COOKIE, cookie.clone());
         let browser_root = response_text(app.clone().oneshot(browser_root).await.unwrap()).await;
         assert!(browser_root.contains("Aktuellen Ordner freigeben"));
-        assert!(browser_root.contains(r#"/admin/shares?path=."#));
+        assert!(browser_root.contains(r#"/admin/shares/new?path=."#));
         assert!(browser_root.contains(r#"action="/admin/files/directories""#));
         assert!(browser_root.contains(r#"action="/admin/files/rename""#));
         assert!(browser_root.contains(r#"/admin/files/delete?path=file%2Etxt"#));
@@ -5490,25 +6819,43 @@ mod tests {
             .insert(header::COOKIE, cookie.clone());
         let browser_folder =
             response_text(app.clone().oneshot(browser_folder).await.unwrap()).await;
-        assert!(browser_folder.contains(r#"/admin/shares?path=uploads"#));
+        assert!(browser_folder.contains(r#"/admin/shares/new?path=uploads"#));
 
-        let mut folder_request = request(Method::GET, "/admin/shares?path=uploads", "");
+        let mut folder_request = request(Method::GET, "/admin/shares/new?path=uploads", "");
         folder_request
             .headers_mut()
             .insert(header::COOKIE, cookie.clone());
         let folder = response_text(app.clone().oneshot(folder_request).await.unwrap()).await;
-        assert!(folder.contains(r#"Ausgewähltes Ziel: <code>/uploads</code>"#));
+        assert!(folder.contains(r#"<strong>/uploads</strong>"#));
         assert!(folder.contains(r#"<input type="hidden" name="path" value="uploads">"#));
-        assert!(folder.contains(r#"<option value="upload_only">Upload only</option>"#));
+        assert!(folder.contains(r#"value="upload_only""#));
 
-        let mut file_request = request(Method::GET, "/admin/shares?path=file.txt", "");
+        let mut file_request = request(Method::GET, "/admin/shares/new?path=file.txt", "");
         file_request.headers_mut().insert(header::COOKIE, cookie);
         let file = response_text(app.clone().oneshot(file_request).await.unwrap()).await;
-        assert!(file.contains(r#"Ausgewähltes Ziel: <code>/file.txt</code>"#));
+        assert!(file.contains(r#"<strong>/file.txt</strong>"#));
         assert!(file.contains(r#"<input type="hidden" name="path" value="file.txt">"#));
-        assert!(file.contains(r#"<option value="download_only">Download only</option>"#));
-        assert!(!file.contains(r#"<option value="upload_only">Upload only</option>"#));
-        assert!(file.contains("Upload-Rechte sind nur"));
+        assert!(file.contains(r#"value="download_only""#));
+        assert!(!file.contains(r#"value="upload_only""#));
+        assert!(!file.contains("data-upload-rules"));
+
+        let mut missing_password = request(
+            Method::POST,
+            "/admin/shares",
+            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&max_downloads=&password_enabled=1&password=&password_confirm=",
+        );
+        missing_password.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=session-token"),
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(missing_password)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
 
         let mut create_request = request(
             Method::POST,
@@ -6128,7 +7475,8 @@ mod tests {
         .await;
         assert!(!login_page.contains("Hauptnavigation"));
         assert!(!login_page.contains("Link erstellen"));
-        assert!(login_page.contains("vaultlink-logo.svg"));
+        assert!(login_page.contains("vl-brand"));
+        assert!(login_page.contains("<svg"));
 
         let mut create_admin = request(
             Method::POST,
@@ -6294,6 +7642,177 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(key, value)| key == "max_preview_size" && value == "64"));
+    }
+
+    #[tokio::test]
+    async fn upload_only_never_exposes_target_paths_or_existing_content() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("private-drop")).unwrap();
+        std::fs::write(
+            root.path().join("private-drop/hidden-secret.txt"),
+            b"secret",
+        )
+        .unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "drop-token",
+                None,
+                "private-drop",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = router(state);
+
+        let html = response_text(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/drop-token", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(html.contains("Datei hochladen"));
+        assert!(html.contains("Vorhandene Dateien und Ordner bleiben verborgen"));
+        assert!(html.contains("Erfolgreiche Uploads werden protokolliert"));
+        assert!(!html.contains("private-drop"));
+        assert!(!html.contains("hidden-secret.txt"));
+        assert!(!html.contains("Dateien durchsuchen"));
+        assert!(!html.contains("Datei herunterladen"));
+
+        let api_body = response_text(
+            app.oneshot(request(Method::GET, "/api/v1/public/shares/drop-token", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(api_body.contains(r#""path":"""#));
+        assert!(!api_body.contains("private-drop"));
+        assert!(!api_body.contains("hidden-secret.txt"));
+    }
+
+    #[tokio::test]
+    async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("uploads")).unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_session(
+                "session-token",
+                1,
+                "csrf-token",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap();
+        state.db.verify_mfa("session-token").unwrap();
+        let app = router(state);
+        let cookie = HeaderValue::from_static("vaultlink_session=session-token");
+
+        let mut wrong_csrf = admin_multipart_request(
+            "/admin/files/upload",
+            "uploads",
+            "wrong",
+            "blocked.txt",
+            b"content",
+            false,
+        );
+        wrong_csrf
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        assert_eq!(
+            app.clone().oneshot(wrong_csrf).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(!root.path().join("uploads/blocked.txt").exists());
+
+        let mut first = admin_multipart_request(
+            "/admin/files/upload",
+            "uploads",
+            "csrf-token",
+            "grüße.txt",
+            b"first",
+            false,
+        );
+        first.headers_mut().insert(header::COOKIE, cookie.clone());
+        assert_eq!(
+            app.clone().oneshot(first).await.unwrap().status(),
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("uploads/grüße.txt")).unwrap(),
+            b"first"
+        );
+
+        let mut conflict = admin_multipart_request(
+            "/admin/files/upload/queue",
+            "uploads",
+            "csrf-token",
+            "grüße.txt",
+            b"second",
+            false,
+        );
+        conflict
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let conflict = app.clone().oneshot(conflict).await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(response_text(conflict).await.contains("file_exists"));
+
+        let mut replace = admin_multipart_request(
+            "/admin/files/upload/queue",
+            "uploads",
+            "csrf-token",
+            "grüße.txt",
+            b"second",
+            true,
+        );
+        replace.headers_mut().insert(header::COOKIE, cookie.clone());
+        let replace = app.clone().oneshot(replace).await.unwrap();
+        assert_eq!(replace.status(), StatusCode::OK);
+        let replace_body = response_text(replace).await;
+        assert!(replace_body.contains(r#""file":"grüße.txt""#));
+        assert!(replace_body.contains(r#""outcome":"replaced"#));
+        assert_eq!(
+            std::fs::read(root.path().join("uploads/grüße.txt")).unwrap(),
+            b"second"
+        );
+
+        let mut blocked = admin_multipart_request(
+            "/admin/files/upload/queue",
+            "uploads",
+            "csrf-token",
+            "payload.exe",
+            b"x",
+            false,
+        );
+        blocked.headers_mut().insert(header::COOKIE, cookie);
+        assert_eq!(
+            app.clone().oneshot(blocked).await.unwrap().status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        let javascript = response_text(
+            app.oneshot(request(Method::GET, "/assets/app.js", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(javascript.contains("input.multiple = true"));
+        assert!(javascript.contains("await uploadItem(item)"));
+        assert!(javascript.contains("Erneut versuchen"));
+        assert!(!javascript.contains("Promise.all"));
     }
 
     #[tokio::test]
@@ -6634,7 +8153,7 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert!(replace_page.contains("Bestehende Datei mit gleichem Namen ersetzen"));
+        assert!(replace_page.contains("Bestehende Datei ersetzen"));
         let upload_page = response_text(
             app.clone()
                 .oneshot(request(Method::GET, "/v/upload", ""))
@@ -6642,7 +8161,7 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert!(!upload_page.contains("Bestehende Datei mit gleichem Namen ersetzen"));
+        assert!(!upload_page.contains("Bestehende Datei ersetzen"));
 
         let uploaded = app
             .clone()
@@ -6653,6 +8172,23 @@ mod tests {
         assert_eq!(
             std::fs::read(root.path().join("uploads/ok.txt")).unwrap(),
             b"content"
+        );
+        let queued = app
+            .clone()
+            .oneshot(multipart_request(
+                "/v/upload/upload/queue",
+                "grüße.txt",
+                b"queued",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::OK);
+        let queued_body = response_text(queued).await;
+        assert!(queued_body.contains(r#""file":"grüße.txt""#));
+        assert!(queued_body.contains(r#""outcome":"created"#));
+        assert_eq!(
+            std::fs::read(root.path().join("uploads/grüße.txt")).unwrap(),
+            b"queued"
         );
         *state
             .upload_directory_sync_failure

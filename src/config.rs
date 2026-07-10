@@ -181,6 +181,8 @@ pub struct Security {
     pub share_unlock_minutes: i64,
     #[serde(default = "default_attempts")]
     pub share_password_attempts: usize,
+    #[serde(default)]
+    pub audit_client_ip_enabled: bool,
 }
 impl Default for Security {
     fn default() -> Self {
@@ -193,6 +195,7 @@ impl Default for Security {
             share_password_max_bytes: default_share_password_max(),
             share_unlock_minutes: default_share_unlock_minutes(),
             share_password_attempts: default_attempts(),
+            audit_client_ip_enabled: false,
         }
     }
 }
@@ -664,6 +667,27 @@ mod tests {
             assert!(c.validate().is_err(), "accepted {value}");
         }
     }
+
+    #[test]
+    fn audit_client_ip_logging_is_opt_in_and_round_trips() {
+        let serialized = toml::to_string(&base()).unwrap();
+        let without_setting = serialized
+            .lines()
+            .filter(|line| !line.starts_with("audit_client_ip_enabled ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let defaulted: Config = toml::from_str(&without_setting).unwrap();
+        assert!(!defaulted.security.audit_client_ip_enabled);
+        defaulted.validate().unwrap();
+
+        let mut enabled = base();
+        enabled.security.audit_client_ip_enabled = true;
+        enabled.validate().unwrap();
+        let round_trip: Config = toml::from_str(&toml::to_string(&enabled).unwrap()).unwrap();
+        assert!(round_trip.security.audit_client_ip_enabled);
+        round_trip.validate().unwrap();
+    }
+
     #[test]
     fn production_requires_secure_cookie() {
         let mut c = base();

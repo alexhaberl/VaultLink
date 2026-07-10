@@ -17,6 +17,7 @@ pub struct RuntimeSettings {
     pub image_preview_extensions: Vec<String>,
     pub pdf_preview_enabled: bool,
     pub max_media_preview_size: u64,
+    pub audit_client_ip_enabled: bool,
 }
 
 impl RuntimeSettings {
@@ -39,6 +40,7 @@ impl RuntimeSettings {
             ),
             pdf_preview_enabled: config.storage.pdf_preview_enabled,
             max_media_preview_size: config.storage.max_media_preview_size,
+            audit_client_ip_enabled: config.security.audit_client_ip_enabled,
         }
     }
 
@@ -85,6 +87,9 @@ impl RuntimeSettings {
             }
             "pdf_preview_enabled" => self.pdf_preview_enabled = parse_bool(key, value)?,
             "max_media_preview_size" => self.max_media_preview_size = parse_u64(key, value)?,
+            "audit_client_ip_enabled" => {
+                self.audit_client_ip_enabled = parse_bool(key, value)?;
+            }
             _ => return Err(format!("unknown runtime setting: {key}")),
         }
         Ok(())
@@ -203,6 +208,10 @@ impl RuntimeSettings {
             (
                 "max_media_preview_size",
                 self.max_media_preview_size.to_string(),
+            ),
+            (
+                "audit_client_ip_enabled",
+                self.audit_client_ip_enabled.to_string(),
             ),
         ]
     }
@@ -336,6 +345,19 @@ mod tests {
         assert!(extension_is_blocked("payload.ExE", &blocked));
         assert!(extension_is_blocked("script.sh", &blocked));
         assert!(!extension_is_blocked("report.pdf", &blocked));
+        assert!(!settings.audit_client_ip_enabled);
+        settings.apply("audit_client_ip_enabled", "true").unwrap();
+        assert!(settings.audit_client_ip_enabled);
+        settings.apply("audit_client_ip_enabled", "off").unwrap();
+        assert!(!settings.audit_client_ip_enabled);
+        let original = settings.clone();
+        assert!(settings
+            .apply("audit_client_ip_enabled", "sometimes")
+            .is_err());
+        assert_eq!(settings, original);
+        assert!(settings
+            .pairs()
+            .contains(&("audit_client_ip_enabled", "false".to_string())));
     }
 
     #[test]

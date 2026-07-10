@@ -11,6 +11,7 @@ pub mod range;
 pub mod runtime;
 pub mod secure_fs;
 pub mod setup;
+pub mod ui;
 pub mod web;
 
 use std::sync::{Arc, RwLock};

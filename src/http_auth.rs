@@ -1,4 +1,6 @@
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use std::{future::Future, net::IpAddr};
+
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::{
@@ -9,6 +11,24 @@ use crate::{
 
 pub const SESSION_COOKIE: &str = "vaultlink_session";
 const TRANSFER_COOKIE_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
+
+tokio::task_local! {
+    static REQUEST_AUDIT_CLIENT_IP: Option<IpAddr>;
+}
+
+pub async fn with_audit_client_ip<F>(client_ip: Option<IpAddr>, future: F) -> F::Output
+where
+    F: Future,
+{
+    REQUEST_AUDIT_CLIENT_IP.scope(client_ip, future).await
+}
+
+pub fn current_audit_client_ip() -> Option<IpAddr> {
+    REQUEST_AUDIT_CLIENT_IP
+        .try_with(|client_ip| *client_ip)
+        .ok()
+        .flatten()
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum MissingSession {
@@ -65,8 +85,19 @@ pub async fn audit(
     object: Option<String>,
     detail: Option<String>,
 ) {
+    let client_ip = runtime_settings(state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
     let _ = database(state.db.clone(), move |db| {
-        db.audit(&actor, action, object.as_deref(), detail.as_deref())
+        db.audit_with_client_ip(
+            &actor,
+            action,
+            object.as_deref(),
+            detail.as_deref(),
+            client_ip.as_deref(),
+        )
     })
     .await;
 }

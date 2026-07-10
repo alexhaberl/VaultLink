@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 pub const TRANSFER_SESSION_TTL_SECONDS: i64 = 15 * 60;
 
@@ -165,6 +165,7 @@ pub struct Share {
     pub active: bool,
     pub password_hash: Option<String>,
     pub upload_conflict_strategy: UploadConflictStrategy,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +175,23 @@ pub struct AuditEvent {
     pub action: String,
     pub object_id: Option<String>,
     pub detail: Option<String>,
+    pub client_ip: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferMonthlyCounts {
+    pub month: String,
+    pub download: u64,
+    pub zip_download: u64,
+    pub preview: u64,
+}
+
+impl TransferMonthlyCounts {
+    pub fn total(&self) -> u64 {
+        self.download
+            .saturating_add(self.zip_download)
+            .saturating_add(self.preview)
+    }
 }
 
 fn token_hash(token: &str) -> String {
@@ -333,6 +351,42 @@ CREATE INDEX IF NOT EXISTS idx_transfer_leases_exp
         )?;
         tx.pragma_update(None, "user_version", 7)?;
     }
+    if version < 8 {
+        let has_client_ip: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('audit') WHERE name='client_ip')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_client_ip {
+            tx.execute("ALTER TABLE audit ADD COLUMN client_ip TEXT", [])?;
+        }
+        tx.execute_batch(
+            r#"
+CREATE INDEX IF NOT EXISTS idx_audit_client_ip
+    ON audit(client_ip) WHERE client_ip IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS transfer_monthly_counts(
+    month TEXT NOT NULL
+        CHECK(month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+              AND substr(month, 6, 2) BETWEEN '01' AND '12'),
+    action TEXT NOT NULL
+        CHECK(action IN ('download', 'zip_download', 'preview')),
+    count INTEGER NOT NULL DEFAULT 0 CHECK(count >= 0),
+    PRIMARY KEY(month, action)
+);
+
+CREATE TABLE IF NOT EXISTS transfer_statistics(
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    started_at TEXT NOT NULL
+);
+"#,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO transfer_statistics(singleton,started_at) VALUES(1,?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        tx.pragma_update(None, "user_version", 8)?;
+    }
     tx.commit()
 }
 
@@ -340,6 +394,39 @@ fn transfer_deadlines() -> (String, String) {
     let now = Utc::now();
     let expires = now + Duration::seconds(TRANSFER_SESSION_TTL_SECONDS);
     (now.to_rfc3339(), expires.to_rfc3339())
+}
+
+fn current_utc_month() -> String {
+    Utc::now().format("%Y-%m").to_string()
+}
+
+fn valid_utc_month(month: &str) -> bool {
+    let bytes = month.as_bytes();
+    if !(bytes.len() == 7
+        && bytes[4] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..].iter().all(u8::is_ascii_digit))
+    {
+        return false;
+    }
+    let numeric_month = (bytes[5] - b'0') * 10 + (bytes[6] - b'0');
+    (1..=12).contains(&numeric_month)
+}
+
+fn increment_transfer_monthly_count(
+    transaction: &Transaction<'_>,
+    month: &str,
+    action: &str,
+) -> rusqlite::Result<()> {
+    if !matches!(action, "download" | "zip_download" | "preview") {
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT INTO transfer_monthly_counts(month,action,count) VALUES(?1,?2,1)
+         ON CONFLICT(month,action) DO UPDATE SET count=count+1",
+        params![month, action],
+    )?;
+    Ok(())
 }
 
 fn cleanup_transfer_state(transaction: &Transaction<'_>, now: &str) -> rusqlite::Result<()> {
@@ -644,17 +731,18 @@ impl Database {
             password_hash: r.get(11)?,
             upload_conflict_strategy: UploadConflictStrategy::parse(&r.get::<_, String>(12)?)
                 .ok_or(rusqlite::Error::InvalidQuery)?,
+            created_at: r.get(13)?,
         })
     }
     pub fn share_by_token(&self, token: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy FROM shares WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
+        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy,created_at FROM shares WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
     }
     pub fn share_by_alias(&self, alias: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy FROM shares WHERE alias=?1",[alias],Self::map_share).optional()
+        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy,created_at FROM shares WHERE alias=?1",[alias],Self::map_share).optional()
     }
     pub fn list_shares(&self) -> rusqlite::Result<Vec<Share>> {
         let c = self.conn();
-        let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy FROM shares ORDER BY id DESC")?;
+        let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy,created_at FROM shares ORDER BY id DESC")?;
         let shares = s
             .query_map([], Self::map_share)?
             .filter_map(Result::ok)
@@ -910,7 +998,7 @@ impl Database {
         cleanup_transfer_state(&transaction, &now)?;
         let lease = transaction
             .query_row(
-                "SELECT grants.id,grants.share_id,grants.counted
+                "SELECT grants.id,grants.share_id,grants.counted,grants.action
                  FROM public_transfer_leases leases
                  JOIN public_transfer_grants grants ON grants.id=leases.grant_id
                  WHERE leases.token_hash=?1 AND leases.expires_at>?2 AND grants.expires_at>?2",
@@ -920,11 +1008,12 @@ impl Database {
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)? != 0,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((grant_id, share_id, already_counted)) = lease else {
+        let Some((grant_id, share_id, already_counted, action)) = lease else {
             transaction.commit()?;
             return Ok(TransferLeaseCompleteOutcome::NotFound);
         };
@@ -947,6 +1036,8 @@ impl Database {
             {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
             }
+            let month = now.get(..7).ok_or(rusqlite::Error::InvalidQuery)?;
+            increment_transfer_monthly_count(&transaction, month, &action)?;
             TransferLeaseCompleteOutcome::Counted
         };
         transaction.execute(
@@ -1119,12 +1210,83 @@ impl Database {
         object: Option<&str>,
         detail: Option<&str>,
     ) -> rusqlite::Result<()> {
+        self.audit_with_client_ip(actor, action, object, detail, None)
+    }
+    pub fn audit_with_client_ip(
+        &self,
+        actor: &str,
+        action: &str,
+        object: Option<&str>,
+        detail: Option<&str>,
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<()> {
         self.conn().execute(
-            "INSERT INTO audit(occurred_at,actor,action,object_id,detail) VALUES(?1,?2,?3,?4,?5)",
-            params![Utc::now().to_rfc3339(), actor, action, object, detail],
+            "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                Utc::now().to_rfc3339(),
+                actor,
+                action,
+                object,
+                detail,
+                client_ip
+            ],
         )?;
+        // Client IP retention is SQLite-only. Never mirror it into tracing/journald.
         tracing::info!(target: "vaultlink::audit", actor, action, object_id = object.unwrap_or(""), detail = detail.unwrap_or(""), "audit event");
         Ok(())
+    }
+    pub fn count_audit_client_ips(&self) -> rusqlite::Result<u64> {
+        self.conn().query_row(
+            "SELECT COUNT(*) FROM audit WHERE client_ip IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+    }
+    pub fn delete_audit_client_ips(&self) -> rusqlite::Result<usize> {
+        self.conn().execute(
+            "UPDATE audit SET client_ip=NULL WHERE client_ip IS NOT NULL",
+            [],
+        )
+    }
+    pub fn transfer_statistics_started_at(&self) -> rusqlite::Result<String> {
+        self.conn().query_row(
+            "SELECT started_at FROM transfer_statistics WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+    }
+    pub fn transfer_monthly_counts(&self, month: &str) -> rusqlite::Result<TransferMonthlyCounts> {
+        if !valid_utc_month(month) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "month must use UTC YYYY-MM".into(),
+            ));
+        }
+        let connection = self.conn();
+        let mut statement = connection.prepare(
+            "SELECT action,count FROM transfer_monthly_counts WHERE month=?1 ORDER BY action",
+        )?;
+        let mut counts = TransferMonthlyCounts {
+            month: month.to_string(),
+            download: 0,
+            zip_download: 0,
+            preview: 0,
+        };
+        for row in statement.query_map([month], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })? {
+            let (action, count) = row?;
+            match action.as_str() {
+                "download" => counts.download = count,
+                "zip_download" => counts.zip_download = count,
+                "preview" => counts.preview = count,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            }
+        }
+        Ok(counts)
+    }
+    pub fn current_transfer_monthly_counts(&self) -> rusqlite::Result<TransferMonthlyCounts> {
+        self.transfer_monthly_counts(&current_utc_month())
     }
     pub fn runtime_settings(&self) -> rusqlite::Result<Vec<(String, String)>> {
         let c = self.conn();
@@ -1164,7 +1326,7 @@ impl Database {
         let c = self.conn();
         if let Some(action) = action {
             let mut statement = c.prepare(
-                "SELECT occurred_at,actor,action,object_id,detail FROM audit WHERE action=?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
+                "SELECT occurred_at,actor,action,object_id,detail,client_ip FROM audit WHERE action=?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
             )?;
             let events = statement
                 .query_map(params![action, limit as i64, offset as i64], |row| {
@@ -1174,13 +1336,14 @@ impl Database {
                         action: row.get(2)?,
                         object_id: row.get(3)?,
                         detail: row.get(4)?,
+                        client_ip: row.get(5)?,
                     })
                 })?
                 .collect();
             events
         } else {
             let mut statement = c.prepare(
-                "SELECT occurred_at,actor,action,object_id,detail FROM audit ORDER BY id DESC LIMIT ?1 OFFSET ?2",
+                "SELECT occurred_at,actor,action,object_id,detail,client_ip FROM audit ORDER BY id DESC LIMIT ?1 OFFSET ?2",
             )?;
             let events = statement
                 .query_map(params![limit as i64, offset as i64], |row| {
@@ -1190,6 +1353,7 @@ impl Database {
                         action: row.get(2)?,
                         object_id: row.get(3)?,
                         detail: row.get(4)?,
+                        client_ip: row.get(5)?,
                     })
                 })?
                 .collect();
@@ -1363,6 +1527,36 @@ mod tests {
     }
 
     #[test]
+    fn audit_client_ips_are_optional_listed_and_purgeable_without_deleting_events() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .audit("admin", "settings_updated", None, None)
+            .unwrap();
+        database
+            .audit_with_client_ip(
+                "public",
+                "share_unlock_failed",
+                Some("7"),
+                Some("rate limited"),
+                Some("203.0.113.24"),
+            )
+            .unwrap();
+
+        assert_eq!(database.count_audit_client_ips().unwrap(), 1);
+        let events = database.list_audit(None, 10, 0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].client_ip.as_deref(), Some("203.0.113.24"));
+        assert!(events[1].client_ip.is_none());
+
+        assert_eq!(database.delete_audit_client_ips().unwrap(), 1);
+        assert_eq!(database.count_audit_client_ips().unwrap(), 0);
+        assert_eq!(database.delete_audit_client_ips().unwrap(), 0);
+        let events = database.list_audit(None, 10, 0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.client_ip.is_none()));
+    }
+
+    #[test]
     fn initial_admin_creation_is_atomic() {
         let database = Database::open(":memory:").unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
@@ -1519,6 +1713,7 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
         let share = database.share_by_token("share-token").unwrap().unwrap();
         assert_eq!(share.download_count, 3);
         assert_eq!(share.max_downloads, Some(7));
+        assert_eq!(share.created_at, "2026-01-01T00:00:00Z");
         assert!(share.password_hash.is_none());
         assert_eq!(
             share.upload_conflict_strategy,
@@ -1554,6 +1749,7 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             connection
                 .execute_batch(
                     "CREATE TABLE shares(id INTEGER PRIMARY KEY, marker TEXT NOT NULL);
+                     CREATE TABLE audit(id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object_id TEXT, detail TEXT);
                      INSERT INTO shares VALUES(7, 'preserved');
                      PRAGMA user_version=6;",
                 )
@@ -1565,7 +1761,7 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             connection
                 .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
                 .unwrap(),
-            7
+            SCHEMA_VERSION
         );
         assert_eq!(
             connection
@@ -1585,6 +1781,78 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
                 )
                 .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn migrates_v7_audit_and_initializes_persistent_transfer_statistics() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v7.sqlite");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE audit(
+                        id INTEGER PRIMARY KEY,
+                        occurred_at TEXT NOT NULL,
+                        actor TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        object_id TEXT,
+                        detail TEXT
+                     );
+                     INSERT INTO audit VALUES(
+                        1,'2026-01-01T00:00:00Z','admin','share_created','1','download_only'
+                     );
+                     PRAGMA user_version=7;",
+                )
+                .unwrap();
+        }
+
+        let database = Database::open(&path).unwrap();
+        assert_eq!(
+            database
+                .conn()
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let event = database.list_audit(None, 10, 0).unwrap().remove(0);
+        assert_eq!(event.action, "share_created");
+        assert!(event.client_ip.is_none());
+        let started_at = database.transfer_statistics_started_at().unwrap();
+        DateTime::parse_from_rfc3339(&started_at).unwrap();
+        assert_eq!(
+            database
+                .conn()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name IN ('transfer_monthly_counts','transfer_statistics')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert!(database
+            .conn()
+            .execute(
+                "INSERT INTO transfer_monthly_counts(month,action,count) VALUES('2026-13','download',1)",
+                [],
+            )
+            .is_err());
+        assert!(database
+            .conn()
+            .execute(
+                "INSERT INTO transfer_monthly_counts(month,action,count) VALUES('2026-07','upload',1)",
+                [],
+            )
+            .is_err());
+        drop(database);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened.transfer_statistics_started_at().unwrap(),
+            started_at
         );
     }
 
@@ -1713,6 +1981,11 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             .unwrap();
 
         assert_eq!(
+            database.current_transfer_monthly_counts().unwrap().total(),
+            0
+        );
+
+        assert_eq!(
             database
                 .check_transfer_availability("client", share_id, "file.bin", "download")
                 .unwrap(),
@@ -1763,8 +2036,16 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             1
         );
         assert_eq!(
+            database.current_transfer_monthly_counts().unwrap().download,
+            1
+        );
+        assert_eq!(
             database.complete_transfer_lease("lease-two").unwrap(),
             TransferLeaseCompleteOutcome::AlreadyCounted
+        );
+        assert_eq!(
+            database.current_transfer_monthly_counts().unwrap().download,
+            1
         );
         assert_eq!(
             database
@@ -1810,11 +2091,122 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             .unwrap();
         assert_eq!(resumed_expiry, counted_expiry);
         assert_eq!(
+            database.complete_transfer_lease("resume").unwrap(),
+            TransferLeaseCompleteOutcome::AlreadyCounted
+        );
+        assert_eq!(
+            database.current_transfer_monthly_counts().unwrap().download,
+            1
+        );
+        assert_eq!(
             database
                 .begin_transfer_lease("client", "new-resource", share_id, "other.bin", "download")
                 .unwrap(),
             TransferLeaseBeginOutcome::LimitReached
         );
+    }
+
+    #[test]
+    fn completed_transfers_increment_each_supported_monthly_action() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = database
+            .create_share(
+                "share",
+                None,
+                "folder",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+
+        for (index, action) in ["download", "zip_download", "preview"]
+            .into_iter()
+            .enumerate()
+        {
+            let session = format!("client-{index}");
+            let lease = format!("lease-{index}");
+            let resource = format!("resource-{index}");
+            assert_eq!(
+                database
+                    .begin_transfer_lease(&session, &lease, share_id, &resource, action)
+                    .unwrap(),
+                TransferLeaseBeginOutcome::NewLease
+            );
+            assert_eq!(
+                database.complete_transfer_lease(&lease).unwrap(),
+                TransferLeaseCompleteOutcome::Counted
+            );
+        }
+
+        let counts = database.current_transfer_monthly_counts().unwrap();
+        assert_eq!(counts.month, current_utc_month());
+        assert_eq!(counts.download, 1);
+        assert_eq!(counts.zip_download, 1);
+        assert_eq!(counts.preview, 1);
+        assert_eq!(counts.total(), 3);
+        assert_eq!(
+            database.transfer_monthly_counts("2000-01").unwrap().total(),
+            0
+        );
+        assert!(database.transfer_monthly_counts("2026-00").is_err());
+        assert!(database.transfer_monthly_counts("2026-1").is_err());
+    }
+
+    #[test]
+    fn monthly_count_failure_rolls_back_the_counted_transfer() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = database
+            .create_share(
+                "share",
+                None,
+                "file.bin",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .begin_transfer_lease("client", "lease", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferLeaseBeginOutcome::NewLease
+        );
+        database
+            .conn()
+            .execute("DROP TABLE transfer_monthly_counts", [])
+            .unwrap();
+
+        assert!(database.complete_transfer_lease("lease").is_err());
+        assert_eq!(
+            database
+                .share_by_token("share")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            0
+        );
+        let counted: i64 = database
+            .conn()
+            .query_row(
+                "SELECT counted FROM public_transfer_grants WHERE share_id=?1",
+                [share_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(counted, 0);
     }
 
     #[test]
@@ -1857,6 +2249,10 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
                 .begin_transfer_lease("other", "replacement", share_id, "file.bin", "download")
                 .unwrap(),
             TransferLeaseBeginOutcome::NewLease
+        );
+        assert_eq!(
+            database.current_transfer_monthly_counts().unwrap().total(),
+            0
         );
     }
 

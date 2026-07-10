@@ -28,6 +28,7 @@ share_password_min_length = 12
 share_password_max_bytes = 256
 share_unlock_minutes = 60
 share_password_attempts = 5
+audit_client_ip_enabled = false
 
 [reverse_proxy]
 enabled = true
