@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 — 2026-07-10
+
+- Added admin-only directory creation and no-clobber file/directory renaming to the browser and session API.
+- Added permanent recursive deletion with exact-name confirmation for non-empty directories, immediate tombstoning, bounded background cleanup, and restart recovery.
+- Kept share paths consistent across renames and automatically deactivated active shares below deleted paths.
+- Serialized storage mutations with share creation and upload publication, added audit events, and expanded Windows/Linux, database, UI, API, and cleanup coverage.
+- Added filename/private-namespace and file-mutation/share-subtree fuzz coverage, executed as eight parallel targets on the self-hosted runner.
+
 ## 0.3.1 — 2026-07-10
 
 - Fixed UTF-8 mojibake in the admin and setup interfaces so German labels, punctuation, and icons render correctly.

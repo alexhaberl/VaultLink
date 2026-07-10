@@ -40,6 +40,7 @@ use crate::{
         TransferAvailabilityOutcome, TransferLeaseBeginOutcome, TransferLeaseCompleteOutcome,
         UploadConflictStrategy,
     },
+    file_ops,
     http_auth::{
         audit, clear_session_cookie, commit_runtime_settings, csrf, database, make_session_cookie,
         make_transfer_cookie, make_unlock_cookie, redirect_with_cookie, runtime_settings, session,
@@ -97,6 +98,12 @@ pub fn router(state: AppState) -> Router {
         .route("/mfa", get(mfa_page).post(mfa))
         .route("/logout", post(logout))
         .route("/admin", get(admin_browser))
+        .route("/admin/files/directories", post(create_directory_ui))
+        .route("/admin/files/rename", post(rename_file_ui))
+        .route(
+            "/admin/files/delete",
+            get(delete_file_confirmation).post(delete_file_ui),
+        )
         .route("/admin/preview", get(admin_preview))
         .route(
             "/admin/preview/raw",
@@ -904,7 +911,195 @@ pub(crate) struct BrowseQuery {
     page: Option<usize>,
     q: Option<String>,
     upload: Option<String>,
+    notice: Option<String>,
 }
+
+#[derive(Deserialize)]
+struct CreateDirectoryForm {
+    csrf: String,
+    parent: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RenameFileForm {
+    csrf: String,
+    path: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteFileQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteFileForm {
+    csrf: String,
+    path: String,
+    confirm_name: Option<String>,
+}
+
+async fn create_directory_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateDirectoryForm>,
+) -> Result<Redirect> {
+    let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&admin, &form.csrf)?;
+    let result = file_ops::create_directory(&state, &form.parent, &form.name)
+        .await
+        .map_err(file_operation_app_error)?;
+    audit(
+        &state,
+        admin.username,
+        "directory_created",
+        Some(result.path),
+        None,
+    )
+    .await;
+    Ok(Redirect::to(&browser_redirect(
+        &form.parent,
+        "directory_created",
+    )))
+}
+
+async fn rename_file_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RenameFileForm>,
+) -> Result<Redirect> {
+    let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&admin, &form.csrf)?;
+    let old_path = form.path.clone();
+    let parent = parent_path(&form.path).unwrap_or_default();
+    let result = file_ops::rename(&state, &form.path, &form.name)
+        .await
+        .map_err(file_operation_app_error)?;
+    audit(
+        &state,
+        admin.username,
+        "path_renamed",
+        Some(result.path),
+        Some(format!(
+            "old_path={old_path};updated_shares={}",
+            result.updated_shares
+        )),
+    )
+    .await;
+    Ok(Redirect::to(&browser_redirect(&parent, "path_renamed")))
+}
+
+async fn delete_file_confirmation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DeleteFileQuery>,
+) -> Result<Html<String>> {
+    let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let inspection = file_ops::inspect_delete(&state, &query.path)
+        .await
+        .map_err(file_operation_app_error)?;
+    let kind = if inspection.status.kind == crate::secure_fs::EntryKind::Directory {
+        "Ordner"
+    } else {
+        "Datei"
+    };
+    let confirmation = if inspection.status.directory_non_empty {
+        format!(
+            r#"<div class="form-card"><p class="bad"><strong>Warnung:</strong> Dieser Ordner ist nicht leer. Sein gesamter Inhalt wird permanent gelöscht.</p><label>Zur Bestätigung den Ordnernamen <code>{}</code> eingeben<input name="confirm_name" autocomplete="off" required></label></div>"#,
+            esc(&inspection.name)
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        r#"<section><h1>{kind} permanent löschen?</h1><p><code>/{}</code></p><p class="bad">Diese Aktion kann nicht rückgängig gemacht werden.</p><p>Betroffene aktive Freigaben: <strong>{}</strong></p><form method="post" action="/admin/files/delete"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}">{}<div class="actions"><button class="danger">Permanent löschen</button><a class="button secondary" href="/admin?path={}">Abbrechen</a></div></form></section>"#,
+        esc(&inspection.path),
+        inspection.affected_shares,
+        esc(&admin.csrf_token),
+        esc(&inspection.path),
+        confirmation,
+        encoded(parent_path(&inspection.path).as_deref().unwrap_or("")),
+    );
+    Ok(Html(admin_page(
+        &state,
+        "Löschen bestätigen",
+        &body,
+        false,
+        &admin.csrf_token,
+    )))
+}
+
+async fn delete_file_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteFileForm>,
+) -> Result<Redirect> {
+    let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&admin, &form.csrf)?;
+    let parent = parent_path(&form.path).unwrap_or_default();
+    let result = file_ops::delete(&state, &form.path, form.confirm_name.as_deref())
+        .await
+        .map_err(file_operation_app_error)?;
+    let notice = if result.cleanup_pending {
+        "path_delete_queued"
+    } else {
+        "path_deleted"
+    };
+    audit(
+        &state,
+        admin.username,
+        "path_deleted",
+        Some(result.path),
+        Some(format!(
+            "kind={};deactivated_shares={};cleanup={}",
+            file_ops::kind_name(result.kind),
+            result.deactivated_shares,
+            if result.cleanup_pending {
+                "pending"
+            } else {
+                "complete"
+            }
+        )),
+    )
+    .await;
+    Ok(Redirect::to(&browser_redirect(&parent, notice)))
+}
+
+fn browser_redirect(path: &str, notice: &str) -> String {
+    format!("/admin?path={}&notice={notice}", encoded(path))
+}
+
+fn file_operation_app_error(error: file_ops::FileOperationError) -> AppError {
+    use file_ops::FileOperationError;
+    match error {
+        FileOperationError::InvalidPath => AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"),
+        FileOperationError::InvalidName => AppError(StatusCode::BAD_REQUEST, "Ungültiger Name"),
+        FileOperationError::NotFound => AppError(StatusCode::NOT_FOUND, "Ziel nicht gefunden"),
+        FileOperationError::Conflict => {
+            AppError(StatusCode::CONFLICT, "Zielname ist bereits vorhanden")
+        }
+        FileOperationError::ConfirmationRequired { .. } => AppError(
+            StatusCode::CONFLICT,
+            "Der exakte Ordnername muss bestätigt werden",
+        ),
+        FileOperationError::Database(_)
+        | FileOperationError::Io(_)
+        | FileOperationError::Join(_) => internal(error),
+    }
+}
+
+fn file_row_actions(path: &str, name: &str, csrf_token: &str) -> String {
+    format!(
+        r#"<a class="button secondary small" href="/admin/shares?path={}">Freigeben</a><details><summary class="button secondary small">Umbenennen</summary><form method="post" action="/admin/files/rename" class="row"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label>Neuer Name<input name="name" value="{}" maxlength="255" required></label><button class="small">Speichern</button></form></details><a class="button danger small" href="/admin/files/delete?path={}">Löschen</a>"#,
+        encoded(path),
+        esc(csrf_token),
+        esc(path),
+        esc(name),
+        encoded(path),
+    )
+}
+
 async fn admin_browser(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -936,6 +1131,7 @@ async fn admin_browser(
         for hit in hits {
             let target = encoded(&hit.relative_path);
             let name = esc(&hit.relative_path);
+            let actions = file_row_actions(&hit.relative_path, &hit.entry.name, &s.csrf_token);
             let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings) {
                 format!(
                     r#"<a class="button secondary small" href="/admin/preview?path={target}">Ansehen</a> "#
@@ -949,7 +1145,7 @@ async fn admin_browser(
                 .map(format_file_time)
                 .unwrap_or_else(|| "—".into());
             rows += &format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}<a class="button secondary small" href="/admin/shares?path={}">Freigeben</a></td></tr>"#,
+                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}{}</td></tr>"#,
                 if hit.entry.is_dir {
                     format!(r#"📁 <a href="/admin?path={target}">{name}</a>"#)
                 } else {
@@ -963,7 +1159,7 @@ async fn admin_browser(
                 },
                 modified,
                 preview,
-                target
+                actions
             );
         }
     } else {
@@ -983,6 +1179,7 @@ async fn admin_browser(
             let modified = entry.modified;
             let child = join_display(&rel, &name);
             let target = encoded(&child);
+            let actions = file_row_actions(&child, &name, &s.csrf_token);
             let display = if is_dir {
                 format!("📁 <a href=\"/admin?path={target}\">{}</a>", esc(&name))
             } else {
@@ -997,12 +1194,12 @@ async fn admin_browser(
             };
             let modified = modified.map(format_file_time).unwrap_or_else(|| "—".into());
             rows += &format!(
-                r#"<tr><td>{display}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}<a class="button secondary small" href="/admin/shares?path={}">Freigeben</a></td></tr>"#,
+                r#"<tr><td>{display}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}{}</td></tr>"#,
                 if is_dir { "Ordner" } else { "Datei" },
                 if is_dir { "—".into() } else { human(size) },
                 modified,
                 preview,
-                target
+                actions
             );
         }
         if truncated {
@@ -1047,7 +1244,16 @@ async fn admin_browser(
             )
         })
         .unwrap_or_default();
-    let body = format!(
+    let notice = match q.notice.as_deref() {
+        Some("directory_created") => "<p class=\"notice\">Ordner wurde erstellt.</p>",
+        Some("path_renamed") => "<p class=\"notice\">Eintrag wurde umbenannt.</p>",
+        Some("path_deleted") => "<p class=\"notice\">Eintrag wurde permanent gelöscht.</p>",
+        Some("path_delete_queued") => {
+            "<p class=\"notice\">Eintrag wurde entfernt; die Bereinigung läuft im Hintergrund.</p>"
+        }
+        _ => "",
+    };
+    let listing = format!(
         r#"<section class="hero"><div><p class="eyebrow">VaultLink Admin</p><h1>Dateibrowser</h1>{}<p class=muted>Relativer Pfad: /{}</p></div><div class="side-panel"><strong>Schnellaktion</strong><p class="muted">Aktuellen Ordner sicher freigeben oder per Suche eingrenzen.</p><p><a class="button" href="/admin/shares?path={}">Aktuellen Ordner freigeben</a></p></div></section><section>{}<form method="get" class="row"><input type="hidden" name="path" value="{}"><label>Suche<br><input name="q" value="{}" placeholder="Dateiname"></label><button>Suchen</button></form><table><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th></th></tr></thead><tbody>{}</tbody></table><p>{} {}</p><p class=muted>100 Einträge pro Seite. Suche ist limitiert und läuft innerhalb des aktuellen Ordners.</p></section>"#,
         breadcrumbs(&rel, "/admin"),
         esc(&rel),
@@ -1059,6 +1265,17 @@ async fn admin_browser(
         previous,
         next
     );
+    let create_form = format!(
+        r#"<form method="post" action="/admin/files/directories"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="parent" value="{}"><label>Neuer Ordner<input name="name" maxlength="255" required></label><button>Ordner erstellen</button></form>"#,
+        esc(&s.csrf_token),
+        esc(&rel),
+    );
+    let listing = listing.replacen(
+        "</div></section><section>",
+        &format!("{create_form}</div></section><section>"),
+        1,
+    );
+    let body = format!("{notice}{listing}");
     Ok(Html(admin_page(
         &state,
         "Dateien",
@@ -2346,6 +2563,7 @@ async fn create_share(
 ) -> Result<Redirect> {
     let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&s, &f.csrf)?;
+    let _storage_guard = state.storage_mutation.lock().await;
     let rel = path_security::validate_relative(&f.path)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?
         .to_string_lossy()
@@ -4326,6 +4544,7 @@ pub(crate) async fn upload(
         {
             pending.fail_next_directory_sync(kind);
         }
+        let _storage_guard = state.storage_mutation.lock().await;
         let publish_result = tokio::task::spawn_blocking(move || {
             if allow_replace {
                 pending.publish_replace(&publish_name)
@@ -5210,6 +5429,34 @@ mod tests {
         let browser_root = response_text(app.clone().oneshot(browser_root).await.unwrap()).await;
         assert!(browser_root.contains("Aktuellen Ordner freigeben"));
         assert!(browser_root.contains(r#"/admin/shares?path=."#));
+        assert!(browser_root.contains(r#"action="/admin/files/directories""#));
+        assert!(browser_root.contains(r#"action="/admin/files/rename""#));
+        assert!(browser_root.contains(r#"/admin/files/delete?path=file%2Etxt"#));
+
+        let mut create_folder = request(
+            Method::POST,
+            "/admin/files/directories",
+            "csrf=csrf-token&parent=&name=Neu",
+        );
+        create_folder
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        assert_eq!(
+            app.clone().oneshot(create_folder).await.unwrap().status(),
+            StatusCode::SEE_OTHER
+        );
+        assert!(root.path().join("Neu").is_dir());
+
+        std::fs::create_dir(root.path().join("tree")).unwrap();
+        std::fs::write(root.path().join("tree/child.txt"), b"child").unwrap();
+        let mut delete_confirmation = request(Method::GET, "/admin/files/delete?path=tree", "");
+        delete_confirmation
+            .headers_mut()
+            .insert(header::COOKIE, cookie.clone());
+        let delete_confirmation =
+            response_text(app.clone().oneshot(delete_confirmation).await.unwrap()).await;
+        assert!(delete_confirmation.contains(r#"name="confirm_name""#));
+        assert!(delete_confirmation.contains("tree"));
 
         let mut browser_folder = request(Method::GET, "/admin?path=uploads", "");
         browser_folder

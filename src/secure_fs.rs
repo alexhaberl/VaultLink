@@ -19,6 +19,9 @@ use crate::path_security;
 const UPLOAD_FRAGMENT_PREFIX: &str = ".vaultlink-";
 const UPLOAD_FRAGMENT_SUFFIX: &str = ".part";
 const UPLOAD_FRAGMENT_TOKEN_LENGTH: usize = 24;
+const DELETION_TOMBSTONE_PREFIX: &str = ".vaultlink-delete-";
+const DELETION_TOMBSTONE_SUFFIX: &str = ".tombstone";
+const DELETION_TOMBSTONE_TOKEN_LENGTH: usize = 24;
 
 #[cfg(target_os = "linux")]
 type ActiveUploadFragmentKey = (u64, u64);
@@ -65,6 +68,47 @@ pub fn is_upload_fragment_name(name: &OsStr) -> bool {
         && token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+pub fn deletion_tombstone_name() -> String {
+    format!(
+        "{DELETION_TOMBSTONE_PREFIX}{}{DELETION_TOMBSTONE_SUFFIX}",
+        crate::auth::random_token(18)
+    )
+}
+
+pub fn is_deletion_tombstone_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(token) = name
+        .strip_prefix(DELETION_TOMBSTONE_PREFIX)
+        .and_then(|name| name.strip_suffix(DELETION_TOMBSTONE_SUFFIX))
+    else {
+        return false;
+    };
+    token.len() == DELETION_TOMBSTONE_TOKEN_LENGTH
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntryStatus {
+    pub kind: EntryKind,
+    pub directory_non_empty: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct DeleteCommitOutcome {
+    pub cleanup_pending: bool,
+    pub tombstone_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -172,6 +216,8 @@ struct CleanupDirectory {
     directory: File,
     entries: std::fs::ReadDir,
     removed_in_pass: bool,
+    delete_all: bool,
+    remove_from: Option<(File, OsString)>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -179,10 +225,38 @@ struct CleanupDirectory {
     directory: PathBuf,
     entries: std::fs::ReadDir,
     removed_in_pass: bool,
+    delete_all: bool,
+    remove_from: Option<PathBuf>,
+}
+
+pub struct StagedRename {
+    original_path: String,
+    new_path: String,
+    kind: EntryKind,
+    committed: bool,
+    #[cfg(target_os = "linux")]
+    parent: File,
+    #[cfg(not(target_os = "linux"))]
+    parent: PathBuf,
+    original_name: String,
+    new_name: String,
+}
+
+pub struct StagedDelete {
+    original_path: String,
+    tombstone_path: String,
+    status: EntryStatus,
+    committed: bool,
+    #[cfg(target_os = "linux")]
+    parent: File,
+    #[cfg(not(target_os = "linux"))]
+    parent: PathBuf,
+    original_name: String,
+    tombstone_name: String,
 }
 
 fn visible_entry(name: OsString, metadata: std::fs::Metadata) -> DirectoryScanItem {
-    if is_upload_fragment_name(&name) {
+    if is_upload_fragment_name(&name) || is_deletion_tombstone_name(&name) {
         return DirectoryScanItem::Filtered;
     }
     let Some(display_name) = name.to_str() else {
@@ -301,7 +375,22 @@ impl UploadFragmentCleanup {
                         .directories
                         .pop()
                         .expect("cleanup directory disappeared");
-                    if completed.removed_in_pass {
+                    if completed.delete_all {
+                        let Some((parent, name)) = completed.remove_from else {
+                            batch.failed += 1;
+                            continue;
+                        };
+                        match linux::rmdir(&parent, &name) {
+                            Ok(()) => {
+                                batch.removed += 1;
+                                if let Some(parent) = self.directories.last_mut() {
+                                    parent.removed_in_pass = true;
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(_) => batch.failed += 1,
+                        }
+                    } else if completed.removed_in_pass {
                         match cleanup_directory_from_file(completed.directory) {
                             Ok(directory) => self.directories.push(directory),
                             Err(_) => batch.failed += 1,
@@ -334,17 +423,31 @@ impl UploadFragmentCleanup {
             if metadata.is_dir() {
                 if self.visited.insert((metadata.dev(), metadata.ino())) {
                     match cleanup_directory_from_file(child) {
-                        Ok(directory) => self.directories.push(directory),
+                        Ok(mut directory) => {
+                            let delete_all =
+                                current.delete_all || is_deletion_tombstone_name(&name);
+                            directory.delete_all = delete_all;
+                            if delete_all {
+                                directory.remove_from =
+                                    Some((current.directory.try_clone()?, name.clone()));
+                            }
+                            self.directories.push(directory);
+                        }
                         Err(_) => batch.failed += 1,
                     }
                 }
-            } else if metadata.is_file() && is_upload_fragment_name(&name) {
-                let active_key = (metadata.dev(), metadata.ino());
-                let active = active_upload_fragment_guard();
-                if active.contains(&active_key) {
-                    continue;
+            } else if current.delete_all
+                || (metadata.is_file() && is_upload_fragment_name(&name))
+                || is_deletion_tombstone_name(&name)
+            {
+                if !current.delete_all {
+                    let active_key = (metadata.dev(), metadata.ino());
+                    let active = active_upload_fragment_guard();
+                    if active.contains(&active_key) {
+                        continue;
+                    }
                 }
-                match linux::unlink(&current.directory, name.to_string_lossy().as_ref()) {
+                match linux::unlink(&current.directory, &name) {
                     Ok(()) => {
                         current.removed_in_pass = true;
                         batch.removed += 1;
@@ -378,7 +481,22 @@ impl UploadFragmentCleanup {
                         .directories
                         .pop()
                         .expect("cleanup directory disappeared");
-                    if completed.removed_in_pass {
+                    if completed.delete_all {
+                        let Some(path) = completed.remove_from else {
+                            batch.failed += 1;
+                            continue;
+                        };
+                        match std::fs::remove_dir(path) {
+                            Ok(()) => {
+                                batch.removed += 1;
+                                if let Some(parent) = self.directories.last_mut() {
+                                    parent.removed_in_pass = true;
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(_) => batch.failed += 1,
+                        }
+                    } else if completed.removed_in_pass {
                         match cleanup_directory_from_path(completed.directory) {
                             Ok(directory) => self.directories.push(directory),
                             Err(_) => batch.failed += 1,
@@ -398,28 +516,45 @@ impl UploadFragmentCleanup {
                 }
             };
             if metadata.is_dir() {
-                let canonical = match path.canonicalize() {
-                    Ok(canonical)
-                        if canonical == self.root || canonical.starts_with(&self.root) =>
-                    {
-                        canonical
-                    }
-                    Ok(_) => continue,
-                    Err(_) => {
-                        batch.failed += 1;
-                        continue;
+                let delete_all =
+                    current.delete_all || is_deletion_tombstone_name(&item.file_name());
+                let canonical = if delete_all {
+                    path.clone()
+                } else {
+                    match path.canonicalize() {
+                        Ok(canonical)
+                            if canonical == self.root || canonical.starts_with(&self.root) =>
+                        {
+                            canonical
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {
+                            batch.failed += 1;
+                            continue;
+                        }
                     }
                 };
                 if self.visited.insert(canonical.clone()) {
                     match cleanup_directory_from_path(canonical) {
-                        Ok(directory) => self.directories.push(directory),
+                        Ok(mut directory) => {
+                            directory.delete_all = delete_all;
+                            if delete_all {
+                                directory.remove_from = Some(path);
+                            }
+                            self.directories.push(directory);
+                        }
                         Err(_) => batch.failed += 1,
                     }
                 }
-            } else if metadata.is_file() && is_upload_fragment_name(&item.file_name()) {
-                let active = active_upload_fragment_guard();
-                if active.contains(&path) {
-                    continue;
+            } else if current.delete_all
+                || (metadata.is_file() && is_upload_fragment_name(&item.file_name()))
+                || is_deletion_tombstone_name(&item.file_name())
+            {
+                if !current.delete_all {
+                    let active = active_upload_fragment_guard();
+                    if active.contains(&path) {
+                        continue;
+                    }
                 }
                 match std::fs::remove_file(path) {
                     Ok(()) => {
@@ -505,6 +640,72 @@ impl SecureRoot {
         self.root.scan_directory(relative)
     }
 
+    pub fn entry_status(&self, relative: &str) -> io::Result<EntryStatus> {
+        let (parent, name) = split_parent_name(relative)?;
+        self.root.bind_directory(&parent)?.entry_status(&name)
+    }
+
+    pub fn create_directory(&self, parent: &str, name: &str) -> io::Result<String> {
+        let parent = normalized(parent)?;
+        let name = path_security::safe_admin_filename(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
+        self.root.bind_directory(&parent)?.create_directory(name)?;
+        Ok(join_relative(&parent, name))
+    }
+
+    pub fn stage_rename(&self, relative: &str, new_name: &str) -> io::Result<StagedRename> {
+        let (parent_path, original_name) = split_parent_name(relative)?;
+        let new_name = path_security::safe_admin_filename(new_name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid destination name"))?;
+        if original_name == new_name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "new name matches current name",
+            ));
+        }
+        let parent = self.root.bind_directory(&parent_path)?;
+        let kind = parent.entry_status(&original_name)?.kind;
+        parent.rename_noreplace(&original_name, new_name)?;
+        Ok(StagedRename {
+            original_path: join_relative(&parent_path, &original_name),
+            new_path: join_relative(&parent_path, new_name),
+            kind,
+            committed: false,
+            #[cfg(target_os = "linux")]
+            parent: parent.directory.try_clone()?,
+            #[cfg(not(target_os = "linux"))]
+            parent: parent.directory.clone(),
+            original_name,
+            new_name: new_name.to_string(),
+        })
+    }
+
+    pub fn stage_delete(&self, relative: &str) -> io::Result<StagedDelete> {
+        let (parent_path, original_name) = split_parent_name(relative)?;
+        let parent = self.root.bind_directory(&parent_path)?;
+        let status = parent.entry_status(&original_name)?;
+        let tombstone_name = loop {
+            let candidate = deletion_tombstone_name();
+            match parent.rename_noreplace(&original_name, &candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        Ok(StagedDelete {
+            original_path: join_relative(&parent_path, &original_name),
+            tombstone_path: join_relative(&parent_path, &tombstone_name),
+            status,
+            committed: false,
+            #[cfg(target_os = "linux")]
+            parent: parent.directory.try_clone()?,
+            #[cfg(not(target_os = "linux"))]
+            parent: parent.directory.clone(),
+            original_name,
+            tombstone_name,
+        })
+    }
+
     pub fn begin_upload(&self, directory: &str) -> io::Result<PendingUpload> {
         self.root.begin_upload(directory)
     }
@@ -513,6 +714,52 @@ impl SecureRoot {
     /// Uploads active in this process are registered and cannot be removed by it.
     pub fn start_upload_fragment_cleanup(&self) -> io::Result<UploadFragmentCleanup> {
         self.root.start_upload_fragment_cleanup()
+    }
+
+    pub fn start_deletion_cleanup(
+        &self,
+        tombstone_relative: &str,
+    ) -> io::Result<UploadFragmentCleanup> {
+        let (parent_path, tombstone_name) = split_parent_name_private(tombstone_relative)?;
+        if !is_deletion_tombstone_name(OsStr::new(&tombstone_name)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid deletion tombstone",
+            ));
+        }
+        let parent = self.root.bind_directory(&parent_path)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let directory = linux::openat2(
+                parent.directory.as_ref(),
+                &tombstone_name,
+                linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
+            )?;
+            let metadata = directory.metadata()?;
+            let mut cleanup = cleanup_directory_from_file(directory)?;
+            cleanup.delete_all = true;
+            cleanup.remove_from = Some((
+                parent.directory.as_ref().try_clone()?,
+                OsString::from(tombstone_name),
+            ));
+            return Ok(UploadFragmentCleanup {
+                directories: vec![cleanup],
+                visited: HashSet::from([(metadata.dev(), metadata.ino())]),
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let path = parent.directory.join(tombstone_name);
+            let mut cleanup = cleanup_directory_from_path(path.clone())?;
+            cleanup.delete_all = true;
+            cleanup.remove_from = Some(path.clone());
+            Ok(UploadFragmentCleanup {
+                directories: vec![cleanup],
+                visited: HashSet::from([path]),
+                root: self.display_root.clone(),
+            })
+        }
     }
 }
 
@@ -538,6 +785,116 @@ impl SecureDirectory {
                 ));
             }
             Ok(Self { directory })
+        }
+    }
+
+    fn entry_status(&self, name: &str) -> io::Result<EntryStatus> {
+        path_security::safe_admin_filename(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid entry name"))?;
+        #[cfg(target_os = "linux")]
+        {
+            let child = linux::openat2(
+                self.directory.as_ref(),
+                name,
+                linux::O_PATH | linux::O_NOFOLLOW,
+            )?;
+            let metadata = child.metadata()?;
+            let kind = if metadata.is_file() {
+                EntryKind::File
+            } else if metadata.is_dir() {
+                EntryKind::Directory
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "entry is not a regular file or directory",
+                ));
+            };
+            let directory_non_empty = if kind == EntryKind::Directory {
+                let directory = linux::openat2(
+                    self.directory.as_ref(),
+                    name,
+                    linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
+                )?;
+                directory_scan_from_file(directory)?
+                    .entries
+                    .next()
+                    .is_some()
+            } else {
+                false
+            };
+            return Ok(EntryStatus {
+                kind,
+                directory_non_empty,
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let path = self.directory.join(name);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            let kind = if metadata.is_file() {
+                EntryKind::File
+            } else if metadata.is_dir() {
+                EntryKind::Directory
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "entry is not a regular file or directory",
+                ));
+            };
+            let directory_non_empty =
+                kind == EntryKind::Directory && std::fs::read_dir(path)?.next().is_some();
+            Ok(EntryStatus {
+                kind,
+                directory_non_empty,
+            })
+        }
+    }
+
+    fn create_directory(&self, name: &str) -> io::Result<()> {
+        path_security::safe_admin_filename(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::mkdir(self.directory.as_ref(), name)?;
+            if let Err(error) = self.directory.sync_all() {
+                tracing::warn!(%error, "created directory but parent sync was uncertain");
+            }
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::fs::create_dir(self.directory.join(name))?;
+            if let Err(error) = sync_directory_path(&self.directory) {
+                tracing::warn!(%error, "created directory but parent sync was uncertain");
+            }
+            Ok(())
+        }
+    }
+
+    fn rename_noreplace(&self, old: &str, new: &str) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::rename_noreplace(self.directory.as_ref(), old, new)?;
+            if let Err(error) = self.directory.sync_all() {
+                tracing::warn!(%error, "renamed entry but parent sync was uncertain");
+            }
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let old = self.directory.join(old);
+            let new = self.directory.join(new);
+            if new.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination already exists",
+                ));
+            }
+            std::fs::rename(old, new)?;
+            if let Err(error) = sync_directory_path(&self.directory) {
+                tracing::warn!(%error, "renamed entry but parent sync was uncertain");
+            }
+            Ok(())
         }
     }
 
@@ -747,6 +1104,8 @@ fn cleanup_directory_from_file(directory: File) -> io::Result<CleanupDirectory> 
         directory,
         entries,
         removed_in_pass: false,
+        delete_all: false,
+        remove_from: None,
     })
 }
 
@@ -756,6 +1115,8 @@ fn cleanup_directory_from_path(directory: PathBuf) -> io::Result<CleanupDirector
         entries: std::fs::read_dir(&directory)?,
         directory,
         removed_in_pass: false,
+        delete_all: false,
+        remove_from: None,
     })
 }
 
@@ -765,19 +1126,195 @@ fn validated(raw: &str) -> io::Result<String> {
     Ok(if value.is_empty() { ".".into() } else { value })
 }
 
+fn normalized(raw: &str) -> io::Result<String> {
+    let path = path_security::validate_relative(raw).map_err(path_error)?;
+    Ok(path.to_string_lossy().replace('\\', "/"))
+}
+
+fn split_parent_name(relative: &str) -> io::Result<(String, String)> {
+    let relative = normalized(relative)?;
+    if relative.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage root cannot be mutated",
+        ));
+    }
+    let (parent, name) = relative
+        .rsplit_once('/')
+        .map_or(("", relative.as_str()), |(parent, name)| (parent, name));
+    path_security::safe_admin_filename(name).map_err(path_error)?;
+    Ok((parent.to_string(), name.to_string()))
+}
+
+fn split_parent_name_private(relative: &str) -> io::Result<(String, String)> {
+    let relative = normalized(relative)?;
+    if relative.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing entry name",
+        ));
+    }
+    let (parent, name) = relative
+        .rsplit_once('/')
+        .map_or(("", relative.as_str()), |(parent, name)| (parent, name));
+    path_security::safe_filename(name).map_err(path_error)?;
+    Ok((parent.to_string(), name.to_string()))
+}
+
+fn join_relative(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
 fn path_error(error: path_security::PathError) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
 }
 
 fn upload_destination_name(name: &str) -> io::Result<&str> {
-    let name = path_security::safe_filename(name).map_err(path_error)?;
-    if is_upload_fragment_name(OsStr::new(name)) {
-        return Err(io::Error::new(
+    path_security::safe_admin_filename(name).map_err(|_| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
-            "upload destination uses the private fragment namespace",
-        ));
+            "upload destination uses an invalid or private name",
+        )
+    })
+}
+
+impl StagedRename {
+    pub fn original_path(&self) -> &str {
+        &self.original_path
     }
-    Ok(name)
+
+    pub fn new_path(&self) -> &str {
+        &self.new_path
+    }
+
+    pub fn kind(&self) -> EntryKind {
+        self.kind
+    }
+
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+
+    fn rollback(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::rename_noreplace(&self.parent, &self.new_name, &self.original_name)?;
+            if let Err(error) = self.parent.sync_all() {
+                tracing::warn!(%error, "rolled back rename but parent sync was uncertain");
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::fs::rename(
+                self.parent.join(&self.new_name),
+                self.parent.join(&self.original_name),
+            )?;
+            if let Err(error) = sync_directory_path(&self.parent) {
+                tracing::warn!(%error, "rolled back rename but parent sync was uncertain");
+            }
+            Ok(())
+        }
+    }
+}
+
+impl Drop for StagedRename {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(error) = self.rollback() {
+                tracing::error!(%error, from = %self.new_path, to = %self.original_path, "could not roll back staged rename");
+            }
+        }
+    }
+}
+
+impl StagedDelete {
+    pub fn original_path(&self) -> &str {
+        &self.original_path
+    }
+
+    pub fn status(&self) -> &EntryStatus {
+        &self.status
+    }
+
+    pub fn commit(mut self) -> io::Result<DeleteCommitOutcome> {
+        if self.status.kind == EntryKind::Directory && self.status.directory_non_empty {
+            self.committed = true;
+            return Ok(DeleteCommitOutcome {
+                cleanup_pending: true,
+                tombstone_path: Some(self.tombstone_path.clone()),
+            });
+        }
+        self.committed = true;
+        #[cfg(target_os = "linux")]
+        let removal = match self.status.kind {
+            EntryKind::File => linux::unlink(&self.parent, OsStr::new(&self.tombstone_name)),
+            EntryKind::Directory => linux::rmdir(&self.parent, OsStr::new(&self.tombstone_name)),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let removal = {
+            let tombstone = self.parent.join(&self.tombstone_name);
+            match self.status.kind {
+                EntryKind::File => std::fs::remove_file(tombstone),
+                EntryKind::Directory => std::fs::remove_dir(tombstone),
+            }
+        };
+        if let Err(error) = removal {
+            tracing::warn!(%error, tombstone = %self.tombstone_path, "deletion tombstone cleanup deferred");
+            return Ok(DeleteCommitOutcome {
+                cleanup_pending: true,
+                tombstone_path: Some(self.tombstone_path.clone()),
+            });
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = self.parent.sync_all() {
+            tracing::warn!(%error, "removed deletion tombstone but parent sync was uncertain");
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Err(error) = sync_directory_path(&self.parent) {
+            tracing::warn!(%error, "removed deletion tombstone but parent sync was uncertain");
+        }
+        Ok(DeleteCommitOutcome {
+            cleanup_pending: false,
+            tombstone_path: None,
+        })
+    }
+
+    fn rollback(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::rename_noreplace(&self.parent, &self.tombstone_name, &self.original_name)?;
+            if let Err(error) = self.parent.sync_all() {
+                tracing::warn!(%error, "restored deletion target but parent sync was uncertain");
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::fs::rename(
+                self.parent.join(&self.tombstone_name),
+                self.parent.join(&self.original_name),
+            )?;
+            if let Err(error) = sync_directory_path(&self.parent) {
+                tracing::warn!(%error, "restored deletion target but parent sync was uncertain");
+            }
+            Ok(())
+        }
+    }
+}
+
+impl Drop for StagedDelete {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(error) = self.rollback() {
+                tracing::error!(%error, tombstone = %self.tombstone_path, original = %self.original_path, "could not roll back staged deletion");
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1043,6 +1580,7 @@ mod linux {
     const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
     const RESOLVE_BENEATH: u64 = 0x08;
     const RENAME_NOREPLACE: c_uint = 1;
+    const AT_REMOVEDIR: c_int = 0x200;
 
     #[repr(C)]
     struct OpenHow {
@@ -1061,6 +1599,7 @@ mod linux {
             flags: c_uint,
         ) -> c_int;
         fn unlinkat(dir: c_int, path: *const c_char, flags: c_int) -> c_int;
+        fn mkdirat(dir: c_int, path: *const c_char, mode: c_uint) -> c_int;
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1138,10 +1677,32 @@ mod linux {
         }
     }
 
-    pub fn unlink(directory: &File, name: &str) -> io::Result<()> {
+    pub fn unlink(directory: &File, name: impl AsRef<Path>) -> io::Result<()> {
         let name = c_path(name)?;
         // SAFETY: C string and descriptor are valid; flags=0 removes files only.
         let result = unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub fn rmdir(directory: &File, name: impl AsRef<Path>) -> io::Result<()> {
+        let name = c_path(name)?;
+        // SAFETY: C string and descriptor are valid; AT_REMOVEDIR refuses non-directories.
+        let result = unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), AT_REMOVEDIR) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub fn mkdir(directory: &File, name: impl AsRef<Path>) -> io::Result<()> {
+        let name = c_path(name)?;
+        // SAFETY: C string and descriptor are valid; mode is intentionally admin-private.
+        let result = unsafe { mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
         if result == 0 {
             Ok(())
         } else {
@@ -1205,6 +1766,68 @@ mod tests {
             pending.publish(&upload_fragment_name()).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn deletion_tombstone_filter_is_strict() {
+        let generated = deletion_tombstone_name();
+        assert!(is_deletion_tombstone_name(OsStr::new(&generated)));
+        for name in [
+            ".vaultlink-delete-short.tombstone",
+            ".vaultlink-delete-AAAAAAAAAAAAAAAAAAAAAAAA.part",
+            ".vaultlink-delete-AAAAAAAAAAAAAAAAAAAAAAA!.tombstone",
+            "vaultlink-delete-AAAAAAAAAAAAAAAAAAAAAAAA.tombstone",
+        ] {
+            assert!(!is_deletion_tombstone_name(OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn admin_mutations_create_rename_rollback_and_delete_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        assert_eq!(root.create_directory("", "docs").unwrap(), "docs");
+        std::fs::write(directory.path().join("docs/file.txt"), b"content").unwrap();
+
+        {
+            let staged = root.stage_rename("docs/file.txt", "draft.txt").unwrap();
+            assert_eq!(staged.kind(), EntryKind::File);
+            assert!(directory.path().join("docs/draft.txt").exists());
+        }
+        assert!(directory.path().join("docs/file.txt").exists());
+
+        root.stage_rename("docs/file.txt", "final.txt")
+            .unwrap()
+            .commit();
+        assert!(directory.path().join("docs/final.txt").exists());
+        assert!(root.stage_rename("docs/final.txt", "final.txt").is_err());
+        assert!(root
+            .create_directory("", &deletion_tombstone_name())
+            .is_err());
+
+        let staged = root.stage_delete("docs").unwrap();
+        assert_eq!(
+            staged.status(),
+            &EntryStatus {
+                kind: EntryKind::Directory,
+                directory_non_empty: true,
+            }
+        );
+        let outcome = staged.commit().unwrap();
+        assert!(outcome.cleanup_pending);
+        assert!(!directory.path().join("docs").exists());
+        let tombstone = outcome.tombstone_path.unwrap();
+        let mut cleanup = root.start_deletion_cleanup(&tombstone).unwrap();
+        loop {
+            let batch = cleanup.run_batch(1).unwrap();
+            if batch.complete {
+                break;
+            }
+        }
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-`0.3.1` is a private release. Security fixes are made only on the latest private release.
+`0.3.2` is a private release. Security fixes are made only on the latest private release.
 
 ## Build and release security
 

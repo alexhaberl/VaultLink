@@ -661,6 +661,82 @@ impl Database {
             .collect();
         Ok(shares)
     }
+    pub fn count_active_shares_for_path(
+        &self,
+        path: &str,
+        is_directory: bool,
+    ) -> rusqlite::Result<usize> {
+        let connection = self.conn();
+        let mut statement =
+            connection.prepare("SELECT relative_path FROM shares WHERE active=1")?;
+        let mut count = 0usize;
+        for relative_path in statement.query_map([], |row| row.get::<_, String>(0))? {
+            if share_path_matches(&relative_path?, path, is_directory) {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+    pub fn rename_share_paths(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        is_directory: bool,
+    ) -> rusqlite::Result<usize> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updates = {
+            let mut statement = transaction.prepare("SELECT id,relative_path FROM shares")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut updates = Vec::new();
+            for row in rows {
+                let (id, path) = row?;
+                if let Some(rewritten) = rewrite_share_path(&path, old_path, new_path, is_directory)
+                {
+                    updates.push((id, rewritten));
+                }
+            }
+            updates
+        };
+        for (id, path) in &updates {
+            transaction.execute(
+                "UPDATE shares SET relative_path=?2 WHERE id=?1",
+                params![id, path],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(updates.len())
+    }
+    pub fn deactivate_shares_for_path(
+        &self,
+        path: &str,
+        is_directory: bool,
+    ) -> rusqlite::Result<usize> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids = {
+            let mut statement =
+                transaction.prepare("SELECT id,relative_path FROM shares WHERE active=1")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let (id, relative_path) = row?;
+                if share_path_matches(&relative_path, path, is_directory) {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+        for id in &ids {
+            transaction.execute("UPDATE shares SET active=0 WHERE id=?1", [id])?;
+        }
+        transaction.commit()?;
+        Ok(ids.len())
+    }
     pub fn set_share_active(&self, id: i64, active: bool) -> rusqlite::Result<()> {
         self.conn().execute(
             "UPDATE shares SET active=?2 WHERE id=?1",
@@ -1122,9 +1198,93 @@ impl Database {
     }
 }
 
+fn share_path_matches(candidate: &str, target: &str, is_directory: bool) -> bool {
+    candidate == target
+        || (is_directory
+            && candidate
+                .strip_prefix(target)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+pub fn rewrite_share_path(
+    candidate: &str,
+    target: &str,
+    replacement: &str,
+    is_directory: bool,
+) -> Option<String> {
+    if candidate == target {
+        return Some(replacement.to_string());
+    }
+    if !is_directory {
+        return None;
+    }
+    candidate
+        .strip_prefix(target)
+        .filter(|suffix| suffix.starts_with('/'))
+        .map(|suffix| format!("{replacement}{suffix}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_mutations_update_only_exact_share_subtrees() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let mut ids = Vec::new();
+        for (index, path) in ["foo", "foo/child.txt", "foobar", "other"]
+            .into_iter()
+            .enumerate()
+        {
+            ids.push(
+                database
+                    .create_share(
+                        &format!("token-{index}"),
+                        None,
+                        path,
+                        path == "foo",
+                        &Permission::DownloadOnly,
+                        None,
+                        None,
+                        None,
+                        1,
+                        None,
+                        &UploadConflictStrategy::Reject,
+                    )
+                    .unwrap(),
+            );
+        }
+        database.set_share_active(ids[1], false).unwrap();
+        assert_eq!(
+            database.rename_share_paths("foo", "renamed", true).unwrap(),
+            2
+        );
+        let shares = database.list_shares().unwrap();
+        assert!(shares.iter().any(|share| share.relative_path == "renamed"));
+        assert!(shares
+            .iter()
+            .any(|share| share.relative_path == "renamed/child.txt" && !share.active));
+        assert!(shares.iter().any(|share| share.relative_path == "foobar"));
+        assert_eq!(
+            database
+                .count_active_shares_for_path("renamed", true)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .deactivate_shares_for_path("renamed", true)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .count_active_shares_for_path("renamed", true)
+                .unwrap(),
+            0
+        );
+    }
+
     #[test]
     fn download_limit_is_atomic() {
         let d = Database::open(":memory:").unwrap();

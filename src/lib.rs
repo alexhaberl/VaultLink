@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod file_ops;
 pub mod http_auth;
 pub mod multipart_guard;
 pub mod path_security;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub limiter: auth::LoginLimiter,
     pub share_limiter: auth::LoginLimiter,
     pub runtime: Arc<RwLock<RuntimeSettings>>,
+    pub storage_mutation: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     pub upload_directory_sync_failure: Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>,
 }
@@ -62,6 +64,7 @@ impl AppState {
             db,
             secure_root,
             runtime: Arc::new(RwLock::new(runtime)),
+            storage_mutation: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             upload_directory_sync_failure: Arc::new(std::sync::Mutex::new(None)),
         })

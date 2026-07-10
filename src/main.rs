@@ -139,7 +139,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn start_upload_fragment_cleanup(state: &AppState) {
     const CLEANUP_BATCH_ENTRIES: usize = 4096;
 
-    let mut cleanup = match state.secure_root.start_upload_fragment_cleanup() {
+    let secure_root = state.secure_root.clone();
+    let mut cleanup = match secure_root.start_upload_fragment_cleanup() {
         Ok(cleanup) => cleanup,
         Err(error) => {
             tracing::warn!(%error, "could not start stale upload fragment cleanup");
@@ -183,7 +184,30 @@ fn start_upload_fragment_cleanup(state: &AppState) {
                         "stale upload fragment cleanup completed"
                     );
                 }
-                return;
+                if failed == 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let restart_root = secure_root.clone();
+                cleanup = match tokio::task::spawn_blocking(move || {
+                    restart_root.start_upload_fragment_cleanup()
+                })
+                .await
+                {
+                    Ok(Ok(cleanup)) => cleanup,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "could not restart stale storage cleanup");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "stale storage cleanup restart failed");
+                        return;
+                    }
+                };
+                scanned = 0;
+                removed = 0;
+                failed = 0;
+                continue;
             }
             tokio::task::yield_now().await;
         }

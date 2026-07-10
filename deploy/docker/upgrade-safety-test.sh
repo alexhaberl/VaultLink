@@ -157,7 +157,7 @@ write_binary() {
     readiness_connect_to=${4:--}
     readiness_insecure=${5:-0}
     if [[ "$marker" == candidate ]]; then
-        version=0.3.1
+        version=0.3.2
     else
         version=0.3.0
     fi
@@ -254,10 +254,10 @@ class Handler(BaseHTTPRequestHandler):
             if count <= ready_after:
                 self.respond(503, '{"ok":false}')
                 return
-            self.respond(200, '{"ok":true,"version":"0.3.1"}')
+            self.respond(200, '{"ok":true,"version":"0.3.2"}')
             return
         if mode == "http500":
-            self.respond(500, '{"ok":false,"version":"0.3.1"}')
+            self.respond(500, '{"ok":false,"version":"0.3.2"}')
             return
         if mode == "wrong-version":
             self.respond(200, '{"ok":true,"version":"0.3.0"}')
@@ -267,19 +267,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if mode == "timeout":
             time.sleep(3)
-            self.respond(200, '{"ok":true,"version":"0.3.1"}')
+            self.respond(200, '{"ok":true,"version":"0.3.2"}')
             return
         if mode == "mutate-then-500":
             if count == 1:
                 with sqlite3.connect(database) as connection:
                     connection.execute("UPDATE marker SET value='candidate-write'")
                 (state_dir / "health-mutation.done").write_text("yes", encoding="utf-8")
-            self.respond(500, '{"ok":false,"version":"0.3.1"}')
+            self.respond(500, '{"ok":false,"version":"0.3.2"}')
             return
         if mode != "success":
             self.respond(500, '{"ok":false,"error":"unknown test mode"}')
             return
-        self.respond(200, '{"ok":true,"version":"0.3.1"}')
+        self.respond(200, '{"ok":true,"version":"0.3.2"}')
 
 
 server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
@@ -504,7 +504,7 @@ printf '%s\n' "$(id -un)" >"$TLS_CURL_CAPTURE_DIR/user"
 for argument do
     printf '%s\n' "$argument" >>"$TLS_CURL_CAPTURE_DIR/args"
 done
-printf '%s' '{"ok":true,"version":"0.3.1"}VAULTLINK_HTTP_STATUS:200'
+printf '%s' '{"ok":true,"version":"0.3.2"}VAULTLINK_HTTP_STATUS:200'
 SH
     chmod 0755 "$tls_mock_bin/curl"
 

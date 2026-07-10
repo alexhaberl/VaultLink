@@ -68,7 +68,7 @@ for pattern in /config.toml .env '.env.*' '*.sqlite*'; do
     fi
 done
 
-for target in path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy; do
+for target in path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy file_mutation_policy; do
     if ! grep -E -q "(^|[[:space:]])${target}([[:space:]]|$)" Makefile; then
         report "Makefile fuzz target list is missing $target"
     fi
@@ -82,8 +82,8 @@ if ! grep -F -q 'run: make fuzz-parallel' .github/workflows/fuzz.yml; then
     report "fuzz workflow must run all targets through the parallel Make target"
 fi
 
-if ! grep -E -q '^[[:space:]]+FUZZ_JOBS:[[:space:]]+7$' .github/workflows/fuzz.yml; then
-    report "fuzz workflow must run all seven targets concurrently"
+if ! grep -E -q '^[[:space:]]+FUZZ_JOBS:[[:space:]]+8$' .github/workflows/fuzz.yml; then
+    report "fuzz workflow must run all eight targets concurrently"
 fi
 
 if ! grep -E -q '^[[:space:]]+cancel-in-progress:[[:space:]]+true$' .github/workflows/fuzz.yml; then

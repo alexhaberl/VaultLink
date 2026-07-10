@@ -19,6 +19,7 @@ use crate::{
         AdminDeactivationOutcome, AdminSummary, AuditEvent, Permission, Share,
         UploadConflictStrategy,
     },
+    file_ops,
     http_auth::{
         audit, clear_session_cookie, commit_runtime_settings, csrf_header, database,
         make_session_cookie, make_unlock_cookie, runtime_settings, session, share_is_unlocked,
@@ -104,7 +105,13 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/session/mfa", post(mfa))
         .route("/session/logout", post(logout))
         .route("/session/me", get(me))
-        .route("/files", get(files))
+        .route(
+            "/files",
+            get(files)
+                .patch(rename_file_entry)
+                .delete(delete_file_entry),
+        )
+        .route("/files/directories", post(create_directory))
         .route("/shares", get(list_shares).post(create_share))
         .route("/shares/{id}", patch(update_share).delete(delete_share))
         .route("/shares/{id}/activate", post(activate_share))
@@ -495,6 +502,179 @@ async fn files(
     }))
 }
 
+#[derive(Deserialize)]
+struct CreateDirectoryRequest {
+    #[serde(default)]
+    parent: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RenameFileRequest {
+    path: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteFileRequest {
+    path: String,
+    confirm_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreatedDirectoryResponse {
+    ok: bool,
+    path: String,
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct RenamedFileResponse {
+    ok: bool,
+    path: String,
+    kind: &'static str,
+    updated_shares: usize,
+}
+
+#[derive(Serialize)]
+struct DeletedFileResponse {
+    ok: bool,
+    path: String,
+    kind: &'static str,
+    deactivated_shares: usize,
+    cleanup_pending: bool,
+}
+
+async fn create_directory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateDirectoryRequest>,
+) -> ApiResult<Response> {
+    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
+    csrf_header(&session_data, &headers)?;
+    let result = file_ops::create_directory(&state, &request.parent, &request.name)
+        .await
+        .map_err(file_operation_error)?;
+    audit(
+        &state,
+        session_data.username,
+        "directory_created",
+        Some(result.path.clone()),
+        None,
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedDirectoryResponse {
+            ok: true,
+            path: result.path,
+            kind: "directory",
+        }),
+    )
+        .into_response())
+}
+
+async fn rename_file_entry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RenameFileRequest>,
+) -> ApiResult<Json<RenamedFileResponse>> {
+    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
+    csrf_header(&session_data, &headers)?;
+    let old_path = request.path.clone();
+    let result = file_ops::rename(&state, &request.path, &request.name)
+        .await
+        .map_err(file_operation_error)?;
+    audit(
+        &state,
+        session_data.username,
+        "path_renamed",
+        Some(result.path.clone()),
+        Some(format!(
+            "old_path={old_path};updated_shares={}",
+            result.updated_shares
+        )),
+    )
+    .await;
+    Ok(Json(RenamedFileResponse {
+        ok: true,
+        path: result.path,
+        kind: file_ops::kind_name(result.kind),
+        updated_shares: result.updated_shares,
+    }))
+}
+
+async fn delete_file_entry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DeleteFileRequest>,
+) -> ApiResult<Response> {
+    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
+    csrf_header(&session_data, &headers)?;
+    let result = file_ops::delete(&state, &request.path, request.confirm_name.as_deref())
+        .await
+        .map_err(file_operation_error)?;
+    audit(
+        &state,
+        session_data.username,
+        "path_deleted",
+        Some(result.path.clone()),
+        Some(format!(
+            "kind={};deactivated_shares={};cleanup={}",
+            file_ops::kind_name(result.kind),
+            result.deactivated_shares,
+            if result.cleanup_pending {
+                "pending"
+            } else {
+                "complete"
+            }
+        )),
+    )
+    .await;
+    let status = if result.cleanup_pending {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(DeletedFileResponse {
+            ok: true,
+            path: result.path,
+            kind: file_ops::kind_name(result.kind),
+            deactivated_shares: result.deactivated_shares,
+            cleanup_pending: result.cleanup_pending,
+        }),
+    )
+        .into_response())
+}
+
+fn file_operation_error(error: file_ops::FileOperationError) -> ApiError {
+    use file_ops::FileOperationError;
+    match error {
+        FileOperationError::InvalidPath => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", "Ungültiger Pfad")
+        }
+        FileOperationError::InvalidName => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_name", "Ungültiger Name")
+        }
+        FileOperationError::NotFound => ApiError::not_found("Ziel nicht gefunden"),
+        FileOperationError::Conflict => ApiError::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "Zielname ist bereits vorhanden",
+        ),
+        FileOperationError::ConfirmationRequired { .. } => ApiError::new(
+            StatusCode::CONFLICT,
+            "confirmation_required",
+            "Der exakte Ordnername muss bestätigt werden",
+        ),
+        FileOperationError::Database(_)
+        | FileOperationError::Io(_)
+        | FileOperationError::Join(_) => ApiError::internal(error),
+    }
+}
+
 #[derive(Serialize)]
 struct ShareResponse {
     id: i64,
@@ -571,6 +751,7 @@ async fn create_share(
 ) -> ApiResult<Json<ShareResponse>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
+    let _storage_guard = state.storage_mutation.lock().await;
     let settings = runtime_settings(&state);
     let rel = validate_rel(&request.path)?;
     let metadata = state
@@ -2048,6 +2229,123 @@ mod tests {
                 .download_count,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn api_admin_file_mutations_update_shares_and_require_tree_confirmation() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/file.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+        let secret = auth::new_totp_secret();
+        let hash = auth::hash_password("correct horse battery staple").unwrap();
+        state.db.create_admin("admin", &hash, &secret).unwrap();
+        state
+            .db
+            .create_share(
+                "file-token",
+                None,
+                "docs/file.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let (session_cookie, csrf) = api_login(&state, &secret).await;
+        let app = crate::web::router(state.clone());
+
+        let mut create = json_request(
+            Method::POST,
+            "/api/v1/files/directories",
+            r#"{"parent":"","name":"tree"}"#,
+        );
+        authorize_mutation(&mut create, &session_cookie, &csrf);
+        assert_eq!(
+            app.clone().oneshot(create).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+
+        let mut rename = json_request(
+            Method::PATCH,
+            "/api/v1/files",
+            r#"{"path":"docs/file.txt","name":"final.txt"}"#,
+        );
+        authorize_mutation(&mut rename, &session_cookie, &csrf);
+        assert_eq!(
+            app.clone().oneshot(rename).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            state
+                .db
+                .share_by_token("file-token")
+                .unwrap()
+                .unwrap()
+                .relative_path,
+            "docs/final.txt"
+        );
+
+        std::fs::write(root.path().join("tree/child.txt"), b"child").unwrap();
+        state
+            .db
+            .create_share(
+                "tree-token",
+                None,
+                "tree/child.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let mut unconfirmed = json_request(Method::DELETE, "/api/v1/files", r#"{"path":"tree"}"#);
+        authorize_mutation(&mut unconfirmed, &session_cookie, &csrf);
+        let unconfirmed = app.clone().oneshot(unconfirmed).await.unwrap();
+        assert_eq!(unconfirmed.status(), StatusCode::CONFLICT);
+        assert!(response_text(unconfirmed)
+            .await
+            .contains("confirmation_required"));
+        assert!(root.path().join("tree").exists());
+
+        let mut confirmed = json_request(
+            Method::DELETE,
+            "/api/v1/files",
+            r#"{"path":"tree","confirm_name":"tree"}"#,
+        );
+        authorize_mutation(&mut confirmed, &session_cookie, &csrf);
+        assert_eq!(
+            app.oneshot(confirmed).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+        assert!(!root.path().join("tree").exists());
+        assert!(
+            !state
+                .db
+                .share_by_token("tree-token")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+    }
+
+    fn authorize_mutation(request: &mut Request<Body>, session_cookie: &str, csrf: &str) {
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(session_cookie).unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(csrf).unwrap());
     }
 
     #[tokio::test]

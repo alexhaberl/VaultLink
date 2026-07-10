@@ -26,7 +26,7 @@ API, upgrade, and rollback smoke tests run afterwards on the same host.
 Superseded pull-request runs are cancelled automatically.
 
 The weekly and manually dispatched fuzz gate also uses one runner job. It runs
-all seven ten-minute fuzz targets concurrently (`FUZZ_JOBS=7`), so its expected
+all eight ten-minute fuzz targets concurrently (`FUZZ_JOBS=8`), so its expected
 wall-clock runtime is about 10-15 minutes after toolchain and build setup. A
 single registered runner service serializes the CI and fuzz jobs, preventing
 the two CPU-intensive workloads from competing for the same VM.

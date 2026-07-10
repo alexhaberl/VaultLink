@@ -69,6 +69,7 @@ pub fn safe_filename(name: &str) -> Result<&str, PathError> {
             matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
         });
     if name.is_empty()
+        || name.len() > 255
         || name == "."
         || name == ".."
         || name.ends_with(['.', ' '])
@@ -84,6 +85,27 @@ pub fn safe_filename(name: &str) -> Result<&str, PathError> {
         return Err(PathError::Invalid);
     }
     Ok(name)
+}
+
+pub fn safe_admin_filename(name: &str) -> Result<&str, PathError> {
+    let name = safe_filename(name)?;
+    if private_token_name(name, ".vaultlink-", ".part")
+        || private_token_name(name, ".vaultlink-delete-", ".tombstone")
+    {
+        return Err(PathError::Invalid);
+    }
+    Ok(name)
+}
+
+fn private_token_name(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|name| name.strip_suffix(suffix))
+        .is_some_and(|token| {
+            token.len() == 24
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
 }
 
 pub fn display_relative(root: &Path, path: &Path) -> Result<String, PathError> {

@@ -1,13 +1,15 @@
-# v0.3.1 release checklist
+# v0.3.2 release checklist
 
 Stand: 2026-07-10 nach Security-/Reliability-Hardening für SecureFS, Runtime-Transaktionen, Transfer-Limits, Streaming-ZIP, Setup-Recovery, UTF-8-Rendering sowie Build-/Deploy-Gates und Toolchain-Updates.
 
 Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschließlich bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
-## Feature-Scope für 0.3.1
+## Feature-Scope für 0.3.2
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
-- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.3.1.
+- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.3.2.
+- [x] Admin-Dateiverwaltung zum Erstellen von Ordnern, No-Clobber-Umbenennen und permanenten rekursiven Löschen mit Bestätigung.
+- [x] Begrenzte, neustartfähige Tombstone-Bereinigung und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
 - [x] API und UI teilen Auth-, Session-, CSRF-, SecureFS-, SQLite-, Runtime-Settings- und Audit-Logik.
 - [x] API-Fehler werden als JSON normalisiert; Streaming-Routen liefern nur bei Erfolg Binärdaten.
 - [x] Root-begrenzter Dateibrowser mit Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der Oberfläche.
@@ -37,7 +39,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Public Upload-Fehlerseiten für validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Größenlimits, fehlende Dateinamen und Speicherfehler.
 - [x] Fuzzing für Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, Upload-Validierung und API-Request-Policy.
 
-## Bewusste Nicht-Ziele für 0.3.1
+## Bewusste Nicht-Ziele für 0.3.2
 
 - DEB-Paket.
 - ARM64-Build.
@@ -89,8 +91,9 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
   - ZIP/Search/Preview-Pfadfälle inklusive Media-Preview,
   - Upload-Overwrite-Policy,
   - Upload-Validierungslogik,
-  - API-Request-Policy.
-  - Der Workflow läuft zusätzlich wöchentlich als einzelner Self-hosted-Job, der alle sieben Targets intern parallel ausführt; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
+  - API-Request-Policy,
+  - Admin-Dateimutations- und Share-Teilbaumpolicy.
+  - Der Workflow läuft zusätzlich wöchentlich als einzelner Self-hosted-Job, der alle acht Targets intern parallel ausführt; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
 - [ ] Dabei `Cargo.lock` und `fuzz/Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.
@@ -166,7 +169,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [ ] `make policy-check` grün; alle Dependabot-Pin-Updates gegen die jeweiligen Upstream-Repositories geprüft.
 - [ ] Staging- und Public-Gates grün.
 - [ ] 72h-Soak bestanden.
-- [ ] Annotierten Tag `v0.3.1` erstellen.
+- [ ] Annotierten Tag `v0.3.2` erstellen.
 - [ ] Tag-Release-Workflow prüfen:
   - GitHub Release ist privat,
   - Artefakte stammen ausschließlich aus CI,
