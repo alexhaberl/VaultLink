@@ -1,6 +1,9 @@
-.PHONY: dev-setup sample-data test security-test fuzz lint build run docker-setup-smoke docker-api-smoke
+.PHONY: dev-setup sample-data test security-test fuzz lint build run policy-check docker-smoke-build docker-smoke docker-setup-smoke docker-api-smoke docker-upgrade-safety-test
 
 CONFIG ?= config/development.toml
+DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
+FUZZ_MAX_TOTAL_TIME ?= 600
+FUZZ_TARGETS := path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy
 
 dev-setup: sample-data
 	@command -v cargo >/dev/null || (echo "Rust fehlt: https://rustup.rs installieren" && exit 1)
@@ -20,12 +23,14 @@ security-test:
 	cargo test db::tests::migrates_unversioned_installation_without_losing_data
 	cargo test proxy
 	cargo test auth
-	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh tools/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi
+	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi
+	sh tools/check-supply-chain-policy.sh
 
 fuzz:
-	cargo +nightly-2026-07-01 fuzz run path_normalization -- -max_total_time=600
-	cargo +nightly-2026-07-01 fuzz run byte_range -- -max_total_time=600
-	cargo +nightly-2026-07-01 fuzz run filename -- -max_total_time=600
+	@set -e; for target in $(FUZZ_TARGETS); do \
+		echo "Fuzzing $$target for $(FUZZ_MAX_TOTAL_TIME)s"; \
+		cargo +nightly-2026-07-01 fuzz run "$$target" -- -max_total_time=$(FUZZ_MAX_TOTAL_TIME); \
+	done
 
 lint:
 	cargo fmt --all -- --check
@@ -37,12 +42,23 @@ build:
 run: sample-data
 	cargo run -- --config $(CONFIG)
 
-docker-setup-smoke:
-	@docker version >/dev/null 2>&1 || (echo "Docker fehlt oder WSL-Integration ist nicht aktiv" && exit 1)
-	docker build -f deploy/docker/Dockerfile.setup-smoke -t vaultlink:setup-smoke .
-	docker run --rm vaultlink:setup-smoke
+policy-check:
+	sh tools/check-supply-chain-policy.sh
 
-docker-api-smoke:
+docker-smoke-build:
 	@docker version >/dev/null 2>&1 || (echo "Docker fehlt oder WSL-Integration ist nicht aktiv" && exit 1)
-	docker build -f deploy/docker/Dockerfile.setup-smoke -t vaultlink:api-smoke .
-	docker run --rm vaultlink:api-smoke bash deploy/docker/api-smoke.sh
+	docker build -f deploy/docker/Dockerfile.setup-smoke -t $(DOCKER_SMOKE_IMAGE) .
+
+docker-smoke: docker-smoke-build
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE)
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/api-smoke.sh
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh
+
+docker-setup-smoke: docker-smoke-build
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE)
+
+docker-api-smoke: docker-smoke-build
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/api-smoke.sh
+
+docker-upgrade-safety-test: docker-smoke-build
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh

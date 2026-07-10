@@ -2,6 +2,10 @@
 target
 fuzz/target
 dev
+/config.toml
+.env
+.env.*
+*.sqlite*
 *.tmp
 *.tar
 *.tar.gz

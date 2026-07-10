@@ -43,6 +43,10 @@ impl RuntimeSettings {
     }
 
     pub fn apply(&mut self, key: &str, value: &str) -> Result<(), String> {
+        self.apply_many(std::iter::once((key, value)))
+    }
+
+    fn apply_field(&mut self, key: &str, value: &str) -> Result<(), String> {
         match key {
             "public_base_url" => {
                 let value = value.trim().trim_end_matches('/').to_string();
@@ -83,20 +87,43 @@ impl RuntimeSettings {
             "max_media_preview_size" => self.max_media_preview_size = parse_u64(key, value)?,
             _ => return Err(format!("unknown runtime setting: {key}")),
         }
-        self.validate()
+        Ok(())
     }
 
     pub fn apply_many<'a>(
         &mut self,
         entries: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<(), String> {
+        let mut next = self.clone();
         for (key, value) in entries {
-            self.apply(key, value)?;
+            next.apply_field(key, value)?;
         }
+        next.validate()?;
+        *self = next;
         Ok(())
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        let raw_public_base_url = self.public_base_url.trim();
+        if !raw_public_base_url.starts_with("http://")
+            && !raw_public_base_url.starts_with("https://")
+        {
+            return Err("public_base_url must use canonical HTTP(S) authority syntax".into());
+        }
+        let public_base_url = url::Url::parse(raw_public_base_url)
+            .map_err(|_| "public_base_url must be a valid absolute URL".to_string())?;
+        if !matches!(public_base_url.scheme(), "http" | "https")
+            || public_base_url.host_str().is_none()
+            || public_base_url.query().is_some()
+            || public_base_url.fragment().is_some()
+            || !public_base_url.username().is_empty()
+            || public_base_url.password().is_some()
+        {
+            return Err(
+                "public_base_url must be an absolute HTTP(S) URL without credentials, query, or fragment"
+                    .into(),
+            );
+        }
         if self.max_upload_size == 0
             || self.max_zip_size == 0
             || self.max_zip_files == 0
@@ -129,6 +156,18 @@ impl RuntimeSettings {
             )
         }) {
             return Err("image_preview_extensions must not include active content types".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_config(&self, config: &Config) -> Result<(), String> {
+        self.validate()?;
+        if config.server.production_mode
+            && url::Url::parse(&self.public_base_url)
+                .ok()
+                .is_none_or(|url| url.scheme() != "https")
+        {
+            return Err("production public_base_url must use HTTPS".into());
         }
         Ok(())
     }
@@ -297,5 +336,66 @@ mod tests {
         assert!(extension_is_blocked("payload.ExE", &blocked));
         assert!(extension_is_blocked("script.sh", &blocked));
         assert!(!extension_is_blocked("report.pdf", &blocked));
+    }
+
+    #[test]
+    fn settings_batch_validates_only_the_complete_candidate() {
+        let mut settings = RuntimeSettings::from_config(&config());
+
+        // Database rows are sorted alphabetically, so max is loaded before min.
+        settings
+            .apply_many([
+                ("share_password_max_length", "8"),
+                ("share_password_min_length", "8"),
+            ])
+            .unwrap();
+        assert_eq!(settings.share_password_min_length, 8);
+        assert_eq!(settings.share_password_max_length, 8);
+
+        // The web form supplies min before max. Raising both must also be valid.
+        settings
+            .apply_many([
+                ("share_password_min_length", "12"),
+                ("share_password_max_length", "12"),
+            ])
+            .unwrap();
+        assert_eq!(settings.share_password_min_length, 12);
+        assert_eq!(settings.share_password_max_length, 12);
+    }
+
+    #[test]
+    fn failed_settings_batch_does_not_mutate_the_original() {
+        let mut settings = RuntimeSettings::from_config(&config());
+        let original = settings.clone();
+
+        assert!(settings
+            .apply_many([
+                ("max_upload_size", "999"),
+                ("share_password_max_length", "8"),
+            ])
+            .is_err());
+        assert_eq!(settings, original);
+
+        assert!(settings
+            .apply_many([("max_upload_size", "999"), ("max_zip_files", "invalid")])
+            .is_err());
+        assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn direct_runtime_candidates_cannot_bypass_url_validation() {
+        let mut settings = RuntimeSettings::from_config(&config());
+        settings.public_base_url.clear();
+        assert!(settings.validate().is_err());
+        settings.public_base_url = "file:///tmp/vaultlink".into();
+        assert!(settings.validate().is_err());
+        settings.public_base_url = "https://example.test?next=/admin".into();
+        assert!(settings.validate().is_err());
+        settings.public_base_url = "https://example.test/#section".into();
+        assert!(settings.validate().is_err());
+        settings.public_base_url = "https://user:secret@example.test".into();
+        assert!(settings.validate().is_err());
+        settings.public_base_url = "http:/missing-host".into();
+        assert!(settings.validate().is_err());
     }
 }

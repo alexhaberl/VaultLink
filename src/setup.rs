@@ -21,7 +21,7 @@ use crate::{
         CertificateSource, Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage,
         Tls,
     },
-    db::Database,
+    db::{Database, InitialAdminOutcome},
     runtime,
 };
 
@@ -29,11 +29,19 @@ use crate::{
 struct SetupState {
     config_path: Arc<PathBuf>,
     token: Arc<String>,
+    commit: Arc<tokio::sync::Mutex<bool>>,
 }
+
+const INITIAL_SETUP_PENDING_FILE: &str = ".vaultlink-initial-setup.pending";
 
 #[derive(Deserialize)]
 struct TokenQuery {
     token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompleteSetupForm {
+    token: String,
 }
 
 #[derive(Deserialize)]
@@ -85,9 +93,11 @@ pub async fn run(
     let state = SetupState {
         config_path: Arc::new(config_path),
         token: Arc::new(token),
+        commit: Arc::new(tokio::sync::Mutex::new(false)),
     };
     let app = Router::new()
         .route("/", get(setup_page).post(submit_setup))
+        .route("/complete", axum::routing::post(complete_setup))
         .route("/browse", get(setup_browse))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -122,15 +132,26 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
         )
             .into_response();
     }
+    let completed = state.commit.lock().await;
+    if *completed {
+        return (
+            StatusCode::CONFLICT,
+            Html(page("Setup wurde bereits abgeschlossen.")),
+        )
+            .into_response();
+    }
     match build_and_store(&state.config_path, form).await {
         Ok(result) => match qr_svg(&result.otpauth) {
-            Ok(qr) => Html(page(&format!(
-                r#"<section><h1>Setup abgeschlossen</h1><p>Config wurde geschrieben und der erste Admin wurde angelegt.</p><p>Dieses TOTP-Secret wird nur jetzt angezeigt. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p>Setup-Prozess jetzt mit Ctrl+C beenden und VaultLink normal starten.</p></section>"#,
-                qr,
-                esc(&result.totp_secret),
-                esc(&result.otpauth)
-            )))
-            .into_response(),
+            Ok(qr) => {
+                Html(page(&format!(
+                    r#"<section><h1>Setup abgeschlossen</h1><p>Config wurde geschrieben und der erste Admin wurde angelegt.</p><p>Das TOTP-Secret bleibt bis zur ausdrÃ¼cklichen BestÃ¤tigung Ã¼ber diesen lokalen Setup-Flow wiederherstellbar. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button>Secret sicher gespeichert</button></form><p>Danach den Setup-Prozess mit Ctrl+C beenden und VaultLink normal starten.</p></section>"#,
+                    qr,
+                    esc(&result.totp_secret),
+                    esc(&result.otpauth),
+                    esc(&state.token)
+                )))
+                .into_response()
+            }
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(page(&format!(
@@ -144,6 +165,56 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
             let body = setup_form(&state.token, Some(&error));
             (StatusCode::BAD_REQUEST, Html(page(&body))).into_response()
         }
+    }
+}
+
+async fn complete_setup(
+    State(state): State<SetupState>,
+    Form(form): Form<CompleteSetupForm>,
+) -> Response {
+    if form.token != *state.token {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html(page("Setup-Token fehlt oder ist ungÃ¼ltig.")),
+        )
+            .into_response();
+    }
+    let mut completed = state.commit.lock().await;
+    if *completed {
+        return Html(page(
+            "<section><h1>Setup bestÃ¤tigt</h1><p>Die TOTP-Wiederherstellung ist bereits geschlossen.</p></section>",
+        ))
+        .into_response();
+    }
+    let config = match Config::load(state.config_path.as_ref()) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(page(&format!(
+                    "Konfiguration kann nicht geladen werden: {}",
+                    esc(&error.to_string())
+                ))),
+            )
+                .into_response()
+        }
+    };
+    match clear_initial_setup_pending(&config.storage.data_directory) {
+        Ok(()) => {
+            *completed = true;
+            Html(page(
+                "<section><h1>Setup bestÃ¤tigt</h1><p>Die TOTP-Wiederherstellung wurde geschlossen. VaultLink kann jetzt normal gestartet werden.</p></section>",
+            ))
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html(page(&format!(
+                "Setup-BestÃ¤tigung fehlgeschlagen: {}",
+                esc(&error)
+            ))),
+        )
+            .into_response(),
     }
 }
 
@@ -258,22 +329,92 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
         },
     };
     config.validate().map_err(|error| error.to_string())?;
-    write_config_atomic(config_path, &config).map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(&config.storage.data_directory).map_err(|error| error.to_string())?;
-    let database = Database::open(config.storage.data_directory.join("data.sqlite"))
-        .map_err(|error| error.to_string())?;
-    if database.admin_count().map_err(|error| error.to_string())? != 0 {
-        return Err("Datenbank enthält bereits Admins; Setup legt nur den ersten Admin an.".into());
-    }
+    let serialized = toml::to_string_pretty(&config).map_err(|error| error.to_string())?;
+    let recovering_existing_config = if config_path.exists() {
+        let existing = Config::load(config_path).map_err(|error| {
+            format!("Vorhandene Konfiguration kann nicht sicher fortgesetzt werden: {error}")
+        })?;
+        let existing_serialized =
+            toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
+        if existing_serialized != serialized {
+            return Err(
+                "Konfigurationsdatei existiert bereits und wird nicht überschrieben.".into(),
+            );
+        }
+        true
+    } else {
+        false
+    };
     let totp_secret = auth::new_totp_secret();
+    let submitted_password = form.admin_password.clone();
     let password = form.admin_password;
     let hash = tokio::task::spawn_blocking(move || auth::hash_password(&password))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
-    database
-        .create_admin(&form.admin_username, &hash, &totp_secret)
+    std::fs::create_dir_all(&config.storage.data_directory).map_err(|error| error.to_string())?;
+    let database = Database::open(config.storage.data_directory.join("data.sqlite"))
         .map_err(|error| error.to_string())?;
+    if database.admin_count().map_err(|error| error.to_string())? != 0 {
+        if recovering_existing_config
+            && read_initial_setup_pending(&config.storage.data_directory)?.as_deref()
+                == Some(form.admin_username.as_str())
+        {
+            let admin = database
+                .admin(&form.admin_username)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Initial setup recovery is unavailable".to_string())?;
+            let password_hash = admin.password_hash.clone();
+            let password_valid = tokio::task::spawn_blocking(move || {
+                auth::verify_password(&password_hash, &submitted_password)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            if !password_valid {
+                return Err("Initial setup recovery is unavailable".into());
+            }
+            let totp_secret = admin.totp_secret;
+            let otpauth = format!(
+                "otpauth://totp/VaultLink:{}?secret={}&issuer=VaultLink",
+                form.admin_username, totp_secret
+            );
+            return Ok(SetupResult {
+                totp_secret,
+                otpauth,
+            });
+        }
+        return Err("Datenbank enthält bereits Admins; Setup legt nur den ersten Admin an.".into());
+    }
+    let wrote_config = if recovering_existing_config {
+        false
+    } else {
+        write_config_atomic_new(config_path, &serialized).map_err(|error| error.to_string())?;
+        true
+    };
+    if let Err(error) =
+        ensure_initial_setup_pending(&config.storage.data_directory, &form.admin_username)
+    {
+        if wrote_config {
+            let _ = std::fs::remove_file(config_path);
+            let _ = sync_parent(config_path);
+        }
+        return Err(error);
+    }
+    match database.create_initial_admin(&form.admin_username, &hash, &totp_secret) {
+        Ok(InitialAdminOutcome::Created) => {}
+        Ok(InitialAdminOutcome::AlreadyInitialized) => {
+            return Err(
+                "Datenbank enthält bereits Admins; Setup legt nur den ersten Admin an.".into(),
+            );
+        }
+        Err(error) => {
+            if wrote_config {
+                let _ = std::fs::remove_file(config_path);
+                let _ = sync_parent(config_path);
+            }
+            return Err(error.to_string());
+        }
+    }
     let otpauth = format!(
         "otpauth://totp/VaultLink:{}?secret={}&issuer=VaultLink",
         form.admin_username, totp_secret
@@ -284,20 +425,61 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
     })
 }
 
-fn write_config_atomic(path: &Path, config: &Config) -> std::io::Result<()> {
+fn initial_setup_pending_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(INITIAL_SETUP_PENDING_FILE)
+}
+
+fn read_initial_setup_pending(data_directory: &Path) -> Result<Option<String>, String> {
+    let path = initial_setup_pending_path(data_directory);
+    match std::fs::read_to_string(path) {
+        Ok(username) => Ok(Some(username.trim().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn ensure_initial_setup_pending(data_directory: &Path, username: &str) -> Result<(), String> {
+    if let Some(existing) = read_initial_setup_pending(data_directory)? {
+        return if existing == username {
+            Ok(())
+        } else {
+            Err("Pending initial setup belongs to a different administrator".into())
+        };
+    }
+    let path = initial_setup_pending_path(data_directory);
+    write_config_atomic_new(&path, &format!("{username}\n")).map_err(|error| error.to_string())
+}
+
+fn clear_initial_setup_pending(data_directory: &Path) -> Result<(), String> {
+    let path = initial_setup_pending_path(data_directory);
+    match std::fs::remove_file(&path) {
+        Ok(()) => sync_parent(&path).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn write_config_atomic_new(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    let content = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
     temporary.write_all(content.as_bytes())?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
     temporary
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| error.error)
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
+    sync_parent(path)
+}
+
+fn sync_parent(_path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(_path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn parse_unit_to_bytes(name: &str, value: &str, unit: u64) -> Result<u64, String> {
@@ -540,5 +722,65 @@ mod tests {
         );
         assert!(config.tls.letsencrypt_staging);
         assert_eq!(config.storage.max_media_preview_size, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn setup_never_overwrites_an_existing_different_config() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        build_and_store(&config_path, form(root.path(), data.path()))
+            .await
+            .unwrap();
+        let original = std::fs::read(&config_path).unwrap();
+
+        let mut changed = form(root.path(), data.path());
+        changed.public_base_url = "http://localhost:9999".into();
+        assert!(build_and_store(&config_path, changed).await.is_err());
+        assert_eq!(std::fs::read(&config_path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn setup_recovers_matching_config_when_admin_commit_was_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        build_and_store(&config_path, form(root.path(), data.path()))
+            .await
+            .unwrap();
+        std::fs::remove_file(data.path().join("data.sqlite")).unwrap();
+
+        build_and_store(&config_path, form(root.path(), data.path()))
+            .await
+            .unwrap();
+        let database = Database::open(data.path().join("data.sqlite")).unwrap();
+        assert_eq!(database.admin_count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn setup_recovers_committed_totp_until_the_operator_confirms_it() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+
+        let first = build_and_store(&config_path, form(root.path(), data.path()))
+            .await
+            .unwrap();
+        assert!(initial_setup_pending_path(data.path()).is_file());
+        let recovered = build_and_store(&config_path, form(root.path(), data.path()))
+            .await
+            .unwrap();
+        assert_eq!(recovered.totp_secret, first.totp_secret);
+
+        clear_initial_setup_pending(data.path()).unwrap();
+        assert!(!initial_setup_pending_path(data.path()).exists());
+        assert!(
+            build_and_store(&config_path, form(root.path(), data.path()))
+                .await
+                .is_err()
+        );
     }
 }

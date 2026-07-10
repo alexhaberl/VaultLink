@@ -247,8 +247,27 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.server.public_base_url.starts_with("http://")
+            && !self.server.public_base_url.starts_with("https://")
+        {
+            return Err(ConfigError::Invalid(
+                "public_base_url must use canonical HTTP(S) authority syntax".into(),
+            ));
+        }
         let url = Url::parse(&self.server.public_base_url)
             .map_err(|e| ConfigError::Invalid(format!("public_base_url: {e}")))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(ConfigError::Invalid(
+                "public_base_url must be an absolute HTTP(S) URL without credentials, query, or fragment"
+                    .into(),
+            ));
+        }
         let listen: std::net::SocketAddr = self.server.listen_address.parse().map_err(|_| {
             ConfigError::Invalid("listen_address must be an IP socket address".into())
         })?;
@@ -566,6 +585,21 @@ mod tests {
         let mut c = base();
         c.server.listen_address = "0.0.0.0:8080".into();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn public_base_url_rejects_ambiguous_suffixes_and_credentials() {
+        let mut c = base();
+        for value in [
+            "http://localhost:8080?next=/admin",
+            "http://localhost:8080/#section",
+            "http://user:secret@localhost:8080",
+            "http:/missing-host",
+            "mailto:admin@example.test",
+        ] {
+            c.server.public_base_url = value.into();
+            assert!(c.validate().is_err(), "accepted {value}");
+        }
     }
     #[test]
     fn production_requires_secure_cookie() {

@@ -1,5 +1,5 @@
-use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use chrono::{DateTime, Duration, Utc};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -7,7 +7,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+
+pub const TRANSFER_SESSION_TTL_SECONDS: i64 = 15 * 60;
 
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
@@ -33,6 +35,47 @@ pub struct Session {
     pub username: String,
     pub csrf_token: String,
     pub mfa_verified: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitialAdminOutcome {
+    Created,
+    AlreadyInitialized,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminDeactivationOutcome {
+    Deactivated,
+    AlreadyInactive,
+    LastActive,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferLeaseBeginOutcome {
+    AlreadyCounted,
+    NewLease,
+    LimitReached,
+    ShareUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferLeaseCompleteOutcome {
+    Counted,
+    AlreadyCounted,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferLeaseCancelOutcome {
+    Cancelled,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferLeaseHeartbeatOutcome {
+    Extended,
+    NotFound,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -240,13 +283,93 @@ CREATE INDEX IF NOT EXISTS idx_preview_exp ON public_preview_sessions(expires_at
         }
         tx.pragma_update(None, "user_version", 6)?;
     }
+    if version < 7 {
+        tx.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS public_transfer_grants(
+    id INTEGER PRIMARY KEY,
+    session_token_hash TEXT NOT NULL,
+    share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+    resource_key TEXT NOT NULL CHECK(length(resource_key) > 0),
+    action TEXT NOT NULL CHECK(length(action) > 0),
+    counted INTEGER NOT NULL DEFAULT 0 CHECK(counted IN (0, 1)),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    UNIQUE(session_token_hash, share_id, resource_key, action)
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_grants_exp
+    ON public_transfer_grants(expires_at);
+CREATE INDEX IF NOT EXISTS idx_transfer_grants_reservations
+    ON public_transfer_grants(share_id, counted, expires_at);
+
+CREATE TABLE IF NOT EXISTS public_transfer_leases(
+    token_hash TEXT PRIMARY KEY,
+    grant_id INTEGER NOT NULL REFERENCES public_transfer_grants(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_leases_grant
+    ON public_transfer_leases(grant_id);
+CREATE INDEX IF NOT EXISTS idx_transfer_leases_exp
+    ON public_transfer_leases(expires_at);
+"#,
+        )?;
+        tx.pragma_update(None, "user_version", 7)?;
+    }
     tx.commit()
+}
+
+fn transfer_deadlines() -> (String, String) {
+    let now = Utc::now();
+    let expires = now + Duration::seconds(TRANSFER_SESSION_TTL_SECONDS);
+    (now.to_rfc3339(), expires.to_rfc3339())
+}
+
+fn cleanup_transfer_state(transaction: &Transaction<'_>, now: &str) -> rusqlite::Result<()> {
+    transaction.execute(
+        "DELETE FROM public_transfer_leases WHERE expires_at<=?1",
+        [now],
+    )?;
+    transaction.execute(
+        "DELETE FROM public_transfer_grants
+         WHERE expires_at<=?1
+            OR (counted=0 AND NOT EXISTS(
+                SELECT 1 FROM public_transfer_leases leases
+                WHERE leases.grant_id=public_transfer_grants.id AND leases.expires_at>?1
+            ))",
+        [now],
+    )?;
+    Ok(())
 }
 
 impl Database {
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().expect("database mutex poisoned")
     }
+    pub fn create_initial_admin(
+        &self,
+        username: &str,
+        password_hash: &str,
+        totp_secret: &str,
+    ) -> rusqlite::Result<InitialAdminOutcome> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let initialized: bool =
+            transaction.query_row("SELECT EXISTS(SELECT 1 FROM admins)", [], |row| row.get(0))?;
+        let outcome = if initialized {
+            InitialAdminOutcome::AlreadyInitialized
+        } else {
+            transaction.execute(
+                "INSERT INTO admins(username,password_hash,totp_secret,created_at,active) VALUES(?1,?2,?3,?4,1)",
+                params![username, password_hash, totp_secret, Utc::now().to_rfc3339()],
+            )?;
+            InitialAdminOutcome::Created
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
     pub fn create_admin(
         &self,
         username: &str,
@@ -307,19 +430,48 @@ impl Database {
             .collect();
         admins
     }
-    pub fn set_admin_active(&self, id: i64, active: bool) -> rusqlite::Result<bool> {
-        let mut connection = self.conn();
-        let transaction = connection.transaction()?;
-        let changed = transaction.execute(
-            "UPDATE admins SET active=?2 WHERE id=?1",
-            params![id, active as i64],
-        )? == 1;
-        if changed && !active {
-            transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
-        }
-        transaction.commit()?;
-        Ok(changed)
+    pub fn activate_admin(&self, id: i64) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn()
+            .execute("UPDATE admins SET active=1 WHERE id=?1", [id])?
+            == 1)
     }
+
+    pub fn deactivate_admin(&self, id: i64) -> rusqlite::Result<AdminDeactivationOutcome> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active = transaction
+            .query_row("SELECT active FROM admins WHERE id=?1", [id], |row| {
+                row.get::<_, i64>(0).map(|active| active != 0)
+            })
+            .optional()?;
+        let outcome = match active {
+            None => AdminDeactivationOutcome::NotFound,
+            Some(false) => {
+                // Preserve the session-revocation invariant even if an older database
+                // somehow contains sessions for an already inactive administrator.
+                transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
+                AdminDeactivationOutcome::AlreadyInactive
+            }
+            Some(true) => {
+                let changed = transaction.execute(
+                    "UPDATE admins SET active=0
+                     WHERE id=?1 AND active=1
+                       AND EXISTS(SELECT 1 FROM admins WHERE active=1 AND id<>?1)",
+                    [id],
+                )? == 1;
+                if changed {
+                    transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
+                    AdminDeactivationOutcome::Deactivated
+                } else {
+                    AdminDeactivationOutcome::LastActive
+                }
+            }
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
     pub fn reset_admin_password(&self, id: i64, password_hash: &str) -> rusqlite::Result<bool> {
         let mut connection = self.conn();
         let transaction = connection.transaction()?;
@@ -464,8 +616,283 @@ impl Database {
         Ok(())
     }
     pub fn count_download(&self, id: i64) -> rusqlite::Result<bool> {
-        Ok(self.conn().execute("UPDATE shares SET download_count=download_count+1 WHERE id=?1 AND active=1 AND (expires_at IS NULL OR expires_at>?2) AND (max_downloads IS NULL OR download_count<max_downloads)",params![id,Utc::now().to_rfc3339()])?==1)
+        let now = Utc::now().to_rfc3339();
+        Ok(self.conn().execute(
+            "UPDATE shares
+             SET download_count=download_count+1
+             WHERE id=?1 AND active=1 AND (expires_at IS NULL OR expires_at>?2)
+               AND (max_downloads IS NULL OR download_count + (
+                    SELECT COUNT(*) FROM public_transfer_grants grants
+                    WHERE grants.share_id=shares.id AND grants.counted=0
+                      AND grants.expires_at>?2
+                      AND EXISTS(
+                          SELECT 1 FROM public_transfer_leases leases
+                          WHERE leases.grant_id=grants.id AND leases.expires_at>?2
+                      )
+               ) < max_downloads)",
+            params![id, now],
+        )? == 1)
     }
+
+    /// Starts one HTTP request lease for a route-scoped client transfer session.
+    ///
+    /// `session_token` is the client session cookie value. HTTP surfaces should use
+    /// separate tokens (and cookie paths) when their sessions must not overlap.
+    /// `resource_key` and `action` form the logical, count-once transfer identity.
+    /// Each concrete request supplies a fresh `lease_token`.
+    pub fn begin_transfer_lease(
+        &self,
+        session_token: &str,
+        lease_token: &str,
+        share_id: i64,
+        resource_key: &str,
+        action: &str,
+    ) -> rusqlite::Result<TransferLeaseBeginOutcome> {
+        let (now, expires) = transfer_deadlines();
+        let session_token_hash = token_hash(session_token);
+        let lease_token_hash = token_hash(lease_token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_transfer_state(&transaction, &now)?;
+
+        let share = transaction
+            .query_row(
+                "SELECT max_downloads,download_count FROM shares
+                 WHERE id=?1 AND active=1 AND (expires_at IS NULL OR expires_at>?2)
+                   AND permission IN ('download_only','download_upload')",
+                params![share_id, now],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((max_downloads, download_count)) = share else {
+            transaction.commit()?;
+            return Ok(TransferLeaseBeginOutcome::ShareUnavailable);
+        };
+
+        let existing_grant = transaction
+            .query_row(
+                "SELECT id,counted FROM public_transfer_grants
+                 WHERE session_token_hash=?1 AND share_id=?2
+                   AND resource_key=?3 AND action=?4 AND expires_at>?5",
+                params![session_token_hash, share_id, resource_key, action, now],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?;
+
+        if let Some((grant_id, counted)) = existing_grant {
+            if !counted {
+                transaction.execute(
+                    "UPDATE public_transfer_grants SET expires_at=?2 WHERE id=?1",
+                    params![grant_id, expires],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO public_transfer_leases(token_hash,grant_id,created_at,heartbeat_at,expires_at)
+                 VALUES(?1,?2,?3,?3,?4)",
+                params![lease_token_hash, grant_id, now, expires],
+            )?;
+            transaction.commit()?;
+            return Ok(if counted {
+                TransferLeaseBeginOutcome::AlreadyCounted
+            } else {
+                TransferLeaseBeginOutcome::NewLease
+            });
+        }
+
+        let pending_grants: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM public_transfer_grants grants
+             WHERE grants.share_id=?1 AND grants.counted=0 AND grants.expires_at>?2
+               AND EXISTS(
+                   SELECT 1 FROM public_transfer_leases leases
+                   WHERE leases.grant_id=grants.id AND leases.expires_at>?2
+               )",
+            params![share_id, now],
+            |row| row.get(0),
+        )?;
+        if max_downloads
+            .is_some_and(|maximum| download_count.saturating_add(pending_grants) >= maximum)
+        {
+            transaction.commit()?;
+            return Ok(TransferLeaseBeginOutcome::LimitReached);
+        }
+
+        transaction.execute(
+            "INSERT INTO public_transfer_grants(
+                session_token_hash,share_id,resource_key,action,counted,created_at,expires_at
+             ) VALUES(?1,?2,?3,?4,0,?5,?6)",
+            params![
+                session_token_hash,
+                share_id,
+                resource_key,
+                action,
+                now,
+                expires
+            ],
+        )?;
+        let grant_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO public_transfer_leases(token_hash,grant_id,created_at,heartbeat_at,expires_at)
+             VALUES(?1,?2,?3,?3,?4)",
+            params![lease_token_hash, grant_id, now, expires],
+        )?;
+        transaction.commit()?;
+        Ok(TransferLeaseBeginOutcome::NewLease)
+    }
+
+    /// Completes one request lease. The first successful request for a pending
+    /// grant increments the share counter; later requests for that grant do not.
+    pub fn complete_transfer_lease(
+        &self,
+        lease_token: &str,
+    ) -> rusqlite::Result<TransferLeaseCompleteOutcome> {
+        let (now, expires) = transfer_deadlines();
+        let lease_token_hash = token_hash(lease_token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_transfer_state(&transaction, &now)?;
+        let lease = transaction
+            .query_row(
+                "SELECT grants.id,grants.share_id,grants.counted
+                 FROM public_transfer_leases leases
+                 JOIN public_transfer_grants grants ON grants.id=leases.grant_id
+                 WHERE leases.token_hash=?1 AND leases.expires_at>?2 AND grants.expires_at>?2",
+                params![lease_token_hash, now],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((grant_id, share_id, already_counted)) = lease else {
+            transaction.commit()?;
+            return Ok(TransferLeaseCompleteOutcome::NotFound);
+        };
+
+        let outcome = if already_counted {
+            TransferLeaseCompleteOutcome::AlreadyCounted
+        } else {
+            if transaction.execute(
+                "UPDATE shares SET download_count=download_count+1 WHERE id=?1",
+                [share_id],
+            )? != 1
+            {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            if transaction.execute(
+                "UPDATE public_transfer_grants SET counted=1,expires_at=?2
+                 WHERE id=?1 AND counted=0",
+                params![grant_id, expires],
+            )? != 1
+            {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            TransferLeaseCompleteOutcome::Counted
+        };
+        transaction.execute(
+            "DELETE FROM public_transfer_leases WHERE token_hash=?1",
+            [lease_token_hash],
+        )?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Cancels only the specified request. A pending grant reservation is released
+    /// when its final lease disappears; counted grants remain resumable until expiry.
+    pub fn cancel_transfer_lease(
+        &self,
+        lease_token: &str,
+    ) -> rusqlite::Result<TransferLeaseCancelOutcome> {
+        let (now, _) = transfer_deadlines();
+        let lease_token_hash = token_hash(lease_token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_transfer_state(&transaction, &now)?;
+        let grant = transaction
+            .query_row(
+                "SELECT grants.id,grants.counted
+                 FROM public_transfer_leases leases
+                 JOIN public_transfer_grants grants ON grants.id=leases.grant_id
+                 WHERE leases.token_hash=?1",
+                [lease_token_hash.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?;
+        let Some((grant_id, counted)) = grant else {
+            transaction.commit()?;
+            return Ok(TransferLeaseCancelOutcome::NotFound);
+        };
+        transaction.execute(
+            "DELETE FROM public_transfer_leases WHERE token_hash=?1",
+            [lease_token_hash],
+        )?;
+        if !counted {
+            transaction.execute(
+                "DELETE FROM public_transfer_grants
+                 WHERE id=?1 AND counted=0
+                   AND NOT EXISTS(SELECT 1 FROM public_transfer_leases WHERE grant_id=?1)",
+                [grant_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(TransferLeaseCancelOutcome::Cancelled)
+    }
+
+    pub fn heartbeat_transfer_lease(
+        &self,
+        lease_token: &str,
+    ) -> rusqlite::Result<TransferLeaseHeartbeatOutcome> {
+        let (now, expires) = transfer_deadlines();
+        let lease_token_hash = token_hash(lease_token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_transfer_state(&transaction, &now)?;
+        let grant = transaction
+            .query_row(
+                "SELECT leases.grant_id,grants.counted
+                 FROM public_transfer_leases leases
+                 JOIN public_transfer_grants grants ON grants.id=leases.grant_id
+                 WHERE leases.token_hash=?1 AND leases.expires_at>?2",
+                params![lease_token_hash, now],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?;
+        let Some((grant_id, counted)) = grant else {
+            transaction.commit()?;
+            return Ok(TransferLeaseHeartbeatOutcome::NotFound);
+        };
+        transaction.execute(
+            "UPDATE public_transfer_leases
+             SET heartbeat_at=?2,expires_at=?3 WHERE token_hash=?1",
+            params![lease_token_hash, now, expires],
+        )?;
+        if !counted {
+            transaction.execute(
+                "UPDATE public_transfer_grants SET expires_at=?2 WHERE id=?1",
+                params![grant_id, expires],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(TransferLeaseHeartbeatOutcome::Extended)
+    }
+
+    /// Number of distinct, uncounted grants currently reserving a download slot.
+    pub fn active_transfer_reservations(&self, share_id: i64) -> rusqlite::Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        self.conn().query_row(
+            "SELECT COUNT(*) FROM public_transfer_grants grants
+             WHERE grants.share_id=?1 AND grants.counted=0 AND grants.expires_at>?2
+               AND EXISTS(
+                   SELECT 1 FROM public_transfer_leases leases
+                   WHERE leases.grant_id=grants.id AND leases.expires_at>?2
+               )",
+            params![share_id, now],
+            |row| row.get(0),
+        )
+    }
+
     pub fn set_share_password(&self, id: i64, hash: Option<&str>) -> rusqlite::Result<bool> {
         let mut connection = self.conn();
         let transaction = connection.transaction()?;
@@ -549,14 +976,27 @@ impl Database {
             .collect();
         settings
     }
-    pub fn set_runtime_setting(&self, key: &str, value: &str, admin: i64) -> rusqlite::Result<()> {
-        self.conn().execute(
-            "INSERT INTO runtime_settings(key,value,updated_by,updated_at) VALUES(?1,?2,?3,?4)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
-            params![key, value, admin, Utc::now().to_rfc3339()],
-        )?;
-        Ok(())
+    pub fn replace_runtime_settings(
+        &self,
+        settings: &[(&str, String)],
+        admin: i64,
+    ) -> rusqlite::Result<()> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM runtime_settings", [])?;
+        let updated_at = Utc::now().to_rfc3339();
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO runtime_settings(key,value,updated_by,updated_at)
+                 VALUES(?1,?2,?3,?4)",
+            )?;
+            for (key, value) in settings {
+                statement.execute(params![*key, value.as_str(), admin, updated_at])?;
+            }
+        }
+        transaction.commit()
     }
+
     pub fn list_audit(
         &self,
         action: Option<&str>,
@@ -681,6 +1121,110 @@ mod tests {
     }
 
     #[test]
+    fn initial_admin_creation_is_atomic() {
+        let database = Database::open(":memory:").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for username in ["first", "second"] {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                database
+                    .create_initial_admin(username, "hash", "secret")
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == InitialAdminOutcome::Created)
+                .count(),
+            1
+        );
+        assert_eq!(database.admin_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn concurrent_admin_deactivation_preserves_one_active_admin() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("one", "hash", "secret").unwrap();
+        database.create_admin("two", "hash", "secret").unwrap();
+        database
+            .create_session("one-session", 1, "csrf", Utc::now() + Duration::hours(1))
+            .unwrap();
+        database
+            .create_session("two-session", 2, "csrf", Utc::now() + Duration::hours(1))
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let first = {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                database.deactivate_admin(2).unwrap()
+            })
+        };
+        let second = {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                database.deactivate_admin(1).unwrap()
+            })
+        };
+        barrier.wait();
+        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        assert!(outcomes.contains(&AdminDeactivationOutcome::Deactivated));
+        assert!(outcomes.contains(&AdminDeactivationOutcome::LastActive));
+        assert_eq!(database.active_admin_count().unwrap(), 1);
+        assert_eq!(
+            database
+                .conn()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_settings_replacement_rolls_back_as_one_snapshot() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let original = [
+            ("max_upload_size", "10".to_string()),
+            ("max_zip_size", "20".to_string()),
+        ];
+        database.replace_runtime_settings(&original, 1).unwrap();
+        database
+            .conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_runtime_replace
+                 BEFORE INSERT ON runtime_settings
+                 WHEN NEW.key='max_zip_size'
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        let replacement = [
+            ("max_upload_size", "100".to_string()),
+            ("max_zip_size", "200".to_string()),
+        ];
+        assert!(database.replace_runtime_settings(&replacement, 1).is_err());
+        assert_eq!(
+            database.runtime_settings().unwrap(),
+            vec![
+                ("max_upload_size".to_string(), "10".to_string()),
+                ("max_zip_size".to_string(), "20".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn disabled_and_deleted_links_change_state() {
         let d = Database::open(":memory:").unwrap();
         d.create_admin("admin", "hash", "secret").unwrap();
@@ -757,6 +1301,49 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             .unwrap();
         drop(connection);
         assert!(Database::open(path).is_err());
+    }
+
+    #[test]
+    fn migrates_v6_database_to_transfer_grants_without_losing_shares() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v6.sqlite");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE shares(id INTEGER PRIMARY KEY, marker TEXT NOT NULL);
+                     INSERT INTO shares VALUES(7, 'preserved');
+                     PRAGMA user_version=6;",
+                )
+                .unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        let connection = database.conn();
+        assert_eq!(
+            connection
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            connection
+                .query_row::<String, _, _>("SELECT marker FROM shares WHERE id=7", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            "preserved"
+        );
+        assert_eq!(
+            connection
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name IN ('public_transfer_grants','public_transfer_leases')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -861,5 +1448,238 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             )
             .unwrap();
         assert_ne!(stored, "preview-secret");
+    }
+
+    #[test]
+    fn transfer_grant_reserves_and_counts_once_across_request_leases() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = database
+            .create_share(
+                "share",
+                None,
+                "file.bin",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+
+        assert_eq!(
+            database
+                .begin_transfer_lease("client", "lease-one", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferLeaseBeginOutcome::NewLease
+        );
+        assert_eq!(
+            database
+                .begin_transfer_lease("client", "lease-two", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferLeaseBeginOutcome::NewLease
+        );
+        assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 1);
+        assert_eq!(
+            database
+                .begin_transfer_lease("other", "blocked", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferLeaseBeginOutcome::LimitReached
+        );
+        assert_eq!(
+            database.complete_transfer_lease("lease-one").unwrap(),
+            TransferLeaseCompleteOutcome::Counted
+        );
+        assert_eq!(
+            database
+                .share_by_token("share")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
+        assert_eq!(
+            database.complete_transfer_lease("lease-two").unwrap(),
+            TransferLeaseCompleteOutcome::AlreadyCounted
+        );
+        assert_eq!(
+            database
+                .share_by_token("share")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
+        let counted_expiry: String = database
+            .conn()
+            .query_row(
+                "SELECT expires_at FROM public_transfer_grants WHERE share_id=?1",
+                [share_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .begin_transfer_lease("client", "resume", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferLeaseBeginOutcome::AlreadyCounted
+        );
+        let resumed_expiry: String = database
+            .conn()
+            .query_row(
+                "SELECT expires_at FROM public_transfer_grants WHERE share_id=?1",
+                [share_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resumed_expiry, counted_expiry);
+        assert_eq!(
+            database
+                .begin_transfer_lease("client", "new-resource", share_id, "other.bin", "download")
+                .unwrap(),
+            TransferLeaseBeginOutcome::LimitReached
+        );
+    }
+
+    #[test]
+    fn transfer_cancel_releases_only_the_final_pending_lease() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = database
+            .create_share(
+                "share",
+                None,
+                "file.bin",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        database
+            .begin_transfer_lease("client", "one", share_id, "file.bin", "download")
+            .unwrap();
+        database
+            .begin_transfer_lease("client", "two", share_id, "file.bin", "download")
+            .unwrap();
+        assert_eq!(
+            database.cancel_transfer_lease("one").unwrap(),
+            TransferLeaseCancelOutcome::Cancelled
+        );
+        assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 1);
+        assert_eq!(
+            database.cancel_transfer_lease("two").unwrap(),
+            TransferLeaseCancelOutcome::Cancelled
+        );
+        assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 0);
+        assert_eq!(
+            database
+                .begin_transfer_lease("other", "replacement", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferLeaseBeginOutcome::NewLease
+        );
+    }
+
+    #[test]
+    fn concurrent_transfer_grants_cannot_overbook_the_limit() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = database
+            .create_share(
+                "share",
+                None,
+                "folder",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for (client, lease, resource) in [
+            ("client-a", "lease-a", "folder/a"),
+            ("client-b", "lease-b", "folder/b"),
+        ] {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                database
+                    .begin_transfer_lease(client, lease, share_id, resource, "download")
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == TransferLeaseBeginOutcome::NewLease)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == TransferLeaseBeginOutcome::LimitReached)
+                .count(),
+            1
+        );
+        assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn transfer_heartbeat_and_expiry_are_enforced() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = database
+            .create_share(
+                "share",
+                None,
+                "file.bin",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        database
+            .begin_transfer_lease("client", "lease", share_id, "file.bin", "download")
+            .unwrap();
+        assert_eq!(
+            database.heartbeat_transfer_lease("lease").unwrap(),
+            TransferLeaseHeartbeatOutcome::Extended
+        );
+        database
+            .conn()
+            .execute(
+                "UPDATE public_transfer_leases SET expires_at='2000-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            database.heartbeat_transfer_lease("lease").unwrap(),
+            TransferLeaseHeartbeatOutcome::NotFound
+        );
+        assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 0);
     }
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 WORK_DIR="${VAULTLINK_SMOKE_DIR:-/tmp/vaultlink-setup-smoke}"
 BIN="${VAULTLINK_BIN:-/work/target/release/vaultlink}"
@@ -86,8 +87,13 @@ curl -sS -f -X POST "http://$SETUP_ADDR/" \
     --data-urlencode "admin_password_confirm=$ADMIN_PASSWORD" \
     | grep -q "Setup abgeschlossen"
 
+curl -sS -f -X POST "http://$SETUP_ADDR/complete" \
+    --data-urlencode "token=$TOKEN" \
+    | grep -q "Setup best"
+
 test -s "$CONFIG_PATH"
 test -s "$DATA_DIR/data.sqlite"
+test ! -e "$DATA_DIR/.vaultlink-initial-setup.pending"
 grep -q 'mode = "development"' "$CONFIG_PATH"
 grep -q "root_mount_path" "$CONFIG_PATH"
 

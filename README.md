@@ -8,9 +8,10 @@ GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sh
 
 ## 1. Sicherheitskonzept
 
-- Dateizugriffe sind Linux descriptor-relativ. `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` bindet Listing, Metadaten, Download, ZIP und Upload an den beim Start geöffneten Root-Descriptor. Ein Kernel ohne `openat2` wird mit verständlichem Startfehler abgewiesen.
-- Relative Nutzpfade verbieten absolute Pfade, `..`, Backslashes, NUL, doppelte Prozentkodierung und ungültiges UTF-8.
+- Dateizugriffe sind Linux descriptor-relativ. `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` bindet Adminzugriffe an den Storage-Root und öffentliche Zugriffe zusätzlich an eine pro Freigabe verengte Directory-/File-Capability. Sibling-Shares bleiben damit auch über Symlinks getrennt. Ein Kernel ohne `openat2` wird mit verständlichem Startfehler abgewiesen.
+- Relative Nutzpfade werden nach genau einer HTTP-Dekodierung geprüft und verbieten absolute Pfade, `..`, Backslashes und NUL. Uploadnamen folgen zusätzlich einer plattformübergreifenden Policy, damit Windows-Prefixe und reservierte Namen nie aus dem Zielordner aufgelöst werden.
 - Uploads werden als zufällige `0600`-Temporärdateien im Zielordner geschrieben, geflusht und per `fsync` gesichert. Default ist atomarer No-Replace-Publish mit `renameat2(RENAME_NOREPLACE)`; optional kann pro Upload-Ordnerlink ein explizit bestätigtes atomisches Ersetzen erlaubt werden.
+- Abgebrochene private Uploadfragmente werden in fortsetzbaren Hintergrund-Batches entfernt; eine synchronisierte Active-Registry verhindert dabei Kollisionen mit Uploads des laufenden Prozesses. Listing, Suche und ZIP budgetieren jedes rohe Verzeichniselement, auch wenn es später als intern oder unsicher gefiltert wird.
 - Adminpasswörter verwenden Argon2id. Nach dem Passwort ist TOTP zwingend. Sessions sind zufällige serverseitige Bearer-Tokens, deren Hash in SQLite liegt.
 - Cookies sind `HttpOnly`, `SameSite=Strict` und in Production `Secure`.
 - Mutierende Adminaktionen verlangen CSRF. Login und Share-Unlock sind rate-limitiert.
@@ -18,7 +19,7 @@ GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sh
 - Security Header: CSP, `X-Content-Type-Options: nosniff`, Frame-Schutz, Referrer-Policy, Permissions-Policy und HSTS nur bei HTTPS.
 - Audit liegt in SQLite und wird strukturiert an journald gespiegelt. Passwörter, TOTP-Secrets, Sessiontokens und Share-Tokens werden nicht geloggt.
 
-Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner. VaultLink ersetzt vorhandene Dateien nur, wenn ein Admin dies für den konkreten Upload-Link erlaubt und der Public-Uploader das Ersetzen beim Upload aktiv bestätigt. Ordnerfreigaben unterstützen ZIP-Download mit Limits, Suche, Upload in navigierten Unterordnern und Preview bei Downloadrecht. Upload-only-Freigaben listen keine Inhalte und erlauben keine Preview/Downloads.
+Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner. VaultLink ersetzt vorhandene Dateien nur, wenn ein Admin dies für den konkreten Upload-Link erlaubt und der Public-Uploader das Ersetzen beim Upload aktiv bestätigt. Ordnerfreigaben unterstützen begrenzt und inkrementell erzeugte ZIP-Downloads, Suche, Upload in navigierten Unterordnern und Preview bei Downloadrecht. Kleine Standardlimits schützen gepufferte Form-/JSON-Routen; nur Uploadrouten erhalten den großen, weiterhin gestreamten Body-Rahmen. Davor begrenzt ein konstanter Streaming-Guard Multipart-Präambel und jeden Headerblock, ohne Dateiinhalte zu sammeln. Upload-only-Freigaben listen keine Inhalte und erlauben keine Preview/Downloads.
 
 ## 2. Projektstruktur
 
@@ -48,7 +49,7 @@ VaultLink/
 
 ## 3. Daten- und Persistenzmodell
 
-SQLite ist bewusst gewählt: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `runtime_settings`, `audit`.
+SQLite ist bewusst gewählt: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `runtime_settings`, `audit`.
 
 `shares.max_upload_size` ist optional; `NULL` nutzt das globale Runtime-Limit. Migrationen laufen transaktional über `PRAGMA user_version`; unbekannte neuere Schemas verweigern den Start. Die Datenbank liegt standardmäßig in `/var/lib/vaultlink/data.sqlite` und muss `vaultlink:vaultlink 0600` gehören.
 
@@ -57,6 +58,8 @@ Upgrade mit Backup bei gestopptem Dienst:
 ```sh
 sudo deploy/vaultlink-upgrade.sh /pfad/zum/neuen/vaultlink
 ```
+
+Das Upgrade-Skript ist ausschließlich für eine bestehende Installation mit Binary und Datenbank gedacht. Es bereitet Binary und Backup-Verzeichnis vor der Downtime vor, veröffentlicht nur ein erfolgreich geprüftes SQLite-Backup und startet bei frühen Fehlern den zuvor laufenden Dienst wieder. Scheitert Aktivierung oder Health-Check, werden Binary und Datenbank aus dem verifizierten Backup restauriert.
 
 Restore und Rollback: [docs/UPGRADE-ROLLBACK.md](docs/UPGRADE-ROLLBACK.md).
 
@@ -76,7 +79,11 @@ Startregeln:
 - `standalone_tls` + `certificate_source = "files"`: Production, HTTPS-URL, TLS aktiv, Zertifikat und Key vorhanden; optionaler SIGHUP-Reload.
 - `standalone_tls` + `certificate_source = "letsencrypt"`: Production, HTTPS-URL, TLS aktiv, Reverse Proxy aus, DNS-Domain in `public_base_url`, Kontakt-E-Mail und sicherer ACME-Cache innerhalb `data_directory`.
 
+`public_base_url` verwendet kanonische `http://`- beziehungsweise `https://`-Authority-Syntax und darf weder Zugangsdaten noch Query oder Fragment enthalten.
+
 Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadlimit, blockierte Endungen, Share-Passwortpolitik, Unlock-Dauer, ZIP-/Search-/Text-/Media-Preview-Limits, Text-/Bild-Preview-Endungen und PDF-Preview-Status. Servermodus, Bind-Adresse, TLS-Pfade, Trusted Proxies, Root-Mount, Data-Dir und ACME-Modus bleiben file-/restart-basiert.
+
+Runtime-Settings werden als ein validierter Snapshot in SQLite geschrieben und erst danach atomar im Arbeitsspeicher ausgetauscht. Beim Start wird ebenfalls der vollständige Snapshot validiert; gültige gekoppelte Werte hängen nicht von der alphabetischen Schlüsselreihenfolge ab.
 
 ## 5. Routen- und API-Design
 
@@ -95,8 +102,8 @@ Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadli
 | `/admin/audit` | GET | paginiertes Audit-Dashboard |
 | `/v/:token` | GET | öffentliche Datei-/Ordnerseite |
 | `/v/:token/unlock` | POST | passwortgeschützte Freigabe entsperren |
-| `/v/:token/preview` | GET | öffentliche Preview, zählt als Downloadzugriff |
-| `/v/:token/preview/raw` | GET/HEAD | kurzlebig tokenisierte Raw-Bild/PDF-Preview |
+| `/v/:token/preview` | GET | öffentliche Text-/Media-Preview-Seite |
+| `/v/:token/preview/raw` | GET/HEAD | kurzlebig tokenisierte Raw-Bild/PDF-Preview; erfolgreicher GET zählt |
 | `/v/:token/download` | GET/HEAD | Streaming, einzelner Byte-Range, `206`/`416` |
 | `/v/:token/download.zip` | GET | limitierter ZIP-Download für Ordner |
 | `/v/:token/upload` | POST | exklusiver Ordnerupload |
@@ -134,7 +141,7 @@ JSON-Fehler haben die Form:
 
 Auch delegierte API-Routen für Download, Upload, Preview und ZIP normalisieren Fehler auf dieses JSON-Format. Erfolgreiche Streaming-Antworten bleiben Binärdaten.
 
-Interne absolute Pfade, Passwort-Hashes, Session-Hashes, Unlock-/Preview-Session-Hashes und TOTP-Secrets werden nicht ausgegeben. TOTP-Secrets erscheinen nur einmalig bei Admin-Erstellung oder MFA-Reset.
+Interne absolute Pfade, Passwort-Hashes, Session-Hashes, Unlock-/Preview-/Transfer-Hashes und TOTP-Secrets werden nicht über die API ausgegeben. TOTP-Secrets erscheinen bei Admin-Erstellung oder MFA-Reset einmalig. Beim ersten lokalen Setup bleibt das initiale Secret bis zum expliziten Klick auf „Secret sicher gespeichert“ mit Setup-Token und Adminpasswort wiederherstellbar; danach wird der Pending-Marker gelöscht.
 
 ## 6. UI und UX
 
@@ -148,7 +155,7 @@ Preview:
 - Bilder: nur allowlistete Rasterformate (`jpg`, `jpeg`, `png`, `gif`, `webp`, `bmp`, `avif` per Default), feste Content-Types, `nosniff`.
 - PDF: `application/pdf`, `inline`, `nosniff`, kein serverseitiges Rendering.
 - Alle anderen Dateitypen bleiben blockiert.
-- Public Media-Raw-Preview benötigt einen kurzlebigen, share- und pfadgebundenen Preview-Token. Die Preview-Seite zählt genau einmal als Downloadzugriff; PDF-Range-Requests umgehen Downloadlimits nicht mehrfach.
+- Public Media-Raw-Preview benötigt einen kurzlebigen, share- und pfadgebundenen Preview-Token. Textpreview zählt nach vollständig ausgelieferter HTML-Antwort; bei Bild/PDF zählt erst der vollständig ausgelieferte Raw-GET. Abgebrochene Antworten zählen nicht. Range-Requests teilen innerhalb eines festen 15-Minuten-Resume-Fensters einen Transfer-Grant, ohne dieses Fenster durch Wiederholungen unbegrenzt zu verlängern.
 
 ## 7. HTTPS- und Betriebsmodi
 
@@ -265,7 +272,7 @@ cargo run -- init-admin --config config/development.toml --username admin
 make run
 ```
 
-`make sample-data` erzeugt `dev/mount` und `dev/data`. WSL braucht kein systemd und kein TLS. Wenn Docker in WSL verfügbar ist, prüft `make docker-setup-smoke` das lokale Setup-UI in einem frischen Debian-Container. `make docker-api-smoke` startet zusätzlich eine frische Setup-Installation und testet die session-basierte JSON-API inklusive Login, MFA, CSRF, Dateibrowser, Share-Erstellung und Public-Upload-Fehlern als JSON.
+`make sample-data` erzeugt `dev/mount` und `dev/data`. WSL braucht kein systemd und kein TLS. Wenn Docker verfügbar ist, baut `make docker-smoke` einmalig das digest-gepinnte Debian-13/Rust-Testimage und führt ohne externes Containernetzwerk Setup-, API- sowie isolierte Upgrade-/Rollback-Fehlertests aus. `make docker-setup-smoke`, `make docker-api-smoke` und `make docker-upgrade-safety-test` bleiben als einzelne Ziele verfügbar. `make policy-check` verhindert mutable Action-/Image-Referenzen, ungepinnte Cargo-CI-Tools und fehlende Docker-Secret-Ausschlüsse.
 
 ## Troubleshooting
 

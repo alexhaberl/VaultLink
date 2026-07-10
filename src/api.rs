@@ -2,6 +2,7 @@ use std::{net::SocketAddr, path::Path};
 
 use axum::{
     body::Body,
+    extract::DefaultBodyLimit,
     extract::{ConnectInfo, Path as AxPath, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
@@ -14,10 +15,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth,
-    db::{AdminSummary, AuditEvent, Permission, Share, UploadConflictStrategy},
+    db::{
+        AdminDeactivationOutcome, AdminSummary, AuditEvent, Permission, Share,
+        UploadConflictStrategy,
+    },
     http_auth::{
-        audit, clear_session_cookie, csrf_header, database, make_session_cookie,
-        make_unlock_cookie, runtime_settings, session, share_is_unlocked, MissingSession,
+        audit, clear_session_cookie, commit_runtime_settings, csrf_header, database,
+        make_session_cookie, make_unlock_cookie, runtime_settings, session, share_is_unlocked,
+        MissingSession, UnlockCookieScope,
     },
     path_security, proxy,
     runtime::RuntimeSettings,
@@ -133,7 +138,14 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/public/shares/{token}/download.zip",
             get(crate::web::download_zip),
         )
-        .route("/public/shares/{token}/upload", post(crate::web::upload))
+        .route(
+            "/public/shares/{token}/upload",
+            post(crate::web::upload)
+                .layer(DefaultBodyLimit::max(
+                    crate::web::HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize,
+                ))
+                .layer(middleware::from_fn(crate::web::guard_multipart_upload)),
+        )
         .layer(middleware::from_fn(normalize_api_errors))
         .with_state(state)
 }
@@ -385,7 +397,49 @@ struct FilesResponse {
     path: String,
     page: usize,
     has_next: bool,
+    truncated: bool,
     entries: Vec<FileEntryResponse>,
+}
+
+fn list_file_page(
+    secure_root: crate::secure_fs::SecureRoot,
+    relative: &str,
+    page: usize,
+    query: Option<&str>,
+    scan_limit: usize,
+) -> std::io::Result<(Vec<crate::secure_fs::Entry>, bool)> {
+    let needle = query.map(str::to_ascii_lowercase);
+    let skip = page.saturating_mul(100);
+    let mut matched = 0usize;
+    let mut scanned = 0usize;
+    let mut results = Vec::new();
+    let mut truncated = false;
+    let mut directory = secure_root.scan_directory(relative)?;
+    while results.len() < 101 {
+        let remaining = scan_limit.saturating_sub(scanned);
+        if remaining == 0 {
+            let sentinel = directory.run_batch(1)?;
+            truncated = sentinel.scanned != 0 || !sentinel.complete;
+            break;
+        }
+        let batch = directory.run_batch(remaining.min(100))?;
+        scanned = scanned.saturating_add(batch.scanned);
+        for entry in batch.entries {
+            if needle
+                .as_ref()
+                .is_none_or(|needle| entry.name.to_ascii_lowercase().contains(needle))
+            {
+                if matched >= skip && results.len() < 101 {
+                    results.push(entry);
+                }
+                matched = matched.saturating_add(1);
+            }
+        }
+        if batch.complete {
+            break;
+        }
+    }
+    Ok((results, truncated))
 }
 
 async fn files(
@@ -398,22 +452,20 @@ async fn files(
     let raw = query.path.unwrap_or_default();
     let rel = validate_rel(&raw)?;
     let page = query.page.unwrap_or(0).min(1_000_000);
+    let search = query
+        .q
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let secure_root = state.secure_root.clone();
-    let entries =
-        tokio::task::spawn_blocking(move || secure_root.list(&rel, page.saturating_mul(100), 101))
-            .await
-            .map_err(ApiError::internal)?
-            .map_err(ApiError::internal)?;
+    let scan_limit = settings.max_search_entries;
+    let (entries, truncated) = tokio::task::spawn_blocking(move || {
+        list_file_page(secure_root, &rel, page, search.as_deref(), scan_limit)
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)?;
     let mut entries = entries
         .into_iter()
-        .filter(|entry| {
-            query.q.as_ref().is_none_or(|q| {
-                entry
-                    .name
-                    .to_ascii_lowercase()
-                    .contains(&q.to_ascii_lowercase())
-            })
-        })
         .map(|entry| {
             let path = if raw.is_empty() {
                 entry.name.clone()
@@ -438,6 +490,7 @@ async fn files(
         path: raw,
         page,
         has_next,
+        truncated,
         entries,
     }))
 }
@@ -461,12 +514,16 @@ struct ShareResponse {
 }
 
 fn share_response(settings: &RuntimeSettings, share: Share) -> ShareResponse {
-    let token_path = share.alias.clone().unwrap_or_else(|| share.token.clone());
+    let public_path = share
+        .alias
+        .as_ref()
+        .map(|alias| format!("s/{alias}"))
+        .unwrap_or_else(|| format!("v/{}", share.token));
     ShareResponse {
         id: share.id,
         token: share.token,
         alias: share.alias,
-        url: format!("{}/v/{}", settings.public_base_url, token_path),
+        url: format!("{}/{}", settings.public_base_url, public_path),
         path: share.relative_path,
         is_directory: share.is_directory,
         permission: share.permission,
@@ -523,6 +580,16 @@ async fn create_share(
     if metadata.is_file() && request.permission.can_upload() {
         return Err(ApiError::bad_request(
             "Upload-Rechte sind für Datei-Freigaben nicht erlaubt",
+        ));
+    }
+    if request.max_downloads == Some(0) {
+        return Err(ApiError::bad_request(
+            "Maximale Downloadanzahl muss mindestens 1 sein",
+        ));
+    }
+    if request.max_upload_size == Some(0) {
+        return Err(ApiError::bad_request(
+            "Uploadlimit muss mindestens 1 Byte sein",
         ));
     }
     let alias = request
@@ -882,17 +949,22 @@ async fn set_admin_active_api(
             "Eigener Admin kann nicht stillgelegt werden",
         ));
     }
-    if !active {
-        let active_count = database(state.db.clone(), |db| db.active_admin_count()).await?;
-        if active_count <= 1 {
-            return Err(ApiError::bad_request(
-                "Letzter aktiver Admin kann nicht stillgelegt werden",
-            ));
+    if active {
+        if !database(state.db.clone(), move |db| db.activate_admin(id)).await? {
+            return Err(ApiError::not_found("Admin nicht gefunden"));
         }
-    }
-    let changed = database(state.db.clone(), move |db| db.set_admin_active(id, active)).await?;
-    if !changed {
-        return Err(ApiError::not_found("Admin nicht gefunden"));
+    } else {
+        match database(state.db.clone(), move |db| db.deactivate_admin(id)).await? {
+            AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive => {}
+            AdminDeactivationOutcome::LastActive => {
+                return Err(ApiError::bad_request(
+                    "Letzter aktiver Admin kann nicht stillgelegt werden",
+                ));
+            }
+            AdminDeactivationOutcome::NotFound => {
+                return Err(ApiError::not_found("Admin nicht gefunden"));
+            }
+        }
     }
     audit(
         &state,
@@ -1038,40 +1110,51 @@ async fn update_settings(
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
     let mut next = runtime_settings(&state);
-    next.public_base_url = body
-        .public_base_url
-        .trim()
-        .trim_end_matches('/')
-        .to_string();
-    next.max_upload_size = body.max_upload_size;
-    next.blocked_extensions = body.blocked_extensions;
-    next.share_password_min_length = body.share_password_min_length;
-    next.share_password_max_length = body.share_password_max_length;
-    next.share_unlock_minutes = body.share_unlock_minutes;
-    next.max_zip_size = body.max_zip_size;
-    next.max_zip_files = body.max_zip_files;
-    next.max_search_entries = body.max_search_entries;
-    next.max_search_results = body.max_search_results;
-    next.max_preview_size = body.max_preview_size;
-    next.preview_extensions = body.preview_extensions;
-    next.image_preview_extensions = body.image_preview_extensions;
-    next.pdf_preview_enabled = body.pdf_preview_enabled;
-    next.max_media_preview_size = body.max_media_preview_size;
+    let max_upload_size = body.max_upload_size.to_string();
+    let blocked_extensions = body.blocked_extensions.join(",");
+    let share_password_min_length = body.share_password_min_length.to_string();
+    let share_password_max_length = body.share_password_max_length.to_string();
+    let share_unlock_minutes = body.share_unlock_minutes.to_string();
+    let max_zip_size = body.max_zip_size.to_string();
+    let max_zip_files = body.max_zip_files.to_string();
+    let max_search_entries = body.max_search_entries.to_string();
+    let max_search_results = body.max_search_results.to_string();
+    let max_preview_size = body.max_preview_size.to_string();
+    let preview_extensions = body.preview_extensions.join(",");
+    let image_preview_extensions = body.image_preview_extensions.join(",");
+    let pdf_preview_enabled = body.pdf_preview_enabled.to_string();
+    let max_media_preview_size = body.max_media_preview_size.to_string();
+    next.apply_many([
+        ("public_base_url", body.public_base_url.as_str()),
+        ("max_upload_size", max_upload_size.as_str()),
+        ("blocked_extensions", blocked_extensions.as_str()),
+        (
+            "share_password_min_length",
+            share_password_min_length.as_str(),
+        ),
+        (
+            "share_password_max_length",
+            share_password_max_length.as_str(),
+        ),
+        ("share_unlock_minutes", share_unlock_minutes.as_str()),
+        ("max_zip_size", max_zip_size.as_str()),
+        ("max_zip_files", max_zip_files.as_str()),
+        ("max_search_entries", max_search_entries.as_str()),
+        ("max_search_results", max_search_results.as_str()),
+        ("max_preview_size", max_preview_size.as_str()),
+        ("preview_extensions", preview_extensions.as_str()),
+        (
+            "image_preview_extensions",
+            image_preview_extensions.as_str(),
+        ),
+        ("pdf_preview_enabled", pdf_preview_enabled.as_str()),
+        ("max_media_preview_size", max_media_preview_size.as_str()),
+    ])
+    .map_err(|_| ApiError::bad_request("Invalid runtime setting"))?;
     next.validate()
         .map_err(|_| ApiError::bad_request("Ungültige Einstellung"))?;
-    let pairs = next.pairs();
     let admin_id = session_data.admin_id;
-    database(state.db.clone(), move |db| {
-        for (key, value) in pairs {
-            db.set_runtime_setting(key, &value, admin_id)?;
-        }
-        Ok(())
-    })
-    .await?;
-    *state
-        .runtime
-        .write()
-        .expect("runtime settings lock poisoned") = next.clone();
+    commit_runtime_settings(&state, next.clone(), admin_id).await?;
     audit(
         &state,
         session_data.username,
@@ -1249,8 +1332,13 @@ async fn unlock_share(
     let mut response = Json(SimpleResponse { ok: true }).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_str(&make_unlock_cookie(&state, &share, &unlock_token))
-            .map_err(ApiError::internal)?,
+        HeaderValue::from_str(&make_unlock_cookie(
+            &state,
+            &share,
+            &unlock_token,
+            UnlockCookieScope::Api,
+        ))
+        .map_err(ApiError::internal)?,
     );
     Ok(response)
 }
@@ -1578,6 +1666,23 @@ mod tests {
         let (session_cookie, csrf) = api_login(&state, &secret).await;
         let app = crate::web::router(state.clone());
 
+        let mut invalid_limit = json_request(
+            Method::POST,
+            "/api/v1/shares",
+            r#"{"path":"docs","permission":"download_only","max_downloads":0}"#,
+        );
+        invalid_limit.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        invalid_limit
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.clone().oneshot(invalid_limit).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
         let mut create = json_request(
             Method::POST,
             "/api/v1/shares",
@@ -1594,6 +1699,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
         assert!(body.contains(r#""alias":"docsapi""#));
+        assert!(body.contains(r#""url":"http://localhost:8080/s/docsapi""#));
         assert!(body.contains(r#""password_protected":true"#));
         assert!(body.contains(r#""upload_conflict_strategy":"overwrite_allowed""#));
         assert!(!body.contains("password_hash"));
@@ -1654,6 +1760,279 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = response_text(response).await;
         assert!(body.contains("CSRF"));
+    }
+
+    #[tokio::test]
+    async fn api_settings_are_canonical_and_restart_safe() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let config = state.config.as_ref().clone();
+        let secret = auth::new_totp_secret();
+        let hash = auth::hash_password("correct horse battery staple").unwrap();
+        state.db.create_admin("admin", &hash, &secret).unwrap();
+        let (session_cookie, csrf) = api_login(&state, &secret).await;
+        let app = crate::web::router(state.clone());
+
+        let mut invalid_body = settings_body(runtime_settings(&state));
+        invalid_body.public_base_url.clear();
+        let invalid_json = serde_json::to_string(&invalid_body).unwrap();
+        let mut invalid = json_request(Method::PUT, "/api/v1/settings", &invalid_json);
+        invalid.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        invalid
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.clone().oneshot(invalid).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state.db.runtime_settings().unwrap().is_empty());
+
+        let mut valid_body = settings_body(runtime_settings(&state));
+        valid_body.public_base_url = "http://localhost:8080/".into();
+        valid_body.blocked_extensions = vec!["EXE, .SH".into()];
+        let valid_json = serde_json::to_string(&valid_body).unwrap();
+        let mut valid = json_request(Method::PUT, "/api/v1/settings", &valid_json);
+        valid.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        valid
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.clone().oneshot(valid).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let current = runtime_settings(&state);
+        assert_eq!(current.public_base_url, "http://localhost:8080");
+        assert_eq!(current.blocked_extensions, ["exe", "sh"]);
+
+        drop(app);
+        drop(state);
+        let restarted = AppState::new(config).unwrap();
+        let restarted = runtime_settings(&restarted);
+        assert_eq!(restarted.public_base_url, "http://localhost:8080");
+        assert_eq!(restarted.blocked_extensions, ["exe", "sh"]);
+    }
+
+    #[tokio::test]
+    async fn api_file_search_filters_before_pagination() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        for index in 0..180 {
+            std::fs::write(root.path().join(format!("ordinary-{index:03}.txt")), "x").unwrap();
+        }
+        std::fs::write(root.path().join("only-late-match.txt"), "match").unwrap();
+        let state = test_state(root.path(), data.path());
+        let secret = auth::new_totp_secret();
+        let hash = auth::hash_password("correct horse battery staple").unwrap();
+        state.db.create_admin("admin", &hash, &secret).unwrap();
+        let (session_cookie, _) = api_login(&state, &secret).await;
+        let app = crate::web::router(state);
+        let mut request = json_request(Method::GET, "/api/v1/files?path=&q=only-late-match", "");
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("only-late-match.txt"), "{body}");
+        assert!(body.contains(r#""truncated":false"#));
+        assert!(body.contains(r#""has_next":false"#));
+    }
+
+    #[test]
+    fn api_file_pages_count_filtered_raw_directory_items() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        for _ in 0..2 {
+            std::fs::write(
+                root.path().join(crate::secure_fs::upload_fragment_name()),
+                b"partial",
+            )
+            .unwrap();
+        }
+        let state = test_state(root.path(), data.path());
+        let (entries, truncated) =
+            list_file_page(state.secure_root.clone(), "", 0, None, 1).unwrap();
+        assert!(entries.is_empty());
+        assert!(truncated);
+        let (entries, truncated) =
+            list_file_page(state.secure_root, "", 0, Some("missing"), 1).unwrap();
+        assert!(entries.is_empty());
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn api_unlock_cookie_authorizes_followup_api_download() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("secret.txt"), "protected content").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        let password_hash = auth::hash_password("very strong share password").unwrap();
+        state
+            .db
+            .create_share(
+                "protected-token",
+                None,
+                "secret.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                Some(&password_hash),
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = crate::web::router(state);
+        let unlock = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/public/shares/protected-token/unlock",
+                r#"{"password":"very strong share password"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unlock.status(), StatusCode::OK);
+        let set_cookie = unlock
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.contains("Path=/api/v1/public/shares/protected-token"));
+        let unlock_cookie = set_cookie.split(';').next().unwrap().to_string();
+
+        let mut download = json_request(
+            Method::GET,
+            "/api/v1/public/shares/protected-token/download",
+            "",
+        );
+        download.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        let download = app.oneshot(download).await.unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        assert!(download
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| value
+                .to_str()
+                .unwrap()
+                .contains("Path=/api/v1/public/shares/protected-token")));
+        assert_eq!(response_text(download).await, "protected content");
+    }
+
+    #[tokio::test]
+    async fn api_media_preview_keeps_unlock_and_raw_routes_api_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("protected")).unwrap();
+        std::fs::write(root.path().join("protected/image.png"), b"\x89PNG").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        let password_hash = auth::hash_password("very strong share password").unwrap();
+        state
+            .db
+            .create_share(
+                "media-token",
+                None,
+                "protected",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                Some(&password_hash),
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = crate::web::router(state.clone());
+        let unlock = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/public/shares/media-token/unlock",
+                r#"{"password":"very strong share password"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unlock.status(), StatusCode::OK);
+        let unlock_cookie = unlock
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let mut preview = json_request(
+            Method::GET,
+            "/api/v1/public/shares/media-token/preview?path=image.png",
+            "",
+        );
+        preview.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        let preview = app.clone().oneshot(preview).await.unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview = response_text(preview).await;
+        assert!(preview.contains("/api/v1/public/shares/media-token/preview/raw?path=image%2Epng"));
+        assert!(preview.contains("href=\"/api/v1/public/shares/media-token\""));
+        assert!(!preview.contains("/v/media-token/preview/raw"));
+        assert!(!preview.contains("href=\"/v/media-token\""));
+        let token_start = preview.find("preview_token=").unwrap() + "preview_token=".len();
+        let preview_token = preview[token_start..]
+            .chars()
+            .take_while(|character| *character != '"' && *character != '&')
+            .collect::<String>();
+
+        let mut raw = json_request(
+            Method::GET,
+            &format!(
+                "/api/v1/public/shares/media-token/preview/raw?path=image.png&preview_token={preview_token}"
+            ),
+            "",
+        );
+        raw.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        let raw = app.oneshot(raw).await.unwrap();
+        assert_eq!(raw.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(raw.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"\x89PNG"
+        );
+        assert_eq!(
+            state
+                .db
+                .share_by_token("media-token")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
     }
 
     #[tokio::test]

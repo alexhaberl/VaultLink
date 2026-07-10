@@ -8,6 +8,7 @@ use crate::{
 };
 
 pub const SESSION_COOKIE: &str = "vaultlink_session";
+const TRANSFER_COOKIE_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy)]
 pub enum MissingSession {
@@ -76,6 +77,26 @@ pub fn runtime_settings(state: &AppState) -> RuntimeSettings {
         .read()
         .expect("runtime settings lock poisoned")
         .clone()
+}
+
+pub async fn commit_runtime_settings(
+    state: &AppState,
+    next: RuntimeSettings,
+    admin_id: i64,
+) -> Result<()> {
+    next.validate_for_config(&state.config)
+        .map_err(|_| HttpAuthError::status(StatusCode::BAD_REQUEST, "Invalid runtime setting"))?;
+    let runtime = state.runtime.clone();
+    database(state.db.clone(), move |database| {
+        // Settings commits always acquire locks in Runtime -> Database order. Readers
+        // therefore see the old snapshot until SQLite has committed the replacement.
+        let mut current = runtime.write().expect("runtime settings lock poisoned");
+        let pairs = next.pairs();
+        database.replace_runtime_settings(&pairs, admin_id)?;
+        *current = next;
+        Ok(())
+    })
+    .await
 }
 
 pub fn named_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -197,13 +218,66 @@ pub async fn share_is_unlocked(
     .await
 }
 
-pub fn make_unlock_cookie(state: &AppState, share: &Share, token: &str) -> String {
-    let settings = runtime_settings(state);
+#[derive(Clone, Copy)]
+pub enum UnlockCookieScope {
+    Web,
+    Api,
+}
+
+#[derive(Clone, Copy)]
+pub enum TransferCookieScope {
+    Web,
+    Api,
+}
+
+pub fn transfer_cookie_name(share_id: i64) -> String {
+    format!("vaultlink_transfer_{share_id}")
+}
+
+pub fn transfer_cookie(headers: &HeaderMap, share_id: i64) -> Option<&str> {
+    named_cookie(headers, &transfer_cookie_name(share_id))
+}
+
+pub fn make_transfer_cookie(
+    state: &AppState,
+    share: &Share,
+    token: &str,
+    scope: TransferCookieScope,
+) -> String {
+    let path = match scope {
+        TransferCookieScope::Web => format!("/v/{}", share.token),
+        TransferCookieScope::Api => format!("/api/v1/public/shares/{}", share.token),
+    };
     format!(
-        "{}={}; Path=/v/{}; HttpOnly; SameSite=Strict; Max-Age={};{}",
+        "{}={}; Path={}; HttpOnly; SameSite=Strict; Max-Age={};{}",
+        transfer_cookie_name(share.id),
+        token,
+        path,
+        TRANSFER_COOKIE_MAX_AGE_SECONDS,
+        if state.config.security.secure_cookie {
+            " Secure"
+        } else {
+            ""
+        }
+    )
+}
+
+pub fn make_unlock_cookie(
+    state: &AppState,
+    share: &Share,
+    token: &str,
+    scope: UnlockCookieScope,
+) -> String {
+    let settings = runtime_settings(state);
+    let path = match scope {
+        UnlockCookieScope::Web => format!("/v/{}", share.token),
+        UnlockCookieScope::Api => format!("/api/v1/public/shares/{}", share.token),
+    };
+    format!(
+        "{}={}; Path={}; HttpOnly; SameSite=Strict; Max-Age={};{}",
         unlock_cookie_name(share.id),
         token,
-        share.token,
+        path,
         settings.share_unlock_minutes * 60,
         if state.config.security.secure_cookie {
             " Secure"

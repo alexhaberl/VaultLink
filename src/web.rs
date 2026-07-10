@@ -1,18 +1,28 @@
-use std::{collections::VecDeque, io::Read, net::SocketAddr, path::Path};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    io::{self, Read, Seek, Write},
+    net::SocketAddr,
+    path::Path,
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll},
+};
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{
-        ConnectInfo, DefaultBodyLimit, Form, Multipart, Path as AxPath, Query, Request, State,
+        ConnectInfo, DefaultBodyLimit, Form, Multipart, OriginalUri, Path as AxPath, Query,
+        Request, State,
     },
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use qrcode::{render::svg, QrCode};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -25,20 +35,28 @@ use tower_http::{
 
 use crate::{
     auth,
-    db::{Permission, Session, Share, UploadConflictStrategy},
+    db::{
+        AdminDeactivationOutcome, Database, Permission, Session, Share, TransferLeaseBeginOutcome,
+        TransferLeaseCompleteOutcome, UploadConflictStrategy,
+    },
     http_auth::{
-        audit, clear_session_cookie, csrf, database, make_session_cookie, make_unlock_cookie,
-        redirect_with_cookie, runtime_settings, session, share_is_unlocked, MissingSession,
+        audit, clear_session_cookie, commit_runtime_settings, csrf, database, make_session_cookie,
+        make_transfer_cookie, make_unlock_cookie, redirect_with_cookie, runtime_settings, session,
+        share_is_unlocked, transfer_cookie, MissingSession, TransferCookieScope, UnlockCookieScope,
     },
     path_security, proxy,
     range::parse_byte_range,
     runtime,
     runtime::RuntimeSettings,
-    secure_fs::Entry,
+    secure_fs::{DirectoryScan, Entry, SecureDirectory, SecureFile, SecureRoot},
     AppState,
 };
 
-const HARD_MULTIPART_LIMIT: u64 = 128 * 1024 * 1024 * 1024;
+pub(crate) const HARD_MULTIPART_LIMIT: u64 = 128 * 1024 * 1024 * 1024;
+const DEFAULT_REQUEST_BODY_LIMIT: usize = 1024 * 1024;
+const MAX_UPLOAD_PATH_FIELD_BYTES: usize = 4 * 1024;
+const MAX_UPLOAD_OPTION_FIELD_BYTES: usize = 16;
+const MAX_UPLOAD_MULTIPART_FIELDS: usize = 4;
 
 #[derive(Debug)]
 pub struct AppError(StatusCode, &'static str);
@@ -107,14 +125,19 @@ pub fn router(state: AppState) -> Router {
         .route("/v/{token}/unlock", post(unlock_share))
         .route("/v/{token}/download", get(download).head(download))
         .route("/v/{token}/download.zip", get(download_zip))
-        .route("/v/{token}/upload", post(upload))
+        .route(
+            "/v/{token}/upload",
+            post(upload)
+                .layer(DefaultBodyLimit::max(limit))
+                .layer(middleware::from_fn(guard_multipart_upload)),
+        )
         .route("/s/{alias}", get(short_redirect))
         .route("/assets/app.js", get(app_js))
         .route("/assets/vaultlink-logo.svg", get(logo_svg))
         .route("/assets/favicon.svg", get(favicon_svg))
         .route("/assets/favicon-32.png", get(favicon_png))
         .route("/favicon.ico", get(favicon_png))
-        .layer(DefaultBodyLimit::max(limit))
+        .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
             header::HeaderName::from_static("x-request-id"),
@@ -151,6 +174,13 @@ async fn security_headers(State(state): State<AppState>, req: Request, next: Nex
     }
     h.insert("cache-control", HeaderValue::from_static("no-store"));
     response
+}
+
+pub(crate) async fn guard_multipart_upload(request: Request, next: Next) -> Response {
+    match crate::multipart_guard::guard_multipart_request(request) {
+        Ok(request) => next.run(request).await,
+        Err(error) => AppError(error.status_code(), "Ungültiger Multipart-Upload").into_response(),
+    }
 }
 
 fn esc(s: &str) -> String {
@@ -308,7 +338,336 @@ fn storage_has_room(path: &Path, needed: u64) -> bool {
 fn storage_full_error(error: &std::io::Error) -> bool {
     const ENOSPC: i32 = 28;
     const EDQUOT: i32 = 122;
-    matches!(error.raw_os_error(), Some(ENOSPC | EDQUOT))
+    error.kind() == std::io::ErrorKind::StorageFull
+        || matches!(error.raw_os_error(), Some(ENOSPC | EDQUOT | 112))
+}
+
+struct PublicTransferLease {
+    lease_token: Option<String>,
+    cookie: String,
+    heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    database: Database,
+}
+
+impl PublicTransferLease {
+    fn into_stream_parts(mut self) -> (String, Option<tokio::sync::oneshot::Sender<()>>) {
+        let lease_token = self
+            .lease_token
+            .take()
+            .expect("public transfer lease token");
+        let heartbeat_stop = self.heartbeat_stop.take();
+        (lease_token, heartbeat_stop)
+    }
+}
+
+impl Drop for PublicTransferLease {
+    fn drop(&mut self) {
+        self.heartbeat_stop.take();
+        if let Some(lease_token) = self.lease_token.take() {
+            spawn_transfer_cancel(self.database.clone(), lease_token);
+        }
+    }
+}
+
+fn start_transfer_heartbeat(
+    database: Database,
+    lease_token: String,
+) -> Option<tokio::sync::oneshot::Sender<()>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let (stop_sender, mut stop_receiver) = tokio::sync::oneshot::channel();
+    handle.spawn(async move {
+        let heartbeat_interval = std::time::Duration::from_secs(
+            (crate::db::TRANSFER_SESSION_TTL_SECONDS / 3) as u64,
+        );
+        let mut ticker = tokio::time::interval(heartbeat_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = &mut stop_receiver => break,
+                _ = ticker.tick() => {
+                    let heartbeat_database = database.clone();
+                    let heartbeat_token = lease_token.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        heartbeat_database.heartbeat_transfer_lease(&heartbeat_token)
+                    }).await {
+                        Ok(Ok(crate::db::TransferLeaseHeartbeatOutcome::Extended)) => {}
+                        Ok(Ok(crate::db::TransferLeaseHeartbeatOutcome::NotFound)) => {
+                            tracing::warn!("public transfer lease disappeared while the response was active");
+                            break;
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "could not heartbeat public transfer lease");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "public transfer heartbeat task failed");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Some(stop_sender)
+}
+
+fn transfer_scope(uri: &Uri) -> TransferCookieScope {
+    if uri.path().starts_with("/api/v1/") {
+        TransferCookieScope::Api
+    } else {
+        TransferCookieScope::Web
+    }
+}
+
+fn public_share_route(uri: &Uri, token: &str) -> String {
+    if uri.path().starts_with("/api/v1/") {
+        format!("/api/v1/public/shares/{token}")
+    } else {
+        format!("/v/{token}")
+    }
+}
+
+async fn begin_public_transfer(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    share: &Share,
+    resource_key: String,
+    action: &'static str,
+) -> Result<PublicTransferLease> {
+    let session_token = transfer_cookie(headers, share.id)
+        .map(str::to_string)
+        .unwrap_or_else(|| auth::random_token(32));
+    let lease_token = auth::random_token(32);
+    let session_for_db = session_token.clone();
+    let lease_for_db = lease_token.clone();
+    let share_id = share.id;
+    let outcome = database(state.db.clone(), move |database| {
+        database.begin_transfer_lease(
+            &session_for_db,
+            &lease_for_db,
+            share_id,
+            &resource_key,
+            action,
+        )
+    })
+    .await?;
+    match outcome {
+        TransferLeaseBeginOutcome::NewLease | TransferLeaseBeginOutcome::AlreadyCounted => {
+            Ok(PublicTransferLease {
+                heartbeat_stop: start_transfer_heartbeat(state.db.clone(), lease_token.clone()),
+                lease_token: Some(lease_token),
+                cookie: make_transfer_cookie(state, share, &session_token, transfer_scope(uri)),
+                database: state.db.clone(),
+            })
+        }
+        TransferLeaseBeginOutcome::LimitReached => {
+            Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"))
+        }
+        TransferLeaseBeginOutcome::ShareUnavailable => {
+            Err(AppError(StatusCode::GONE, "Freigabe nicht verfügbar"))
+        }
+    }
+}
+
+fn transfer_complete_future(
+    database: Database,
+    lease_token: String,
+    action: &'static str,
+    share_id: i64,
+) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
+    Box::pin(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let outcome = database.complete_transfer_lease(&lease_token)?;
+            let audit_failed = outcome == TransferLeaseCompleteOutcome::Counted
+                && database
+                    .audit(
+                        "public",
+                        action,
+                        Some(&share_id.to_string()),
+                        Some("completed transfer session"),
+                    )
+                    .is_err();
+            Ok::<_, rusqlite::Error>(audit_failed)
+        })
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        match result {
+            Ok(true) => tracing::warn!(share_id, action, "could not audit completed transfer"),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(share_id, action, %error, "could not finalize public transfer lease");
+                return Err(io::Error::other(error.to_string()));
+            }
+        }
+        Ok(())
+    })
+}
+
+fn spawn_transfer_cancel(database: Database, lease_token: String) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let _ =
+            tokio::task::spawn_blocking(move || database.cancel_transfer_lease(&lease_token)).await;
+    });
+}
+
+struct TransferBodyStream {
+    inner: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
+    database: Database,
+    lease_token: Option<String>,
+    action: &'static str,
+    share_id: i64,
+    heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    finalize: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
+    remaining_bytes: Option<u64>,
+    pending_final_chunk: Option<Bytes>,
+}
+
+impl Stream for TransferBodyStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if let Some(finalize) = self.finalize.as_mut() {
+                return match finalize.as_mut().poll(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Ok(())) => {
+                        self.finalize.take();
+                        match self.pending_final_chunk.take() {
+                            Some(chunk) => Poll::Ready(Some(Ok(chunk))),
+                            None => Poll::Ready(None),
+                        }
+                    }
+                    Poll::Ready(Err(error)) => {
+                        self.finalize.take();
+                        Poll::Ready(Some(Err(error)))
+                    }
+                };
+            }
+            match self.inner.as_mut().poll_next(context) {
+                Poll::Ready(None) => {
+                    if self.remaining_bytes.is_some_and(|remaining| remaining > 0) {
+                        self.heartbeat_stop.take();
+                        if let Some(token) = self.lease_token.take() {
+                            spawn_transfer_cancel(self.database.clone(), token);
+                        }
+                        return Poll::Ready(Some(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "transfer source ended before Content-Length",
+                        ))));
+                    }
+                    self.heartbeat_stop.take();
+                    if let Some(token) = self.lease_token.take() {
+                        self.finalize = Some(transfer_complete_future(
+                            self.database.clone(),
+                            token,
+                            self.action,
+                            self.share_id,
+                        ));
+                        continue;
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.heartbeat_stop.take();
+                    if let Some(token) = self.lease_token.take() {
+                        spawn_transfer_cancel(self.database.clone(), token);
+                    }
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if let Some(remaining) = self.remaining_bytes {
+                        let chunk_length = chunk.len() as u64;
+                        if chunk_length > remaining {
+                            self.heartbeat_stop.take();
+                            if let Some(token) = self.lease_token.take() {
+                                spawn_transfer_cancel(self.database.clone(), token);
+                            }
+                            return Poll::Ready(Some(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "transfer source exceeded Content-Length",
+                            ))));
+                        }
+                        let remaining = remaining - chunk_length;
+                        self.remaining_bytes = Some(remaining);
+                        if remaining == 0 {
+                            self.heartbeat_stop.take();
+                            if let Some(token) = self.lease_token.take() {
+                                self.pending_final_chunk = Some(chunk);
+                                self.finalize = Some(transfer_complete_future(
+                                    self.database.clone(),
+                                    token,
+                                    self.action,
+                                    self.share_id,
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl Drop for TransferBodyStream {
+    fn drop(&mut self) {
+        self.heartbeat_stop.take();
+        if let Some(token) = self.lease_token.take() {
+            spawn_transfer_cancel(self.database.clone(), token);
+        }
+    }
+}
+
+fn transfer_body<S>(
+    stream: S,
+    state: &AppState,
+    transfer: PublicTransferLease,
+    action: &'static str,
+    share_id: i64,
+    expected_bytes: Option<u64>,
+) -> Body
+where
+    S: Stream<Item = io::Result<Bytes>> + Send + 'static,
+{
+    let (lease_token, heartbeat_stop) = transfer.into_stream_parts();
+    Body::from_stream(TransferBodyStream {
+        inner: Box::pin(stream),
+        database: state.db.clone(),
+        lease_token: Some(lease_token),
+        action,
+        share_id,
+        heartbeat_stop,
+        finalize: None,
+        remaining_bytes: expected_bytes,
+        pending_final_chunk: None,
+    })
+}
+
+async fn complete_transfer_without_body(
+    state: &AppState,
+    transfer: PublicTransferLease,
+    action: &'static str,
+    share_id: i64,
+) -> Result<()> {
+    let (lease_token, heartbeat_stop) = transfer.into_stream_parts();
+    drop(heartbeat_stop);
+    transfer_complete_future(state.db.clone(), lease_token, action, share_id)
+        .await
+        .map_err(internal)
+}
+
+fn set_transfer_cookie(response: &mut Response, cookie: &str) -> Result<()> {
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(cookie).map_err(internal)?,
+    );
+    Ok(())
 }
 
 fn upload_io_error(error: std::io::Error) -> AppError {
@@ -320,6 +679,24 @@ fn upload_io_error(error: std::io::Error) -> AppError {
     } else {
         internal(error)
     }
+}
+
+async fn limited_multipart_text(
+    mut field: axum::extract::multipart::Field<'_>,
+    maximum: usize,
+) -> std::result::Result<String, ()> {
+    let mut value = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(|_| ())? {
+        if value
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > maximum)
+        {
+            return Err(());
+        }
+        value.extend_from_slice(&chunk);
+    }
+    String::from_utf8(value).map_err(|_| ())
 }
 
 fn public_upload_error(
@@ -557,8 +934,9 @@ async fn admin_browser(
         }
     } else {
         let listing_path = rel.clone();
-        let entries = tokio::task::spawn_blocking(move || {
-            secure_root.list(&listing_path, page_number.saturating_mul(100), 101)
+        let scan_limit = settings.max_search_entries;
+        let (entries, truncated) = tokio::task::spawn_blocking(move || {
+            list_directory_page(&secure_root, &listing_path, page_number, scan_limit)
         })
         .await
         .map_err(internal)?
@@ -598,6 +976,9 @@ async fn admin_browser(
                 preview,
                 target
             );
+        }
+        if truncated {
+            rows += r#"<tr><td colspan="5" class="muted">Verzeichnis-Scanlimit erreicht; weitere Einträge werden aus Sicherheitsgründen nicht gelesen.</td></tr>"#;
         }
     }
     let encoded_path = encoded(&rel);
@@ -999,6 +1380,21 @@ fn preview_allowed(path: &str, settings: &RuntimeSettings) -> bool {
     preview_kind(path, settings).is_some()
 }
 
+fn public_preview_error(error: io::Error) -> AppError {
+    // Linux openat2 reports EXDEV/ELOOP when resolution would cross the
+    // descriptor-bound share or follow a forbidden final symlink. Keep that
+    // security boundary indistinguishable from a missing public file.
+    if matches!(error.raw_os_error(), Some(18 | 40)) {
+        return AppError(StatusCode::NOT_FOUND, "Datei nicht verfuegbar");
+    }
+    match error.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
+            AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar")
+        }
+        _ => AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"),
+    }
+}
+
 fn image_content_type(extension: &str) -> Option<&'static str> {
     match extension {
         "jpg" | "jpeg" => Some("image/jpeg"),
@@ -1017,29 +1413,92 @@ struct SearchHit {
     entry: Entry,
 }
 
-fn search_tree(
-    secure_root: crate::secure_fs::SecureRoot,
+trait DirectoryAccess: Clone + Send + 'static {
+    fn scan_entries(&self, relative: &str) -> io::Result<DirectoryScan>;
+    fn open_regular_file(&self, relative: &str) -> io::Result<std::fs::File>;
+    fn entry_metadata(&self, relative: &str) -> io::Result<std::fs::Metadata>;
+}
+
+impl DirectoryAccess for SecureRoot {
+    fn scan_entries(&self, relative: &str) -> io::Result<DirectoryScan> {
+        self.scan_directory(relative)
+    }
+
+    fn open_regular_file(&self, relative: &str) -> io::Result<std::fs::File> {
+        self.open_file(relative)
+    }
+
+    fn entry_metadata(&self, relative: &str) -> io::Result<std::fs::Metadata> {
+        self.metadata(relative)
+    }
+}
+
+impl DirectoryAccess for SecureDirectory {
+    fn scan_entries(&self, relative: &str) -> io::Result<DirectoryScan> {
+        self.scan_directory(relative)
+    }
+
+    fn open_regular_file(&self, relative: &str) -> io::Result<std::fs::File> {
+        self.open_file(relative).map(SecureFile::into_file)
+    }
+
+    fn entry_metadata(&self, relative: &str) -> io::Result<std::fs::Metadata> {
+        self.metadata(relative)
+    }
+}
+
+fn list_directory_page<D: DirectoryAccess>(
+    directory: &D,
+    relative: &str,
+    page: usize,
+    scan_limit: usize,
+) -> io::Result<(Vec<Entry>, bool)> {
+    let skip = page.saturating_mul(100);
+    let mut visible = 0usize;
+    let mut scanned = 0usize;
+    let mut entries = Vec::new();
+    let mut scan = directory.scan_entries(relative)?;
+    while entries.len() < 101 {
+        let remaining = scan_limit.saturating_sub(scanned);
+        if remaining == 0 {
+            let sentinel = scan.run_batch(1)?;
+            return Ok((entries, sentinel.scanned != 0 || !sentinel.complete));
+        }
+        let batch = scan.run_batch(remaining.min(100))?;
+        scanned = scanned.saturating_add(batch.scanned);
+        for entry in batch.entries {
+            if visible >= skip && entries.len() < 101 {
+                entries.push(entry);
+            }
+            visible = visible.saturating_add(1);
+        }
+        if batch.complete {
+            break;
+        }
+    }
+    Ok((entries, false))
+}
+
+fn search_tree<D: DirectoryAccess>(
+    secure_root: D,
     base: &str,
     query: &str,
     settings: &RuntimeSettings,
 ) -> std::io::Result<Vec<SearchHit>> {
     let needle = query.to_ascii_lowercase();
-    let mut visited = 0usize;
+    let mut scanned_entries = 0usize;
     let mut results = Vec::new();
     let mut queue = VecDeque::from([base.to_string()]);
     while let Some(directory) = queue.pop_front() {
-        let mut offset = 0usize;
+        let mut scan = secure_root.scan_entries(&directory)?;
         loop {
-            let entries = secure_root.list(&directory, offset, 100)?;
-            if entries.is_empty() {
-                break;
+            let remaining = settings.max_search_entries.saturating_sub(scanned_entries);
+            if remaining == 0 {
+                return Ok(results);
             }
-            offset += entries.len();
-            for entry in entries {
-                visited += 1;
-                if visited > settings.max_search_entries {
-                    return Ok(results);
-                }
+            let batch = scan.run_batch(remaining.min(100))?;
+            scanned_entries = scanned_entries.saturating_add(batch.scanned);
+            for entry in batch.entries {
                 let relative_path = join_display(&directory, &entry.name);
                 if entry.name.to_ascii_lowercase().contains(&needle)
                     && results.len() < settings.max_search_results
@@ -1061,7 +1520,7 @@ fn search_tree(
                     return Ok(results);
                 }
             }
-            if offset == 0 || !offset.is_multiple_of(100) {
+            if batch.complete {
                 break;
             }
         }
@@ -1069,8 +1528,260 @@ fn search_tree(
     Ok(results)
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
+const ZIP_CHUNK_SIZE: usize = 64 * 1024;
+const ZIP_CHANNEL_CHUNKS: usize = 8;
+const ZIP_TEMP_MIN_RESERVE: u64 = 64 * 1024 * 1024;
+static ZIP_TEMP_RESERVED: AtomicU64 = AtomicU64::new(0);
+
+struct ZipTempReservation {
+    bytes: u64,
+}
+
+impl ZipTempReservation {
+    fn acquire(estimated_bytes: u64) -> Option<Self> {
+        let safety = ZIP_TEMP_MIN_RESERVE.max(estimated_bytes / 10);
+        let required = estimated_bytes.checked_add(safety)?;
+        let available = disk_stats(&std::env::temp_dir()).map(|stats| stats.free);
+        loop {
+            let reserved = ZIP_TEMP_RESERVED.load(Ordering::Acquire);
+            if available.is_some_and(|free| free.saturating_sub(reserved) < required) {
+                return None;
+            }
+            if ZIP_TEMP_RESERVED
+                .compare_exchange_weak(
+                    reserved,
+                    reserved.checked_add(estimated_bytes)?,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(Self {
+                    bytes: estimated_bytes,
+                });
+            }
+        }
+    }
+}
+
+impl Drop for ZipTempReservation {
+    fn drop(&mut self) {
+        ZIP_TEMP_RESERVED.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+enum ZipBuildError {
+    Limit(&'static str),
+    Source(io::Error),
+    Output(io::Error),
+}
+
+impl ZipBuildError {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Limit(message) => io::Error::new(io::ErrorKind::InvalidData, message),
+            Self::Source(error) | Self::Output(error) => error,
+        }
+    }
+
+    fn is_output_capacity_error(&self) -> bool {
+        matches!(self, Self::Output(error) if storage_full_error(error))
+    }
+}
+
+#[derive(Clone)]
+struct ZipFilePlan {
+    source_path: String,
+    archive_name: String,
+    scanned_len: u64,
+}
+
+#[derive(Clone)]
+struct ZipPlan {
+    files: Vec<ZipFilePlan>,
+    max_data_size: u64,
+    estimated_archive_size: u64,
+}
+
+fn plan_zip<D: DirectoryAccess>(
+    directory: &D,
+    root_path: &str,
+    settings: &RuntimeSettings,
+) -> std::result::Result<ZipPlan, ZipBuildError> {
+    let mut queue = VecDeque::from([(root_path.to_string(), String::new())]);
+    let mut files = Vec::new();
+    let mut scanned_entries = 0usize;
+    let mut total_data = 0u64;
+    let mut estimated_archive_size = 22u64;
+    while let Some((current_directory, archive_prefix)) = queue.pop_front() {
+        let mut scan = directory
+            .scan_entries(&current_directory)
+            .map_err(ZipBuildError::Source)?;
+        loop {
+            let remaining = settings.max_search_entries.saturating_sub(scanned_entries);
+            if remaining == 0 {
+                let sentinel = scan.run_batch(1).map_err(ZipBuildError::Source)?;
+                if sentinel.scanned == 0 && sentinel.complete {
+                    break;
+                }
+                return Err(ZipBuildError::Limit("zip scan entry limit exceeded"));
+            }
+            let batch = scan
+                .run_batch(remaining.min(100))
+                .map_err(ZipBuildError::Source)?;
+            scanned_entries = scanned_entries.saturating_add(batch.scanned);
+            for entry in batch.entries {
+                let source_path = join_display(&current_directory, &entry.name);
+                let archive_name = join_display(&archive_prefix, &entry.name);
+                if entry.is_dir {
+                    queue.push_back((source_path, archive_name));
+                    continue;
+                }
+                if archive_name.len() > u16::MAX as usize {
+                    return Err(ZipBuildError::Limit("zip entry name is too long"));
+                }
+                files.push(ZipFilePlan {
+                    source_path,
+                    archive_name: archive_name.clone(),
+                    scanned_len: entry.len,
+                });
+                if files.len() > settings.max_zip_files || files.len() > u16::MAX as usize {
+                    return Err(ZipBuildError::Limit("zip file count limit exceeded"));
+                }
+                total_data = total_data
+                    .checked_add(entry.len)
+                    .ok_or(ZipBuildError::Limit("zip size overflow"))?;
+                if total_data > settings.max_zip_size {
+                    return Err(ZipBuildError::Limit("zip size limit exceeded"));
+                }
+                let name_len = archive_name.len() as u64;
+                estimated_archive_size = estimated_archive_size
+                    .checked_add(entry.len)
+                    .and_then(|size| size.checked_add(30 + name_len + 16 + 46 + name_len))
+                    .ok_or(ZipBuildError::Limit("zip archive size overflow"))?;
+                if estimated_archive_size > u32::MAX as u64 {
+                    return Err(ZipBuildError::Limit("ZIP64 archives are not supported"));
+                }
+            }
+            if batch.complete {
+                break;
+            }
+        }
+    }
+    Ok(ZipPlan {
+        files,
+        max_data_size: settings.max_zip_size,
+        estimated_archive_size,
+    })
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, written: 0 }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct StreamingZipEntry {
+    name: String,
+    crc: u32,
+    size: u32,
+    local_offset: u32,
+}
+
+fn write_zip_u16(writer: &mut impl Write, value: u16) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn write_zip_u32(writer: &mut impl Write, value: u32) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn write_streaming_local_header(writer: &mut impl Write, name: &[u8]) -> io::Result<()> {
+    write_zip_u32(writer, 0x0403_4b50)?;
+    write_zip_u16(writer, 20)?;
+    write_zip_u16(writer, 0x0808)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, 33)?;
+    write_zip_u32(writer, 0)?;
+    write_zip_u32(writer, 0)?;
+    write_zip_u32(writer, 0)?;
+    write_zip_u16(writer, name.len() as u16)?;
+    write_zip_u16(writer, 0)?;
+    writer.write_all(name)
+}
+
+fn write_streaming_descriptor(writer: &mut impl Write, crc: u32, size: u32) -> io::Result<()> {
+    write_zip_u32(writer, 0x0807_4b50)?;
+    write_zip_u32(writer, crc)?;
+    write_zip_u32(writer, size)?;
+    write_zip_u32(writer, size)
+}
+
+fn write_streaming_central_entry(
+    writer: &mut impl Write,
+    entry: &StreamingZipEntry,
+) -> io::Result<()> {
+    let name = entry.name.as_bytes();
+    write_zip_u32(writer, 0x0201_4b50)?;
+    write_zip_u16(writer, 20)?;
+    write_zip_u16(writer, 20)?;
+    write_zip_u16(writer, 0x0808)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, 33)?;
+    write_zip_u32(writer, entry.crc)?;
+    write_zip_u32(writer, entry.size)?;
+    write_zip_u32(writer, entry.size)?;
+    write_zip_u16(writer, name.len() as u16)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u32(writer, 0)?;
+    write_zip_u32(writer, entry.local_offset)?;
+    writer.write_all(name)
+}
+
+fn write_streaming_eocd(
+    writer: &mut impl Write,
+    entries: u16,
+    central_size: u32,
+    central_offset: u32,
+) -> io::Result<()> {
+    write_zip_u32(writer, 0x0605_4b50)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, entries)?;
+    write_zip_u16(writer, entries)?;
+    write_zip_u32(writer, central_size)?;
+    write_zip_u32(writer, central_offset)?;
+    write_zip_u16(writer, 0)
+}
+
+fn update_crc32(mut crc: u32, bytes: &[u8]) -> u32 {
     for byte in bytes {
         crc ^= u32::from(*byte);
         for _ in 0..8 {
@@ -1078,138 +1789,176 @@ fn crc32(bytes: &[u8]) -> u32 {
             crc = (crc >> 1) ^ (0xedb8_8320 & mask);
         }
     }
-    !crc
+    crc
 }
 
-struct ZipEntry {
-    name: String,
-    crc: u32,
-    size: u32,
-    local_offset: u32,
-}
-
-fn write_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn write_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_zip_file(out: &mut Vec<u8>, entries: &mut Vec<ZipEntry>, name: &str, bytes: &[u8]) {
-    let crc = crc32(bytes);
-    let local_offset = out.len() as u32;
-    let name_bytes = name.as_bytes();
-    write_u32(out, 0x0403_4b50);
-    write_u16(out, 20);
-    write_u16(out, 0x0800);
-    write_u16(out, 0);
-    write_u16(out, 0);
-    write_u16(out, 33);
-    write_u32(out, crc);
-    write_u32(out, bytes.len() as u32);
-    write_u32(out, bytes.len() as u32);
-    write_u16(out, name_bytes.len() as u16);
-    write_u16(out, 0);
-    out.extend_from_slice(name_bytes);
-    out.extend_from_slice(bytes);
-    entries.push(ZipEntry {
-        name: name.to_string(),
-        crc,
-        size: bytes.len() as u32,
-        local_offset,
-    });
-}
-
-fn finish_zip(mut out: Vec<u8>, entries: &[ZipEntry]) -> Vec<u8> {
-    let central_offset = out.len() as u32;
-    for entry in entries {
-        let name_bytes = entry.name.as_bytes();
-        write_u32(&mut out, 0x0201_4b50);
-        write_u16(&mut out, 20);
-        write_u16(&mut out, 20);
-        write_u16(&mut out, 0x0800);
-        write_u16(&mut out, 0);
-        write_u16(&mut out, 0);
-        write_u16(&mut out, 33);
-        write_u32(&mut out, entry.crc);
-        write_u32(&mut out, entry.size);
-        write_u32(&mut out, entry.size);
-        write_u16(&mut out, name_bytes.len() as u16);
-        write_u16(&mut out, 0);
-        write_u16(&mut out, 0);
-        write_u16(&mut out, 0);
-        write_u16(&mut out, 0);
-        write_u32(&mut out, 0);
-        write_u32(&mut out, entry.local_offset);
-        out.extend_from_slice(name_bytes);
+fn write_zip_archive<D: DirectoryAccess, W: Write>(
+    directory: &D,
+    plan: &ZipPlan,
+    output: W,
+) -> std::result::Result<W, ZipBuildError> {
+    let mut writer = CountingWriter::new(output);
+    let mut central_entries = Vec::with_capacity(plan.files.len());
+    let mut total_data = 0u64;
+    let mut buffer = vec![0u8; ZIP_CHUNK_SIZE];
+    for planned in &plan.files {
+        let local_offset = u32::try_from(writer.written)
+            .map_err(|_| ZipBuildError::Limit("ZIP64 archives are not supported"))?;
+        write_streaming_local_header(&mut writer, planned.archive_name.as_bytes())
+            .map_err(ZipBuildError::Output)?;
+        let mut source = directory
+            .open_regular_file(&planned.source_path)
+            .map_err(ZipBuildError::Source)?;
+        let mut remaining = planned.scanned_len;
+        let mut size = 0u64;
+        let mut crc = 0xffff_ffffu32;
+        while remaining > 0 {
+            let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+            let read = source
+                .read(&mut buffer[..wanted])
+                .map_err(ZipBuildError::Source)?;
+            if read == 0 {
+                break;
+            }
+            remaining -= read as u64;
+            size = size.saturating_add(read as u64);
+            total_data = total_data.saturating_add(read as u64);
+            if total_data > plan.max_data_size {
+                return Err(ZipBuildError::Limit("zip size limit exceeded"));
+            }
+            crc = update_crc32(crc, &buffer[..read]);
+            writer
+                .write_all(&buffer[..read])
+                .map_err(ZipBuildError::Output)?;
+        }
+        let size = u32::try_from(size)
+            .map_err(|_| ZipBuildError::Limit("ZIP64 entries are not supported"))?;
+        let crc = !crc;
+        write_streaming_descriptor(&mut writer, crc, size).map_err(ZipBuildError::Output)?;
+        central_entries.push(StreamingZipEntry {
+            name: planned.archive_name.clone(),
+            crc,
+            size,
+            local_offset,
+        });
     }
-    let central_size = out.len() as u32 - central_offset;
-    write_u32(&mut out, 0x0605_4b50);
-    write_u16(&mut out, 0);
-    write_u16(&mut out, 0);
-    write_u16(&mut out, entries.len() as u16);
-    write_u16(&mut out, entries.len() as u16);
-    write_u32(&mut out, central_size);
-    write_u32(&mut out, central_offset);
-    write_u16(&mut out, 0);
-    out
+    let central_offset = u32::try_from(writer.written)
+        .map_err(|_| ZipBuildError::Limit("ZIP64 archives are not supported"))?;
+    for entry in &central_entries {
+        write_streaming_central_entry(&mut writer, entry).map_err(ZipBuildError::Output)?;
+    }
+    let central_end = u32::try_from(writer.written)
+        .map_err(|_| ZipBuildError::Limit("ZIP64 archives are not supported"))?;
+    let central_size = central_end
+        .checked_sub(central_offset)
+        .ok_or(ZipBuildError::Limit("zip central directory overflow"))?;
+    write_streaming_eocd(
+        &mut writer,
+        central_entries.len() as u16,
+        central_size,
+        central_offset,
+    )
+    .map_err(ZipBuildError::Output)?;
+    writer.flush().map_err(ZipBuildError::Output)?;
+    Ok(writer.into_inner())
 }
 
-fn build_zip(
-    secure_root: crate::secure_fs::SecureRoot,
-    root_path: &str,
-    settings: RuntimeSettings,
-) -> std::io::Result<Vec<u8>> {
-    let mut queue = VecDeque::from([(root_path.to_string(), String::new())]);
-    let mut files = Vec::new();
-    let mut total = 0u64;
-    while let Some((directory, zip_prefix)) = queue.pop_front() {
-        let mut offset = 0usize;
-        loop {
-            let entries = secure_root.list(&directory, offset, 100)?;
-            if entries.is_empty() {
-                break;
-            }
-            offset += entries.len();
-            for entry in entries {
-                let fs_path = join_display(&directory, &entry.name);
-                let zip_name = join_display(&zip_prefix, &entry.name);
-                if entry.is_dir {
-                    queue.push_back((fs_path, zip_name));
-                    continue;
-                }
-                files.push((fs_path, zip_name, entry.len));
-                if files.len() > settings.max_zip_files {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "zip file count limit exceeded",
-                    ));
-                }
-                total = total.checked_add(entry.len).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "zip size overflow")
-                })?;
-                if total > settings.max_zip_size {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "zip size limit exceeded",
-                    ));
-                }
-            }
-            if offset == 0 || !offset.is_multiple_of(100) {
-                break;
-            }
+fn build_zip_temp<D: DirectoryAccess>(
+    directory: &D,
+    plan: &ZipPlan,
+) -> std::result::Result<std::fs::File, ZipBuildError> {
+    let file = tempfile::tempfile().map_err(ZipBuildError::Output)?;
+    let mut file = write_zip_archive(directory, plan, file)?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(ZipBuildError::Output)?;
+    Ok(file)
+}
+
+struct ZipChannelWriter {
+    sender: tokio::sync::mpsc::Sender<io::Result<Bytes>>,
+    buffer: Vec<u8>,
+}
+
+impl ZipChannelWriter {
+    fn new(sender: tokio::sync::mpsc::Sender<io::Result<Bytes>>) -> Self {
+        Self {
+            sender,
+            buffer: Vec::with_capacity(ZIP_CHUNK_SIZE),
         }
     }
-    let mut out = Vec::with_capacity(total.min(settings.max_zip_size) as usize);
-    let mut zip_entries = Vec::new();
-    for (fs_path, zip_name, _) in files {
-        let mut file = secure_root.open_file(&fs_path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        push_zip_file(&mut out, &mut zip_entries, &zip_name, &bytes);
+
+    fn send_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let bytes = Bytes::from(std::mem::replace(
+            &mut self.buffer,
+            Vec::with_capacity(ZIP_CHUNK_SIZE),
+        ));
+        self.sender
+            .blocking_send(Ok(bytes))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "zip client disconnected"))
     }
-    Ok(finish_zip(out, &zip_entries))
+}
+
+impl Write for ZipChannelWriter {
+    fn write(&mut self, mut input: &[u8]) -> io::Result<usize> {
+        let original_len = input.len();
+        while !input.is_empty() {
+            let remaining = ZIP_CHUNK_SIZE - self.buffer.len();
+            let take = remaining.min(input.len());
+            self.buffer.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.buffer.len() == ZIP_CHUNK_SIZE {
+                self.send_buffer()?;
+            }
+        }
+        Ok(original_len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.send_buffer()
+    }
+}
+
+fn direct_zip_stream<D: DirectoryAccess>(
+    directory: D,
+    plan: ZipPlan,
+) -> impl Stream<Item = io::Result<Bytes>> + Send {
+    let (sender, receiver) = tokio::sync::mpsc::channel(ZIP_CHANNEL_CHUNKS);
+    let error_sender = sender.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = write_zip_archive(&directory, &plan, ZipChannelWriter::new(sender)) {
+            let _ = error_sender.blocking_send(Err(error.into_io()));
+        }
+    });
+    futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    })
+}
+
+struct ReservedZipStream {
+    inner: ReaderStream<tokio::fs::File>,
+    _reservation: ZipTempReservation,
+}
+
+impl Stream for ReservedZipStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(context)
+    }
+}
+
+fn zip_error(error: ZipBuildError) -> AppError {
+    match error {
+        ZipBuildError::Limit(_) => AppError(StatusCode::PAYLOAD_TOO_LARGE, "ZIP-Limit erreicht"),
+        ZipBuildError::Source(_) => AppError(StatusCode::NOT_FOUND, "ZIP-Quelle nicht verfügbar"),
+        ZipBuildError::Output(_) => AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ZIP-Erstellung fehlgeschlagen",
+        ),
+    }
 }
 
 enum PreviewContent {
@@ -1218,8 +1967,28 @@ enum PreviewContent {
     Media { kind: PreviewKind, size: u64 },
 }
 
-fn read_preview(
-    secure_root: crate::secure_fs::SecureRoot,
+fn read_preview<D: DirectoryAccess>(
+    secure_root: D,
+    path: &str,
+    settings: &RuntimeSettings,
+) -> std::io::Result<PreviewContent> {
+    let metadata = secure_root.entry_metadata(path)?;
+    let file = secure_root.open_regular_file(path)?;
+    read_preview_opened(file, metadata, path, settings)
+}
+
+fn read_preview_secure_file(
+    file: SecureFile,
+    path: &str,
+    settings: &RuntimeSettings,
+) -> std::io::Result<PreviewContent> {
+    let metadata = file.metadata()?;
+    read_preview_opened(file.into_file(), metadata, path, settings)
+}
+
+fn read_preview_opened(
+    file: std::fs::File,
+    metadata: std::fs::Metadata,
     path: &str,
     settings: &RuntimeSettings,
 ) -> std::io::Result<PreviewContent> {
@@ -1229,7 +1998,6 @@ fn read_preview(
             "preview extension is not allowed",
         )
     })?;
-    let metadata = secure_root.metadata(path)?;
     if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1252,7 +2020,6 @@ fn read_preview(
             size: metadata.len(),
         });
     }
-    let file = secure_root.open_file(path)?;
     let mut bytes = Vec::new();
     file.take(settings.max_preview_size + 1)
         .read_to_end(&mut bytes)?;
@@ -1267,8 +2034,8 @@ fn read_preview(
     ))
 }
 
-async fn raw_preview_response(
-    secure_root: crate::secure_fs::SecureRoot,
+async fn raw_preview_response<D: DirectoryAccess>(
+    secure_root: D,
     method: Method,
     headers: HeaderMap,
     relative_file: String,
@@ -1276,10 +2043,40 @@ async fn raw_preview_response(
     max_size: u64,
 ) -> Result<Response> {
     let open_path = relative_file.clone();
-    let file = tokio::task::spawn_blocking(move || secure_root.open_file(&open_path))
+    let file = tokio::task::spawn_blocking(move || secure_root.open_regular_file(&open_path))
         .await
         .map_err(internal)?
         .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfuegbar"))?;
+    raw_preview_opened_response(file, method, headers, relative_file, kind, max_size).await
+}
+
+async fn raw_preview_secure_file_response(
+    file: SecureFile,
+    method: Method,
+    headers: HeaderMap,
+    relative_file: String,
+    kind: PreviewKind,
+    max_size: u64,
+) -> Result<Response> {
+    raw_preview_opened_response(
+        file.into_file(),
+        method,
+        headers,
+        relative_file,
+        kind,
+        max_size,
+    )
+    .await
+}
+
+async fn raw_preview_opened_response(
+    file: std::fs::File,
+    method: Method,
+    headers: HeaderMap,
+    relative_file: String,
+    kind: PreviewKind,
+    max_size: u64,
+) -> Result<Response> {
     if !file.metadata().map_err(internal)?.is_file() {
         return Err(AppError(StatusCode::BAD_REQUEST, "Keine Datei"));
     }
@@ -1615,14 +2412,15 @@ async fn create_share(
     {
         Some(parse_unit_to_bytes(value, GB, "UngÃ¼ltiges Uploadlimit")?)
     } else {
-        f.max_upload_size
+        let parsed = f
+            .max_upload_size
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.parse::<u64>())
             .transpose()
             .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiges Uploadlimit"))?;
-        None
+        parsed
     };
     if max_upload_size == Some(0) {
         return Err(AppError(
@@ -2105,16 +2903,17 @@ async fn deactivate_admin(
             "Eigener Admin kann nicht stillgelegt werden",
         ));
     }
-    let active_count = database(state.db.clone(), |db| db.active_admin_count()).await?;
-    if active_count <= 1 {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Letzter aktiver Admin kann nicht stillgelegt werden",
-        ));
-    }
-    let changed = database(state.db.clone(), move |db| db.set_admin_active(id, false)).await?;
-    if !changed {
-        return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
+    match database(state.db.clone(), move |db| db.deactivate_admin(id)).await? {
+        AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive => {}
+        AdminDeactivationOutcome::LastActive => {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "Letzter aktiver Admin kann nicht stillgelegt werden",
+            ));
+        }
+        AdminDeactivationOutcome::NotFound => {
+            return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
+        }
     }
     audit(
         &state,
@@ -2135,7 +2934,7 @@ async fn activate_admin(
 ) -> Result<Redirect> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
-    let changed = database(state.db.clone(), move |db| db.set_admin_active(id, true)).await?;
+    let changed = database(state.db.clone(), move |db| db.activate_admin(id)).await?;
     if !changed {
         return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
     }
@@ -2299,22 +3098,8 @@ async fn update_settings(
             "Production public_base_url muss HTTPS verwenden",
         ));
     }
-    let pairs = next.pairs();
     let admin_id = session.admin_id;
-    database(state.db.clone(), move |db| {
-        for (key, value) in pairs {
-            db.set_runtime_setting(key, &value, admin_id)?;
-        }
-        Ok(())
-    })
-    .await?;
-    {
-        let mut current = state
-            .runtime
-            .write()
-            .expect("runtime settings lock poisoned");
-        *current = next.clone();
-    }
+    commit_runtime_settings(&state, next.clone(), admin_id).await?;
     let actor = session.username.clone();
     audit(&state, actor, "settings_updated", None, None).await;
     Ok(Html(admin_page(
@@ -2471,7 +3256,7 @@ async fn unlock_share(
     .await;
     Ok(redirect_with_cookie(
         &format!("/v/{token}"),
-        make_unlock_cookie(&state, &share, &unlock_token),
+        make_unlock_cookie(&state, &share, &unlock_token, UnlockCookieScope::Web),
     ))
 }
 
@@ -2498,6 +3283,12 @@ async fn public_page(
         let message = match upload_status {
             "replaced" => "Datei erfolgreich ersetzt.",
             "ok" => "Upload erfolgreich abgeschlossen.",
+            "uncertain" => {
+                "Upload veröffentlicht; die dauerhafte Speicherung konnte nicht bestätigt werden."
+            }
+            "replaced_uncertain" => {
+                "Datei ersetzt; die dauerhafte Speicherung konnte nicht bestätigt werden."
+            }
             _ => "",
         };
         if !message.is_empty() {
@@ -2514,7 +3305,11 @@ async fn public_page(
             .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Pfad"))?
             .to_string_lossy()
             .replace('\\', "/");
-        let relative_dir = joined_relative(&sh.relative_path, &clean_sub)?;
+        let relative_dir = clean_sub.clone();
+        let share_scope = state
+            .secure_root
+            .bind_directory(&sh.relative_path)
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
         body += &public_breadcrumbs(&token, &clean_sub);
         if let Some(parent) = parent_path(&clean_sub) {
             body += &format!(
@@ -2528,7 +3323,7 @@ async fn public_page(
             esc(search.as_deref().unwrap_or("")),
             encoded(&clean_sub)
         );
-        let secure_root = state.secure_root.clone();
+        let secure_root = share_scope;
         let mut rows = String::new();
         let mut has_next = false;
         if let Some(search) = search.clone() {
@@ -2540,12 +3335,7 @@ async fn public_page(
             .map_err(internal)?
             .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfÃ¼gbar"))?;
             for hit in hits {
-                let share_rel = hit
-                    .relative_path
-                    .strip_prefix(&sh.relative_path)
-                    .unwrap_or(&hit.relative_path)
-                    .trim_start_matches('/')
-                    .to_string();
+                let share_rel = hit.relative_path.clone();
                 let target = encoded(&share_rel);
                 let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings)
                 {
@@ -2572,8 +3362,9 @@ async fn public_page(
                 );
             }
         } else {
-            let entries = tokio::task::spawn_blocking(move || {
-                secure_root.list(&relative_dir, page_number.saturating_mul(100), 101)
+            let scan_limit = settings.max_search_entries;
+            let (entries, truncated) = tokio::task::spawn_blocking(move || {
+                list_directory_page(&secure_root, &relative_dir, page_number, scan_limit)
             })
             .await
             .map_err(internal)?
@@ -2588,17 +3379,19 @@ async fn public_page(
                         r#"<tr><td>ðŸ“ <a href="/v/{token}?path={target}">{name}</a></td><td class="actions"><a href="/v/{token}?path={target}">Ã–ffnen</a></td></tr>"#
                     );
                 } else {
-                    let preview =
-                        if preview_allowed(&joined_relative(&sh.relative_path, &rel)?, &settings) {
-                            format!(r#"<a href="/v/{token}/preview?path={target}">Ansehen</a> "#)
-                        } else {
-                            String::new()
-                        };
+                    let preview = if preview_allowed(&rel, &settings) {
+                        format!(r#"<a href="/v/{token}/preview?path={target}">Ansehen</a> "#)
+                    } else {
+                        String::new()
+                    };
                     rows += &format!(
                         r#"<tr><td>ðŸ“„ {name}</td><td class="actions">{}<a href="/v/{token}/download?path={target}">Download</a></td></tr>"#,
                         preview
                     );
                 }
+            }
+            if truncated {
+                rows += r#"<tr><td colspan="2" class="muted">Verzeichnis-Scanlimit erreicht; weitere Einträge werden aus Sicherheitsgründen nicht gelesen.</td></tr>"#;
             }
         }
         body += "<table><tr><th>Name</th><th>Aktion</th></tr>";
@@ -2670,15 +3463,19 @@ fn joined_relative(base: &str, child: &str) -> Result<String> {
     Ok(path.to_string_lossy().replace('\\', "/"))
 }
 
-fn public_back_link(token: &str, share_relative_file: &str, is_directory_share: bool) -> String {
+fn public_back_link(
+    public_route: &str,
+    share_relative_file: &str,
+    is_directory_share: bool,
+) -> String {
     if !is_directory_share {
-        return format!("/v/{token}");
+        return public_route.to_string();
     }
     let parent = parent_path(share_relative_file).unwrap_or_default();
     if parent.is_empty() {
-        format!("/v/{token}")
+        public_route.to_string()
     } else {
-        format!("/v/{token}?path={}", encoded(&parent))
+        format!("{public_route}?path={}", encoded(&parent))
     }
 }
 
@@ -2700,10 +3497,11 @@ fn add_public_preview_actions(
 
 pub(crate) async fn public_preview(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
     Query(q): Query<BrowseQuery>,
-) -> Result<Html<String>> {
+) -> Result<Response> {
     let sh = get_share(&state, &token).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
@@ -2716,40 +3514,57 @@ pub(crate) async fn public_preview(
         if requested_path.is_empty() {
             return Err(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"));
         }
-        joined_relative(&sh.relative_path, &requested_path)?
+        requested_path.clone()
     } else {
         sh.relative_path.clone()
     };
     let settings = runtime_settings(&state);
-    let secure_root = state.secure_root.clone();
     let preview_path = relative_file.clone();
-    let content =
-        tokio::task::spawn_blocking(move || read_preview(secure_root, &preview_path, &settings))
-            .await
-            .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;
-    let share_id = sh.id;
-    if !database(state.db.clone(), move |db| db.count_download(share_id)).await? {
-        return Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"));
+    let content = if sh.is_directory {
+        let scope = state
+            .secure_root
+            .bind_directory(&sh.relative_path)
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+        let requested = requested_path.clone();
+        tokio::task::spawn_blocking(move || read_preview(scope, &requested, &settings)).await
+    } else {
+        let file = state
+            .secure_root
+            .bind_file(&sh.relative_path)
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
+        tokio::task::spawn_blocking(move || {
+            read_preview_secure_file(file, &preview_path, &settings)
+        })
+        .await
     }
-    audit(
-        &state,
-        "public".into(),
-        "preview",
-        Some(sh.id.to_string()),
-        None,
-    )
-    .await;
+    .map_err(internal)?
+    .map_err(public_preview_error)?;
     let share_rel = if sh.is_directory {
         requested_path
     } else {
         String::new()
     };
+    let public_route = public_share_route(&uri, &token);
     let download_link = if sh.is_directory {
-        format!(r#"/v/{token}/download?path={}"#, encoded(&share_rel))
+        format!(r#"{public_route}/download?path={}"#, encoded(&share_rel))
     } else {
-        format!("/v/{token}/download")
+        format!("{public_route}/download")
     };
+    if let PreviewContent::TooLarge { size } = &content {
+        let body = preview_too_large_body(
+            &share_rel,
+            *size,
+            "Datei ist größer als das Preview-Limit.",
+            Some(&download_link),
+        );
+        let body = add_public_preview_actions(
+            body,
+            &public_back_link(&public_route, &share_rel, sh.is_directory),
+            Some(&download_link),
+        );
+        return Ok(Html(plain_page("Vorschau", &body)).into_response());
+    }
+    let count_html_preview = matches!(&content, PreviewContent::Text(_));
     let body = match content {
         PreviewContent::TooLarge { size } => preview_too_large_body(
             &share_rel,
@@ -2765,7 +3580,11 @@ pub(crate) async fn public_preview(
             let preview_token = auth::random_token(32);
             let stored_preview_token = preview_token.clone();
             let share_id = sh.id;
-            let token_path = relative_file.clone();
+            let token_path = if sh.is_directory {
+                share_rel.clone()
+            } else {
+                String::new()
+            };
             let expires = Utc::now() + Duration::minutes(5);
             database(state.db.clone(), move |db| {
                 db.create_preview_session(&stored_preview_token, share_id, &token_path, expires)
@@ -2773,13 +3592,13 @@ pub(crate) async fn public_preview(
             .await?;
             let raw_url = if sh.is_directory {
                 format!(
-                    "/v/{token}/preview/raw?path={}&preview_token={}",
+                    "{public_route}/preview/raw?path={}&preview_token={}",
                     encoded(&share_rel),
                     encoded(&preview_token)
                 )
             } else {
                 format!(
-                    "/v/{token}/preview/raw?preview_token={}",
+                    "{public_route}/preview/raw?preview_token={}",
                     encoded(&preview_token)
                 )
             };
@@ -2793,14 +3612,44 @@ pub(crate) async fn public_preview(
     };
     let body = add_public_preview_actions(
         body,
-        &public_back_link(&token, &share_rel, sh.is_directory),
+        &public_back_link(&public_route, &share_rel, sh.is_directory),
         Some(&download_link),
     );
-    Ok(Html(plain_page("Vorschau", &body)))
+    let page = plain_page("Vorschau", &body);
+    let mut response = if count_html_preview {
+        let resource_key = if sh.is_directory {
+            share_rel.clone()
+        } else {
+            sh.relative_path.clone()
+        };
+        let transfer =
+            begin_public_transfer(&state, &headers, &uri, &sh, resource_key, "preview").await?;
+        let transfer_cookie_value = transfer.cookie.clone();
+        let page_length = page.len() as u64;
+        let stream = futures_util::stream::once(async move { Ok(Bytes::from(page)) });
+        let mut response = Response::new(transfer_body(
+            stream,
+            &state,
+            transfer,
+            "preview",
+            sh.id,
+            Some(page_length),
+        ));
+        set_transfer_cookie(&mut response, &transfer_cookie_value)?;
+        response
+    } else {
+        Response::new(Body::from(page))
+    };
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    Ok(response)
 }
 
 pub(crate) async fn public_preview_raw(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
@@ -2818,7 +3667,7 @@ pub(crate) async fn public_preview_raw(
         if requested_path.is_empty() {
             return Err(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"));
         }
-        joined_relative(&sh.relative_path, &requested_path)?
+        requested_path.clone()
     } else {
         sh.relative_path.clone()
     };
@@ -2826,7 +3675,11 @@ pub(crate) async fn public_preview_raw(
         .preview_token
         .ok_or(AppError(StatusCode::FORBIDDEN, "Preview-Token fehlt"))?;
     let share_id = sh.id;
-    let token_path = relative_file.clone();
+    let token_path = if sh.is_directory {
+        requested_path.clone()
+    } else {
+        String::new()
+    };
     let token_valid = database(state.db.clone(), move |db| {
         db.preview_session(&preview_token, share_id, &token_path)
     })
@@ -2844,19 +3697,67 @@ pub(crate) async fn public_preview_raw(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "Vorschau nicht erlaubt",
         ))?;
-    raw_preview_response(
-        state.secure_root.clone(),
-        method,
-        headers,
-        relative_file,
-        kind,
-        settings.max_media_preview_size,
-    )
-    .await
+    let mut response = if sh.is_directory {
+        let scope = state
+            .secure_root
+            .bind_directory(&sh.relative_path)
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+        raw_preview_response(
+            scope,
+            method.clone(),
+            headers.clone(),
+            relative_file.clone(),
+            kind,
+            settings.max_media_preview_size,
+        )
+        .await?
+    } else {
+        let file = state
+            .secure_root
+            .bind_file(&sh.relative_path)
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
+        raw_preview_secure_file_response(
+            file,
+            method.clone(),
+            headers.clone(),
+            relative_file.clone(),
+            kind,
+            settings.max_media_preview_size,
+        )
+        .await?
+    };
+    if method == Method::GET && response.status().is_success() {
+        let resource_key = if sh.is_directory {
+            relative_file
+        } else {
+            sh.relative_path.clone()
+        };
+        let transfer =
+            begin_public_transfer(&state, &headers, &uri, &sh, resource_key, "preview").await?;
+        let transfer_cookie_value = transfer.cookie.clone();
+        let expected_bytes = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        if expected_bytes == Some(0) {
+            complete_transfer_without_body(&state, transfer, "preview", sh.id).await?;
+        } else {
+            let body = std::mem::replace(response.body_mut(), Body::empty());
+            let stream = body
+                .into_data_stream()
+                .map(|item| item.map_err(io::Error::other));
+            *response.body_mut() =
+                transfer_body(stream, &state, transfer, "preview", sh.id, expected_bytes);
+        }
+        set_transfer_cookie(&mut response, &transfer_cookie_value)?;
+    }
+    Ok(response)
 }
 
 pub(crate) async fn download_zip(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
     Query(q): Query<BrowseQuery>,
@@ -2871,32 +3772,94 @@ pub(crate) async fn download_zip(
             "ZIP-Download nicht erlaubt",
         ));
     }
-    let sub = q.path.unwrap_or_default();
-    let relative_dir = joined_relative(&sh.relative_path, &sub)?;
+    let sub = path_security::validate_relative(q.path.as_deref().unwrap_or_default())
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger ZIP-Pfad"))?
+        .to_string_lossy()
+        .replace('\\', "/");
     let settings = runtime_settings(&state);
-    let secure_root = state.secure_root.clone();
-    let zip = tokio::task::spawn_blocking(move || build_zip(secure_root, &relative_dir, settings))
-        .await
-        .map_err(internal)?
-        .map_err(|_| AppError(StatusCode::PAYLOAD_TOO_LARGE, "ZIP-Limit erreicht"))?;
-    let share_id = sh.id;
-    if !database(state.db.clone(), move |db| db.count_download(share_id)).await? {
-        return Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"));
-    }
-    audit(
-        &state,
-        "public".into(),
-        "zip_download",
-        Some(sh.id.to_string()),
-        None,
-    )
-    .await;
+    let secure_root = state
+        .secure_root
+        .bind_directory(&sh.relative_path)
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+    let plan_scope = secure_root.clone();
+    let plan_path = sub.clone();
+    let plan_settings = settings.clone();
+    let plan =
+        tokio::task::spawn_blocking(move || plan_zip(&plan_scope, &plan_path, &plan_settings))
+            .await
+            .map_err(internal)?
+            .map_err(zip_error)?;
+    let resource_key = if sub.is_empty() { ".".to_string() } else { sub };
+    let transfer =
+        begin_public_transfer(&state, &headers, &uri, &sh, resource_key, "zip_download").await;
+    let transfer = transfer?;
+    let transfer_cookie_value = transfer.cookie.clone();
+    let mut transfer = Some(transfer);
+    let mut content_length = None;
+    let body = if let Some(reservation) = ZipTempReservation::acquire(plan.estimated_archive_size) {
+        let temp_scope = secure_root.clone();
+        let temp_plan = plan.clone();
+        match tokio::task::spawn_blocking(move || build_zip_temp(&temp_scope, &temp_plan))
+            .await
+            .map_err(internal)?
+        {
+            Ok(file) => {
+                content_length = file.metadata().ok().map(|metadata| metadata.len());
+                let stream = ReservedZipStream {
+                    inner: ReaderStream::new(tokio::fs::File::from_std(file)),
+                    _reservation: reservation,
+                };
+                transfer_body(
+                    stream,
+                    &state,
+                    transfer.take().expect("ZIP transfer lease"),
+                    "zip_download",
+                    sh.id,
+                    content_length,
+                )
+            }
+            Err(error) if error.is_output_capacity_error() => {
+                drop(reservation);
+                transfer_body(
+                    direct_zip_stream(secure_root, plan),
+                    &state,
+                    transfer.take().expect("ZIP transfer lease"),
+                    "zip_download",
+                    sh.id,
+                    None,
+                )
+            }
+            Err(error) => {
+                let lease = transfer
+                    .as_ref()
+                    .expect("ZIP transfer lease")
+                    .lease_token
+                    .as_ref()
+                    .expect("ZIP transfer lease token")
+                    .clone();
+                let _ = database(state.db.clone(), move |database| {
+                    database.cancel_transfer_lease(&lease).map(|_| ())
+                })
+                .await;
+                return Err(zip_error(error));
+            }
+        }
+    } else {
+        transfer_body(
+            direct_zip_stream(secure_root, plan),
+            &state,
+            transfer.take().expect("ZIP transfer lease"),
+            "zip_download",
+            sh.id,
+            None,
+        )
+    };
     let name = Path::new(&sh.relative_path)
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("vaultlink");
     let filename = encoded(&format!("{name}.zip"));
-    let mut response = Response::new(Body::from(zip));
+    let mut response = Response::new(body);
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/zip"),
@@ -2906,11 +3869,19 @@ pub(crate) async fn download_zip(
         HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{filename}"))
             .map_err(internal)?,
     );
+    if let Some(length) = content_length {
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&length.to_string()).map_err(internal)?,
+        );
+    }
+    set_transfer_cookie(&mut response, &transfer_cookie_value)?;
     Ok(response)
 }
 
 pub(crate) async fn download(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
@@ -2927,16 +3898,32 @@ pub(crate) async fn download(
         let rel = q
             .path
             .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
-        joined_relative(&sh.relative_path, &rel)?
+        path_security::validate_relative(&rel)
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Dateipfad"))?
+            .to_string_lossy()
+            .replace('\\', "/")
     } else {
         sh.relative_path.clone()
     };
     let secure_root = state.secure_root.clone();
     let open_path = relative_file.clone();
-    let file = tokio::task::spawn_blocking(move || secure_root.open_file(&open_path))
-        .await
-        .map_err(internal)?
-        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfÃ¼gbar"))?;
+    let share_path = sh.relative_path.clone();
+    let directory_share = sh.is_directory;
+    let file = tokio::task::spawn_blocking(move || {
+        if directory_share {
+            secure_root
+                .bind_directory(&share_path)?
+                .open_file(&open_path)
+                .map(SecureFile::into_file)
+        } else {
+            secure_root
+                .bind_file(&share_path)
+                .map(SecureFile::into_file)
+        }
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfÃ¼gbar"))?;
     if !file.metadata().map_err(internal)?.is_file() {
         return Err(AppError(StatusCode::BAD_REQUEST, "Keine Datei"));
     }
@@ -2961,12 +3948,21 @@ pub(crate) async fn download(
         },
         None => None,
     };
-    let share_id = sh.id;
-    if method == Method::GET
-        && !database(state.db.clone(), move |db| db.count_download(share_id)).await?
-    {
-        return Err(AppError(StatusCode::GONE, "Downloadlimit erreicht"));
-    }
+    let transfer = if method == Method::GET {
+        Some(
+            begin_public_transfer(
+                &state,
+                &headers,
+                &uri,
+                &sh,
+                relative_file.clone(),
+                "download",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let (start, end) = range.unwrap_or((0, length.saturating_sub(1)));
     let response_length = if length == 0 { 0 } else { end - start + 1 };
     if start > 0 {
@@ -2979,10 +3975,24 @@ pub(crate) async fn download(
         .and_then(|n| n.to_str())
         .unwrap_or("download");
     let encoded = percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC);
-    let body = if method == Method::HEAD {
-        Body::empty()
+    let (body, transfer_cookie_value) = if let Some(transfer) = transfer {
+        let cookie = transfer.cookie.clone();
+        let body = if response_length == 0 {
+            complete_transfer_without_body(&state, transfer, "download", sh.id).await?;
+            Body::empty()
+        } else {
+            transfer_body(
+                ReaderStream::new(f.take(response_length)),
+                &state,
+                transfer,
+                "download",
+                sh.id,
+                Some(response_length),
+            )
+        };
+        (body, Some(cookie))
     } else {
-        Body::from_stream(ReaderStream::new(f.take(response_length)))
+        (Body::empty(), None)
     };
     let mut r = Response::new(body);
     if range.is_some() {
@@ -3012,20 +4022,14 @@ pub(crate) async fn download(
         HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{encoded}"))
             .map_err(internal)?,
     );
-    if method == Method::GET {
-        audit(
-            &state,
-            "public".into(),
-            "download",
-            Some(sh.id.to_string()),
-            None,
-        )
-        .await;
+    if let Some(cookie) = transfer_cookie_value {
+        set_transfer_cookie(&mut r, &cookie)?;
     }
     Ok(r)
 }
 pub(crate) async fn upload(
     State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
     mut multipart: Multipart,
@@ -3037,6 +4041,10 @@ pub(crate) async fn upload(
     if !sh.is_directory || !sh.permission.can_upload() {
         return Err(AppError(StatusCode::FORBIDDEN, "Upload nicht erlaubt"));
     }
+    let share_scope = state
+        .secure_root
+        .bind_directory(&sh.relative_path)
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Zielordner nicht verfügbar"))?;
     let settings = runtime_settings(&state);
     let maximum = sh.max_upload_size.unwrap_or(settings.max_upload_size);
     if headers
@@ -3054,6 +4062,9 @@ pub(crate) async fn upload(
     }
     let mut upload_subdir = String::new();
     let mut overwrite_existing = false;
+    let mut fields_seen = 0usize;
+    let mut saw_path = false;
+    let mut saw_overwrite = false;
     while let Some(field) = match multipart.next_field().await {
         Ok(field) => field,
         Err(_) => {
@@ -3065,9 +4076,26 @@ pub(crate) async fn upload(
             ))
         }
     } {
+        fields_seen += 1;
+        if fields_seen > MAX_UPLOAD_MULTIPART_FIELDS {
+            return Ok(public_upload_error(
+                &token,
+                &upload_subdir,
+                StatusCode::BAD_REQUEST,
+                "Zu viele Multipart-Felder",
+            ));
+        }
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "path" {
-            let value = match field.text().await {
+            if std::mem::replace(&mut saw_path, true) {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::BAD_REQUEST,
+                    "Uploadpfad wurde mehrfach übermittelt",
+                ));
+            }
+            let value = match limited_multipart_text(field, MAX_UPLOAD_PATH_FIELD_BYTES).await {
                 Ok(value) => value,
                 Err(_) => {
                     return Ok(public_upload_error(
@@ -3094,7 +4122,15 @@ pub(crate) async fn upload(
             continue;
         }
         if field_name == "overwrite_existing" {
-            let value = match field.text().await {
+            if std::mem::replace(&mut saw_overwrite, true) {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::BAD_REQUEST,
+                    "Uploadoption wurde mehrfach übermittelt",
+                ));
+            }
+            let value = match limited_multipart_text(field, MAX_UPLOAD_OPTION_FIELD_BYTES).await {
                 Ok(value) => value,
                 Err(_) => {
                     return Ok(public_upload_error(
@@ -3109,7 +4145,12 @@ pub(crate) async fn upload(
             continue;
         }
         if field_name != "file" {
-            continue;
+            return Ok(public_upload_error(
+                &token,
+                &upload_subdir,
+                StatusCode::BAD_REQUEST,
+                "Unbekanntes Multipart-Feld",
+            ));
         }
         let Some(file_name) = field.file_name() else {
             return Ok(public_upload_error(
@@ -3130,6 +4171,14 @@ pub(crate) async fn upload(
                 ))
             }
         };
+        if crate::secure_fs::is_upload_fragment_name(std::ffi::OsStr::new(&name)) {
+            return Ok(public_upload_error(
+                &token,
+                &upload_subdir,
+                StatusCode::BAD_REQUEST,
+                "Dateiname ist für interne Uploadfragmente reserviert",
+            ));
+        }
         if extension_is_blocked(&name, &settings.blocked_extensions) {
             return Ok(public_upload_error(
                 &token,
@@ -3138,12 +4187,8 @@ pub(crate) async fn upload(
                 "Dateityp blockiert",
             ));
         }
-        let secure_root = state.secure_root.clone();
-        let upload_directory = if upload_subdir.is_empty() {
-            sh.relative_path.clone()
-        } else {
-            joined_relative(&sh.relative_path, &upload_subdir)?
-        };
+        let secure_root = share_scope.clone();
+        let upload_directory = upload_subdir.clone();
         let mut pending =
             match tokio::task::spawn_blocking(move || secure_root.begin_upload(&upload_directory))
                 .await
@@ -3233,6 +4278,15 @@ pub(crate) async fn upload(
         let publish_name = name.clone();
         let allow_replace = sh.upload_conflict_strategy.can_overwrite() && overwrite_existing;
         let replaced = allow_replace;
+        #[cfg(test)]
+        if let Some(kind) = state
+            .upload_directory_sync_failure
+            .lock()
+            .expect("upload sync fault lock")
+            .take()
+        {
+            pending.fail_next_directory_sync(kind);
+        }
         let publish_result = tokio::task::spawn_blocking(move || {
             if allow_replace {
                 pending.publish_replace(&publish_name)
@@ -3242,25 +4296,40 @@ pub(crate) async fn upload(
         })
         .await
         .map_err(internal)?;
-        if let Err(error) = publish_result {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Ok(public_upload_error(
-                    &token,
-                    &upload_subdir,
-                    StatusCode::CONFLICT,
-                    "Datei existiert bereits.",
-                ));
+        let publish_outcome = match publish_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Ok(public_upload_error(
+                        &token,
+                        &upload_subdir,
+                        StatusCode::CONFLICT,
+                        "Datei existiert bereits.",
+                    ));
+                }
+                return if storage_full_error(&error) {
+                    Ok(public_upload_error(
+                        &token,
+                        &upload_subdir,
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        "Nicht genug freier Speicher",
+                    ))
+                } else {
+                    Err(internal(error))
+                };
             }
-            return if storage_full_error(&error) {
-                Ok(public_upload_error(
-                    &token,
-                    &upload_subdir,
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "Nicht genug freier Speicher",
-                ))
-            } else {
-                Err(internal(error))
-            };
+        };
+        let durability_uncertain = !publish_outcome.is_durable();
+        if let Some(error) = publish_outcome.sync_error() {
+            tracing::warn!(share_id = sh.id, file = %name, %error, "upload published but directory fsync failed");
+            audit(
+                &state,
+                "public".into(),
+                "upload_durability_uncertain",
+                Some(sh.id.to_string()),
+                Some(name.clone()),
+            )
+            .await;
         }
         audit(
             &state,
@@ -3274,16 +4343,29 @@ pub(crate) async fn upload(
             Some(name),
         )
         .await;
-        let upload_status = if replaced { "replaced" } else { "ok" };
+        let upload_status = match (replaced, durability_uncertain) {
+            (true, true) => "replaced_uncertain",
+            (false, true) => "uncertain",
+            (true, false) => "replaced",
+            (false, false) => "ok",
+        };
+        let public_route = public_share_route(&uri, &token);
         let target = if upload_subdir.is_empty() {
-            format!("/v/{token}?upload={upload_status}")
+            format!("{public_route}?upload={upload_status}")
         } else {
             format!(
-                "/v/{token}?path={}&upload={upload_status}",
+                "{public_route}?path={}&upload={upload_status}",
                 encoded(&upload_subdir)
             )
         };
-        return Ok(Redirect::to(&target).into_response());
+        let mut response = Redirect::to(&target).into_response();
+        if durability_uncertain {
+            response.headers_mut().insert(
+                "x-vaultlink-durability",
+                HeaderValue::from_static("uncertain"),
+            );
+        }
+        return Ok(response);
     }
     Ok(public_upload_error(
         &token,
@@ -3380,11 +4462,15 @@ mod tests {
 
     #[test]
     fn public_preview_back_link_returns_share_parent() {
-        assert_eq!(public_back_link("tok", "file.txt", false), "/v/tok");
-        assert_eq!(public_back_link("tok", "file.txt", true), "/v/tok");
+        assert_eq!(public_back_link("/v/tok", "file.txt", false), "/v/tok");
+        assert_eq!(public_back_link("/v/tok", "file.txt", true), "/v/tok");
         assert_eq!(
-            public_back_link("tok", "folder/file.txt", true),
+            public_back_link("/v/tok", "folder/file.txt", true),
             "/v/tok?path=folder"
+        );
+        assert_eq!(
+            public_back_link("/api/v1/public/shares/tok", "folder/file.txt", true),
+            "/api/v1/public/shares/tok?path=folder"
         );
     }
 
@@ -3393,6 +4479,178 @@ mod tests {
         assert!(storage_full_error(&std::io::Error::from_raw_os_error(28)));
         assert!(storage_full_error(&std::io::Error::from_raw_os_error(122)));
         assert!(!storage_full_error(&std::io::Error::from_raw_os_error(13)));
+    }
+
+    #[tokio::test]
+    async fn non_upload_routes_reject_large_buffered_bodies() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let app = router(state);
+        let oversized = format!(
+            "username={}&password=x",
+            "a".repeat(DEFAULT_REQUEST_BODY_LIMIT)
+        );
+        assert_eq!(
+            app.oneshot(request(Method::POST, "/login", &oversized))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_routes_reject_multipart_headers_before_the_parser_can_buffer_them() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("uploads")).unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "guarded-upload",
+                None,
+                "uploads",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = router(state);
+        let boundary = "guard-boundary";
+        let body = format!(
+            "--{boundary}\r\nX-Long: {}\r\n\r\nvalue\r\n--{boundary}--\r\n",
+            "x".repeat(crate::multipart_guard::DEFAULT_MAX_HEADER_BYTES + 1)
+        );
+        let mut malformed = Request::builder()
+            .method(Method::POST)
+            .uri("/v/guarded-upload/upload")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        malformed.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        assert_eq!(
+            app.clone().oneshot(malformed).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut missing_content_type = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/public/shares/missing/upload")
+            .body(Body::empty())
+            .unwrap();
+        missing_content_type.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = app.oneshot(missing_content_type).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"));
+    }
+
+    #[tokio::test]
+    async fn zip_temp_and_direct_paths_cap_files_at_the_scanned_size() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        let file_path = root.path().join("docs/file.txt");
+        std::fs::write(&file_path, b"small").unwrap();
+        let state = test_state(root.path(), data.path());
+        let scope = state.secure_root.bind_directory("docs").unwrap();
+        let settings = runtime_settings(&state);
+        let plan = plan_zip(&scope, "", &settings).unwrap();
+
+        const GROWN_MARKER: &[u8] = b"-must-not-enter-the-archive";
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .unwrap()
+            .write_all(GROWN_MARKER)
+            .unwrap();
+
+        let mut temp_file = build_zip_temp(&scope, &plan).unwrap();
+        let mut temp_bytes = Vec::new();
+        temp_file.read_to_end(&mut temp_bytes).unwrap();
+
+        let mut direct_bytes = Vec::new();
+        let mut stream = Box::pin(direct_zip_stream(scope, plan));
+        while let Some(chunk) = stream.next().await {
+            direct_bytes.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(direct_bytes, temp_bytes);
+        assert!(temp_bytes.starts_with(b"PK\x03\x04"));
+        assert!(temp_bytes.ends_with(b"PK\x05\x06\0\0\0\0\x01\0\x01\0\x36\0\0\0\x3b\0\0\0\0\0"));
+        assert!(!temp_bytes
+            .windows(GROWN_MARKER.len())
+            .any(|window| window == GROWN_MARKER));
+    }
+
+    #[test]
+    fn zip_planning_bounds_empty_directory_scans() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        std::fs::create_dir(root.path().join("docs/one")).unwrap();
+        std::fs::create_dir(root.path().join("docs/two")).unwrap();
+        std::fs::create_dir(root.path().join("single")).unwrap();
+        std::fs::write(root.path().join("single/only.txt"), b"one").unwrap();
+        let state = test_state(root.path(), data.path());
+        let scope = state.secure_root.bind_directory("docs").unwrap();
+        let mut settings = runtime_settings(&state);
+        settings.max_search_entries = 1;
+        assert!(matches!(
+            plan_zip(&scope, "", &settings),
+            Err(ZipBuildError::Limit("zip scan entry limit exceeded"))
+        ));
+        let single = state.secure_root.bind_directory("single").unwrap();
+        assert_eq!(plan_zip(&single, "", &settings).unwrap().files.len(), 1);
+    }
+
+    #[test]
+    fn filtered_directory_items_consume_listing_search_and_zip_budgets() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        for _ in 0..2 {
+            std::fs::write(
+                root.path()
+                    .join("docs")
+                    .join(crate::secure_fs::upload_fragment_name()),
+                b"partial",
+            )
+            .unwrap();
+        }
+        let state = test_state(root.path(), data.path());
+        let scope = state.secure_root.bind_directory("docs").unwrap();
+        let mut settings = runtime_settings(&state);
+        settings.max_search_entries = 1;
+
+        let (entries, truncated) = list_directory_page(&scope, "", 0, 1).unwrap();
+        assert!(entries.is_empty());
+        assert!(truncated);
+        assert!(search_tree(scope.clone(), "", "missing", &settings)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            plan_zip(&scope, "", &settings),
+            Err(ZipBuildError::Limit("zip scan entry limit exceeded"))
+        ));
     }
 
     fn multipart_request(uri: &str, name: &str, content: &[u8]) -> Request {
@@ -3849,13 +5107,323 @@ mod tests {
             HeaderValue::from_static("vaultlink_session=session-token"),
         );
         assert_eq!(
-            app.oneshot(create_request).await.unwrap().status(),
+            app.clone().oneshot(create_request).await.unwrap().status(),
+            StatusCode::SEE_OTHER
+        );
+
+        let mut rejected_zero = request(
+            Method::POST,
+            "/admin/shares",
+            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&max_downloads=&max_upload_size=0&password=&password_confirm=",
+        );
+        rejected_zero.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=session-token"),
+        );
+        assert_eq!(
+            app.clone().oneshot(rejected_zero).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut legacy_limit = request(
+            Method::POST,
+            "/admin/shares",
+            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&max_downloads=&max_upload_size=1234&password=&password_confirm=",
+        );
+        legacy_limit.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=session-token"),
+        );
+        assert_eq!(
+            app.oneshot(legacy_limit).await.unwrap().status(),
             StatusCode::SEE_OTHER
         );
         let shares = state.db.list_shares().unwrap();
-        assert_eq!(shares.len(), 1);
-        assert_eq!(shares[0].relative_path, "uploads");
-        assert_eq!(shares[0].max_downloads, None);
+        assert_eq!(shares.len(), 2);
+        assert!(shares.iter().all(|share| share.relative_path == "uploads"));
+        assert!(shares.iter().all(|share| share.max_downloads.is_none()));
+        assert_eq!(
+            shares
+                .iter()
+                .filter(|share| share.max_upload_size == Some(1234))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn public_share_scope_blocks_sibling_symlink_http_flows() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("share-a/real")).unwrap();
+        std::fs::create_dir_all(root.path().join("share-b/uploads")).unwrap();
+        std::fs::write(root.path().join("share-a/real/allowed.txt"), "allowed").unwrap();
+        std::fs::write(root.path().join("share-b/secret.txt"), "secret").unwrap();
+        symlink("real", root.path().join("share-a/inside")).unwrap();
+        symlink("../share-b", root.path().join("share-a/outside")).unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "scope",
+                None,
+                "share-a",
+                true,
+                &Permission::DownloadUpload,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = router(state.clone());
+
+        let allowed = app
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                "/v/scope/download?path=inside/allowed.txt",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(response_text(allowed).await, "allowed");
+
+        for uri in [
+            "/v/scope?path=outside",
+            "/v/scope/download?path=outside/secret.txt",
+            "/v/scope/preview?path=outside/secret.txt",
+            "/v/scope/download.zip?path=outside",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Method::GET, uri, ""))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND,
+                "{uri} crossed the share boundary"
+            );
+        }
+        let upload = app
+            .oneshot(multipart_request_with_path(
+                "/v/scope/upload",
+                "created.txt",
+                b"blocked",
+                Some("outside/uploads"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::NOT_FOUND);
+        assert!(!root.path().join("share-b/uploads/created.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn transfer_session_counts_range_resume_once_and_abort_not_at_all() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.txt"), b"abcdef").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        let _share_id = state
+            .db
+            .create_share(
+                "limited",
+                None,
+                "file.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let aborted_id = state
+            .db
+            .create_share(
+                "aborted",
+                None,
+                "file.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        state
+            .db
+            .create_share(
+                "known-length",
+                None,
+                "file.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        std::fs::write(root.path().join("empty.txt"), b"").unwrap();
+        state
+            .db
+            .create_share(
+                "empty",
+                None,
+                "empty.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = router(state.clone());
+
+        let first = app
+            .clone()
+            .oneshot(range_request(
+                Method::GET,
+                "/v/limited/download",
+                Some("bytes=0-2"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::PARTIAL_CONTENT);
+        let transfer_cookie = first
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(response_text(first).await, "abc");
+        for _ in 0..100 {
+            if state
+                .db
+                .share_by_token("limited")
+                .unwrap()
+                .unwrap()
+                .download_count
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            state
+                .db
+                .share_by_token("limited")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
+
+        // HTTP/1 stops polling a response body after exactly Content-Length bytes.
+        // The final chunk therefore must not become visible until the lease is counted.
+        let known_length = app
+            .clone()
+            .oneshot(request(Method::GET, "/v/known-length/download", ""))
+            .await
+            .unwrap();
+        assert_eq!(known_length.headers()[header::CONTENT_LENGTH], "6");
+        let mut body = known_length.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"abcdef");
+        drop(body); // deliberately never poll the stream to EOF
+        assert_eq!(
+            state
+                .db
+                .share_by_token("known-length")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
+
+        let empty = app
+            .clone()
+            .oneshot(request(Method::GET, "/v/empty/download", ""))
+            .await
+            .unwrap();
+        assert_eq!(empty.headers()[header::CONTENT_LENGTH], "0");
+        drop(empty);
+        assert_eq!(
+            state
+                .db
+                .share_by_token("empty")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
+
+        let mut resumed = range_request(Method::GET, "/v/limited/download", Some("bytes=3-5"));
+        resumed.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&transfer_cookie).unwrap(),
+        );
+        let resumed = app.clone().oneshot(resumed).await.unwrap();
+        assert_eq!(resumed.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response_text(resumed).await, "def");
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/limited/download", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
+        );
+
+        let aborted = app
+            .clone()
+            .oneshot(request(Method::GET, "/v/aborted/download", ""))
+            .await
+            .unwrap();
+        assert_eq!(aborted.status(), StatusCode::OK);
+        drop(aborted);
+        for _ in 0..100 {
+            if state.db.active_transfer_reservations(aborted_id).unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            state.db.active_transfer_reservations(aborted_id).unwrap(),
+            0
+        );
+        assert_eq!(
+            state
+                .db
+                .share_by_token("aborted")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            0
+        );
     }
 
     #[tokio::test]
@@ -4295,7 +5863,7 @@ mod tests {
         assert!(!image_token.is_empty());
         assert!(state
             .db
-            .preview_session(&image_token, media_id, "docs/image.png")
+            .preview_session(&image_token, media_id, "image.png")
             .unwrap());
         let raw_image_uri =
             format!("/v/media/preview/raw?path=image.png&preview_token={image_token}");
@@ -4324,6 +5892,23 @@ mod tests {
             raw_image.headers().get("x-content-type-options").unwrap(),
             "nosniff"
         );
+        let raw_image_bytes = axum::body::to_bytes(raw_image.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(raw_image_bytes.as_ref(), b"\x89PNG");
+        for _ in 0..100 {
+            if state
+                .db
+                .share_by_token("media")
+                .unwrap()
+                .unwrap()
+                .download_count
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
         let head_image = app
             .clone()
             .oneshot(range_request(Method::HEAD, &raw_image_uri, None))
@@ -4346,6 +5931,14 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, &raw_image_uri, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::GONE
         );
 
@@ -4360,7 +5953,7 @@ mod tests {
         let pdf_token = preview_token_from(&pdf_preview);
         assert!(state
             .db
-            .preview_session(&pdf_token, du_id, "docs/file.pdf")
+            .preview_session(&pdf_token, du_id, "file.pdf")
             .unwrap());
         let raw_pdf = app
             .clone()
@@ -4394,7 +5987,11 @@ mod tests {
             .oneshot(request(Method::GET, "/v/du/download.zip", ""))
             .await
             .unwrap();
-        assert_eq!(zip.status(), StatusCode::OK);
+        if zip.status() != StatusCode::OK {
+            let status = zip.status();
+            let body = response_text(zip).await;
+            panic!("ZIP failed with {status}: {body}");
+        }
         assert_eq!(
             zip.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/zip"
@@ -4472,7 +6069,23 @@ mod tests {
                 &UploadConflictStrategy::OverwriteAllowed,
             )
             .unwrap();
-        let app = router(state);
+        state
+            .db
+            .create_share(
+                "roundtrip",
+                None,
+                "uploads",
+                true,
+                &Permission::DownloadUpload,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = router(state.clone());
 
         let replace_page = response_text(
             app.clone()
@@ -4501,6 +6114,78 @@ mod tests {
             std::fs::read(root.path().join("uploads/ok.txt")).unwrap(),
             b"content"
         );
+        *state
+            .upload_directory_sync_failure
+            .lock()
+            .expect("upload sync fault lock") = Some(std::io::ErrorKind::Other);
+        let uncertain = app
+            .clone()
+            .oneshot(multipart_request("/v/upload/upload", "uncertain.txt", b"x"))
+            .await
+            .unwrap();
+        assert_eq!(uncertain.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            uncertain.headers().get("x-vaultlink-durability").unwrap(),
+            "uncertain"
+        );
+        assert!(uncertain
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("upload=uncertain"));
+        assert_eq!(
+            std::fs::read(root.path().join("uploads/uncertain.txt")).unwrap(),
+            b"x"
+        );
+        let percent_name = app
+            .clone()
+            .oneshot(multipart_request(
+                "/v/roundtrip/upload",
+                "100%.txt",
+                b"percent",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(percent_name.status(), StatusCode::SEE_OTHER);
+        let percent_download = app
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                "/v/roundtrip/download?path=100%25.txt",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(percent_download.status(), StatusCode::OK);
+        assert_eq!(response_text(percent_download).await, "percent");
+        for unsafe_name in ["C:escape.txt", "CON.txt"] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(multipart_request("/v/upload/upload", unsafe_name, b"x"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST,
+                "unsafe upload name was accepted: {unsafe_name}"
+            );
+        }
+        let huge_path = "a".repeat(MAX_UPLOAD_PATH_FIELD_BYTES + 1);
+        assert_eq!(
+            app.clone()
+                .oneshot(multipart_request_with_path(
+                    "/v/roundtrip/upload",
+                    "never.txt",
+                    b"x",
+                    Some(&huge_path),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!root.path().join("uploads/never.txt").exists());
         let conflict = app
             .clone()
             .oneshot(multipart_request("/v/upload/upload", "ok.txt", b"new"))
@@ -4582,5 +6267,54 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
             .count();
         assert_eq!(remaining_parts, 0);
+    }
+
+    #[tokio::test]
+    async fn api_upload_route_can_stream_beyond_the_buffered_body_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("uploads")).unwrap();
+        let state = test_state_with_limit(root.path(), data.path(), 2_000_000);
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "large-upload",
+                None,
+                "uploads",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = router(state);
+        let content = vec![b'x'; DEFAULT_REQUEST_BODY_LIMIT + 64 * 1024];
+        let response = app
+            .oneshot(multipart_request(
+                "/api/v1/public/shares/large-upload/upload",
+                "large.bin",
+                &content,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(response
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/api/v1/public/shares/large-upload"));
+        assert_eq!(
+            std::fs::metadata(root.path().join("uploads/large.bin"))
+                .unwrap()
+                .len(),
+            content.len() as u64
+        );
     }
 }

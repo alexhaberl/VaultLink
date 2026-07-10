@@ -9,24 +9,56 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.96.1
           components: rustfmt, clippy
+      - name: Supply-chain policy
+        run: sh tools/check-supply-chain-policy.sh
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Lints
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --locked --all-targets
+      - name: Fuzz crate compiles
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
       - name: Deployment artifacts
         run: |
-          shellcheck deploy/*.sh tools/*.sh
+          shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
           sudo install -d /opt/vaultlink /root/.acme.sh /var/lib/vaultlink /var/log/vaultlink /mnt/storage
           sudo install -m 0755 /bin/true /opt/vaultlink/vaultlink
           sudo install -m 0755 /bin/true /root/.acme.sh/acme.sh
           sudo systemd-analyze verify deploy/vaultlink.service deploy/vaultlink-cert-renew.service deploy/vaultlink-cert-renew.timer
       - name: Release build
         run: cargo build --locked --release
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.96.1
+      - name: Install pinned cargo-audit
+        run: cargo install --locked cargo-audit --version 0.22.2
+      - name: Audit application and fuzz lockfiles
+        run: |
+          cargo audit --deny warnings
+          cargo audit --deny warnings --file fuzz/Cargo.lock
+
+  docker-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Setup, API, upgrade, and rollback smoke tests
+        run: make docker-smoke

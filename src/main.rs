@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Admin created. Add this secret to the authenticator exactly once:\n{secret}\notpauth://totp/VaultLink:{username}?secret={secret}&issuer=VaultLink");
         return Ok(());
     }
+    start_upload_fragment_cleanup(&state);
     let addr: std::net::SocketAddr = config.server.listen_address.parse()?;
     let app = web::router(state);
     tracing::info!(%addr,mode=?config.server.mode,"VaultLink starting");
@@ -59,7 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
                 #[cfg(unix)]
                 install_sighup_handler_for_files(&config, tls.clone());
+                let handle = axum_server::Handle::new();
+                install_server_shutdown(handle.clone());
                 axum_server::bind_rustls(addr, tls)
+                    .handle(handle)
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
             }
@@ -98,8 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     staging = config.tls.letsencrypt_staging,
                     "Standalone TLS uses Let's Encrypt ACME tls-alpn-01"
                 );
+                let handle = axum_server::Handle::new();
+                install_server_shutdown(handle.clone());
                 axum_server::bind(addr)
                     .acceptor(acceptor)
+                    .handle(handle)
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
             }
@@ -107,15 +114,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             #[cfg(unix)]
             install_noop_sighup_handler("no reloadable TLS configuration in this mode");
-            let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .await?;
+            let handle = axum_server::Handle::new();
+            install_server_shutdown(handle.clone());
+            axum_server::bind(addr)
+                .handle(handle)
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await?;
         }
     }
     Ok(())
+}
+
+fn start_upload_fragment_cleanup(state: &AppState) {
+    const CLEANUP_BATCH_ENTRIES: usize = 4096;
+
+    let mut cleanup = match state.secure_root.start_upload_fragment_cleanup() {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            tracing::warn!(%error, "could not start stale upload fragment cleanup");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let mut scanned = 0usize;
+        let mut removed = 0usize;
+        let mut failed = 0usize;
+        loop {
+            let result = tokio::task::spawn_blocking(move || {
+                let batch = cleanup.run_batch(CLEANUP_BATCH_ENTRIES);
+                (cleanup, batch)
+            })
+            .await;
+            let (next_cleanup, batch) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(%error, "stale upload fragment cleanup task failed");
+                    return;
+                }
+            };
+            cleanup = next_cleanup;
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    tracing::warn!(%error, "could not continue stale upload fragment cleanup");
+                    return;
+                }
+            };
+            scanned = scanned.saturating_add(batch.scanned);
+            removed = removed.saturating_add(batch.removed);
+            failed = failed.saturating_add(batch.failed);
+            if batch.complete {
+                if removed > 0 || failed > 0 {
+                    tracing::info!(
+                        scanned,
+                        removed,
+                        failed,
+                        "stale upload fragment cleanup completed"
+                    );
+                }
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
+fn install_server_shutdown(handle: axum_server::Handle<std::net::SocketAddr>) {
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received; draining active connections");
+        handle.graceful_shutdown(Some(std::time::Duration::from_secs(25)));
+    });
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    tracing::error!(%error, "cannot install SIGTERM handler");
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(unix)]

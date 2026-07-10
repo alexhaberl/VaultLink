@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 WORK_DIR="${VAULTLINK_SMOKE_DIR:-/tmp/vaultlink-api-smoke}"
 BIN="${VAULTLINK_BIN:-/work/target/release/vaultlink}"
@@ -135,6 +136,9 @@ curl -sS -f -X POST "http://$SETUP_ADDR/" \
 grep -q "Setup abgeschlossen" "$SETUP_RESPONSE" || fail "setup did not complete"
 TOTP_SECRET="$(grep -Eo '[A-Z2-7]{32}' "$SETUP_RESPONSE" | head -n 1)"
 [[ -n "$TOTP_SECRET" ]] || fail "TOTP secret was not rendered"
+curl -sS -f -X POST "http://$SETUP_ADDR/complete" \
+    --data-urlencode "token=$SETUP_TOKEN" \
+    | grep -q "Setup best" || fail "setup confirmation failed"
 
 cleanup
 unset SETUP_PID
@@ -168,6 +172,28 @@ curl -sS -f -b "$COOKIE_JAR" "http://$APP_ADDR/api/v1/session/me" | grep -q '"us
 
 curl -sS -f -b "$COOKIE_JAR" "http://$APP_ADDR/api/v1/files?path=" | grep -q '"readme.txt"' \
     || fail "files API did not list readme.txt"
+
+DOWNLOAD_SHARE_JSON="$(
+    curl -sS -f -b "$COOKIE_JAR" \
+        -H "content-type: application/json" \
+        -H "x-csrf-token: $CSRF" \
+        -X POST "http://$APP_ADDR/api/v1/shares" \
+        -d '{"path":".","permission":"download_only"}'
+)"
+DOWNLOAD_SHARE_TOKEN="$(printf '%s' "$DOWNLOAD_SHARE_JSON" | json_get token)"
+[[ -n "$DOWNLOAD_SHARE_TOKEN" ]] || fail "download share create did not return token"
+curl -sS -f \
+    "http://$APP_ADDR/api/v1/public/shares/$DOWNLOAD_SHARE_TOKEN/download.zip" \
+    -o "$WORK_DIR/download.zip"
+python3 - "$WORK_DIR/download.zip" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    assert archive.testzip() is None
+    assert "readme.txt" in archive.namelist()
+    assert archive.read("readme.txt") == b"VaultLink API smoke test file\n"
+PY
 
 NO_CSRF_STATUS="$(
     curl -sS -o "$WORK_DIR/no-csrf.json" -w '%{http_code}' -b "$COOKIE_JAR" \

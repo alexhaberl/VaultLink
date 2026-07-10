@@ -13,7 +13,7 @@ jobs:
   release:
     if: github.repository_visibility == 'private'
     runs-on: ubuntu-24.04
-    container: debian:13.1-slim
+    container: rust:1.96.1-trixie@sha256:1f0dbad1df66647807e6952d1db85d0b2bda7606cb2139d82517e4f009967376
     env:
       CARGO_TERM_COLOR: always
       SOURCE_DATE_EPOCH: "0"
@@ -21,15 +21,23 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config libssl-dev clang git gh minisign xz-utils shellcheck
-      - uses: actions/checkout@v5
+          apt-get install -y --no-install-recommends ca-certificates build-essential pkg-config libssl-dev clang git gh minisign xz-utils shellcheck
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
-      - name: Install pinned Rust toolchain
+          persist-credentials: false
+      - name: Verify release inputs
         shell: bash
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.1
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          test "$(rustc --version | awk '{print $2}')" = "1.96.1"
+          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$package_version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$package_version"
+            test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+          fi
+          sh tools/check-supply-chain-policy.sh
       - name: Install release gates
         run: |
           cargo install --locked cargo-audit --version 0.22.2
@@ -39,8 +47,10 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets
-          shellcheck deploy/*.sh tools/*.sh
+          cargo check --manifest-path fuzz/Cargo.toml --locked
+          shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
           cargo audit --deny warnings
+          cargo audit --deny warnings --file fuzz/Cargo.lock
       - name: Build and SBOM
         run: |
           cargo build --locked --release
@@ -96,7 +106,7 @@ jobs:
             "dist/$root.tar.gz" dist/vaultlink.cdx.json dist/SHA256SUMS dist/SHA256SUMS.minisig dist/vaultlink.minisig
       - name: Upload dry-run artifact
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vaultlink-release-dry-run
           path: |

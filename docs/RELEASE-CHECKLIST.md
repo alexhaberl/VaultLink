@@ -1,6 +1,6 @@
 # v0.3.0 release checklist
 
-Stand: 2026-07-09 nach JSON-API, UI-/Upload-Polish, Built-in-Let's-Encrypt-Standalone-TLS und Upload-/API-Fuzzing.
+Stand: 2026-07-10 nach Security-/Reliability-Hardening für SecureFS, Runtime-Transaktionen, Transfer-Limits, Streaming-ZIP, Setup-Recovery sowie Build-/Deploy-Gates.
 
 Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschließlich bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
@@ -14,19 +14,22 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Linkverwaltung für Datei-/Ordnerlinks mit `download_only`, `upload_only`, `download_upload`.
 - [x] Passwortgeschützte Shares mit Argon2id, Unlock-Cookies und Rate-Limit.
 - [x] Optionaler Kurzlink-Alias.
-- [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`.
+- [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`; feste Transfer-Grants zählen erst vollständige Antworten und fassen Range-Resumes ohne Sliding-Expiry zusammen.
 - [x] Sichere Uploads mit temporärer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
 - [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink; Default bleibt No-Replace und Public-Uploader müssen Replace pro Upload bestätigen.
 - [x] Upload in navigierten Unterordnern für `download_upload`-Ordnerlinks.
 - [x] Upload-only-Freigaben listen keine Ordnerinhalte und erlauben keine Preview/Downloads.
-- [x] ZIP-Download für Ordnerfreigaben mit Datei- und Größenlimits.
-- [x] Begrenzte case-insensitive Dateinamensuche.
+- [x] Inkrementeller ZIP-Download für Ordnerfreigaben mit Datei-, Scan- und Größenlimits, gecappten Quelldateien, Temp-Budget und backpressured Direct-Stream-Fallback.
+- [x] Begrenzte case-insensitive Dateinamensuche; Listing, Suche und ZIP zählen auch gefilterte rohe Verzeichniseinträge und setzen Scans ohne Offset-Rescan fort.
 - [x] Sichere Browser-Textvorschau für allowlistete Endungen; escaped HTML in `<pre>`, kein Inline-User-MIME.
 - [x] Sichere Browser-Vorschau für allowlistete Rasterbilder und PDFs über Raw-Preview-Routen mit `inline`, `nosniff`, `HEAD`, `206` und `416`.
-- [x] Admin-UI für zusätzliche Admins; TOTP-Secret wird genau einmal angezeigt.
+- [x] Admin-UI für zusätzliche Admins; TOTP-Secret wird genau einmal angezeigt. Initial-Setup kann ein noch nicht bestätigtes Secret lokal und passwortgebunden wiederanzeigen.
 - [x] Runtime-editierbare Policy-Settings in SQLite, nicht in `/etc/vaultlink/config.toml`.
 - [x] Audit-Dashboard mit Pagination und Action-Filter.
 - [x] Loopback-only Setup-UI: `vaultlink setup --config <path> --listen 127.0.0.1:8090`.
+- [x] Setup überschreibt keine bestehende Konfiguration; Config-ohne-Admin und committed Admin vor verlorener TOTP-Antwort sind wiederaufnehmbar.
+- [x] Pro-Share SecureFS-Capabilities verhindern Symlink-Wechsel in Sibling-Shares für Listing, Preview, Download, ZIP und Upload.
+- [x] Gepufferte Form-/JSON-Bodies sind klein begrenzt; ausschließlich Uploadrouten erhalten den großen Streaming-Rahmen. Ein konstanter Streaming-Guard begrenzt Präambel und jeden Multipart-Headerblock, zusätzlich sind Feldanzahl und Metadaten klein begrenzt.
 - [x] Reverse-Proxy-Modus, Standalone-TLS-Modus, SIGHUP-Zertifikatsreload für PEM-Dateien.
 - [x] Optionaler Built-in-Let's-Encrypt-Standalone-TLS-Modus über `tls-alpn-01` und `rustls-acme`.
 - [x] ZeroSSL/acme.sh Renewal-Dokumentation und systemd-Beispiele.
@@ -42,7 +45,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - API-Tokens oder externe API-Clients als stabile Public Contract Garantie.
 - Inline-Preview für alle anderen Dateitypen.
 - Built-in ACME hinter Nginx/Caddy; Auto-TLS ist ausschließlich für echten Standalone-Port-443-Betrieb.
-- Unbounded/streaming ZIP für sehr große Ordner; ZIP wird limitiert und bei Überschreitung abgelehnt.
+- Unbegrenzte ZIPs, ZIP64 und Kompression; ZIP wird inkrementell erzeugt, bleibt aber hart limitiert und wird bei Überschreitung abgelehnt.
 - Admin-Löschen; Admins können deaktiviert/reaktiviert werden.
 
 ## Lokal in dieser Arbeitskopie grün
@@ -51,14 +54,16 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - [x] `cargo test --locked --all-targets`
-  - Ergebnis: 62 Tests bestanden.
-  - Enthalten: API Login/MFA/Session/CSRF, Share-Erstellung, Secret-Redaction, Admin-/Settings-API, delegierte API-Uploadfehler als JSON, Setup-UI, Admin-Anlage, Runtime-Settings, Text-/Bild-/PDF-Preview, Raw-Preview-Token, ZIP, Suche, Upload in Unterordner, Upload-No-Replace/-Replace, Share-Rechte, Auth, Migrationen und Upload-Cleanup.
+  - Ergebnis: 107 Tests unter Windows bestanden; der finale Linux-/Containerlauf folgt nach Abschluss dieses Updates erneut.
+  - Enthalten: API Login/MFA/Session/CSRF, API-URL-/Listen-Restart-Sicherheit, API-scoped Unlock/Media-Preview, Share-Erstellung, Secret-Redaction, Admin-/Settings-API, delegierte API-Uploadfehler als JSON, Setup-UI/-Recovery, transaktionale Admin-/Runtime-Pfade, Text-/Bild-/PDF-Preview, Transfer-Grant/Abort/Range-Resume einschließlich HTTP/1-`Content-Length`, Raw-Preview-Token, inkrementelles ZIP, rohe Scanbudgets, Multipart-Präambel/-Header, Body-Limits, `%`-Dateinamens-Roundtrip, Upload-No-Replace/-Replace/-Durability, Share-Rechte, Migrationen und resumierbares Upload-Cleanup.
 - [x] `cargo check --manifest-path fuzz/Cargo.toml --locked`
   - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy` und `api_request_policy` kompiliert.
-- [x] `cargo audit --deny warnings`
-  - Keine bekannten Vulnerabilities/Warnings.
-- [x] `make docker-api-smoke`
-  - Ergebnis: frischer Debian/Rust-Container gebaut, Setup-UI ausgeführt, App gestartet, API Login/MFA/CSRF/Files/Share/Public-Upload-JSON-Fehler erfolgreich geprüft.
+- [x] `cargo audit --deny warnings` und `cargo audit --deny warnings --file fuzz/Cargo.lock`
+  - Beide Lockfiles (`Cargo.lock`, `fuzz/Cargo.lock`) ohne bekannte Vulnerabilities/Warnings.
+- [x] `make policy-check`
+  - Externe Actions auf volle Commit-SHAs und Container auf Digests gepinnt; Cargo-CI-Tools versioniert; Docker-Secret-Ausschlüsse vorhanden.
+- [x] `make docker-smoke`
+  - Ergebnis vor dem letzten Source-Hardening: digest-gepinntes Debian/Rust-Image gebaut; Setup-UI, API Login/MFA/CSRF/Files/Share/Public-Upload-JSON-Fehler sowie isolierte Upgrade-/Rollback-Fehlerpfade erfolgreich und ohne externes Runtime-Netzwerk geprüft. Der erneute finale Lauf bleibt bis zur unten dokumentierten Verifikation offen.
 
 ## Bereits auf Debian 13 geprüft, vor finalem Runtime-Deploy erneut auszuführen
 
@@ -81,9 +86,11 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
   - Upload-Overwrite-Policy,
   - Upload-Validierungslogik,
   - API-Request-Policy.
+  - Der Workflow läuft zusätzlich wöchentlich als parallele Sieben-Target-Matrix; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
+- [ ] Dabei `Cargo.lock` und `fuzz/Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.
-- [ ] Release-Dry-Run im gepinnten Debian-13-amd64-Container mit `--locked` grün.
+- [ ] Release-Dry-Run im digest-gepinnten Rust-1.96.1-/Debian-13-amd64-Container mit `--locked` grün.
 - [ ] Artefakte prüfen:
   - Binary,
   - README,
@@ -145,13 +152,14 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
   - `PRAGMA integrity_check = ok`,
   - kein kontinuierliches RSS-Wachstum > 15 %,
   - keine auffälligen 5xx-/Panic-/DB-Fehler im Journal.
-- [ ] Lange Soaks werden nach reinen Doku-/CI-Änderungen nicht neu gestartet; jedes neue Binary-Deploy setzt den Soak zurück.
+- [ ] Lange Soaks werden nach reinen Doku-/CI-/Deploy-Skript-Änderungen ohne neues Binary nicht neu gestartet; geänderte Upgrade-/Rollback-Skripte müssen ihre Staging-Gates trotzdem erneut bestehen. Jedes neue Binary-Deploy setzt den Soak zurück.
 
 ## Tag-Freigabe
 
 - [ ] Sauberer Worktree.
 - [ ] Grüner CI-Run auf finalem `main`.
 - [ ] Release-Dry-Run und `cargo-audit` weiterhin grün.
+- [ ] `make policy-check` grün; alle Dependabot-Pin-Updates gegen die jeweiligen Upstream-Repositories geprüft.
 - [ ] Staging- und Public-Gates grün.
 - [ ] 72h-Soak bestanden.
 - [ ] Annotierten Tag `v0.3.0` erstellen.
