@@ -834,8 +834,10 @@ impl PendingUpload {
             "could not allocate upload temporary file",
         ))
     }
-    pub fn take_file(&mut self) -> File {
-        self.file.take().expect("upload file already taken")
+    pub fn take_file(&mut self) -> io::Result<File> {
+        self.file
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "upload file already taken"))
     }
 
     pub fn publish(&mut self, name: &str) -> io::Result<PublishOutcome> {
@@ -896,6 +898,8 @@ pub struct PendingUpload {
     directory: PathBuf,
     active_key: Option<ActiveUploadFragmentKey>,
     #[cfg(test)]
+    next_reopen_error: Option<io::ErrorKind>,
+    #[cfg(test)]
     next_directory_sync_error: Option<io::ErrorKind>,
 }
 
@@ -915,19 +919,28 @@ impl PendingUpload {
             directory,
             active_key: Some(active_key),
             #[cfg(test)]
+            next_reopen_error: None,
+            #[cfg(test)]
             next_directory_sync_error: None,
         })
     }
-    pub fn take_file(&mut self) -> File {
+    pub fn take_file(&mut self) -> io::Result<File> {
+        #[cfg(test)]
+        if let Some(kind) = self.next_reopen_error.take() {
+            return Err(io::Error::new(kind, "injected upload reopen failure"));
+        }
         self.temporary
             .as_ref()
-            .expect("upload file already taken")
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "upload file already taken")
+            })?
             .reopen()
-            .expect("reopen temporary upload")
     }
     pub fn publish(&mut self, name: &str) -> io::Result<PublishOutcome> {
         let name = upload_destination_name(name)?;
-        let temporary = self.temporary.take().expect("upload already published");
+        let temporary = self.temporary.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "upload already published")
+        })?;
         let persisted = temporary
             .persist_noclobber(self.directory.join(name))
             .map_err(|error| error.error)?;
@@ -937,7 +950,9 @@ impl PendingUpload {
 
     pub fn publish_replace(&mut self, name: &str) -> io::Result<PublishOutcome> {
         let name = upload_destination_name(name)?;
-        let temporary = self.temporary.take().expect("upload already published");
+        let temporary = self.temporary.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "upload already published")
+        })?;
         let persisted = temporary
             .persist(self.directory.join(name))
             .map_err(|error| error.error)?;
@@ -961,6 +976,11 @@ impl PendingUpload {
             return Err(io::Error::new(kind, "injected directory sync failure"));
         }
         sync_directory_path(&self.directory)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_reopen(&mut self, kind: io::ErrorKind) {
+        self.next_reopen_error = Some(kind);
     }
 
     #[cfg(test)]
@@ -1150,12 +1170,37 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn pending_upload_reopen_and_reuse_fail_without_panicking() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+
+        let mut missing = root.begin_upload("").unwrap();
+        missing.fail_next_reopen(io::ErrorKind::Other);
+        assert_eq!(
+            missing.take_file().unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+
+        let mut published = root.begin_upload("").unwrap();
+        published.publish("published.txt").unwrap();
+        assert_eq!(
+            published.take_file().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            published.publish("again.txt").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
     #[test]
     fn private_fragment_namespace_cannot_be_published() {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         let mut pending = root.begin_upload("").unwrap();
-        pending.take_file().write_all(b"content").unwrap();
+        pending.take_file().unwrap().write_all(b"content").unwrap();
         assert_eq!(
             pending.publish(&upload_fragment_name()).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
@@ -1307,7 +1352,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         let mut pending = root.begin_upload("").unwrap();
-        pending.take_file().write_all(b"active").unwrap();
+        pending.take_file().unwrap().write_all(b"active").unwrap();
         let mut cleanup = root.start_upload_fragment_cleanup().unwrap();
         loop {
             let batch = cleanup.run_batch(1).unwrap();
@@ -1371,7 +1416,7 @@ mod tests {
         std::fs::write(directory.path().join("existing.txt"), b"original").unwrap();
 
         let mut upload = root.begin_upload("").unwrap();
-        let mut file = upload.take_file();
+        let mut file = upload.take_file().unwrap();
         file.write_all(b"replacement").unwrap();
         file.sync_all().unwrap();
         drop(file);
@@ -1386,7 +1431,7 @@ mod tests {
         );
 
         let mut upload = root.begin_upload("").unwrap();
-        let mut file = upload.take_file();
+        let mut file = upload.take_file().unwrap();
         file.write_all(b"complete").unwrap();
         file.sync_all().unwrap();
         drop(file);
@@ -1404,7 +1449,7 @@ mod tests {
         std::fs::write(directory.path().join("existing.txt"), b"original").unwrap();
 
         let mut upload = root.begin_upload("").unwrap();
-        let mut file = upload.take_file();
+        let mut file = upload.take_file().unwrap();
         file.write_all(b"replacement").unwrap();
         file.sync_all().unwrap();
         drop(file);
@@ -1429,7 +1474,7 @@ mod tests {
         let root = SecureRoot::open(directory.path()).unwrap();
         {
             let mut upload = root.begin_upload("").unwrap();
-            let mut file = upload.take_file();
+            let mut file = upload.take_file().unwrap();
             file.write_all(b"partial").unwrap();
             assert!(root.list("", 0, 100).unwrap().is_empty());
         }
@@ -1445,7 +1490,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         let mut upload = root.begin_upload("").unwrap();
-        let mut file = upload.take_file();
+        let mut file = upload.take_file().unwrap();
         file.write_all(b"complete").unwrap();
         file.sync_all().unwrap();
         drop(file);
@@ -1469,7 +1514,7 @@ mod tests {
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::write(directory.path().join("existing.txt"), b"old").unwrap();
         let mut upload = root.begin_upload("").unwrap();
-        let mut file = upload.take_file();
+        let mut file = upload.take_file().unwrap();
         file.write_all(b"new").unwrap();
         file.sync_all().unwrap();
         drop(file);
@@ -1497,7 +1542,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let mut upload = root.begin_upload("").unwrap();
-                    let mut file = upload.take_file();
+                    let mut file = upload.take_file().unwrap();
                     file.write_all(value.to_string().as_bytes()).unwrap();
                     file.sync_all().unwrap();
                     drop(file);

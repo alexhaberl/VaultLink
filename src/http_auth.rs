@@ -85,7 +85,7 @@ pub async fn commit_runtime_settings(
     admin_id: i64,
 ) -> Result<()> {
     next.validate_for_config(&state.config)
-        .map_err(|_| HttpAuthError::status(StatusCode::BAD_REQUEST, "Invalid runtime setting"))?;
+        .map_err(|_| HttpAuthError::status(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
     let runtime = state.runtime.clone();
     database(state.db.clone(), move |database| {
         // Settings commits always acquire locks in Runtime -> Database order. Readers
@@ -186,12 +186,11 @@ pub fn clear_session_cookie(state: &AppState) -> String {
     )
 }
 
-pub fn redirect_with_cookie(to: &str, value: String) -> Response {
+pub fn redirect_with_cookie(to: &str, value: String) -> Result<Response> {
     let mut response = Redirect::to(to).into_response();
-    response
-        .headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_str(&value).unwrap());
-    response
+    let value = HeaderValue::from_str(&value).map_err(internal)?;
+    response.headers_mut().insert(header::SET_COOKIE, value);
+    Ok(response)
 }
 
 pub fn unlock_cookie_name(share_id: i64) -> String {
@@ -285,4 +284,16 @@ pub fn make_unlock_cookie(
             ""
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_response_cookie_is_reported_without_panicking() {
+        let error = redirect_with_cookie("/", "cookie=value\r\nbad=value".to_string())
+            .expect_err("invalid cookie header must be rejected");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

@@ -104,10 +104,12 @@ Runtime-Settings werden als ein validierter Snapshot in SQLite geschrieben und e
 | `/v/:token/unlock` | POST | passwortgeschützte Freigabe entsperren |
 | `/v/:token/preview` | GET | öffentliche Text-/Media-Preview-Seite |
 | `/v/:token/preview/raw` | GET/HEAD | kurzlebig tokenisierte Raw-Bild/PDF-Preview; erfolgreicher GET zählt |
-| `/v/:token/download` | GET/HEAD | Streaming, einzelner Byte-Range, `206`/`416` |
+| `/v/:token/download` | GET/HEAD | Streaming, einzelner Byte-Range, `206`/`416`; HEAD prüft die Transferquote, zählt und reserviert aber nicht |
 | `/v/:token/download.zip` | GET | limitierter ZIP-Download für Ordner |
 | `/v/:token/upload` | POST | exklusiver Ordnerupload |
 | `/s/:alias` | GET | validierter Kurzlink |
+
+`max_downloads` begrenzt abgeschlossene Inhaltsübertragungen (Download, ZIP und gezählte Vorschau), nicht den Aufruf der öffentlichen Metadaten-/Landingpage oder Uploads. `HEAD` liefert nur dann Metadaten, wenn derselbe logische `GET` mit der aktuellen Transfer-Session beginnen dürfte, verbraucht selbst aber keine Quote.
 
 Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.3.x` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
 
@@ -128,7 +130,7 @@ Wichtige API-Routen:
 | `/api/v1/audit` | GET | Audit-Events paginiert |
 | `/api/v1/public/shares/:token` | GET | Public-Freigabe-Metadaten |
 | `/api/v1/public/shares/:token/unlock` | POST | passwortgeschützte Freigabe entsperren |
-| `/api/v1/public/shares/:token/download` | GET/HEAD | delegiert auf sichere Streaming-Downloadlogik |
+| `/api/v1/public/shares/:token/download` | GET/HEAD | delegiert auf sichere Streaming- und HEAD-Quotenlogik |
 | `/api/v1/public/shares/:token/upload` | POST | delegiert auf sichere Uploadlogik |
 | `/api/v1/public/shares/:token/preview` | GET | delegiert auf sichere Previewlogik |
 | `/api/v1/public/shares/:token/download.zip` | GET | delegiert auf sichere ZIP-Logik |
