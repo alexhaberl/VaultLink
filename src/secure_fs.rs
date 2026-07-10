@@ -743,10 +743,10 @@ impl SecureRoot {
                 parent.directory.as_ref().try_clone()?,
                 OsString::from(tombstone_name),
             ));
-            return Ok(UploadFragmentCleanup {
+            Ok(UploadFragmentCleanup {
                 directories: vec![cleanup],
                 visited: HashSet::from([(metadata.dev(), metadata.ino())]),
-            });
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -822,10 +822,10 @@ impl SecureDirectory {
             } else {
                 false
             };
-            return Ok(EntryStatus {
+            Ok(EntryStatus {
                 kind,
                 directory_non_empty,
-            });
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -859,7 +859,7 @@ impl SecureDirectory {
             if let Err(error) = self.directory.sync_all() {
                 tracing::warn!(%error, "created directory but parent sync was uncertain");
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -878,7 +878,7 @@ impl SecureDirectory {
             if let Err(error) = self.directory.sync_all() {
                 tracing::warn!(%error, "renamed entry but parent sync was uncertain");
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
