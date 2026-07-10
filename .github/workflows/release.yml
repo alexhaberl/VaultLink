@@ -13,7 +13,7 @@ jobs:
   release:
     if: github.repository_visibility == 'private'
     runs-on: ubuntu-24.04
-    container: rust:1.96.1-trixie@sha256:1f0dbad1df66647807e6952d1db85d0b2bda7606cb2139d82517e4f009967376
+    container: rust:1.97.0-trixie@sha256:44637ff22d0a6571a221bfaf137849711ad02ff4723dbb4736e297538f6a3e60
     env:
       CARGO_TERM_COLOR: always
       SOURCE_DATE_EPOCH: "0"
@@ -30,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(rustc --version | awk '{print $2}')" = "1.96.1"
+          test "$(rustc --version | awk '{print $2}')" = "1.97.0"
           package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           test -n "$package_version"
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then

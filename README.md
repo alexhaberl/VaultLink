@@ -2,7 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Zielplattform ist Debian Linux; Entwicklung und Tests funktionieren auch unter Debian/Ubuntu in WSL.
 
-Status: `0.3.0`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
+Status: `0.3.1`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
@@ -109,7 +109,7 @@ Runtime-Settings werden als ein validierter Snapshot in SQLite geschrieben und e
 | `/v/:token/upload` | POST | exklusiver Ordnerupload |
 | `/s/:alias` | GET | validierter Kurzlink |
 
-Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.3.0` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
+Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.3.x` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
 
 Wichtige API-Routen:
 

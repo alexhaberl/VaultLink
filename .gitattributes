@@ -1,7 +1,10 @@
 * text=auto
+.gitattributes text eol=lf
 
 *.rs text eol=lf
 *.toml text eol=lf
+Cargo.lock text eol=lf
+fuzz/Cargo.lock text eol=lf
 *.md text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
@@ -10,5 +13,6 @@
 *.timer text eol=lf
 *.conf text eol=lf
 Makefile text eol=lf
+Dockerfile* text eol=lf
 Caddyfile text eol=lf
 .gitignore text eol=lf

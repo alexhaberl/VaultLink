@@ -1,13 +1,13 @@
-# v0.3.0 release checklist
+# v0.3.1 release checklist
 
-Stand: 2026-07-10 nach Security-/Reliability-Hardening für SecureFS, Runtime-Transaktionen, Transfer-Limits, Streaming-ZIP, Setup-Recovery sowie Build-/Deploy-Gates.
+Stand: 2026-07-10 nach Security-/Reliability-Hardening für SecureFS, Runtime-Transaktionen, Transfer-Limits, Streaming-ZIP, Setup-Recovery, UTF-8-Rendering sowie Build-/Deploy-Gates und Toolchain-Updates.
 
 Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschließlich bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
-## Feature-Scope für 0.3.0
+## Feature-Scope für 0.3.1
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
-- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.3.0.
+- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.3.1.
 - [x] API und UI teilen Auth-, Session-, CSRF-, SecureFS-, SQLite-, Runtime-Settings- und Audit-Logik.
 - [x] API-Fehler werden als JSON normalisiert; Streaming-Routen liefern nur bei Erfolg Binärdaten.
 - [x] Root-begrenzter Dateibrowser mit Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der Oberfläche.
@@ -37,7 +37,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Public Upload-Fehlerseiten für validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Größenlimits, fehlende Dateinamen und Speicherfehler.
 - [x] Fuzzing für Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, Upload-Validierung und API-Request-Policy.
 
-## Bewusste Nicht-Ziele für 0.3.0
+## Bewusste Nicht-Ziele für 0.3.1
 
 - DEB-Paket.
 - ARM64-Build.
@@ -54,18 +54,18 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - [x] `cargo test --locked --all-targets`
-  - Ergebnis: 107 Tests unter Windows bestanden; zusätzlich 115 Tests im final neu gebauten Debian-13-Container.
-  - Enthalten: API Login/MFA/Session/CSRF, API-URL-/Listen-Restart-Sicherheit, API-scoped Unlock/Media-Preview, Share-Erstellung, Secret-Redaction, Admin-/Settings-API, delegierte API-Uploadfehler als JSON, Setup-UI/-Recovery, transaktionale Admin-/Runtime-Pfade, Text-/Bild-/PDF-Preview, Transfer-Grant/Abort/Range-Resume einschließlich HTTP/1-`Content-Length`, Raw-Preview-Token, inkrementelles ZIP, rohe Scanbudgets, Multipart-Präambel/-Header, Body-Limits, `%`-Dateinamens-Roundtrip, Upload-No-Replace/-Replace/-Durability, Share-Rechte, Migrationen und resumierbares Upload-Cleanup.
+  - Ergebnis: 110 Tests unter Windows bestanden; zusätzlich 118 Tests im final neu gebauten Rust-1.97.0-/Debian-13-Container.
+  - Enthalten: API Login/MFA/Session/CSRF, API-URL-/Listen-Restart-Sicherheit, API-scoped Unlock/Media-Preview, Share-Erstellung, Secret-Redaction, Admin-/Settings-API, delegierte API-Uploadfehler als JSON, Setup-UI/-Recovery, UTF-8-Response-/Source-Guards, transaktionale Admin-/Runtime-Pfade, Text-/Bild-/PDF-Preview, Transfer-Grant/Abort/Range-Resume einschließlich HTTP/1-`Content-Length`, Raw-Preview-Token, inkrementelles ZIP, rohe Scanbudgets, Multipart-Präambel/-Header, Body-Limits, `%`-Dateinamens-Roundtrip, Upload-No-Replace/-Replace/-Durability, Share-Rechte, Migrationen und resumierbares Upload-Cleanup.
 - [x] `cargo check --manifest-path fuzz/Cargo.toml --locked`
   - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy` und `api_request_policy` kompiliert.
 - [x] `cargo audit --deny warnings` und `cargo audit --deny warnings --file fuzz/Cargo.lock`
   - Beide Lockfiles (`Cargo.lock`, `fuzz/Cargo.lock`) ohne bekannte Vulnerabilities/Warnings.
 - [x] `make policy-check`
-  - Externe Actions auf volle Commit-SHAs und Container auf Digests gepinnt; Cargo-CI-Tools versioniert; Docker-Secret-Ausschlüsse vorhanden.
+  - Externe Actions auf volle Commit-SHAs und Container auf Digests gepinnt; Stable-Rust-Version und Smoke-/Release-Image synchron; Cargo-CI-Tools versioniert; Docker-Secret-Ausschlüsse vorhanden.
 - [x] `make docker-smoke`
   - Da GNU Make auf dem Windows-Host nicht installiert ist, wurden die identischen Docker-Build-/Run-Befehle direkt ausgeführt.
-  - Ergebnis auf dem final neu gebauten, digest-gepinnten Debian/Rust-Image: Setup-UI, API Login/MFA/CSRF/Files/Share/Public-Upload-JSON-Fehler sowie sechs isolierte Upgrade-/Rollback-Erfolgs- und Fehlerpfade erfolgreich mit `--network none` geprüft.
-  - Zusätzlich im selben Image grün: Linux-Rustfmt, Clippy über alle Targets/Features mit `-D warnings`, 115/115 Tests inklusive `openat2`-/Symlink-/FIFO-Schutz, Release-Build, Fuzz-Crate-Check, ShellCheck und Supply-Chain-Policy.
+  - Ergebnis auf dem final neu gebauten, digest-gepinnten Rust-1.97.0-/Debian-13-Image: Setup-UI, API Login/MFA/CSRF/Files/Share/Public-Upload-JSON-Fehler sowie sechs isolierte Upgrade-/Rollback-Erfolgs- und Fehlerpfade erfolgreich mit `--network none` geprüft.
+  - Zusätzlich im selben Image grün: Linux-Rustfmt, Clippy über alle Targets/Features mit `-D warnings`, 118/118 Tests inklusive `openat2`-/Symlink-/FIFO-Schutz, Release-Build, Fuzz-Crate-Check, ShellCheck und Supply-Chain-Policy.
 
 ## Debian-13-/Docker-Verifikation und noch offene Runtime-Deploys
 
@@ -94,7 +94,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
 - [ ] Dabei `Cargo.lock` und `fuzz/Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.
-- [ ] Release-Dry-Run im digest-gepinnten Rust-1.96.1-/Debian-13-amd64-Container mit `--locked` grün.
+- [ ] Release-Dry-Run im digest-gepinnten Rust-1.97.0-/Debian-13-amd64-Container mit `--locked` grün.
 - [ ] Artefakte prüfen:
   - Binary,
   - README,
@@ -166,7 +166,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [ ] `make policy-check` grün; alle Dependabot-Pin-Updates gegen die jeweiligen Upstream-Repositories geprüft.
 - [ ] Staging- und Public-Gates grün.
 - [ ] 72h-Soak bestanden.
-- [ ] Annotierten Tag `v0.3.0` erstellen.
+- [ ] Annotierten Tag `v0.3.1` erstellen.
 - [ ] Tag-Release-Workflow prüfen:
   - GitHub Release ist privat,
   - Artefakte stammen ausschließlich aus CI,

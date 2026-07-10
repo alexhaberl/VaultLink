@@ -23,6 +23,34 @@ if ! grep -E -q '^[[:space:]]+container:[[:space:]]+[^[:space:]]+@sha256:[0-9a-f
     report "release container must be pinned by digest"
 fi
 
+stable_toolchain=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)
+ci_toolchains=$(sed -n 's/^[[:space:]]*toolchain:[[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' .github/workflows/ci.yml)
+ci_toolchain_uses=$(grep -c 'uses:[[:space:]]*dtolnay/rust-toolchain@' .github/workflows/ci.yml || true)
+ci_toolchain_count=$(printf '%s\n' "$ci_toolchains" | grep -c . || true)
+docker_image=$(sed -n 's/^FROM[[:space:]][[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' deploy/docker/Dockerfile.setup-smoke | head -n 1)
+release_image=$(sed -n 's/^[[:space:]]*container:[[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' .github/workflows/release.yml | head -n 1)
+
+if [ -z "$stable_toolchain" ] || [ -z "$ci_toolchains" ] || [ -z "$docker_image" ] || [ -z "$release_image" ]; then
+    report "stable Rust toolchain and container pins must be readable"
+else
+    if [ "$ci_toolchain_uses" -ne "$ci_toolchain_count" ]; then
+        report "every CI Rust toolchain action must declare an exact toolchain"
+    fi
+    for ci_toolchain in $ci_toolchains; do
+        if [ "$ci_toolchain" != "$stable_toolchain" ]; then
+            report "CI Rust toolchains must match rust-toolchain.toml"
+            break
+        fi
+    done
+    if [ "$docker_image" != "$release_image" ]; then
+        report "Docker smoke and release containers must use the same image ref"
+    fi
+    case "$docker_image" in
+        "rust:${stable_toolchain}-trixie@sha256:"*) ;;
+        *) report "container image version must match rust-toolchain.toml" ;;
+    esac
+fi
+
 if grep -R -n -E 'curl[^|]*\|[[:space:]]*(ba)?sh' .github/workflows; then
     report "workflows must not pipe remote scripts into a shell"
 fi
