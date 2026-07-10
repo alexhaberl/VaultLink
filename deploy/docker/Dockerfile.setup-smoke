@@ -12,6 +12,7 @@ RUN apt-get update \
         build-essential \
         shellcheck \
         sqlite3 \
+        systemd \
         util-linux \
     && rm -rf /var/lib/apt/lists/*
 
@@ -19,11 +20,23 @@ WORKDIR /work
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
 COPY deploy/docker ./deploy/docker
-COPY deploy/vaultlink-upgrade.sh deploy/vaultlink-rollback.sh ./deploy/
+COPY deploy/vaultlink-upgrade.sh deploy/vaultlink-rollback.sh \
+    deploy/vaultlink.service deploy/vaultlink-cert-renew.service \
+    deploy/vaultlink-cert-renew.timer ./deploy/
 
 RUN test ! -e /work/config.toml \
     && test ! -e /work/.env \
     && ! find /work -type f -name '*.sqlite*' -print -quit | grep -q .
+
+RUN install -d /opt/vaultlink /root/.acme.sh /var/lib/vaultlink \
+        /var/log/vaultlink /mnt/storage \
+    && install -m 0755 /bin/true /opt/vaultlink/vaultlink \
+    && install -m 0755 /bin/true /root/.acme.sh/acme.sh \
+    && systemd-analyze verify \
+        deploy/vaultlink.service \
+        deploy/vaultlink-cert-renew.service \
+        deploy/vaultlink-cert-renew.timer \
+    && rm -f /opt/vaultlink/vaultlink /root/.acme.sh/acme.sh
 
 RUN cargo build --release --locked
 
