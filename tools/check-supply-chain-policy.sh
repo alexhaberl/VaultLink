@@ -74,6 +74,22 @@ for target in path_normalization byte_range filename zip_search_preview_paths up
     fi
 done
 
+if ! grep -F -q 'runs-on: [self-hosted, Linux, X64, vaultlink]' .github/workflows/fuzz.yml; then
+    report "fuzz workflow must use the dedicated self-hosted runner"
+fi
+
+if ! grep -F -q 'run: make fuzz-parallel' .github/workflows/fuzz.yml; then
+    report "fuzz workflow must run all targets through the parallel Make target"
+fi
+
+if ! grep -E -q '^[[:space:]]+FUZZ_JOBS:[[:space:]]+7$' .github/workflows/fuzz.yml; then
+    report "fuzz workflow must run all seven targets concurrently"
+fi
+
+if ! grep -E -q '^[[:space:]]+cancel-in-progress:[[:space:]]+true$' .github/workflows/fuzz.yml; then
+    report "fuzz workflow must cancel superseded runs"
+fi
+
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi

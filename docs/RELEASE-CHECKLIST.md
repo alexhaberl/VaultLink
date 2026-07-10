@@ -90,7 +90,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
   - Upload-Overwrite-Policy,
   - Upload-Validierungslogik,
   - API-Request-Policy.
-  - Der Workflow läuft zusätzlich wöchentlich als parallele Sieben-Target-Matrix; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
+  - Der Workflow läuft zusätzlich wöchentlich als einzelner Self-hosted-Job, der alle sieben Targets intern parallel ausführt; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
 - [ ] Dabei `Cargo.lock` und `fuzz/Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.

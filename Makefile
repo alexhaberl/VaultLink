@@ -1,8 +1,10 @@
-.PHONY: dev-setup sample-data test security-test fuzz lint build run policy-check docker-smoke-build docker-smoke docker-setup-smoke docker-api-smoke docker-upgrade-safety-test
+.PHONY: dev-setup sample-data test security-test fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-smoke docker-setup-smoke docker-api-smoke docker-upgrade-safety-test
 
 CONFIG ?= config/development.toml
 DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
 FUZZ_MAX_TOTAL_TIME ?= 600
+FUZZ_JOBS ?= 7
+FUZZ_LOG_DIR ?= /tmp/vaultlink-fuzz-logs
 FUZZ_TARGETS := path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy
 
 dev-setup: sample-data
@@ -26,11 +28,14 @@ security-test:
 	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi
 	sh tools/check-supply-chain-policy.sh
 
-fuzz:
-	@set -e; for target in $(FUZZ_TARGETS); do \
-		echo "Fuzzing $$target for $(FUZZ_MAX_TOTAL_TIME)s"; \
-		cargo +nightly-2026-07-01 fuzz run "$$target" -- -max_total_time=$(FUZZ_MAX_TOTAL_TIME); \
-	done
+fuzz: fuzz-parallel
+
+fuzz-parallel:
+	@FUZZ_JOBS="$(FUZZ_JOBS)" FUZZ_MAX_TOTAL_TIME="$(FUZZ_MAX_TOTAL_TIME)" FUZZ_LOG_DIR="$(FUZZ_LOG_DIR)" \
+		sh tools/run-fuzz-targets.sh $(FUZZ_TARGETS)
+
+fuzz-sequential:
+	@$(MAKE) fuzz-parallel FUZZ_JOBS=1
 
 lint:
 	cargo fmt --all -- --check

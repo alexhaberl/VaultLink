@@ -8,22 +8,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fuzz:
-    name: Fuzz ${{ matrix.target }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - path_normalization
-          - byte_range
-          - filename
-          - zip_search_preview_paths
-          - upload_overwrite_policy
-          - upload_validation_policy
-          - api_request_policy
+    name: Fuzz all targets
+    runs-on: [self-hosted, Linux, X64, vaultlink]
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      FUZZ_JOBS: 7
+      FUZZ_MAX_TOTAL_TIME: 600
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -33,13 +30,17 @@ jobs:
           toolchain: nightly-2026-07-01
       - name: Install pinned cargo-fuzz
         run: cargo install --locked cargo-fuzz --version 0.13.2
-      - name: Run target for 10 minutes
-        run: cargo +nightly-2026-07-01 fuzz run "${{ matrix.target }}" -- -max_total_time=600
-      - name: Upload crash artifacts
+      - name: Run all targets in parallel for 10 minutes
+        run: make fuzz-parallel
+        env:
+          FUZZ_LOG_DIR: ${{ runner.temp }}/vaultlink-fuzz-logs
+      - name: Upload crash artifacts and logs
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fuzz-${{ matrix.target }}-${{ github.sha }}
-          path: fuzz/artifacts/${{ matrix.target }}/
+          name: fuzz-${{ github.sha }}
+          path: |
+            fuzz/artifacts/
+            ${{ runner.temp }}/vaultlink-fuzz-logs/
           if-no-files-found: ignore
           retention-days: 14
