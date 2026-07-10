@@ -34,8 +34,9 @@ avoids granting the runner general `sudo` access merely to inspect paths under
 Check the service and recent logs:
 
 ```sh
-sudo systemctl status actions.runner.alexhaberl-VaultLink.vaultlink-proxmox-01.service
-sudo journalctl -u actions.runner.alexhaberl-VaultLink.vaultlink-proxmox-01.service -n 100
+systemctl list-unit-files 'actions.runner.*.service'
+sudo systemctl status 'actions.runner.*.service'
+sudo journalctl --unit='actions.runner.*.service' -n 100
 ```
 
 Check disk usage periodically because Rust and Docker caches are persistent:
