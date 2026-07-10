@@ -254,7 +254,7 @@ const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
 
 fn plain_page(title: &str, body: &str) -> String {
     format!(
-        r#"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} Â· VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><style>{}</style><script src="/assets/app.js" defer></script></head><body><div class="public-shell"><main><div class="public-brand"><img src="/assets/vaultlink-logo.svg" alt="VaultLink Logo"><div>VaultLink<small>Secure file links</small></div></div>{}</main></div></body></html>"#,
+        r#"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><style>{}</style><script src="/assets/app.js" defer></script></head><body><div class="public-shell"><main><div class="public-brand"><img src="/assets/vaultlink-logo.svg" alt="VaultLink Logo"><div>VaultLink<small>Secure file links</small></div></div>{}</main></div></body></html>"#,
         esc(title),
         app_css(),
         body
@@ -274,7 +274,7 @@ fn admin_page(
         ""
     };
     format!(
-        r#"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} Â· VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><style>{}</style><script src="/assets/app.js" defer></script></head><body><div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/assets/vaultlink-logo.svg" alt="VaultLink Logo"><div>VaultLink<small>Secure file links</small></div></div><nav class="nav-group" aria-label="Hauptnavigation"><a class="nav-link" href="/admin">ðŸ“ Dateien</a><a class="nav-link" href="/admin/shares">ðŸ”— Links</a><a class="nav-link" href="/admin/admins">ðŸ‘¥ Admins</a><a class="nav-link" href="/admin/settings">âš™ï¸ Einstellungen</a><a class="nav-link" href="/admin/audit">ðŸ›¡ï¸ Audit</a></nav><div class="sidebar-foot"><strong class="good">â— System</strong><br><span>{}</span></div></aside><div class="content"><header class="topbar"><div class="topbar-title"><p>VaultLink Admin</p><h1>{}</h1></div><div class="topbar-actions">{}<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button class="secondary">Abmelden</button></form></div></header><main>{}</main></div></div></body></html>"#,
+        r#"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><style>{}</style><script src="/assets/app.js" defer></script></head><body><div class="app-shell"><aside class="sidebar"><div class="brand"><img src="/assets/vaultlink-logo.svg" alt="VaultLink Logo"><div>VaultLink<small>Secure file links</small></div></div><nav class="nav-group" aria-label="Hauptnavigation"><a class="nav-link" href="/admin">📁 Dateien</a><a class="nav-link" href="/admin/shares">🔗 Links</a><a class="nav-link" href="/admin/admins">👥 Admins</a><a class="nav-link" href="/admin/settings">⚙️ Einstellungen</a><a class="nav-link" href="/admin/audit">🛡️ Audit</a></nav><div class="sidebar-foot"><strong class="good">● System</strong><br><span>{}</span></div></aside><div class="content"><header class="topbar"><div class="topbar-title"><p>VaultLink Admin</p><h1>{}</h1></div><div class="topbar-actions">{}<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button class="secondary">Abmelden</button></form></div></header><main>{}</main></div></div></body></html>"#,
         esc(title),
         app_css(),
         system_panel(state),
@@ -715,7 +715,7 @@ fn public_upload_error(
         Html(plain_page(
             "Fehler",
             &format!(
-                r#"<section><h1>Fehler</h1><p>{}</p><p><a class="button secondary" href="{}">ZurÃ¼ck zur Freigabe</a></p></section>"#,
+                r#"<section><h1>Fehler</h1><p>{}</p><p><a class="button secondary" href="{}">Zurück zur Freigabe</a></p></section>"#,
                 esc(message),
                 esc(&back)
             ),
@@ -786,10 +786,7 @@ async fn login(
         state.limiter.failure(&key);
         state.limiter.failure(&ip_key);
         audit(&state, form.username, "login_failed", None, None).await;
-        return Err(AppError(
-            StatusCode::UNAUTHORIZED,
-            "UngÃ¼ltige Zugangsdaten",
-        ));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
     state.limiter.success(&key);
     state.limiter.success(&ip_key);
@@ -841,7 +838,7 @@ async fn mfa(
     if !auth::verify_totp_now(&admin.totp_secret, &form.code) {
         state.limiter.failure(&key);
         audit(&state, s.username, "mfa_failed", None, None).await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "UngÃ¼ltiger MFA-Code"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
     }
     state.limiter.success(&key);
     database(state.db.clone(), move |db| db.verify_mfa(&token)).await?;
@@ -884,7 +881,7 @@ async fn admin_browser(
         q.q.map(|value| value.trim().to_string())
             .filter(|v| !v.is_empty());
     let rel = path_security::validate_relative(&raw)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Pfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
         .to_string_lossy()
         .replace('\\', "/");
     let secure_root = state.secure_root.clone();
@@ -913,17 +910,17 @@ async fn admin_browser(
                 .entry
                 .modified
                 .map(format_file_time)
-                .unwrap_or_else(|| "â€”".into());
+                .unwrap_or_else(|| "—".into());
             rows += &format!(
                 r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}<a class="button secondary small" href="/admin/shares?path={}">Freigeben</a></td></tr>"#,
                 if hit.entry.is_dir {
-                    format!(r#"ðŸ“ <a href="/admin?path={target}">{name}</a>"#)
+                    format!(r#"📁 <a href="/admin?path={target}">{name}</a>"#)
                 } else {
-                    format!("ðŸ“„ {name}")
+                    format!("📄 {name}")
                 },
                 if hit.entry.is_dir { "Ordner" } else { "Datei" },
                 if hit.entry.is_dir {
-                    "â€”".into()
+                    "—".into()
                 } else {
                     human(hit.entry.len)
                 },
@@ -950,9 +947,9 @@ async fn admin_browser(
             let child = join_display(&rel, &name);
             let target = encoded(&child);
             let display = if is_dir {
-                format!("ðŸ“ <a href=\"/admin?path={target}\">{}</a>", esc(&name))
+                format!("📁 <a href=\"/admin?path={target}\">{}</a>", esc(&name))
             } else {
-                format!("ðŸ“„ {}", esc(&name))
+                format!("📄 {}", esc(&name))
             };
             let preview = if !is_dir && preview_allowed(&child, &settings) {
                 format!(
@@ -961,17 +958,11 @@ async fn admin_browser(
             } else {
                 String::new()
             };
-            let modified = modified
-                .map(format_file_time)
-                .unwrap_or_else(|| "â€”".into());
+            let modified = modified.map(format_file_time).unwrap_or_else(|| "—".into());
             rows += &format!(
                 r#"<tr><td>{display}</td><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}<a class="button secondary small" href="/admin/shares?path={}">Freigeben</a></td></tr>"#,
                 if is_dir { "Ordner" } else { "Datei" },
-                if is_dir {
-                    "â€”".into()
-                } else {
-                    human(size)
-                },
+                if is_dir { "—".into() } else { human(size) },
                 modified,
                 preview,
                 target
@@ -995,7 +986,7 @@ async fn admin_browser(
     };
     let previous = if page_number > 0 {
         format!(
-            "<a href=\"/admin?path={encoded_path}&page={}{}\">ZurÃ¼ck</a>",
+            "<a href=\"/admin?path={encoded_path}&page={}{}\">Zurück</a>",
             page_number - 1,
             search_param
         )
@@ -1020,7 +1011,7 @@ async fn admin_browser(
         })
         .unwrap_or_default();
     let body = format!(
-        r#"<section class="hero"><div><p class="eyebrow">VaultLink Admin</p><h1>Dateibrowser</h1>{}<p class=muted>Relativer Pfad: /{}</p></div><div class="side-panel"><strong>Schnellaktion</strong><p class="muted">Aktuellen Ordner sicher freigeben oder per Suche eingrenzen.</p><p><a class="button" href="/admin/shares?path={}">Aktuellen Ordner freigeben</a></p></div></section><section>{}<form method="get" class="row"><input type="hidden" name="path" value="{}"><label>Suche<br><input name="q" value="{}" placeholder="Dateiname"></label><button>Suchen</button></form><table><thead><tr><th>Name</th><th>Typ</th><th>GrÃ¶ÃŸe</th><th>GeÃ¤ndert</th><th></th></tr></thead><tbody>{}</tbody></table><p>{} {}</p><p class=muted>100 EintrÃ¤ge pro Seite. Suche ist limitiert und lÃ¤uft innerhalb des aktuellen Ordners.</p></section>"#,
+        r#"<section class="hero"><div><p class="eyebrow">VaultLink Admin</p><h1>Dateibrowser</h1>{}<p class=muted>Relativer Pfad: /{}</p></div><div class="side-panel"><strong>Schnellaktion</strong><p class="muted">Aktuellen Ordner sicher freigeben oder per Suche eingrenzen.</p><p><a class="button" href="/admin/shares?path={}">Aktuellen Ordner freigeben</a></p></div></section><section>{}<form method="get" class="row"><input type="hidden" name="path" value="{}"><label>Suche<br><input name="q" value="{}" placeholder="Dateiname"></label><button>Suchen</button></form><table><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th></th></tr></thead><tbody>{}</tbody></table><p>{} {}</p><p class=muted>100 Einträge pro Seite. Suche ist limitiert und läuft innerhalb des aktuellen Ordners.</p></section>"#,
         breadcrumbs(&rel, "/admin"),
         esc(&rel),
         current_folder_target,
@@ -1050,7 +1041,7 @@ async fn admin_preview(
         .path
         .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
     let rel = path_security::validate_relative(&raw)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Pfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
         .to_string_lossy()
         .replace('\\', "/");
     let settings = runtime_settings(&state);
@@ -1062,14 +1053,11 @@ async fn admin_preview(
             .map_err(internal)?
             .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;
     let body = match content {
-        PreviewContent::TooLarge { size } => preview_too_large_body(
-            &rel,
-            size,
-            "Datei ist grÃ¶ÃŸer als das Preview-Limit.",
-            None,
-        ),
+        PreviewContent::TooLarge { size } => {
+            preview_too_large_body(&rel, size, "Datei ist größer als das Preview-Limit.", None)
+        }
         PreviewContent::Text(text) => format!(
-            r#"<section><h1>Vorschau</h1><p class="preview-actions"><a href="/admin?path={}">ZurÃ¼ck zum Ordner</a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
+            r#"<section><h1>Vorschau</h1><p class="preview-actions"><a href="/admin?path={}">Zurück zum Ordner</a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
             encoded(parent_path(&rel).as_deref().unwrap_or("")),
             esc(&rel),
             esc(&text)
@@ -1096,7 +1084,7 @@ async fn admin_preview_raw(
         .path
         .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
     let rel = path_security::validate_relative(&raw)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Pfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
         .to_string_lossy()
         .replace('\\', "/");
     let settings = runtime_settings(&state);
@@ -1121,7 +1109,7 @@ fn admin_media_preview_body(path: &str, kind: PreviewKind, size: u64) -> String 
     let raw = format!("/admin/preview/raw?path={}", encoded(path));
     let viewer = media_viewer(kind, &raw);
     format!(
-        r#"<section><h1>Vorschau</h1><p class="preview-actions"><a href="/admin?path={}">ZurÃ¼ck zum Ordner</a></p><p><code>/{}</code> <span class="muted">{}</span></p>{}</section>"#,
+        r#"<section><h1>Vorschau</h1><p class="preview-actions"><a href="/admin?path={}">Zurück zum Ordner</a></p><p><code>/{}</code> <span class="muted">{}</span></p>{}</section>"#,
         encoded(parent_path(path).as_deref().unwrap_or("")),
         esc(path),
         human(size),
@@ -1154,12 +1142,12 @@ fn preview_too_large_body(
         String::new()
     } else {
         format!(
-            r#"<a href="/admin?path={}">ZurÃ¼ck zum Ordner</a>"#,
+            r#"<a href="/admin?path={}">Zurück zum Ordner</a>"#,
             encoded(parent_path(path).as_deref().unwrap_or(""))
         )
     };
     format!(
-        r#"<section><h1>Vorschau</h1><p class="preview-actions">{}</p><p><code>/{}</code></p><p class="muted">{} GrÃ¶ÃŸe: {}.</p></section>"#,
+        r#"<section><h1>Vorschau</h1><p class="preview-actions">{}</p><p><code>/{}</code></p><p class="muted">{} Größe: {}.</p></section>"#,
         back,
         esc(path),
         esc(message),
@@ -1188,7 +1176,7 @@ fn display_limit_unit_floor(bytes: u64, unit: u64) -> String {
 }
 
 fn expiry_picker_html() -> &'static str {
-    r#"<label>Ablauf (optional)<br><div class="datetime-picker" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="TT.MM.JJJJ HH:MM" autocomplete="off" inputmode="numeric"><button class="secondary calendar-button" type="button" data-datetime-toggle aria-label="Kalender Ã¶ffnen">ðŸ“…</button><div class="datetime-popover" data-datetime-popover hidden><div class="picker-grid"><label>Jahr<br><select data-dt-year></select></label><label>Monat<br><select data-dt-month data-pad="2"></select></label><label>Tag<br><select data-dt-day data-pad="2"></select></label><label>Stunde<br><select data-dt-hour data-pad="2"></select></label><label>Minute<br><select data-dt-minute data-pad="2"></select></label></div><div class="picker-actions"><button class="secondary small" type="button" data-datetime-clear>LÃ¶schen</button><button class="small" type="button" data-datetime-apply>Ãœbernehmen</button></div></div></div><small class="muted">Format: TT.MM.JJJJ HH:MM</small></label>"#
+    r#"<label>Ablauf (optional)<br><div class="datetime-picker" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="TT.MM.JJJJ HH:MM" autocomplete="off" inputmode="numeric"><button class="secondary calendar-button" type="button" data-datetime-toggle aria-label="Kalender öffnen">📅</button><div class="datetime-popover" data-datetime-popover hidden><div class="picker-grid"><label>Jahr<br><select data-dt-year></select></label><label>Monat<br><select data-dt-month data-pad="2"></select></label><label>Tag<br><select data-dt-day data-pad="2"></select></label><label>Stunde<br><select data-dt-hour data-pad="2"></select></label><label>Minute<br><select data-dt-minute data-pad="2"></select></label></div><div class="picker-actions"><button class="secondary small" type="button" data-datetime-clear>Löschen</button><button class="small" type="button" data-datetime-apply>Übernehmen</button></div></div></div><small class="muted">Format: TT.MM.JJJJ HH:MM</small></label>"#
 }
 
 fn format_unit_floor(bytes: u64, unit: u64) -> String {
@@ -1220,7 +1208,7 @@ fn parse_expiry(
             .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S"))
             .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M"))
             .or_else(|_| NaiveDateTime::parse_from_str(value, "%d.%m.%Y %H:%M"))
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiges Ablaufdatum"))?;
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"))?;
         let offset = offset_minutes
             .unwrap_or("0")
             .trim()
@@ -2192,7 +2180,7 @@ async fn shares_page(
             });
         let upload_conflict = match sh.upload_conflict_strategy {
             UploadConflictStrategy::Reject => "Konflikt: ablehnen",
-            UploadConflictStrategy::OverwriteAllowed => "Konflikt: Ãœberschreiben erlaubt",
+            UploadConflictStrategy::OverwriteAllowed => "Konflikt: Überschreiben erlaubt",
         };
         let upload_conflict_form = if sh.is_directory && sh.permission.can_upload() {
             let checked = if sh.upload_conflict_strategy.can_overwrite() {
@@ -2201,7 +2189,7 @@ async fn shares_page(
                 ""
             };
             format!(
-                r#"<div class="overwrite-panel"><form method="post" action="/admin/shares/{}/upload-conflict" class="button-group"><input type="hidden" name="csrf" value="{}"><label class="toggle-card"><input type="checkbox" name="overwrite_allowed" value="1" {}><span>Ãœberschreiben erlauben<small>Kann jederzeit wieder deaktiviert werden.</small></span></label><button class="secondary">Ãœbernehmen</button></form></div>"#,
+                r#"<div class="overwrite-panel"><form method="post" action="/admin/shares/{}/upload-conflict" class="button-group"><input type="hidden" name="csrf" value="{}"><label class="toggle-card"><input type="checkbox" name="overwrite_allowed" value="1" {}><span>Überschreiben erlauben<small>Kann jederzeit wieder deaktiviert werden.</small></span></label><button class="secondary">Übernehmen</button></form></div>"#,
                 sh.id,
                 esc(&s.csrf_token),
                 checked
@@ -2211,13 +2199,13 @@ async fn shares_page(
         };
         let upload_limit = format!("{upload_limit}; {upload_conflict}");
         rows += &format!(
-            r#"<div class="share-card"><div class="share-main"><div><small class="muted">Pfad</small><br><code>{}</code><br><small>{}</small></div><div><small class="muted">Recht</small><br>{}</div><div><small class="muted">Status</small><br>{}<br>{}<br><small>Uploadlimit: {}</small></div><div><small class="muted">Downloads</small><br>{}/{}</div><div><small class="muted">Aktionen</small><div class="share-actions"><a class="button secondary" href="{}">Ã–ffnen</a><button type="button" data-copy="{}">Kopieren</button><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button>{}</button></form><form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="danger">LÃ¶schen</button></form></div><form method="post" action="/admin/shares/{}/password" class="password-actions"><input type="hidden" name="csrf" value="{}"><input type="password" name="password" minlength="{}" maxlength="{}" placeholder="Passwort ersetzen"><input type="password" name="password_confirm" placeholder="BestÃ¤tigen"><button>Setzen</button><button class="secondary" name="remove" value="1">Entfernen</button></form></div></div>{}</div>"#,
+            r#"<div class="share-card"><div class="share-main"><div><small class="muted">Pfad</small><br><code>{}</code><br><small>{}</small></div><div><small class="muted">Recht</small><br>{}</div><div><small class="muted">Status</small><br>{}<br>{}<br><small>Uploadlimit: {}</small></div><div><small class="muted">Downloads</small><br>{}/{}</div><div><small class="muted">Aktionen</small><div class="share-actions"><a class="button secondary" href="{}">Öffnen</a><button type="button" data-copy="{}">Kopieren</button><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button>{}</button></form><form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="danger">Löschen</button></form></div><form method="post" action="/admin/shares/{}/password" class="password-actions"><input type="hidden" name="csrf" value="{}"><input type="password" name="password" minlength="{}" maxlength="{}" placeholder="Passwort ersetzen"><input type="password" name="password_confirm" placeholder="Bestätigen"><button>Setzen</button><button class="secondary" name="remove" value="1">Entfernen</button></form></div></div>{}</div>"#,
             esc(&sh.relative_path),
             esc(&url),
             esc(sh.permission.as_str()),
             if sh.active { "aktiv" } else { "inaktiv" },
             if sh.password_hash.is_some() {
-                "passwortgeschÃ¼tzt"
+                "passwortgeschützt"
             } else {
                 "ohne Passwort"
             },
@@ -2225,7 +2213,7 @@ async fn shares_page(
             sh.download_count,
             sh.max_downloads
                 .map(|v| v.to_string())
-                .unwrap_or_else(|| "âˆž".into()),
+                .unwrap_or_else(|| "∞".into()),
             esc(&url),
             esc(&url),
             sh.id,
@@ -2249,7 +2237,7 @@ async fn shares_page(
         None
     } else {
         let rel = path_security::validate_relative(&selected_raw)
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Zielpfad"))?
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?
             .to_string_lossy()
             .replace('\\', "/");
         let secure_root = state.secure_root.clone();
@@ -2257,7 +2245,7 @@ async fn shares_page(
         let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
             .await
             .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Zielpfad"))?;
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
         Some((rel, metadata.is_dir()))
     };
     let create_section = if let Some((selected, is_dir)) = selected {
@@ -2269,10 +2257,10 @@ async fn shares_page(
         let upload_hint = if is_dir {
             String::new()
         } else {
-            r#"<p class="muted">Upload-Rechte sind nur fÃ¼r Ordnerlinks verfÃ¼gbar. FÃ¼r Uploads bitte im Dateibrowser einen Zielordner auswÃ¤hlen.</p>"#.into()
+            r#"<p class="muted">Upload-Rechte sind nur für Ordnerlinks verfügbar. Für Uploads bitte im Dateibrowser einen Zielordner auswählen.</p>"#.into()
         };
         format!(
-            r#"<section><h1>Link erstellen</h1><div class="form-card"><h2>Ziel</h2><p>AusgewÃ¤hltes Ziel: <code>/{}</code> <span class="muted">({})</span></p>{}<p><a class="button secondary" href="/admin">Anderen Pfad im Dateibrowser auswÃ¤hlen</a></p></div><form method="post"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><div class="form-card"><h2>Freigabeoptionen</h2><div class="form-grid"><label>Berechtigung<br><select name="permission">{}</select></label><label class="toggle-card"><input type="checkbox" name="overwrite_allowed" value="1"><span>Ãœberschreiben fÃ¼r Uploads erlauben<small>Uploader mÃ¼ssen das Ersetzen pro Upload zusÃ¤tzlich bestÃ¤tigen.</small></span></label></div></div><div class="form-card"><h2>Limits und Schutz</h2><div class="form-grid"><label>Alias (optional)<br><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}"></label>{}<label>Max. Downloads<br><input name="max_downloads" type="number" min="1"></label><label>Uploadlimit GB (optional)<br><input name="max_upload_size_gb" type="number" min="1" step="1" placeholder="global: {}"></label><label>Passwort (optional)<br><input name="password" type="password" minlength="{}" maxlength="{}"></label><label>Passwort bestÃ¤tigen<br><input name="password_confirm" type="password"></label></div></div><button>Erstellen</button></form></section>"#,
+            r#"<section><h1>Link erstellen</h1><div class="form-card"><h2>Ziel</h2><p>Ausgewähltes Ziel: <code>/{}</code> <span class="muted">({})</span></p>{}<p><a class="button secondary" href="/admin">Anderen Pfad im Dateibrowser auswählen</a></p></div><form method="post"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><div class="form-card"><h2>Freigabeoptionen</h2><div class="form-grid"><label>Berechtigung<br><select name="permission">{}</select></label><label class="toggle-card"><input type="checkbox" name="overwrite_allowed" value="1"><span>Überschreiben für Uploads erlauben<small>Uploader müssen das Ersetzen pro Upload zusätzlich bestätigen.</small></span></label></div></div><div class="form-card"><h2>Limits und Schutz</h2><div class="form-grid"><label>Alias (optional)<br><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}"></label>{}<label>Max. Downloads<br><input name="max_downloads" type="number" min="1"></label><label>Uploadlimit GB (optional)<br><input name="max_upload_size_gb" type="number" min="1" step="1" placeholder="global: {}"></label><label>Passwort (optional)<br><input name="password" type="password" minlength="{}" maxlength="{}"></label><label>Passwort bestätigen<br><input name="password_confirm" type="password"></label></div></div><button>Erstellen</button></form></section>"#,
             esc(&selected),
             if is_dir { "Ordner" } else { "Datei" },
             upload_hint,
@@ -2285,7 +2273,7 @@ async fn shares_page(
             settings.share_password_max_length,
         )
     } else {
-        r#"<section><h1>Link erstellen</h1><p>Bitte zuerst im Dateibrowser eine Datei oder einen Ordner auswÃ¤hlen.</p><p><a class="button secondary" href="/admin">Pfad im Dateibrowser auswÃ¤hlen</a></p></section>"#.into()
+        r#"<section><h1>Link erstellen</h1><p>Bitte zuerst im Dateibrowser eine Datei oder einen Ordner auswählen.</p><p><a class="button secondary" href="/admin">Pfad im Dateibrowser auswählen</a></p></section>"#.into()
     };
     let body = format!(
         r#"{create_section}<section><h1>Freigaben</h1>{}</section>"#,
@@ -2322,7 +2310,7 @@ async fn create_share(
     let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&s, &f.csrf)?;
     let rel = path_security::validate_relative(&f.path)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Zielpfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?
         .to_string_lossy()
         .replace('\\', "/");
     let secure_root = state.secure_root.clone();
@@ -2330,13 +2318,13 @@ async fn create_share(
     let target_metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
         .await
         .map_err(internal)?
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Zielpfad"))?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
     let permission = Permission::parse(&f.permission)
-        .ok_or(AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltige Berechtigung"))?;
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "Ungültige Berechtigung"))?;
     if target_metadata.is_file() && permission.can_upload() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Uploads sind im MVP nur fÃ¼r Ordnerlinks erlaubt",
+            "Uploads sind im MVP nur für Ordnerlinks erlaubt",
         ));
     }
     let alias = f.alias.filter(|a| !a.is_empty());
@@ -2347,7 +2335,7 @@ async fn create_share(
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }) {
-        return Err(AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Alias"));
+        return Err(AppError(StatusCode::BAD_REQUEST, "Ungültiger Alias"));
     }
     let exp = parse_expiry(
         f.expires_local.as_deref(),
@@ -2369,7 +2357,7 @@ async fn create_share(
     {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "PasswÃ¶rter stimmen nicht Ã¼berein",
+            "Passwörter stimmen nicht überein",
         ));
     }
     let password_hash = if let Some(password) = password {
@@ -2392,12 +2380,7 @@ async fn create_share(
         .filter(|value| !value.is_empty())
         .map(|value| value.parse::<u64>())
         .transpose()
-        .map_err(|_| {
-            AppError(
-                StatusCode::BAD_REQUEST,
-                "UngÃ¼ltige maximale Downloadanzahl",
-            )
-        })?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige maximale Downloadanzahl"))?;
     if max_downloads == Some(0) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
@@ -2410,7 +2393,7 @@ async fn create_share(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        Some(parse_unit_to_bytes(value, GB, "UngÃ¼ltiges Uploadlimit")?)
+        Some(parse_unit_to_bytes(value, GB, "Ungültiges Uploadlimit")?)
     } else {
         let parsed = f
             .max_upload_size
@@ -2419,7 +2402,7 @@ async fn create_share(
             .filter(|value| !value.is_empty())
             .map(|value| value.parse::<u64>())
             .transpose()
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiges Uploadlimit"))?;
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Uploadlimit"))?;
         parsed
     };
     if max_upload_size == Some(0) {
@@ -2508,7 +2491,7 @@ async fn set_share_upload_conflict(
     let strategy = if let Some(strategy) = form.strategy.as_deref() {
         UploadConflictStrategy::parse(strategy).ok_or(AppError(
             StatusCode::BAD_REQUEST,
-            "UngÃ¼ltige Upload-Konfliktstrategie",
+            "Ungültige Upload-Konfliktstrategie",
         ))?
     } else if form.overwrite_allowed.as_deref() == Some("1") {
         UploadConflictStrategy::OverwriteAllowed
@@ -2523,7 +2506,7 @@ async fn set_share_upload_conflict(
     if !share.is_directory || !share.permission.can_upload() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Ãœberschreiben ist nur fÃ¼r Ordnerlinks mit Uploadrecht erlaubt",
+            "Überschreiben ist nur für Ordnerlinks mit Uploadrecht erlaubt",
         ));
     }
     let stored_strategy = strategy.clone();
@@ -2576,7 +2559,7 @@ async fn set_share_password(
         if password != form.password_confirm.unwrap_or_default() {
             return Err(AppError(
                 StatusCode::BAD_REQUEST,
-                "PasswÃ¶rter stimmen nicht Ã¼berein",
+                "Passwörter stimmen nicht überein",
             ));
         }
         let settings = runtime_settings(&state);
@@ -2643,7 +2626,7 @@ async fn admins_page_v3(
     let mut inactive_rows = String::new();
     for admin in admins {
         let action = if admin.id == session.admin_id {
-            r#"<div class="admin-actions"><span class="pill">Aktueller Admin</span><small class="muted">Eigene Passwort- und MFA-Ã„nderungen erfolgen spÃ¤ter Ã¼ber â€žMein Kontoâ€œ.</small></div>"#
+            r#"<div class="admin-actions"><span class="pill">Aktueller Admin</span><small class="muted">Eigene Passwort- und MFA-Änderungen erfolgen später über „Mein Konto“.</small></div>"#
                 .to_string()
         } else {
             let status_action = if admin.active {
@@ -2660,7 +2643,7 @@ async fn admins_page_v3(
                 )
             };
             format!(
-                r#"<div class="admin-actions"><div class="button-group">{}<form method="post" action="/admin/admins/{}/totp"><input type="hidden" name="csrf" value="{}"><button class="secondary">MFA zurÃ¼cksetzen</button></form></div><form method="post" action="/admin/admins/{}/password" class="admin-reset-form"><input type="hidden" name="csrf" value="{}"><label>Neues Passwort<input name="password" type="password" minlength="14" required></label><label>BestÃ¤tigen<input name="password_confirm" type="password" minlength="14" required></label><button>Passwort setzen</button></form></div>"#,
+                r#"<div class="admin-actions"><div class="button-group">{}<form method="post" action="/admin/admins/{}/totp"><input type="hidden" name="csrf" value="{}"><button class="secondary">MFA zurücksetzen</button></form></div><form method="post" action="/admin/admins/{}/password" class="admin-reset-form"><input type="hidden" name="csrf" value="{}"><label>Neues Passwort<input name="password" type="password" minlength="14" required></label><label>Bestätigen<input name="password_confirm" type="password" minlength="14" required></label><button>Passwort setzen</button></form></div>"#,
                 status_action,
                 admin.id,
                 esc(&session.csrf_token),
@@ -2696,7 +2679,7 @@ async fn admins_page_v3(
         _ => "",
     };
     let body = format!(
-        r#"<section><h1>Admins</h1>{notice}<div class="admin-columns"><details class="admin-column" open><summary>Aktive Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{active_rows}</table></details><details class="admin-column" open><summary>Stillgelegte Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{inactive_rows}</table></details></div><p class="muted">Admin-LÃ¶schen ist bewusst nicht enthalten, damit Audit-/Share-BezÃ¼ge stabil bleiben.</p></section><section><h2>Admin erstellen</h2><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Benutzername<br><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label>Passwort<br><input name="password" type="password" minlength="14" required></label><label>Passwort bestÃ¤tigen<br><input name="password_confirm" type="password" required></label><button>Erstellen</button></form></section>"#,
+        r#"<section><h1>Admins</h1>{notice}<div class="admin-columns"><details class="admin-column" open><summary>Aktive Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{active_rows}</table></details><details class="admin-column" open><summary>Stillgelegte Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{inactive_rows}</table></details></div><p class="muted">Admin-Löschen ist bewusst nicht enthalten, damit Audit-/Share-Bezüge stabil bleiben.</p></section><section><h2>Admin erstellen</h2><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Benutzername<br><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label>Passwort<br><input name="password" type="password" minlength="14" required></label><label>Passwort bestätigen<br><input name="password_confirm" type="password" required></label><button>Erstellen</button></form></section>"#,
         esc(&session.csrf_token)
     );
     Ok(Html(admin_page(
@@ -2744,7 +2727,7 @@ async fn create_admin_ui(
     if form.password != form.password_confirm {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "PasswÃ¶rter stimmen nicht Ã¼berein",
+            "Passwörter stimmen nicht überein",
         ));
     }
     if form.password.chars().count() < 14 {
@@ -2804,13 +2787,13 @@ async fn reset_admin_password(
     if id == session.admin_id {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Eigenes Passwort kann hier nicht zurÃ¼ckgesetzt werden",
+            "Eigenes Passwort kann hier nicht zurückgesetzt werden",
         ));
     }
     if form.password != form.password_confirm {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "PasswÃ¶rter stimmen nicht Ã¼berein",
+            "Passwörter stimmen nicht überein",
         ));
     }
     if form.password.chars().count() < 14 {
@@ -2853,7 +2836,7 @@ async fn reset_admin_totp(
     if id == session.admin_id {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Eigene MFA kann hier nicht zurÃ¼ckgesetzt werden",
+            "Eigene MFA kann hier nicht zurückgesetzt werden",
         ));
     }
     let secret = auth::new_totp_secret();
@@ -2874,7 +2857,7 @@ async fn reset_admin_totp(
     let otpauth = otpauth_url(&username, &secret);
     let qr = qr_svg(&otpauth)?;
     let body = format!(
-        r#"<section><h1>MFA zurÃ¼ckgesetzt</h1><p>Dieses neue TOTP-Secret wird nur jetzt angezeigt. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins">Zur Adminliste</a></p></section>"#,
+        r#"<section><h1>MFA zurückgesetzt</h1><p>Dieses neue TOTP-Secret wird nur jetzt angezeigt. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins">Zur Adminliste</a></p></section>"#,
         esc(&username),
         qr,
         esc(&secret),
@@ -2882,7 +2865,7 @@ async fn reset_admin_totp(
     );
     Ok(Html(admin_page(
         &state,
-        "MFA zurÃ¼ckgesetzt",
+        "MFA zurückgesetzt",
         &body,
         false,
         &session.csrf_token,
@@ -2995,7 +2978,7 @@ fn settings_form(session: &Session, settings: &RuntimeSettings, message: &str) -
         format!(r#"<p class="muted">{}</p>"#, esc(message))
     };
     format!(
-        r#"<section><h1>Einstellungen</h1>{message}<p class="muted">Runtime-Policy wird in SQLite gespeichert. Servermodus, Bind-Adresse, TLS-Dateien, Trusted Proxies, Root-Mount und Data-Dir bleiben file-/restart-basiert.</p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label>Globales Uploadlimit GB<br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label>Blockierte Endungen<br><input name="blocked_extensions" value="{}"></label><label>Share-Passwort Min. Zeichen<br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label>Share-Passwort Max. Zeichen<br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label>Unlock Minuten<br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label>ZIP Max. GB<br><input name="max_zip_size_gb" type="number" min="1" step="1" value="{}" required></label><label>ZIP Max. Dateien<br><input name="max_zip_files" type="number" min="1" value="{}" required></label><label>Suche Max. EintrÃ¤ge<br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label>Suche Max. Treffer<br><input name="max_search_results" type="number" min="1" value="{}" required></label><label>Text-Preview Max. MB<br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Text-Preview-Endungen<br><input name="preview_extensions" value="{}" required></label><label>Media-Preview Max. MB<br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Bild-Preview-Endungen<br><input name="image_preview_extensions" value="{}"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" {}><span>PDF-Preview aktiv<small>PDFs werden inline mit sicheren Headern angezeigt.</small></span></label><button>Speichern</button></form></section>"#,
+        r#"<section><h1>Einstellungen</h1>{message}<p class="muted">Runtime-Policy wird in SQLite gespeichert. Servermodus, Bind-Adresse, TLS-Dateien, Trusted Proxies, Root-Mount und Data-Dir bleiben file-/restart-basiert.</p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label>Globales Uploadlimit GB<br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label>Blockierte Endungen<br><input name="blocked_extensions" value="{}"></label><label>Share-Passwort Min. Zeichen<br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label>Share-Passwort Max. Zeichen<br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label>Unlock Minuten<br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label>ZIP Max. GB<br><input name="max_zip_size_gb" type="number" min="1" step="1" value="{}" required></label><label>ZIP Max. Dateien<br><input name="max_zip_files" type="number" min="1" value="{}" required></label><label>Suche Max. Einträge<br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label>Suche Max. Treffer<br><input name="max_search_results" type="number" min="1" value="{}" required></label><label>Text-Preview Max. MB<br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Text-Preview-Endungen<br><input name="preview_extensions" value="{}" required></label><label>Media-Preview Max. MB<br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Bild-Preview-Endungen<br><input name="image_preview_extensions" value="{}"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" {}><span>PDF-Preview aktiv<small>PDFs werden inline mit sicheren Headern angezeigt.</small></span></label><button>Speichern</button></form></section>"#,
         esc(&session.csrf_token),
         esc(&settings.public_base_url),
         display_limit_unit_floor(settings.max_upload_size, GB),
@@ -3028,24 +3011,24 @@ async fn update_settings(
     csrf(&session, &form.csrf)?;
     let mut next = runtime_settings(&state);
     let max_upload_size = if let Some(value) = form.max_upload_size_gb.as_deref() {
-        parse_unit_to_bytes(value, GB, "UngÃ¼ltiges Uploadlimit")?.to_string()
+        parse_unit_to_bytes(value, GB, "Ungültiges Uploadlimit")?.to_string()
     } else {
         form.max_upload_size.unwrap_or_default()
     };
     let max_zip_size = if let Some(value) = form.max_zip_size_gb.as_deref() {
-        parse_unit_to_bytes(value, GB, "UngÃ¼ltiges ZIP-Limit")?.to_string()
+        parse_unit_to_bytes(value, GB, "Ungültiges ZIP-Limit")?.to_string()
     } else {
         form.max_zip_size.unwrap_or_default()
     };
     let max_preview_size = if let Some(value) = form.max_preview_size_mb.as_deref() {
-        parse_unit_to_bytes(value, MB, "UngÃ¼ltiges Preview-Limit")?.to_string()
+        parse_unit_to_bytes(value, MB, "Ungültiges Preview-Limit")?.to_string()
     } else {
         form.max_preview_size.unwrap_or_default()
     };
     let max_media_preview_size = if let Some(value) = form.max_media_preview_size_mb.as_deref() {
-        parse_unit_to_bytes(value, MB, "UngÃ¼ltiges Media-Preview-Limit")?.to_string()
+        parse_unit_to_bytes(value, MB, "Ungültiges Media-Preview-Limit")?.to_string()
     } else if let Some(value) = form.max_media_preview_size_gb.as_deref() {
-        parse_unit_to_bytes(value, GB, "UngÃ¼ltiges Media-Preview-Limit")?.to_string()
+        parse_unit_to_bytes(value, GB, "Ungültiges Media-Preview-Limit")?.to_string()
     } else {
         form.max_media_preview_size.unwrap_or_default()
     };
@@ -3087,7 +3070,7 @@ async fn update_settings(
         ("max_media_preview_size", max_media_preview_size.as_str()),
     ];
     next.apply_many(entries)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltige Einstellung"))?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
     if state.config.server.production_mode
         && url::Url::parse(&next.public_base_url)
             .ok()
@@ -3150,7 +3133,7 @@ async fn audit_page(
         percent_encoding::utf8_percent_encode(filter_value, percent_encoding::NON_ALPHANUMERIC);
     let previous = if page_number > 0 {
         format!(
-            r#"<a href="/admin/audit?action={encoded_filter}&page={}">ZurÃ¼ck</a>"#,
+            r#"<a href="/admin/audit?action={encoded_filter}&page={}">Zurück</a>"#,
             page_number - 1
         )
     } else {
@@ -3235,7 +3218,7 @@ async fn unlock_share(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "UngÃ¼ltiges Passwort"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiges Passwort"));
     }
     state.share_limiter.success(&key);
     let unlock_token = auth::random_token(32);
@@ -3270,13 +3253,13 @@ async fn public_page(
     let settings = runtime_settings(&state);
     if !share_is_unlocked(&state, &headers, &sh).await? {
         let body = format!(
-            r#"<section><h1>GeschÃ¼tzte Freigabe</h1><form method="post" action="/v/{}/unlock"><label>Passwort<br><input type="password" name="password" autocomplete="current-password" required></label><button>Entsperren</button></form></section>"#,
+            r#"<section><h1>Geschützte Freigabe</h1><form method="post" action="/v/{}/unlock"><label>Passwort<br><input type="password" name="password" autocomplete="current-password" required></label><button>Entsperren</button></form></section>"#,
             esc(&token)
         );
-        return Ok(Html(plain_page("GeschÃ¼tzte Freigabe", &body)));
+        return Ok(Html(plain_page("Geschützte Freigabe", &body)));
     }
     let mut body = format!(
-        "<section><h1>Ã–ffentliche Freigabe</h1><p>Berechtigung: <strong>{}</strong></p>",
+        "<section><h1>Öffentliche Freigabe</h1><p>Berechtigung: <strong>{}</strong></p>",
         esc(sh.permission.as_str())
     );
     if let Some(upload_status) = q.upload.as_deref() {
@@ -3302,7 +3285,7 @@ async fn public_page(
             q.q.map(|value| value.trim().to_string())
                 .filter(|v| !v.is_empty());
         let clean_sub = path_security::validate_relative(&sub)
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Pfad"))?
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
             .to_string_lossy()
             .replace('\\', "/");
         let relative_dir = clean_sub.clone();
@@ -3333,7 +3316,7 @@ async fn public_page(
             })
             .await
             .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfÃ¼gbar"))?;
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
             for hit in hits {
                 let share_rel = hit.relative_path.clone();
                 let target = encoded(&share_rel);
@@ -3347,11 +3330,11 @@ async fn public_page(
                     r#"<tr><td>{}</td><td class="actions">{}{}</td></tr>"#,
                     if hit.entry.is_dir {
                         format!(
-                            r#"ðŸ“ <a href="/v/{token}?path={target}">{}</a>"#,
+                            r#"📁 <a href="/v/{token}?path={target}">{}</a>"#,
                             esc(&share_rel)
                         )
                     } else {
-                        format!("ðŸ“„ {}", esc(&share_rel))
+                        format!("📄 {}", esc(&share_rel))
                     },
                     if hit.entry.is_dir {
                         String::new()
@@ -3368,7 +3351,7 @@ async fn public_page(
             })
             .await
             .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfÃ¼gbar"))?;
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
             has_next = entries.len() > 100;
             for entry in entries.into_iter().take(100) {
                 let rel = joined_relative(&clean_sub, &entry.name)?;
@@ -3376,7 +3359,7 @@ async fn public_page(
                 let target = encoded(&rel);
                 if entry.is_dir {
                     rows += &format!(
-                        r#"<tr><td>ðŸ“ <a href="/v/{token}?path={target}">{name}</a></td><td class="actions"><a href="/v/{token}?path={target}">Ã–ffnen</a></td></tr>"#
+                        r#"<tr><td>📁 <a href="/v/{token}?path={target}">{name}</a></td><td class="actions"><a href="/v/{token}?path={target}">Öffnen</a></td></tr>"#
                     );
                 } else {
                     let preview = if preview_allowed(&rel, &settings) {
@@ -3385,7 +3368,7 @@ async fn public_page(
                         String::new()
                     };
                     rows += &format!(
-                        r#"<tr><td>ðŸ“„ {name}</td><td class="actions">{}<a href="/v/{token}/download?path={target}">Download</a></td></tr>"#,
+                        r#"<tr><td>📄 {name}</td><td class="actions">{}<a href="/v/{token}/download?path={target}">Download</a></td></tr>"#,
                         preview
                     );
                 }
@@ -3404,7 +3387,7 @@ async fn public_page(
             .unwrap_or_default();
         if page_number > 0 {
             body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\">ZurÃ¼ck</a>",
+                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\">Zurück</a>",
                 page_number - 1,
                 search_param
             );
@@ -3430,7 +3413,7 @@ async fn public_page(
     if sh.is_directory && sh.permission.can_upload() {
         let upload_path = if sh.permission.can_download() {
             path_security::validate_relative(q.path.as_deref().unwrap_or_default())
-                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "UngÃ¼ltiger Pfad"))?
+                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
                 .to_string_lossy()
                 .replace('\\', "/")
         } else {
@@ -3455,10 +3438,10 @@ async fn public_page(
 }
 fn joined_relative(base: &str, child: &str) -> Result<String> {
     let mut path = path_security::validate_relative(base)
-        .map_err(|_| AppError(StatusCode::FORBIDDEN, "UngÃ¼ltiger Pfad"))?;
+        .map_err(|_| AppError(StatusCode::FORBIDDEN, "Ungültiger Pfad"))?;
     path.push(
         path_security::validate_relative(child)
-            .map_err(|_| AppError(StatusCode::FORBIDDEN, "UngÃ¼ltiger Pfad"))?,
+            .map_err(|_| AppError(StatusCode::FORBIDDEN, "Ungültiger Pfad"))?,
     );
     Ok(path.to_string_lossy().replace('\\', "/"))
 }
@@ -3488,7 +3471,7 @@ fn add_public_preview_actions(
         .map(|link| format!(r#"<a href="{}">Herunterladen</a>"#, esc(link)))
         .unwrap_or_default();
     let action = format!(
-        r#"<h1>Vorschau</h1><p class="preview-actions"><a href="{}">ZurÃ¼ck zur Freigabe</a>{}</p>"#,
+        r#"<h1>Vorschau</h1><p class="preview-actions"><a href="{}">Zurück zur Freigabe</a>{}</p>"#,
         esc(back_link),
         download
     );
@@ -3569,7 +3552,7 @@ pub(crate) async fn public_preview(
         PreviewContent::TooLarge { size } => preview_too_large_body(
             &share_rel,
             size,
-            "Datei ist grÃ¶ÃŸer als das Preview-Limit.",
+            "Datei ist größer als das Preview-Limit.",
             Some(&download_link),
         ),
         PreviewContent::Text(text) => format!(
@@ -3604,7 +3587,7 @@ pub(crate) async fn public_preview(
             };
             let viewer = media_viewer(kind, &raw_url);
             format!(
-                r#"<section><h1>Vorschau</h1><p class="muted">{} - Raw-Token lÃ¤uft nach wenigen Minuten ab.</p>{}</section>"#,
+                r#"<section><h1>Vorschau</h1><p class="muted">{} - Raw-Token läuft nach wenigen Minuten ab.</p>{}</section>"#,
                 human(size),
                 viewer
             )
@@ -3923,7 +3906,7 @@ pub(crate) async fn download(
     })
     .await
     .map_err(internal)?
-    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfÃ¼gbar"))?;
+    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
     if !file.metadata().map_err(internal)?.is_file() {
         return Err(AppError(StatusCode::BAD_REQUEST, "Keine Datei"));
     }
@@ -4072,7 +4055,7 @@ pub(crate) async fn upload(
                 &token,
                 &upload_subdir,
                 StatusCode::BAD_REQUEST,
-                "UngÃ¼ltiger Upload",
+                "Ungültiger Upload",
             ))
         }
     } {
@@ -4102,7 +4085,7 @@ pub(crate) async fn upload(
                         &token,
                         &upload_subdir,
                         StatusCode::BAD_REQUEST,
-                        "UngÃ¼ltiger Uploadpfad",
+                        "Ungültiger Uploadpfad",
                     ))
                 }
             };
@@ -4114,7 +4097,7 @@ pub(crate) async fn upload(
                             &token,
                             &upload_subdir,
                             StatusCode::BAD_REQUEST,
-                            "UngÃ¼ltiger Uploadpfad",
+                            "Ungültiger Uploadpfad",
                         ))
                     }
                 };
@@ -4137,7 +4120,7 @@ pub(crate) async fn upload(
                         &token,
                         &upload_subdir,
                         StatusCode::BAD_REQUEST,
-                        "UngÃ¼ltiger Upload",
+                        "Ungültiger Upload",
                     ))
                 }
             };
@@ -4167,7 +4150,7 @@ pub(crate) async fn upload(
                     &token,
                     &upload_subdir,
                     StatusCode::BAD_REQUEST,
-                    "UngÃ¼ltiger Dateiname",
+                    "Ungültiger Dateiname",
                 ))
             }
         };
@@ -4200,7 +4183,7 @@ pub(crate) async fn upload(
                         &token,
                         &upload_subdir,
                         StatusCode::NOT_FOUND,
-                        "Zielordner nicht verfÃ¼gbar",
+                        "Zielordner nicht verfügbar",
                     ))
                 }
             };
@@ -4225,7 +4208,7 @@ pub(crate) async fn upload(
                     &token,
                     &upload_subdir,
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "Upload ist zu groÃŸ",
+                    "Upload ist zu groß",
                 ));
             };
             if !storage_has_room(state.secure_root.display_root(), chunk.len() as u64) {
@@ -4718,6 +4701,83 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    fn windows_1252_byte(ch: char) -> Option<u8> {
+        match ch {
+            '\u{0000}'..='\u{009f}' | '\u{00a0}'..='\u{00ff}' => Some(ch as u32 as u8),
+            '\u{20ac}' => Some(0x80),
+            '\u{201a}' => Some(0x82),
+            '\u{0192}' => Some(0x83),
+            '\u{201e}' => Some(0x84),
+            '\u{2026}' => Some(0x85),
+            '\u{2020}' => Some(0x86),
+            '\u{2021}' => Some(0x87),
+            '\u{02c6}' => Some(0x88),
+            '\u{2030}' => Some(0x89),
+            '\u{0160}' => Some(0x8a),
+            '\u{2039}' => Some(0x8b),
+            '\u{0152}' => Some(0x8c),
+            '\u{017d}' => Some(0x8e),
+            '\u{2018}' => Some(0x91),
+            '\u{2019}' => Some(0x92),
+            '\u{201c}' => Some(0x93),
+            '\u{201d}' => Some(0x94),
+            '\u{2022}' => Some(0x95),
+            '\u{2013}' => Some(0x96),
+            '\u{2014}' => Some(0x97),
+            '\u{02dc}' => Some(0x98),
+            '\u{2122}' => Some(0x99),
+            '\u{0161}' => Some(0x9a),
+            '\u{203a}' => Some(0x9b),
+            '\u{0153}' => Some(0x9c),
+            '\u{017e}' => Some(0x9e),
+            '\u{0178}' => Some(0x9f),
+            _ => None,
+        }
+    }
+
+    fn assert_no_mojibake(label: &str, text: &str) {
+        if let Some((offset, _)) = text.char_indices().find(|(_, ch)| *ch == '\u{fffd}') {
+            panic!("{label} contains the Unicode replacement character at byte {offset}");
+        }
+
+        let chars = text.char_indices().collect::<Vec<_>>();
+        for start in 0..chars.len() {
+            for len in 2..=4 {
+                let end = start + len;
+                if end > chars.len() {
+                    continue;
+                }
+                let Some(bytes) = chars[start..end]
+                    .iter()
+                    .map(|(_, ch)| windows_1252_byte(*ch))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                let expected_len = match bytes[0] {
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => continue,
+                };
+                if len != expected_len
+                    || !bytes[1..].iter().all(|byte| (0x80..=0xbf).contains(byte))
+                {
+                    continue;
+                }
+                let Ok(decoded) = std::str::from_utf8(&bytes) else {
+                    continue;
+                };
+                let start_offset = chars[start].0;
+                let end_offset = chars.get(end).map_or(text.len(), |(offset, _)| *offset);
+                let suspect = &text[start_offset..end_offset];
+                panic!(
+                    "{label} contains likely Windows-1252/UTF-8 mojibake at byte {start_offset}: {suspect:?} should be {decoded:?}"
+                );
+            }
+        }
+    }
+
     fn preview_token_from(html: &str) -> String {
         let marker = "preview_token=";
         let start = html.find(marker).expect("preview token in html") + marker.len();
@@ -4756,8 +4816,7 @@ mod tests {
 
     #[test]
     fn invalid_credentials_remain_an_error() {
-        let response =
-            AppError(StatusCode::UNAUTHORIZED, "UngÃ¼ltige Zugangsdaten").into_response();
+        let response = AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten").into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(response.headers().get(header::LOCATION).is_none());
     }
@@ -4840,13 +4899,43 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let state = test_state(root.path(), data.path());
         let html = admin_page(&state, "Dateien", "<section></section>", true, "csrf");
-        assert!(html.contains("ðŸ“ Dateien"));
-        assert!(html.contains("ðŸ”— Links"));
-        assert!(html.contains("ðŸ‘¥ Admins"));
-        assert!(html.contains("âš™ï¸ Einstellungen"));
-        assert!(html.contains("ðŸ›¡ï¸ Audit"));
-        assert!(html.contains("â— System"));
+        assert!(html.contains("<title>Dateien · VaultLink</title>"));
+        assert!(html.contains("📁 Dateien"));
+        assert!(html.contains("🔗 Links"));
+        assert!(html.contains("👥 Admins"));
+        assert!(html.contains("⚙️ Einstellungen"));
+        assert!(html.contains("🛡️ Audit"));
+        assert!(html.contains("● System"));
+        assert_no_mojibake("admin shell", &html);
         assert!(!html.contains("Secure Mode"));
+    }
+
+    #[tokio::test]
+    async fn login_page_serves_correct_utf8() {
+        let response = login_page().await.into_response();
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let html = response_text(response).await;
+        assert!(html.contains("<meta charset=\"utf-8\">"));
+        assert!(html.contains("<title>Login · VaultLink</title>"));
+        assert_no_mojibake("login page", &html);
+    }
+
+    #[test]
+    fn user_facing_sources_do_not_contain_mojibake() {
+        assert_no_mojibake("src/web.rs", include_str!("web.rs"));
+        assert_no_mojibake("src/setup.rs", include_str!("setup.rs"));
+    }
+
+    #[test]
+    #[should_panic(expected = "likely Windows-1252/UTF-8 mojibake")]
+    fn mojibake_guard_rejects_redecoded_utf8_bytes() {
+        let broken_folder = ['\u{00f0}', '\u{0178}', '\u{201c}', '\u{0081}']
+            .into_iter()
+            .collect::<String>();
+        assert_no_mojibake("broken folder icon", &broken_folder);
     }
 
     #[test]
@@ -4877,13 +4966,8 @@ mod tests {
         assert!(html.contains(
             r#"name="max_media_preview_size_mb" type="number" min="1" step="1" value="100""#
         ));
-        assert!(html.contains("Suche Max. EintrÃ¤ge"));
-        for broken in ["Ãƒ", "Ã‚", "Ã¢", "Ã°Å¸", "ï¿½"] {
-            assert!(
-                !html.contains(broken),
-                "settings form contains broken UTF-8 marker {broken:?}"
-            );
-        }
+        assert!(html.contains("Suche Max. Einträge"));
+        assert_no_mojibake("settings form", &html);
         assert!(!html.contains("Media-Preview Max. GB"));
     }
 
@@ -4914,7 +4998,7 @@ mod tests {
     fn public_preview_actions_are_rendered_above_content() {
         let body = r#"<section><h1>Vorschau</h1><pre>long text</pre></section>"#.to_string();
         let html = add_public_preview_actions(body, "/v/token", Some("/v/token/download"));
-        let actions = html.find("ZurÃ¼ck zur Freigabe").unwrap();
+        let actions = html.find("Zurück zur Freigabe").unwrap();
         let content = html.find("<pre>long text</pre>").unwrap();
         assert!(actions < content);
         assert!(html.contains("Herunterladen"));
@@ -5084,14 +5168,14 @@ mod tests {
             .headers_mut()
             .insert(header::COOKIE, cookie.clone());
         let folder = response_text(app.clone().oneshot(folder_request).await.unwrap()).await;
-        assert!(folder.contains(r#"AusgewÃ¤hltes Ziel: <code>/uploads</code>"#));
+        assert!(folder.contains(r#"Ausgewähltes Ziel: <code>/uploads</code>"#));
         assert!(folder.contains(r#"<input type="hidden" name="path" value="uploads">"#));
         assert!(folder.contains(r#"<option value="upload_only">Upload only</option>"#));
 
         let mut file_request = request(Method::GET, "/admin/shares?path=file.txt", "");
         file_request.headers_mut().insert(header::COOKIE, cookie);
         let file = response_text(app.clone().oneshot(file_request).await.unwrap()).await;
-        assert!(file.contains(r#"AusgewÃ¤hltes Ziel: <code>/file.txt</code>"#));
+        assert!(file.contains(r#"Ausgewähltes Ziel: <code>/file.txt</code>"#));
         assert!(file.contains(r#"<input type="hidden" name="path" value="file.txt">"#));
         assert!(file.contains(r#"<option value="download_only">Download only</option>"#));
         assert!(!file.contains(r#"<option value="upload_only">Upload only</option>"#));
@@ -5650,7 +5734,7 @@ mod tests {
         let admin_list_html = response_text(app.clone().oneshot(admin_list).await.unwrap()).await;
         assert!(admin_list_html.contains("Aktive Admins"));
         assert!(admin_list_html.contains("Stillgelegte Admins"));
-        assert!(admin_list_html.contains("Admin-LÃ¶schen ist bewusst nicht enthalten"));
+        assert!(admin_list_html.contains("Admin-Löschen ist bewusst nicht enthalten"));
         assert!(admin_list_html.contains("Aktueller Admin"));
         assert_eq!(admin_list_html.matches("Passwort setzen").count(), 2);
         assert!(
@@ -5661,7 +5745,7 @@ mod tests {
             admin_list_html.find("Aktive Admins").unwrap()
                 < admin_list_html.find("Stillgelegte Admins").unwrap()
         );
-        assert!(admin_list_html.contains("MFA zurÃ¼cksetzen"));
+        assert!(admin_list_html.contains("MFA zurücksetzen"));
         assert!(admin_list_html.contains("Passwort setzen"));
         state
             .db
@@ -5730,7 +5814,7 @@ mod tests {
         let reset_totp_response = app.clone().oneshot(reset_totp).await.unwrap();
         assert_eq!(reset_totp_response.status(), StatusCode::OK);
         let reset_totp_html = response_text(reset_totp_response).await;
-        assert!(reset_totp_html.contains("MFA zurÃ¼ckgesetzt"));
+        assert!(reset_totp_html.contains("MFA zurückgesetzt"));
         assert!(reset_totp_html.contains("TOTP QR-Code"));
         assert!(reset_totp_html.contains("otpauth://totp/VaultLink:later"));
 
@@ -6194,7 +6278,7 @@ mod tests {
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
         let conflict_body = response_text(conflict).await;
         assert!(conflict_body.contains("Datei existiert bereits"));
-        assert!(conflict_body.contains("ZurÃ¼ck zur Freigabe"));
+        assert!(conflict_body.contains("Zurück zur Freigabe"));
         assert!(conflict_body.contains(r#"href="/v/upload""#));
         let replace_without_checkbox = app
             .clone()
@@ -6203,7 +6287,7 @@ mod tests {
             .unwrap();
         assert_eq!(replace_without_checkbox.status(), StatusCode::CONFLICT);
         let replace_without_checkbox_body = response_text(replace_without_checkbox).await;
-        assert!(replace_without_checkbox_body.contains("ZurÃ¼ck zur Freigabe"));
+        assert!(replace_without_checkbox_body.contains("Zurück zur Freigabe"));
         let replaced = app
             .clone()
             .oneshot(multipart_request_with_options(
@@ -6228,7 +6312,7 @@ mod tests {
         assert_eq!(blocked.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         let blocked_body = response_text(blocked).await;
         assert!(blocked_body.contains("Dateityp blockiert"));
-        assert!(blocked_body.contains("ZurÃ¼ck zur Freigabe"));
+        assert!(blocked_body.contains("Zurück zur Freigabe"));
 
         let blocked_with_overwrite = app
             .clone()
@@ -6247,7 +6331,7 @@ mod tests {
         );
         let blocked_with_overwrite_body = response_text(blocked_with_overwrite).await;
         assert!(blocked_with_overwrite_body.contains("Dateityp blockiert"));
-        assert!(blocked_with_overwrite_body.contains("ZurÃ¼ck zur Freigabe"));
+        assert!(blocked_with_overwrite_body.contains("Zurück zur Freigabe"));
 
         let too_large = app
             .oneshot(multipart_request(
@@ -6259,8 +6343,8 @@ mod tests {
             .unwrap();
         assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let too_large_body = response_text(too_large).await;
-        assert!(too_large_body.contains("Upload ist zu groÃŸ"));
-        assert!(too_large_body.contains("ZurÃ¼ck zur Freigabe"));
+        assert!(too_large_body.contains("Upload ist zu groß"));
+        assert!(too_large_body.contains("Zurück zur Freigabe"));
         let remaining_parts = std::fs::read_dir(root.path().join("uploads"))
             .unwrap()
             .filter_map(|entry| entry.ok())

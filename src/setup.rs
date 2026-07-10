@@ -144,7 +144,7 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
         Ok(result) => match qr_svg(&result.otpauth) {
             Ok(qr) => {
                 Html(page(&format!(
-                    r#"<section><h1>Setup abgeschlossen</h1><p>Config wurde geschrieben und der erste Admin wurde angelegt.</p><p>Das TOTP-Secret bleibt bis zur ausdrÃ¼cklichen BestÃ¤tigung Ã¼ber diesen lokalen Setup-Flow wiederherstellbar. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button>Secret sicher gespeichert</button></form><p>Danach den Setup-Prozess mit Ctrl+C beenden und VaultLink normal starten.</p></section>"#,
+                    r#"<section><h1>Setup abgeschlossen</h1><p>Config wurde geschrieben und der erste Admin wurde angelegt.</p><p>Das TOTP-Secret bleibt bis zur ausdrücklichen Bestätigung über diesen lokalen Setup-Flow wiederherstellbar. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button>Secret sicher gespeichert</button></form><p>Danach den Setup-Prozess mit Ctrl+C beenden und VaultLink normal starten.</p></section>"#,
                     qr,
                     esc(&result.totp_secret),
                     esc(&result.otpauth),
@@ -175,14 +175,14 @@ async fn complete_setup(
     if form.token != *state.token {
         return (
             StatusCode::UNAUTHORIZED,
-            Html(page("Setup-Token fehlt oder ist ungÃ¼ltig.")),
+            Html(page("Setup-Token fehlt oder ist ungültig.")),
         )
             .into_response();
     }
     let mut completed = state.commit.lock().await;
     if *completed {
         return Html(page(
-            "<section><h1>Setup bestÃ¤tigt</h1><p>Die TOTP-Wiederherstellung ist bereits geschlossen.</p></section>",
+            "<section><h1>Setup bestätigt</h1><p>Die TOTP-Wiederherstellung ist bereits geschlossen.</p></section>",
         ))
         .into_response();
     }
@@ -203,14 +203,14 @@ async fn complete_setup(
         Ok(()) => {
             *completed = true;
             Html(page(
-                "<section><h1>Setup bestÃ¤tigt</h1><p>Die TOTP-Wiederherstellung wurde geschlossen. VaultLink kann jetzt normal gestartet werden.</p></section>",
+                "<section><h1>Setup bestätigt</h1><p>Die TOTP-Wiederherstellung wurde geschlossen. VaultLink kann jetzt normal gestartet werden.</p></section>",
             ))
             .into_response()
         }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Html(page(&format!(
-                "Setup-BestÃ¤tigung fehlgeschlagen: {}",
+                "Setup-Bestätigung fehlgeschlagen: {}",
                 esc(&error)
             ))),
         )
