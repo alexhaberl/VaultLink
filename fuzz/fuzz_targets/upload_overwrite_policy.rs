@@ -53,7 +53,10 @@ fuzz_target!(|input: (String, String, String, bool, u8)| {
         Ok(upload) => upload,
         Err(_) => return,
     };
-    let mut file = upload.take_file();
+    let mut file = match upload.take_file() {
+        Ok(file) => file,
+        Err(_) => return,
+    };
     file.write_all(&[payload_byte]).expect("write fuzz payload");
     file.sync_all().expect("sync fuzz payload");
     drop(file);
