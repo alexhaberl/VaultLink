@@ -4,6 +4,7 @@ FROM rust:1.97.0-trixie@sha256:44637ff22d0a6571a221bfaf137849711ad02ff4723dbb473
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        coreutils \
         curl \
         passwd \
         python3 \
@@ -11,6 +12,7 @@ RUN apt-get update \
         build-essential \
         shellcheck \
         sqlite3 \
+        util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

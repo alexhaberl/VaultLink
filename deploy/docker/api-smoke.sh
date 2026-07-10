@@ -90,6 +90,32 @@ assert_json_error() {
     fi
 }
 
+assert_health_json() {
+    python3 -c '
+import json
+import sys
+
+raw = sys.stdin.read()
+try:
+    response = json.loads(raw)
+except json.JSONDecodeError as error:
+    raise SystemExit(f"invalid health JSON: {error}")
+
+if not isinstance(response, dict) or set(response) != {"ok", "version"}:
+    raise SystemExit("health JSON must contain exactly ok and version")
+if response["ok"] is not True:
+    raise SystemExit("health JSON ok must be true")
+if not isinstance(response["version"], str) or not response["version"]:
+    raise SystemExit("health JSON version must be a non-empty string")
+
+expected = "{\"ok\":true,\"version\":" + json.dumps(
+    response["version"], ensure_ascii=False, separators=(",", ":")
+) + "}"
+if raw != expected:
+    raise SystemExit("health JSON is not in the handler compact response form")
+'
+}
+
 rm -rf "$WORK_DIR"
 mkdir -p "$ROOT_DIR/uploads" "$DATA_DIR"
 printf '%s\n' 'VaultLink API smoke test file' > "$ROOT_DIR/readme.txt"
@@ -146,7 +172,12 @@ unset SETUP_PID
 "$BIN" --config "$CONFIG_PATH" >"$APP_LOG" 2>&1 &
 APP_PID="$!"
 wait_http "http://$APP_ADDR/login" "200"
-wait_http "http://$APP_ADDR/api/v1/health" "200"
+if ! HEALTH_JSON="$(curl -sS -f "http://$APP_ADDR/api/v1/health")"; then
+    fail "health endpoint did not return HTTP success"
+fi
+if ! printf '%s' "$HEALTH_JSON" | assert_health_json; then
+    fail "health endpoint returned an invalid response"
+fi
 
 LOGIN_JSON="$(
     curl -sS -f -c "$COOKIE_JAR" \

@@ -240,7 +240,7 @@ Der Hook installiert PEMs nach `/etc/vaultlink/tls/` mit `root:vaultlink 0640` u
 ## 8. Debian-Deployment
 
 ```sh
-sudo apt update && sudo apt install -y build-essential pkg-config
+sudo apt update && sudo apt install -y build-essential coreutils curl pkg-config sqlite3 util-linux
 cargo build --release --locked
 
 sudo useradd --system --home /var/lib/vaultlink --shell /usr/sbin/nologin vaultlink
@@ -264,7 +264,7 @@ Firewall: bei Reverse Proxy nur 80/443 für Caddy/Nginx öffnen und VaultLink au
 ## 9. WSL-Entwicklung
 
 ```sh
-sudo apt update && sudo apt install -y build-essential curl pkg-config
+sudo apt update && sudo apt install -y build-essential coreutils curl pkg-config sqlite3 util-linux
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 make dev-setup

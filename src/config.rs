@@ -1,6 +1,6 @@
 use std::{
     fs,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
 };
 
@@ -21,6 +21,13 @@ pub struct Config {
     pub security: Security,
     #[serde(default)]
     pub logging: Logging,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalReadinessTarget {
+    pub url: String,
+    pub connect_to: Option<String>,
+    pub insecure: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -246,6 +253,50 @@ impl Config {
         Ok(config)
     }
 
+    pub fn local_readiness_target(&self) -> Result<LocalReadinessTarget, ConfigError> {
+        let listen: SocketAddr = self.server.listen_address.parse().map_err(|_| {
+            ConfigError::Invalid("listen_address must be an IP socket address".into())
+        })?;
+        let local_ip = match listen.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
+        let local = SocketAddr::new(local_ip, listen.port());
+
+        if self.server.mode != ServerMode::StandaloneTls {
+            return Ok(LocalReadinessTarget {
+                url: format!("http://{local}/api/v1/health"),
+                connect_to: None,
+                insecure: false,
+            });
+        }
+
+        let mut public_url = Url::parse(&self.server.public_base_url)
+            .map_err(|error| ConfigError::Invalid(format!("public_base_url: {error}")))?;
+        let public_host = public_url
+            .host_str()
+            .ok_or_else(|| ConfigError::Invalid("public_base_url must contain a host".into()))?
+            .to_string();
+        let public_port = public_url.port_or_known_default().ok_or_else(|| {
+            ConfigError::Invalid("public_base_url must contain a known port".into())
+        })?;
+        public_url.set_path("/api/v1/health");
+        public_url.set_query(None);
+        public_url.set_fragment(None);
+
+        Ok(LocalReadinessTarget {
+            url: public_url.to_string(),
+            connect_to: Some(format!(
+                "{}:{public_port}:{}:{}",
+                curl_connect_host(&public_host),
+                curl_connect_host(&local.ip().to_string()),
+                local.port()
+            )),
+            insecure: true,
+        })
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.server.public_base_url.starts_with("http://")
             && !self.server.public_base_url.starts_with("https://")
@@ -435,6 +486,18 @@ impl Config {
             return Err(ConfigError::Invalid("invalid share password policy".into()));
         }
         Ok(())
+    }
+}
+
+fn curl_connect_host(host: &str) -> String {
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if matches!(bare_host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+        format!("[{bare_host}]")
+    } else {
+        bare_host.to_string()
     }
 }
 
@@ -719,5 +782,78 @@ mod tests {
         c.server.public_base_url = "https://files.example.test".into();
         c.tls.letsencrypt_cache_dir = "../acme".into();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn readiness_target_uses_loopback_for_wildcard_reverse_proxy_bind() {
+        let mut c = base();
+        c.server.mode = ServerMode::ReverseProxy;
+        c.server.production_mode = true;
+        c.server.listen_address = "0.0.0.0:8080".into();
+        c.server.public_base_url = "https://vaultlink.example".into();
+        c.security.secure_cookie = true;
+        c.reverse_proxy.enabled = true;
+        c.reverse_proxy.allow_non_loopback = true;
+        c.reverse_proxy.trusted_proxies = vec!["192.0.2.10".parse().unwrap()];
+        assert!(c.validate().is_ok());
+
+        assert_eq!(
+            c.local_readiness_target().unwrap(),
+            LocalReadinessTarget {
+                url: "http://127.0.0.1:8080/api/v1/health".into(),
+                connect_to: None,
+                insecure: false,
+            }
+        );
+    }
+
+    #[test]
+    fn standalone_readiness_target_preserves_hostname_and_replaces_path() {
+        let mut c = base();
+        c.server.mode = ServerMode::StandaloneTls;
+        c.server.production_mode = true;
+        c.server.listen_address = "0.0.0.0:443".into();
+        c.server.public_base_url = "https://files.example.test/base/path".into();
+        c.security.secure_cookie = true;
+        c.tls.enabled = true;
+        c.tls.certificate_source = CertificateSource::LetsEncrypt;
+        c.tls.letsencrypt_contact_email = "admin@example.test".into();
+        c.tls.letsencrypt_cache_dir = "acme".into();
+        assert!(c.validate().is_ok());
+
+        assert_eq!(
+            c.local_readiness_target().unwrap(),
+            LocalReadinessTarget {
+                url: "https://files.example.test/api/v1/health".into(),
+                connect_to: Some("files.example.test:443:127.0.0.1:443".into()),
+                insecure: true,
+            }
+        );
+    }
+
+    #[test]
+    fn standalone_readiness_target_formats_ipv6_loopback_for_curl() {
+        let mut c = base();
+        c.server.mode = ServerMode::StandaloneTls;
+        c.server.production_mode = true;
+        c.server.listen_address = "[::]:8443".into();
+        c.server.public_base_url = "https://files.example.test:8443".into();
+        c.security.secure_cookie = true;
+        c.tls.enabled = true;
+        c.tls.certificate_source = CertificateSource::LetsEncrypt;
+        c.tls.letsencrypt_contact_email = "admin@example.test".into();
+        c.tls.letsencrypt_cache_dir = "acme".into();
+        assert!(c.validate().is_ok());
+
+        assert_eq!(
+            c.local_readiness_target().unwrap(),
+            LocalReadinessTarget {
+                url: "https://files.example.test:8443/api/v1/health".into(),
+                connect_to: Some("files.example.test:8443:[::1]:8443".into()),
+                insecure: true,
+            }
+        );
+        assert_eq!(curl_connect_host("::1"), "[::1]");
+        assert_eq!(curl_connect_host("[::1]"), "[::1]");
     }
 }

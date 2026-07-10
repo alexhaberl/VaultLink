@@ -9,6 +9,10 @@ use vaultlink::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).is_some_and(|value| value == "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let config_path = arg(&args, "--config")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
@@ -18,6 +22,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return vaultlink::setup::run(config_path, listen).await;
     }
     let config = Config::load(&config_path)?;
+    if args.get(1).is_some_and(|value| value == "readiness-target") {
+        let target = config.local_readiness_target()?;
+        println!("{}", target.url);
+        println!("{}", target.connect_to.as_deref().unwrap_or("-"));
+        println!("{}", u8::from(target.insecure));
+        return Ok(());
+    }
     let filter = tracing_subscriber::EnvFilter::try_new(&config.logging.level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();

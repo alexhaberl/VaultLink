@@ -6,6 +6,7 @@
 - Added rendered-response and source-level regression checks for UTF-8 metadata and common Windows-1252/UTF-8 corruption patterns.
 - Updated the pinned GitHub workflow actions to `checkout` v7 and `upload-artifact` v7.0.1, aligned the stable Rust, CI, Docker, and release toolchains on Rust 1.97.0, and added a policy check that keeps the stable image pins synchronized.
 - Fixed release dry-runs on branch names containing slashes by deriving artifact versions from `Cargo.toml`, and validated every required dry-run output before artifact upload.
+- Hardened upgrades with a bounded local HTTP readiness gate, exact candidate-version health responses, DNS/proxy-independent standalone-TLS probing, and verified automatic restore after readiness failures.
 
 ## 0.3.0 — 2026-07-10
 
