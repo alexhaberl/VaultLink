@@ -6,7 +6,7 @@ GitHub-hosted runner so that tagged release builds use a fresh environment.
 
 ## Host baseline
 
-- Debian 13, 4 vCPU, 8 GiB RAM, and at least 100 GiB SSD storage
+- Debian 13, 8 vCPU, 8 GiB RAM, and at least 100 GiB SSD storage
 - Docker Engine from Docker's official Debian repository
 - `build-essential`, `clang`, `git`, `libssl-dev`, `make`, `pkg-config`,
   `python3`, `shellcheck`, `sqlite3`, and `util-linux`
@@ -24,6 +24,12 @@ The CI workflow uses one job so that Cargo artifacts are reused by formatting,
 Clippy, tests, fuzz compilation, and audit checks within a run. Docker setup,
 API, upgrade, and rollback smoke tests run afterwards on the same host.
 Superseded pull-request runs are cancelled automatically.
+
+The weekly and manually dispatched fuzz gate also uses one runner job. It runs
+all seven ten-minute fuzz targets concurrently (`FUZZ_JOBS=7`), so its expected
+wall-clock runtime is about 10-15 minutes after toolchain and build setup. A
+single registered runner service serializes the CI and fuzz jobs, preventing
+the two CPU-intensive workloads from competing for the same VM.
 
 The Docker smoke image validates the systemd units inside the container. This
 avoids granting the runner general `sudo` access merely to inspect paths under
