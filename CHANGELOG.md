@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.5 — 2026-07-11
+
+- Rebuilt the server-rendered setup, admin, and public interfaces around a shared dark VaultLink design system with responsive navigation, accessible controls, inline SVG icons, and self-hosted assets.
+- Added dedicated share creation, searchable and paginated link management, improved public download/upload views, mobile upload-only privacy, and a sequential multi-file upload queue with single-request fallback.
+- Added UTC monthly transfer statistics for downloads, ZIP downloads, and previews, plus opt-in trusted-proxy-aware audit IP storage, display, and confirmed deletion.
+- Added hardened admin uploads, richer audit details, improved setup mode/TLS field switching and filesystem pickers, and same-process transition from setup into the configured server mode.
+- Corrected admin table, action-menu, date/time-picker, preview, form alignment, spacing, and long-value rendering issues found during visual QA.
+
 ## 0.3.2 — 2026-07-10
 
 - Added admin-only directory creation and no-clobber file/directory renaming to the browser and session API.

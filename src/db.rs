@@ -1360,6 +1360,20 @@ impl Database {
             events
         }
     }
+
+    pub fn count_audit(&self, action: Option<&str>) -> rusqlite::Result<usize> {
+        let connection = self.conn();
+        let count: i64 = if let Some(action) = action {
+            connection.query_row(
+                "SELECT COUNT(*) FROM audit WHERE action=?1",
+                params![action],
+                |row| row.get(0),
+            )?
+        } else {
+            connection.query_row("SELECT COUNT(*) FROM audit", [], |row| row.get(0))?
+        };
+        Ok(count.max(0) as usize)
+    }
 }
 
 fn share_path_matches(candidate: &str, target: &str, is_directory: bool) -> bool {
@@ -1543,6 +1557,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(database.count_audit_client_ips().unwrap(), 1);
+        assert_eq!(database.count_audit(None).unwrap(), 2);
+        assert_eq!(database.count_audit(Some("settings_updated")).unwrap(), 1);
+        assert_eq!(database.count_audit(Some("missing_action")).unwrap(), 0);
         let events = database.list_audit(None, 10, 0).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].client_ip.as_deref(), Some("203.0.113.24"));

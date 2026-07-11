@@ -278,13 +278,13 @@ async fn app_js() -> impl IntoResponse {
         )],
         format!(
             "{}\n{}",
-            r#"document.addEventListener('click',async e=>{const b=e.target.closest('[data-copy]');if(!b)return;try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='Kopiert';}catch(_){b.textContent='Kopieren fehlgeschlagen';}});
+            r#"document.addEventListener('click',async e=>{const closer=e.target.closest('[data-details-close]');if(closer){closer.closest('details')?.removeAttribute('open');return;}const b=e.target.closest('[data-copy]');if(!b)return;try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='Kopiert';}catch(_){b.textContent='Kopieren fehlgeschlagen';}});
 const pad=n=>String(n).padStart(2,'0');
 function fillSelect(select,from,to,current){select.innerHTML='';for(let i=from;i<=to;i++){const o=document.createElement('option');o.value=String(i);o.textContent=String(i).padStart(select.dataset.pad||0,'0');if(i===current)o.selected=true;select.appendChild(o);}}
 function daysInMonth(y,m){return new Date(y,m,0).getDate();}
-function initDateTimePicker(picker){const input=picker.querySelector('[data-datetime-input]');const pop=picker.querySelector('[data-datetime-popover]');const year=picker.querySelector('[data-dt-year]');const month=picker.querySelector('[data-dt-month]');const day=picker.querySelector('[data-dt-day]');const hour=picker.querySelector('[data-dt-hour]');const minute=picker.querySelector('[data-dt-minute]');const now=new Date();fillSelect(year,now.getFullYear(),now.getFullYear()+5,now.getFullYear());fillSelect(month,1,12,now.getMonth()+1);fillSelect(hour,0,23,23);fillSelect(minute,0,59,0);function syncDays(){const selected=Number(day.value)||now.getDate();fillSelect(day,1,daysInMonth(Number(year.value),Number(month.value)),Math.min(selected,daysInMonth(Number(year.value),Number(month.value))))}syncDays();[year,month].forEach(s=>s.addEventListener('change',syncDays));picker.querySelector('[data-datetime-toggle]').addEventListener('click',()=>{pop.hidden=!pop.hidden;});picker.querySelector('[data-datetime-apply]').addEventListener('click',()=>{input.value=`${pad(day.value)}.${pad(month.value)}.${year.value} ${pad(hour.value)}:${pad(minute.value)}`;pop.hidden=true;});picker.querySelector('[data-datetime-clear]').addEventListener('click',()=>{input.value='';pop.hidden=true;});}
+function initDateTimePicker(picker){const input=picker.querySelector('[data-datetime-input]');const pop=picker.querySelector('[data-datetime-popover]');const toggle=picker.querySelector('[data-datetime-toggle]');const year=picker.querySelector('[data-dt-year]');const month=picker.querySelector('[data-dt-month]');const day=picker.querySelector('[data-dt-day]');const hour=picker.querySelector('[data-dt-hour]');const minute=picker.querySelector('[data-dt-minute]');const now=new Date();fillSelect(year,now.getFullYear(),now.getFullYear()+5,now.getFullYear());fillSelect(month,1,12,now.getMonth()+1);fillSelect(hour,0,23,23);fillSelect(minute,0,59,0);function syncDays(){const selected=Number(day.value)||now.getDate();fillSelect(day,1,daysInMonth(Number(year.value),Number(month.value)),Math.min(selected,daysInMonth(Number(year.value),Number(month.value))))}function setOpen(open){pop.hidden=!open;toggle.setAttribute('aria-expanded',String(open));if(open)year.focus();}syncDays();[year,month].forEach(s=>s.addEventListener('change',syncDays));toggle.addEventListener('click',()=>setOpen(pop.hidden));picker.addEventListener('keydown',e=>{if(e.key==='Escape'){setOpen(false);toggle.focus();}});picker.querySelector('[data-datetime-apply]').addEventListener('click',()=>{input.value=`${pad(day.value)}.${pad(month.value)}.${year.value} ${pad(hour.value)}:${pad(minute.value)}`;setOpen(false);});picker.querySelector('[data-datetime-clear]').addEventListener('click',()=>{input.value='';setOpen(false);});}
 function initDeleteConfirmation(form){const input=form.querySelector('[data-confirm-input]');const button=form.querySelector('[data-confirm-delete]');if(!input||!button)return;const sync=()=>{button.disabled=input.value!==form.dataset.requiredName;};input.addEventListener('input',sync);sync();input.focus();}
-document.addEventListener('click',e=>{document.querySelectorAll('[data-datetime-picker]').forEach(p=>{if(!p.contains(e.target)){const pop=p.querySelector('[data-datetime-popover]');if(pop)pop.hidden=true;}});});
+document.addEventListener('click',e=>{document.querySelectorAll('[data-datetime-picker]').forEach(p=>{if(!p.contains(e.target)){const pop=p.querySelector('[data-datetime-popover]');const toggle=p.querySelector('[data-datetime-toggle]');if(pop)pop.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');}});});
 function initFileSelection(){const bar=document.querySelector('[data-selection-bar]');const link=bar?.querySelector('[data-selection-share]');const name=bar?.querySelector('[data-selection-name]');if(!bar||!link||!name)return;document.querySelectorAll('[data-file-select]').forEach(input=>input.addEventListener('change',()=>{if(!input.checked)return;name.textContent=`${input.value||'/'} ausgewählt`;link.href=`/admin/shares/new?path=${encodeURIComponent(input.value)}`;bar.hidden=false;}));}
 function initShareReview(){const form=document.querySelector('[data-share-create]');if(!form)return;const review=form.parentElement.querySelector('[data-share-review]');const passwordToggle=form.querySelector('[data-password-toggle]');const passwordFields=form.querySelector('[data-password-fields]');const uploadRules=form.querySelector('[data-upload-rules]');const permissionLabels={download_only:'Nur Download',upload_only:'Nur Upload',download_upload:'Download + Upload'};const sync=()=>{const permission=form.querySelector('[name="permission"]:checked')?.value||form.querySelector('[name="permission"]')?.value||'download_only';const alias=form.elements.alias?.value.trim();const maximum=form.elements.max_downloads?.value.trim();const protectedShare=Boolean(passwordToggle?.checked);if(review){review.querySelector('[data-review-permission]').textContent=permissionLabels[permission]||permission;review.querySelector('[data-review-password]').textContent=protectedShare?'Passwort geschützt':'Ohne Passwort';review.querySelector('[data-review-limit]').textContent=maximum?`${maximum} Übertragungen`:'Unbegrenzt';const url=review.querySelector('[data-review-url]');if(url){const base=url.textContent.split('/v/')[0].split('/s/')[0];url.textContent=alias?`${base}/s/${alias}`:`${base}/v/••••••••`;}}if(passwordFields){passwordFields.hidden=!protectedShare;passwordFields.querySelectorAll('input').forEach(input=>{input.disabled=!protectedShare;input.required=protectedShare;});}if(uploadRules)uploadRules.hidden=permission==='download_only';};form.addEventListener('input',sync);form.addEventListener('change',sync);sync();}
 document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);initFileSelection();initShareReview();});
@@ -1660,7 +1660,7 @@ async fn admin_browser(
                 .map(format_file_time)
                 .unwrap_or_else(|| "—".into());
             rows += &format!(
-                r#"<tr><td data-label="Name">{}</td><td data-label="Typ">{}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion" class="actions">{}{}</td></tr>"#,
+                r#"<tr><td data-label="Name">{}</td><td data-label="Typ">{}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion"><div class="vl-inline-actions">{}{}</div></td></tr>"#,
                 file_name_cell(&hit.relative_path, &hit.relative_path, hit.entry.is_dir),
                 if hit.entry.is_dir { "Ordner" } else { "Datei" },
                 if hit.entry.is_dir {
@@ -1701,7 +1701,7 @@ async fn admin_browser(
             };
             let modified = modified.map(format_file_time).unwrap_or_else(|| "—".into());
             rows += &format!(
-                r#"<tr><td data-label="Name">{display}</td><td data-label="Typ">{}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion" class="actions">{}{}</td></tr>"#,
+                r#"<tr><td data-label="Name">{display}</td><td data-label="Typ">{}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion"><div class="vl-inline-actions">{}{}</div></td></tr>"#,
                 if is_dir { "Ordner" } else { "Datei" },
                 if is_dir { "—".into() } else { human(size) },
                 modified,
@@ -1776,12 +1776,12 @@ async fn admin_browser(
         next
     );
     let create_form = format!(
-        r#"<details class="vl-create-folder"><summary class="vl-button vl-button--secondary">Neuer Ordner</summary><form method="post" action="/admin/files/directories" class="vl-inline-actions"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="parent" value="{}"><label class="vl-field">Ordnername<input name="name" maxlength="255" required></label><button class="vl-button">Ordner erstellen</button></form></details>"#,
+        r#"<details class="vl-create-folder"><summary class="vl-button vl-button--secondary">Neuer Ordner</summary><form method="post" action="/admin/files/directories" class="vl-create-folder__form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="parent" value="{}"><label class="vl-field vl-create-folder__field"><span>Ordnername</span><input name="name" maxlength="255" required></label><button class="vl-button">Ordner erstellen</button></form></details>"#,
         esc(&s.csrf_token),
         esc(&rel),
     );
     let upload_form = format!(
-        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} Dateien hochladen</summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><label class="vl-checkbox"><input type="checkbox" name="overwrite_existing" value="1"> Nur die jeweils betroffene Datei nach Konflikt ersetzen</label><label class="vl-upload-dropzone" data-upload-dropzone><strong>Datei hier ablegen</strong><span class="vl-muted">Ohne JavaScript ist genau eine Datei pro Upload möglich.</span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>Upload starten</button></form></details>"#,
+        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} Dateien hochladen</summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><div class="vl-panel-head"><div><strong>Admin-Upload</strong><p class="vl-muted">Dateien werden nacheinander und atomar veröffentlicht.</p></div><button class="vl-button vl-button--ghost vl-button--small" type="button" data-details-close>Schließen</button></div><label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span>Konfliktdatei ersetzen<small>Nur nach einem konkreten Namenskonflikt verwenden.</small></span></label><label class="vl-upload-dropzone" data-upload-dropzone><strong>Datei hier ablegen</strong><span class="vl-muted">Oder über die Dateiauswahl hinzufügen.</span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>Upload starten</button></form></details>"#,
         crate::ui::icon(crate::ui::Icon::Upload),
         esc(&rel),
         esc(&s.csrf_token),
@@ -1808,7 +1808,7 @@ async fn admin_browser(
         &state,
         "Dateien",
         &body,
-        true,
+        false,
         &s.csrf_token,
     )))
 }
@@ -1852,7 +1852,7 @@ async fn admin_preview(
             preview_too_large_body(&rel, size, "Datei ist größer als das Preview-Limit.", None)
         }
         PreviewContent::Text(text) => format!(
-            r#"<section><h1>Vorschau</h1><p class="preview-actions"><a href="/admin?path={}">Zurück zum Ordner</a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
+            r#"<section><p class="preview-actions"><a href="/admin?path={}">Zurück zum Ordner</a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
             encoded(parent_path(&rel).as_deref().unwrap_or("")),
             esc(&rel),
             esc(&text)
@@ -1904,7 +1904,7 @@ fn admin_media_preview_body(path: &str, kind: PreviewKind, size: u64) -> String 
     let raw = format!("/admin/preview/raw?path={}", encoded(path));
     let viewer = media_viewer(kind, &raw);
     format!(
-        r#"<section><h1>Vorschau</h1><p class="preview-actions"><a href="/admin?path={}">Zurück zum Ordner</a></p><p><code>/{}</code> <span class="muted">{}</span></p>{}</section>"#,
+        r#"<section><p class="preview-actions"><a href="/admin?path={}">Zurück zum Ordner</a></p><p><code>/{}</code> <span class="muted">{}</span></p>{}</section>"#,
         encoded(parent_path(path).as_deref().unwrap_or("")),
         esc(path),
         human(size),
@@ -1941,8 +1941,10 @@ fn preview_too_large_body(
             encoded(parent_path(path).as_deref().unwrap_or(""))
         )
     };
+    let heading = if is_public { "<h1>Vorschau</h1>" } else { "" };
     format!(
-        r#"<section><h1>Vorschau</h1><p class="preview-actions">{}</p><p><code>/{}</code></p><p class="muted">{} Größe: {}.</p></section>"#,
+        r#"<section>{}<p class="preview-actions">{}</p><p><code>/{}</code></p><p class="muted">{} Größe: {}.</p></section>"#,
+        heading,
         back,
         esc(path),
         esc(message),
@@ -1972,7 +1974,7 @@ fn display_limit_unit_floor(bytes: u64, unit: u64) -> String {
 
 fn expiry_picker_html() -> String {
     format!(
-        r#"<label class="vl-field">Ablauf (optional)<div class="datetime-picker vl-input-action" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="TT.MM.JJJJ HH:MM" autocomplete="off" inputmode="numeric"><button class="vl-button vl-button--secondary calendar-button" type="button" data-datetime-toggle aria-label="Kalender öffnen">{}</button><div class="datetime-popover" data-datetime-popover hidden><div class="picker-grid"><label>Jahr<select data-dt-year></select></label><label>Monat<select data-dt-month data-pad="2"></select></label><label>Tag<select data-dt-day data-pad="2"></select></label><label>Stunde<select data-dt-hour data-pad="2"></select></label><label>Minute<select data-dt-minute data-pad="2"></select></label></div><div class="picker-actions"><button class="vl-button vl-button--secondary vl-button--small" type="button" data-datetime-clear>Löschen</button><button class="vl-button vl-button--small" type="button" data-datetime-apply>Übernehmen</button></div></div></div><small>Format: TT.MM.JJJJ HH:MM</small></label>"#,
+        r#"<label class="vl-field">Ablauf (optional)<div class="vl-datetime-picker vl-input-action" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="TT.MM.JJJJ HH:MM" autocomplete="off" inputmode="numeric"><button class="vl-button vl-button--secondary" type="button" data-datetime-toggle aria-label="Datum und Uhrzeit auswählen" aria-expanded="false">{}</button><div class="vl-datetime-popover" data-datetime-popover hidden><div class="vl-datetime-popover__grid"><label>Jahr<select data-dt-year></select></label><label>Monat<select data-dt-month data-pad="2"></select></label><label>Tag<select data-dt-day data-pad="2"></select></label><label>Stunde<select data-dt-hour data-pad="2"></select></label><label>Minute<select data-dt-minute data-pad="2"></select></label></div><div class="vl-datetime-popover__actions"><button class="vl-button vl-button--secondary vl-button--small" type="button" data-datetime-clear>Löschen</button><button class="vl-button vl-button--small" type="button" data-datetime-apply>Übernehmen</button></div></div></div><small>Format: TT.MM.JJJJ HH:MM</small></label>"#,
         crate::ui::icon(crate::ui::Icon::Calendar)
     )
 }
@@ -3150,7 +3152,7 @@ async fn share_index_page(
             .map(upload_limit_label)
             .unwrap_or_else(|| format!("global {}", human(settings.max_upload_size)));
         share_rows += &format!(
-            r#"<article class="vl-share-row"><div class="vl-share-identity"><span class="vl-file-kind" aria-hidden="true"></span><div><strong>{}</strong><span class="vl-muted">/{}</span></div></div><div class="vl-share-url"><code>{}</code><button class="vl-icon-button" type="button" data-copy="{}" aria-label="Link kopieren">Kopieren</button></div><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span><span class="vl-badge vl-badge--{}">{}</span>{}</div><div class="vl-share-quota"><span>{} / {} gezählte Übertragungen</span>{}<small class="vl-muted">Uploadlimit: {}</small></div><details class="vl-action-details"><summary class="vl-icon-button">Aktionen</summary><div class="vl-action-panel"><a class="vl-button vl-button--ghost" href="{}">Öffnen</a><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--ghost">{}</button></form><details><summary>Passwort ändern</summary><form method="post" action="/admin/shares/{}/password" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field">Neues Passwort<input type="password" name="password" minlength="{}" maxlength="{}"></label><label class="vl-field">Bestätigen<input type="password" name="password_confirm"></label><div class="vl-inline-actions"><button class="vl-button">Setzen</button><button class="vl-button vl-button--secondary" name="remove" value="1">Entfernen</button></div></form></details>{}<form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--danger">Löschen</button></form></div></details></article>"#,
+            r#"<article class="vl-share-row"><div class="vl-share-identity"><span class="vl-file-kind" aria-hidden="true"></span><div><strong>{}</strong><span class="vl-muted">/{}</span></div></div><div class="vl-share-url"><code>{}</code><button class="vl-button vl-button--secondary vl-button--small vl-copy-button" type="button" data-copy="{}" aria-label="Link kopieren">Kopieren</button></div><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span><span class="vl-badge vl-badge--{}">{}</span>{}</div><div class="vl-share-quota"><span>{} / {} gezählte Übertragungen</span>{}<small class="vl-muted">Uploadlimit: {}</small></div><details class="vl-action-details"><summary class="vl-icon-button">Aktionen</summary><div class="vl-action-panel"><a class="vl-button vl-button--ghost" href="{}">Öffnen</a><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--ghost">{}</button></form><details><summary>Passwort ändern</summary><form method="post" action="/admin/shares/{}/password" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field">Neues Passwort<input type="password" name="password" minlength="{}" maxlength="{}"></label><label class="vl-field">Bestätigen<input type="password" name="password_confirm"></label><div class="vl-inline-actions"><button class="vl-button">Setzen</button><button class="vl-button vl-button--secondary" name="remove" value="1">Entfernen</button></div></form></details>{}<form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--danger">Löschen</button></form></div></details></article>"#,
             esc(display_name),
             esc(&share.relative_path),
             esc(&url),
@@ -3221,7 +3223,7 @@ async fn share_index_page(
         &state,
         "Links",
         &body,
-        true,
+        false,
         &session_data.csrf_token,
     ))
     .into_response())
@@ -3424,7 +3426,7 @@ async fn share_create_page_legacy(
         &state,
         "Links",
         &body,
-        true,
+        false,
         &s.csrf_token,
     )))
 }
@@ -3837,7 +3839,7 @@ async fn admins_page_v3(
         _ => "",
     };
     let body = format!(
-        r#"<section><h1>Admins</h1>{notice}<div class="admin-columns"><details class="admin-column" open><summary>Aktive Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{active_rows}</table></details><details class="admin-column" open><summary>Stillgelegte Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{inactive_rows}</table></details></div><p class="muted">Admin-Löschen ist bewusst nicht enthalten, damit Audit-/Share-Bezüge stabil bleiben.</p></section><section><h2>Admin erstellen</h2><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Benutzername<br><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label>Passwort<br><input name="password" type="password" minlength="14" required></label><label>Passwort bestätigen<br><input name="password_confirm" type="password" required></label><button>Erstellen</button></form></section>"#,
+        r#"<section><h1>Admins</h1>{notice}<div class="admin-columns"><details class="admin-column" open><summary>Aktive Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{active_rows}</table></details><details class="admin-column" open><summary>Stillgelegte Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{inactive_rows}</table></details></div></section><section><h2>Admin erstellen</h2><form method="post" class="vl-admin-create-form"><input type="hidden" name="csrf" value="{}"><label class="vl-field">Benutzername<input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label class="vl-field">Passwort<input name="password" type="password" minlength="14" required></label><label class="vl-field">Passwort bestätigen<input name="password_confirm" type="password" required></label><button class="vl-button">Erstellen</button></form></section>"#,
         esc(&session.csrf_token)
     );
     Ok(Html(admin_page(
@@ -4366,29 +4368,34 @@ async fn audit_page(
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let settings = runtime_settings(&state);
     let client_ip_enabled = settings.audit_client_ip_enabled;
-    let page_number = query.page.unwrap_or(0).min(1_000_000);
+    let requested_page = query.page.unwrap_or(0).min(1_000_000);
     let action = query
         .action
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_string());
     let action_for_db = action.clone();
-    let events = database(state.db.clone(), move |db| {
-        db.list_audit(action_for_db.as_deref(), 101, page_number * 100)
+    let (events, total, page_number) = database(state.db.clone(), move |db| {
+        let total = db.count_audit(action_for_db.as_deref())?;
+        let total_pages = total.div_ceil(100).max(1);
+        let page_number = requested_page.min(total_pages - 1);
+        let events = db.list_audit(action_for_db.as_deref(), 100, page_number * 100)?;
+        Ok((events, total, page_number))
     })
     .await?;
-    let has_next = events.len() > 100;
+    let total_pages = total.div_ceil(100).max(1);
+    let has_next = page_number + 1 < total_pages;
     let mut rows = String::new();
-    for event in events.into_iter().take(100) {
+    for event in events {
         let client_ip = if client_ip_enabled {
             format!(
-                r#"<td data-label="Client-IP">{}</td>"#,
+                r#"<td class="vl-audit-ip" data-label="Client-IP">{}</td>"#,
                 event.client_ip.as_deref().map(esc).unwrap_or_default()
             )
         } else {
             String::new()
         };
         rows += &format!(
-            r#"<tr><td data-label="Zeit">{}</td><td data-label="Akteur">{}</td><td data-label="Aktion"><code>{}</code></td><td data-label="Objekt">{}</td><td data-label="Detail">{}</td>{client_ip}</tr>"#,
+            r#"<tr><td class="vl-audit-time" data-label="Zeit">{}</td><td class="vl-audit-user" data-label="User">{}</td><td class="vl-audit-action" data-label="Aktion"><code>{}</code></td><td class="vl-audit-object" data-label="Objekt">{}</td><td class="vl-audit-detail" data-label="Detail">{}</td>{client_ip}</tr>"#,
             esc(&format_audit_time(&event.occurred_at)),
             esc(&event.actor),
             esc(&event.action),
@@ -4401,7 +4408,7 @@ async fn audit_page(
         percent_encoding::utf8_percent_encode(filter_value, percent_encoding::NON_ALPHANUMERIC);
     let previous = if page_number > 0 {
         format!(
-            r#"<a href="/admin/audit?action={encoded_filter}&page={}">Zurück</a>"#,
+            r#"<a class="vl-button vl-button--ghost" href="/admin/audit?action={encoded_filter}&page={}">Zurück</a>"#,
             page_number - 1
         )
     } else {
@@ -4409,14 +4416,14 @@ async fn audit_page(
     };
     let next = if has_next {
         format!(
-            r#"<a href="/admin/audit?action={encoded_filter}&page={}">Weiter</a>"#,
+            r#"<a class="vl-button vl-button--ghost" href="/admin/audit?action={encoded_filter}&page={}">Weiter</a>"#,
             page_number + 1
         )
     } else {
         String::new()
     };
     let ip_header = if client_ip_enabled {
-        "<th>Client-IP</th>"
+        "<th class=\"vl-audit-ip\">Client-IP</th>"
     } else {
         ""
     };
@@ -4426,8 +4433,10 @@ async fn audit_page(
         .unwrap_or_else(|| "unbekannt".into());
     let trusted_proxy_count = state.config.reverse_proxy.trusted_proxies.len();
     let body = format!(
-        r#"<div class="vl-audit-layout"><section class="vl-panel"><div class="vl-panel-head"><div><p class="vl-eyebrow">Nachvollziehbarkeit</p><h2>Audit-Ereignisse</h2></div><form method="get" class="vl-inline-actions"><label class="vl-field"><span class="vl-sr-only">Action-Filter</span><input name="action" value="{}" placeholder="Action filtern"></label><button class="vl-button">Filtern</button></form></div><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th>Zeit</th><th>Akteur</th><th>Aktion</th><th>Objekt</th><th>Detail</th>{ip_header}</tr></thead><tbody>{rows}</tbody></table></div><nav class="vl-pagination" aria-label="Audit-Seiten">{previous} {next}</nav></section><aside class="vl-panel vl-security-facts"><p class="vl-eyebrow">Security-Status</p><h2>Belegte Konfiguration</h2><dl><div><dt>MFA</dt><dd>Für Admin-Sitzungen verpflichtend</dd></div><div><dt>Servermodus</dt><dd>{:?}</dd></div><div><dt>Öffentliches URL-Schema</dt><dd>{}</dd></div><div><dt>Trusted Proxies</dt><dd>{}</dd></div><div><dt>Audit-IP-Erfassung</dt><dd>{}</dd></div><div><dt>Protokollierung</dt><dd>SQLite + strukturiertes Serverlog</dd></div></dl></aside></div>"#,
+        r#"<div class="vl-audit-layout"><section class="vl-panel"><div class="vl-panel-head"><div><p class="vl-eyebrow">Nachvollziehbarkeit</p><h2>Audit-Ereignisse</h2></div><form method="get" class="vl-inline-actions"><label class="vl-field"><span class="vl-sr-only">Action-Filter</span><input name="action" value="{}" placeholder="Action filtern"></label><button class="vl-button">Filtern</button></form></div><div class="vl-table-wrap"><table class="vl-data-table vl-audit-table"><thead><tr><th class="vl-audit-time">Zeit</th><th class="vl-audit-user">User</th><th class="vl-audit-action">Aktion</th><th class="vl-audit-object">Objekt</th><th class="vl-audit-detail">Detail</th>{ip_header}</tr></thead><tbody>{rows}</tbody></table></div><nav class="vl-pagination" aria-label="Audit-Seiten">{previous}<span>Seite {} von {}</span>{next}</nav></section><aside class="vl-panel vl-security-facts"><p class="vl-eyebrow">Security-Status</p><h2>Belegte Konfiguration</h2><dl><div><dt>MFA</dt><dd>Für Admin-Sitzungen verpflichtend</dd></div><div><dt>Servermodus</dt><dd>{:?}</dd></div><div><dt>Öffentliches URL-Schema</dt><dd>{}</dd></div><div><dt>Trusted Proxies</dt><dd>{}</dd></div><div><dt>Audit-IP-Erfassung</dt><dd>{}</dd></div><div><dt>Protokollierung</dt><dd>SQLite + strukturiertes Serverlog</dd></div></dl></aside></div>"#,
         esc(filter_value),
+        page_number + 1,
+        total_pages,
         state.config.server.mode,
         esc(&url_scheme),
         trusted_proxy_count,
@@ -7527,7 +7536,7 @@ mod tests {
         let admin_list_html = response_text(app.clone().oneshot(admin_list).await.unwrap()).await;
         assert!(admin_list_html.contains("Aktive Admins"));
         assert!(admin_list_html.contains("Stillgelegte Admins"));
-        assert!(admin_list_html.contains("Admin-Löschen ist bewusst nicht enthalten"));
+        assert!(!admin_list_html.contains("Admin-Löschen ist bewusst nicht enthalten"));
         assert!(admin_list_html.contains("Aktueller Admin"));
         assert_eq!(admin_list_html.matches("Passwort setzen").count(), 2);
         assert!(

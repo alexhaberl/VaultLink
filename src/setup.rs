@@ -2,7 +2,10 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use axum::{
@@ -31,6 +34,8 @@ struct SetupState {
     config_path: Arc<PathBuf>,
     token: Arc<String>,
     commit: Arc<tokio::sync::Mutex<bool>>,
+    start_sender: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    start_requested: Arc<AtomicBool>,
 }
 
 const INITIAL_SETUP_PENDING_FILE: &str = ".vaultlink-initial-setup.pending";
@@ -67,9 +72,7 @@ struct SetupForm {
     blocked_extensions: String,
     secure_cookie: Option<String>,
     audit_client_ip_enabled: Option<String>,
-    reverse_proxy_enabled: Option<String>,
     trusted_proxies: String,
-    tls_enabled: Option<String>,
     certificate_source: String,
     tls_cert_file: String,
     tls_key_file: String,
@@ -86,27 +89,39 @@ struct SetupForm {
 pub async fn run(
     config_path: PathBuf,
     listen: SocketAddr,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     validate_setup_listen(listen)?;
     let token = auth::random_token(32);
     println!("VaultLink setup URL:");
     println!("http://{listen}/?token={token}");
     println!("The setup token is printed once and is required by the browser form.");
+    let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
+    let start_requested = Arc::new(AtomicBool::new(false));
     let state = SetupState {
         config_path: Arc::new(config_path),
         token: Arc::new(token),
         commit: Arc::new(tokio::sync::Mutex::new(false)),
+        start_sender: Arc::new(tokio::sync::Mutex::new(Some(start_sender))),
+        start_requested: start_requested.clone(),
     };
     let app = setup_router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = start_receiver => {},
+                _ = tokio::signal::ctrl_c() => {},
+            }
+        })
+        .await?;
+    Ok(start_requested.load(Ordering::Acquire))
 }
 
 fn setup_router(state: SetupState) -> Router {
     Router::new()
         .route("/", get(setup_page).post(submit_setup))
         .route("/complete", axum::routing::post(complete_setup))
+        .route("/start", axum::routing::post(start_server))
         .route("/browse", get(setup_browse))
         .route("/assets/vaultlink.css", get(stylesheet_asset))
         .route("/assets/setup.js", get(setup_javascript_asset))
@@ -203,7 +218,7 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
         Ok(result) => match qr_svg(&result.otpauth) {
             Ok(qr) => {
                 Html(page(&format!(
-                    r#"<section><h1>Setup abgeschlossen</h1><p>Config wurde geschrieben und der erste Admin wurde angelegt.</p><p>Das TOTP-Secret bleibt bis zur ausdrücklichen Bestätigung über diesen lokalen Setup-Flow wiederherstellbar. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button>Secret sicher gespeichert</button></form><p>Danach den Setup-Prozess mit Ctrl+C beenden und VaultLink normal starten.</p></section>"#,
+                    r#"<section><h1>Setup abgeschlossen</h1><p>Config wurde geschrieben und der erste Admin wurde angelegt.</p><p>Das TOTP-Secret bleibt bis zur ausdrücklichen Bestätigung über diesen lokalen Setup-Flow wiederherstellbar. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button>Secret sicher gespeichert</button></form></section>"#,
                     qr,
                     esc(&result.totp_secret),
                     esc(&result.otpauth),
@@ -240,10 +255,22 @@ async fn complete_setup(
     }
     let mut completed = state.commit.lock().await;
     if *completed {
-        return Html(page(
-            "<section><h1>Setup bestätigt</h1><p>Die TOTP-Wiederherstellung ist bereits geschlossen.</p></section>",
-        ))
-        .into_response();
+        return match Config::load(state.config_path.as_ref()) {
+            Ok(config) => Html(page(&setup_confirmed_body(
+                &config,
+                state.token.as_ref(),
+                "Die TOTP-Wiederherstellung ist bereits geschlossen.",
+            )))
+            .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(page(&format!(
+                    "Konfiguration kann nicht geladen werden: {}",
+                    esc(&error.to_string())
+                ))),
+            )
+                .into_response(),
+        };
     }
     let config = match Config::load(state.config_path.as_ref()) {
         Ok(config) => config,
@@ -261,9 +288,11 @@ async fn complete_setup(
     match clear_initial_setup_pending(&config.storage.data_directory) {
         Ok(()) => {
             *completed = true;
-            Html(page(
-                "<section><h1>Setup bestätigt</h1><p>Die TOTP-Wiederherstellung wurde geschlossen. VaultLink kann jetzt normal gestartet werden.</p></section>",
-            ))
+            Html(page(&setup_confirmed_body(
+                &config,
+                state.token.as_ref(),
+                "Die TOTP-Wiederherstellung wurde geschlossen.",
+            )))
             .into_response()
         }
         Err(error) => (
@@ -275,6 +304,72 @@ async fn complete_setup(
         )
             .into_response(),
     }
+}
+
+fn setup_confirmed_body(config: &Config, token: &str, message: &str) -> String {
+    let mode = match &config.server.mode {
+        ServerMode::Development => "Development",
+        ServerMode::ReverseProxy => "Reverse Proxy",
+        ServerMode::StandaloneTls => "Standalone TLS",
+    };
+    format!(
+        r#"<section><h1>Setup bestätigt</h1><p>{}</p><p>VaultLink ist für den Modus <strong>{mode}</strong> konfiguriert.</p><form method="post" action="/start"><input type="hidden" name="token" value="{}"><button>VaultLink jetzt starten</button></form><p class="muted">Für den dauerhaften Produktivbetrieb sollte VaultLink anschließend weiterhin über den konfigurierten Systemdienst gestartet werden.</p></section>"#,
+        esc(message),
+        esc(token),
+    )
+}
+
+async fn start_server(
+    State(state): State<SetupState>,
+    Form(form): Form<CompleteSetupForm>,
+) -> Response {
+    if form.token != *state.token {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html(page("Setup-Token fehlt oder ist ungültig.")),
+        )
+            .into_response();
+    }
+    if !*state.commit.lock().await {
+        return (
+            StatusCode::CONFLICT,
+            Html(page("Das TOTP-Secret muss zuerst bestätigt werden.")),
+        )
+            .into_response();
+    }
+    let config = match Config::load(state.config_path.as_ref()) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(page(&format!(
+                    "Konfiguration kann nicht geladen werden: {}",
+                    esc(&error.to_string())
+                ))),
+            )
+                .into_response()
+        }
+    };
+    let Some(sender) = state.start_sender.lock().await.take() else {
+        return (
+            StatusCode::CONFLICT,
+            Html(page("Der Serverstart wurde bereits angefordert.")),
+        )
+            .into_response();
+    };
+    let start_requested = state.start_requested.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        start_requested.store(true, Ordering::Release);
+        if sender.send(()).is_err() {
+            start_requested.store(false, Ordering::Release);
+        }
+    });
+    Html(page(&format!(
+        r#"<section><h1>VaultLink wird gestartet</h1><p>Der lokale Setup-Listener wird beendet und VaultLink übernimmt mit der gespeicherten Konfiguration.</p><p><a class="button" href="{}">VaultLink öffnen</a></p><p class="muted">Der Start kann abhängig von TLS und Let&apos;s Encrypt einen Moment dauern.</p></section>"#,
+        esc(&config.server.public_base_url),
+    )))
+    .into_response()
 }
 
 struct SetupResult {
@@ -304,6 +399,8 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
         _ => return Err("Ungültiger Servermodus.".into()),
     };
     let standalone_tls = matches!(mode, ServerMode::StandaloneTls);
+    let reverse_proxy_mode = matches!(mode, ServerMode::ReverseProxy);
+    let production_mode = !matches!(mode, ServerMode::Development);
     let certificate_source = match form.certificate_source.as_str() {
         "files" => CertificateSource::Files,
         "letsencrypt" => CertificateSource::LetsEncrypt,
@@ -326,7 +423,7 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
             mode,
             listen_address: form.listen_address,
             public_base_url: form.public_base_url,
-            production_mode: form.production_mode.is_some(),
+            production_mode: production_mode || form.production_mode.is_some(),
         },
         storage: Storage {
             root_mount_path: form.root_mount_path.into(),
@@ -356,27 +453,24 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
             blocked_extensions,
         },
         reverse_proxy: ReverseProxy {
-            enabled: form.reverse_proxy_enabled.is_some(),
+            enabled: reverse_proxy_mode,
             allow_non_loopback: false,
             trusted_proxies,
-            trust_x_forwarded_headers: form.reverse_proxy_enabled.is_some(),
+            trust_x_forwarded_headers: reverse_proxy_mode,
         },
         tls: Tls {
-            enabled: form.tls_enabled.is_some()
-                || certificate_source == CertificateSource::LetsEncrypt,
+            enabled: standalone_tls,
             certificate_source,
             cert_file: form.tls_cert_file.into(),
             key_file: form.tls_key_file.into(),
             hsts_enabled: form.hsts_enabled.is_some(),
-            reload_on_cert_change: standalone_tls
-                && form.tls_enabled.is_some()
-                && form.certificate_source == "files",
+            reload_on_cert_change: standalone_tls && form.certificate_source == "files",
             letsencrypt_contact_email: form.letsencrypt_contact_email,
             letsencrypt_cache_dir: form.letsencrypt_cache_dir.into(),
             letsencrypt_staging: form.letsencrypt_staging.is_some(),
         },
         security: Security {
-            secure_cookie: form.secure_cookie.is_some(),
+            secure_cookie: production_mode || form.secure_cookie.is_some(),
             audit_client_ip_enabled: form.audit_client_ip_enabled.is_some(),
             ..Default::default()
         },
@@ -566,12 +660,15 @@ const GB: u64 = 1_000_000_000;
 struct BrowseQuery {
     token: Option<String>,
     path: Option<String>,
+    mode: Option<String>,
+    file_kind: Option<String>,
 }
 
 #[derive(Serialize)]
 struct BrowseEntry {
     name: String,
     path: String,
+    is_directory: bool,
 }
 
 #[derive(Serialize)]
@@ -589,6 +686,8 @@ async fn setup_browse(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let requested = query.path.unwrap_or_else(|| "/".to_string());
+    let include_files = query.mode.as_deref() == Some("file");
+    let file_kind = query.file_kind.as_deref();
     let path = PathBuf::from(&requested);
     if !path.is_absolute() {
         return (StatusCode::BAD_REQUEST, "path must be absolute").into_response();
@@ -602,14 +701,24 @@ async fn setup_browse(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if !file_type.is_dir() {
+        let is_directory = file_type.is_dir();
+        let entry_path = entry.path();
+        if !is_directory
+            && !(include_files
+                && file_type.is_file()
+                && setup_picker_file_allowed(&entry_path, file_kind))
+        {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        let path = entry.path().display().to_string();
-        entries.push(BrowseEntry { name, path });
+        let path = entry_path.display().to_string();
+        entries.push(BrowseEntry {
+            name,
+            path,
+            is_directory,
+        });
     }
-    entries.sort_by_key(|entry| entry.name.to_lowercase());
+    entries.sort_by_key(|entry| (!entry.is_directory, entry.name.to_lowercase()));
     let parent = path
         .parent()
         .filter(|parent| *parent != path)
@@ -622,6 +731,18 @@ async fn setup_browse(
     .into_response()
 }
 
+fn setup_picker_file_allowed(path: &Path, file_kind: Option<&str>) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    matches!(
+        (file_kind, extension.as_deref()),
+        (Some("certificate"), Some("pem" | "crt" | "cer"))
+            | (Some("private_key"), Some("pem" | "key"))
+    )
+}
+
 fn setup_form(token: &str, error: Option<&str>) -> String {
     let error = error
         .map(|error| format!(r#"<p class="bad">{}</p>"#, esc(error)))
@@ -631,9 +752,85 @@ fn setup_form(token: &str, error: Option<&str>) -> String {
         esc(token),
         esc(token)
     );
-    form.replace(
+    let form = form.replace(
         r#"<section class="form-card"><h2>Erster Admin"#,
         r#"<section class="form-card"><h2>Audit und Datenschutz</h2><div class="form-grid"><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled"><span>Client-IP im Audit speichern<small>Standardmäßig aus. Bei Aktivierung werden vollständige IP-Adressen unbegrenzt in SQLite gespeichert.</small></span></label></div></section><section class="form-card"><h2>Erster Admin"#,
+    );
+    form.replace(
+        r#"<select name="server_mode">"#,
+        r#"<select name="server_mode" data-server-mode>"#,
+    )
+    .replace(
+        r#"<section class="form-card"><h2>Proxy und TLS</h2>"#,
+        r#"<section class="form-card" data-production-section><h2>Proxy und TLS</h2>"#,
+    )
+    .replace(
+        r#"<label class="toggle-card"><input type="checkbox" name="production_mode"><span>Production Mode<small>Aktiviert produktive Startvalidierung.</small></span></label>"#,
+        "",
+    )
+    .replace(
+        r#"<label class="toggle-card"><input type="checkbox" name="secure_cookie"><span>Secure Cookies<small>Für produktiven HTTPS-Betrieb aktivieren.</small></span></label>"#,
+        "",
+    )
+    .replace(
+        r#"<label class="toggle-card"><input type="checkbox" name="reverse_proxy_enabled"><span>Reverse Proxy aktiv<small>Forwarded Header nur von Trusted Proxies akzeptieren.</small></span></label>"#,
+        "",
+    )
+    .replace(
+        r#"<label class="toggle-card"><input type="checkbox" name="tls_enabled"><span>Standalone TLS aktiv<small>Nur ohne Reverse Proxy verwenden.</small></span></label>"#,
+        "",
+    )
+    .replace(
+        r#"<label>Trusted Proxies<br>"#,
+        r#"<label data-mode-only="reverse_proxy">Trusted Proxies<br>"#,
+    )
+    .replace(
+        r#"<label>Zertifikatsquelle<br>"#,
+        r#"<label data-mode-only="standalone_tls">Zertifikatsquelle<br>"#,
+    )
+    .replace(
+        r#"<select name="certificate_source">"#,
+        r#"<select name="certificate_source" data-certificate-source>"#,
+    )
+    .replace(
+        r#"<label>TLS Cert File<br>"#,
+        r#"<label data-certificate-only="files">TLS Cert File<br>"#,
+    )
+    .replace(
+        r#"<label>TLS Key File<br>"#,
+        r#"<label data-certificate-only="files">TLS Key File<br>"#,
+    )
+    .replace(
+        r#"<input name="tls_cert_file">"#,
+        r#"<div class="input-action"><input name="tls_cert_file"><button class="secondary small" type="button" data-file-picker="tls_cert_file">Durchsuchen</button></div>"#,
+    )
+    .replace(
+        r#"<input name="tls_key_file">"#,
+        r#"<div class="input-action"><input name="tls_key_file"><button class="secondary small" type="button" data-file-picker="tls_key_file">Durchsuchen</button></div>"#,
+    )
+    .replace(
+        r#"<label>Let&apos;s Encrypt Kontakt-E-Mail<br>"#,
+        r#"<label data-certificate-only="letsencrypt">Let&apos;s Encrypt Kontakt-E-Mail<br>"#,
+    )
+    .replace(
+        r#"<label>ACME Cache Directory<br>"#,
+        r#"<label data-certificate-only="letsencrypt">ACME Cache Directory<br>"#,
+    )
+    .replace(
+        r#"<label class="toggle-card"><input type="checkbox" name="letsencrypt_staging""#,
+        r#"<label class="toggle-card" data-certificate-only="letsencrypt"><input type="checkbox" name="letsencrypt_staging""#,
+    )
+    .replace(
+        r#"<div class="dir-list" data-dir-list>"#,
+        r#"<p class="muted">Es werden nur Verzeichnisse im Dateisystem des VaultLink-Servers angezeigt.</p><div class="dir-list" data-dir-list>"#,
+    )
+    .replace(
+        r#"<strong>Verzeichnis auswählen</strong>"#,
+        r#"<strong data-picker-title>Verzeichnis auswählen</strong>"#,
+    )
+    .replace(
+        r#"<p class="muted">Es werden nur Verzeichnisse im Dateisystem des VaultLink-Servers angezeigt.</p>"#,
+        r#"<p class="muted" data-picker-help>Es werden nur Verzeichnisse im Dateisystem des VaultLink-Servers angezeigt.</p>"#,
     )
 }
 
@@ -649,7 +846,120 @@ fn setup_css() -> &'static str {
     r#":root{--bg:#070d1b;--card:#121b31;--card2:#172542;--text:#f4f7ff;--soft:#d7e3fb;--muted:#9fb0d0;--accent:#5aa7ff;--line:#263653;--line2:#3b5076;--bad:#ff7b86;--good:#55d69a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top right,#221b57 0,#081020 34%,#050914 100%);color:var(--text);font:16px system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1220px;margin:auto;padding:2rem}.setup-shell{min-height:100vh}.public-brand{display:flex;align-items:center;gap:.8rem;margin:0 0 1.5rem;font-weight:900}.public-brand svg{width:48px;height:48px;border-radius:14px;box-shadow:0 12px 28px rgba(47,103,189,.25)}.public-brand small{display:block;color:var(--muted);font-weight:700}.hero,section{background:linear-gradient(180deg,rgba(23,37,66,.92),rgba(18,27,49,.92));border:1px solid rgba(90,167,255,.16);border-radius:22px;padding:1.35rem;margin:1rem 0;box-shadow:0 18px 60px rgba(0,0,0,.22)}.hero{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:1rem;align-items:center}.eyebrow{color:#9ed0ff;text-transform:uppercase;letter-spacing:.16em;font-weight:900;font-size:.78rem}.side-panel{padding:1rem;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.045)}h1{font-size:clamp(2rem,4vw,3.4rem);line-height:1;margin:.2rem 0 .7rem}h2{margin:0 0 .9rem;font-size:1.12rem;color:#dbeafe}.muted{color:var(--muted)}.bad{color:var(--bad);font-weight:800}.qr-card{display:inline-flex;margin:1rem 0;padding:1rem;border-radius:18px;background:#f8fbff;box-shadow:0 18px 42px rgba(0,0,0,.28)}.qr-card svg{display:block;width:220px;height:220px}.secret-block{display:grid;gap:.6rem;margin:1rem 0}.secret-block code{display:block;max-width:100%;overflow:auto;padding:.85rem;border-radius:12px;background:#081226;border:1px solid var(--line2);color:#dbeafe}.form-card{padding:1rem;border:1px solid rgba(90,167,255,.16);border-radius:18px;background:rgba(90,167,255,.045);margin:1rem 0}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:.9rem;align-items:end}label{display:block;color:var(--soft);font-weight:700}input,select,button{font:inherit;padding:.72rem .8rem;border-radius:12px;border:1px solid var(--line2);background:#0b1326;color:var(--text);max-width:100%}label input,label select{margin-top:.25rem;width:100%}input:focus,select:focus{outline:2px solid rgba(90,167,255,.35);border-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;cursor:pointer;padding:.78rem 1rem;border-radius:12px;background:linear-gradient(135deg,#2f67bd,#4e7de2);border:1px solid rgba(255,255,255,.1);color:white;box-shadow:0 10px 24px rgba(47,103,189,.22);font-weight:800;line-height:1.1;text-decoration:none;white-space:nowrap}.secondary{background:rgba(90,167,255,.12);border-color:rgba(90,167,255,.35);box-shadow:none;color:#dbeafe}.small{padding:.55rem .75rem;border-radius:10px;font-size:.92rem}.form-actions,.button-group{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center}.input-action{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:end}.toggle-card{display:flex;align-items:center;gap:.85rem;width:100%;min-width:260px;padding:.9rem 1rem;border:1px solid rgba(90,167,255,.22);border-radius:16px;background:rgba(90,167,255,.07);cursor:pointer}.toggle-card input{position:absolute;opacity:0;width:1px;height:1px}.toggle-card>input+span{position:relative;display:grid;gap:.15rem;padding-left:68px;color:var(--text)}.toggle-card>input+span::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);width:54px;height:30px;border-radius:999px;background:#1f2b45;border:1px solid var(--line2);box-shadow:inset 0 1px 4px rgba(0,0,0,.28)}.toggle-card>input+span::after{content:"";position:absolute;left:4px;top:50%;transform:translateY(-50%);width:22px;height:22px;border-radius:999px;background:#dbeafe;transition:transform .18s ease,background .18s ease}.toggle-card>input:checked+span::before{background:linear-gradient(135deg,#2f67bd,#4e7de2);border-color:rgba(255,255,255,.18)}.toggle-card>input:checked+span::after{transform:translate(24px,-50%);background:#fff}.toggle-card small{display:block;color:var(--muted);font-weight:600;line-height:1.35}.dir-dialog{width:min(720px,92vw);border:1px solid rgba(90,167,255,.22);border-radius:20px;background:#101a30;color:var(--text);box-shadow:0 30px 90px rgba(0,0,0,.55);padding:1rem}.dir-dialog::backdrop{background:rgba(0,0,0,.55)}.dir-dialog-head{display:flex;justify-content:space-between;gap:1rem;align-items:center}.dir-list{display:grid;gap:.45rem;max-height:420px;overflow:auto;margin-top:.9rem}.dir-entry{display:flex;justify-content:space-between;gap:.8rem;align-items:center;padding:.75rem .85rem;border:1px solid rgba(255,255,255,.08);border-radius:14px;background:rgba(255,255,255,.035);color:var(--text);text-align:left}.dir-entry:hover{filter:brightness(1.08)}@media(max-width:850px){main{padding:1rem}.hero{grid-template-columns:1fr}.input-action{grid-template-columns:1fr}.form-actions{display:block}}"#
 }
 
-const SETUP_JAVASCRIPT: &str = r#"document.addEventListener('DOMContentLoaded',()=>{const form=document.querySelector('[data-setup-token]');const dialog=document.querySelector('[data-dir-dialog]');if(!form||!dialog||!dialog.showModal)return;const token=form.dataset.setupToken;const list=dialog.querySelector('[data-dir-list]');const current=dialog.querySelector('[data-dir-current]');let target=null;let path='/';async function load(p){const res=await fetch(`/browse?token=${encodeURIComponent(token)}&path=${encodeURIComponent(p)}`);if(!res.ok){list.innerHTML='<p class="bad">Verzeichnis kann nicht gelesen werden.</p>';return;}const data=await res.json();path=data.path;current.textContent=path;dialog.querySelector('[data-dir-up]').disabled=!data.parent;dialog.querySelector('[data-dir-up]').dataset.parent=data.parent||'';list.innerHTML='';for(const entry of data.entries){const b=document.createElement('button');b.type='button';b.className='dir-entry';b.textContent='Ordner '+entry.name;b.addEventListener('click',()=>load(entry.path));list.appendChild(b);}if(!data.entries.length){list.innerHTML='<p class="muted">Keine Unterverzeichnisse.</p>';}}document.querySelectorAll('[data-dir-picker]').forEach(button=>button.addEventListener('click',()=>{target=form.elements[button.dataset.dirPicker];path=(target&&target.value&&target.value.startsWith('/'))?target.value:'/';load(path);dialog.showModal();}));dialog.querySelector('[data-dir-close]').addEventListener('click',()=>dialog.close());dialog.querySelector('[data-dir-up]').addEventListener('click',e=>{if(e.currentTarget.dataset.parent)load(e.currentTarget.dataset.parent);});dialog.querySelector('[data-dir-use]').addEventListener('click',()=>{if(target)target.value=path;dialog.close();});});"#;
+const SETUP_JAVASCRIPT: &str = r#"
+document.addEventListener('DOMContentLoaded', () => {
+  const form = document.querySelector('[data-setup-token]');
+  if (!form) return;
+
+  const mode = form.querySelector('[data-server-mode]');
+  const certificateSource = form.querySelector('[data-certificate-source]');
+  const syncConditionalFields = () => {
+    const selectedMode = mode?.value || 'development';
+    const selectedCertificate = certificateSource?.value || 'files';
+    const standalone = selectedMode === 'standalone_tls';
+    form.querySelectorAll('[data-production-section]').forEach(element => {
+      element.hidden = selectedMode === 'development';
+    });
+    form.querySelectorAll('[data-mode-only]').forEach(element => {
+      element.hidden = element.dataset.modeOnly !== selectedMode;
+    });
+    form.querySelectorAll('[data-certificate-only]').forEach(element => {
+      element.hidden = !standalone || element.dataset.certificateOnly !== selectedCertificate;
+    });
+    for (const name of ['tls_cert_file', 'tls_key_file']) {
+      const input = form.elements[name];
+      if (input) input.required = standalone && selectedCertificate === 'files';
+    }
+    for (const name of ['letsencrypt_contact_email', 'letsencrypt_cache_dir']) {
+      const input = form.elements[name];
+      if (input) input.required = standalone && selectedCertificate === 'letsencrypt';
+    }
+  };
+  mode?.addEventListener('change', syncConditionalFields);
+  certificateSource?.addEventListener('change', syncConditionalFields);
+  syncConditionalFields();
+
+  const dialog = document.querySelector('[data-dir-dialog]');
+  if (!dialog?.showModal) return;
+  const token = form.dataset.setupToken;
+  const list = dialog.querySelector('[data-dir-list]');
+  const current = dialog.querySelector('[data-dir-current]');
+  const pickerTitle = dialog.querySelector('[data-picker-title]');
+  const pickerHelp = dialog.querySelector('[data-picker-help]');
+  const useDirectory = dialog.querySelector('[data-dir-use]');
+  let target = null;
+  let path = '/';
+  let pickerMode = 'directory';
+  let pickerFileKind = '';
+
+  async function load(requestedPath, fallbackToRoot = false) {
+    const response = await fetch(`/browse?token=${encodeURIComponent(token)}&path=${encodeURIComponent(requestedPath)}&mode=${pickerMode}&file_kind=${encodeURIComponent(pickerFileKind)}`);
+    if (!response.ok) {
+      if (fallbackToRoot && requestedPath !== '/') return load('/', false);
+      list.innerHTML = '<p class="bad">Verzeichnis kann nicht gelesen werden.</p>';
+      return;
+    }
+    const data = await response.json();
+    path = data.path;
+    current.textContent = path;
+    const up = dialog.querySelector('[data-dir-up]');
+    up.disabled = !data.parent;
+    up.dataset.parent = data.parent || '';
+    list.innerHTML = '';
+    for (const entry of data.entries) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'dir-entry';
+      button.dataset.entryType = entry.is_directory ? 'directory' : 'file';
+      button.textContent = entry.name;
+      button.addEventListener('click', () => {
+        if (entry.is_directory) {
+          load(entry.path);
+        } else {
+          target.value = entry.path;
+          dialog.close();
+        }
+      });
+      list.appendChild(button);
+    }
+    if (!data.entries.length) {
+      list.innerHTML = `<p class="muted">${pickerMode === 'file' ? 'Keine Dateien oder Unterverzeichnisse.' : 'Keine Unterverzeichnisse.'}</p>`;
+    }
+  }
+
+  function openPicker(button, mode) {
+    pickerMode = mode;
+    target = form.elements[button.dataset.dirPicker || button.dataset.filePicker];
+    pickerFileKind = target?.name === 'tls_cert_file' ? 'certificate'
+      : target?.name === 'tls_key_file' ? 'private_key' : '';
+    const value = target?.value || '';
+    path = value.startsWith('/') ? value : '/';
+    if (pickerMode === 'file' && path !== '/') {
+      path = path.slice(0, path.lastIndexOf('/')) || '/';
+    }
+    pickerTitle.textContent = pickerMode === 'file' ? 'Datei auswählen' : 'Verzeichnis auswählen';
+    pickerHelp.textContent = pickerMode === 'file'
+      ? pickerFileKind === 'certificate'
+        ? 'Es werden nur PEM-, CRT- und CER-Zertifikatsdateien angezeigt.'
+        : 'Es werden nur PEM- und KEY-Dateien für den Private Key angezeigt.'
+      : 'Es werden nur Verzeichnisse im Dateisystem des VaultLink-Servers angezeigt.';
+    useDirectory.hidden = pickerMode === 'file';
+    load(path, true);
+    dialog.showModal();
+  }
+
+  document.querySelectorAll('[data-dir-picker]').forEach(button => button.addEventListener('click', () => openPicker(button, 'directory')));
+  document.querySelectorAll('[data-file-picker]').forEach(button => button.addEventListener('click', () => openPicker(button, 'file')));
+  dialog.querySelector('[data-dir-close]').addEventListener('click', () => dialog.close());
+  dialog.querySelector('[data-dir-up]').addEventListener('click', event => {
+    if (event.currentTarget.dataset.parent) load(event.currentTarget.dataset.parent);
+  });
+  dialog.querySelector('[data-dir-use]').addEventListener('click', () => {
+    if (target) target.value = path;
+    dialog.close();
+  });
+});
+"#;
 
 const SETUP_LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="VaultLink"><defs><linearGradient id="setup-g" x1="9" y1="7" x2="55" y2="59" gradientUnits="userSpaceOnUse"><stop stop-color="#5aa7ff"/><stop offset="1" stop-color="#7c5cff"/></linearGradient><filter id="setup-s" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="6" stdDeviation="5" flood-color="#193b8f" flood-opacity=".35"/></filter></defs><rect width="64" height="64" rx="18" fill="#081226"/><path filter="url(#setup-s)" d="M32 7 51 15v15c0 13-7.8 22.8-19 27-11.2-4.2-19-14-19-27V15L32 7Z" fill="url(#setup-g)"/><path d="M24.4 36.7a7.5 7.5 0 0 1 0-10.6l4.1-4.1a7.5 7.5 0 0 1 10.6 0 2.8 2.8 0 0 1-4 4 1.9 1.9 0 0 0-2.7 0l-4.1 4.1a1.9 1.9 0 0 0 2.7 2.7 2.8 2.8 0 0 1 4 4 7.5 7.5 0 0 1-10.6-.1Z" fill="#f3f7ff"/><path d="M28.8 42a2.8 2.8 0 0 1 0-4 1.9 1.9 0 0 0 2.7 0l4.1-4.1a1.9 1.9 0 0 0-2.7-2.7 2.8 2.8 0 1 1-4-4 7.5 7.5 0 0 1 10.6 10.7L35.4 42a7.5 7.5 0 0 1-10.6 0Z" fill="#dbeafe" opacity=".95"/><path d="M27 32h10" stroke="#081226" stroke-width="4.2" stroke-linecap="round" opacity=".45"/></svg>"##;
 
@@ -697,9 +1007,7 @@ mod tests {
             blocked_extensions: "exe".into(),
             audit_client_ip_enabled: None,
             secure_cookie: None,
-            reverse_proxy_enabled: None,
             trusted_proxies: "127.0.0.1".into(),
-            tls_enabled: None,
             certificate_source: "files".into(),
             tls_cert_file: "".into(),
             tls_key_file: "".into(),
@@ -725,7 +1033,18 @@ mod tests {
         assert!(html.contains("name=\"max_media_preview_size_mb\""));
         assert!(html.contains("<select name=\"log_level\">"));
         assert!(html.contains("data-dir-picker=\"root_mount_path\""));
+        assert!(html.contains("data-file-picker=\"tls_cert_file\""));
+        assert!(html.contains("data-file-picker=\"tls_key_file\""));
         assert!(html.contains("data-dir-dialog"));
+        assert!(html.contains("data-server-mode"));
+        assert!(html.contains("data-production-section"));
+        assert!(html.contains("data-mode-only=\"reverse_proxy\""));
+        assert!(html.contains("data-certificate-only=\"files\""));
+        assert!(html.contains("data-certificate-only=\"letsencrypt\""));
+        assert!(!html.contains("Reverse Proxy aktiv"));
+        assert!(!html.contains("Standalone TLS aktiv"));
+        assert!(SETUP_JAVASCRIPT.contains("fallbackToRoot"));
+        assert!(!SETUP_JAVASCRIPT.contains("`Ordner ${entry.name}`"));
         assert!(!html.contains("Max Upload Bytes"));
         assert!(!html.contains("Log Level<br><input"));
     }
@@ -744,6 +1063,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_browser_filters_certificate_and_private_key_files_server_side() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("certs")).unwrap();
+        std::fs::write(root.path().join("server.pem"), "certificate").unwrap();
+        std::fs::write(root.path().join("server.crt"), "certificate").unwrap();
+        std::fs::write(root.path().join("server.key"), "private key").unwrap();
+        std::fs::write(root.path().join("setup-ui-proxy.py"), "script").unwrap();
+        let (start_sender, _start_receiver) = tokio::sync::oneshot::channel();
+        let state = SetupState {
+            config_path: Arc::new(root.path().join("config.toml")),
+            token: Arc::new("token".into()),
+            commit: Arc::new(tokio::sync::Mutex::new(false)),
+            start_sender: Arc::new(tokio::sync::Mutex::new(Some(start_sender))),
+            start_requested: Arc::new(AtomicBool::new(false)),
+        };
+        let browse = |mode, file_kind| BrowseQuery {
+            token: Some("token".into()),
+            path: Some(root.path().display().to_string()),
+            mode,
+            file_kind,
+        };
+
+        let directory_response =
+            setup_browse(State(state.clone()), Query(browse(None, None))).await;
+        let directory_body = axum::body::to_bytes(directory_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let directory_body = String::from_utf8(directory_body.to_vec()).unwrap();
+        assert!(directory_body.contains("certs"));
+        assert!(!directory_body.contains("server.pem"));
+
+        let certificate_response = setup_browse(
+            State(state.clone()),
+            Query(browse(Some("file".into()), Some("certificate".into()))),
+        )
+        .await;
+        let certificate_body = axum::body::to_bytes(certificate_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let certificate_body = String::from_utf8(certificate_body.to_vec()).unwrap();
+        assert!(certificate_body.contains("certs"));
+        assert!(certificate_body.contains("server.pem"));
+        assert!(certificate_body.contains("server.crt"));
+        assert!(!certificate_body.contains("server.key"));
+        assert!(!certificate_body.contains("setup-ui-proxy.py"));
+
+        let key_response = setup_browse(
+            State(state),
+            Query(browse(Some("file".into()), Some("private_key".into()))),
+        )
+        .await;
+        let key_body = axum::body::to_bytes(key_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let key_body = String::from_utf8(key_body.to_vec()).unwrap();
+        assert!(key_body.contains("server.pem"));
+        assert!(key_body.contains("server.key"));
+        assert!(!key_body.contains("server.crt"));
+        assert!(!key_body.contains("setup-ui-proxy.py"));
+        assert!(key_body.contains(r#""is_directory":false"#));
+    }
+
+    #[tokio::test]
     async fn setup_writes_config_and_initial_admin() {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -755,9 +1137,53 @@ mod tests {
         assert!(!result.totp_secret.is_empty());
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.storage.max_preview_size, 1_000_000);
+        let confirmed = setup_confirmed_body(&config, "token", "Secret geschlossen.");
+        assert!(confirmed.contains("VaultLink jetzt starten"));
+        assert!(confirmed.contains("Development"));
+        assert!(!include_str!("setup.rs").contains(concat!("Ctrl", "+C")));
         let database = Database::open(data.path().join("data.sqlite")).unwrap();
         assert_eq!(database.admin_count().unwrap(), 1);
         assert!(database.admin("admin").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn setup_start_button_signals_transition_to_normal_server() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        build_and_store(&config_path, form(root.path(), data.path()))
+            .await
+            .unwrap();
+        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
+        let requested = Arc::new(AtomicBool::new(false));
+        let state = SetupState {
+            config_path: Arc::new(config_path),
+            token: Arc::new("token".into()),
+            commit: Arc::new(tokio::sync::Mutex::new(true)),
+            start_sender: Arc::new(tokio::sync::Mutex::new(Some(start_sender))),
+            start_requested: requested.clone(),
+        };
+
+        let response = start_server(
+            State(state),
+            Form(CompleteSetupForm {
+                token: "token".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("VaultLink wird gestartet"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), start_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(requested.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -772,7 +1198,6 @@ mod tests {
         form.public_base_url = "https://files.example.test".into();
         form.production_mode = Some("on".into());
         form.secure_cookie = Some("on".into());
-        form.tls_enabled = Some("on".into());
         form.certificate_source = "letsencrypt".into();
         form.letsencrypt_contact_email = "admin@example.test".into();
         let result = build_and_store(&config_path, form).await.unwrap();
@@ -784,6 +1209,24 @@ mod tests {
         );
         assert!(config.tls.letsencrypt_staging);
         assert_eq!(config.storage.max_media_preview_size, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn setup_server_mode_enables_reverse_proxy_security_without_redundant_toggles() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let mut form = form(root.path(), data.path());
+        form.server_mode = "reverse_proxy".into();
+        form.public_base_url = "https://files.example.test".into();
+        build_and_store(&config_path, form).await.unwrap();
+        let config = Config::load(&config_path).unwrap();
+        assert!(config.server.production_mode);
+        assert!(config.security.secure_cookie);
+        assert!(config.reverse_proxy.enabled);
+        assert!(config.reverse_proxy.trust_x_forwarded_headers);
+        assert!(!config.tls.enabled);
     }
 
     #[tokio::test]

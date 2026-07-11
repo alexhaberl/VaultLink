@@ -2,7 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Zielplattform ist Debian Linux; Entwicklung und Tests funktionieren auch unter Debian/Ubuntu in WSL.
 
-Status: `0.3.2`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
+Status: `0.3.5`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 

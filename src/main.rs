@@ -19,7 +19,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.get(1).is_some_and(|value| value == "setup") {
         let listen = arg(&args, "--listen").unwrap_or("127.0.0.1:8090");
         let listen: std::net::SocketAddr = listen.parse()?;
-        return vaultlink::setup::run(config_path, listen).await;
+        if !vaultlink::setup::run(config_path.clone(), listen).await? {
+            return Ok(());
+        }
     }
     let config = Config::load(&config_path)?;
     if args.get(1).is_some_and(|value| value == "readiness-target") {

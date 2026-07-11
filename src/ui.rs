@@ -63,6 +63,7 @@ pub const STYLESHEET: &str = r#"
     --vl-space-4: 1rem;
     --vl-space-5: 1.25rem;
     --vl-space-6: 1.5rem;
+    --vl-space-7: 1.75rem;
     --vl-space-8: 2rem;
     --vl-space-10: 2.5rem;
     --vl-space-12: 3rem;
@@ -121,6 +122,8 @@ pub const STYLESHEET: &str = r#"
     font-size: var(--vl-text-md);
     line-height: 1.5;
   }
+
+  .vl-ui [hidden] { display: none !important; }
 
   .vl-ui a {
     color: var(--vl-accent);
@@ -310,6 +313,8 @@ pub const STYLESHEET: &str = r#"
     box-shadow: var(--vl-shadow-panel);
   }
 
+  .vl-panel, .vl-form-section { overflow: visible; }
+
   .vl-hero {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(17rem, 22.5rem);
@@ -351,6 +356,7 @@ pub const STYLESHEET: &str = r#"
   .vl-form-grid > label {
     display: grid;
     gap: var(--vl-space-1);
+    margin: 0;
     color: var(--vl-text-soft);
     font-weight: 700;
   }
@@ -369,6 +375,33 @@ pub const STYLESHEET: &str = r#"
     align-items: end;
   }
 
+  .vl-datetime-picker { position: relative; }
+  .vl-datetime-popover {
+    position: absolute;
+    z-index: 40;
+    top: calc(100% + var(--vl-space-2));
+    right: 0;
+    width: min(28rem, calc(100vw - 2rem));
+    padding: var(--vl-space-4);
+    border: 1px solid var(--vl-border-strong);
+    border-radius: var(--vl-radius-lg);
+    background: #0d182d;
+    box-shadow: var(--vl-shadow-overlay);
+  }
+  .vl-datetime-popover[hidden] { display: none; }
+  .vl-datetime-popover__grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--vl-space-3);
+  }
+  .vl-datetime-popover__grid label { display: grid; gap: var(--vl-space-1); margin: 0; }
+  .vl-datetime-popover__actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--vl-space-2);
+    margin-top: var(--vl-space-4);
+  }
+
   .vl-form-actions,
   .vl-button-group {
     display: flex;
@@ -376,6 +409,14 @@ pub const STYLESHEET: &str = r#"
     gap: var(--vl-space-2);
     align-items: center;
   }
+
+  .vl-panel-head {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--vl-space-4);
+    align-items: flex-start;
+  }
+  .vl-panel-head p { margin-bottom: 0; }
 
   .vl-toggle {
     position: relative;
@@ -572,6 +613,7 @@ pub const STYLESHEET: &str = r#"
     color: var(--vl-text);
     text-align: left;
   }
+
 }
 
 @layer vl-layouts {
@@ -796,24 +838,27 @@ pub const STYLESHEET: &str = r#"
   .vl-stat-strip strong { font-size: var(--vl-text-xl); }
   .vl-stat-strip span { color: var(--vl-text-muted); font-size: var(--vl-text-sm); }
 
-  .vl-toolbar { display: flex; gap: var(--vl-space-3); align-items: end; margin-bottom: var(--vl-space-5); }
+  .vl-toolbar { display: flex; gap: var(--vl-space-3); align-items: stretch; margin-bottom: var(--vl-space-5); }
   .vl-toolbar .vl-search { flex: 1 1 20rem; }
   .vl-toolbar > .vl-field:not(.vl-search) { flex: 0 1 12rem; }
+  .vl-toolbar > .vl-button,
+  .vl-toolbar > button { align-self: stretch; }
 
   .vl-data-table { width: 100%; border-collapse: collapse; }
   .vl-data-table th { padding: var(--vl-space-3); color: var(--vl-text-muted); font-size: var(--vl-text-xs); letter-spacing: .08em; text-align: left; text-transform: uppercase; }
   .vl-data-table td { padding: var(--vl-space-3); border-top: 1px solid rgba(255,255,255,.08); vertical-align: middle; }
   .vl-data-table tbody tr:hover { background: rgba(90,167,255,.045); }
-  .vl-table-wrap { min-width: 0; overflow-x: auto; }
+  .vl-table-wrap { min-width: 0; overflow: visible; }
 
   @media (min-width: 45.01rem) {
-    .vl-audit-layout .vl-data-table { table-layout: fixed; }
-    .vl-audit-layout .vl-data-table th:nth-child(1) { width: 9rem; }
-    .vl-audit-layout .vl-data-table th:nth-child(2) { width: 5rem; }
-    .vl-audit-layout .vl-data-table th:nth-child(3) { width: 9rem; }
-    .vl-audit-layout .vl-data-table th:nth-child(4) { width: 4.5rem; }
-    .vl-audit-layout .vl-data-table td:nth-child(3) code { white-space: nowrap; overflow-wrap: normal; word-break: normal; }
-    .vl-audit-layout .vl-data-table td:nth-child(5) { overflow-wrap: anywhere; word-break: break-word; }
+    .vl-audit-table { table-layout: fixed; }
+    .vl-audit-table .vl-audit-time { width: 8rem; }
+    .vl-audit-table .vl-audit-user { width: 10rem; overflow-wrap: anywhere; word-break: break-word; }
+    .vl-audit-table .vl-audit-action { width: 10rem; }
+    .vl-audit-table .vl-audit-object { width: 11rem; overflow-wrap: anywhere; word-break: break-word; }
+    .vl-audit-table .vl-audit-ip { width: 8rem; overflow-wrap: anywhere; }
+    .vl-audit-table .vl-audit-action code { display: inline-block; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+    .vl-audit-table .vl-audit-detail { overflow-wrap: anywhere; word-break: break-word; }
   }
 
   .vl-file-select { display: block; color: var(--vl-text); font-weight: 650; cursor: pointer; }
@@ -840,6 +885,62 @@ pub const STYLESHEET: &str = r#"
   }
   .vl-action-panel > form > button, .vl-action-panel > a { width: 100%; }
   .vl-action-panel details { padding: var(--vl-space-2); border: 1px solid var(--vl-border); border-radius: var(--vl-radius-md); }
+
+  .vl-copy-button { min-width: 6.5rem; }
+
+  .vl-create-folder[open] > summary { display: none; }
+  .vl-create-folder__form {
+    display: grid;
+    grid-template-columns: minmax(22rem, 1fr) auto;
+    gap: var(--vl-space-2);
+    align-items: end;
+  }
+  .vl-create-folder__field {
+    display: grid;
+    grid-template-columns: auto minmax(14rem, 1fr);
+    gap: var(--vl-space-2);
+    align-items: center;
+  }
+  .vl-create-folder__form > .vl-button,
+  .vl-admin-create-form > .vl-button,
+  .vl-browser-head .vl-inline-actions > .vl-button,
+  .vl-browser-head .vl-inline-actions > details > summary {
+    min-height: calc(1.5em + var(--vl-space-6) + 2px);
+  }
+
+  .vl-admin-create-form {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(12rem, 1fr)) auto;
+    gap: var(--vl-space-3);
+    align-items: end;
+  }
+  .vl-admin-create-form > .vl-button { align-self: end; }
+
+  .vl-upload-dialog { position: relative; }
+  .vl-upload-dialog[open]::before {
+    position: fixed;
+    z-index: 29;
+    inset: 0;
+    background: rgba(2, 7, 18, .68);
+    content: "";
+  }
+  .vl-upload-dialog > form {
+    position: fixed;
+    z-index: 30;
+    top: 50%;
+    left: 50%;
+    width: min(32rem, calc(100vw - 2rem));
+    max-height: calc(100vh - 2rem);
+    padding: var(--vl-space-4);
+    overflow: auto;
+    border: 1px solid var(--vl-border-strong);
+    border-radius: var(--vl-radius-lg);
+    background: #0d182d;
+    box-shadow: var(--vl-shadow-overlay);
+    transform: translate(-50%, -50%);
+  }
+  .vl-upload-dialog .vl-upload-dropzone { padding: var(--vl-space-5); }
+  .vl-upload-dialog [data-upload-submit] { width: 100%; }
 
   .vl-pagination { display: flex; flex-wrap: wrap; gap: var(--vl-space-3); align-items: center; justify-content: center; margin-top: var(--vl-space-5); }
   .vl-empty { padding: var(--vl-space-7); text-align: center; }
@@ -890,6 +991,7 @@ pub const STYLESHEET: &str = r#"
   .vl-upload-item { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: var(--vl-space-3); padding: var(--vl-space-3); border: 1px solid var(--vl-border); border-radius: var(--vl-radius-md); }
 
   .vl-audit-layout, .vl-public-share-layout, .vl-create-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(18rem, .8fr); gap: var(--vl-space-5); align-items: start; }
+  .vl-audit-layout { grid-template-columns: minmax(0, 3.4fr) minmax(17rem, .8fr); }
   .vl-create-layout { grid-template-columns: minmax(0, 1.8fr) minmax(19rem, .8fr); }
   .vl-review-card { position: sticky; top: var(--vl-space-4); }
   .vl-security-list { display: grid; margin: 0; }
@@ -899,13 +1001,13 @@ pub const STYLESHEET: &str = r#"
 
 @layer vl-layouts {
   .vl-app-shell { display: grid; grid-template-columns: 15.5rem minmax(0,1fr); min-height: 100vh; }
-  .vl-sidebar { position: sticky; top: 0; display: flex; height: 100vh; flex-direction: column; gap: var(--vl-space-6); padding: var(--vl-space-5); border-right: 1px solid rgba(255,255,255,.08); background: rgba(7,15,29,.96); }
+  .vl-sidebar { position: sticky; top: 0; display: flex; height: 100vh; flex-direction: column; gap: var(--vl-space-6); padding: var(--vl-space-8) var(--vl-space-5) var(--vl-space-5); border-right: 1px solid rgba(255,255,255,.08); background: rgba(7,15,29,.96); }
   .vl-nav { display: grid; gap: var(--vl-space-1); }
   .vl-nav-link { display: flex; min-height: var(--vl-control-height); align-items: center; gap: var(--vl-space-3); padding: var(--vl-space-3); border: 1px solid transparent; border-radius: var(--vl-radius-md); color: var(--vl-text-soft) !important; text-decoration: none; }
   .vl-nav-link:hover, .vl-nav-link[aria-current="page"] { border-color: rgba(90,167,255,.34); background: rgba(90,167,255,.11); color: var(--vl-accent) !important; }
   .vl-system-card { display: grid; gap: var(--vl-space-2); margin-top: auto; padding: var(--vl-space-4); border: 1px solid rgba(85,214,154,.2); border-radius: var(--vl-radius-lg); background: rgba(85,214,154,.06); color: var(--vl-text-muted); font-size: var(--vl-text-sm); overflow-wrap: anywhere; }
   .vl-system-card strong { color: var(--vl-success); }
-  .vl-content { min-width: 0; padding: var(--vl-space-5) var(--vl-space-6) var(--vl-space-7); }
+  .vl-content { min-width: 0; padding: var(--vl-space-8) var(--vl-space-6); }
   .vl-topbar { display: flex; max-width: var(--vl-content-max); justify-content: space-between; gap: var(--vl-space-5); align-items: center; margin: 0 auto var(--vl-space-5); }
   .vl-main { width: min(100%, var(--vl-content-max)); margin: 0 auto; }
   .vl-public-shell { min-height: 100vh; padding: var(--vl-space-7); }
@@ -920,17 +1022,18 @@ pub const STYLESHEET: &str = r#"
   }
   @media (max-width: 60rem) {
     .vl-app-shell { display: block; }
-    .vl-sidebar { position: relative; height: auto; gap: var(--vl-space-4); border-right: 0; border-bottom: 1px solid var(--vl-border); }
+    .vl-sidebar { position: relative; height: auto; gap: var(--vl-space-4); padding: var(--vl-space-6) var(--vl-space-4); border-right: 0; border-bottom: 1px solid var(--vl-border); }
     .vl-nav { display: flex; overflow-x: auto; }
     .vl-nav-link { flex: 0 0 auto; }
     .vl-system-card { display: none; }
-    .vl-content { padding: var(--vl-space-4); }
+    .vl-content { padding: var(--vl-space-6) var(--vl-space-4) var(--vl-space-4); }
     .vl-share-row { grid-template-columns: 1fr 1fr auto; }
     .vl-share-url, .vl-share-quota { grid-column: 1 / 3; }
   }
   @media (max-width: 45rem) {
-    .vl-topbar, .vl-browser-head, .vl-target-card, .vl-selection-bar { align-items: stretch; flex-direction: column; }
+    .vl-topbar, .vl-browser-head, .vl-panel-head, .vl-target-card, .vl-selection-bar { align-items: stretch; flex-direction: column; }
     .vl-topbar-actions, .vl-toolbar { display: grid; grid-template-columns: 1fr; }
+    .vl-create-folder__form, .vl-admin-create-form, .vl-create-folder__field { grid-template-columns: 1fr; }
     .vl-topbar-actions > *, .vl-toolbar > *, .vl-selection-bar > * { width: 100%; }
     .vl-public-shell { padding: var(--vl-space-4); }
     .vl-public-header { align-items: flex-start; flex-direction: column; }
@@ -943,6 +1046,16 @@ pub const STYLESHEET: &str = r#"
     .vl-data-table tr { margin-bottom: var(--vl-space-3); padding: var(--vl-space-3); border: 1px solid var(--vl-border); border-radius: var(--vl-radius-md); }
     .vl-data-table td { display: grid; grid-template-columns: 7rem minmax(0,1fr); gap: var(--vl-space-3); border: 0; }
     .vl-data-table td::before { color: var(--vl-text-muted); content: attr(data-label); font-size: var(--vl-text-xs); font-weight: 700; text-transform: uppercase; }
+    .vl-datetime-popover {
+      position: fixed;
+      top: 50%;
+      right: auto;
+      left: 50%;
+      max-height: calc(100vh - 2rem);
+      overflow: auto;
+      transform: translate(-50%, -50%);
+    }
+    .vl-datetime-popover__grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 30rem) {
     .vl-content, .vl-public-shell { padding: var(--vl-space-3); }
