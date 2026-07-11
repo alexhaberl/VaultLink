@@ -19,7 +19,7 @@ GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sh
 - Security Header: CSP, `X-Content-Type-Options: nosniff`, Frame-Schutz, Referrer-Policy, Permissions-Policy und HSTS nur bei HTTPS.
 - Audit liegt in SQLite und wird strukturiert an journald gespiegelt. Passwörter, TOTP-Secrets, Sessiontokens und Share-Tokens werden nicht geloggt.
 
-Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner. VaultLink ersetzt vorhandene Dateien nur, wenn ein Admin dies für den konkreten Upload-Link erlaubt und der Public-Uploader das Ersetzen beim Upload aktiv bestätigt. Ordnerfreigaben unterstützen begrenzt und inkrementell erzeugte ZIP-Downloads, Suche, Upload in navigierten Unterordnern und Preview bei Downloadrecht. Kleine Standardlimits schützen gepufferte Form-/JSON-Routen; nur Uploadrouten erhalten den großen, weiterhin gestreamten Body-Rahmen. Davor begrenzt ein konstanter Streaming-Guard Multipart-Präambel und jeden Headerblock, ohne Dateiinhalte zu sammeln. Upload-only-Freigaben listen keine Inhalte und erlauben keine Preview/Downloads.
+Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner. VaultLink ersetzt vorhandene Dateien nur, wenn ein Admin dies für den konkreten Upload-Link erlaubt und der Public-Uploader das Ersetzen beim Upload aktiv bestätigt. Ordnerfreigaben unterstützen begrenzt und inkrementell im ZIP64-Format erzeugte ZIP-Downloads, Suche, Upload in navigierten Unterordnern und Preview bei Downloadrecht. Kleine Standardlimits schützen gepufferte Form-/JSON-Routen; nur Uploadrouten erhalten den großen, weiterhin gestreamten Body-Rahmen. Davor begrenzt ein konstanter Streaming-Guard Multipart-Präambel und jeden Headerblock, ohne Dateiinhalte zu sammeln. Upload-only-Freigaben listen keine Inhalte und erlauben keine Preview/Downloads.
 
 ## 2. Projektstruktur
 
@@ -84,6 +84,8 @@ Startregeln:
 Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadlimit, blockierte Endungen, Share-Passwortpolitik, Unlock-Dauer, ZIP-/Search-/Text-/Media-Preview-Limits, Text-/Bild-Preview-Endungen und PDF-Preview-Status. Servermodus, Bind-Adresse, TLS-Pfade, Trusted Proxies, Root-Mount, Data-Dir und ACME-Modus bleiben file-/restart-basiert.
 
 Runtime-Settings werden als ein validierter Snapshot in SQLite geschrieben und erst danach atomar im Arbeitsspeicher ausgetauscht. Beim Start wird ebenfalls der vollständige Snapshot validiert; gültige gekoppelte Werte hängen nicht von der alphabetischen Schlüsselreihenfolge ab.
+
+ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenzt weiterhin die Summe der Quelldaten; `max_zip_files` und das auch für rohe ZIP-Scans geltende `max_search_entries` bleiben unabhängig davon aktiv.
 
 ## 5. Routen- und API-Design
 

@@ -7,6 +7,7 @@
 - Added UTC monthly transfer statistics for downloads, ZIP downloads, and previews, plus opt-in trusted-proxy-aware audit IP storage, display, and confirmed deletion.
 - Added hardened admin uploads, richer audit details, improved setup mode/TLS field switching and filesystem pickers, and same-process transition from setup into the configured server mode.
 - Corrected admin table, action-menu, date/time-picker, preview, form alignment, spacing, and long-value rendering issues found during visual QA.
+- Simplified ZIP generation to always stream full ZIP64 records for every entry and archive while retaining the configured ZIP size, file-count, and scan limits.
 
 ## 0.3.2 — 2026-07-10
 

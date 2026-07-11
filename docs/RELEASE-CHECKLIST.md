@@ -21,7 +21,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink; Default bleibt No-Replace und Public-Uploader müssen Replace pro Upload bestätigen.
 - [x] Upload in navigierten Unterordnern für `download_upload`-Ordnerlinks.
 - [x] Upload-only-Freigaben listen keine Ordnerinhalte und erlauben keine Preview/Downloads.
-- [x] Inkrementeller ZIP-Download für Ordnerfreigaben mit Datei-, Scan- und Größenlimits, gecappten Quelldateien, Temp-Budget und backpressured Direct-Stream-Fallback.
+- [x] Inkrementeller ZIP-Download für Ordnerfreigaben mit durchgehendem ZIP64, Datei-, Scan- und Größenlimits, gecappten Quelldateien, Temp-Budget und backpressured Direct-Stream-Fallback.
 - [x] Begrenzte case-insensitive Dateinamensuche; Listing, Suche und ZIP zählen auch gefilterte rohe Verzeichniseinträge und setzen Scans ohne Offset-Rescan fort.
 - [x] Sichere Browser-Textvorschau für allowlistete Endungen; escaped HTML in `<pre>`, kein Inline-User-MIME.
 - [x] Sichere Browser-Vorschau für allowlistete Rasterbilder und PDFs über Raw-Preview-Routen mit `inline`, `nosniff`, `HEAD`, `206` und `416`.
@@ -47,7 +47,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - API-Tokens oder externe API-Clients als stabile Public Contract Garantie.
 - Inline-Preview für alle anderen Dateitypen.
 - Built-in ACME hinter Nginx/Caddy; Auto-TLS ist ausschließlich für echten Standalone-Port-443-Betrieb.
-- Unbegrenzte ZIPs, ZIP64 und Kompression; ZIP wird inkrementell erzeugt, bleibt aber hart limitiert und wird bei Überschreitung abgelehnt.
+- Unbegrenzte ZIPs und Kompression; das durchgehend verwendete ZIP64-Format ändert nichts an den konfigurierten Datei-, Scan- und Größenlimits.
 - Admin-Löschen; Admins können deaktiviert/reaktiviert werden.
 
 ## Lokal in dieser Arbeitskopie grün

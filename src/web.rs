@@ -2319,6 +2319,22 @@ fn search_tree<D: DirectoryAccess>(
 const ZIP_CHUNK_SIZE: usize = 64 * 1024;
 const ZIP_CHANNEL_CHUNKS: usize = 8;
 const ZIP_TEMP_MIN_RESERVE: u64 = 64 * 1024 * 1024;
+const ZIP64_VERSION: u16 = 45;
+const ZIP_LOCAL_HEADER_SIZE: u64 = 30;
+const ZIP_CENTRAL_HEADER_SIZE: u64 = 46;
+const ZIP64_DATA_DESCRIPTOR_SIZE: u64 = 24;
+const ZIP64_LOCAL_EXTRA_SIZE: u64 = 20;
+const ZIP64_CENTRAL_EXTRA_SIZE: u64 = 28;
+const ZIP64_EXTRA_PAYLOAD_SIZE: u16 = 24;
+const ZIP64_SIZE_FIELDS_SIZE: u16 = 16;
+const ZIP_EOCD_SIZE: u64 = 22;
+const ZIP64_END_RECORDS_SIZE: u64 = 76;
+const ZIP64_ENTRY_FIXED_SIZE: u64 = ZIP_LOCAL_HEADER_SIZE
+    + ZIP64_LOCAL_EXTRA_SIZE
+    + ZIP64_DATA_DESCRIPTOR_SIZE
+    + ZIP_CENTRAL_HEADER_SIZE
+    + ZIP64_CENTRAL_EXTRA_SIZE;
+const ZIP64_ARCHIVE_END_SIZE: u64 = ZIP_EOCD_SIZE + ZIP64_END_RECORDS_SIZE;
 static ZIP_TEMP_RESERVED: AtomicU64 = AtomicU64::new(0);
 
 struct ZipTempReservation {
@@ -2392,6 +2408,23 @@ struct ZipPlan {
     estimated_archive_size: u64,
 }
 
+fn estimate_zip_archive_size(files: &[ZipFilePlan]) -> std::result::Result<u64, ZipBuildError> {
+    let mut archive_size = ZIP64_ARCHIVE_END_SIZE;
+    for file in files {
+        let name_len = u64::try_from(file.archive_name.len())
+            .map_err(|_| ZipBuildError::Limit("zip entry name is too long"))?;
+        let names_size = name_len
+            .checked_mul(2)
+            .ok_or(ZipBuildError::Limit("zip archive size overflow"))?;
+        archive_size = archive_size
+            .checked_add(file.scanned_len)
+            .and_then(|size| size.checked_add(ZIP64_ENTRY_FIXED_SIZE))
+            .and_then(|size| size.checked_add(names_size))
+            .ok_or(ZipBuildError::Limit("zip archive size overflow"))?;
+    }
+    Ok(archive_size)
+}
+
 fn plan_zip<D: DirectoryAccess>(
     directory: &D,
     root_path: &str,
@@ -2401,7 +2434,6 @@ fn plan_zip<D: DirectoryAccess>(
     let mut files = Vec::new();
     let mut scanned_entries = 0usize;
     let mut total_data = 0u64;
-    let mut estimated_archive_size = 22u64;
     while let Some((current_directory, archive_prefix)) = queue.pop_front() {
         let mut scan = directory
             .scan_entries(&current_directory)
@@ -2434,7 +2466,7 @@ fn plan_zip<D: DirectoryAccess>(
                     archive_name: archive_name.clone(),
                     scanned_len: entry.len,
                 });
-                if files.len() > settings.max_zip_files || files.len() > u16::MAX as usize {
+                if files.len() > settings.max_zip_files {
                     return Err(ZipBuildError::Limit("zip file count limit exceeded"));
                 }
                 total_data = total_data
@@ -2443,20 +2475,13 @@ fn plan_zip<D: DirectoryAccess>(
                 if total_data > settings.max_zip_size {
                     return Err(ZipBuildError::Limit("zip size limit exceeded"));
                 }
-                let name_len = archive_name.len() as u64;
-                estimated_archive_size = estimated_archive_size
-                    .checked_add(entry.len)
-                    .and_then(|size| size.checked_add(30 + name_len + 16 + 46 + name_len))
-                    .ok_or(ZipBuildError::Limit("zip archive size overflow"))?;
-                if estimated_archive_size > u32::MAX as u64 {
-                    return Err(ZipBuildError::Limit("ZIP64 archives are not supported"));
-                }
             }
             if batch.complete {
                 break;
             }
         }
     }
+    let estimated_archive_size = estimate_zip_archive_size(&files)?;
     Ok(ZipPlan {
         files,
         max_data_size: settings.max_zip_size,
@@ -2482,7 +2507,10 @@ impl<W> CountingWriter<W> {
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let written = self.inner.write(buffer)?;
-        self.written = self.written.saturating_add(written as u64);
+        self.written = self
+            .written
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "zip size overflow"))?;
         Ok(written)
     }
 
@@ -2494,8 +2522,8 @@ impl<W: Write> Write for CountingWriter<W> {
 struct StreamingZipEntry {
     name: String,
     crc: u32,
-    size: u32,
-    local_offset: u32,
+    size: u64,
+    local_offset: u64,
 }
 
 fn write_zip_u16(writer: &mut impl Write, value: u16) -> io::Result<()> {
@@ -2506,26 +2534,36 @@ fn write_zip_u32(writer: &mut impl Write, value: u32) -> io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
 
+fn write_zip_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
 fn write_streaming_local_header(writer: &mut impl Write, name: &[u8]) -> io::Result<()> {
     write_zip_u32(writer, 0x0403_4b50)?;
-    write_zip_u16(writer, 20)?;
+    write_zip_u16(writer, ZIP64_VERSION)?;
     write_zip_u16(writer, 0x0808)?;
     write_zip_u16(writer, 0)?;
     write_zip_u16(writer, 0)?;
     write_zip_u16(writer, 33)?;
     write_zip_u32(writer, 0)?;
-    write_zip_u32(writer, 0)?;
-    write_zip_u32(writer, 0)?;
+    write_zip_u32(writer, u32::MAX)?;
+    write_zip_u32(writer, u32::MAX)?;
     write_zip_u16(writer, name.len() as u16)?;
-    write_zip_u16(writer, 0)?;
-    writer.write_all(name)
+    write_zip_u16(writer, ZIP64_LOCAL_EXTRA_SIZE as u16)?;
+    writer.write_all(name)?;
+    // Bit 3 makes the descriptor authoritative; zero placeholders announce its 64-bit width.
+    write_zip_u16(writer, 0x0001)?;
+    write_zip_u16(writer, ZIP64_SIZE_FIELDS_SIZE)?;
+    write_zip_u64(writer, 0)?;
+    write_zip_u64(writer, 0)?;
+    Ok(())
 }
 
-fn write_streaming_descriptor(writer: &mut impl Write, crc: u32, size: u32) -> io::Result<()> {
+fn write_streaming_descriptor(writer: &mut impl Write, crc: u32, size: u64) -> io::Result<()> {
     write_zip_u32(writer, 0x0807_4b50)?;
     write_zip_u32(writer, crc)?;
-    write_zip_u32(writer, size)?;
-    write_zip_u32(writer, size)
+    write_zip_u64(writer, size)?;
+    write_zip_u64(writer, size)
 }
 
 fn write_streaming_central_entry(
@@ -2534,39 +2572,68 @@ fn write_streaming_central_entry(
 ) -> io::Result<()> {
     let name = entry.name.as_bytes();
     write_zip_u32(writer, 0x0201_4b50)?;
-    write_zip_u16(writer, 20)?;
-    write_zip_u16(writer, 20)?;
+    write_zip_u16(writer, ZIP64_VERSION)?;
+    write_zip_u16(writer, ZIP64_VERSION)?;
     write_zip_u16(writer, 0x0808)?;
     write_zip_u16(writer, 0)?;
     write_zip_u16(writer, 0)?;
     write_zip_u16(writer, 33)?;
     write_zip_u32(writer, entry.crc)?;
-    write_zip_u32(writer, entry.size)?;
-    write_zip_u32(writer, entry.size)?;
+    write_zip_u32(writer, u32::MAX)?;
+    write_zip_u32(writer, u32::MAX)?;
     write_zip_u16(writer, name.len() as u16)?;
-    write_zip_u16(writer, 0)?;
+    write_zip_u16(writer, ZIP64_CENTRAL_EXTRA_SIZE as u16)?;
     write_zip_u16(writer, 0)?;
     write_zip_u16(writer, 0)?;
     write_zip_u16(writer, 0)?;
     write_zip_u32(writer, 0)?;
-    write_zip_u32(writer, entry.local_offset)?;
-    writer.write_all(name)
+    write_zip_u32(writer, u32::MAX)?;
+    writer.write_all(name)?;
+    write_zip_u16(writer, 0x0001)?;
+    write_zip_u16(writer, ZIP64_EXTRA_PAYLOAD_SIZE)?;
+    write_zip_u64(writer, entry.size)?;
+    write_zip_u64(writer, entry.size)?;
+    write_zip_u64(writer, entry.local_offset)?;
+    Ok(())
 }
 
-fn write_streaming_eocd(
-    writer: &mut impl Write,
-    entries: u16,
-    central_size: u32,
-    central_offset: u32,
-) -> io::Result<()> {
+fn write_streaming_eocd(writer: &mut impl Write) -> io::Result<()> {
     write_zip_u32(writer, 0x0605_4b50)?;
     write_zip_u16(writer, 0)?;
     write_zip_u16(writer, 0)?;
-    write_zip_u16(writer, entries)?;
-    write_zip_u16(writer, entries)?;
-    write_zip_u32(writer, central_size)?;
-    write_zip_u32(writer, central_offset)?;
+    write_zip_u16(writer, u16::MAX)?;
+    write_zip_u16(writer, u16::MAX)?;
+    write_zip_u32(writer, u32::MAX)?;
+    write_zip_u32(writer, u32::MAX)?;
     write_zip_u16(writer, 0)
+}
+
+fn write_streaming_zip64_eocd(
+    writer: &mut impl Write,
+    entries: u64,
+    central_size: u64,
+    central_offset: u64,
+) -> io::Result<()> {
+    write_zip_u32(writer, 0x0606_4b50)?;
+    write_zip_u64(writer, 44)?;
+    write_zip_u16(writer, ZIP64_VERSION)?;
+    write_zip_u16(writer, ZIP64_VERSION)?;
+    write_zip_u32(writer, 0)?;
+    write_zip_u32(writer, 0)?;
+    write_zip_u64(writer, entries)?;
+    write_zip_u64(writer, entries)?;
+    write_zip_u64(writer, central_size)?;
+    write_zip_u64(writer, central_offset)
+}
+
+fn write_streaming_zip64_locator(
+    writer: &mut impl Write,
+    zip64_eocd_offset: u64,
+) -> io::Result<()> {
+    write_zip_u32(writer, 0x0706_4b50)?;
+    write_zip_u32(writer, 0)?;
+    write_zip_u64(writer, zip64_eocd_offset)?;
+    write_zip_u32(writer, 1)
 }
 
 fn update_crc32(mut crc: u32, bytes: &[u8]) -> u32 {
@@ -2590,8 +2657,7 @@ fn write_zip_archive<D: DirectoryAccess, W: Write>(
     let mut total_data = 0u64;
     let mut buffer = vec![0u8; ZIP_CHUNK_SIZE];
     for planned in &plan.files {
-        let local_offset = u32::try_from(writer.written)
-            .map_err(|_| ZipBuildError::Limit("ZIP64 archives are not supported"))?;
+        let local_offset = writer.written;
         write_streaming_local_header(&mut writer, planned.archive_name.as_bytes())
             .map_err(ZipBuildError::Output)?;
         let mut source = directory
@@ -2609,8 +2675,12 @@ fn write_zip_archive<D: DirectoryAccess, W: Write>(
                 break;
             }
             remaining -= read as u64;
-            size = size.saturating_add(read as u64);
-            total_data = total_data.saturating_add(read as u64);
+            size = size
+                .checked_add(read as u64)
+                .ok_or(ZipBuildError::Limit("zip size overflow"))?;
+            total_data = total_data
+                .checked_add(read as u64)
+                .ok_or(ZipBuildError::Limit("zip size overflow"))?;
             if total_data > plan.max_data_size {
                 return Err(ZipBuildError::Limit("zip size limit exceeded"));
             }
@@ -2619,8 +2689,6 @@ fn write_zip_archive<D: DirectoryAccess, W: Write>(
                 .write_all(&buffer[..read])
                 .map_err(ZipBuildError::Output)?;
         }
-        let size = u32::try_from(size)
-            .map_err(|_| ZipBuildError::Limit("ZIP64 entries are not supported"))?;
         let crc = !crc;
         write_streaming_descriptor(&mut writer, crc, size).map_err(ZipBuildError::Output)?;
         central_entries.push(StreamingZipEntry {
@@ -2630,23 +2698,21 @@ fn write_zip_archive<D: DirectoryAccess, W: Write>(
             local_offset,
         });
     }
-    let central_offset = u32::try_from(writer.written)
-        .map_err(|_| ZipBuildError::Limit("ZIP64 archives are not supported"))?;
+    let central_offset = writer.written;
     for entry in &central_entries {
         write_streaming_central_entry(&mut writer, entry).map_err(ZipBuildError::Output)?;
     }
-    let central_end = u32::try_from(writer.written)
-        .map_err(|_| ZipBuildError::Limit("ZIP64 archives are not supported"))?;
+    let central_end = writer.written;
     let central_size = central_end
         .checked_sub(central_offset)
         .ok_or(ZipBuildError::Limit("zip central directory overflow"))?;
-    write_streaming_eocd(
-        &mut writer,
-        central_entries.len() as u16,
-        central_size,
-        central_offset,
-    )
-    .map_err(ZipBuildError::Output)?;
+    let entries = u64::try_from(central_entries.len())
+        .map_err(|_| ZipBuildError::Limit("zip file count overflow"))?;
+    let zip64_eocd_offset = writer.written;
+    write_streaming_zip64_eocd(&mut writer, entries, central_size, central_offset)
+        .map_err(ZipBuildError::Output)?;
+    write_streaming_zip64_locator(&mut writer, zip64_eocd_offset).map_err(ZipBuildError::Output)?;
+    write_streaming_eocd(&mut writer).map_err(ZipBuildError::Output)?;
     writer.flush().map_err(ZipBuildError::Output)?;
     Ok(writer.into_inner())
 }
@@ -5985,6 +6051,18 @@ mod tests {
         request
     }
 
+    fn zip_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn zip_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn zip_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
     #[test]
     fn public_preview_back_link_returns_share_parent() {
         assert_eq!(public_back_link("/v/tok", "file.txt", false), "/v/tok");
@@ -6004,6 +6082,186 @@ mod tests {
         assert!(storage_full_error(&std::io::Error::from_raw_os_error(28)));
         assert!(storage_full_error(&std::io::Error::from_raw_os_error(122)));
         assert!(!storage_full_error(&std::io::Error::from_raw_os_error(13)));
+    }
+
+    #[test]
+    fn every_zip_archive_uses_full_zip64_records() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/tiny.bin"), b"abc").unwrap();
+        let state = test_state(root.path(), data.path());
+        let scope = state.secure_root.bind_directory("docs").unwrap();
+        let files = vec![ZipFilePlan {
+            source_path: "tiny.bin".into(),
+            archive_name: "tiny.bin".into(),
+            scanned_len: 3,
+        }];
+        let plan = ZipPlan {
+            estimated_archive_size: estimate_zip_archive_size(&files).unwrap(),
+            files,
+            max_data_size: 3,
+        };
+
+        let archive = write_zip_archive(&scope, &plan, Vec::new()).unwrap();
+        assert_eq!(archive.len() as u64, plan.estimated_archive_size);
+        assert_eq!(archive.len(), 265);
+
+        assert_eq!(zip_u32(&archive, 0), 0x0403_4b50);
+        assert_eq!(zip_u16(&archive, 4), ZIP64_VERSION);
+        assert_eq!(zip_u16(&archive, 6), 0x0808);
+        assert_eq!(zip_u32(&archive, 18), u32::MAX);
+        assert_eq!(zip_u32(&archive, 22), u32::MAX);
+        assert_eq!(zip_u16(&archive, 26), 8);
+        assert_eq!(zip_u16(&archive, 28), ZIP64_LOCAL_EXTRA_SIZE as u16);
+        assert_eq!(&archive[30..38], b"tiny.bin");
+        assert_eq!(zip_u16(&archive, 38), 0x0001);
+        assert_eq!(zip_u16(&archive, 40), ZIP64_SIZE_FIELDS_SIZE);
+        assert_eq!(zip_u64(&archive, 42), 0);
+        assert_eq!(zip_u64(&archive, 50), 0);
+        assert_eq!(&archive[58..61], b"abc");
+
+        assert_eq!(zip_u32(&archive, 61), 0x0807_4b50);
+        assert_eq!(zip_u32(&archive, 65), 0x3524_41c2);
+        assert_eq!(zip_u64(&archive, 69), 3);
+        assert_eq!(zip_u64(&archive, 77), 3);
+
+        assert_eq!(zip_u32(&archive, 85), 0x0201_4b50);
+        assert_eq!(zip_u16(&archive, 89), ZIP64_VERSION);
+        assert_eq!(zip_u16(&archive, 91), ZIP64_VERSION);
+        assert_eq!(zip_u32(&archive, 105), u32::MAX);
+        assert_eq!(zip_u32(&archive, 109), u32::MAX);
+        assert_eq!(zip_u16(&archive, 115), ZIP64_CENTRAL_EXTRA_SIZE as u16);
+        assert_eq!(zip_u32(&archive, 127), u32::MAX);
+        assert_eq!(&archive[131..139], b"tiny.bin");
+        assert_eq!(zip_u16(&archive, 139), 0x0001);
+        assert_eq!(zip_u16(&archive, 141), ZIP64_EXTRA_PAYLOAD_SIZE);
+        assert_eq!(zip_u64(&archive, 143), 3);
+        assert_eq!(zip_u64(&archive, 151), 3);
+        assert_eq!(zip_u64(&archive, 159), 0);
+
+        assert_eq!(zip_u32(&archive, 167), 0x0606_4b50);
+        assert_eq!(zip_u64(&archive, 171), 44);
+        assert_eq!(zip_u16(&archive, 179), ZIP64_VERSION);
+        assert_eq!(zip_u16(&archive, 181), ZIP64_VERSION);
+        assert_eq!(zip_u64(&archive, 191), 1);
+        assert_eq!(zip_u64(&archive, 199), 1);
+        assert_eq!(zip_u64(&archive, 207), 82);
+        assert_eq!(zip_u64(&archive, 215), 85);
+        assert_eq!(zip_u32(&archive, 223), 0x0706_4b50);
+        assert_eq!(zip_u64(&archive, 231), 167);
+        assert_eq!(zip_u32(&archive, 239), 1);
+        assert_eq!(zip_u32(&archive, 243), 0x0605_4b50);
+        assert_eq!(zip_u16(&archive, 251), u16::MAX);
+        assert_eq!(zip_u16(&archive, 253), u16::MAX);
+        assert_eq!(zip_u32(&archive, 255), u32::MAX);
+        assert_eq!(zip_u32(&archive, 259), u32::MAX);
+
+        let empty_files = Vec::<ZipFilePlan>::new();
+        let empty_plan = ZipPlan {
+            estimated_archive_size: estimate_zip_archive_size(&empty_files).unwrap(),
+            files: empty_files,
+            max_data_size: 0,
+        };
+        let empty_archive = write_zip_archive(&scope, &empty_plan, Vec::new()).unwrap();
+        assert_eq!(empty_archive.len(), 98);
+        assert_eq!(zip_u32(&empty_archive, 0), 0x0606_4b50);
+        assert_eq!(zip_u64(&empty_archive, 24), 0);
+        assert_eq!(zip_u32(&empty_archive, 56), 0x0706_4b50);
+        assert_eq!(zip_u32(&empty_archive, 76), 0x0605_4b50);
+    }
+
+    #[test]
+    fn every_central_entry_uses_zip64_sizes_and_offset() {
+        let mut central = Vec::new();
+        write_streaming_central_entry(
+            &mut central,
+            &StreamingZipEntry {
+                name: "x".into(),
+                crc: 7,
+                size: 9,
+                local_offset: 11,
+            },
+        )
+        .unwrap();
+        assert_eq!(central.len(), 75);
+        assert_eq!(zip_u16(&central, 4), ZIP64_VERSION);
+        assert_eq!(zip_u32(&central, 20), u32::MAX);
+        assert_eq!(zip_u32(&central, 24), u32::MAX);
+        assert_eq!(zip_u16(&central, 30), ZIP64_CENTRAL_EXTRA_SIZE as u16);
+        assert_eq!(zip_u32(&central, 42), u32::MAX);
+        assert_eq!(&central[46..47], b"x");
+        assert_eq!(zip_u16(&central, 47), 0x0001);
+        assert_eq!(zip_u16(&central, 49), ZIP64_EXTRA_PAYLOAD_SIZE);
+        assert_eq!(zip_u64(&central, 51), 9);
+        assert_eq!(zip_u64(&central, 59), 9);
+        assert_eq!(zip_u64(&central, 67), 11);
+    }
+
+    #[test]
+    fn zip64_end_records_preserve_64_bit_directory_values() {
+        let entries = u16::MAX as u64;
+        let central_size = u32::MAX as u64 + 3;
+        let central_offset = u32::MAX as u64 + 9;
+        let zip64_eocd_offset = 0x2_0000_0042;
+        let mut records = Vec::new();
+        write_streaming_zip64_eocd(&mut records, entries, central_size, central_offset).unwrap();
+        write_streaming_zip64_locator(&mut records, zip64_eocd_offset).unwrap();
+        write_streaming_eocd(&mut records).unwrap();
+
+        assert_eq!(records.len(), 98);
+        assert_eq!(zip_u32(&records, 0), 0x0606_4b50);
+        assert_eq!(zip_u64(&records, 4), 44);
+        assert_eq!(zip_u16(&records, 12), ZIP64_VERSION);
+        assert_eq!(zip_u16(&records, 14), ZIP64_VERSION);
+        assert_eq!(zip_u64(&records, 24), entries);
+        assert_eq!(zip_u64(&records, 32), entries);
+        assert_eq!(zip_u64(&records, 40), central_size);
+        assert_eq!(zip_u64(&records, 48), central_offset);
+        assert_eq!(zip_u32(&records, 56), 0x0706_4b50);
+        assert_eq!(zip_u64(&records, 64), zip64_eocd_offset);
+        assert_eq!(zip_u32(&records, 72), 1);
+        assert_eq!(zip_u32(&records, 76), 0x0605_4b50);
+        assert_eq!(zip_u16(&records, 84), u16::MAX);
+        assert_eq!(zip_u16(&records, 86), u16::MAX);
+        assert_eq!(zip_u32(&records, 88), u32::MAX);
+        assert_eq!(zip_u32(&records, 92), u32::MAX);
+    }
+
+    #[test]
+    fn always_zip64_estimate_is_fixed_and_rejects_u64_overflow() {
+        assert_eq!(estimate_zip_archive_size(&[]).unwrap(), 98);
+
+        let tiny_file = ZipFilePlan {
+            source_path: "tiny.bin".into(),
+            archive_name: "tiny.bin".into(),
+            scanned_len: 3,
+        };
+        assert_eq!(estimate_zip_archive_size(&[tiny_file]).unwrap(), 265);
+
+        let multiple_files = [
+            ZipFilePlan {
+                source_path: "first".into(),
+                archive_name: "x".into(),
+                scanned_len: 0,
+            },
+            ZipFilePlan {
+                source_path: "second".into(),
+                archive_name: "long".into(),
+                scanned_len: 10,
+            },
+        ];
+        assert_eq!(estimate_zip_archive_size(&multiple_files).unwrap(), 414);
+
+        let overflowing_file = ZipFilePlan {
+            source_path: "overflow.bin".into(),
+            archive_name: "overflow.bin".into(),
+            scanned_len: u64::MAX,
+        };
+        assert!(matches!(
+            estimate_zip_archive_size(&[overflowing_file]),
+            Err(ZipBuildError::Limit("zip archive size overflow"))
+        ));
     }
 
     #[tokio::test]
@@ -6098,6 +6356,7 @@ mod tests {
         let scope = state.secure_root.bind_directory("docs").unwrap();
         let settings = runtime_settings(&state);
         let plan = plan_zip(&scope, "", &settings).unwrap();
+        let estimated_archive_size = plan.estimated_archive_size;
 
         const GROWN_MARKER: &[u8] = b"-must-not-enter-the-archive";
         use std::io::Write as _;
@@ -6119,8 +6378,14 @@ mod tests {
         }
 
         assert_eq!(direct_bytes, temp_bytes);
+        assert_eq!(temp_bytes.len() as u64, estimated_archive_size);
         assert!(temp_bytes.starts_with(b"PK\x03\x04"));
-        assert!(temp_bytes.ends_with(b"PK\x05\x06\0\0\0\0\x01\0\x01\0\x36\0\0\0\x3b\0\0\0\0\0"));
+        let eocd = temp_bytes.len() - ZIP_EOCD_SIZE as usize;
+        assert_eq!(zip_u32(&temp_bytes, eocd), 0x0605_4b50);
+        assert_eq!(zip_u16(&temp_bytes, eocd + 8), u16::MAX);
+        assert_eq!(zip_u16(&temp_bytes, eocd + 10), u16::MAX);
+        assert_eq!(zip_u32(&temp_bytes, eocd + 12), u32::MAX);
+        assert_eq!(zip_u32(&temp_bytes, eocd + 16), u32::MAX);
         assert!(!temp_bytes
             .windows(GROWN_MARKER.len())
             .any(|window| window == GROWN_MARKER));
