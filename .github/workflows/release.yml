@@ -22,6 +22,11 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates build-essential pkg-config libssl-dev clang git gh minisign xz-utils shellcheck
+      - name: Restore host workspace ownership before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
@@ -119,3 +124,9 @@ jobs:
             dist/vaultlink.cdx.json
             dist/SHA256SUMS
           if-no-files-found: error
+      - name: Restore host workspace ownership
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
