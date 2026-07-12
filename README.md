@@ -12,7 +12,7 @@ GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sh
 - Relative Nutzpfade werden nach genau einer HTTP-Dekodierung geprüft und verbieten absolute Pfade, `..`, Backslashes und NUL. Uploadnamen folgen zusätzlich einer plattformübergreifenden Policy, damit Windows-Prefixe und reservierte Namen nie aus dem Zielordner aufgelöst werden.
 - Uploads werden als zufällige `0600`-Temporärdateien im Zielordner geschrieben, geflusht und per `fsync` gesichert. Default ist atomarer No-Replace-Publish mit `renameat2(RENAME_NOREPLACE)`; optional kann pro Upload-Ordnerlink ein explizit bestätigtes atomisches Ersetzen erlaubt werden.
 - Abgebrochene private Uploadfragmente werden in fortsetzbaren Hintergrund-Batches entfernt; eine synchronisierte Active-Registry verhindert dabei Kollisionen mit Uploads des laufenden Prozesses. Listing, Suche und ZIP budgetieren jedes rohe Verzeichniselement, auch wenn es später als intern oder unsicher gefiltert wird.
-- Adminpasswörter verwenden Argon2id. Nach dem Passwort ist TOTP zwingend. Sessions sind zufällige serverseitige Bearer-Tokens, deren Hash in SQLite liegt.
+- Adminpasswörter verwenden Argon2id. Nach dem Passwort ist TOTP oder ein registrierter WebAuthn/FIDO2-Sicherheitsschlüssel (zum Beispiel YubiKey) erforderlich. Sessions sind zufällige serverseitige Bearer-Tokens, deren Hash in SQLite liegt.
 - Cookies sind `HttpOnly`, `SameSite=Strict` und in Production `Secure`.
 - Mutierende Adminaktionen verlangen CSRF. Login und Share-Unlock sind rate-limitiert.
 - Forwarded-Header werden nur im Reverse-Proxy-Modus und nur von `trusted_proxies` akzeptiert.
@@ -96,7 +96,8 @@ ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenz
 | `/admin` | GET | Root-begrenzter Dateibrowser |
 | `/admin/account` | GET | aktuellen Benutzer und eigene Credential-Aktionen anzeigen |
 | `/admin/account/password` | POST | eigenes Passwort nach erneuter Passwortprüfung ändern |
-| `/admin/account/mfa/start`, `/admin/account/mfa/confirm` | POST | MFA-Wechsel beginnen und mit dem neuen TOTP-Code bestätigen |
+| `/admin/account/mfa/start`, `/admin/account/mfa/confirm` | POST | TOTP-Wechsel beginnen und mit dem neuen Code bestätigen |
+| `/admin/account/security-keys/register/start`, `/admin/account/security-keys/register/finish` | POST | WebAuthn/FIDO2-Sicherheitsschlüssel registrieren |
 | `/admin/preview` | GET | Admin-Preview-Seite |
 | `/admin/preview/raw` | GET/HEAD | Raw-Bild/PDF-Preview für Admins |
 | `/admin/shares` | GET/POST | Links auflisten/erstellen |
@@ -153,7 +154,9 @@ Interne absolute Pfade, Passwort-Hashes, Session-Hashes, Unlock-/Preview-/Transf
 
 ## 6. UI und UX
 
-Die Admin-UI bietet Login, MFA, Dateibrowser, Linkverwaltung, Admin-Anlage, Einstellungen, Audit und „Mein Konto“. Dort kann der angemeldete Benutzer nach erneuter Passwortprüfung das eigene Passwort ändern oder MFA zweistufig ersetzen. Das bisherige TOTP-Secret bleibt gültig, bis ein Code des neuen Authenticators erfolgreich bestätigt wurde; danach werden alle Sessions beendet.
+Die Admin-UI bietet Login, MFA, Dateibrowser, Linkverwaltung, Admin-Anlage, Einstellungen, Audit und „Mein Konto“. Dort kann der angemeldete Benutzer nach erneuter Passwortprüfung das eigene Passwort ändern, TOTP zweistufig ersetzen und mehrere WebAuthn/FIDO2-Sicherheitsschlüssel registrieren. Hardware-MFA wird erst ab zwei registrierten Schlüsseln aktiviert; der Bestand darf nicht von zwei auf einen reduziert werden. TOTP und der lokale SSH-Recovery-Pfad bleiben als Wiederherstellung verfügbar.
+
+WebAuthn-Credentials sind fest an RP-ID und Browser-Origin gebunden. Die Registrierung muss deshalb über die endgültige öffentliche HTTPS-URL erfolgen. Der Setup-Tunnel auf `127.0.0.1:8090` ist nur für Bootstrap/TOTP gedacht und kann keinen Schlüssel für die spätere öffentliche Domain registrieren. Die WebAuthn-Origin wird beim Prozessstart aus `server.public_base_url` übernommen; eine Änderung der Domain erfordert die erneute Registrierung aller Sicherheitsschlüssel.
 
 Setup, Login, Admin- und Public-Seiten sind auf Deutsch und Englisch verfügbar. Eine explizite Auswahl im `vaultlink_locale`-Cookie hat Vorrang vor `Accept-Language`; für unbekannte oder fehlende Browser-Sprachen ist Englisch der Fallback. Dynamische Benutzernamen, Dateinamen, Aliase und Auditwerte werden dabei nicht übersetzt.
 
@@ -252,7 +255,7 @@ Der Hook installiert PEMs nach `/etc/vaultlink/tls/` mit `root:vaultlink 0640` u
 ## 8. Debian-Deployment
 
 ```sh
-sudo apt update && sudo apt install -y build-essential coreutils curl pkg-config sqlite3 util-linux
+sudo apt update && sudo apt install -y build-essential coreutils curl libssl-dev pkg-config sqlite3 util-linux
 cargo build --release --locked
 
 sudo useradd --system --home /var/lib/vaultlink --shell /usr/sbin/nologin vaultlink
@@ -357,7 +360,7 @@ Firewall: bei Reverse Proxy nur 80/443 für Caddy/Nginx öffnen und VaultLink au
 ## 9. WSL-Entwicklung
 
 ```sh
-sudo apt update && sudo apt install -y build-essential coreutils curl pkg-config sqlite3 util-linux
+sudo apt update && sudo apt install -y build-essential coreutils curl libssl-dev pkg-config sqlite3 util-linux
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 make dev-setup

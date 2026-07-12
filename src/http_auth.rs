@@ -117,6 +117,19 @@ pub async fn commit_runtime_settings(
 ) -> Result<()> {
     next.validate_for_config(&state.config)
         .map_err(|_| HttpAuthError::status(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
+    let public_url_changed = runtime_settings(state).public_base_url != next.public_base_url;
+    if public_url_changed {
+        let credential_count = database(state.db.clone(), |database| {
+            database.webauthn_credential_count()
+        })
+        .await?;
+        if credential_count > 0 {
+            return Err(HttpAuthError::status(
+                StatusCode::CONFLICT,
+                "Public Base URL kann mit registrierten Sicherheitsschlüsseln nicht geändert werden",
+            ));
+        }
+    }
     let runtime = state.runtime.clone();
     database(state.db.clone(), move |database| {
         // Settings commits always acquire locks in Runtime -> Database order. Readers

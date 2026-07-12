@@ -14,6 +14,7 @@ pub mod secure_fs;
 pub mod setup;
 pub mod ui;
 pub mod web;
+pub mod webauthn;
 
 use std::sync::{Arc, RwLock};
 
@@ -29,6 +30,7 @@ pub struct AppState {
     pub limiter: auth::LoginLimiter,
     pub share_limiter: auth::LoginLimiter,
     pub runtime: Arc<RwLock<RuntimeSettings>>,
+    pub webauthn: webauthn::WebAuthnService,
     pub storage_mutation: Arc<tokio::sync::Mutex<()>>,
     pub storage_cleanup: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
@@ -54,6 +56,8 @@ impl AppState {
         runtime
             .validate_for_config(&config)
             .map_err(|error| format!("invalid persisted runtime settings: {error}"))?;
+        let webauthn = webauthn::WebAuthnService::from_public_base_url(&runtime.public_base_url)
+            .map_err(|error| format!("invalid WebAuthn configuration: {error}"))?;
         Ok(Self {
             limiter: auth::LoginLimiter::new(
                 config.security.login_attempts,
@@ -67,6 +71,7 @@ impl AppState {
             db,
             secure_root,
             runtime: Arc::new(RwLock::new(runtime)),
+            webauthn,
             storage_mutation: Arc::new(tokio::sync::Mutex::new(())),
             storage_cleanup: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]

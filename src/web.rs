@@ -24,6 +24,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use base64::Engine as _;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use futures_util::{Stream, StreamExt};
 use qrcode::{render::svg, QrCode};
@@ -106,6 +107,14 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(|| async { Redirect::to("/admin") }))
         .route("/login", get(login_page).post(login))
         .route("/mfa", get(mfa_page).post(mfa))
+        .route(
+            "/mfa/security-key/start",
+            post(start_security_key_authentication),
+        )
+        .route(
+            "/mfa/security-key/finish",
+            post(finish_security_key_authentication),
+        )
         .route("/locale", post(set_locale))
         .route("/logout", post(logout))
         .route("/admin", get(admin_browser))
@@ -113,6 +122,18 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/account/password", post(change_account_password))
         .route("/admin/account/mfa/start", post(start_account_mfa))
         .route("/admin/account/mfa/confirm", post(confirm_account_mfa))
+        .route(
+            "/admin/account/security-keys/register/start",
+            post(start_security_key_registration),
+        )
+        .route(
+            "/admin/account/security-keys/register/finish",
+            post(finish_security_key_registration),
+        )
+        .route(
+            "/admin/account/security-keys/{id}/delete",
+            post(delete_security_key),
+        )
         .route("/admin/files/directories", post(create_directory_ui))
         .route(
             "/admin/files/upload",
@@ -352,7 +373,14 @@ function initDeleteConfirmation(form){const input=form.querySelector('[data-conf
 document.addEventListener('click',e=>{document.querySelectorAll('[data-datetime-picker]').forEach(p=>{if(!p.contains(e.target)){const pop=p.querySelector('[data-datetime-popover]');const toggle=p.querySelector('[data-datetime-toggle]');if(pop)pop.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');}});});
 function initFileSelection(){const bar=document.querySelector('[data-selection-bar]');const link=bar?.querySelector('[data-selection-share]');const name=bar?.querySelector('[data-selection-name]');if(!bar||!link||!name)return;document.querySelectorAll('[data-file-select]').forEach(input=>input.addEventListener('change',()=>{if(!input.checked)return;name.textContent=`${input.value||'/'} <vl-i18n key="files.selected"/>`;link.href=`/admin/shares/new?path=${encodeURIComponent(input.value)}`;bar.hidden=false;}));}
 function initShareReview(){const form=document.querySelector('[data-share-create]');if(!form)return;const review=form.parentElement.querySelector('[data-share-review]');const passwordToggle=form.querySelector('[data-password-toggle]');const passwordFields=form.querySelector('[data-password-fields]');const uploadRules=form.querySelector('[data-upload-rules]');const permissionLabels={download_only:'<vl-i18n key="share.download_only"/>',upload_only:'<vl-i18n key="share.upload_only"/>',download_upload:'<vl-i18n key="share.download_upload"/>'};const sync=()=>{const permission=form.querySelector('[name="permission"]:checked')?.value||form.querySelector('[name="permission"]')?.value||'download_only';const alias=form.elements.alias?.value.trim();const maximum=form.elements.max_downloads?.value.trim();const protectedShare=Boolean(passwordToggle?.checked);if(review){review.querySelector('[data-review-permission]').textContent=permissionLabels[permission]||permission;review.querySelector('[data-review-password]').textContent=protectedShare?'<vl-i18n key="share.password_protected"/>':'<vl-i18n key="share.no_password"/>';review.querySelector('[data-review-limit]').textContent=maximum?`${maximum} <vl-i18n key="share.transfers"/>`:'<vl-i18n key="common.unlimited"/>';const url=review.querySelector('[data-review-url]');if(url){const base=url.textContent.split('/v/')[0].split('/s/')[0];url.textContent=alias?`${base}/s/${alias}`:`${base}/v/••••••••`;}}if(passwordFields){passwordFields.hidden=!protectedShare;passwordFields.querySelectorAll('input').forEach(input=>{input.disabled=!protectedShare;input.required=protectedShare;});}if(uploadRules)uploadRules.hidden=permission==='download_only';};form.addEventListener('input',sync);form.addEventListener('change',sync);sync();}
-document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);initFileSelection();initShareReview();});
+function webauthnBuffer(value){const padded=value.replace(/-/g,'+').replace(/_/g,'/')+'==='.slice((value.length+3)%4);const raw=atob(padded);return Uint8Array.from(raw,c=>c.charCodeAt(0));}
+function webauthnBase64(value){const bytes=new Uint8Array(value);let raw='';bytes.forEach(byte=>raw+=String.fromCharCode(byte));return btoa(raw).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
+function webauthnOptions(options){options.publicKey.challenge=webauthnBuffer(options.publicKey.challenge);if(options.publicKey.user)options.publicKey.user.id=webauthnBuffer(options.publicKey.user.id);for(const key of ['allowCredentials','excludeCredentials'])for(const item of options.publicKey[key]||[])item.id=webauthnBuffer(item.id);return options;}
+function webauthnCredential(credential){const response={};for(const key of ['attestationObject','clientDataJSON','authenticatorData','signature','userHandle'])if(credential.response[key])response[key]=webauthnBase64(credential.response[key]);if(credential.response.getTransports)response.transports=credential.response.getTransports();return{id:credential.id,rawId:webauthnBase64(credential.rawId),type:credential.type,response,clientExtensionResults:credential.getClientExtensionResults(),authenticatorAttachment:credential.authenticatorAttachment};}
+async function webauthnPost(url,body){const response=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});if(!response.ok)throw new Error(await response.text());return response.json();}
+function initSecurityKeyLogin(){const button=document.querySelector('[data-security-key-login]');if(!button)return;const status=document.querySelector('[data-security-key-status]');button.addEventListener('click',async()=>{button.disabled=true;status.textContent='<vl-i18n key="auth.security_key_wait"/>';try{const options=webauthnOptions(await webauthnPost('/mfa/security-key/start'));const credential=await navigator.credentials.get(options);const result=await webauthnPost('/mfa/security-key/finish',{credential:webauthnCredential(credential)});location.assign(result.redirect);}catch(error){status.textContent='<vl-i18n key="auth.security_key_failed"/>';button.disabled=false;}});}
+function initSecurityKeyRegistration(){const form=document.querySelector('[data-security-key-register]');if(!form)return;const status=form.querySelector('[data-security-key-status]');form.addEventListener('submit',async event=>{event.preventDefault();const button=form.querySelector('button');button.disabled=true;status.textContent='<vl-i18n key="auth.security_key_wait"/>';const label=form.elements.label.value.trim();try{const options=webauthnOptions(await webauthnPost('/admin/account/security-keys/register/start',{csrf:form.dataset.csrf,current_password:form.elements.current_password.value,label}));const credential=await navigator.credentials.create(options);const result=await webauthnPost('/admin/account/security-keys/register/finish',{csrf:form.dataset.csrf,label,credential:webauthnCredential(credential)});location.assign(result.redirect);}catch(error){status.textContent='<vl-i18n key="auth.security_key_failed"/>';button.disabled=false;}});}
+document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);initFileSelection();initShareReview();initSecurityKeyLogin();initSecurityKeyRegistration();});
 document.addEventListener('submit',e=>{e.target.querySelectorAll('[data-tz-offset]').forEach(i=>{i.value=String(new Date().getTimezoneOffset())})});"#,
         crate::ui::UPLOAD_QUEUE_JAVASCRIPT
     );
@@ -1264,10 +1292,24 @@ async fn login(
     )?)
 }
 async fn mfa_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
-    session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
+    let (_, current_session) =
+        session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
+    let admin_id = current_session.admin_id;
+    let security_key_count = database(state.db.clone(), move |db| {
+        db.admin_webauthn_credentials(admin_id)
+            .map(|credentials| credentials.len())
+    })
+    .await?;
+    let security_key_button = if security_key_count >= 2 {
+        r#"<hr><button type="button" data-security-key-login><vl-i18n key="auth.security_key_use"/></button><p class="vl-muted" data-security-key-status></p>"#
+    } else {
+        ""
+    };
     Ok(Html(plain_page(
         "MFA",
-        r#"<section><h1><vl-i18n key="auth.second_factor"/></h1><form method="post"><label><vl-i18n key="auth.six_digit_totp"/><br><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" required></label><button><vl-i18n key="auth.verify"/></button></form></section>"#,
+        &format!(
+            r#"<section><h1><vl-i18n key="auth.second_factor"/></h1><form method="post"><label><vl-i18n key="auth.six_digit_totp"/><br><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button><vl-i18n key="auth.verify"/></button></form>{security_key_button}</section>"#
+        ),
     )))
 }
 #[derive(Deserialize)]
@@ -1300,6 +1342,109 @@ async fn mfa(
     database(state.db.clone(), move |db| db.verify_mfa(&token)).await?;
     audit(&state, s.username, "login_success", None, None).await;
     Ok(Redirect::to("/admin"))
+}
+
+fn decode_security_keys(
+    rows: &[crate::db::AdminWebauthnCredential],
+) -> Result<Vec<webauthn_rs::prelude::SecurityKey>> {
+    rows.iter()
+        .map(|row| serde_json::from_str(&row.credential_json).map_err(internal))
+        .collect()
+}
+
+async fn start_security_key_authentication(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<webauthn_rs::prelude::RequestChallengeResponse>> {
+    let (token, session) =
+        session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
+    if session.mfa_verified {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "MFA wurde bereits bestätigt",
+        ));
+    }
+    let admin_id = session.admin_id;
+    let rows = database(state.db.clone(), move |db| {
+        db.admin_webauthn_credentials(admin_id)
+    })
+    .await?;
+    if rows.len() < 2 {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Kein Sicherheitsschlüssel registriert",
+        ));
+    }
+    let keys = decode_security_keys(&rows)?;
+    let challenge = state
+        .webauthn
+        .start_authentication(&token, admin_id, &keys)
+        .map_err(|_| {
+            AppError(
+                StatusCode::BAD_REQUEST,
+                "Sicherheitsschlüssel konnte nicht gestartet werden",
+            )
+        })?;
+    Ok(Json(challenge))
+}
+
+#[derive(Deserialize)]
+struct SecurityKeyAuthenticationFinish {
+    credential: webauthn_rs::prelude::PublicKeyCredential,
+}
+
+async fn finish_security_key_authentication(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SecurityKeyAuthenticationFinish>,
+) -> Result<Json<serde_json::Value>> {
+    let (token, session) =
+        session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
+    if session.mfa_verified {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "MFA wurde bereits bestätigt",
+        ));
+    }
+    let admin_id = session.admin_id;
+    let rows = database(state.db.clone(), move |db| {
+        db.admin_webauthn_credentials(admin_id)
+    })
+    .await?;
+    let mut keys = decode_security_keys(&rows)?;
+    let index = state
+        .webauthn
+        .finish_authentication(&token, admin_id, &body.credential, &mut keys)
+        .map_err(|_| AppError(StatusCode::UNAUTHORIZED, "Ungültiger Sicherheitsschlüssel"))?;
+    let row = rows.get(index).ok_or_else(|| internal(()))?;
+    let credential_id = row.id;
+    let expected_credential_json = row.credential_json.clone();
+    let credential_json = serde_json::to_string(&keys[index]).map_err(internal)?;
+    let completed = database(state.db.clone(), move |db| {
+        db.complete_webauthn_mfa(
+            &token,
+            credential_id,
+            admin_id,
+            &expected_credential_json,
+            &credential_json,
+        )
+    })
+    .await?;
+    if !completed {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "Sicherheitsschlüssel wurde gleichzeitig geändert",
+        ));
+    }
+    audit(
+        &state,
+        session.username,
+        "login_success_webauthn",
+        None,
+        None,
+    )
+    .await;
+    Ok(Json(serde_json::json!({"redirect":"/admin"})))
 }
 #[derive(Deserialize)]
 struct CsrfForm {
@@ -4125,12 +4270,189 @@ async fn delete_share(
     Ok(Redirect::to("/admin/shares"))
 }
 
+#[derive(Deserialize)]
+struct SecurityKeyRegistrationStart {
+    csrf: String,
+    current_password: String,
+    label: String,
+}
+
+async fn start_security_key_registration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SecurityKeyRegistrationStart>,
+) -> Result<Json<webauthn_rs::prelude::CreationChallengeResponse>> {
+    let (token, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&session, &body.csrf)?;
+    let label = body.label.trim();
+    if label.is_empty() || label.chars().count() > 80 {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Ungültiger Schlüsselname",
+        ));
+    }
+    let username = session.username.clone();
+    let admin = database(state.db.clone(), move |db| db.admin(&username))
+        .await?
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+    let password_hash = admin.password_hash;
+    let current_password = body.current_password;
+    let password_valid = tokio::task::spawn_blocking(move || {
+        auth::verify_password(&password_hash, &current_password)
+    })
+    .await
+    .map_err(internal)?;
+    if !password_valid {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    let admin_id = session.admin_id;
+    let rows = database(state.db.clone(), move |db| {
+        db.admin_webauthn_credentials(admin_id)
+    })
+    .await?;
+    let existing = decode_security_keys(&rows)?;
+    let challenge = state
+        .webauthn
+        .start_registration(&token, admin_id, &session.username, &existing)
+        .map_err(|_| {
+            AppError(
+                StatusCode::BAD_REQUEST,
+                "Sicherheitsschlüssel konnte nicht gestartet werden",
+            )
+        })?;
+    Ok(Json(challenge))
+}
+
+#[derive(Deserialize)]
+struct SecurityKeyRegistrationFinish {
+    csrf: String,
+    label: String,
+    credential: webauthn_rs::prelude::RegisterPublicKeyCredential,
+}
+
+async fn finish_security_key_registration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SecurityKeyRegistrationFinish>,
+) -> Result<Json<serde_json::Value>> {
+    let (token, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&session, &body.csrf)?;
+    let label = body.label.trim().to_string();
+    if label.is_empty() || label.chars().count() > 80 {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Ungültiger Schlüsselname",
+        ));
+    }
+    let key = state
+        .webauthn
+        .finish_registration(&token, session.admin_id, &body.credential)
+        .map_err(|_| {
+            AppError(
+                StatusCode::BAD_REQUEST,
+                "Ungültige Sicherheitsschlüssel-Antwort",
+            )
+        })?;
+    let credential_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.cred_id());
+    let credential_json = serde_json::to_string(&key).map_err(internal)?;
+    let admin_id = session.admin_id;
+    database(state.db.clone(), move |db| {
+        db.add_admin_webauthn_credential(admin_id, &label, &credential_id, &credential_json)
+    })
+    .await
+    .map_err(|_| {
+        AppError(
+            StatusCode::CONFLICT,
+            "Sicherheitsschlüssel ist bereits registriert",
+        )
+    })?;
+    audit(
+        &state,
+        session.username,
+        "webauthn_credential_added",
+        None,
+        None,
+    )
+    .await;
+    Ok(Json(serde_json::json!({"redirect":"/admin/account"})))
+}
+
+#[derive(Deserialize)]
+struct DeleteSecurityKeyForm {
+    csrf: String,
+    current_password: String,
+    current_code: String,
+}
+
+async fn delete_security_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<i64>,
+    Form(form): Form<DeleteSecurityKeyForm>,
+) -> Result<Redirect> {
+    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&session, &form.csrf)?;
+    let username = session.username.clone();
+    let admin = database(state.db.clone(), move |db| db.admin(&username))
+        .await?
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+    let password_hash = admin.password_hash;
+    let password = form.current_password;
+    let password_valid =
+        tokio::task::spawn_blocking(move || auth::verify_password(&password_hash, &password))
+            .await
+            .map_err(internal)?;
+    if !password_valid || !auth::verify_totp_now(&admin.totp_secret, &form.current_code) {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    let admin_id = session.admin_id;
+    let deleted = database(state.db.clone(), move |db| {
+        db.delete_admin_webauthn_credential(id, admin_id)
+    })
+    .await?;
+    if !deleted {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "Sicherheitsschlüssel nicht gefunden",
+        ));
+    }
+    audit(
+        &state,
+        session.username,
+        "webauthn_credential_deleted",
+        Some(id.to_string()),
+        None,
+    )
+    .await;
+    Ok(Redirect::to("/admin/account"))
+}
+
 async fn account_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let admin_id = session.admin_id;
+    let security_keys = database(state.db.clone(), move |db| {
+        db.admin_webauthn_credentials(admin_id)
+    })
+    .await?;
+    let security_key_rows = if security_keys.is_empty() {
+        r#"<p class="vl-muted"><vl-i18n key="account.security_keys_empty"/></p>"#.to_string()
+    } else {
+        security_keys
+            .iter()
+            .map(|key| format!(
+                r#"<article class="vl-share-row"><div><strong>{}</strong><small class="vl-muted">{}</small></div><form method="post" action="/admin/account/security-keys/{}/delete" class="vl-stack"><input type="hidden" name="csrf" value="{}"><input name="current_password" type="password" autocomplete="current-password" placeholder="Passwort" required><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" placeholder="TOTP" required><button class="vl-button vl-button--danger"><vl-i18n key="common.delete"/></button></form></article>"#,
+                esc(&key.label),
+                esc(&key.created_at),
+                key.id,
+                esc(&session.csrf_token),
+            ))
+            .collect::<String>()
+    };
     let body = format!(
-        r#"<div class="vl-create-layout"><section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.current_user"/></p><h2>{username}</h2></div><form method="post" action="/admin/account/password" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><h2><vl-i18n key="account.change_password"/></h2><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.new_password"/><input name="new_password" type="password" minlength="14" autocomplete="new-password" required><small><vl-i18n key="error.password_min"/></small></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" minlength="14" autocomplete="new-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.change_password"/></button></form></section><aside class="vl-panel vl-stack"><h2><vl-i18n key="account.change_mfa"/></h2><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><form method="post" action="/admin/account/mfa/start" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.current_mfa_code"/><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button" type="submit"><vl-i18n key="common.continue"/></button></form></aside></div>"#,
+        r#"<div class="vl-create-layout"><section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.current_user"/></p><h2>{username}</h2></div><form method="post" action="/admin/account/password" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><h2><vl-i18n key="account.change_password"/></h2><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.new_password"/><input name="new_password" type="password" minlength="14" autocomplete="new-password" required><small><vl-i18n key="error.password_min"/></small></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" minlength="14" autocomplete="new-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.change_password"/></button></form></section><aside class="vl-panel vl-stack"><h2><vl-i18n key="account.change_mfa"/></h2><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><form method="post" action="/admin/account/mfa/start" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.current_mfa_code"/><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button" type="submit"><vl-i18n key="common.continue"/></button></form></aside></div><section class="vl-panel vl-stack"><h2><vl-i18n key="account.security_keys"/></h2><p class="vl-muted"><vl-i18n key="account.security_keys_help"/></p>{security_key_rows}<form class="vl-stack" data-security-key-register data-csrf="{csrf}"><label class="vl-field"><vl-i18n key="account.security_key_label"/><input name="label" maxlength="80" required></label><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.security_key_add"/></button><p class="vl-muted" data-security-key-status></p></form></section>"#,
         username = esc(&session.username),
         csrf = esc(&session.csrf_token),
+        security_key_rows = security_key_rows,
     );
     Ok(Html(admin_page(
         &state,

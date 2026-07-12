@@ -2,6 +2,7 @@
 
 ## 0.4.0 — 2026-07-11
 
+- Added WebAuthn/FIDO2 security keys such as YubiKey as an alternative admin second factor, with multiple named keys per account, password-confirmed enrollment, TOTP-protected removal, session-bound single-use ceremonies, and stable RP-ID/origin configuration.
 - Added a German/English interface with explicit language selection, browser-language detection, localized server-rendered pages and locale-aware browser behavior.
 - Added “My account” for current-user password changes and response-loss-safe, two-step MFA replacement that keeps the previous authenticator valid until the new code is confirmed.
 - Added the local `recover-admin` break-glass command for atomic password and/or MFA recovery through SSH/host access, including session and pending-enrollment revocation plus secret-free auditing.
