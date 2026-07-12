@@ -10048,6 +10048,7 @@ mod tests {
         std::fs::create_dir(root.path().join("uploads")).unwrap();
         std::fs::write(root.path().join("uploads/report.txt"), b"external").unwrap();
         let mut state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
         state
             .db
             .create_share(
