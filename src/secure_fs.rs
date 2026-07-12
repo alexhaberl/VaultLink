@@ -6,6 +6,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::SystemTime,
