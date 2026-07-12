@@ -129,6 +129,7 @@ SETUP_TOKEN="$(sed -n 's#^http://[^?]*?token=##p' "$SETUP_LOG" | tail -n 1)"
 wait_http "http://$SETUP_ADDR/?token=$SETUP_TOKEN" "200"
 
 curl -sS -f -X POST "http://$SETUP_ADDR/" \
+    -H "Accept-Language: de" \
     --data-urlencode "token=$SETUP_TOKEN" \
     --data-urlencode "server_mode=development" \
     --data-urlencode "listen_address=$APP_ADDR" \
@@ -163,6 +164,7 @@ grep -q "Setup abgeschlossen" "$SETUP_RESPONSE" || fail "setup did not complete"
 TOTP_SECRET="$(grep -Eo '[A-Z2-7]{32}' "$SETUP_RESPONSE" | head -n 1)"
 [[ -n "$TOTP_SECRET" ]] || fail "TOTP secret was not rendered"
 curl -sS -f -X POST "http://$SETUP_ADDR/complete" \
+    -H "Accept-Language: de" \
     --data-urlencode "token=$SETUP_TOKEN" \
     | grep -q "Setup best" || fail "setup confirmation failed"
 
