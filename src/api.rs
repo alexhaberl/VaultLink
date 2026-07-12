@@ -171,17 +171,18 @@ async fn normalize_api_errors(request: Request, next: Next) -> Response {
     if is_json {
         return response;
     }
-    let status = response.status();
+    let (mut parts, _) = response.into_parts();
+    let status = parts.status;
     let code = status_code_name(status);
     let message = status.canonical_reason().unwrap_or("Request failed");
     let body = format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#);
-    let mut normalized = Response::new(Body::from(body));
-    *normalized.status_mut() = status;
-    normalized.headers_mut().insert(
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.remove(header::CONTENT_ENCODING);
+    parts.headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json; charset=utf-8"),
     );
-    normalized
+    Response::from_parts(parts, Body::from(body))
 }
 
 fn status_code_name(status: StatusCode) -> &'static str {
@@ -234,13 +235,34 @@ async fn login(
     Json(form): Json<LoginRequest>,
 ) -> ApiResult<Response> {
     let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
-    let key = format!("{}:{}", ip, form.username.to_lowercase());
     let ip_key = format!("ip:{ip}");
-    if !state.limiter.allowed(&key) || !state.limiter.allowed(&ip_key) {
+    if !auth::valid_admin_username(&form.username) {
+        if !state.limiter.check_and_record_attempt(&ip_key) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "Zu viele Anmeldeversuche",
+            ));
+        }
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Ungültige Zugangsdaten",
+        ));
+    }
+    let key = format!("{}:{}", ip, form.username.to_lowercase());
+    if !state.limiter.check_and_record_attempts(&[&key, &ip_key]) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
             "Zu viele Anmeldeversuche",
+        ));
+    }
+    if form.password.len() > 1_024 {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Ungültige Zugangsdaten",
         ));
     }
     let username = form.username.clone();
@@ -258,8 +280,6 @@ async fn login(
     .await
     .map_err(ApiError::internal)?;
     if !valid {
-        state.limiter.failure(&key);
-        state.limiter.failure(&ip_key);
         audit(&state, form.username, "login_failed", None, None).await;
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -286,8 +306,6 @@ async fn login(
     })
     .await?;
     if outcome != PasswordSessionCreationOutcome::Created {
-        state.limiter.failure(&key);
-        state.limiter.failure(&ip_key);
         audit(&state, form.username, "login_failed", None, None).await;
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -323,7 +341,7 @@ async fn mfa(
     let (token, session_data) =
         session(&state, &headers, false, MissingSession::Unauthorized).await?;
     let key = format!("mfa:{}", session_data.username.to_lowercase());
-    if !state.limiter.allowed(&key) {
+    if !state.limiter.check_and_record_attempt(&key) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -335,7 +353,6 @@ async fn mfa(
         .await?
         .ok_or_else(|| ApiError::internal(()))?;
     if !auth::verify_totp_now(&admin.totp_secret, &form.code) {
-        state.limiter.failure(&key);
         audit(&state, session_data.username, "mfa_failed", None, None).await;
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -722,7 +739,11 @@ fn share_response(settings: &RuntimeSettings, share: Share) -> ShareResponse {
         id: share.id,
         token: share.token,
         alias: share.alias,
-        url: format!("{}/{}", settings.public_base_url, public_path),
+        url: format!(
+            "{}/{}",
+            settings.public_base_url.trim_end_matches('/'),
+            public_path
+        ),
         path: share.relative_path,
         is_directory: share.is_directory,
         permission: share.permission,
@@ -790,6 +811,14 @@ async fn create_share(
     if request.max_upload_size == Some(0) {
         return Err(ApiError::bad_request(
             "Uploadlimit muss mindestens 1 Byte sein",
+        ));
+    }
+    if request
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
+    {
+        return Err(ApiError::bad_request(
+            "Ablaufzeit muss in der Zukunft liegen",
         ));
     }
     let alias = request
@@ -911,7 +940,10 @@ async fn update_share(
         ));
     }
     if let Some(active) = request.active {
-        database(state.db.clone(), move |db| db.set_share_active(id, active)).await?;
+        let changed = database(state.db.clone(), move |db| db.set_share_active(id, active)).await?;
+        if !changed {
+            return Err(ApiError::not_found("Freigabe nicht gefunden"));
+        }
         audit(
             &state,
             session_data.username.clone(),
@@ -971,7 +1003,10 @@ async fn set_share_active_api(
 ) -> ApiResult<Json<SimpleResponse>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    database(state.db.clone(), move |db| db.set_share_active(id, active)).await?;
+    let changed = database(state.db.clone(), move |db| db.set_share_active(id, active)).await?;
+    if !changed {
+        return Err(ApiError::not_found("Freigabe nicht gefunden"));
+    }
     audit(
         &state,
         session_data.username,
@@ -994,7 +1029,10 @@ async fn delete_share(
 ) -> ApiResult<Json<SimpleResponse>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    database(state.db.clone(), move |db| db.delete_share(id)).await?;
+    let deleted = database(state.db.clone(), move |db| db.delete_share(id)).await?;
+    if !deleted {
+        return Err(ApiError::not_found("Freigabe nicht gefunden"));
+    }
     audit(
         &state,
         session_data.username,
@@ -1543,50 +1581,62 @@ async fn delete_audit_client_ips(
     Ok(Json(DeletedAuditClientIpsResponse { deleted }))
 }
 
-#[derive(Default, Deserialize)]
-struct PublicShareQuery {
-    path: Option<String>,
-}
-
 #[derive(Serialize)]
 struct PublicShareResponse {
-    token: String,
-    path: String,
-    is_directory: bool,
-    permission: Permission,
     locked: bool,
-    active: bool,
-    expires_at: Option<DateTime<Utc>>,
-    download_count: u64,
-    max_downloads: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_directory: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permission: Option<Permission>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<Option<DateTime<Utc>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_downloads: Option<Option<u64>>,
 }
 
 async fn public_share(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
-    Query(query): Query<PublicShareQuery>,
 ) -> ApiResult<Json<PublicShareResponse>> {
-    if let Some(path) = query.path.as_deref() {
-        let _ = validate_rel(path)?;
-    }
     let share = get_share(&state, &token).await?;
     let unlocked = share_is_unlocked(&state, &headers, &share).await?;
+    if !unlocked {
+        return Ok(Json(PublicShareResponse {
+            locked: true,
+            token: None,
+            path: None,
+            is_directory: None,
+            permission: None,
+            active: None,
+            expires_at: None,
+            download_count: None,
+            max_downloads: None,
+        }));
+    }
     let public_path = if share.permission == Permission::UploadOnly {
         String::new()
     } else {
         share.relative_path.clone()
     };
     Ok(Json(PublicShareResponse {
-        token: share.token,
-        path: public_path,
-        is_directory: share.is_directory,
-        permission: share.permission,
-        locked: !unlocked,
-        active: share.active,
-        expires_at: share.expires_at,
-        download_count: share.download_count,
-        max_downloads: share.max_downloads,
+        locked: false,
+        token: Some(share.token),
+        path: Some(public_path),
+        is_directory: Some(share.is_directory),
+        permission: Some(share.permission),
+        active: Some(share.active),
+        expires_at: Some(share.expires_at),
+        download_count: Some(share.download_count),
+        max_downloads: Some(share.max_downloads),
     }))
 }
 
@@ -1605,7 +1655,7 @@ async fn unlock_share(
     let share = get_share(&state, &token).await?;
     let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
     let key = format!("share:{}:{ip}", share.id);
-    if !state.share_limiter.allowed(&key) {
+    if !state.share_limiter.check_and_record_attempt(&key) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -1620,7 +1670,6 @@ async fn unlock_share(
         .await
         .map_err(ApiError::internal)?;
     if !valid {
-        state.share_limiter.failure(&key);
         audit(
             &state,
             "public".into(),
@@ -1709,15 +1758,9 @@ fn validate_rel(value: &str) -> ApiResult<String> {
 
 fn validate_alias(value: &str) -> ApiResult<String> {
     let value = value.trim();
-    if (3..=32).contains(&value.len())
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        Ok(value.to_string())
-    } else {
-        Err(ApiError::bad_request("Ungültiger Alias"))
-    }
+    path_security::validate_new_share_alias(value)
+        .map(str::to_string)
+        .map_err(|_| ApiError::bad_request("Ungültiger Alias"))
 }
 
 fn validate_share_password(settings: &RuntimeSettings, password: &str) -> ApiResult<()> {
@@ -1732,11 +1775,7 @@ fn validate_share_password(settings: &RuntimeSettings, password: &str) -> ApiRes
 }
 
 fn validate_admin_username(username: &str) -> ApiResult<()> {
-    if (3..=64).contains(&username.len())
-        && username
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
+    if auth::valid_admin_username(username) {
         Ok(())
     } else {
         Err(ApiError::bad_request("Ungültiger Benutzername"))
@@ -1908,6 +1947,42 @@ mod tests {
         auth::totp_code(secret, step).unwrap()
     }
 
+    #[tokio::test]
+    async fn error_normalization_preserves_protocol_headers() {
+        let app = Router::new()
+            .route(
+                "/range",
+                get(|| async {
+                    let mut response =
+                        (StatusCode::RANGE_NOT_SATISFIABLE, "invalid range").into_response();
+                    response.headers_mut().insert(
+                        header::CONTENT_RANGE,
+                        HeaderValue::from_static("bytes */10"),
+                    );
+                    response
+                }),
+            )
+            .layer(middleware::from_fn(normalize_api_errors));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/range")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes */10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
+    }
+
     async fn api_login(state: &AppState, secret: &str) -> (String, String) {
         let app = crate::web::router(state.clone());
         let login = app
@@ -2001,10 +2076,27 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
+        let mut expired = json_request(
+            Method::POST,
+            "/api/v1/shares",
+            r#"{"path":"docs","permission":"download_only","expires_at":"2000-01-01T00:00:00Z"}"#,
+        );
+        expired.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        expired
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.clone().oneshot(expired).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
         let mut create = json_request(
             Method::POST,
             "/api/v1/shares",
-            r#"{"path":"docs","permission":"download_upload","alias":"docsapi","max_downloads":5,"password":"very strong share password","overwrite_allowed":true}"#,
+            r#"{"path":"docs","permission":"download_upload","alias":"docs-api-123","max_downloads":5,"password":"very strong share password","overwrite_allowed":true}"#,
         );
         create.headers_mut().insert(
             header::COOKIE,
@@ -2016,8 +2108,8 @@ mod tests {
         let response = app.clone().oneshot(create).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
-        assert!(body.contains(r#""alias":"docsapi""#));
-        assert!(body.contains(r#""url":"http://localhost:8080/s/docsapi""#));
+        assert!(body.contains(r#""alias":"docs-api-123""#));
+        assert!(body.contains(r#""url":"http://localhost:8080/s/docs-api-123""#));
         assert!(body.contains(r#""password_protected":true"#));
         assert!(body.contains(r#""upload_conflict_strategy":"overwrite_allowed""#));
         assert!(!body.contains("password_hash"));
@@ -2025,7 +2117,7 @@ mod tests {
         let detail = audit_events[0].detail.as_deref().unwrap();
         assert!(detail.contains("path=docs"));
         assert!(detail.contains("permission=download_upload"));
-        assert!(detail.contains("alias=docsapi"));
+        assert!(detail.contains("alias=docs-api-123"));
         assert!(detail.contains("transfer_limit=5"));
         assert!(detail.contains("password_protected=true"));
         assert!(detail.contains("overwrite_allowed=true"));
@@ -2035,12 +2127,25 @@ mod tests {
             header::COOKIE,
             HeaderValue::from_str(&session_cookie).unwrap(),
         );
-        let response = app.oneshot(list).await.unwrap();
+        let response = app.clone().oneshot(list).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
-        assert!(body.contains("docsapi"));
+        assert!(body.contains("docs-api-123"));
         assert!(!body.contains("very strong share password"));
         assert!(!body.contains("password_hash"));
+
+        let mut missing_delete = json_request(Method::DELETE, "/api/v1/shares/999999", "");
+        missing_delete.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        missing_delete
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.oneshot(missing_delete).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -2167,6 +2272,7 @@ mod tests {
         state.db.create_admin("admin", &hash, &secret).unwrap();
         let (session_cookie, csrf) = api_login(&state, &secret).await;
         let app = crate::web::router(state.clone());
+        let original_webauthn = state.webauthn.read().unwrap().instance_id();
 
         let mut invalid_body = settings_body(runtime_settings(&state));
         invalid_body.public_base_url.clear();
@@ -2186,7 +2292,7 @@ mod tests {
         assert!(state.db.runtime_settings().unwrap().is_empty());
 
         let mut valid_body = settings_body(runtime_settings(&state));
-        valid_body.public_base_url = "http://localhost:8080/".into();
+        valid_body.public_base_url = "http://localhost:8081/".into();
         valid_body.blocked_extensions = vec!["EXE, .SH".into()];
         valid_body.audit_client_ip_enabled = Some(true);
         let valid_json = serde_json::to_string(&valid_body).unwrap();
@@ -2204,9 +2310,13 @@ mod tests {
             .await
             .contains(r#""audit_client_ip_enabled":true"#));
         let current = runtime_settings(&state);
-        assert_eq!(current.public_base_url, "http://localhost:8080");
+        assert_eq!(current.public_base_url, "http://localhost:8081");
         assert_eq!(current.blocked_extensions, ["exe", "sh"]);
         assert!(current.audit_client_ip_enabled);
+        assert_ne!(
+            state.webauthn.read().unwrap().instance_id(),
+            original_webauthn
+        );
 
         let mut legacy_json = serde_json::to_value(settings_body(current)).unwrap();
         legacy_json
@@ -2235,7 +2345,7 @@ mod tests {
         drop(state);
         let restarted = AppState::new(config).unwrap();
         let restarted = runtime_settings(&restarted);
-        assert_eq!(restarted.public_base_url, "http://localhost:8080");
+        assert_eq!(restarted.public_base_url, "http://localhost:8081");
         assert_eq!(restarted.blocked_extensions, ["exe", "sh"]);
         assert!(restarted.audit_client_ip_enabled);
     }
@@ -2430,6 +2540,17 @@ mod tests {
             )
             .unwrap();
         let app = crate::web::router(state.clone());
+        let locked_metadata = app
+            .clone()
+            .oneshot(json_request(
+                Method::GET,
+                "/api/v1/public/shares/protected-token",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(locked_metadata.status(), StatusCode::OK);
+        assert_eq!(response_text(locked_metadata).await, r#"{"locked":true}"#);
         let unlock = app
             .clone()
             .oneshot(json_request(
@@ -2483,14 +2604,13 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        let metadata = app
-            .oneshot(json_request(
-                Method::GET,
-                "/api/v1/public/shares/protected-token",
-                "",
-            ))
-            .await
-            .unwrap();
+        let mut metadata_request =
+            json_request(Method::GET, "/api/v1/public/shares/protected-token", "");
+        metadata_request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        let metadata = app.oneshot(metadata_request).await.unwrap();
         assert_eq!(metadata.status(), StatusCode::OK);
         assert!(response_text(metadata)
             .await

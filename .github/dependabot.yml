@@ -1,5 +1,21 @@
 version: 2
 updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:30"
+      timezone: Europe/Vienna
+    open-pull-requests-limit: 5
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:45"
+      timezone: Europe/Vienna
+    open-pull-requests-limit: 3
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

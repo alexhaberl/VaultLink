@@ -15,8 +15,8 @@ use std::{
 use axum::{
     body::{Body, Bytes},
     extract::{
-        ConnectInfo, DefaultBodyLimit, Form, Json, Multipart, OriginalUri, Path as AxPath, Query,
-        Request, State,
+        ConnectInfo, DefaultBodyLimit, Form, Json, MatchedPath, Multipart, OriginalUri,
+        Path as AxPath, Query, Request, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
@@ -211,7 +211,21 @@ pub fn router(state: AppState) -> Router {
             header::HeaderName::from_static("x-request-id"),
             MakeRequestUuid,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request| {
+                let matched_path = request
+                    .extensions()
+                    .get::<MatchedPath>()
+                    .map(MatchedPath::as_str)
+                    .unwrap_or("<unmatched>");
+                tracing::debug_span!(
+                    "http_request",
+                    method = %request.method(),
+                    route = matched_path,
+                    version = ?request.version()
+                )
+            }),
+        )
         .layer(CatchPanicLayer::new())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -711,6 +725,46 @@ fn storage_has_room(path: &Path, needed: u64) -> bool {
     })
 }
 
+static UPLOAD_BYTES_RESERVED: AtomicU64 = AtomicU64::new(0);
+
+struct UploadChunkReservation {
+    bytes: u64,
+}
+
+impl UploadChunkReservation {
+    fn acquire(path: &Path, bytes: u64) -> Option<Self> {
+        loop {
+            let reserved = UPLOAD_BYTES_RESERVED.load(Ordering::Acquire);
+            if disk_stats(path).is_some_and(|stats| {
+                stats
+                    .free
+                    .saturating_sub(STORAGE_RESERVE_BYTES)
+                    .saturating_sub(reserved)
+                    <= bytes
+            }) {
+                return None;
+            }
+            if UPLOAD_BYTES_RESERVED
+                .compare_exchange_weak(
+                    reserved,
+                    reserved.checked_add(bytes)?,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(Self { bytes });
+            }
+        }
+    }
+}
+
+impl Drop for UploadChunkReservation {
+    fn drop(&mut self) {
+        UPLOAD_BYTES_RESERVED.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 fn storage_full_error(error: &std::io::Error) -> bool {
     const ENOSPC: i32 = 28;
     const EDQUOT: i32 = 122;
@@ -755,7 +809,11 @@ impl Drop for PublicTransferLease {
 
 fn start_transfer_heartbeat(
     database: Database,
+    runtime: Arc<RwLock<RuntimeSettings>>,
     lease_token: String,
+    action: &'static str,
+    share_id: i64,
+    client_ip: Option<String>,
 ) -> Option<tokio::sync::oneshot::Sender<()>> {
     let handle = tokio::runtime::Handle::try_current().ok()?;
     let (stop_sender, mut stop_receiver) = tokio::sync::oneshot::channel();
@@ -776,6 +834,34 @@ fn start_transfer_heartbeat(
                         heartbeat_database.heartbeat_transfer_lease(&heartbeat_token)
                     }).await {
                         Ok(Ok(crate::db::TransferLeaseHeartbeatOutcome::Extended)) => {}
+                        Ok(Ok(crate::db::TransferLeaseHeartbeatOutcome::CappedAndCounted)) => {
+                            let audit_ip = runtime
+                                .read()
+                                .ok()
+                                .is_some_and(|settings| settings.audit_client_ip_enabled)
+                                .then(|| client_ip.clone())
+                                .flatten();
+                            let audit_database = database.clone();
+                            let audit_result = tokio::task::spawn_blocking(move || {
+                                audit_database.audit_with_client_ip(
+                                    "public",
+                                    action,
+                                    Some(&share_id.to_string()),
+                                    Some("capped transfer session"),
+                                    audit_ip.as_deref(),
+                                )
+                            })
+                            .await;
+                            if !matches!(audit_result, Ok(Ok(()))) {
+                                tracing::warn!(share_id, action, "could not audit capped transfer");
+                            }
+                            tracing::warn!(share_id, action, "public transfer reached its absolute lifetime and was counted");
+                            break;
+                        }
+                        Ok(Ok(crate::db::TransferLeaseHeartbeatOutcome::CappedAlreadyCounted)) => {
+                            tracing::warn!(share_id, action, "public transfer reached its absolute lifetime");
+                            break;
+                        }
                         Ok(Ok(crate::db::TransferLeaseHeartbeatOutcome::NotFound)) => {
                             tracing::warn!("public transfer lease disappeared while the response was active");
                             break;
@@ -838,16 +924,24 @@ async fn begin_public_transfer(
     .await?;
     match outcome {
         TransferLeaseBeginOutcome::NewLease | TransferLeaseBeginOutcome::AlreadyCounted => {
+            let client_ip = runtime_settings(state)
+                .audit_client_ip_enabled
+                .then(current_audit_client_ip)
+                .flatten()
+                .map(|ip| ip.to_string());
             Ok(PublicTransferLease {
-                heartbeat_stop: start_transfer_heartbeat(state.db.clone(), lease_token.clone()),
+                heartbeat_stop: start_transfer_heartbeat(
+                    state.db.clone(),
+                    state.runtime.clone(),
+                    lease_token.clone(),
+                    action,
+                    share.id,
+                    client_ip.clone(),
+                ),
                 lease_token: Some(lease_token),
                 cookie: make_transfer_cookie(state, share, &session_token, transfer_scope(uri)),
                 database: state.db.clone(),
-                client_ip: runtime_settings(state)
-                    .audit_client_ip_enabled
-                    .then(current_audit_client_ip)
-                    .flatten()
-                    .map(|ip| ip.to_string()),
+                client_ip,
             })
         }
         TransferLeaseBeginOutcome::LimitReached => {
@@ -1222,13 +1316,25 @@ async fn login(
     Form(form): Form<LoginForm>,
 ) -> Result<Response> {
     let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
-    let key = format!("{}:{}", ip, form.username.to_lowercase());
     let ip_key = format!("ip:{ip}");
-    if !state.limiter.allowed(&key) || !state.limiter.allowed(&ip_key) {
+    if !auth::valid_admin_username(&form.username) {
+        if !state.limiter.check_and_record_attempt(&ip_key) {
+            return Err(AppError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Zu viele Anmeldeversuche",
+            ));
+        }
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    let key = format!("{}:{}", ip, form.username.to_lowercase());
+    if !state.limiter.check_and_record_attempts(&[&key, &ip_key]) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Zu viele Anmeldeversuche",
         ));
+    }
+    if form.password.len() > 1_024 {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
     let username = form.username.clone();
     let admin = database(state.db.clone(), move |db| db.admin(&username)).await?;
@@ -1245,8 +1351,6 @@ async fn login(
     .await
     .map_err(internal)?;
     if !valid {
-        state.limiter.failure(&key);
-        state.limiter.failure(&ip_key);
         audit(&state, form.username, "login_failed", None, None).await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
@@ -1269,8 +1373,6 @@ async fn login(
     })
     .await?;
     if outcome != PasswordSessionCreationOutcome::Created {
-        state.limiter.failure(&key);
-        state.limiter.failure(&ip_key);
         audit(&state, form.username, "login_failed", None, None).await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
@@ -1314,7 +1416,7 @@ async fn mfa(
 ) -> Result<Redirect> {
     let (token, s) = session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     let key = format!("mfa:{}", s.username.to_lowercase());
-    if !state.limiter.allowed(&key) {
+    if !state.limiter.check_and_record_attempt(&key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Zu viele MFA-Versuche",
@@ -1325,7 +1427,6 @@ async fn mfa(
         .await?
         .ok_or_else(|| internal(()))?;
     if !auth::verify_totp_now(&admin.totp_secret, &form.code) {
-        state.limiter.failure(&key);
         audit(&state, s.username, "mfa_failed", None, None).await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
     }
@@ -1367,8 +1468,12 @@ async fn start_security_key_authentication(
         ));
     }
     let keys = decode_security_keys(&rows)?;
-    let challenge = state
+    let webauthn = state
         .webauthn
+        .read()
+        .expect("WebAuthn service lock poisoned")
+        .clone();
+    let challenge = webauthn
         .start_authentication(&token, admin_id, &keys)
         .map_err(|_| {
             AppError(
@@ -1403,8 +1508,12 @@ async fn finish_security_key_authentication(
     })
     .await?;
     let mut keys = decode_security_keys(&rows)?;
-    let index = state
+    let webauthn = state
         .webauthn
+        .read()
+        .expect("WebAuthn service lock poisoned")
+        .clone();
+    let index = webauthn
         .finish_authentication(&token, admin_id, &body.credential, &mut keys)
         .map_err(|_| AppError(StatusCode::UNAUTHORIZED, "Ungültiger Sicherheitsschlüssel"))?;
     let row = rows.get(index).ok_or_else(|| internal(()))?;
@@ -1699,12 +1808,14 @@ async fn stage_admin_upload(
                 "Upload ist zu groß",
             ));
         };
-        if !storage_has_room(state.secure_root.display_root(), chunk.len() as u64) {
+        let Some(_reservation) =
+            UploadChunkReservation::acquire(state.secure_root.display_root(), chunk.len() as u64)
+        else {
             return Err(AppError(
                 StatusCode::INSUFFICIENT_STORAGE,
                 "Nicht genug freier Speicher",
             ));
-        }
+        };
         total = new_total;
         output.write_all(&chunk).await.map_err(upload_io_error)?;
     }
@@ -2184,18 +2295,6 @@ async fn admin_browser(
         }
         _ => "",
     };
-    let _legacy_listing = format!(
-        r#"<section class="hero"><div><p class="eyebrow">VaultLink Admin</p><h1>Dateibrowser</h1>{}<p class=muted>Relativer Pfad: /{}</p></div><div class="side-panel"><strong>Schnellaktion</strong><p class="muted">Aktuellen Ordner sicher freigeben oder per Suche eingrenzen.</p><p><a class="button" href="/admin/shares?path={}">Aktuellen Ordner freigeben</a></p></div></section><section>{}<form method="get" class="row"><input type="hidden" name="path" value="{}"><label>Suche<br><input name="q" value="{}" placeholder="Dateiname"></label><button>Suchen</button></form><table><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th></th></tr></thead><tbody>{}</tbody></table><p>{} {}</p><p class=muted>100 Einträge pro Seite. Suche ist limitiert und läuft innerhalb des aktuellen Ordners.</p></section>"#,
-        breadcrumbs(&rel, "/admin"),
-        esc(&rel),
-        current_folder_target,
-        up,
-        esc(&rel),
-        esc(search_value),
-        rows,
-        previous,
-        next
-    );
     let create_form = format!(
         r#"<details class="vl-create-folder"><summary class="vl-button vl-button--secondary"><vl-i18n key="files.new_folder"/></summary><form method="post" action="/admin/files/directories" class="vl-create-folder__form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="parent" value="{}"><label class="vl-field vl-create-folder__field"><span><vl-i18n key="files.folder_name"/></span><input name="name" maxlength="255" required></label><button class="vl-button"><vl-i18n key="files.create_folder"/></button></form></details>"#,
         esc(&s.csrf_token),
@@ -3783,8 +3882,13 @@ async fn share_create_page(
         "{}/v/••••••••",
         settings.public_base_url.trim_end_matches('/')
     );
+    let alias_pattern = format!(
+        "[A-Za-z0-9_-]{{{},{}}}",
+        path_security::SHARE_ALIAS_MIN_LENGTH,
+        path_security::SHARE_ALIAS_MAX_LENGTH
+    );
     let body = format!(
-        r#"<div class="vl-create-layout"><form method="post" action="/admin/shares" class="vl-panel vl-stack" data-share-create><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><section class="vl-target-card"><div><span class="vl-eyebrow"><vl-i18n key="share.selected_target"/></span><strong>/{}</strong><small class="vl-muted">{}</small></div><a class="vl-button vl-button--ghost" href="/admin"><vl-i18n key="share.change_target"/></a></section><section class="vl-form-section"><h2><vl-i18n key="share.step_permission"/></h2>{permission_fields}</section><section class="vl-form-section"><h2><vl-i18n key="share.step_link"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.short_alias"/><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}" data-share-alias><small><vl-i18n key="share.alias_help"/></small></label>{}<label class="vl-field"><vl-i18n key="share.max_transfers"/><input name="max_downloads" type="number" min="1"><small><vl-i18n key="share.empty_unlimited"/></small></label></div></section><section class="vl-form-section"><h2><vl-i18n key="share.step_protection"/></h2><label class="vl-switch"><input type="checkbox" data-password-toggle><span><vl-i18n key="share.password_protection"/><small><vl-i18n key="share.password_enable"/></small></span></label><div class="vl-form-grid" data-password-fields><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="{}" maxlength="{}" autocomplete="new-password"></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" autocomplete="new-password"></label></div></section>{upload_rules}<button class="vl-button vl-button--primary" type="submit"><vl-i18n key="share.create_secure"/></button></form><aside class="vl-panel vl-review-card" data-share-review><h2><vl-i18n key="share.review"/></h2><dl class="vl-review-list"><div><dt><vl-i18n key="common.target"/></dt><dd>/{}</dd></div><div><dt><vl-i18n key="share.permission"/></dt><dd data-review-permission><vl-i18n key="share.download_only"/></dd></div><div><dt><vl-i18n key="auth.password"/></dt><dd data-review-password><vl-i18n key="share.no_password"/></dd></div><div><dt><vl-i18n key="share.limit"/></dt><dd data-review-limit><vl-i18n key="common.unlimited"/></dd></div></dl><div class="vl-field"><span><vl-i18n key="share.url_preview"/></span><code data-review-url>{}</code></div><p class="vl-muted"><vl-i18n key="share.audit_help"/></p></aside></div>"#,
+        r#"<div class="vl-create-layout"><form method="post" action="/admin/shares" class="vl-panel vl-stack" data-share-create><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><section class="vl-target-card"><div><span class="vl-eyebrow"><vl-i18n key="share.selected_target"/></span><strong>/{}</strong><small class="vl-muted">{}</small></div><a class="vl-button vl-button--ghost" href="/admin"><vl-i18n key="share.change_target"/></a></section><section class="vl-form-section"><h2><vl-i18n key="share.step_permission"/></h2>{permission_fields}</section><section class="vl-form-section"><h2><vl-i18n key="share.step_link"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.short_alias"/><input name="alias" pattern="{alias_pattern}" data-share-alias><small><vl-i18n key="share.alias_help"/></small></label>{}<label class="vl-field"><vl-i18n key="share.max_transfers"/><input name="max_downloads" type="number" min="1"><small><vl-i18n key="share.empty_unlimited"/></small></label></div></section><section class="vl-form-section"><h2><vl-i18n key="share.step_protection"/></h2><label class="vl-switch"><input type="checkbox" data-password-toggle><span><vl-i18n key="share.password_protection"/><small><vl-i18n key="share.password_enable"/></small></span></label><div class="vl-form-grid" data-password-fields><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="{}" maxlength="{}" autocomplete="new-password"></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" autocomplete="new-password"></label></div></section>{upload_rules}<button class="vl-button vl-button--primary" type="submit"><vl-i18n key="share.create_secure"/></button></form><aside class="vl-panel vl-review-card" data-share-review><h2><vl-i18n key="share.review"/></h2><dl class="vl-review-list"><div><dt><vl-i18n key="common.target"/></dt><dd>/{}</dd></div><div><dt><vl-i18n key="share.permission"/></dt><dd data-review-permission><vl-i18n key="share.download_only"/></dd></div><div><dt><vl-i18n key="auth.password"/></dt><dd data-review-password><vl-i18n key="share.no_password"/></dd></div><div><dt><vl-i18n key="share.limit"/></dt><dd data-review-limit><vl-i18n key="common.unlimited"/></dd></div></dl><div class="vl-field"><span><vl-i18n key="share.url_preview"/></span><code data-review-url>{}</code></div><p class="vl-muted"><vl-i18n key="share.audit_help"/></p></aside></div>"#,
         esc(&session_data.csrf_token),
         esc(&relative_path),
         esc(&relative_path),
@@ -3816,135 +3920,6 @@ async fn share_create_page(
     )))
 }
 
-#[allow(dead_code)]
-async fn share_create_page_legacy(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(q): Query<ShareQuery>,
-) -> Result<Html<String>> {
-    let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    let settings = runtime_settings(&state);
-    let mut rows = String::new();
-    let shares = database(state.db.clone(), |db| db.list_shares()).await?;
-    for sh in shares {
-        let url = format!(
-            "{}/v/{}",
-            settings.public_base_url.trim_end_matches('/'),
-            sh.token
-        );
-        let upload_limit = sh
-            .max_upload_size
-            .map(upload_limit_label)
-            .unwrap_or_else(|| format!("global ({})", human(settings.max_upload_size)));
-        let upload_conflict = match sh.upload_conflict_strategy {
-            UploadConflictStrategy::Reject => "Konflikt: ablehnen",
-            UploadConflictStrategy::OverwriteAllowed => "Konflikt: Überschreiben erlaubt",
-        };
-        let upload_conflict_form = if sh.is_directory && sh.permission.can_upload() {
-            let checked = if sh.upload_conflict_strategy.can_overwrite() {
-                "checked"
-            } else {
-                ""
-            };
-            format!(
-                r#"<div class="overwrite-panel"><form method="post" action="/admin/shares/{}/upload-conflict" class="button-group"><input type="hidden" name="csrf" value="{}"><label class="toggle-card"><input type="checkbox" name="overwrite_allowed" value="1" {}><span>Überschreiben erlauben<small>Kann jederzeit wieder deaktiviert werden.</small></span></label><button class="secondary">Übernehmen</button></form></div>"#,
-                sh.id,
-                esc(&s.csrf_token),
-                checked
-            )
-        } else {
-            String::new()
-        };
-        let upload_limit = format!("{upload_limit}; {upload_conflict}");
-        rows += &format!(
-            r#"<div class="share-card"><div class="share-main"><div><small class="muted">Pfad</small><br><code>{}</code><br><small>{}</small></div><div><small class="muted">Recht</small><br>{}</div><div><small class="muted">Status</small><br>{}<br>{}<br><small>Uploadlimit: {}</small></div><div><small class="muted">Downloads</small><br>{}/{}</div><div><small class="muted">Aktionen</small><div class="share-actions"><a class="button secondary" href="{}">Öffnen</a><button type="button" data-copy="{}">Kopieren</button><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button>{}</button></form><form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="danger">Löschen</button></form></div><form method="post" action="/admin/shares/{}/password" class="password-actions"><input type="hidden" name="csrf" value="{}"><input type="password" name="password" minlength="{}" maxlength="{}" placeholder="Passwort ersetzen"><input type="password" name="password_confirm" placeholder="Bestätigen"><button>Setzen</button><button class="secondary" name="remove" value="1">Entfernen</button></form></div></div>{}</div>"#,
-            esc(&sh.relative_path),
-            esc(&url),
-            esc(sh.permission.as_str()),
-            if sh.active { "aktiv" } else { "inaktiv" },
-            if sh.password_hash.is_some() {
-                "passwortgeschützt"
-            } else {
-                "ohne Passwort"
-            },
-            esc(&upload_limit),
-            sh.download_count,
-            sh.max_downloads
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "∞".into()),
-            esc(&url),
-            esc(&url),
-            sh.id,
-            esc(&s.csrf_token),
-            if sh.active {
-                "Deaktivieren"
-            } else {
-                "Aktivieren"
-            },
-            sh.id,
-            esc(&s.csrf_token),
-            sh.id,
-            esc(&s.csrf_token),
-            settings.share_password_min_length,
-            settings.share_password_max_length,
-            upload_conflict_form,
-        );
-    }
-    let selected_raw = q.path.unwrap_or_default();
-    let selected = if selected_raw.is_empty() {
-        None
-    } else {
-        let rel = path_security::validate_relative(&selected_raw)
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let secure_root = state.secure_root.clone();
-        let metadata_path = rel.clone();
-        let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
-            .await
-            .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
-        Some((rel, metadata.is_dir()))
-    };
-    let create_section = if let Some((selected, is_dir)) = selected {
-        let permissions = if is_dir {
-            r#"<option value="download_only">Download only</option><option value="upload_only">Upload only</option><option value="download_upload">Download + Upload</option>"#
-        } else {
-            r#"<option value="download_only">Download only</option>"#
-        };
-        let upload_hint = if is_dir {
-            String::new()
-        } else {
-            r#"<p class="muted">Upload-Rechte sind nur für Ordnerlinks verfügbar. Für Uploads bitte im Dateibrowser einen Zielordner auswählen.</p>"#.into()
-        };
-        format!(
-            r#"<section><h1>Link erstellen</h1><div class="form-card"><h2>Ziel</h2><p>Ausgewähltes Ziel: <code>/{}</code> <span class="muted">({})</span></p>{}<p><a class="button secondary" href="/admin">Anderen Pfad im Dateibrowser auswählen</a></p></div><form method="post"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><div class="form-card"><h2>Freigabeoptionen</h2><div class="form-grid"><label>Berechtigung<br><select name="permission">{}</select></label><label class="toggle-card"><input type="checkbox" name="overwrite_allowed" value="1"><span>Überschreiben für Uploads erlauben<small>Uploader müssen das Ersetzen pro Upload zusätzlich bestätigen.</small></span></label></div></div><div class="form-card"><h2>Limits und Schutz</h2><div class="form-grid"><label>Alias (optional)<br><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}"></label>{}<label>Max. Downloads<br><input name="max_downloads" type="number" min="1"></label><label>Uploadlimit GB (optional)<br><input name="max_upload_size_gb" type="number" min="1" step="1" placeholder="global: {}"></label><label>Passwort (optional)<br><input name="password" type="password" minlength="{}" maxlength="{}"></label><label>Passwort bestätigen<br><input name="password_confirm" type="password"></label></div></div><button>Erstellen</button></form></section>"#,
-            esc(&selected),
-            if is_dir { "Ordner" } else { "Datei" },
-            upload_hint,
-            esc(&s.csrf_token),
-            esc(&selected),
-            permissions,
-            expiry_picker_html(),
-            display_limit_unit_floor(settings.max_upload_size, GB),
-            settings.share_password_min_length,
-            settings.share_password_max_length,
-        )
-    } else {
-        r#"<section><h1>Link erstellen</h1><p>Bitte zuerst im Dateibrowser eine Datei oder einen Ordner auswählen.</p><p><a class="button secondary" href="/admin">Pfad im Dateibrowser auswählen</a></p></section>"#.into()
-    };
-    let body = format!(
-        r#"{create_section}<section><h1>Freigaben</h1>{}</section>"#,
-        rows
-    );
-    Ok(Html(admin_page(
-        &state,
-        PageId::Links,
-        &body,
-        false,
-        &s.csrf_token,
-    )))
-}
 #[derive(Deserialize)]
 struct CreateShare {
     csrf: String,
@@ -3954,7 +3929,6 @@ struct CreateShare {
     expires_local: Option<String>,
     expires_tz_offset_minutes: Option<String>,
     max_downloads: Option<String>,
-    max_upload_size: Option<String>,
     max_upload_size_gb: Option<String>,
     password: Option<String>,
     password_confirm: Option<String>,
@@ -3987,15 +3961,10 @@ async fn create_share(
             "Uploads sind im MVP nur für Ordnerlinks erlaubt",
         ));
     }
-    let alias = f.alias.filter(|a| !a.is_empty());
-    if alias.as_ref().is_some_and(|a| {
-        a.len() < 3
-            || a.len() > 32
-            || !a
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    }) {
-        return Err(AppError(StatusCode::BAD_REQUEST, "Ungültiger Alias"));
+    let alias = f.alias.filter(|value| !value.is_empty());
+    if let Some(alias) = alias.as_deref() {
+        path_security::validate_new_share_alias(alias)
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Alias"))?;
     }
     let exp = parse_expiry(
         f.expires_local.as_deref(),
@@ -4054,24 +4023,13 @@ async fn create_share(
             "Das Übertragungslimit muss mindestens 1 sein",
         ));
     }
-    let max_upload_size = if let Some(value) = f
+    let max_upload_size = f
         .max_upload_size_gb
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        Some(parse_unit_to_bytes(value, GB, "Ungültiges Uploadlimit")?)
-    } else {
-        let parsed = f
-            .max_upload_size
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Uploadlimit"))?;
-        parsed
-    };
+        .map(|value| parse_unit_to_bytes(value, GB, "Ungültiges Uploadlimit"))
+        .transpose()?;
     if max_upload_size == Some(0) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
@@ -4140,10 +4098,13 @@ async fn toggle_share(
         .into_iter()
         .find(|v| v.id == id)
         .ok_or(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"))?;
-    database(state.db.clone(), move |db| {
+    let changed = database(state.db.clone(), move |db| {
         db.set_share_active(id, !sh.active)
     })
     .await?;
+    if !changed {
+        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+    }
     audit(
         &state,
         s.username,
@@ -4283,7 +4244,10 @@ async fn delete_share(
 ) -> Result<Redirect> {
     let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&s, &f.csrf)?;
-    database(state.db.clone(), move |db| db.delete_share(id)).await?;
+    let deleted = database(state.db.clone(), move |db| db.delete_share(id)).await?;
+    if !deleted {
+        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+    }
     audit(
         &state,
         s.username,
@@ -4336,8 +4300,12 @@ async fn start_security_key_registration(
     })
     .await?;
     let existing = decode_security_keys(&rows)?;
-    let challenge = state
+    let webauthn = state
         .webauthn
+        .read()
+        .expect("WebAuthn service lock poisoned")
+        .clone();
+    let challenge = webauthn
         .start_registration(&token, admin_id, &session.username, &existing)
         .map_err(|_| {
             AppError(
@@ -4369,8 +4337,13 @@ async fn finish_security_key_registration(
             "Ungültiger Schlüsselname",
         ));
     }
-    let key = state
+    let security_settings_guard = state.security_settings_mutation.lock().await;
+    let webauthn = state
         .webauthn
+        .read()
+        .expect("WebAuthn service lock poisoned")
+        .clone();
+    let key = webauthn
         .finish_registration(&token, session.admin_id, &body.credential)
         .map_err(|_| {
             AppError(
@@ -4391,6 +4364,7 @@ async fn finish_security_key_registration(
             "Sicherheitsschlüssel ist bereits registriert",
         )
     })?;
+    drop(security_settings_guard);
     audit(
         &state,
         session.username,
@@ -4504,7 +4478,7 @@ async fn change_account_password(
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
     let limiter_key = format!("account-password:{}", session.admin_id);
-    if !state.limiter.allowed(&limiter_key) {
+    if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Zu viele Passwortversuche",
@@ -4524,7 +4498,6 @@ async fn change_account_password(
     .await
     .map_err(internal)?;
     if !current_password_valid {
-        state.limiter.failure(&limiter_key);
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
     state.limiter.success(&limiter_key);
@@ -4591,7 +4564,7 @@ async fn start_account_mfa(
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
     let limiter_key = format!("account-mfa-start:{}", session.admin_id);
-    if !state.limiter.allowed(&limiter_key) {
+    if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Zu viele MFA-Versuche",
@@ -4611,7 +4584,6 @@ async fn start_account_mfa(
     .map_err(internal)?;
     let current_mfa_valid = auth::verify_totp_now(&admin.totp_secret, &form.current_code);
     if !current_password_valid || !current_mfa_valid {
-        state.limiter.failure(&limiter_key);
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
     state.limiter.success(&limiter_key);
@@ -4676,7 +4648,7 @@ async fn confirm_account_mfa(
         ));
     }
     let limiter_key = format!("account-mfa-confirm:{}", session.admin_id);
-    if !state.limiter.allowed(&limiter_key) {
+    if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Zu viele MFA-Versuche",
@@ -4693,7 +4665,6 @@ async fn confirm_account_mfa(
         "Kontoänderung fehlgeschlagen.",
     ))?;
     if !auth::verify_totp_now(&enrollment.totp_secret, &form.code) {
-        state.limiter.failure(&limiter_key);
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
     }
     state.limiter.success(&limiter_key);
@@ -5048,26 +5019,20 @@ async fn activate_admin(
 struct SettingsForm {
     csrf: String,
     public_base_url: String,
-    max_upload_size_gb: Option<String>,
-    max_upload_size: Option<String>,
+    max_upload_size_gb: String,
     blocked_extensions: String,
     share_password_min_length: String,
     share_password_max_length: Option<String>,
-    share_password_max_bytes: Option<String>,
     share_unlock_minutes: String,
-    max_zip_size_gb: Option<String>,
-    max_zip_size: Option<String>,
+    max_zip_size_gb: String,
     max_zip_files: String,
     max_search_entries: String,
     max_search_results: String,
-    max_preview_size_mb: Option<String>,
-    max_preview_size: Option<String>,
+    max_preview_size_mb: String,
     preview_extensions: String,
     image_preview_extensions: String,
     pdf_preview_enabled: Option<String>,
-    max_media_preview_size_mb: Option<String>,
-    max_media_preview_size_gb: Option<String>,
-    max_media_preview_size: Option<String>,
+    max_media_preview_size_mb: String,
     audit_client_ip_enabled: Option<String>,
 }
 
@@ -5145,36 +5110,22 @@ async fn update_settings(
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
     let mut next = runtime_settings(&state);
-    let max_upload_size = if let Some(value) = form.max_upload_size_gb.as_deref() {
-        parse_unit_to_bytes(value, GB, "Ungültiges Uploadlimit")?.to_string()
+    let max_upload_size =
+        parse_unit_to_bytes(&form.max_upload_size_gb, GB, "Ungültiges Uploadlimit")?.to_string();
+    let max_zip_size = if form.max_zip_size_gb.trim() == "0" {
+        "0".to_string()
     } else {
-        form.max_upload_size.unwrap_or_default()
+        parse_unit_to_bytes(&form.max_zip_size_gb, GB, "Ungültiges ZIP-Limit")?.to_string()
     };
-    let max_zip_size = if let Some(value) = form.max_zip_size_gb.as_deref() {
-        if value.trim() == "0" {
-            "0".to_string()
-        } else {
-            parse_unit_to_bytes(value, GB, "Ungültiges ZIP-Limit")?.to_string()
-        }
-    } else {
-        form.max_zip_size.unwrap_or_default()
-    };
-    let max_preview_size = if let Some(value) = form.max_preview_size_mb.as_deref() {
-        parse_unit_to_bytes(value, MB, "Ungültiges Preview-Limit")?.to_string()
-    } else {
-        form.max_preview_size.unwrap_or_default()
-    };
-    let max_media_preview_size = if let Some(value) = form.max_media_preview_size_mb.as_deref() {
-        parse_unit_to_bytes(value, MB, "Ungültiges Media-Preview-Limit")?.to_string()
-    } else if let Some(value) = form.max_media_preview_size_gb.as_deref() {
-        parse_unit_to_bytes(value, GB, "Ungültiges Media-Preview-Limit")?.to_string()
-    } else {
-        form.max_media_preview_size.unwrap_or_default()
-    };
-    let share_password_max_length = form
-        .share_password_max_length
-        .or(form.share_password_max_bytes)
-        .unwrap_or_default();
+    let max_preview_size =
+        parse_unit_to_bytes(&form.max_preview_size_mb, MB, "Ungültiges Preview-Limit")?.to_string();
+    let max_media_preview_size = parse_unit_to_bytes(
+        &form.max_media_preview_size_mb,
+        MB,
+        "Ungültiges Media-Preview-Limit",
+    )?
+    .to_string();
+    let share_password_max_length = form.share_password_max_length.unwrap_or_default();
     let entries = [
         ("public_base_url", form.public_base_url.as_str()),
         ("max_upload_size", max_upload_size.as_str()),
@@ -5451,7 +5402,7 @@ async fn unlock_share(
     };
     let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
     let key = format!("share:{}:{ip}", share.id);
-    if !state.share_limiter.allowed(&key) {
+    if !state.share_limiter.check_and_record_attempt(&key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Zu viele Passwortversuche",
@@ -5463,7 +5414,6 @@ async fn unlock_share(
             .await
             .map_err(internal)?;
     if !valid {
-        state.share_limiter.failure(&key);
         audit(
             &state,
             "public".into(),
@@ -6622,14 +6572,17 @@ pub(crate) async fn upload(
                     "Upload ist zu groß",
                 ));
             };
-            if !storage_has_room(state.secure_root.display_root(), chunk.len() as u64) {
+            let Some(_reservation) = UploadChunkReservation::acquire(
+                state.secure_root.display_root(),
+                chunk.len() as u64,
+            ) else {
                 return Ok(public_upload_error(
                     &token,
                     &upload_subdir,
                     StatusCode::INSUFFICIENT_STORAGE,
                     "Nicht genug freier Speicher",
                 ));
-            }
+            };
             total = new_total;
             if let Err(e) = output.write_all(&chunk).await {
                 return if storage_full_error(&e) {
@@ -6879,8 +6832,20 @@ async fn upload_queue(
 }
 async fn short_redirect(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     AxPath(alias): AxPath<String>,
 ) -> Result<Redirect> {
+    let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
+    if !state
+        .alias_limiter
+        .check_and_record_attempt(&format!("alias:{ip}"))
+    {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele Alias-Anfragen",
+        ));
+    }
     if alias.len() > 32
         || !alias
             .chars()
@@ -8315,6 +8280,7 @@ mod tests {
         let folder = response_text(app.clone().oneshot(folder_request).await.unwrap()).await;
         assert!(folder.contains(r#"<strong>/uploads</strong>"#));
         assert!(folder.contains(r#"<input type="hidden" name="path" value="uploads">"#));
+        assert!(folder.contains(r#"pattern="[A-Za-z0-9_-]{12,32}""#));
         assert!(folder.contains(r#"value="upload_only""#));
 
         let mut file_request = request(Method::GET, "/admin/shares/new?path=file.txt", "");
@@ -8344,6 +8310,20 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
+        let mut short_alias = request(
+            Method::POST,
+            "/admin/shares",
+            "csrf=csrf-token&path=uploads&permission=upload_only&alias=short&max_downloads=&password=&password_confirm=",
+        );
+        short_alias.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=session-token"),
+        );
+        assert_eq!(
+            app.clone().oneshot(short_alias).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
         let mut create_request = request(
             Method::POST,
             "/admin/shares",
@@ -8361,7 +8341,7 @@ mod tests {
         let mut rejected_zero = request(
             Method::POST,
             "/admin/shares",
-            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&max_downloads=&max_upload_size=0&password=&password_confirm=",
+            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&max_downloads=&max_upload_size_gb=0&password=&password_confirm=",
         );
         rejected_zero.headers_mut().insert(
             header::COOKIE,
@@ -8372,17 +8352,17 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
-        let mut legacy_limit = request(
+        let mut upload_limit = request(
             Method::POST,
             "/admin/shares",
-            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&max_downloads=&max_upload_size=1234&password=&password_confirm=",
+            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&max_downloads=&max_upload_size_gb=2&password=&password_confirm=",
         );
-        legacy_limit.headers_mut().insert(
+        upload_limit.headers_mut().insert(
             header::COOKIE,
             HeaderValue::from_static("vaultlink_session=session-token"),
         );
         assert_eq!(
-            app.oneshot(legacy_limit).await.unwrap().status(),
+            app.clone().oneshot(upload_limit).await.unwrap().status(),
             StatusCode::SEE_OTHER
         );
         let shares = state.db.list_shares().unwrap();
@@ -8392,9 +8372,35 @@ mod tests {
         assert_eq!(
             shares
                 .iter()
-                .filter(|share| share.max_upload_size == Some(1234))
+                .filter(|share| share.max_upload_size == Some(2 * GB))
                 .count(),
             1
+        );
+
+        state
+            .db
+            .create_share(
+                "legacy-token",
+                Some("old"),
+                "uploads",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let legacy_alias = app
+            .oneshot(request(Method::GET, "/s/old", ""))
+            .await
+            .unwrap();
+        assert_eq!(legacy_alias.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            legacy_alias.headers().get(header::LOCATION).unwrap(),
+            "/v/legacy-token"
         );
     }
 
@@ -9321,7 +9327,7 @@ mod tests {
         let mut settings_request = request(
             Method::POST,
             "/admin/settings",
-            "csrf=csrf-token&public_base_url=http%3A%2F%2Flocalhost%3A9999&max_upload_size=16&blocked_extensions=exe%2Cbat&share_password_min_length=12&share_password_max_bytes=128&share_unlock_minutes=30&max_zip_size=2048&max_zip_files=20&max_search_entries=200&max_search_results=20&max_preview_size=64&preview_extensions=txt%2Clog&image_preview_extensions=jpg%2Cpng&pdf_preview_enabled=on&max_media_preview_size=4096",
+            "csrf=csrf-token&public_base_url=http%3A%2F%2Flocalhost%3A9999&max_upload_size_gb=16&blocked_extensions=exe%2Cbat&share_password_min_length=12&share_password_max_length=128&share_unlock_minutes=30&max_zip_size_gb=2&max_zip_files=20&max_search_entries=200&max_search_results=20&max_preview_size_mb=64&preview_extensions=txt%2Clog&image_preview_extensions=jpg%2Cpng&pdf_preview_enabled=on&max_media_preview_size_mb=4096",
         );
         settings_request
             .headers_mut()
@@ -9330,14 +9336,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let runtime = state.runtime.read().unwrap().clone();
         assert_eq!(runtime.public_base_url, "http://localhost:9999");
-        assert_eq!(runtime.max_upload_size, 16);
+        assert_eq!(runtime.max_upload_size, 16 * GB);
         assert_eq!(runtime.blocked_extensions, ["exe", "bat"]);
         assert!(state
             .db
             .runtime_settings()
             .unwrap()
             .iter()
-            .any(|(key, value)| key == "max_preview_size" && value == "64"));
+            .any(|(key, value)| key == "max_preview_size" && value == &(64 * MB).to_string()));
     }
 
     #[tokio::test]

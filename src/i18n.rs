@@ -435,7 +435,7 @@ catalog! {
     UPLOAD_LINK_FOLDER_ONLY, "share.upload_link_folder", "Upload-Rechte sind nur für Ordnerlinks verfügbar. Für Uploads bitte im Dateibrowser einen Zielordner auswählen.", "Upload permission is available for folder links only. Select a target folder in the file browser.";
     ALIAS_OPTIONAL, "share.alias_optional", "Alias (optional)", "Alias (optional)";
     SHORT_ALIAS, "share.short_alias", "Kurzer Alias", "Short alias";
-    ALIAS_HELP, "share.alias_help", "Optional, 3–32 Zeichen.", "Optional, 3–32 characters.";
+    ALIAS_HELP, "share.alias_help", "Optional, 12–32 Zeichen.", "Optional, 12–32 characters.";
     MAX_DOWNLOADS, "share.max_downloads", "Max. Downloads", "Max. downloads";
     MAX_TRANSFERS, "share.max_transfers", "Max. gezählte Übertragungen", "Max. counted transfers";
     COUNTED_TRANSFERS, "share.counted_transfers", "gezählte Übertragungen", "counted transfers";

@@ -55,7 +55,7 @@ impl RuntimeSettings {
             max_upload_size: config.storage.max_upload_size,
             blocked_extensions: normalize_extensions(&config.storage.blocked_extensions),
             share_password_min_length: config.security.share_password_min_length,
-            share_password_max_length: config.security.share_password_max_bytes,
+            share_password_max_length: config.security.share_password_max_length,
             share_unlock_minutes: config.security.share_unlock_minutes,
             max_zip_size: config.storage.max_zip_size,
             max_zip_files: config.storage.max_zip_files,
@@ -151,6 +151,7 @@ impl RuntimeSettings {
             || public_base_url.fragment().is_some()
             || !public_base_url.username().is_empty()
             || public_base_url.password().is_some()
+            || public_base_url.path() != "/"
         {
             return Err(
                 "public_base_url must be an absolute HTTP(S) URL without credentials, query, or fragment"
@@ -167,7 +168,8 @@ impl RuntimeSettings {
         }
         if self.share_password_min_length < 8
             || self.share_password_max_length < self.share_password_min_length
-            || self.share_unlock_minutes <= 0
+            || self.share_password_max_length > 1_024
+            || !(1..=43_200).contains(&self.share_unlock_minutes)
         {
             return Err("invalid share password policy".into());
         }
@@ -470,6 +472,20 @@ mod tests {
         settings.public_base_url = "https://user:secret@example.test".into();
         assert!(settings.validate().is_err());
         settings.public_base_url = "http:/missing-host".into();
+        assert!(settings.validate().is_err());
+        settings.public_base_url = "https://example.test/base/path".into();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn runtime_security_limits_are_bounded() {
+        let mut settings = RuntimeSettings::from_config(&config());
+        settings.share_unlock_minutes = 0;
+        assert!(settings.validate().is_err());
+        settings.share_unlock_minutes = 43_201;
+        assert!(settings.validate().is_err());
+        settings.share_unlock_minutes = 60;
+        settings.share_password_max_length = 1_025;
         assert!(settings.validate().is_err());
     }
 }

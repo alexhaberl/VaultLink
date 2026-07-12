@@ -185,8 +185,12 @@ pub struct Security {
     pub secure_cookie: bool,
     #[serde(default = "default_share_password_min")]
     pub share_password_min_length: usize,
-    #[serde(default = "default_share_password_max")]
-    pub share_password_max_bytes: usize,
+    #[serde(
+        default = "default_share_password_max",
+        rename = "share_password_max_length",
+        alias = "share_password_max_bytes"
+    )]
+    pub share_password_max_length: usize,
     #[serde(default = "default_share_unlock_minutes")]
     pub share_unlock_minutes: i64,
     #[serde(default = "default_attempts")]
@@ -202,7 +206,7 @@ impl Default for Security {
             login_window_seconds: default_window(),
             secure_cookie: true,
             share_password_min_length: default_share_password_min(),
-            share_password_max_bytes: default_share_password_max(),
+            share_password_max_length: default_share_password_max(),
             share_unlock_minutes: default_share_unlock_minutes(),
             share_password_attempts: default_attempts(),
             audit_client_ip_enabled: false,
@@ -230,6 +234,12 @@ fn default_share_password_max() -> usize {
 fn default_share_unlock_minutes() -> i64 {
     60
 }
+
+const MAX_SESSION_HOURS: i64 = 24 * 365;
+const MAX_AUTH_ATTEMPTS: usize = 100;
+const MAX_LOGIN_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+const MAX_SHARE_PASSWORD_LENGTH: usize = 1_024;
+const MAX_SHARE_UNLOCK_MINUTES: i64 = 30 * 24 * 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -330,6 +340,18 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "public_base_url must be an absolute HTTP(S) URL without credentials, query, or fragment"
                     .into(),
+            ));
+        }
+        let authority_start = self
+            .server
+            .public_base_url
+            .find("://")
+            .map(|index| index + 3)
+            .unwrap_or_default();
+        if url.path() != "/" || self.server.public_base_url[authority_start..].contains(['/', '\\'])
+        {
+            return Err(ConfigError::Invalid(
+                "public_base_url must use the root path and omit the trailing slash".into(),
             ));
         }
         let listen: std::net::SocketAddr = self.server.listen_address.parse().map_err(|_| {
@@ -490,10 +512,26 @@ impl Config {
                 "image_preview_extensions must not include active content types".into(),
             ));
         }
+        if !(1..=MAX_SESSION_HOURS).contains(&self.security.session_hours) {
+            return Err(ConfigError::Invalid(format!(
+                "session_hours must be between 1 and {MAX_SESSION_HOURS}"
+            )));
+        }
+        if !(1..=MAX_AUTH_ATTEMPTS).contains(&self.security.login_attempts) {
+            return Err(ConfigError::Invalid(format!(
+                "login_attempts must be between 1 and {MAX_AUTH_ATTEMPTS}"
+            )));
+        }
+        if !(1..=MAX_LOGIN_WINDOW_SECONDS).contains(&self.security.login_window_seconds) {
+            return Err(ConfigError::Invalid(format!(
+                "login_window_seconds must be between 1 and {MAX_LOGIN_WINDOW_SECONDS}"
+            )));
+        }
         if self.security.share_password_min_length < 8
-            || self.security.share_password_max_bytes < self.security.share_password_min_length
-            || self.security.share_unlock_minutes <= 0
-            || self.security.share_password_attempts == 0
+            || self.security.share_password_max_length < self.security.share_password_min_length
+            || self.security.share_password_max_length > MAX_SHARE_PASSWORD_LENGTH
+            || !(1..=MAX_SHARE_UNLOCK_MINUTES).contains(&self.security.share_unlock_minutes)
+            || !(1..=MAX_AUTH_ATTEMPTS).contains(&self.security.share_password_attempts)
         {
             return Err(ConfigError::Invalid("invalid share password policy".into()));
         }
@@ -865,6 +903,9 @@ mod tests {
     fn public_base_url_rejects_ambiguous_suffixes_and_credentials() {
         let mut c = base();
         for value in [
+            "http://localhost:8080/",
+            "http://localhost:8080/base/path",
+            "http://localhost:8080/.",
             "http://localhost:8080?next=/admin",
             "http://localhost:8080/#section",
             "http://user:secret@localhost:8080",
@@ -874,6 +915,69 @@ mod tests {
             c.server.public_base_url = value.into();
             assert!(c.validate().is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn security_limits_are_positive_and_bounded() {
+        let mut c = base();
+        c.validate().unwrap();
+
+        for invalid in [0, MAX_SESSION_HOURS + 1] {
+            c.security.session_hours = invalid;
+            assert!(c.validate().is_err(), "accepted session_hours={invalid}");
+        }
+        c.security.session_hours = default_session_hours();
+
+        for invalid in [0, MAX_AUTH_ATTEMPTS + 1] {
+            c.security.login_attempts = invalid;
+            assert!(c.validate().is_err(), "accepted login_attempts={invalid}");
+        }
+        c.security.login_attempts = default_attempts();
+
+        for invalid in [0, MAX_LOGIN_WINDOW_SECONDS + 1] {
+            c.security.login_window_seconds = invalid;
+            assert!(
+                c.validate().is_err(),
+                "accepted login_window_seconds={invalid}"
+            );
+        }
+        c.security.login_window_seconds = default_window();
+
+        for invalid in [0, MAX_SHARE_UNLOCK_MINUTES + 1] {
+            c.security.share_unlock_minutes = invalid;
+            assert!(
+                c.validate().is_err(),
+                "accepted share_unlock_minutes={invalid}"
+            );
+        }
+        c.security.share_unlock_minutes = default_share_unlock_minutes();
+
+        c.security.share_password_max_length = MAX_SHARE_PASSWORD_LENGTH + 1;
+        assert!(c.validate().is_err(), "accepted excessive password length");
+        c.security.share_password_max_length = default_share_password_max();
+
+        for invalid in [0, MAX_AUTH_ATTEMPTS + 1] {
+            c.security.share_password_attempts = invalid;
+            assert!(
+                c.validate().is_err(),
+                "accepted share_password_attempts={invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_max_length_uses_character_name_and_accepts_legacy_key() {
+        let serialized = toml::to_string(&base()).unwrap();
+        assert!(serialized.contains("share_password_max_length = 256"));
+        assert!(!serialized.contains("share_password_max_bytes"));
+
+        let legacy = serialized.replace(
+            "share_password_max_length = 256",
+            "share_password_max_bytes = 256",
+        );
+        let parsed: Config = toml::from_str(&legacy).unwrap();
+        assert_eq!(parsed.security.share_password_max_length, 256);
+        parsed.validate().unwrap();
     }
 
     #[test]
@@ -1047,13 +1151,13 @@ mod tests {
     }
 
     #[test]
-    fn standalone_readiness_target_preserves_hostname_and_replaces_path() {
+    fn standalone_readiness_target_preserves_hostname() {
         let mut c = base();
         c.server.mode = ServerMode::StandaloneTls;
         c.server.production_mode = true;
         configure_local_mount_policy(&mut c);
         c.server.listen_address = "0.0.0.0:443".into();
-        c.server.public_base_url = "https://files.example.test/base/path".into();
+        c.server.public_base_url = "https://files.example.test".into();
         c.security.secure_cookie = true;
         c.tls.enabled = true;
         c.tls.certificate_source = CertificateSource::LetsEncrypt;
