@@ -347,7 +347,7 @@ if grep -Fq "$ADMIN_PASSWORD" "$SETUP_LOG" "$APP_LOG"; then
     fail "logs contain sensitive setup data"
 fi
 
-TOMBSTONE="$ROOT_DIR/.vaultlink-delete-AAAAAAAAAAAAAAAAAAAAAAAA.tombstone"
+TOMBSTONE="$ROOT_DIR/.vaultlink-internal/tombstones/.vaultlink-delete-AAAAAAAAAAAAAAAAAAAAAAAA.tombstone"
 mkdir -p "$TOMBSTONE/nested"
 printf '%s\n' 'restart cleanup' > "$TOMBSTONE/nested/child.txt"
 kill "$APP_PID"
