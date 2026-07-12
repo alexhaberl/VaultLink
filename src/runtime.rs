@@ -158,8 +158,6 @@ impl RuntimeSettings {
             );
         }
         if self.max_upload_size == 0
-            || self.max_zip_size == 0
-            || self.max_zip_files == 0
             || self.max_search_entries == 0
             || self.max_search_results == 0
             || self.max_preview_size == 0
@@ -368,7 +366,10 @@ mod tests {
         assert_eq!(settings.max_upload_size, 50);
         assert_eq!(settings.preview_extensions, ["txt", "log", "json"]);
         assert!(settings.apply("blocked_extensions", "../x").is_err());
-        assert!(settings.apply("max_zip_files", "0").is_err());
+        settings.apply("max_zip_files", "0").unwrap();
+        settings.apply("max_zip_size", "0").unwrap();
+        assert_eq!(settings.max_zip_files, 0);
+        assert_eq!(settings.max_zip_size, 0);
         let blocked = parse_extension_list("exe,.SH").unwrap();
         assert!(extension_is_blocked("payload.ExE", &blocked));
         assert!(extension_is_blocked("script.sh", &blocked));

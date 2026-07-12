@@ -447,9 +447,7 @@ impl Config {
                 "max_upload_size must be positive".into(),
             ));
         }
-        if self.storage.max_zip_size == 0
-            || self.storage.max_zip_files == 0
-            || self.storage.max_search_entries == 0
+        if self.storage.max_search_entries == 0
             || self.storage.max_search_results == 0
             || self.storage.max_preview_size == 0
             || self.storage.max_media_preview_size == 0
@@ -651,6 +649,14 @@ mod tests {
         let mut c = base();
         c.server.listen_address = "0.0.0.0:8080".into();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn zero_disables_zip_limits() {
+        let mut c = base();
+        c.storage.max_zip_size = 0;
+        c.storage.max_zip_files = 0;
+        c.validate().unwrap();
     }
 
     #[test]

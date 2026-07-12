@@ -9,6 +9,7 @@
 - Kept the privileged setup UI loopback-only while adding an explicit IPv4 SSH-tunnel workflow, clearer post-setup listen-address labeling, and hardened setup boundary validation.
 - Bound Web and API session creation atomically to the still-current password hash and active administrator state so concurrent credential rotation or deactivation cannot create a stale session.
 - Renamed the product tagline to “Secure file sharing”, restricted `init-admin` to initial bootstrap, and made CLI command/option parsing fail closed.
+- Made the ZIP source-size and file-count limits independently optional with `0`, while retaining scan, overflow, ZIP64, and temporary-storage safeguards.
 
 ## 0.3.5 — 2026-07-11
 

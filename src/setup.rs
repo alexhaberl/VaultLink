@@ -977,8 +977,8 @@ fn setup_form(token: &str, error: Option<&str>) -> String {
     <label><vl-i18n key="setup.blocked_extensions"/><br><input name="blocked_extensions" value="exe,sh,php"></label>
   </div></section>
   <section class="form-card"><h2><vl-i18n key="setup.zip_search_preview"/></h2><div class="form-grid">
-    <label><vl-i18n key="setup.zip_max_gb"/><br><input name="max_zip_size_gb" type="number" min="1" step="1" value="1" required></label>
-    <label><vl-i18n key="setup.zip_max_files"/><br><input name="max_zip_files" type="number" min="1" value="10000" required></label>
+    <label><vl-i18n key="setup.zip_max_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="1" required></label>
+    <label><vl-i18n key="setup.zip_max_files"/><br><input name="max_zip_files" type="number" min="0" value="10000" required></label>
     <label><vl-i18n key="setup.search_max_entries"/><br><input name="max_search_entries" type="number" min="1" value="50000" required></label>
     <label><vl-i18n key="setup.search_max_results"/><br><input name="max_search_results" type="number" min="1" value="500" required></label>
     <label><vl-i18n key="setup.text_preview_max_mb"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="1" required></label>

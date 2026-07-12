@@ -2899,13 +2899,13 @@ fn plan_zip<D: DirectoryAccess>(
                     archive_name: archive_name.clone(),
                     scanned_len: entry.len,
                 });
-                if files.len() > settings.max_zip_files {
+                if settings.max_zip_files != 0 && files.len() > settings.max_zip_files {
                     return Err(ZipBuildError::Limit("zip file count limit exceeded"));
                 }
                 total_data = total_data
                     .checked_add(entry.len)
                     .ok_or(ZipBuildError::Limit("zip size overflow"))?;
-                if total_data > settings.max_zip_size {
+                if settings.max_zip_size != 0 && total_data > settings.max_zip_size {
                     return Err(ZipBuildError::Limit("zip size limit exceeded"));
                 }
             }
@@ -3114,7 +3114,7 @@ fn write_zip_archive<D: DirectoryAccess, W: Write>(
             total_data = total_data
                 .checked_add(read as u64)
                 .ok_or(ZipBuildError::Limit("zip size overflow"))?;
-            if total_data > plan.max_data_size {
+            if plan.max_data_size != 0 && total_data > plan.max_data_size {
                 return Err(ZipBuildError::Limit("zip size limit exceeded"));
             }
             crc = update_crc32(crc, &buffer[..read]);
@@ -5083,7 +5083,7 @@ fn settings_form(
         String::new()
     };
     format!(
-        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label><vl-i18n key="settings.upload_limit"/><br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.blocked"/><br><input name="blocked_extensions" value="{}"></label><label><vl-i18n key="settings.password_min"/><br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.password_max"/><br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.unlock_minutes"/><br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.zip_gb"/><br><input name="max_zip_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.zip_files"/><br><input name="max_zip_files" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_entries"/><br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_results"/><br><input name="max_search_results" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.text_preview"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.text_extensions"/><br><input name="preview_extensions" value="{}" required></label><label><vl-i18n key="settings.media_preview"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.image_extensions"/><br><input name="image_preview_extensions" value="{}"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" {}><span><vl-i18n key="settings.pdf_active"/><small><vl-i18n key="settings.pdf_help"/></small></span></label><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled" {}><span><vl-i18n key="settings.audit_ip"/><small><vl-i18n key="settings.audit_ip_help"/></small></span></label><button><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
+        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label><vl-i18n key="settings.upload_limit"/><br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.blocked"/><br><input name="blocked_extensions" value="{}"></label><label><vl-i18n key="settings.password_min"/><br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.password_max"/><br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.unlock_minutes"/><br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.zip_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="{}" required></label><label><vl-i18n key="settings.zip_files"/><br><input name="max_zip_files" type="number" min="0" value="{}" required></label><label><vl-i18n key="settings.search_entries"/><br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_results"/><br><input name="max_search_results" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.text_preview"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.text_extensions"/><br><input name="preview_extensions" value="{}" required></label><label><vl-i18n key="settings.media_preview"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.image_extensions"/><br><input name="image_preview_extensions" value="{}"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" {}><span><vl-i18n key="settings.pdf_active"/><small><vl-i18n key="settings.pdf_help"/></small></span></label><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled" {}><span><vl-i18n key="settings.audit_ip"/><small><vl-i18n key="settings.audit_ip_help"/></small></span></label><button><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
         esc(&session.csrf_token),
         esc(&settings.public_base_url),
         display_limit_unit_floor(settings.max_upload_size, GB),
@@ -5126,7 +5126,11 @@ async fn update_settings(
         form.max_upload_size.unwrap_or_default()
     };
     let max_zip_size = if let Some(value) = form.max_zip_size_gb.as_deref() {
-        parse_unit_to_bytes(value, GB, "Ungültiges ZIP-Limit")?.to_string()
+        if value.trim() == "0" {
+            "0".to_string()
+        } else {
+            parse_unit_to_bytes(value, GB, "Ungültiges ZIP-Limit")?.to_string()
+        }
     } else {
         form.max_zip_size.unwrap_or_default()
     };
@@ -7264,6 +7268,25 @@ mod tests {
     }
 
     #[test]
+    fn zero_disables_zip_size_and_file_count_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/one.txt"), b"one").unwrap();
+        std::fs::write(root.path().join("docs/two.txt"), b"two").unwrap();
+        let state = test_state(root.path(), data.path());
+        let scope = state.secure_root.bind_directory("docs").unwrap();
+        let mut settings = runtime_settings(&state);
+        settings.max_zip_size = 0;
+        settings.max_zip_files = 0;
+
+        let plan = plan_zip(&scope, "", &settings).unwrap();
+        assert_eq!(plan.files.len(), 2);
+        assert_eq!(plan.max_data_size, 0);
+        write_zip_archive(&scope, &plan, Vec::new()).unwrap();
+    }
+
+    #[test]
     fn zip_planning_bounds_empty_directory_scans() {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -7980,7 +8003,7 @@ mod tests {
         assert!(
             html.contains(r#"name="max_upload_size_gb" type="number" min="1" step="1" value="53""#)
         );
-        assert!(html.contains(r#"name="max_zip_size_gb" type="number" min="1" step="1" value="1""#));
+        assert!(html.contains(r#"name="max_zip_size_gb" type="number" min="0" step="1" value="1""#));
         assert!(
             html.contains(r#"name="max_preview_size_mb" type="number" min="1" step="1" value="1""#)
         );

@@ -212,8 +212,8 @@ catalog! {
     SETUP_MAX_UPLOAD_MB, "setup.max_upload_mb", "Max. Upload MB", "Max upload MB";
     SETUP_BLOCKED_EXTENSIONS, "setup.blocked_extensions", "Blockierte Endungen", "Blocked extensions";
     SETUP_ZIP_SEARCH_PREVIEW, "setup.zip_search_preview", "ZIP, Suche und Preview", "ZIP, search, and preview";
-    SETUP_ZIP_MAX_GB, "setup.zip_max_gb", "ZIP Max. GB", "ZIP max GB";
-    SETUP_ZIP_MAX_FILES, "setup.zip_max_files", "ZIP Max. Dateien", "ZIP max files";
+    SETUP_ZIP_MAX_GB, "setup.zip_max_gb", "Max. Quelldaten pro ZIP in GB (0 = kein separates Limit)", "Max source data per ZIP in GB (0 = no separate limit)";
+    SETUP_ZIP_MAX_FILES, "setup.zip_max_files", "Max. Dateien pro ZIP (0 = kein separates Limit)", "Max files per ZIP (0 = no separate limit)";
     SETUP_SEARCH_MAX_ENTRIES, "setup.search_max_entries", "Suche Max. Einträge", "Search max entries";
     SETUP_SEARCH_MAX_RESULTS, "setup.search_max_results", "Suche Max. Treffer", "Search max results";
     SETUP_TEXT_PREVIEW_MAX_MB, "setup.text_preview_max_mb", "Text-Preview Max. MB", "Text preview max MB";
@@ -527,8 +527,8 @@ catalog! {
     SHARE_PASSWORD_MIN, "settings.password_min", "Share-Passwort Min. Zeichen", "Share password min. characters";
     SHARE_PASSWORD_MAX, "settings.password_max", "Share-Passwort Max. Zeichen", "Share password max. characters";
     UNLOCK_MINUTES, "settings.unlock_minutes", "Unlock Minuten", "Unlock minutes";
-    ZIP_MAX_GB, "settings.zip_gb", "ZIP Max. GB", "ZIP max. GB";
-    ZIP_MAX_FILES, "settings.zip_files", "ZIP Max. Dateien", "ZIP max. files";
+    ZIP_MAX_GB, "settings.zip_gb", "Max. Quelldaten pro ZIP in GB (0 = kein separates Limit)", "Max source data per ZIP in GB (0 = no separate limit)";
+    ZIP_MAX_FILES, "settings.zip_files", "Max. Dateien pro ZIP (0 = kein separates Limit)", "Max files per ZIP (0 = no separate limit)";
     SEARCH_MAX_ENTRIES, "settings.search_entries", "Suche Max. Einträge", "Search max. entries";
     SEARCH_MAX_RESULTS, "settings.search_results", "Suche Max. Treffer", "Search max. results";
     TEXT_PREVIEW_MAX, "settings.text_preview", "Text-Preview Max. MB", "Text preview max. MB";

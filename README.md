@@ -85,7 +85,7 @@ Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadli
 
 Runtime-Settings werden als ein validierter Snapshot in SQLite geschrieben und erst danach atomar im Arbeitsspeicher ausgetauscht. Beim Start wird ebenfalls der vollständige Snapshot validiert; gültige gekoppelte Werte hängen nicht von der alphabetischen Schlüsselreihenfolge ab.
 
-ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenzt weiterhin die Summe der Quelldaten; `max_zip_files` und das auch für rohe ZIP-Scans geltende `max_search_entries` bleiben unabhängig davon aktiv.
+ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenzt die Summe der Quelldaten und `max_zip_files` die Dateianzahl; der Wert `0` deaktiviert die jeweilige separate Grenze. Die Prüfung des freien temporären Speicherplatzes, der Überlaufschutz und das auch für ZIP-Scans geltende `max_search_entries` bleiben unabhängig davon aktiv.
 
 ## 5. Routen- und API-Design
 
