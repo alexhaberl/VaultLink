@@ -3,6 +3,8 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    io,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -10,6 +12,7 @@ use std::{
 const SCHEMA_VERSION: i64 = 10;
 
 pub const TRANSFER_SESSION_TTL_SECONDS: i64 = 15 * 60;
+pub const TRANSFER_LEASE_MAX_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
 pub const ADMIN_MFA_ENROLLMENT_TTL_SECONDS: i64 = 10 * 60;
 
 #[derive(Clone)]
@@ -148,6 +151,8 @@ pub enum TransferLeaseCancelOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferLeaseHeartbeatOutcome {
     Extended,
+    CappedAndCounted,
+    CappedAlreadyCounted,
     NotFound,
 }
 
@@ -258,16 +263,66 @@ fn token_hash(token: &str) -> String {
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let path = path.as_ref();
+        let persistent = path != Path::new(":memory:");
+        if persistent {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) => validate_database_metadata(path, &metadata, false)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(database_io_error(error)),
+            }
+        }
         let mut conn = Connection::open(path)?;
-        if path != Path::new(":memory:") {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if persistent {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(database_io_error)?;
+            let metadata = std::fs::symlink_metadata(path).map_err(database_io_error)?;
+            validate_database_metadata(path, &metadata, true)?;
         }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&mut conn)?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
+}
+
+fn database_io_error(error: io::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+}
+
+fn invalid_database_file(path: &Path, reason: &str) -> rusqlite::Error {
+    database_io_error(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unsafe database file {}: {reason}", path.display()),
+    ))
+}
+
+fn validate_database_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    require_private_mode: bool,
+) -> rusqlite::Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(invalid_database_file(
+            path,
+            "symbolic links are not allowed",
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(invalid_database_file(path, "path is not a regular file"));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(invalid_database_file(
+            path,
+            "file is not owned by the effective service user",
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(invalid_database_file(path, "hard links are not allowed"));
+    }
+    if require_private_mode && metadata.mode() & 0o7777 != 0o600 {
+        return Err(invalid_database_file(path, "file mode is not 0600"));
+    }
+    Ok(())
 }
 
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -1304,6 +1359,19 @@ impl Database {
     }
     fn map_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
         let exp: Option<String> = r.get(6)?;
+        let expires_at = exp
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .map(|parsed| parsed.with_timezone(&Utc))
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+            })
+            .transpose()?;
         Ok(Share {
             id: r.get(0)?,
             token: r.get(1)?,
@@ -1312,9 +1380,7 @@ impl Database {
             is_directory: r.get::<_, i64>(4)? != 0,
             permission: Permission::parse(&r.get::<_, String>(5)?)
                 .ok_or(rusqlite::Error::InvalidQuery)?,
-            expires_at: exp
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|d| d.with_timezone(&Utc)),
+            expires_at,
             max_downloads: r.get(7)?,
             max_upload_size: r.get(8)?,
             download_count: r.get(9)?,
@@ -1336,8 +1402,7 @@ impl Database {
         let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,download_count,active,password_hash,upload_conflict_strategy,created_at FROM shares ORDER BY id DESC")?;
         let shares = s
             .query_map([], Self::map_share)?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(shares)
     }
     pub fn count_active_shares_for_path(
@@ -1416,12 +1481,11 @@ impl Database {
         transaction.commit()?;
         Ok(ids.len())
     }
-    pub fn set_share_active(&self, id: i64, active: bool) -> rusqlite::Result<()> {
-        self.conn().execute(
+    pub fn set_share_active(&self, id: i64, active: bool) -> rusqlite::Result<bool> {
+        Ok(self.conn().execute(
             "UPDATE shares SET active=?2 WHERE id=?1",
             params![id, active as i64],
-        )?;
-        Ok(())
+        )? == 1)
     }
     pub fn set_upload_conflict_strategy(
         &self,
@@ -1433,10 +1497,11 @@ impl Database {
             params![id, strategy.as_str()],
         )? == 1)
     }
-    pub fn delete_share(&self, id: i64) -> rusqlite::Result<()> {
-        self.conn()
-            .execute("DELETE FROM shares WHERE id=?1", [id])?;
-        Ok(())
+    pub fn delete_share(&self, id: i64) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn()
+            .execute("DELETE FROM shares WHERE id=?1", [id])?
+            == 1)
     }
     pub fn count_download(&self, id: i64) -> rusqlite::Result<bool> {
         let now = Utc::now().to_rfc3339();
@@ -1684,25 +1749,95 @@ impl Database {
         &self,
         lease_token: &str,
     ) -> rusqlite::Result<TransferLeaseHeartbeatOutcome> {
-        let (now, expires) = transfer_deadlines();
+        let now_datetime = Utc::now();
+        let now = now_datetime.to_rfc3339();
+        let rolling_expiry = now_datetime + Duration::seconds(TRANSFER_SESSION_TTL_SECONDS);
         let lease_token_hash = token_hash(lease_token);
         let mut connection = self.conn();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        cleanup_transfer_state(&transaction, &now)?;
         let grant = transaction
             .query_row(
-                "SELECT leases.grant_id,grants.counted
+                "SELECT leases.grant_id,grants.share_id,grants.counted,grants.action,
+                        leases.created_at,leases.expires_at
                  FROM public_transfer_leases leases
                  JOIN public_transfer_grants grants ON grants.id=leases.grant_id
-                 WHERE leases.token_hash=?1 AND leases.expires_at>?2",
-                params![lease_token_hash, now],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+                 WHERE leases.token_hash=?1",
+                [lease_token_hash.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((grant_id, counted)) = grant else {
+        let Some((grant_id, share_id, counted, action, created_at, lease_expires_at)) = grant
+        else {
+            cleanup_transfer_state(&transaction, &now)?;
             transaction.commit()?;
             return Ok(TransferLeaseHeartbeatOutcome::NotFound);
         };
+        let created_at = DateTime::parse_from_rfc3339(&created_at)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        let lease_expires_at = DateTime::parse_from_rfc3339(&lease_expires_at)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        let absolute_expiry = created_at + Duration::seconds(TRANSFER_LEASE_MAX_LIFETIME_SECONDS);
+        if absolute_expiry <= now_datetime {
+            let outcome = if counted {
+                TransferLeaseHeartbeatOutcome::CappedAlreadyCounted
+            } else {
+                if transaction.execute(
+                    "UPDATE shares SET download_count=download_count+1 WHERE id=?1",
+                    [share_id],
+                )? != 1
+                {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                if transaction.execute(
+                    "UPDATE public_transfer_grants SET counted=1,expires_at=?2
+                     WHERE id=?1 AND counted=0",
+                    params![grant_id, rolling_expiry.to_rfc3339()],
+                )? != 1
+                {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                let month = now.get(..7).ok_or(rusqlite::Error::InvalidQuery)?;
+                increment_transfer_monthly_count(&transaction, month, &action)?;
+                TransferLeaseHeartbeatOutcome::CappedAndCounted
+            };
+            transaction.execute(
+                "DELETE FROM public_transfer_leases WHERE token_hash=?1",
+                [lease_token_hash],
+            )?;
+            cleanup_transfer_state(&transaction, &now)?;
+            transaction.commit()?;
+            return Ok(outcome);
+        }
+        if lease_expires_at <= now_datetime {
+            cleanup_transfer_state(&transaction, &now)?;
+            transaction.commit()?;
+            return Ok(TransferLeaseHeartbeatOutcome::NotFound);
+        }
+        cleanup_transfer_state(&transaction, &now)?;
+        let expires = std::cmp::min(rolling_expiry, absolute_expiry).to_rfc3339();
         transaction.execute(
             "UPDATE public_transfer_leases
              SET heartbeat_at=?2,expires_at=?3 WHERE token_hash=?1",
@@ -1710,8 +1845,12 @@ impl Database {
         )?;
         if !counted {
             transaction.execute(
-                "UPDATE public_transfer_grants SET expires_at=?2 WHERE id=?1",
-                params![grant_id, expires],
+                "UPDATE public_transfer_grants
+                 SET expires_at=(
+                     SELECT MAX(expires_at) FROM public_transfer_leases WHERE grant_id=?1
+                 )
+                 WHERE id=?1",
+                [grant_id],
             )?;
         }
         transaction.commit()?;
@@ -1996,6 +2135,32 @@ pub fn rewrite_share_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_database_is_regular_private_and_not_linked() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data.sqlite");
+        std::fs::write(&path, []).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let database = Database::open(&path).unwrap();
+        drop(database);
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+
+        let hard_link = directory.path().join("data-hard-link.sqlite");
+        std::fs::hard_link(&path, &hard_link).unwrap();
+        assert!(Database::open(&path).is_err());
+
+        let symlink = directory.path().join("data-symlink.sqlite");
+        std::os::unix::fs::symlink(&path, &symlink).unwrap();
+        assert!(Database::open(&symlink).is_err());
+        assert!(Database::open(directory.path()).is_err());
+    }
+
     #[test]
     fn file_mutations_update_only_exact_share_subtrees() {
         let database = Database::open(":memory:").unwrap();
@@ -2749,10 +2914,45 @@ mod tests {
                 &UploadConflictStrategy::Reject,
             )
             .unwrap();
-        d.set_share_active(id, false).unwrap();
+        assert!(d.set_share_active(id, false).unwrap());
+        assert!(!d.set_share_active(id + 1, false).unwrap());
         assert!(!d.share_by_token("token").unwrap().unwrap().active);
-        d.delete_share(id).unwrap();
+        assert!(d.delete_share(id).unwrap());
+        assert!(!d.delete_share(id).unwrap());
         assert!(d.share_by_token("token").unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_share_expiry_fails_individual_and_list_queries() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        for (token, path) in [("valid", "valid.txt"), ("corrupt", "corrupt.txt")] {
+            database
+                .create_share(
+                    token,
+                    None,
+                    path,
+                    false,
+                    &Permission::DownloadOnly,
+                    None,
+                    None,
+                    None,
+                    1,
+                    None,
+                    &UploadConflictStrategy::Reject,
+                )
+                .unwrap();
+        }
+        database
+            .conn()
+            .execute(
+                "UPDATE shares SET expires_at='not-a-timestamp' WHERE token_hash=?1",
+                [token_hash("corrupt")],
+            )
+            .unwrap();
+
+        assert!(database.share_by_token("corrupt").is_err());
+        assert!(database.list_shares().is_err());
     }
 
     #[test]
@@ -3420,6 +3620,72 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             TransferLeaseHeartbeatOutcome::NotFound
         );
         assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn transfer_heartbeat_cannot_extend_lease_past_absolute_lifetime() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = database
+            .create_share(
+                "share",
+                None,
+                "file.bin",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        database
+            .begin_transfer_lease("client", "lease", share_id, "file.bin", "download")
+            .unwrap();
+        let older_than_absolute_limit =
+            Utc::now() - Duration::seconds(TRANSFER_LEASE_MAX_LIFETIME_SECONDS + 1);
+        {
+            let connection = database.conn();
+            connection
+                .execute(
+                    "UPDATE public_transfer_leases
+                     SET created_at=?1,expires_at='2000-01-01T00:00:00Z'",
+                    [older_than_absolute_limit.to_rfc3339()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE public_transfer_grants SET expires_at='2099-01-01T00:00:00Z'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            database.heartbeat_transfer_lease("lease").unwrap(),
+            TransferLeaseHeartbeatOutcome::CappedAndCounted
+        );
+        assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 0);
+        assert_eq!(
+            database
+                .share_by_token("share")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
+        assert_eq!(
+            database.complete_transfer_lease("lease").unwrap(),
+            TransferLeaseCompleteOutcome::NotFound
+        );
+        assert_eq!(
+            database
+                .begin_transfer_lease("other", "other-lease", share_id, "file.bin", "download")
+                .unwrap(),
+            TransferLeaseBeginOutcome::LimitReached
+        );
     }
 
     #[test]

@@ -10,12 +10,26 @@ pub fn effective_client_ip(peer: IpAddr, headers: &HeaderMap, config: &Config) -
     {
         return peer;
     }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(peer)
+
+    let mut forwarded = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(value) = value.to_str() else {
+            return peer;
+        };
+        forwarded.extend(value.split(',').map(str::trim));
+    }
+
+    let mut current = peer;
+    for candidate in forwarded.into_iter().rev() {
+        if !config.reverse_proxy.trusted_proxies.contains(&current) {
+            break;
+        }
+        let Ok(candidate) = candidate.parse() else {
+            return peer;
+        };
+        current = candidate;
+    }
+    current
 }
 #[cfg(test)]
 mod tests {
@@ -86,6 +100,60 @@ mod tests {
         assert_eq!(
             effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
             "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn ignores_attacker_controlled_leftmost_forwarded_value() {
+        let mut c = cfg();
+        c.server.mode = ServerMode::ReverseProxy;
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            "198.51.100.200, 203.0.113.7".parse().unwrap(),
+        );
+        assert_eq!(
+            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn walks_right_to_left_through_trusted_proxy_chain() {
+        let mut c = cfg();
+        c.server.mode = ServerMode::ReverseProxy;
+        c.reverse_proxy
+            .trusted_proxies
+            .push("10.0.0.2".parse().unwrap());
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7, 10.0.0.2".parse().unwrap());
+        assert_eq!(
+            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn stops_before_untrusted_forwarded_hops() {
+        let mut c = cfg();
+        c.server.mode = ServerMode::ReverseProxy;
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "not-an-ip, 203.0.113.7".parse().unwrap());
+        assert_eq!(
+            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_relevant_forwarded_hop_falls_back_to_peer() {
+        let mut c = cfg();
+        c.server.mode = ServerMode::ReverseProxy;
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        assert_eq!(
+            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
         );
     }
 }

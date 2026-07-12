@@ -90,7 +90,7 @@ pub async fn audit(
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
-    let _ = database(state.db.clone(), move |db| {
+    let result = database(state.db.clone(), move |db| {
         db.audit_with_client_ip(
             &actor,
             action,
@@ -100,6 +100,9 @@ pub async fn audit(
         )
     })
     .await;
+    if let Err(error) = result {
+        tracing::error!(?error, action, "could not persist audit event");
+    }
 }
 
 pub fn runtime_settings(state: &AppState) -> RuntimeSettings {
@@ -115,9 +118,24 @@ pub async fn commit_runtime_settings(
     next: RuntimeSettings,
     admin_id: i64,
 ) -> Result<()> {
+    let _security_settings_guard = state.security_settings_mutation.lock().await;
     next.validate_for_config(&state.config)
         .map_err(|_| HttpAuthError::status(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
     let public_url_changed = runtime_settings(state).public_base_url != next.public_base_url;
+    let replacement_webauthn = if public_url_changed {
+        Some(
+            crate::webauthn::WebAuthnService::from_public_base_url(&next.public_base_url).map_err(
+                |_| {
+                    HttpAuthError::status(
+                        StatusCode::BAD_REQUEST,
+                        "Ungültige WebAuthn-Konfiguration",
+                    )
+                },
+            )?,
+        )
+    } else {
+        None
+    };
     if public_url_changed {
         let credential_count = database(state.db.clone(), |database| {
             database.webauthn_credential_count()
@@ -131,6 +149,7 @@ pub async fn commit_runtime_settings(
         }
     }
     let runtime = state.runtime.clone();
+    let webauthn = state.webauthn.clone();
     database(state.db.clone(), move |database| {
         // Settings commits always acquire locks in Runtime -> Database order. Readers
         // therefore see the old snapshot until SQLite has committed the replacement.
@@ -138,6 +157,9 @@ pub async fn commit_runtime_settings(
         let pairs = next.pairs();
         database.replace_runtime_settings(&pairs, admin_id)?;
         *current = next;
+        if let Some(replacement) = replacement_webauthn {
+            *webauthn.write().expect("WebAuthn service lock poisoned") = replacement;
+        }
         Ok(())
     })
     .await

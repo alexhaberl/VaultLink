@@ -94,7 +94,7 @@ expected_mount_source = "/dev/mapper/vaultlink"
 
 `expected_mount_source` muss exakt dem Source-Feld der aktiven Zeile in `/proc/self/mountinfo` entsprechen; ein `UUID=`-Eintrag aus `/etc/fstab` ist nicht automatisch derselbe Wert. Für auditierten lokalen Storage sind ext2/3/4, XFS, Btrfs, F2FS, Bcachefs und ZFS zugelassen. Root, internes Verzeichnis und Data Directory gehören dem `vaultlink`-Dienstbenutzer und dürfen weder über Gruppen-/Other-Modusbits noch über die POSIX-ACL-Maske schreibbar sein; lokale Co-Writer sind bei `external_writers = false` nicht unterstützt. SQLite darf dabei auf demselben lokalen Mount liegen, aber niemals innerhalb des sichtbaren Baums. Bei CIFS/SMB muss SQLite zusätzlich auf einem getrennten lokalen Dateisystem liegen.
 
-`public_base_url` verwendet kanonische `http://`- beziehungsweise `https://`-Authority-Syntax und darf weder Zugangsdaten noch Query oder Fragment enthalten.
+`public_base_url` verwendet kanonische `http://`- beziehungsweise `https://`-Authority-Syntax ohne abschließenden Slash. Basispfade, Zugangsdaten, Query und Fragment sind nicht unterstützt.
 
 ### Externer SMB-Server mit Standardclients
 
@@ -155,11 +155,13 @@ ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenz
 | `/v/:token/download` | GET/HEAD | Streaming, einzelner Byte-Range, `206`/`416`; HEAD prüft die Transferquote, zählt und reserviert aber nicht |
 | `/v/:token/download.zip` | GET | limitierter ZIP-Download für Ordner |
 | `/v/:token/upload` | POST | exklusiver Ordnerupload |
-| `/s/:alias` | GET | validierter Kurzlink |
+| `/s/:alias` | GET | rate-limitierter Kurzlink; neue Aliase haben 12–32 Zeichen |
 
 `max_downloads` begrenzt abgeschlossene Inhaltsübertragungen (Download, ZIP und gezählte Vorschau), nicht den Aufruf der öffentlichen Metadaten-/Landingpage oder Uploads. `HEAD` liefert nur dann Metadaten, wenn derselbe logische `GET` mit der aktuellen Transfer-Session beginnen dürfte, verbraucht selbst aber keine Quote.
 
 Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.4.1` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
+
+Bei passwortgeschützten öffentlichen Shares liefert die Metadatenroute vor dem Unlock ausschließlich `{"locked":true}`. Clients müssen nach erfolgreichem Unlock mit dem gesetzten API-Cookie erneut abfragen; Pfad, Berechtigung und Transferzähler werden vorher nicht offengelegt.
 
 Wichtige API-Routen:
 

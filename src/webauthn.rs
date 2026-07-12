@@ -72,6 +72,11 @@ impl WebAuthnService {
         })
     }
 
+    #[cfg(test)]
+    pub fn instance_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     pub fn start_registration(
         &self,
         session_token: &str,
