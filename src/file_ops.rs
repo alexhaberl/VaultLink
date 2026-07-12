@@ -145,8 +145,16 @@ pub async fn delete(
     let cleanup_lock = state.storage_cleanup.clone();
     let database = state.db.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let inspected = secure_root.entry_status(&path).map_err(map_io)?;
+        validate_delete_confirmation(
+            &path,
+            inspected.kind == EntryKind::Directory && inspected.directory_non_empty,
+            confirmation.as_deref(),
+        )?;
         let staged = secure_root.stage_delete(&path).map_err(map_io)?;
         let status = staged.status().clone();
+        // A trusted external writer may change the path between inspection and
+        // the atomic rename. Revalidate the staged object before touching SQLite.
         validate_delete_confirmation(
             &path,
             status.kind == EntryKind::Directory && status.directory_non_empty,

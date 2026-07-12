@@ -1,10 +1,15 @@
-# Self-hosted GitHub Actions runner
+# GitHub Actions runner strategy
 
-VaultLink CI runs on a repository-scoped Debian 13 x86-64 runner with the
-labels `self-hosted`, `Linux`, `X64`, and `vaultlink`. Release jobs remain on a
-GitHub-hosted runner so that tagged release builds use a fresh environment.
+VaultLink uses native Linux runners for both supported release architectures.
+The existing repository-scoped runner remains the only amd64/x86-64 runner:
 
-## Host baseline
+- Debian 13 amd64: `[self-hosted, Linux, X64, vaultlink]`
+- Ubuntu 24.04 arm64: `ubuntu-24.04-arm` (GitHub-hosted)
+
+The arm64 runner is intentionally GitHub-hosted until a dedicated arm64 host is
+available. No x64 CI or release build is moved to a GitHub-hosted runner.
+
+## Self-hosted amd64 baseline
 
 - Debian 13, 8 vCPU, 8 GiB RAM, and at least 100 GiB SSD storage
 - Docker Engine from Docker's official Debian repository
@@ -20,24 +25,40 @@ this runner.
 
 ## Workflow behavior
 
-The CI workflow uses one job so that Cargo artifacts are reused by formatting,
-Clippy, tests, fuzz compilation, and audit checks within a run. Docker setup,
-API, upgrade, and rollback smoke tests run afterwards on the same host.
-Superseded pull-request runs are cancelled automatically.
+The CI workflow uses an amd64/arm64 include matrix. Formatting, Clippy, tests,
+fuzz-crate compilation, dependency audits, Docker smoke tests, and release
+builds run natively on both architectures. Each job verifies `uname -m` and the
+Rust host triple before compiling. Superseded pull-request runs are cancelled
+automatically.
 
-The weekly and manually dispatched fuzz gate also uses one runner job. It runs
-all eight ten-minute fuzz targets concurrently (`FUZZ_JOBS=8`), so its expected
-wall-clock runtime is about 10-15 minutes after toolchain and build setup. A
-single registered runner service serializes the CI and fuzz jobs, preventing
-the two CPU-intensive workloads from competing for the same VM.
+The weekly and manually dispatched fuzz campaign remains on the dedicated
+self-hosted amd64 runner. It runs all eight ten-minute fuzz targets concurrently
+(`FUZZ_JOBS=8`). A single registered runner service serializes amd64 CI, fuzz,
+and release work so that CPU-intensive workloads cannot compete on that host.
 
-The Docker smoke image validates the systemd units inside the container. This
-avoids granting the runner general `sudo` access merely to inspect paths under
-`/root`.
+Release builds use the same digest-pinned Debian 13/Rust 1.97.0 OCI index on
+both native runners. The pin contains both linux/amd64 and linux/arm64 images.
+The build jobs have read-only repository permissions and upload separate,
+short-lived unsigned inputs. The final self-hosted job downloads both immutable
+workflow artifacts, verifies `SHA256SUMS-amd64` and `SHA256SUMS-arm64`, and only
+then accesses the Minisign secret for a tag release.
+
+Release asset names identify version, Debian baseline, and architecture, for
+example:
+
+- `VaultLink-0.4.1-debian13-amd64.tar.gz`
+- `VaultLink-0.4.1-debian13-arm64.tar.gz`
+- `vaultlink-0.4.1-debian13-ARCH`
+- `vaultlink-0.4.1-debian13-ARCH.cdx.json`
+- `SHA256SUMS-ARCH`
+
+Archives, standalone binaries, and checksum manifests receive separate
+architecture-specific `.minisig` files. The signed checksum manifest also
+covers the architecture-specific SBOM.
 
 ## Operations
 
-Check the service and recent logs:
+Check the self-hosted service and recent logs:
 
 ```sh
 systemctl list-unit-files 'actions.runner.*.service'

@@ -259,7 +259,6 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let path = path.as_ref();
         let mut conn = Connection::open(path)?;
-        #[cfg(unix)]
         if path != Path::new(":memory:") {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));

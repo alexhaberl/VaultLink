@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("VaultLink supports Linux only");
+
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -12,6 +15,7 @@ pub mod range;
 pub mod runtime;
 pub mod secure_fs;
 pub mod setup;
+pub mod storage_mount;
 pub mod ui;
 pub mod web;
 pub mod webauthn;
@@ -40,8 +44,18 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         config.validate()?;
-        let secure_root = secure_fs::SecureRoot::open(&config.storage.root_mount_path)
-            .map_err(|error| format!("cannot initialize secure storage access (openat2 is required on Linux): {error}"))?;
+        storage_mount::validate(&config.storage)?;
+        let secure_root = secure_fs::SecureRoot::open_configured(
+            &config.storage.root_mount_path,
+            config.storage.internal_directory.as_deref(),
+            config.storage.require_mount,
+            config.storage.external_writers,
+        )
+        .map_err(|error| {
+            format!(
+                "cannot initialize secure storage access (openat2 is required on Linux): {error}"
+            )
+        })?;
         std::fs::create_dir_all(&config.storage.data_directory)?;
         let db = Database::open(config.storage.data_directory.join("data.sqlite"))?;
         let mut runtime = RuntimeSettings::from_config(&config);
@@ -96,6 +110,11 @@ mod tests {
             storage: Storage {
                 root_mount_path: root.into(),
                 data_directory: data.into(),
+                internal_directory: None,
+                require_mount: false,
+                external_writers: false,
+                expected_filesystem_type: None,
+                expected_mount_source: None,
                 max_upload_size: 1_000_000,
                 max_zip_size: 1_000_000,
                 max_zip_files: 100,

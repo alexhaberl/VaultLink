@@ -209,6 +209,13 @@ catalog! {
     SETUP_ROOT_MOUNT_PATH, "setup.root_mount_path", "Root-Mount-Pfad", "Root mount path";
     SETUP_BROWSE, "setup.browse", "Durchsuchen", "Browse";
     SETUP_DATA_DIRECTORY, "setup.data_directory", "Datenverzeichnis", "Data directory";
+    SETUP_INTERNAL_DIRECTORY, "setup.internal_directory", "Privates internes Verzeichnis", "Private internal directory";
+    SETUP_EXPECTED_FILESYSTEM_TYPE, "setup.expected_filesystem_type", "Erwarteter Dateisystemtyp", "Expected filesystem type";
+    SETUP_EXPECTED_MOUNT_SOURCE, "setup.expected_mount_source", "Erwartete Mount-Quelle", "Expected mount source";
+    SETUP_REQUIRE_MOUNT, "setup.require_mount", "Explizites Mount erzwingen", "Require explicit mount";
+    SETUP_REQUIRE_MOUNT_HELP, "setup.require_mount_help", "In Production immer aktiv. VaultLink startet nur mit exakt passender aktiver Mount-Identität.", "Always enabled in production. VaultLink starts only with the exact active mount identity.";
+    SETUP_EXTERNAL_WRITERS, "setup.external_writers", "Externe SMB-Schreiber", "External SMB writers";
+    SETUP_EXTERNAL_WRITERS_HELP, "setup.external_writers_help", "Standard-SMB-Clients schreiben direkt auf denselben CIFS/SMB3-Server; Replace-Uploads werden deaktiviert.", "Standard SMB clients write directly to the same CIFS/SMB3 server; replacement uploads are disabled.";
     SETUP_MAX_UPLOAD_MB, "setup.max_upload_mb", "Max. Upload MB", "Max upload MB";
     SETUP_BLOCKED_EXTENSIONS, "setup.blocked_extensions", "Blockierte Endungen", "Blocked extensions";
     SETUP_ZIP_SEARCH_PREVIEW, "setup.zip_search_preview", "ZIP, Suche und Preview", "ZIP, search, and preview";

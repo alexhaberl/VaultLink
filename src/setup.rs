@@ -27,7 +27,7 @@ use crate::{
     },
     db::{Database, InitialAdminOutcome},
     i18n::{self, Locale},
-    runtime, ui,
+    runtime, storage_mount, ui,
 };
 
 #[derive(Clone)]
@@ -66,6 +66,11 @@ struct SetupForm {
     production_mode: Option<String>,
     root_mount_path: String,
     data_directory: String,
+    internal_directory: String,
+    require_mount: Option<String>,
+    external_writers: Option<String>,
+    expected_filesystem_type: String,
+    expected_mount_source: String,
     max_upload_size_mb: String,
     max_zip_size_gb: String,
     max_zip_files: String,
@@ -552,6 +557,20 @@ struct SetupResult {
 }
 
 async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupResult, String> {
+    build_and_store_with_mount_validator(config_path, form, |storage| {
+        storage_mount::validate(storage).map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn build_and_store_with_mount_validator<F>(
+    config_path: &Path,
+    form: SetupForm,
+    validate_mount: F,
+) -> Result<SetupResult, String>
+where
+    F: FnOnce(&Storage) -> Result<(), String>,
+{
     if form.admin_password != form.admin_password_confirm {
         return Err(i18n::text(i18n::current_locale(), i18n::PASSWORD_MISMATCH).into());
     }
@@ -578,6 +597,15 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
     let standalone_tls = matches!(mode, ServerMode::StandaloneTls);
     let reverse_proxy_mode = matches!(mode, ServerMode::ReverseProxy);
     let production_mode = !matches!(mode, ServerMode::Development);
+    let external_writers = form.external_writers.is_some();
+    let require_mount = production_mode || form.require_mount.is_some() || external_writers;
+    let optional_mount_value = |value: String| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    };
+    let internal_directory = optional_mount_value(form.internal_directory).map(PathBuf::from);
+    let expected_filesystem_type = optional_mount_value(form.expected_filesystem_type);
+    let expected_mount_source = optional_mount_value(form.expected_mount_source);
     let certificate_source = match form.certificate_source.as_str() {
         "files" => CertificateSource::Files,
         "letsencrypt" => CertificateSource::LetsEncrypt,
@@ -618,6 +646,11 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
         storage: Storage {
             root_mount_path: form.root_mount_path.into(),
             data_directory: form.data_directory.into(),
+            internal_directory,
+            require_mount,
+            external_writers,
+            expected_filesystem_type,
+            expected_mount_source,
             max_upload_size: parse_unit_to_bytes(
                 "max_upload_size_mb",
                 &form.max_upload_size_mb,
@@ -672,9 +705,15 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
             },
         },
     };
-    config.validate().map_err(|_| {
-        i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_CONFIGURATION).to_string()
+    config.validate().map_err(|error| {
+        format!(
+            "{}: {error}",
+            i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_CONFIGURATION)
+        )
     })?;
+    if config.storage.require_mount {
+        validate_mount(&config.storage)?;
+    }
     let serialized = toml::to_string_pretty(&config).map_err(|error| error.to_string())?;
     let recovering_existing_config = if config_path.exists() {
         let existing = Config::load(config_path).map_err(|error| {
@@ -826,11 +865,8 @@ fn write_config_atomic_new(path: &Path, content: &str) -> std::io::Result<()> {
     sync_parent(path)
 }
 
-fn sync_parent(_path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(_path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
-    }
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
     Ok(())
 }
 
@@ -973,6 +1009,11 @@ fn setup_form(token: &str, error: Option<&str>) -> String {
   <section class="form-card"><h2><vl-i18n key="setup.storage"/></h2><div class="form-grid">
     <label><vl-i18n key="setup.root_mount_path"/><br><div class="input-action"><input name="root_mount_path" value="/tmp/vaultlink-root" required><button class="secondary small" type="button" data-dir-picker="root_mount_path"><vl-i18n key="setup.browse"/></button></div></label>
     <label><vl-i18n key="setup.data_directory"/><br><div class="input-action"><input name="data_directory" value="/tmp/vaultlink-data" required><button class="secondary small" type="button" data-dir-picker="data_directory"><vl-i18n key="setup.browse"/></button></div></label>
+    <label><vl-i18n key="setup.internal_directory"/><br><div class="input-action"><input name="internal_directory" data-mount-policy-field><button class="secondary small" type="button" data-dir-picker="internal_directory"><vl-i18n key="setup.browse"/></button></div></label>
+    <label><vl-i18n key="setup.expected_filesystem_type"/><br><input name="expected_filesystem_type" placeholder="ext4 oder cifs" data-mount-policy-field></label>
+    <label><vl-i18n key="setup.expected_mount_source"/><br><input name="expected_mount_source" placeholder="/dev/mapper/storage oder //server/share" data-mount-policy-field></label>
+    <label class="toggle-card"><input type="checkbox" name="require_mount" data-require-mount><span><vl-i18n key="setup.require_mount"/><small><vl-i18n key="setup.require_mount_help"/></small></span></label>
+    <label class="toggle-card"><input type="checkbox" name="external_writers" data-external-writers><span><vl-i18n key="setup.external_writers"/><small><vl-i18n key="setup.external_writers_help"/></small></span></label>
     <label><vl-i18n key="setup.max_upload_mb"/><br><input name="max_upload_size_mb" type="number" min="1" step="1" value="100" required></label>
     <label><vl-i18n key="setup.blocked_extensions"/><br><input name="blocked_extensions" value="exe,sh,php"></label>
   </div></section>
@@ -1047,10 +1088,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const mode = form.querySelector('[data-server-mode]');
   const certificateSource = form.querySelector('[data-certificate-source]');
+  const requireMount = form.querySelector('[data-require-mount]');
+  const externalWriters = form.querySelector('[data-external-writers]');
   const syncConditionalFields = () => {
     const selectedMode = mode?.value || 'development';
     const selectedCertificate = certificateSource?.value || 'files';
     const standalone = selectedMode === 'standalone_tls';
+    const production = selectedMode !== 'development';
+    if (production || externalWriters?.checked) requireMount.checked = true;
+    const mountPolicyRequired = production || requireMount?.checked || externalWriters?.checked;
+    form.querySelectorAll('[data-mount-policy-field]').forEach(element => {
+      element.required = mountPolicyRequired;
+    });
     form.querySelectorAll('[data-production-section]').forEach(element => {
       element.hidden = selectedMode === 'development';
     });
@@ -1071,6 +1120,8 @@ document.addEventListener('DOMContentLoaded', () => {
   };
   mode?.addEventListener('change', syncConditionalFields);
   certificateSource?.addEventListener('change', syncConditionalFields);
+  requireMount?.addEventListener('change', syncConditionalFields);
+  externalWriters?.addEventListener('change', syncConditionalFields);
   syncConditionalFields();
 
   const dialog = document.querySelector('[data-dir-dialog]');
@@ -1220,6 +1271,11 @@ mod tests {
             production_mode: None,
             root_mount_path: root.display().to_string(),
             data_directory: data.display().to_string(),
+            internal_directory: String::new(),
+            require_mount: None,
+            external_writers: None,
+            expected_filesystem_type: String::new(),
+            expected_mount_source: String::new(),
             max_upload_size_mb: "1".into(),
             max_zip_size_gb: "1".into(),
             max_zip_files: "10".into(),
@@ -1248,6 +1304,18 @@ mod tests {
         }
     }
 
+    fn configure_production_mount_policy(form: &mut SetupForm, root: &Path) {
+        form.internal_directory = root
+            .parent()
+            .unwrap()
+            .join(".vaultlink-internal-test")
+            .display()
+            .to_string();
+        form.require_mount = Some("on".into());
+        form.expected_filesystem_type = "ext4".into();
+        form.expected_mount_source = "/dev/mapper/vaultlink-test".into();
+    }
+
     #[tokio::test]
     async fn setup_form_uses_branding_units_log_dropdown_and_directory_picker() {
         let html = i18n::scope(Locale::De, "/?token=token".into(), async {
@@ -1268,6 +1336,9 @@ mod tests {
             html.contains(r#"name="admin_username" value="admin" minlength="3" maxlength="64""#)
         );
         assert!(html.contains("data-dir-picker=\"root_mount_path\""));
+        assert!(html.contains("data-dir-picker=\"internal_directory\""));
+        assert!(html.contains("data-require-mount"));
+        assert!(html.contains("data-external-writers"));
         assert!(html.contains("data-file-picker=\"tls_cert_file\""));
         assert!(html.contains("data-file-picker=\"tls_key_file\""));
         assert!(html.contains("data-dir-dialog"));
@@ -1746,10 +1817,13 @@ mod tests {
         form.listen_address = "0.0.0.0:443".into();
         form.public_base_url = "https://files.example.test".into();
         form.production_mode = Some("on".into());
+        configure_production_mount_policy(&mut form, root.path());
         form.secure_cookie = Some("on".into());
         form.certificate_source = "letsencrypt".into();
         form.letsencrypt_contact_email = "admin@example.test".into();
-        let result = build_and_store(&config_path, form).await.unwrap();
+        let result = build_and_store_with_mount_validator(&config_path, form, |_| Ok(()))
+            .await
+            .unwrap();
         assert!(!result.totp_secret.is_empty());
         let config = Config::load(&config_path).unwrap();
         assert_eq!(
@@ -1769,13 +1843,65 @@ mod tests {
         let mut form = form(root.path(), data.path());
         form.server_mode = "reverse_proxy".into();
         form.public_base_url = "https://files.example.test".into();
-        build_and_store(&config_path, form).await.unwrap();
+        configure_production_mount_policy(&mut form, root.path());
+        build_and_store_with_mount_validator(&config_path, form, |_| Ok(()))
+            .await
+            .unwrap();
         let config = Config::load(&config_path).unwrap();
         assert!(config.server.production_mode);
         assert!(config.security.secure_cookie);
         assert!(config.reverse_proxy.enabled);
         assert!(config.reverse_proxy.trust_x_forwarded_headers);
         assert!(!config.tls.enabled);
+    }
+
+    #[tokio::test]
+    async fn production_setup_rejects_missing_explicit_mount_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let mut form = form(root.path(), data.path());
+        form.server_mode = "reverse_proxy".into();
+        form.public_base_url = "https://files.example.test".into();
+
+        let error = match build_and_store(&config_dir.path().join("config.toml"), form).await {
+            Ok(_) => panic!("production setup without mount policy unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.contains("internal_directory"));
+    }
+
+    #[tokio::test]
+    async fn production_setup_rejects_data_symlinked_into_the_visible_tree_before_writing_secrets()
+    {
+        use std::os::unix::fs::symlink;
+
+        let mount = tempfile::tempdir().unwrap();
+        let shared = mount.path().join("shared");
+        let internal = mount.path().join(".vaultlink-internal");
+        let real_data = shared.join("state");
+        let data_alias = mount.path().join("data-alias");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::create_dir(&internal).unwrap();
+        std::fs::create_dir(&real_data).unwrap();
+        symlink(&real_data, &data_alias).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let mut form = form(&shared, &data_alias);
+        form.server_mode = "reverse_proxy".into();
+        form.public_base_url = "https://files.example.test".into();
+        form.internal_directory = internal.display().to_string();
+        form.require_mount = Some("on".into());
+        form.expected_filesystem_type = "ext4".into();
+        form.expected_mount_source = "/dev/mapper/vaultlink-test".into();
+
+        let error = match build_and_store(&config_path, form).await {
+            Ok(_) => panic!("setup accepted SQLite state inside the visible tree"),
+            Err(error) => error,
+        };
+        assert!(error.contains("user-visible root_mount_path"));
+        assert!(!config_path.exists());
+        assert!(!real_data.join("data.sqlite").exists());
     }
 
     #[tokio::test]

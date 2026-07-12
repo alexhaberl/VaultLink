@@ -7,22 +7,46 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  build:
+    name: Native Debian 13 (${{ matrix.release_architecture }})
     if: github.repository_visibility == 'private'
-    runs-on: [self-hosted, Linux, X64, vaultlink]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release_architecture: amd64
+            runs_on: '["self-hosted", "Linux", "X64", "vaultlink"]'
+            expected_uname: x86_64
+            expected_rust_host: x86_64-unknown-linux-gnu
+            self_hosted: true
+          - release_architecture: arm64
+            runs_on: '["ubuntu-24.04-arm"]'
+            expected_uname: aarch64
+            expected_rust_host: aarch64-unknown-linux-gnu
+            self_hosted: false
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 90
     container: rust:1.97.0-trixie@sha256:44637ff22d0a6571a221bfaf137849711ad02ff4723dbb4736e297538f6a3e60
     env:
       CARGO_TERM_COLOR: always
       SOURCE_DATE_EPOCH: "0"
+      RELEASE_ARCHITECTURE: ${{ matrix.release_architecture }}
+      EXPECTED_UNAME: ${{ matrix.expected_uname }}
+      EXPECTED_RUST_HOST: ${{ matrix.expected_rust_host }}
     steps:
       - name: Install build tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates build-essential pkg-config libssl-dev clang git gh minisign xz-utils shellcheck
+          apt-get install -y --no-install-recommends ca-certificates build-essential pkg-config libssl-dev clang git xz-utils shellcheck
       - name: Restore host workspace ownership before checkout
+        if: ${{ matrix.self_hosted }}
         shell: bash
         run: |
           set -euo pipefail
@@ -31,17 +55,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify release inputs
+      - name: Verify release inputs and native architecture
         shell: bash
         run: |
           set -euo pipefail
           test "$(rustc --version | awk '{print $2}')" = "1.97.0"
+          test "$(uname -m)" = "$EXPECTED_UNAME"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_RUST_HOST"
           package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           test -n "$package_version"
           echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             test "$GITHUB_REF_NAME" = "v$package_version"
             test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+            tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+            main_commit=$(git rev-parse refs/remotes/origin/main)
+            git merge-base --is-ancestor "$tag_commit" "$main_commit"
           fi
           sh tools/check-supply-chain-policy.sh
       - name: Install release gates
@@ -61,31 +90,118 @@ jobs:
         run: |
           cargo build --locked --release
           cargo cyclonedx --format json
-      - name: Assemble deterministic archive
+      - name: Assemble deterministic architecture-specific archive
         shell: bash
         run: |
           set -euo pipefail
           version="$PACKAGE_VERSION"
-          root="VaultLink-${version}-debian13-amd64"
+          arch="$RELEASE_ARCHITECTURE"
+          root="VaultLink-${version}-debian13-${arch}"
+          archive="${root}.tar.gz"
+          binary="vaultlink-${version}-debian13-${arch}"
+          sbom_name="vaultlink-${version}-debian13-${arch}.cdx.json"
+          checksums="SHA256SUMS-${arch}"
+          test ! -e dist
           install -d "dist/$root/bin" "dist/$root/config" "dist/$root/deploy"
           install -m 0755 target/release/vaultlink "dist/$root/bin/vaultlink"
+          install -m 0755 target/release/vaultlink "dist/$binary"
           install -m 0644 README.md CHANGELOG.md SECURITY.md LICENSE rust-toolchain.toml "dist/$root/"
           cp config/*.toml "dist/$root/config/"
           cp -R deploy/. "dist/$root/deploy/"
           if [ -s release/minisign.pub ]; then cp release/minisign.pub "dist/$root/"; fi
-          sbom=$(find . -maxdepth 2 -name '*.cdx.json' -print -quit)
+          sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print -quit)
           test -n "$sbom"
           install -m 0644 "$sbom" "dist/$root/vaultlink.cdx.json"
-          install -m 0644 "$sbom" dist/vaultlink.cdx.json
+          install -m 0644 "$sbom" "dist/$sbom_name"
           tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -C dist -cf "dist/$root.tar" "$root"
           gzip -n -9 "dist/$root.tar"
           cd dist
-          sha256sum "$root.tar.gz" "$root/bin/vaultlink" > SHA256SUMS
-          test -s "$root.tar.gz"
-          test -s vaultlink.cdx.json
-          test -s SHA256SUMS
-          sha256sum -c SHA256SUMS
-      - name: Sign binary and checksums
+          sha256sum "$archive" "$binary" "$sbom_name" > "$checksums"
+          test -s "$archive"
+          test -x "$binary"
+          test -s "$sbom_name"
+          test -s "$checksums"
+          sha256sum -c "$checksums"
+      - name: Upload unsigned architecture-specific release inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vaultlink-release-${{ matrix.release_architecture }}
+          path: |
+            dist/VaultLink-*-debian13-${{ matrix.release_architecture }}.tar.gz
+            dist/vaultlink-*-debian13-${{ matrix.release_architecture }}
+            dist/vaultlink-*-debian13-${{ matrix.release_architecture }}.cdx.json
+            dist/SHA256SUMS-${{ matrix.release_architecture }}
+          if-no-files-found: error
+          retention-days: 7
+      - name: Restore host workspace ownership
+        if: ${{ always() && matrix.self_hosted }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+
+  publish:
+    name: Verify, sign, and publish
+    if: github.repository_visibility == 'private' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: [self-hosted, Linux, X64, vaultlink]
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    container: rust:1.97.0-trixie@sha256:44637ff22d0a6571a221bfaf137849711ad02ff4723dbb4736e297538f6a3e60
+    steps:
+      - name: Install release tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git gh minisign
+      - name: Restore host workspace ownership before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$package_version"
+          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$package_version"
+            test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+            tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+            main_commit=$(git rev-parse refs/remotes/origin/main)
+            git merge-base --is-ancestor "$tag_commit" "$main_commit"
+          fi
+          sh tools/check-supply-chain-policy.sh
+      - name: Download native build outputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vaultlink-release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify architecture-specific checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 8
+          cd dist
+          for arch in amd64 arm64; do
+            root="VaultLink-${PACKAGE_VERSION}-debian13-${arch}"
+            binary="vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
+            sbom="vaultlink-${PACKAGE_VERSION}-debian13-${arch}.cdx.json"
+            checksums="SHA256SUMS-${arch}"
+            test -s "${root}.tar.gz"
+            test -s "$binary"
+            test -s "$sbom"
+            test -s "$checksums"
+            sha256sum -c "$checksums"
+          done
+      - name: Sign and verify architecture-specific assets
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
@@ -95,35 +211,99 @@ jobs:
           set -euo pipefail
           test -s release/minisign.pub
           test -n "$MINISIGN_SECRET_KEY"
+          test -n "$MINISIGN_PASSWORD"
           key=$(mktemp)
           trap 'rm -f "$key"' EXIT
           chmod 0600 "$key"
           printf '%s' "$MINISIGN_SECRET_KEY" > "$key"
-          version="$PACKAGE_VERSION"
-          root="VaultLink-${version}-debian13-amd64"
-          minisign -S -s "$key" -m "dist/$root/bin/vaultlink" -x dist/vaultlink.minisig
-          minisign -S -s "$key" -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
-          minisign -V -p release/minisign.pub -m "dist/$root/bin/vaultlink" -x dist/vaultlink.minisig
-          minisign -V -p release/minisign.pub -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
+          for arch in amd64 arm64; do
+            archive="dist/VaultLink-${PACKAGE_VERSION}-debian13-${arch}.tar.gz"
+            binary="dist/vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
+            checksums="dist/SHA256SUMS-${arch}"
+            for asset in "$archive" "$binary" "$checksums"; do
+              minisign -S -s "$key" -m "$asset" -x "${asset}.minisig"
+              minisign -V -p release/minisign.pub -m "$asset" -x "${asset}.minisig"
+            done
+          done
       - name: Create private release
         if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="$PACKAGE_VERSION"
-          root="VaultLink-${version}-debian13-amd64"
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "VaultLink $GITHUB_REF_NAME" --notes-file CHANGELOG.md \
-            "dist/$root.tar.gz" dist/vaultlink.cdx.json dist/SHA256SUMS dist/SHA256SUMS.minisig dist/vaultlink.minisig
-      - name: Upload dry-run artifact
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          set -euo pipefail
+          assets=()
+          for arch in amd64 arm64; do
+            archive="dist/VaultLink-${PACKAGE_VERSION}-debian13-${arch}.tar.gz"
+            binary="dist/vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
+            sbom="dist/vaultlink-${PACKAGE_VERSION}-debian13-${arch}.cdx.json"
+            checksums="dist/SHA256SUMS-${arch}"
+            assets+=("$archive" "${archive}.minisig" "$binary" "${binary}.minisig" "$sbom" "$checksums" "${checksums}.minisig")
+          done
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "VaultLink $GITHUB_REF_NAME" --notes-file CHANGELOG.md "${assets[@]}"
+      - name: Restore host workspace ownership
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+
+  dry-run:
+    name: Verify combined dry run
+    if: github.repository_visibility == 'private' && !startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: [self-hosted, Linux, X64, vaultlink]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    container: rust:1.97.0-trixie@sha256:44637ff22d0a6571a221bfaf137849711ad02ff4723dbb4736e297538f6a3e60
+    steps:
+      - name: Install verification tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git
+      - name: Restore host workspace ownership before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Read and verify package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$package_version"
+          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
+          sh tools/check-supply-chain-policy.sh
+      - name: Download native build outputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vaultlink-release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify architecture-specific checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 8
+          cd dist
+          for arch in amd64 arm64; do
+            test -s "VaultLink-${PACKAGE_VERSION}-debian13-${arch}.tar.gz"
+            test -s "vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
+            test -s "vaultlink-${PACKAGE_VERSION}-debian13-${arch}.cdx.json"
+            test -s "SHA256SUMS-${arch}"
+            sha256sum -c "SHA256SUMS-${arch}"
+          done
+      - name: Upload combined dry-run artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vaultlink-release-dry-run
-          path: |
-            dist/*.tar.gz
-            dist/vaultlink.cdx.json
-            dist/SHA256SUMS
+          path: dist/*
           if-no-files-found: error
+          retention-days: 7
       - name: Restore host workspace ownership
         if: always()
         shell: bash

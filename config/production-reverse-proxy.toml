@@ -5,8 +5,17 @@ public_base_url = "https://files.example.com"
 production_mode = true
 
 [storage]
-root_mount_path = "/mnt/storage"
+root_mount_path = "/mnt/storage/shared"
 data_directory = "/var/lib/vaultlink"
+internal_directory = "/mnt/storage/.vaultlink-internal"
+# Pre-provision internal_directory/{uploads,tombstones}. The SMB server ACL
+# grants only the VaultLink account access. Co-writers get Modify only in
+# shared/ and no read/write/delete/rename/DELETE_CHILD/WRITE_DAC/WRITE_OWNER
+# or administrative rights on this private sibling or the share root.
+require_mount = true
+external_writers = true
+expected_filesystem_type = "cifs"
+expected_mount_source = "//fileserver.example/vaultlink"
 max_upload_size = 1073741824
 max_zip_size = 1073741824
 max_zip_files = 10000

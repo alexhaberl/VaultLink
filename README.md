@@ -1,17 +1,17 @@
 # VaultLink
 
-VaultLink ist eine serverseitig gerenderte Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Zielplattform ist Debian Linux; Entwicklung und Tests funktionieren auch unter Debian/Ubuntu in WSL.
+VaultLink ist eine serverseitig gerenderte Rust-Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Unterstützte Hostplattformen sind Linux x86_64 und aarch64; Windows-Hostsupport ist ab 0.4.1 entfernt. Windows-, macOS- und Linux-Clients bleiben über einen externen Standard-SMB-Server interoperabel.
 
-Status: `0.4.0`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
+Status: `0.4.1`-Kandidat für ein privates Debian-13-amd64-/arm64-Release. amd64 läuft auf dem lokalen Self-hosted-Runner, arm64 vorerst nativ auf `ubuntu-24.04-arm`. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
 ## 1. Sicherheitskonzept
 
-- Dateizugriffe sind Linux descriptor-relativ. `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` bindet Adminzugriffe an den Storage-Root und öffentliche Zugriffe zusätzlich an eine pro Freigabe verengte Directory-/File-Capability. Sibling-Shares bleiben damit auch über Symlinks getrennt. Ein Kernel ohne `openat2` wird mit verständlichem Startfehler abgewiesen.
+- Dateizugriffe sind Linux descriptor-relativ. `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` bindet Adminzugriffe an den Storage-Root und öffentliche Zugriffe zusätzlich an eine pro Freigabe verengte Directory-/File-Capability. Im Co-Writer-Modus kommt `RESOLVE_NO_SYMLINKS` hinzu, damit externe Writer keinen gespeicherten Share-Pfad umbiegen können. Ein Kernel ohne die benötigten APIs wird mit verständlichem Startfehler abgewiesen.
 - Relative Nutzpfade werden nach genau einer HTTP-Dekodierung geprüft und verbieten absolute Pfade, `..`, Backslashes und NUL. Uploadnamen folgen zusätzlich einer plattformübergreifenden Policy, damit Windows-Prefixe und reservierte Namen nie aus dem Zielordner aufgelöst werden.
-- Uploads werden als zufällige `0600`-Temporärdateien im Zielordner geschrieben, geflusht und per `fsync` gesichert. Default ist atomarer No-Replace-Publish mit `renameat2(RENAME_NOREPLACE)`; optional kann pro Upload-Ordnerlink ein explizit bestätigtes atomisches Ersetzen erlaubt werden.
-- Abgebrochene private Uploadfragmente werden in fortsetzbaren Hintergrund-Batches entfernt; eine synchronisierte Active-Registry verhindert dabei Kollisionen mit Uploads des laufenden Prozesses. Listing, Suche und ZIP budgetieren jedes rohe Verzeichniselement, auch wenn es später als intern oder unsicher gefiltert wird.
+- Uploads werden als zufällige `0600`-Temporärdateien im geschützten internen Upload-Staging geschrieben, geflusht und per `fsync` gesichert. Die Veröffentlichung in den sichtbaren Baum erfolgt atomar mit `renameat2(RENAME_NOREPLACE)`. Bei `external_writers = true` ist Überschreiben in UI, API und Uploadpfad ausnahmslos deaktiviert.
+- Abgebrochene Uploadfragmente und ausschließlich als committed markierte Lösch-Tombstones werden in fortsetzbaren Hintergrund-Batches entfernt. Uncommitted Pending-Löschungen und Rollback-Konflikte bleiben als Recovery-Einträge erhalten, statt beim Neustart Daten zu verlieren.
 - Adminpasswörter verwenden Argon2id. Nach dem Passwort ist TOTP oder ein registrierter WebAuthn/FIDO2-Sicherheitsschlüssel (zum Beispiel YubiKey) erforderlich. Sessions sind zufällige serverseitige Bearer-Tokens, deren Hash in SQLite liegt.
 - Cookies sind `HttpOnly`, `SameSite=Strict` und in Production `Secure`.
 - Mutierende Adminaktionen verlangen CSRF. Login und Share-Unlock sind rate-limitiert.
@@ -19,7 +19,7 @@ GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sh
 - Security Header: CSP, `X-Content-Type-Options: nosniff`, Frame-Schutz, Referrer-Policy, Permissions-Policy und HSTS nur bei HTTPS.
 - Audit liegt in SQLite und wird strukturiert an journald gespiegelt. Passwörter, TOTP-Secrets, Sessiontokens und Share-Tokens werden nicht geloggt.
 
-Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner. VaultLink ersetzt vorhandene Dateien nur, wenn ein Admin dies für den konkreten Upload-Link erlaubt und der Public-Uploader das Ersetzen beim Upload aktiv bestätigt. Ordnerfreigaben unterstützen begrenzt und inkrementell im ZIP64-Format erzeugte ZIP-Downloads, Suche, Upload in navigierten Unterordnern und Preview bei Downloadrecht. Kleine Standardlimits schützen gepufferte Form-/JSON-Routen; nur Uploadrouten erhalten den großen, weiterhin gestreamten Body-Rahmen. Davor begrenzt ein konstanter Streaming-Guard Multipart-Präambel und jeden Headerblock, ohne Dateiinhalte zu sammeln. Upload-only-Freigaben listen keine Inhalte und erlauben keine Preview/Downloads.
+Datei-Links sind nur `download_only`. Uploadrechte gelten für Ordner. Ohne externe Writer kann VaultLink vorhandene Dateien nur ersetzen, wenn ein Admin dies für den konkreten Upload-Link erlaubt und der Public-Uploader das Ersetzen aktiv bestätigt. Ordnerfreigaben unterstützen begrenzt und inkrementell im ZIP64-Format erzeugte ZIP-Downloads, Suche, Upload in navigierten Unterordnern und Preview bei Downloadrecht. Kleine Standardlimits schützen gepufferte Form-/JSON-Routen; nur Uploadrouten erhalten den großen, weiterhin gestreamten Body-Rahmen. Davor begrenzt ein konstanter Streaming-Guard Multipart-Präambel und jeden Headerblock, ohne Dateiinhalte zu sammeln. Upload-only-Freigaben listen keine Inhalte und erlauben keine Preview/Downloads.
 
 ## 2. Projektstruktur
 
@@ -56,10 +56,10 @@ SQLite ist bewusst gewählt: eindeutige Aliase, parallele Sessions, atomare Down
 Upgrade mit Backup bei gestopptem Dienst:
 
 ```sh
-sudo deploy/vaultlink-upgrade.sh /pfad/zum/neuen/vaultlink
+sudo deploy/vaultlink-upgrade.sh /pfad/zum/neuen/vaultlink /pfad/zur/neuen-config.toml
 ```
 
-Das Upgrade-Skript ist ausschließlich für eine bestehende Installation mit Binary und Datenbank gedacht. Es bereitet Binary und Backup-Verzeichnis vor der Downtime vor, veröffentlicht nur ein erfolgreich geprüftes SQLite-Backup und startet bei frühen Fehlern den zuvor laufenden Dienst wieder. Scheitert Aktivierung oder Health-Check, werden Binary und Datenbank aus dem verifizierten Backup restauriert.
+Das Upgrade-Skript ist ausschließlich für eine bestehende Installation mit Binary, Konfiguration und Datenbank gedacht. Die neue Konfiguration bleibt bis zur gestoppten Aktivierungsphase getrennt von der Live-Konfiguration. Jeder verifizierte Backup-Satz und jeder automatische Restore umfasst immer das zusammengehörige Tripel aus Binary, `config.toml` und SQLite-Datenbank. Altes und neues Binary/Config-Paar werden vor der Downtime als unprivilegierter `vaultlink`-Benutzer geprüft.
 
 Restore und Rollback: [docs/UPGRADE-ROLLBACK.md](docs/UPGRADE-ROLLBACK.md).
 
@@ -79,7 +79,48 @@ Startregeln:
 - `standalone_tls` + `certificate_source = "files"`: Production, HTTPS-URL, TLS aktiv, Zertifikat und Key vorhanden; optionaler SIGHUP-Reload.
 - `standalone_tls` + `certificate_source = "letsencrypt"`: Production, HTTPS-URL, TLS aktiv, Reverse Proxy aus, DNS-Domain in `public_base_url`, Kontakt-E-Mail und sicherer ACME-Cache innerhalb `data_directory`.
 
+Jeder Production-Modus verlangt `require_mount = true`, ein pre-provisioniertes privates Geschwisterverzeichnis sowie die exakte aktive Mount-Quelle und den Dateisystemtyp. Damit startet auch eine alte Production-Konfiguration nicht auf einem leeren lokalen Fallback, wenn ihr eigentliches Mount ausgefallen ist. Für lokalen Storage kann die Policy beispielsweise so aussehen:
+
+```toml
+[storage]
+root_mount_path = "/srv/vaultlink/shared"
+data_directory = "/var/lib/vaultlink"
+internal_directory = "/srv/vaultlink/.vaultlink-internal"
+require_mount = true
+external_writers = false
+expected_filesystem_type = "ext4"
+expected_mount_source = "/dev/mapper/vaultlink"
+```
+
+`expected_mount_source` muss exakt dem Source-Feld der aktiven Zeile in `/proc/self/mountinfo` entsprechen; ein `UUID=`-Eintrag aus `/etc/fstab` ist nicht automatisch derselbe Wert. Für auditierten lokalen Storage sind ext2/3/4, XFS, Btrfs, F2FS, Bcachefs und ZFS zugelassen. Root, internes Verzeichnis und Data Directory gehören dem `vaultlink`-Dienstbenutzer und dürfen weder über Gruppen-/Other-Modusbits noch über die POSIX-ACL-Maske schreibbar sein; lokale Co-Writer sind bei `external_writers = false` nicht unterstützt. SQLite darf dabei auf demselben lokalen Mount liegen, aber niemals innerhalb des sichtbaren Baums. Bei CIFS/SMB muss SQLite zusätzlich auf einem getrennten lokalen Dateisystem liegen.
+
 `public_base_url` verwendet kanonische `http://`- beziehungsweise `https://`-Authority-Syntax und darf weder Zugangsdaten noch Query oder Fragment enthalten.
+
+### Externer SMB-Server mit Standardclients
+
+VaultLink hostet keinen SMB-Server. Es mountet als Linux-SMB-Client einen bestehenden Server-Baum; Windows-, macOS- und Linux-Clients greifen weiterhin direkt und ohne VaultLink-Zusatzsoftware auf den Ordner `shared/` dieses Servers zu:
+
+```text
+//fileserver.example/vaultlink  ->  /mnt/storage
+├── shared/                     -> root_mount_path, normale SMB-Clients schreibbar
+└── .vaultlink-internal/        -> internal_directory, nur VaultLink-SMB-Konto
+    ├── uploads/
+    └── tombstones/
+```
+
+Die drei internen Verzeichnisse müssen **vor dem ersten Start serverseitig** provisioniert werden. Ihre Server-ACL erlaubt ausschließlich dem separaten VaultLink-SMB-Dienstkonto Lesen, Schreiben, Löschen und Umbenennen. Co-Writer erhalten Modify-Rechte ausschließlich unter `shared/`, aber keine administrativen Rechte auf Share-Root oder Mount-Basis. Für `.vaultlink-internal` müssen Lesen, Schreiben, Löschen, Umbenennen, Parent-`DELETE_CHILD`, ACL-/Owner-Änderungen (`WRITE_DAC`/`WRITE_OWNER`) sowie `chmod`/`chown`/`setfacl`-Äquivalente verweigert sein. Die lokal sichtbaren CIFS-Modi `0700`/`0600` sind nur eine zusätzliche Prüfung und kein Beweis für diese Server-ACL.
+
+Für den auditierten Co-Writer-Modus gelten:
+
+- `require_mount = true`, `external_writers = true`, `expected_filesystem_type = "cifs"` und die erwartete UNC-Quelle sind Pflicht.
+- Der Kernel muss `statx`-Mount-IDs unterstützen (Linux 5.8 oder neuer). Root und interner Geschwisterpfad müssen dieselbe geprüfte Mount-ID nutzen; nur so bleiben Cross-Directory-Renames atomar.
+- VaultLink prüft `vers=3.1.1`, `seal`, `cache=strict`, `serverino`, `nosuid`, `nodev`, `noexec`, Read-write-Status und verbietet unter anderem `cache=loose`, `nostrictsync`, `noperm`, `noserverino` und `multiuser`.
+- Userpfade dürfen weder Symlinks noch verschachtelte Mounts/DFS-Submounts durchqueren.
+- `data_directory` und SQLite/WAL bleiben auf einem separaten, explizit unterstützten lokalen Dateisystem; CIFS/NFS für SQLite wird abgewiesen.
+- Externe Writer gelten als vertrauenswürdige Publisher des sichtbaren Inhalts. Sie können Dateien verändern oder ersetzen, die ein bestehender VaultLink-Link ausliefert. Diese direkten SMB-Aktionen umgehen VaultLink-Audit, Share-Limits und Web-Policy und müssen deshalb am SMB-Server selbst auditiert werden.
+- VaultLinks Linux-Mount erzwingt Transportverschlüsselung per SMB `seal`. Zusätzlich muss der externe SMB-Server SMB 3.1.1 Signing und Encryption für **jede** direkte Windows-, macOS- und Linux-Co-Writer-Session verpflichtend machen; VaultLink kann diese separaten Sessions nicht erzwingen. Verschlüsselung ruhender Daten ist Aufgabe des SMB-Servers. Transparenter Zugriff mit Standard-SMB-Clients ist nicht mit einer ausschließlich von VaultLink kontrollierten clientseitigen Inhaltsverschlüsselung vereinbar.
+
+Andere Netzwerkdateisysteme mit externen Schreibern sind in 0.4.1 nicht freigegeben. Ein erkanntes Remote-Dateisystem ohne explizite Mount-Policy wird beim Start abgewiesen. Production verlangt die Policy unabhängig vom gerade erkannten Dateisystem, sodass auch ein ausgefallener CIFS-Mount mit lokal sichtbarem Fallback-Verzeichnis fail-closed bleibt.
 
 Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadlimit, blockierte Endungen, Share-Passwortpolitik, Unlock-Dauer, ZIP-/Search-/Text-/Media-Preview-Limits, Text-/Bild-Preview-Endungen und PDF-Preview-Status. Servermodus, Bind-Adresse, TLS-Pfade, Trusted Proxies, Root-Mount, Data-Dir und ACME-Modus bleiben file-/restart-basiert.
 
@@ -118,7 +159,7 @@ ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenz
 
 `max_downloads` begrenzt abgeschlossene Inhaltsübertragungen (Download, ZIP und gezählte Vorschau), nicht den Aufruf der öffentlichen Metadaten-/Landingpage oder Uploads. `HEAD` liefert nur dann Metadaten, wenn derselbe logische `GET` mit der aktuellen Transfer-Session beginnen dürfte, verbraucht selbst aber keine Quote.
 
-Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.4.0` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
+Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.4.1` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
 
 Wichtige API-Routen:
 
@@ -255,7 +296,7 @@ Der Hook installiert PEMs nach `/etc/vaultlink/tls/` mit `root:vaultlink 0640` u
 ## 8. Debian-Deployment
 
 ```sh
-sudo apt update && sudo apt install -y build-essential coreutils curl libssl-dev pkg-config sqlite3 util-linux
+sudo apt update && sudo apt install -y build-essential cifs-utils coreutils curl libssl-dev pkg-config sqlite3 util-linux
 cargo build --release --locked
 
 sudo useradd --system --home /var/lib/vaultlink --shell /usr/sbin/nologin vaultlink
@@ -266,7 +307,7 @@ sudo install -o root -g root -m 0644 deploy/vaultlink.service /etc/systemd/syste
 sudo systemctl daemon-reload
 ```
 
-`ReadWritePaths=/mnt/storage` in [deploy/vaultlink.service](deploy/vaultlink.service) an den echten Mount anpassen. Der Betriebssystembenutzer `vaultlink` benötigt außerdem die beabsichtigten Rechte am Storage-Mount.
+`ReadWritePaths=/mnt/storage` in [deploy/vaultlink.service](deploy/vaultlink.service) an die geprüfte Mount-Basis anpassen. Für SMB außerdem [deploy/mnt-storage.mount.example](deploy/mnt-storage.mount.example) als `/etc/systemd/system/mnt-storage.mount` und [deploy/vaultlink-external-storage.conf](deploy/vaultlink-external-storage.conf) als systemd-Drop-in installieren. `What`, Credentials, UID/GID und UNC-Quelle müssen zur Konfiguration passen. Die Credential-Datei gehört `root:root` mit Modus `0600`.
 
 ### Erstkonfiguration im Browser über SSH-Tunnel
 
@@ -291,9 +332,11 @@ Das Setup gibt einen expliziten IPv4-Tunnel aus. Diesen in einem zweiten Termina
 ssh -4 -N -L 127.0.0.1:8090:127.0.0.1:8090 admin@server.example.com
 ```
 
-Danach die ausgegebene lokale URL `http://127.0.0.1:8090/?token=...` auf dem eigenen Rechner öffnen. Für den empfohlenen Reverse-Proxy-Modus sind `127.0.0.1:8080` als **VaultLink-Dienstadresse nach dem Setup**, die öffentliche HTTPS-URL, der echte Storage-Mount und `/var/lib/vaultlink` als Data Directory passende Werte. Der SSH-Tunnel gilt nur für das Setup; die spätere öffentliche URL läuft über den konfigurierten Reverse Proxy.
+Danach die ausgegebene lokale URL `http://127.0.0.1:8090/?token=...` auf dem eigenen Rechner öffnen. Für den empfohlenen Reverse-Proxy-Modus sind `127.0.0.1:8080` als **VaultLink-Dienstadresse nach dem Setup**, die öffentliche HTTPS-URL, der sichtbare Storage-Unterordner und `/var/lib/vaultlink` als Data Directory passende Werte. Production verlangt zusätzlich das private Geschwisterverzeichnis, den exakten Dateisystemtyp und die aktive Mount-Quelle. Für direkte Standard-SMB-Co-Writer wird „Externe SMB-Schreiber“ aktiviert. Root, internes Verzeichnis und Data Directory müssen vorher provisioniert sein; das Setup prüft die aktive Mount-Identität und schreibt bei einem Alias, Fallback oder Netzwerk-SQLite weder Konfiguration noch Admin-Secrets. Der SSH-Tunnel gilt nur für das Setup; die spätere öffentliche URL läuft über den konfigurierten Reverse Proxy.
 
 Nach dem Speichern des TOTP-Secrets auf der Bestätigungsseite nicht den direkten Serverstart wählen, sondern den Setup-Prozess im Serverterminal mit `Strg+C` beenden. Anschließend die erzeugte Konfiguration mit restriktiven Rechten installieren, das Staging-Verzeichnis entfernen und den Systemdienst starten:
+
+Das Browser-Setup schreibt die vollständige `[storage]`-Policy. Die angezeigte Mount-Quelle muss vor dem Speichern mit `/proc/self/mountinfo` abgeglichen werden; bei SMB sind außerdem die serverseitigen ACLs aus dem Abschnitt oben vorab mit dem VaultLink-Konto und jedem Co-Writer-Konto zu testen.
 
 ```sh
 sudo install -o root -g vaultlink -m 0640 \
@@ -357,7 +400,7 @@ Ein stillgelegter Admin bleibt auch nach der Credential-Wiederherstellung stillg
 
 Firewall: bei Reverse Proxy nur 80/443 für Caddy/Nginx öffnen und VaultLink auf Loopback lassen. Bei Standalone nur 443 öffnen.
 
-## 9. WSL-Entwicklung
+## 9. Linux-Entwicklung, optional in WSL
 
 ```sh
 sudo apt update && sudo apt install -y build-essential coreutils curl libssl-dev pkg-config sqlite3 util-linux
@@ -375,7 +418,8 @@ make run
 - Start verweigert: Config-Modus, HTTPS-URL, Loopback/Trusted Proxies, PEM/ACME-Einstellungen und Storage-Root prüfen.
 - Built-in ACME scheitert: DNS muss auf den Server zeigen, VaultLink muss selbst Port 443 terminieren, Nginx/Caddy darf nicht davor laufen.
 - 403 bei Datei: Pfadvalidierung oder Symlink-Grenze greift.
-- Upload 409: Standard ist no-overwrite. Falls Ersetzen gewünscht ist, muss der Admin es pro Upload-Link erlauben und der Uploader die Replace-Checkbox setzen.
+- Upload 409: Standard ist no-overwrite. Ohne externe Writer kann Ersetzen pro Upload-Link freigegeben und pro Upload bestätigt werden; im Co-Writer-Modus bleibt es gesperrt.
+- SMB-Start verweigert: Mount-Quelle/-Typ und Optionen in `/proc/self/mountinfo`, vorhandene sibling-Verzeichnisse, Modus `0700`, Server-ACL sowie das lokale SQLite-Dateisystem prüfen.
 - TLS nach Renewal alt: `systemctl status vaultlink`, PEM-Rechte und Journal prüfen.
 
 ## Lizenz

@@ -145,9 +145,7 @@ SH
     chmod 0755 "$MOCK_BIN/systemctl" "$MOCK_BIN/sqlite3"
     : >"$MOCK_STATE_DIR/systemctl.log"
     install -d -o root -g vaultlink -m 0750 "$(dirname "$CONFIG_PATH")"
-    printf '%s\n' '# disposable readiness config' >"$CONFIG_PATH"
-    chown root:vaultlink "$CONFIG_PATH"
-    chmod 0640 "$CONFIG_PATH"
+    write_config "$CONFIG_PATH" original
 }
 
 write_binary() {
@@ -156,7 +154,10 @@ write_binary() {
     readiness_url=${3:-$HEALTH_URL}
     readiness_connect_to=${4:--}
     readiness_insecure=${5:-0}
-    if [[ "$marker" == candidate ]]; then
+    version_override=${6:-}
+    if [[ -n "$version_override" ]]; then
+        version=$version_override
+    elif [[ "$marker" == candidate ]]; then
         version=0.3.2
     else
         version=0.3.0
@@ -176,7 +177,7 @@ require_service_user() {
     [ "$(id -un)" = vaultlink ]
 }
 
-case "${1:-}" in
+    case "${1:-}" in
     --version)
         require_service_user
         printf '%s\n' "$VERSION"
@@ -185,6 +186,7 @@ case "${1:-}" in
         require_service_user
         [ "$#" -eq 3 ] && [ "${2:-}" = "--config" ] \
             && [ -f "${3:-}" ] && [ -r "${3:-}" ] || exit 1
+        grep -qx "# config-marker:$MARKER" "$3" || exit 1
         printf '%s\n' "$READINESS_URL" "$READINESS_CONNECT_TO" "$READINESS_INSECURE"
         ;;
     *)
@@ -194,6 +196,14 @@ esac
 SH
     } >"$path"
     chmod 0755 "$path"
+}
+
+write_config() {
+    path=$1
+    marker=$2
+    printf '# config-marker:%s\n' "$marker" >"$path"
+    chown root:vaultlink "$path"
+    chmod 0640 "$path"
 }
 
 start_health_server() {
@@ -317,15 +327,16 @@ initialize_live() {
     binary_marker=$1
     database_marker=$2
 
-    rm -rf /opt/vaultlink /var/lib/vaultlink
-    mkdir -p /opt/vaultlink /var/lib/vaultlink/backups
-    chown root:vaultlink /opt/vaultlink /var/lib/vaultlink /var/lib/vaultlink/backups
-    chmod 0750 /opt/vaultlink /var/lib/vaultlink /var/lib/vaultlink/backups
+    rm -rf /opt/vaultlink /var/lib/vaultlink /var/lib/vaultlink-backups
+    mkdir -p /opt/vaultlink /var/lib/vaultlink
+    chown root:vaultlink /opt/vaultlink /var/lib/vaultlink
+    chmod 0750 /opt/vaultlink /var/lib/vaultlink
     write_binary /opt/vaultlink/vaultlink "$binary_marker"
     "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
         "CREATE TABLE marker(value TEXT NOT NULL); INSERT INTO marker VALUES('$database_marker');"
     chown vaultlink:vaultlink /var/lib/vaultlink/data.sqlite
     chmod 0600 /var/lib/vaultlink/data.sqlite
+    write_config "$CONFIG_PATH" "$binary_marker"
     printf '%s\n' active >"$MOCK_STATE_DIR/service.state"
     printf '%s\n' 0 >"$MOCK_STATE_DIR/stop.count"
     : >"$MOCK_STATE_DIR/systemctl.log"
@@ -337,6 +348,7 @@ initialize_live() {
 
 make_candidate() {
     write_binary "$TEST_ROOT/candidate" candidate
+    write_config "$TEST_ROOT/candidate.toml" candidate
 }
 
 make_source_backup() {
@@ -344,6 +356,7 @@ make_source_backup() {
     rm -rf "$source_backup"
     mkdir -p "$source_backup"
     install -m 0755 /opt/vaultlink/vaultlink "$source_backup/vaultlink"
+    install -m 0640 "$CONFIG_PATH" "$source_backup/config.toml"
     "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite ".backup '$source_backup/data.sqlite'"
     printf '%s\n' "$source_backup"
 }
@@ -360,12 +373,42 @@ assert_database() {
     [[ "$actual" == "$expected" ]] || fail "expected database marker $expected, got $actual"
 }
 
+assert_config() {
+    expected=$1
+    grep -qx "# config-marker:$expected" "$CONFIG_PATH" \
+        || fail "expected $expected configuration"
+}
+
+assert_backup_triple() {
+    backup_dir=$1
+    expected=$2
+    grep -q "binary-marker:$expected" "$backup_dir/vaultlink" \
+        || fail "backup binary was not $expected"
+    grep -qx "# config-marker:$expected" "$backup_dir/config.toml" \
+        || fail "backup configuration was not $expected"
+    backup_marker=$("$REAL_SQLITE3" "$backup_dir/data.sqlite" "SELECT value FROM marker")
+    [[ "$backup_marker" == "$expected" ]] \
+        || fail "backup database was not $expected"
+    [[ "$(stat -c '%U:%G:%a' "$backup_dir")" == root:root:700 ]] \
+        || fail "backup directory owner or mode was not root:root 0700"
+    [[ "$(stat -c '%U:%G:%a' "$backup_dir/vaultlink")" == root:root:700 ]] \
+        || fail "backup binary owner or mode was not root:root 0700"
+    [[ "$(stat -c '%U:%G:%a' "$backup_dir/config.toml")" == root:root:600 ]] \
+        || fail "backup configuration owner or mode was not root:root 0600"
+    [[ "$(stat -c '%U:%G:%a' "$backup_dir/data.sqlite")" == root:root:600 ]] \
+        || fail "backup database owner or mode was not root:root 0600"
+}
+
 assert_service_active() {
     grep -qx active "$MOCK_STATE_DIR/service.state" || fail "service was not active"
 }
 
+assert_service_inactive() {
+    grep -qx inactive "$MOCK_STATE_DIR/service.state" || fail "service was not inactive"
+}
+
 assert_no_incomplete_backup() {
-    if find /var/lib/vaultlink/backups -mindepth 1 -maxdepth 1 -type d -name '*.incomplete.*' -print -quit | grep -q .; then
+    if find /var/lib/vaultlink-backups -mindepth 1 -maxdepth 1 -type d -name '*.incomplete.*' -print -quit 2>/dev/null | grep -q .; then
         fail "incomplete backup directory was not cleaned"
     fi
 }
@@ -380,6 +423,7 @@ assert_health_requests() {
 assert_automatic_upgrade_restore() {
     log_name=$1
     assert_binary original
+    assert_config original
     assert_database original
     assert_service_active
     assert_no_incomplete_backup
@@ -392,13 +436,10 @@ assert_automatic_upgrade_restore() {
     [[ "$stop_count" -eq 2 ]] || fail "$log_name expected two service stops, got $stop_count"
     [[ "$start_count" -eq 2 ]] || fail "$log_name expected two service starts, got $start_count"
 
-    backup_dir=$(find /var/lib/vaultlink/backups -mindepth 1 -maxdepth 1 -type d \
+    backup_dir=$(find /var/lib/vaultlink-backups -mindepth 1 -maxdepth 1 -type d \
         ! -name '*.incomplete.*' -print -quit)
     [[ -n "$backup_dir" ]] || fail "$log_name did not keep its verified backup"
-    grep -q 'binary-marker:original' "$backup_dir/vaultlink" \
-        || fail "$log_name backup did not contain the original binary"
-    backup_marker=$("$REAL_SQLITE3" "$backup_dir/data.sqlite" "SELECT value FROM marker")
-    [[ "$backup_marker" == original ]] || fail "$log_name backup database was not original"
+    assert_backup_triple "$backup_dir" original
 }
 
 expect_failure() {
@@ -416,9 +457,11 @@ expect_failure() {
 test_upgrade_success() {
     initialize_live original original
     make_candidate
-    backup_dir=$("$UPGRADE" "$TEST_ROOT/candidate")
+    backup_dir=$("$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml")
     [[ -d "$backup_dir" ]] || fail "upgrade did not return a backup directory"
+    assert_backup_triple "$backup_dir" original
     assert_binary candidate
+    assert_config candidate
     assert_database original
     assert_service_active
     assert_no_incomplete_backup
@@ -426,12 +469,66 @@ test_upgrade_success() {
     echo "upgrade success case passed"
 }
 
+test_upgrade_rejects_mismatched_binary_configuration_pair_before_stop() {
+    initialize_live original original
+    make_candidate
+    write_config "$TEST_ROOT/candidate.toml" original
+
+    expect_failure upgrade-pair-mismatch \
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
+    assert_binary original
+    assert_config original
+    assert_database original
+    assert_service_active
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "binary/configuration mismatch stopped the service"
+    echo "upgrade binary/configuration pairing preflight passed"
+}
+
+test_upgrade_maintenance_lock_fails_before_stop() {
+    initialize_live original original
+    make_candidate
+    exec 8>/run/lock/vaultlink-maintenance.lock
+    flock -n 8
+    expect_failure upgrade-maintenance-lock \
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
+    flock -u 8
+    exec 8>&-
+    assert_binary original
+    assert_config original
+    assert_database original
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "maintenance lock contention stopped the service"
+    echo "upgrade and rollback shared maintenance lock passed"
+}
+
+test_040_to_041_migration_requires_an_inactive_service() {
+    initialize_live original original
+    write_binary /opt/vaultlink/vaultlink original "$HEALTH_URL" - 0 0.4.0
+    write_binary "$TEST_ROOT/candidate" candidate "$HEALTH_URL" - 0 0.4.1
+    write_config "$TEST_ROOT/candidate.toml" candidate
+
+    expect_failure upgrade-040-041-active \
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
+    grep -q '0.4.0 to 0.4.1 storage migration requires vaultlink.service to be stopped' \
+        "$TEST_ROOT/upgrade-040-041-active.log" \
+        || fail "active migration did not explain the required quiesce gate"
+    assert_binary original
+    assert_config original
+    assert_database original
+    assert_service_active
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "active 0.4.0 to 0.4.1 migration stopped the service itself"
+    echo "0.4.0 to 0.4.1 inactive-service migration gate passed"
+}
+
 test_upgrade_backup_failure() {
     initialize_live original original
     make_candidate
     touch "$MOCK_STATE_DIR/fail-backup-once"
-    expect_failure upgrade-backup-failure "$UPGRADE" "$TEST_ROOT/candidate"
+    expect_failure upgrade-backup-failure "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
     assert_binary original
+    assert_config original
     assert_database original
     assert_service_active
     assert_no_incomplete_backup
@@ -442,8 +539,9 @@ test_upgrade_start_failure() {
     initialize_live original original
     make_candidate
     touch "$MOCK_STATE_DIR/fail-start-once"
-    expect_failure upgrade-start-failure "$UPGRADE" "$TEST_ROOT/candidate"
+    expect_failure upgrade-start-failure "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
     assert_binary original
+    assert_config original
     assert_database original
     assert_service_active
     assert_no_incomplete_backup
@@ -454,8 +552,9 @@ test_upgrade_integrity_failure() {
     initialize_live original original
     make_candidate
     touch "$MOCK_STATE_DIR/fail-live-integrity-once"
-    expect_failure upgrade-integrity-failure "$UPGRADE" "$TEST_ROOT/candidate"
+    expect_failure upgrade-integrity-failure "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
     assert_binary original
+    assert_config original
     assert_database original
     assert_service_active
     assert_no_incomplete_backup
@@ -467,9 +566,10 @@ test_upgrade_delayed_start_and_health() {
     make_candidate
     printf '%s\n' 2 >"$MOCK_STATE_DIR/delayed-active-checks"
     set_health_mode delayed 2
-    backup_dir=$(VAULTLINK_READINESS_ATTEMPTS=4 "$UPGRADE" "$TEST_ROOT/candidate")
+    backup_dir=$(VAULTLINK_READINESS_ATTEMPTS=4 "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml")
     [[ -d "$backup_dir" ]] || fail "delayed upgrade did not return a backup directory"
     assert_binary candidate
+    assert_config candidate
     assert_database original
     assert_service_active
     assert_no_incomplete_backup
@@ -485,6 +585,7 @@ test_upgrade_standalone_tls_curl_arguments() {
     tls_health_url=https://files.example.test/api/v1/health
     tls_connect_to=files.example.test:443:127.0.0.1:443
     write_binary "$TEST_ROOT/candidate" candidate "$tls_health_url" "$tls_connect_to" 1
+    write_config "$TEST_ROOT/candidate.toml" candidate
 
     tls_mock_root=/tmp/vaultlink-upgrade-tls-curl
     tls_mock_bin="$tls_mock_root/bin"
@@ -511,7 +612,7 @@ SH
     tls_stdout="$TEST_ROOT/upgrade-standalone-tls.stdout"
     tls_log="$TEST_ROOT/upgrade-standalone-tls.log"
     if PATH="$tls_mock_bin:$PATH" TLS_CURL_CAPTURE_DIR="$tls_capture" \
-        "$UPGRADE" "$TEST_ROOT/candidate" >"$tls_stdout" 2>"$tls_log"; then
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml" >"$tls_stdout" 2>"$tls_log"; then
         tls_status=0
     else
         tls_status=$?
@@ -565,13 +666,14 @@ ARGS
         fail "standalone TLS curl arguments were not exact"
     fi
 
-    backup_dir=$(find /var/lib/vaultlink/backups -mindepth 1 -maxdepth 1 -type d \
+    backup_dir=$(find /var/lib/vaultlink-backups -mindepth 1 -maxdepth 1 -type d \
         ! -name '*.incomplete.*' -print -quit)
     [[ -n "$backup_dir" ]] || fail "standalone TLS upgrade did not keep its verified backup"
     printf '%s\n' "$backup_dir" >"$TEST_ROOT/upgrade-standalone-tls.expected-stdout"
     cmp -s "$TEST_ROOT/upgrade-standalone-tls.expected-stdout" "$tls_stdout" \
         || fail "standalone TLS upgrade stdout contained more than the backup path"
     assert_binary candidate
+    assert_config candidate
     assert_database original
     assert_service_active
     assert_no_incomplete_backup
@@ -583,7 +685,7 @@ test_upgrade_health_http_500() {
     make_candidate
     set_health_mode http500
     expect_failure upgrade-health-http-500 env \
-        VAULTLINK_READINESS_ATTEMPTS=2 "$UPGRADE" "$TEST_ROOT/candidate"
+        VAULTLINK_READINESS_ATTEMPTS=2 "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
     grep -q 'candidate readiness failed after 2 attempts (HTTP 500)' \
         "$TEST_ROOT/upgrade-health-http-500.log" \
         || fail "HTTP 500 readiness failure was not reported"
@@ -597,7 +699,7 @@ test_upgrade_health_invalid_json() {
     make_candidate
     set_health_mode invalid-json
     expect_failure upgrade-health-invalid-json env \
-        VAULTLINK_READINESS_ATTEMPTS=2 "$UPGRADE" "$TEST_ROOT/candidate"
+        VAULTLINK_READINESS_ATTEMPTS=2 "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
     grep -q 'candidate readiness failed after 2 attempts (HTTP 200 with unexpected health JSON)' \
         "$TEST_ROOT/upgrade-health-invalid-json.log" \
         || fail "invalid readiness JSON failure was not reported"
@@ -611,7 +713,7 @@ test_upgrade_health_wrong_version() {
     make_candidate
     set_health_mode wrong-version
     expect_failure upgrade-health-wrong-version env \
-        VAULTLINK_READINESS_ATTEMPTS=2 "$UPGRADE" "$TEST_ROOT/candidate"
+        VAULTLINK_READINESS_ATTEMPTS=2 "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
     grep -q 'candidate readiness failed after 2 attempts (HTTP 200 with unexpected health JSON)' \
         "$TEST_ROOT/upgrade-health-wrong-version.log" \
         || fail "wrong candidate health version was not reported"
@@ -628,7 +730,7 @@ test_upgrade_health_timeout() {
         VAULTLINK_READINESS_ATTEMPTS=1 \
         VAULTLINK_READINESS_CONNECT_TIMEOUT_SECONDS=1 \
         VAULTLINK_READINESS_MAX_TIME_SECONDS=1 \
-        "$UPGRADE" "$TEST_ROOT/candidate"
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
     grep -q 'candidate readiness failed after 1 attempts (transport failure)' \
         "$TEST_ROOT/upgrade-health-timeout.log" \
         || fail "curl readiness timeout was not reported"
@@ -642,7 +744,7 @@ test_upgrade_health_failure_restores_candidate_write() {
     make_candidate
     set_health_mode mutate-then-500
     expect_failure upgrade-health-mutating-failure env \
-        VAULTLINK_READINESS_ATTEMPTS=1 "$UPGRADE" "$TEST_ROOT/candidate"
+        VAULTLINK_READINESS_ATTEMPTS=1 "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
     [[ -f "$MOCK_STATE_DIR/health-mutation.done" ]] \
         || fail "candidate readiness fixture did not mutate the live database"
     assert_health_requests 1
@@ -658,12 +760,13 @@ test_upgrade_recovery_stop_failure_requires_manual_recovery() {
     expect_failure upgrade-recovery-stop-failure env \
         VAULTLINK_READINESS_ATTEMPTS=1 \
         VAULTLINK_READINESS_TIMEOUT_SECONDS=5 \
-        "$UPGRADE" "$TEST_ROOT/candidate"
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
 
     [[ -f "$MOCK_STATE_DIR/health-mutation.done" ]] \
         || fail "recovery stop fixture did not mutate the live database"
     assert_health_requests 1
     assert_binary candidate
+    assert_config candidate
     assert_database candidate-write
     assert_service_active
     assert_no_incomplete_backup
@@ -684,14 +787,10 @@ test_upgrade_recovery_stop_failure_requires_manual_recovery() {
     [[ "$start_count" -eq 1 ]] \
         || fail "recovery stop failure restarted the service ($start_count starts)"
 
-    backup_dir=$(find /var/lib/vaultlink/backups -mindepth 1 -maxdepth 1 -type d \
+    backup_dir=$(find /var/lib/vaultlink-backups -mindepth 1 -maxdepth 1 -type d \
         ! -name '*.incomplete.*' -print -quit)
     [[ -n "$backup_dir" ]] || fail "recovery stop failure did not keep its verified backup"
-    grep -q 'binary-marker:original' "$backup_dir/vaultlink" \
-        || fail "recovery stop failure backup did not contain the original binary"
-    backup_marker=$("$REAL_SQLITE3" "$backup_dir/data.sqlite" "SELECT value FROM marker")
-    [[ "$backup_marker" == original ]] \
-        || fail "recovery stop failure backup database was not original"
+    assert_backup_triple "$backup_dir" original
 
     echo "upgrade recovery stop failure preserved candidate state for manual recovery"
 }
@@ -700,6 +799,7 @@ prepare_rollback_case() {
     initialize_live original original
     source_backup=$(make_source_backup)
     write_binary /opt/vaultlink/vaultlink candidate
+    write_config "$CONFIG_PATH" candidate
     "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite "UPDATE marker SET value='candidate'"
     printf '%s\n' "$source_backup"
 }
@@ -710,9 +810,13 @@ test_rollback_success() {
     printf '%s\n' "$output" | grep -q 'pre-rollback backup:' \
         || fail "rollback did not report its emergency backup"
     assert_binary original
+    assert_config original
     assert_database original
     assert_service_active
     assert_no_incomplete_backup
+    emergency_dir=${output##*pre-rollback backup: }
+    [[ -d "$emergency_dir" ]] || fail "rollback emergency backup path was invalid"
+    assert_backup_triple "$emergency_dir" candidate
     echo "rollback success case passed"
 }
 
@@ -721,10 +825,53 @@ test_rollback_start_failure() {
     touch "$MOCK_STATE_DIR/fail-start-once"
     expect_failure rollback-start-failure "$ROLLBACK" "$source_backup"
     assert_binary candidate
+    assert_config candidate
     assert_database candidate
     assert_service_active
     assert_no_incomplete_backup
     echo "rollback start-failure recovery passed"
+}
+
+test_rollback_rejects_incomplete_backup_before_stop() {
+    source_backup=$(prepare_rollback_case)
+    rm -f "$source_backup/config.toml"
+    expect_failure rollback-missing-config "$ROLLBACK" "$source_backup"
+    assert_binary candidate
+    assert_config candidate
+    assert_database candidate
+    assert_service_active
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "incomplete rollback backup stopped the service"
+    echo "rollback incomplete triple preflight passed"
+}
+
+test_rollback_rejects_mismatched_pair_before_stop() {
+    source_backup=$(prepare_rollback_case)
+    write_config "$source_backup/config.toml" candidate
+    expect_failure rollback-pair-mismatch "$ROLLBACK" "$source_backup"
+    assert_binary candidate
+    assert_config candidate
+    assert_database candidate
+    assert_service_active
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "mismatched rollback pair stopped the service"
+    echo "rollback binary/configuration pairing preflight passed"
+}
+
+test_rollback_recovery_stop_failure_stays_fail_closed() {
+    source_backup=$(prepare_rollback_case)
+    touch "$MOCK_STATE_DIR/fail-start-once" "$MOCK_STATE_DIR/fail-second-stop-once"
+    expect_failure rollback-recovery-stop-failure "$ROLLBACK" "$source_backup"
+    assert_binary original
+    assert_config original
+    assert_database original
+    assert_service_inactive
+    grep -q 'CRITICAL: vaultlink.service could not be stopped; recover manually from ' \
+        "$TEST_ROOT/rollback-recovery-stop-failure.log" \
+        || fail "rollback recovery stop failure did not report manual recovery"
+    [[ "$(grep -c '^start vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 1 ]] \
+        || fail "rollback recovery stop failure attempted an unsafe restart"
+    echo "rollback recovery stop failure remained fail closed"
 }
 
 create_service_account
@@ -733,6 +880,9 @@ export PATH="$MOCK_BIN:$PATH"
 start_health_server
 
 test_upgrade_success
+test_upgrade_rejects_mismatched_binary_configuration_pair_before_stop
+test_upgrade_maintenance_lock_fails_before_stop
+test_040_to_041_migration_requires_an_inactive_service
 test_upgrade_backup_failure
 test_upgrade_start_failure
 test_upgrade_integrity_failure
@@ -746,5 +896,8 @@ test_upgrade_health_failure_restores_candidate_write
 test_upgrade_recovery_stop_failure_requires_manual_recovery
 test_rollback_success
 test_rollback_start_failure
+test_rollback_rejects_incomplete_backup_before_stop
+test_rollback_rejects_mismatched_pair_before_stop
+test_rollback_recovery_stop_failure_stays_fail_closed
 
 echo "VaultLink upgrade and rollback safety tests passed"

@@ -136,6 +136,9 @@ curl -sS -f -X POST "http://$SETUP_ADDR/" \
     --data-urlencode "public_base_url=http://localhost:18081" \
     --data-urlencode "root_mount_path=$ROOT_DIR" \
     --data-urlencode "data_directory=$DATA_DIR" \
+    --data-urlencode "internal_directory=" \
+    --data-urlencode "expected_filesystem_type=" \
+    --data-urlencode "expected_mount_source=" \
     --data-urlencode "max_upload_size_mb=100" \
     --data-urlencode "blocked_extensions=exe,sh,php" \
     --data-urlencode "max_zip_size_gb=1" \
@@ -344,7 +347,7 @@ if grep -Fq "$ADMIN_PASSWORD" "$SETUP_LOG" "$APP_LOG"; then
     fail "logs contain sensitive setup data"
 fi
 
-TOMBSTONE="$ROOT_DIR/.vaultlink-delete-AAAAAAAAAAAAAAAAAAAAAAAA.tombstone"
+TOMBSTONE="$ROOT_DIR/.vaultlink-internal/tombstones/.vaultlink-delete-AAAAAAAAAAAAAAAAAAAAAAAA.tombstone"
 mkdir -p "$TOMBSTONE/nested"
 printf '%s\n' 'restart cleanup' > "$TOMBSTONE/nested/child.txt"
 kill "$APP_PID"

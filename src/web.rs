@@ -688,19 +688,10 @@ struct DiskStats {
 }
 
 fn disk_stats(path: &Path) -> Option<DiskStats> {
-    #[cfg(unix)]
-    {
-        disk_stats_unix(path)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
+    disk_stats_linux(path)
 }
 
-#[cfg(unix)]
-fn disk_stats_unix(path: &Path) -> Option<DiskStats> {
+fn disk_stats_linux(path: &Path) -> Option<DiskStats> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let stat = rustix::fs::statvfs(&canonical).ok()?;
     let block_size = stat.f_bsize;
@@ -1802,6 +1793,12 @@ async fn process_admin_upload(
                     .await
                     .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Uploadoption"))?;
                 overwrite_existing = value == "1";
+                if overwrite_existing && state.config.storage.external_writers {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+                    ));
+                }
             }
             "file" => {
                 if staged.is_some() {
@@ -2204,11 +2201,17 @@ async fn admin_browser(
         esc(&s.csrf_token),
         esc(&rel),
     );
+    let overwrite_control = if state.config.storage.external_writers {
+        ""
+    } else {
+        r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_conflict"/><small><vl-i18n key="share.after_conflict"/></small></span></label>"#
+    };
     let upload_form = format!(
-        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} <vl-i18n key="upload.files"/></summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><div class="vl-panel-head"><div><strong><vl-i18n key="upload.admin"/></strong><p class="vl-muted"><vl-i18n key="upload.sequential"/></p></div><button class="vl-button vl-button--ghost vl-button--small" type="button" data-details-close><vl-i18n key="common.close"/></button></div><label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_conflict"/><small><vl-i18n key="share.after_conflict"/></small></span></label><label class="vl-upload-dropzone" data-upload-dropzone><strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_add"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit><vl-i18n key="upload.start"/></button></form></details>"#,
+        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} <vl-i18n key="upload.files"/></summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><div class="vl-panel-head"><div><strong><vl-i18n key="upload.admin"/></strong><p class="vl-muted"><vl-i18n key="upload.sequential"/></p></div><button class="vl-button vl-button--ghost vl-button--small" type="button" data-details-close><vl-i18n key="common.close"/></button></div>{}<label class="vl-upload-dropzone" data-upload-dropzone><strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_add"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit><vl-i18n key="upload.start"/></button></form></details>"#,
         crate::ui::icon(crate::ui::Icon::Upload),
         esc(&rel),
         esc(&s.csrf_token),
+        overwrite_control,
     );
     let listing = format!(
         r#"<section class="vl-stat-strip" aria-label="<vl-i18n key="audit.storage_aria"/>"><div><strong>{}</strong><span><vl-i18n key="common.used"/></span></div><div><strong>{}</strong><span><vl-i18n key="common.free"/></span></div><div><strong>{}</strong><span><vl-i18n key="share.active_links"/></span></div></section><section class="vl-panel"><div class="vl-browser-head"><div>{}<p class="vl-muted"><vl-i18n key="files.relative_path"/>: /{}</p></div><div class="vl-inline-actions">{}{}{}<a class="vl-button" href="/admin/shares/new?path={}"><vl-i18n key="share.current_folder"/></a></div></div><form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="files.browse"/></span><input name="q" value="{}" placeholder="<vl-i18n key="files.search_placeholder"/>"></label><button class="vl-button"><vl-i18n key="common.search"/></button></form><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th><vl-i18n key="common.name"/></th><th><vl-i18n key="common.type"/></th><th><vl-i18n key="common.size"/></th><th><vl-i18n key="common.changed"/></th><th><vl-i18n key="common.action"/></th></tr></thead><tbody>{}</tbody></table></div><nav class="vl-pagination" aria-label="<vl-i18n key="files.pages_aria"/>">{} {}</nav><p class="vl-muted"><vl-i18n key="files.entries_page"/></p></section><div class="vl-selection-bar" data-selection-bar hidden><span data-selection-name><vl-i18n key="share.one_selected"/></span><a class="vl-button" data-selection-share href="/admin/shares/new"><vl-i18n key="share.selection"/></a></div>"#,
@@ -3628,7 +3631,10 @@ async fn share_index_page(
                 format!(r#"<progress max="100" value="{value}">{value}%</progress>"#)
             })
             .unwrap_or_default();
-        let upload_settings = if share.is_directory && share.permission.can_upload() {
+        let upload_settings = if share.is_directory
+            && share.permission.can_upload()
+            && !state.config.storage.external_writers
+        {
             let checked = if share.upload_conflict_strategy.can_overwrite() {
                 "checked"
             } else {
@@ -3759,10 +3765,16 @@ async fn share_create_page(
     } else {
         r#"<input type="hidden" name="permission" value="download_only"><span class="vl-badge vl-badge--accent"><vl-i18n key="share.download_only"/></span><p class="vl-muted"><vl-i18n key="share.upload_folder_only"/></p>"#
     };
+    let overwrite_rule = if state.config.storage.external_writers {
+        ""
+    } else {
+        r#"<label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1"><span><vl-i18n key="share.existing_replace"/><small><vl-i18n key="share.uploader_confirm"/></small></span></label>"#
+    };
     let upload_rules = if is_directory {
         format!(
-            r#"<section class="vl-form-section" data-upload-rules><h2><vl-i18n key="share.step_upload"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.max_file"/><input name="max_upload_size_gb" type="number" min="1" step="1" placeholder="Global: {} GB"><small><vl-i18n key="share.empty_global"/></small></label><label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1"><span><vl-i18n key="share.existing_replace"/><small><vl-i18n key="share.uploader_confirm"/></small></span></label></div></section>"#,
-            display_limit_unit_floor(settings.max_upload_size, GB)
+            r#"<section class="vl-form-section" data-upload-rules><h2><vl-i18n key="share.step_upload"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.max_file"/><input name="max_upload_size_gb" type="number" min="1" step="1" placeholder="Global: {} GB"><small><vl-i18n key="share.empty_global"/></small></label>{}</div></section>"#,
+            display_limit_unit_floor(settings.max_upload_size, GB),
+            overwrite_rule,
         )
     } else {
         String::new()
@@ -4066,12 +4078,19 @@ async fn create_share(
             "Uploadlimit muss mindestens 1 Byte sein",
         ));
     }
-    let upload_conflict_strategy =
-        if f.overwrite_allowed.as_deref() == Some("1") && is_directory && permission.can_upload() {
-            UploadConflictStrategy::OverwriteAllowed
-        } else {
-            UploadConflictStrategy::Reject
-        };
+    let overwrite_requested = f.overwrite_allowed.as_deref() == Some("1");
+    if overwrite_requested && state.config.storage.external_writers {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+        ));
+    }
+    let upload_conflict_strategy = if overwrite_requested && is_directory && permission.can_upload()
+    {
+        UploadConflictStrategy::OverwriteAllowed
+    } else {
+        UploadConflictStrategy::Reject
+    };
     let audit_detail = format!(
         "path={rel};permission={permission_detail};alias={};expires_at={};transfer_limit={};upload_limit={};password_protected={password_protected};overwrite_allowed={}",
         alias.as_deref().unwrap_or(""),
@@ -4161,6 +4180,12 @@ async fn set_share_upload_conflict(
     } else {
         UploadConflictStrategy::Reject
     };
+    if strategy.can_overwrite() && state.config.storage.external_writers {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+        ));
+    }
     let share = database(state.db.clone(), |db| db.list_shares())
         .await?
         .into_iter()
@@ -5746,7 +5771,9 @@ async fn public_page(
         } else {
             String::new()
         };
-        let overwrite_checkbox = if sh.upload_conflict_strategy.can_overwrite() {
+        let overwrite_checkbox = if sh.upload_conflict_strategy.can_overwrite()
+            && !state.config.storage.external_writers
+        {
             r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_existing_file"/><small><vl-i18n key="share.replace_concrete"/></small></span></label>"#
         } else {
             ""
@@ -6487,6 +6514,14 @@ pub(crate) async fn upload(
                 }
             };
             overwrite_existing = value == "1";
+            if overwrite_existing && state.config.storage.external_writers {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::BAD_REQUEST,
+                    "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+                ));
+            }
             continue;
         }
         if field_name != "file" {
@@ -6645,7 +6680,9 @@ pub(crate) async fn upload(
         ));
     };
     let publish_name = name.clone();
-    let allow_replace = sh.upload_conflict_strategy.can_overwrite() && overwrite_existing;
+    let allow_replace = !state.config.storage.external_writers
+        && sh.upload_conflict_strategy.can_overwrite()
+        && overwrite_existing;
     #[cfg(test)]
     if let Some(kind) = state
         .upload_directory_sync_failure
@@ -6882,6 +6919,11 @@ mod tests {
             storage: Storage {
                 root_mount_path: root.into(),
                 data_directory: data.into(),
+                internal_directory: None,
+                require_mount: false,
+                external_writers: false,
+                expected_filesystem_type: None,
+                expected_mount_source: None,
                 max_upload_size,
                 max_zip_size: 1024 * 1024,
                 max_zip_files: 100,
@@ -8065,7 +8107,6 @@ mod tests {
         assert!(html.contains("Herunterladen"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn disk_stats_uses_target_path() {
         let root = tempfile::tempdir().unwrap();
@@ -8357,7 +8398,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn public_share_scope_blocks_sibling_symlink_http_flows() {
         use std::os::unix::fs::symlink;
@@ -9999,6 +10039,60 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
             .count();
         assert_eq!(remaining_parts, 0);
+    }
+
+    #[tokio::test]
+    async fn external_writers_disable_saved_public_overwrite_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("uploads")).unwrap();
+        std::fs::write(root.path().join("uploads/report.txt"), b"external").unwrap();
+        let mut state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "external-writers",
+                None,
+                "uploads",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::OverwriteAllowed,
+            )
+            .unwrap();
+        let mut config = (*state.config).clone();
+        config.storage.external_writers = true;
+        state.config = std::sync::Arc::new(config);
+        let app = router(state);
+
+        let page = response_text(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/external-writers", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!page.contains("overwrite_existing"));
+        let response = app
+            .oneshot(multipart_request_with_options(
+                "/v/external-writers/upload",
+                "report.txt",
+                b"vaultlink",
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read(root.path().join("uploads/report.txt")).unwrap(),
+            b"external"
+        );
     }
 
     #[tokio::test]

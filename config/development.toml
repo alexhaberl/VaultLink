@@ -7,6 +7,8 @@ production_mode = false
 [storage]
 root_mount_path = "dev/mount"
 data_directory = "dev/data"
+require_mount = false
+external_writers = false
 max_upload_size = 104857600
 max_zip_size = 1073741824
 max_zip_files = 10000

@@ -1,0 +1,23 @@
+# Example: install as /etc/systemd/system/mnt-storage.mount, then adjust What,
+# the root-only (0600) credential path, and the vaultlink uid/gid mapping.
+# The unit name must match Where=/mnt/storage.
+# Pre-provision .vaultlink-internal/{uploads,tombstones}. Server-side ACLs must
+# grant only the VaultLink SMB account access and deny every co-writer read,
+# write, delete, rename, parent DELETE_CHILD, WRITE_DAC/WRITE_OWNER, chmod,
+# chown, setfacl, and share-root administrative rights. Co-writers receive
+# Modify rights only within shared/.
+[Unit]
+Description=External SMB storage for VaultLink
+Wants=network-online.target
+After=network-online.target
+Before=vaultlink.service
+
+[Mount]
+What=//fileserver.example/vaultlink
+Where=/mnt/storage
+Type=cifs
+Options=_netdev,credentials=/etc/vaultlink/smb-credentials,vers=3.1.1,sign,seal,cache=strict,serverino,nosuid,nodev,noexec,uid=vaultlink,gid=vaultlink,file_mode=0600,dir_mode=0700
+TimeoutSec=30s
+
+[Install]
+WantedBy=remote-fs.target

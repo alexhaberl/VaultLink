@@ -6,12 +6,12 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::SystemTime,
 };
 
-#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
 use crate::path_security;
@@ -22,11 +22,14 @@ const UPLOAD_FRAGMENT_TOKEN_LENGTH: usize = 24;
 const DELETION_TOMBSTONE_PREFIX: &str = ".vaultlink-delete-";
 const DELETION_TOMBSTONE_SUFFIX: &str = ".tombstone";
 const DELETION_TOMBSTONE_TOKEN_LENGTH: usize = 24;
+const DELETION_PENDING_PREFIX: &str = ".vaultlink-delete-pending-";
+const DELETION_PENDING_SUFFIX: &str = ".pending";
+const DELETION_MANIFEST_SUFFIX: &str = ".manifest";
+const INTERNAL_DIRECTORY_NAME: &str = path_security::INTERNAL_STORAGE_DIRECTORY_NAME;
+const UPLOAD_STAGING_DIRECTORY_NAME: &str = "uploads";
+const TOMBSTONE_STAGING_DIRECTORY_NAME: &str = "tombstones";
 
-#[cfg(target_os = "linux")]
-type ActiveUploadFragmentKey = (u64, u64);
-#[cfg(not(target_os = "linux"))]
-type ActiveUploadFragmentKey = PathBuf;
+type ActiveUploadFragmentKey = String;
 
 static ACTIVE_UPLOAD_FRAGMENTS: OnceLock<Mutex<HashSet<ActiveUploadFragmentKey>>> = OnceLock::new();
 
@@ -75,6 +78,33 @@ pub fn deletion_tombstone_name() -> String {
         "{DELETION_TOMBSTONE_PREFIX}{}{DELETION_TOMBSTONE_SUFFIX}",
         crate::auth::random_token(18)
     )
+}
+
+fn deletion_pending_name() -> String {
+    format!(
+        "{DELETION_PENDING_PREFIX}{}{DELETION_PENDING_SUFFIX}",
+        crate::auth::random_token(18)
+    )
+}
+
+fn is_deletion_pending_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(token) = name
+        .strip_prefix(DELETION_PENDING_PREFIX)
+        .and_then(|name| name.strip_suffix(DELETION_PENDING_SUFFIX))
+    else {
+        return false;
+    };
+    token.len() == DELETION_TOMBSTONE_TOKEN_LENGTH
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn deletion_manifest_name(pending_name: &str) -> String {
+    format!("{pending_name}{DELETION_MANIFEST_SUFFIX}")
 }
 
 pub fn is_deletion_tombstone_name(name: &OsStr) -> bool {
@@ -134,15 +164,20 @@ impl PublishOutcome {
 pub struct SecureRoot {
     display_root: PathBuf,
     root: SecureDirectory,
+    tombstones: Arc<File>,
+    #[cfg(test)]
+    next_delete_staging_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_delete_promotion_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
 }
 
 /// A descriptor/path capability whose relative operations cannot resolve above this directory.
 #[derive(Clone)]
 pub struct SecureDirectory {
-    #[cfg(target_os = "linux")]
     directory: Arc<File>,
-    #[cfg(not(target_os = "linux"))]
-    directory: PathBuf,
+    staging: Arc<File>,
+    forbid_symlinks: bool,
+    allow_replace: bool,
 }
 
 /// An already-opened regular file bound to the scope that authorized it.
@@ -179,8 +214,8 @@ impl DirectoryScanItem {
 /// never rescans entries that were already consumed.
 pub struct DirectoryScan {
     entries: std::fs::ReadDir,
-    #[cfg(target_os = "linux")]
     directory: File,
+    strict_mount_boundary: bool,
 }
 
 #[derive(Debug, Default)]
@@ -203,30 +238,22 @@ pub struct UploadFragmentCleanupBatch {
 /// first entry on every pass.
 pub struct UploadFragmentCleanup {
     directories: Vec<CleanupDirectory>,
-    #[cfg(target_os = "linux")]
     visited: HashSet<(u64, u64)>,
-    #[cfg(not(target_os = "linux"))]
-    visited: HashSet<PathBuf>,
-    #[cfg(not(target_os = "linux"))]
-    root: PathBuf,
 }
 
-#[cfg(target_os = "linux")]
 struct CleanupDirectory {
     directory: File,
     entries: std::fs::ReadDir,
     removed_in_pass: bool,
-    delete_all: bool,
+    policy: CleanupPolicy,
     remove_from: Option<(File, OsString)>,
 }
 
-#[cfg(not(target_os = "linux"))]
-struct CleanupDirectory {
-    directory: PathBuf,
-    entries: std::fs::ReadDir,
-    removed_in_pass: bool,
-    delete_all: bool,
-    remove_from: Option<PathBuf>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupPolicy {
+    UploadFragments,
+    TombstoneRoot,
+    DeleteAll,
 }
 
 pub struct StagedRename {
@@ -234,10 +261,7 @@ pub struct StagedRename {
     new_path: String,
     kind: EntryKind,
     committed: bool,
-    #[cfg(target_os = "linux")]
     parent: File,
-    #[cfg(not(target_os = "linux"))]
-    parent: PathBuf,
     original_name: String,
     new_name: String,
 }
@@ -247,16 +271,21 @@ pub struct StagedDelete {
     tombstone_path: String,
     status: EntryStatus,
     committed: bool,
-    #[cfg(target_os = "linux")]
     parent: File,
-    #[cfg(not(target_os = "linux"))]
-    parent: PathBuf,
+    staging: File,
     original_name: String,
     tombstone_name: String,
+    manifest_name: String,
+    active_key: Option<ActiveUploadFragmentKey>,
+    #[cfg(test)]
+    next_promotion_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
 }
 
 fn visible_entry(name: OsString, metadata: std::fs::Metadata) -> DirectoryScanItem {
-    if is_upload_fragment_name(&name) || is_deletion_tombstone_name(&name) {
+    if path_security::is_internal_storage_name(&name)
+        || is_upload_fragment_name(&name)
+        || is_deletion_tombstone_name(&name)
+    {
         return DirectoryScanItem::Filtered;
     }
     let Some(display_name) = name.to_str() else {
@@ -285,27 +314,20 @@ impl Iterator for DirectoryScan {
             Err(_) => return Some(DirectoryScanItem::Filtered),
         };
         let name = item.file_name();
-        #[cfg(target_os = "linux")]
-        {
-            let child =
-                match linux::openat2(&self.directory, &name, linux::O_PATH | linux::O_NOFOLLOW) {
-                    Ok(child) => child,
-                    Err(_) => return Some(DirectoryScanItem::Filtered),
-                };
-            let metadata = match child.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => return Some(DirectoryScanItem::Filtered),
-            };
-            Some(visible_entry(name, metadata))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let metadata = match std::fs::symlink_metadata(item.path()) {
-                Ok(metadata) => metadata,
-                Err(_) => return Some(DirectoryScanItem::Filtered),
-            };
-            Some(visible_entry(name, metadata))
-        }
+        let child = match linux::openat2_scoped(
+            &self.directory,
+            &name,
+            linux::O_PATH | linux::O_NOFOLLOW,
+            self.strict_mount_boundary,
+        ) {
+            Ok(child) => child,
+            Err(_) => return Some(DirectoryScanItem::Filtered),
+        };
+        let metadata = match child.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Some(DirectoryScanItem::Filtered),
+        };
+        Some(visible_entry(name, metadata))
     }
 }
 
@@ -347,13 +369,9 @@ impl UploadFragmentCleanup {
                 "upload fragment cleanup batch size must be positive",
             ));
         }
-        #[cfg(target_os = "linux")]
-        return self.run_linux_batch(max_entries);
-        #[cfg(not(target_os = "linux"))]
-        return self.run_path_batch(max_entries);
+        self.run_linux_batch(max_entries)
     }
 
-    #[cfg(target_os = "linux")]
     fn run_linux_batch(&mut self, max_entries: usize) -> io::Result<UploadFragmentCleanupBatch> {
         use std::os::unix::fs::MetadataExt;
 
@@ -375,7 +393,7 @@ impl UploadFragmentCleanup {
                         .directories
                         .pop()
                         .expect("cleanup directory disappeared");
-                    if completed.delete_all {
+                    if completed.policy == CleanupPolicy::DeleteAll {
                         let Some((parent, name)) = completed.remove_from else {
                             batch.failed += 1;
                             continue;
@@ -391,7 +409,7 @@ impl UploadFragmentCleanup {
                             Err(_) => batch.failed += 1,
                         }
                     } else if completed.removed_in_pass {
-                        match cleanup_directory_from_file(completed.directory) {
+                        match cleanup_directory_from_file(completed.directory, completed.policy) {
                             Ok(directory) => self.directories.push(directory),
                             Err(_) => batch.failed += 1,
                         }
@@ -401,10 +419,20 @@ impl UploadFragmentCleanup {
             };
             batch.scanned += 1;
             let name = item.file_name();
-            let child = match linux::openat2(
+            if current.policy == CleanupPolicy::TombstoneRoot && is_deletion_pending_name(&name) {
+                continue;
+            }
+            if name
+                .to_str()
+                .is_some_and(|name| active_upload_fragment_guard().contains(name))
+            {
+                continue;
+            }
+            let child = match linux::openat2_scoped(
                 &current.directory,
                 &name,
                 linux::O_PATH | linux::O_NOFOLLOW,
+                true,
             ) {
                 Ok(child) => child,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -421,142 +449,36 @@ impl UploadFragmentCleanup {
                 }
             };
             if metadata.is_dir() {
-                if self.visited.insert((metadata.dev(), metadata.ino())) {
-                    match cleanup_directory_from_file(child) {
-                        Ok(mut directory) => {
-                            let delete_all =
-                                current.delete_all || is_deletion_tombstone_name(&name);
-                            directory.delete_all = delete_all;
-                            if delete_all {
+                let child_policy = match current.policy {
+                    CleanupPolicy::DeleteAll => Some(CleanupPolicy::DeleteAll),
+                    CleanupPolicy::TombstoneRoot if is_deletion_tombstone_name(&name) => {
+                        Some(CleanupPolicy::DeleteAll)
+                    }
+                    // Upload staging is flat, and pending/recovery tombstones
+                    // must survive as whole subtrees until an operator resolves
+                    // them. Never recurse into any other private directory.
+                    CleanupPolicy::UploadFragments | CleanupPolicy::TombstoneRoot => None,
+                };
+                if let Some(child_policy) = child_policy {
+                    if self.visited.insert((metadata.dev(), metadata.ino())) {
+                        match cleanup_directory_from_file(child, child_policy) {
+                            Ok(mut directory) => {
                                 directory.remove_from =
                                     Some((current.directory.try_clone()?, name.clone()));
+                                self.directories.push(directory);
                             }
-                            self.directories.push(directory);
+                            Err(_) => batch.failed += 1,
                         }
-                        Err(_) => batch.failed += 1,
                     }
                 }
-            } else if current.delete_all
-                || (metadata.is_file() && is_upload_fragment_name(&name))
-                || is_deletion_tombstone_name(&name)
+            } else if current.policy == CleanupPolicy::DeleteAll
+                || (current.policy == CleanupPolicy::UploadFragments
+                    && metadata.is_file()
+                    && is_upload_fragment_name(&name))
+                || (current.policy == CleanupPolicy::TombstoneRoot
+                    && is_deletion_tombstone_name(&name))
             {
-                if !current.delete_all {
-                    let active_key = (metadata.dev(), metadata.ino());
-                    let active = active_upload_fragment_guard();
-                    if active.contains(&active_key) {
-                        continue;
-                    }
-                }
                 match linux::unlink(&current.directory, &name) {
-                    Ok(()) => {
-                        current.removed_in_pass = true;
-                        batch.removed += 1;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(_) => batch.failed += 1,
-                }
-            }
-        }
-        batch.complete = self.directories.is_empty();
-        Ok(batch)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn run_path_batch(&mut self, max_entries: usize) -> io::Result<UploadFragmentCleanupBatch> {
-        let mut batch = UploadFragmentCleanupBatch::default();
-        while batch.scanned < max_entries {
-            let Some(current) = self.directories.last_mut() else {
-                batch.complete = true;
-                break;
-            };
-            let item = match current.entries.next() {
-                Some(Ok(item)) => item,
-                Some(Err(_)) => {
-                    batch.scanned += 1;
-                    batch.failed += 1;
-                    continue;
-                }
-                None => {
-                    let completed = self
-                        .directories
-                        .pop()
-                        .expect("cleanup directory disappeared");
-                    if completed.delete_all {
-                        let Some(path) = completed.remove_from else {
-                            batch.failed += 1;
-                            continue;
-                        };
-                        match std::fs::remove_dir(path) {
-                            Ok(()) => {
-                                batch.removed += 1;
-                                if let Some(parent) = self.directories.last_mut() {
-                                    parent.removed_in_pass = true;
-                                }
-                            }
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                            Err(_) => batch.failed += 1,
-                        }
-                    } else if completed.removed_in_pass {
-                        match cleanup_directory_from_path(completed.directory) {
-                            Ok(directory) => self.directories.push(directory),
-                            Err(_) => batch.failed += 1,
-                        }
-                    }
-                    continue;
-                }
-            };
-            batch.scanned += 1;
-            let path = item.path();
-            let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => {
-                    batch.failed += 1;
-                    continue;
-                }
-            };
-            if metadata.is_dir() {
-                let delete_all =
-                    current.delete_all || is_deletion_tombstone_name(&item.file_name());
-                let canonical = if delete_all {
-                    path.clone()
-                } else {
-                    match path.canonicalize() {
-                        Ok(canonical)
-                            if canonical == self.root || canonical.starts_with(&self.root) =>
-                        {
-                            canonical
-                        }
-                        Ok(_) => continue,
-                        Err(_) => {
-                            batch.failed += 1;
-                            continue;
-                        }
-                    }
-                };
-                if self.visited.insert(canonical.clone()) {
-                    match cleanup_directory_from_path(canonical) {
-                        Ok(mut directory) => {
-                            directory.delete_all = delete_all;
-                            if delete_all {
-                                directory.remove_from = Some(path);
-                            }
-                            self.directories.push(directory);
-                        }
-                        Err(_) => batch.failed += 1,
-                    }
-                }
-            } else if current.delete_all
-                || (metadata.is_file() && is_upload_fragment_name(&item.file_name()))
-                || is_deletion_tombstone_name(&item.file_name())
-            {
-                if !current.delete_all {
-                    let active = active_upload_fragment_guard();
-                    if active.contains(&path) {
-                        continue;
-                    }
-                }
-                match std::fs::remove_file(path) {
                     Ok(()) => {
                         current.removed_in_pass = true;
                         batch.removed += 1;
@@ -571,8 +493,270 @@ impl UploadFragmentCleanup {
     }
 }
 
+fn open_private_directory(parent: &File, name: &str, create: bool) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut created = false;
+    if create {
+        match linux::mkdir(parent, name) {
+            Ok(()) => created = true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if created {
+        parent.sync_all()?;
+    }
+    let directory = linux::openat2(
+        parent,
+        name,
+        linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
+    )?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.dev() != parent.metadata()?.dev() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "VaultLink internal storage must be a directory on the storage-root filesystem",
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "VaultLink internal storage must not grant group or other mode permissions",
+        ));
+    }
+    Ok(directory)
+}
+
+fn probe_storage_mutations(source: &File, destination: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if source.metadata()?.dev() != destination.metadata()?.dev() {
+        return Err(io::Error::new(
+            io::ErrorKind::CrossesDevices,
+            "VaultLink internal staging directories must share one filesystem",
+        ));
+    }
+    let first = upload_fragment_name();
+    let second = deletion_tombstone_name();
+    let result = (|| {
+        let first_file = linux::openat2(
+            source,
+            &first,
+            linux::O_WRONLY | linux::O_CREAT | linux::O_EXCL,
+        )?;
+        let first_identity = {
+            let metadata = first_file.metadata()?;
+            (metadata.dev(), metadata.ino())
+        };
+        first_file.sync_all()?;
+        let second_file = linux::openat2(
+            destination,
+            &second,
+            linux::O_WRONLY | linux::O_CREAT | linux::O_EXCL,
+        )?;
+        let second_identity = {
+            let metadata = second_file.metadata()?;
+            (metadata.dev(), metadata.ino())
+        };
+        if second_identity == first_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "storage backend does not expose unique file identities",
+            ));
+        }
+        second_file.sync_all()?;
+        drop(first_file);
+        drop(second_file);
+
+        match linux::rename_noreplace_between(source, &first, destination, &second) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Ok(()) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "storage backend ignored RENAME_NOREPLACE",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        linux::unlink(destination, &second)?;
+        linux::rename_noreplace_between(source, &first, destination, &second)?;
+        let moved = linux::openat2(destination, &second, linux::O_PATH | linux::O_NOFOLLOW)?;
+        let moved_metadata = moved.metadata()?;
+        if !moved_metadata.is_file()
+            || (moved_metadata.dev(), moved_metadata.ino()) != first_identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "storage backend does not preserve stable file identity across rename",
+            ));
+        }
+        source.sync_all()?;
+        destination.sync_all()?;
+
+        let replacement = linux::openat2(
+            source,
+            &first,
+            linux::O_WRONLY | linux::O_CREAT | linux::O_EXCL,
+        )?;
+        let replacement_identity = {
+            let metadata = replacement.metadata()?;
+            (metadata.dev(), metadata.ino())
+        };
+        replacement.sync_all()?;
+        drop(replacement);
+        linux::rename_replace_between(source, &first, destination, &second)?;
+        let replaced = linux::openat2(destination, &second, linux::O_PATH | linux::O_NOFOLLOW)?;
+        let replaced_metadata = replaced.metadata()?;
+        if !replaced_metadata.is_file()
+            || (replaced_metadata.dev(), replaced_metadata.ino()) != replacement_identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "storage backend does not preserve replacement identity across rename",
+            ));
+        }
+        source.sync_all()?;
+        destination.sync_all()
+    })();
+    let _ = linux::unlink(source, &first);
+    let _ = linux::unlink(destination, &second);
+    let _ = source.sync_all();
+    let _ = destination.sync_all();
+    result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("storage backend failed required atomic mutation probe: {error}"),
+        )
+    })
+}
+
+fn write_pending_manifest(
+    staging: &File,
+    pending_name: &str,
+    original_path: &str,
+) -> io::Result<String> {
+    use std::io::Write;
+
+    let manifest_name = deletion_manifest_name(pending_name);
+    let mut manifest = linux::openat2(
+        staging,
+        &manifest_name,
+        linux::O_WRONLY | linux::O_CREAT | linux::O_EXCL,
+    )?;
+    let result = (|| {
+        serde_json::to_writer(&mut manifest, original_path).map_err(io::Error::other)?;
+        manifest.write_all(b"\n")?;
+        manifest.sync_all()?;
+        staging.sync_all()
+    })();
+    if result.is_err() {
+        drop(manifest);
+        let _ = linux::unlink(staging, &manifest_name);
+        let _ = staging.sync_all();
+    }
+    result.map(|()| manifest_name)
+}
+
+fn read_pending_manifest(staging: &File, manifest_name: &str) -> io::Result<String> {
+    use std::io::Read;
+
+    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+    let mut manifest = linux::openat2(staging, manifest_name, linux::O_RDONLY | linux::O_NOFOLLOW)?;
+    let metadata = manifest.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion recovery manifest is not a small regular file",
+        ));
+    }
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    manifest
+        .by_ref()
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut content)?;
+    if content.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "deletion recovery manifest exceeds its size limit",
+        ));
+    }
+    serde_json::from_slice(&content).map_err(io::Error::other)
+}
+
+fn remove_pending_manifest(staging: &File, manifest_name: &str) -> io::Result<()> {
+    match linux::unlink(staging, manifest_name) {
+        Ok(()) => staging.sync_all(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn entry_matches_identity(
+    directory: &File,
+    name: &str,
+    expected: (u64, u64),
+    expected_kind: EntryKind,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    linux::openat2(directory, name, linux::O_PATH | linux::O_NOFOLLOW)
+        .and_then(|entry| entry.metadata())
+        .is_ok_and(|metadata| {
+            (metadata.dev(), metadata.ino()) == expected
+                && match expected_kind {
+                    EntryKind::File => metadata.is_file(),
+                    EntryKind::Directory => metadata.is_dir(),
+                }
+        })
+}
+
+fn rollback_pending_delete(
+    staging: &File,
+    pending_name: &str,
+    manifest_name: &str,
+    parent: &File,
+    original_name: &str,
+    original_path: &str,
+) {
+    match linux::rename_noreplace_between(staging, pending_name, parent, original_name) {
+        Ok(()) => {
+            let staging_sync = staging.sync_all();
+            let parent_sync = parent.sync_all();
+            if let Err(error) = &staging_sync {
+                tracing::warn!(%error, "rolled back pending deletion but staging sync was uncertain");
+            }
+            if let Err(error) = &parent_sync {
+                tracing::warn!(%error, "rolled back pending deletion but source sync was uncertain");
+            }
+            if staging_sync.is_ok() && parent_sync.is_ok() {
+                if let Err(error) = remove_pending_manifest(staging, manifest_name) {
+                    tracing::warn!(%error, manifest = %manifest_name, "could not remove durable rollback manifest");
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                recovery_entry = %pending_name,
+                original = %original_path,
+                "could not roll back pending deletion; private recovery entry was preserved"
+            );
+        }
+    }
+}
+
 impl SecureRoot {
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_configured(path, None, false, false)
+    }
+
+    pub fn open_configured(
+        path: &Path,
+        internal_directory: Option<&Path>,
+        require_preprovisioned_internal: bool,
+        forbid_user_symlinks: bool,
+    ) -> io::Result<Self> {
         let display_root = path.canonicalize()?;
         if !display_root.is_dir() {
             return Err(io::Error::new(
@@ -580,31 +764,149 @@ impl SecureRoot {
                 "storage root is not a directory",
             ));
         }
-        #[cfg(target_os = "linux")]
+        let directory = Arc::new(File::open(&display_root)?);
+        // Probe the required kernel API at startup and fail with a useful error.
+        linux::openat2(
+            directory.as_ref(),
+            ".",
+            linux::O_RDONLY | linux::O_DIRECTORY,
+        )?;
+        let internal_path = internal_directory
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| display_root.join(INTERNAL_DIRECTORY_NAME));
+        let internal_parent = internal_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "VaultLink internal storage needs a parent directory",
+            )
+        })?;
+        let internal_name = internal_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "VaultLink internal storage needs a UTF-8 directory name",
+                )
+            })?;
+        let internal_parent = File::open(internal_parent.canonicalize()?)?;
+        let internal = Arc::new(open_private_directory(
+            &internal_parent,
+            internal_name,
+            !require_preprovisioned_internal,
+        )?);
+        let canonical_internal = internal_path.canonicalize()?;
+        if require_preprovisioned_internal
+            && (canonical_internal.starts_with(&display_root)
+                || display_root.starts_with(&canonical_internal))
         {
-            let directory = Arc::new(File::open(&display_root)?);
-            // Probe the required kernel API at startup and fail with a useful error.
-            linux::openat2(
-                directory.as_ref(),
-                ".",
-                linux::O_RDONLY | linux::O_DIRECTORY,
-            )?;
-            Ok(Self {
-                display_root,
-                root: SecureDirectory { directory },
-            })
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "external-writer internal storage must be outside the user-visible storage root",
+            ));
         }
-        #[cfg(not(target_os = "linux"))]
-        Ok(Self {
-            root: SecureDirectory {
-                directory: display_root.clone(),
-            },
+        if internal.metadata()?.dev() != directory.metadata()?.dev() {
+            return Err(io::Error::new(
+                io::ErrorKind::CrossesDevices,
+                "VaultLink internal storage and user-visible root must share one filesystem",
+            ));
+        }
+        let uploads = Arc::new(open_private_directory(
+            internal.as_ref(),
+            UPLOAD_STAGING_DIRECTORY_NAME,
+            !require_preprovisioned_internal,
+        )?);
+        let tombstones = Arc::new(open_private_directory(
+            internal.as_ref(),
+            TOMBSTONE_STAGING_DIRECTORY_NAME,
+            !require_preprovisioned_internal,
+        )?);
+        probe_storage_mutations(uploads.as_ref(), tombstones.as_ref())?;
+        let secure_root = Self {
             display_root,
-        })
+            root: SecureDirectory {
+                directory,
+                staging: uploads,
+                forbid_symlinks: forbid_user_symlinks,
+                allow_replace: !forbid_user_symlinks,
+            },
+            tombstones,
+            #[cfg(test)]
+            next_delete_staging_rename_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_delete_promotion_rename_error: Arc::new(Mutex::new(None)),
+        };
+        secure_root.recover_pending_deletions()?;
+        Ok(secure_root)
     }
 
     pub fn display_root(&self) -> &Path {
         &self.display_root
+    }
+
+    fn recover_pending_deletions(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let proc_path = format!("/proc/self/fd/{}", self.tombstones.as_ref().as_raw_fd());
+        for item in std::fs::read_dir(proc_path)? {
+            let item = item?;
+            let pending_name = item.file_name();
+            if !is_deletion_pending_name(&pending_name) {
+                continue;
+            }
+            let Some(pending_name) = pending_name.to_str() else {
+                continue;
+            };
+            let manifest_name = deletion_manifest_name(pending_name);
+            let original_path = match read_pending_manifest(
+                self.tombstones.as_ref(),
+                &manifest_name,
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::error!(%error, recovery_entry = %pending_name, manifest = %manifest_name, "pending deletion has no valid recovery manifest; entry was preserved");
+                    continue;
+                }
+            };
+            let (parent_path, original_name) = match split_parent_name(&original_path) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    tracing::error!(%error, recovery_entry = %pending_name, original = %original_path, "pending deletion manifest has an invalid original path; entry was preserved");
+                    continue;
+                }
+            };
+            let parent = match self.root.bind_directory(&parent_path) {
+                Ok(parent) => parent,
+                Err(error) => {
+                    tracing::error!(%error, recovery_entry = %pending_name, original = %original_path, "pending deletion parent is unavailable; entry was preserved");
+                    continue;
+                }
+            };
+            match linux::rename_noreplace_between(
+                self.tombstones.as_ref(),
+                pending_name,
+                parent.directory.as_ref(),
+                &original_name,
+            ) {
+                Ok(()) => {
+                    self.tombstones.sync_all()?;
+                    parent.directory.sync_all()?;
+                    if let Err(error) =
+                        remove_pending_manifest(self.tombstones.as_ref(), &manifest_name)
+                    {
+                        tracing::warn!(%error, manifest = %manifest_name, "could not remove recovered deletion manifest");
+                    }
+                    tracing::warn!(recovery_entry = %pending_name, original = %original_path, "restored uncommitted deletion after restart");
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    tracing::error!(%error, recovery_entry = %pending_name, original = %original_path, "could not restore uncommitted deletion because a co-writer reused the original path; both objects were preserved");
+                }
+                Err(error) => {
+                    tracing::error!(%error, recovery_entry = %pending_name, original = %original_path, "could not restore uncommitted deletion; recovery entry was preserved");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Binds a directory share to its own filesystem boundary.
@@ -620,7 +922,15 @@ impl SecureRoot {
     /// Compatibility one-shot cleanup. Returns an error when the raw-entry budget
     /// is exhausted before the scan completes; prefer the resumable API below.
     pub fn cleanup_upload_fragments(&self, max_entries: usize) -> io::Result<usize> {
-        self.root.cleanup_upload_fragments(max_entries)
+        let mut cleanup = self.start_upload_fragment_cleanup()?;
+        let batch = cleanup.run_batch(max_entries)?;
+        if batch.complete {
+            Ok(batch.removed)
+        } else {
+            Err(io::Error::other(
+                "upload fragment cleanup entry limit exceeded",
+            ))
+        }
     }
 
     // Global operations remain available for authenticated admin access.
@@ -654,7 +964,10 @@ impl SecureRoot {
     }
 
     pub fn stage_rename(&self, relative: &str, new_name: &str) -> io::Result<StagedRename> {
+        use std::os::unix::fs::MetadataExt;
+
         let (parent_path, original_name) = split_parent_name(relative)?;
+        let original_path = join_relative(&parent_path, &original_name);
         let new_name = path_security::safe_admin_filename(new_name)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid destination name"))?;
         if original_name == new_name {
@@ -664,46 +977,286 @@ impl SecureRoot {
             ));
         }
         let parent = self.root.bind_directory(&parent_path)?;
-        let kind = parent.entry_status(&original_name)?.kind;
-        parent.rename_noreplace(&original_name, new_name)?;
+        let transaction_parent = parent.directory.try_clone()?;
+        let source = linux::openat2(
+            parent.directory.as_ref(),
+            &original_name,
+            linux::O_PATH | linux::O_NOFOLLOW,
+        )?;
+        let source_metadata = source.metadata()?;
+        let kind = if source_metadata.is_file() {
+            EntryKind::File
+        } else if source_metadata.is_dir() {
+            EntryKind::Directory
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rename source is not a regular file or directory",
+            ));
+        };
+        let source_identity = (source_metadata.dev(), source_metadata.ino());
+        if let Err(error) = parent.rename_noreplace(&original_name, new_name) {
+            if entry_matches_identity(parent.directory.as_ref(), new_name, source_identity, kind) {
+                tracing::warn!(%error, from = %original_path, to = %new_name, "rename returned an error after the entry moved; continuing with verified identity");
+            } else {
+                return Err(error);
+            }
+        }
         Ok(StagedRename {
-            original_path: join_relative(&parent_path, &original_name),
+            original_path,
             new_path: join_relative(&parent_path, new_name),
             kind,
             committed: false,
-            #[cfg(target_os = "linux")]
-            parent: parent.directory.try_clone()?,
-            #[cfg(not(target_os = "linux"))]
-            parent: parent.directory.clone(),
+            parent: transaction_parent,
             original_name,
             new_name: new_name.to_string(),
         })
     }
 
     pub fn stage_delete(&self, relative: &str) -> io::Result<StagedDelete> {
+        use std::os::unix::fs::MetadataExt;
+
         let (parent_path, original_name) = split_parent_name(relative)?;
+        let original_path = join_relative(&parent_path, &original_name);
         let parent = self.root.bind_directory(&parent_path)?;
-        let status = parent.entry_status(&original_name)?;
-        let tombstone_name = loop {
-            let candidate = deletion_tombstone_name();
-            match parent.rename_noreplace(&original_name, &candidate) {
-                Ok(()) => break candidate,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+        // Acquire every capability needed by the returned transaction before the
+        // source name is mutated. An fd-allocation failure must never strand an
+        // untracked tombstone after the original path has disappeared.
+        let rollback_parent = parent.directory.try_clone()?;
+        let transaction_staging = self.tombstones.as_ref().try_clone()?;
+        let source = linux::openat2(
+            parent.directory.as_ref(),
+            &original_name,
+            linux::O_PATH | linux::O_NOFOLLOW,
+        )?;
+        let source_metadata = source.metadata()?;
+        let source_identity = (source_metadata.dev(), source_metadata.ino());
+        let source_kind = if source_metadata.is_file() {
+            EntryKind::File
+        } else if source_metadata.is_dir() {
+            EntryKind::Directory
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deletion target is not a regular file or directory",
+            ));
+        };
+        let (tombstone_name, manifest_name) = loop {
+            let candidate = deletion_pending_name();
+            // Register before any staging I/O. Cleanup can never observe the
+            // renamed pending entry before its active name is published.
+            if !active_upload_fragment_guard().insert(candidate.clone()) {
+                continue;
+            }
+            let manifest_name = match write_pending_manifest(
+                self.tombstones.as_ref(),
+                &candidate,
+                &original_path,
+            ) {
+                Ok(name) => name,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    unregister_upload_fragment(&candidate);
+                    continue;
+                }
+                Err(error) => {
+                    unregister_upload_fragment(&candidate);
+                    return Err(error);
+                }
+            };
+            let rename = linux::rename_noreplace_between(
+                parent.directory.as_ref(),
+                &original_name,
+                self.tombstones.as_ref(),
+                &candidate,
+            );
+            #[cfg(test)]
+            let rename = inject_error_after_successful_rename(
+                rename,
+                self.next_delete_staging_rename_error.as_ref(),
+            );
+            match rename {
+                Ok(()) => break (candidate, manifest_name),
+                Err(error) => {
+                    if entry_matches_identity(
+                        self.tombstones.as_ref(),
+                        &candidate,
+                        source_identity,
+                        source_kind,
+                    ) {
+                        tracing::warn!(%error, pending = %candidate, original = %original_path, "delete staging rename returned an error after the source became pending; continuing with verified identity");
+                        break (candidate, manifest_name);
+                    }
+                    let source_unchanged = entry_matches_identity(
+                        parent.directory.as_ref(),
+                        &original_name,
+                        source_identity,
+                        source_kind,
+                    );
+                    if source_unchanged {
+                        if let Err(cleanup_error) =
+                            remove_pending_manifest(self.tombstones.as_ref(), &manifest_name)
+                        {
+                            tracing::warn!(%cleanup_error, manifest = %manifest_name, "could not remove unused deletion manifest");
+                        }
+                        unregister_upload_fragment(&candidate);
+                        if error.kind() == io::ErrorKind::AlreadyExists {
+                            continue;
+                        }
+                    } else {
+                        tracing::error!(%error, recovery_entry = %candidate, manifest = %manifest_name, original = %original_path, "delete staging rename outcome is ambiguous; recovery metadata was preserved");
+                    }
+                    return Err(error);
+                }
             }
         };
+        let active_key = tombstone_name.clone();
+        let tombstone = match linux::openat2(
+            self.tombstones.as_ref(),
+            &tombstone_name,
+            linux::O_PATH | linux::O_NOFOLLOW,
+        ) {
+            Ok(file) => file,
+            Err(error) => {
+                rollback_pending_delete(
+                    self.tombstones.as_ref(),
+                    &tombstone_name,
+                    &manifest_name,
+                    parent.directory.as_ref(),
+                    &original_name,
+                    &original_path,
+                );
+                unregister_upload_fragment(&active_key);
+                return Err(error);
+            }
+        };
+        let tombstone_metadata = match tombstone.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                rollback_pending_delete(
+                    self.tombstones.as_ref(),
+                    &tombstone_name,
+                    &manifest_name,
+                    parent.directory.as_ref(),
+                    &original_name,
+                    &original_path,
+                );
+                unregister_upload_fragment(&active_key);
+                return Err(error);
+            }
+        };
+        if (tombstone_metadata.dev(), tombstone_metadata.ino()) != source_identity
+            || tombstone_metadata.is_dir() != source_metadata.is_dir()
+            || tombstone_metadata.is_file() != source_metadata.is_file()
+        {
+            rollback_pending_delete(
+                self.tombstones.as_ref(),
+                &tombstone_name,
+                &manifest_name,
+                parent.directory.as_ref(),
+                &original_name,
+                &original_path,
+            );
+            unregister_upload_fragment(&active_key);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "deletion target changed during atomic staging",
+            ));
+        }
+        let status = if tombstone_metadata.is_file() {
+            EntryStatus {
+                kind: EntryKind::File,
+                directory_non_empty: false,
+            }
+        } else if tombstone_metadata.is_dir() {
+            let directory = match linux::openat2(
+                self.tombstones.as_ref(),
+                &tombstone_name,
+                linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
+            ) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    rollback_pending_delete(
+                        self.tombstones.as_ref(),
+                        &tombstone_name,
+                        &manifest_name,
+                        parent.directory.as_ref(),
+                        &original_name,
+                        &original_path,
+                    );
+                    unregister_upload_fragment(&active_key);
+                    return Err(error);
+                }
+            };
+            let mut scan = match directory_scan_from_file(directory, false) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    rollback_pending_delete(
+                        self.tombstones.as_ref(),
+                        &tombstone_name,
+                        &manifest_name,
+                        parent.directory.as_ref(),
+                        &original_name,
+                        &original_path,
+                    );
+                    unregister_upload_fragment(&active_key);
+                    return Err(error);
+                }
+            };
+            EntryStatus {
+                kind: EntryKind::Directory,
+                directory_non_empty: scan.entries.next().is_some(),
+            }
+        } else {
+            rollback_pending_delete(
+                self.tombstones.as_ref(),
+                &tombstone_name,
+                &manifest_name,
+                parent.directory.as_ref(),
+                &original_name,
+                &original_path,
+            );
+            unregister_upload_fragment(&active_key);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deletion target is not a regular file or directory",
+            ));
+        };
+        if let Err(error) = parent.directory.sync_all() {
+            tracing::warn!(%error, "staged deletion but source-directory sync was uncertain");
+        }
+        if let Err(error) = self.tombstones.sync_all() {
+            tracing::warn!(%error, "staged deletion but tombstone-directory sync was uncertain");
+        }
         Ok(StagedDelete {
-            original_path: join_relative(&parent_path, &original_name),
-            tombstone_path: join_relative(&parent_path, &tombstone_name),
+            original_path,
+            tombstone_path: tombstone_name.clone(),
             status,
             committed: false,
-            #[cfg(target_os = "linux")]
-            parent: parent.directory.try_clone()?,
-            #[cfg(not(target_os = "linux"))]
-            parent: parent.directory.clone(),
+            parent: rollback_parent,
+            staging: transaction_staging,
             original_name,
             tombstone_name,
+            manifest_name,
+            active_key: Some(active_key),
+            #[cfg(test)]
+            next_promotion_rename_error: self.next_delete_promotion_rename_error.clone(),
         })
+    }
+
+    #[cfg(test)]
+    fn fail_next_delete_staging_rename_after_success(&self, kind: io::ErrorKind) {
+        *self
+            .next_delete_staging_rename_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(kind);
+    }
+
+    #[cfg(test)]
+    fn fail_next_delete_promotion_rename_after_success(&self, kind: io::ErrorKind) {
+        *self
+            .next_delete_promotion_rename_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(kind);
     }
 
     pub fn begin_upload(&self, directory: &str) -> io::Result<PendingUpload> {
@@ -713,7 +1266,22 @@ impl SecureRoot {
     /// Starts a recursive cleanup cursor suitable for bounded background batches.
     /// Uploads active in this process are registered and cannot be removed by it.
     pub fn start_upload_fragment_cleanup(&self) -> io::Result<UploadFragmentCleanup> {
-        self.root.start_upload_fragment_cleanup()
+        use std::os::unix::fs::MetadataExt;
+
+        let uploads = self.root.staging.as_ref().try_clone()?;
+        let tombstones = self.tombstones.as_ref().try_clone()?;
+        let upload_identity = uploads.metadata()?;
+        let tombstone_identity = tombstones.metadata()?;
+        Ok(UploadFragmentCleanup {
+            directories: vec![
+                cleanup_directory_from_file(tombstones, CleanupPolicy::TombstoneRoot)?,
+                cleanup_directory_from_file(uploads, CleanupPolicy::UploadFragments)?,
+            ],
+            visited: HashSet::from([
+                (upload_identity.dev(), upload_identity.ino()),
+                (tombstone_identity.dev(), tombstone_identity.ino()),
+            ]),
+        })
     }
 
     pub fn start_deletion_cleanup(
@@ -721,236 +1289,133 @@ impl SecureRoot {
         tombstone_relative: &str,
     ) -> io::Result<UploadFragmentCleanup> {
         let (parent_path, tombstone_name) = split_parent_name_private(tombstone_relative)?;
+        if !parent_path.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deletion tombstone must be inside the private tombstone staging directory",
+            ));
+        }
         if !is_deletion_tombstone_name(OsStr::new(&tombstone_name)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid deletion tombstone",
             ));
         }
-        let parent = self.root.bind_directory(&parent_path)?;
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let directory = linux::openat2(
-                parent.directory.as_ref(),
-                &tombstone_name,
-                linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
-            )?;
-            let metadata = directory.metadata()?;
-            let mut cleanup = cleanup_directory_from_file(directory)?;
-            cleanup.delete_all = true;
-            cleanup.remove_from = Some((
-                parent.directory.as_ref().try_clone()?,
-                OsString::from(tombstone_name),
-            ));
-            Ok(UploadFragmentCleanup {
-                directories: vec![cleanup],
-                visited: HashSet::from([(metadata.dev(), metadata.ino())]),
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let path = parent.directory.join(tombstone_name);
-            let mut cleanup = cleanup_directory_from_path(path.clone())?;
-            cleanup.delete_all = true;
-            cleanup.remove_from = Some(path.clone());
-            Ok(UploadFragmentCleanup {
-                directories: vec![cleanup],
-                visited: HashSet::from([path]),
-                root: self.display_root.clone(),
-            })
-        }
+        use std::os::unix::fs::MetadataExt;
+        let directory = linux::openat2(
+            self.tombstones.as_ref(),
+            &tombstone_name,
+            linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
+        )?;
+        let metadata = directory.metadata()?;
+        let mut cleanup = cleanup_directory_from_file(directory, CleanupPolicy::DeleteAll)?;
+        cleanup.remove_from = Some((
+            self.tombstones.as_ref().try_clone()?,
+            OsString::from(tombstone_name),
+        ));
+        Ok(UploadFragmentCleanup {
+            directories: vec![cleanup],
+            visited: HashSet::from([(metadata.dev(), metadata.ino())]),
+        })
     }
 }
 
 impl SecureDirectory {
+    fn open_user_path(&self, path: impl AsRef<Path>, flags: linux::OpenFlags) -> io::Result<File> {
+        linux::openat2_scoped(self.directory.as_ref(), path, flags, self.forbid_symlinks)
+    }
+
     /// Narrows this capability to a child directory. The final component must not be a symlink.
     pub fn bind_directory(&self, relative: &str) -> io::Result<Self> {
         let relative = validated(relative)?;
-        #[cfg(target_os = "linux")]
-        return Ok(Self {
-            directory: Arc::new(linux::openat2(
-                self.directory.as_ref(),
+        Ok(Self {
+            directory: Arc::new(self.open_user_path(
                 &relative,
                 linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
             )?),
-        });
-        #[cfg(not(target_os = "linux"))]
-        {
-            let directory = resolve_scoped_existing(&self.directory, &relative)?;
-            if !directory.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    "share target is not a directory",
-                ));
-            }
-            Ok(Self { directory })
-        }
+            staging: self.staging.clone(),
+            forbid_symlinks: self.forbid_symlinks,
+            allow_replace: self.allow_replace,
+        })
     }
 
     fn entry_status(&self, name: &str) -> io::Result<EntryStatus> {
         path_security::safe_admin_filename(name)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid entry name"))?;
-        #[cfg(target_os = "linux")]
-        {
-            let child = linux::openat2(
-                self.directory.as_ref(),
+        let child = self.open_user_path(name, linux::O_PATH | linux::O_NOFOLLOW)?;
+        let metadata = child.metadata()?;
+        let kind = if metadata.is_file() {
+            EntryKind::File
+        } else if metadata.is_dir() {
+            EntryKind::Directory
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "entry is not a regular file or directory",
+            ));
+        };
+        let directory_non_empty = if kind == EntryKind::Directory {
+            let directory = self.open_user_path(
                 name,
-                linux::O_PATH | linux::O_NOFOLLOW,
+                linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
             )?;
-            let metadata = child.metadata()?;
-            let kind = if metadata.is_file() {
-                EntryKind::File
-            } else if metadata.is_dir() {
-                EntryKind::Directory
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "entry is not a regular file or directory",
-                ));
-            };
-            let directory_non_empty = if kind == EntryKind::Directory {
-                let directory = linux::openat2(
-                    self.directory.as_ref(),
-                    name,
-                    linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
-                )?;
-                directory_scan_from_file(directory)?
-                    .entries
-                    .next()
-                    .is_some()
-            } else {
-                false
-            };
-            Ok(EntryStatus {
-                kind,
-                directory_non_empty,
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let path = self.directory.join(name);
-            let metadata = std::fs::symlink_metadata(&path)?;
-            let kind = if metadata.is_file() {
-                EntryKind::File
-            } else if metadata.is_dir() {
-                EntryKind::Directory
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "entry is not a regular file or directory",
-                ));
-            };
-            let directory_non_empty =
-                kind == EntryKind::Directory && std::fs::read_dir(path)?.next().is_some();
-            Ok(EntryStatus {
-                kind,
-                directory_non_empty,
-            })
-        }
+            directory_scan_from_file(directory, self.forbid_symlinks)?
+                .entries
+                .next()
+                .is_some()
+        } else {
+            false
+        };
+        Ok(EntryStatus {
+            kind,
+            directory_non_empty,
+        })
     }
 
     fn create_directory(&self, name: &str) -> io::Result<()> {
         path_security::safe_admin_filename(name)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
-        #[cfg(target_os = "linux")]
-        {
-            linux::mkdir(self.directory.as_ref(), name)?;
-            if let Err(error) = self.directory.sync_all() {
-                tracing::warn!(%error, "created directory but parent sync was uncertain");
-            }
-            Ok(())
+        linux::mkdir(self.directory.as_ref(), name)?;
+        if let Err(error) = self.directory.sync_all() {
+            tracing::warn!(%error, "created directory but parent sync was uncertain");
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            std::fs::create_dir(self.directory.join(name))?;
-            if let Err(error) = sync_directory_path(&self.directory) {
-                tracing::warn!(%error, "created directory but parent sync was uncertain");
-            }
-            Ok(())
-        }
+        Ok(())
     }
 
     fn rename_noreplace(&self, old: &str, new: &str) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            linux::rename_noreplace(self.directory.as_ref(), old, new)?;
-            if let Err(error) = self.directory.sync_all() {
-                tracing::warn!(%error, "renamed entry but parent sync was uncertain");
-            }
-            Ok(())
+        linux::rename_noreplace(self.directory.as_ref(), old, new)?;
+        if let Err(error) = self.directory.sync_all() {
+            tracing::warn!(%error, "renamed entry but parent sync was uncertain");
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let old = self.directory.join(old);
-            let new = self.directory.join(new);
-            if new.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "destination already exists",
-                ));
-            }
-            std::fs::rename(old, new)?;
-            if let Err(error) = sync_directory_path(&self.directory) {
-                tracing::warn!(%error, "renamed entry but parent sync was uncertain");
-            }
-            Ok(())
-        }
+        Ok(())
     }
 
     pub fn open_file(&self, relative: &str) -> io::Result<SecureFile> {
         let relative = validated(relative)?;
-        #[cfg(target_os = "linux")]
-        {
-            let probe = linux::openat2(
-                self.directory.as_ref(),
-                &relative,
-                linux::O_PATH | linux::O_NOFOLLOW,
-            )?;
-            if !probe.metadata()?.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "target is not a regular file",
-                ));
-            }
-            let file = linux::openat2(
-                self.directory.as_ref(),
-                &relative,
-                linux::O_RDONLY | linux::O_NOFOLLOW | linux::O_NONBLOCK,
-            )?;
-            if !file.metadata()?.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "target is not a regular file",
-                ));
-            }
-            Ok(SecureFile { file })
+        let probe = self.open_user_path(&relative, linux::O_PATH | linux::O_NOFOLLOW)?;
+        if !probe.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target is not a regular file",
+            ));
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let path = resolve_scoped_existing(&self.directory, &relative)?;
-            let file = File::open(path)?;
-            if !file.metadata()?.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "target is not a regular file",
-                ));
-            }
-            Ok(SecureFile { file })
+        let file = self.open_user_path(
+            &relative,
+            linux::O_RDONLY | linux::O_NOFOLLOW | linux::O_NONBLOCK,
+        )?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target is not a regular file",
+            ));
         }
+        Ok(SecureFile { file })
     }
 
     pub fn metadata(&self, relative: &str) -> io::Result<std::fs::Metadata> {
         let relative = validated(relative)?;
-        #[cfg(target_os = "linux")]
-        return linux::openat2(
-            self.directory.as_ref(),
-            &relative,
-            linux::O_PATH | linux::O_NOFOLLOW,
-        )?
-        .metadata();
-        #[cfg(not(target_os = "linux"))]
-        return std::fs::metadata(resolve_scoped_existing(&self.directory, &relative)?);
+        self.open_user_path(&relative, linux::O_PATH | linux::O_NOFOLLOW)?
+            .metadata()
     }
 
     pub fn list(&self, relative: &str, offset: usize, limit: usize) -> io::Result<Vec<Entry>> {
@@ -964,44 +1429,24 @@ impl SecureDirectory {
 
     pub fn scan_directory(&self, relative: &str) -> io::Result<DirectoryScan> {
         let relative = validated(relative)?;
-        #[cfg(target_os = "linux")]
-        {
-            let directory = linux::openat2(
-                self.directory.as_ref(),
-                &relative,
-                linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
-            )?;
-            directory_scan_from_file(directory)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let directory = resolve_scoped_existing(&self.directory, &relative)?;
-            directory_scan_from_path(directory)
-        }
+        let directory = self.open_user_path(
+            &relative,
+            linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
+        )?;
+        directory_scan_from_file(directory, self.forbid_symlinks)
     }
 
     pub fn begin_upload(&self, directory: &str) -> io::Result<PendingUpload> {
         let directory = validated(directory)?;
-        #[cfg(target_os = "linux")]
-        {
-            let dir = linux::openat2(
-                self.directory.as_ref(),
-                &directory,
-                linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
-            )?;
-            PendingUpload::new(dir)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let dir = resolve_scoped_existing(&self.directory, &directory)?;
-            if !dir.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    "upload target is not a directory",
-                ));
-            }
-            PendingUpload::new(dir)
-        }
+        let destination = self.open_user_path(
+            &directory,
+            linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
+        )?;
+        PendingUpload::new(
+            self.staging.as_ref().try_clone()?,
+            destination,
+            self.allow_replace,
+        )
     }
 
     /// Compatibility one-shot cleanup. Returns an error when the raw-entry budget
@@ -1021,28 +1466,7 @@ impl SecureDirectory {
     /// Starts a recursive cleanup cursor suitable for bounded background batches.
     /// Uploads active in this process are registered and cannot be removed by it.
     pub fn start_upload_fragment_cleanup(&self) -> io::Result<UploadFragmentCleanup> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::MetadataExt;
-
-            let root = self.directory.try_clone()?;
-            let metadata = root.metadata()?;
-            let directory = cleanup_directory_from_file(root)?;
-            Ok(UploadFragmentCleanup {
-                directories: vec![directory],
-                visited: HashSet::from([(metadata.dev(), metadata.ino())]),
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let root = self.directory.canonicalize()?;
-            let directory = cleanup_directory_from_path(root.clone())?;
-            Ok(UploadFragmentCleanup {
-                directories: vec![directory],
-                visited: HashSet::from([root.clone()]),
-                root,
-            })
-        }
+        start_cleanup_from_directory(self.staging.as_ref(), CleanupPolicy::UploadFragments)
     }
 }
 
@@ -1056,46 +1480,25 @@ impl SecureFile {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn resolve_scoped_existing(root: &Path, raw: &str) -> io::Result<PathBuf> {
-    let relative = validated(raw)?;
-    let target = root.join(relative);
-    let metadata = std::fs::symlink_metadata(&target)?;
-    if metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "final symlink is not allowed",
-        ));
-    }
-    let canonical = target.canonicalize()?;
-    if canonical == root || canonical.starts_with(root) {
-        Ok(canonical)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "path is outside the secure directory",
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn directory_scan_from_file(directory: File) -> io::Result<DirectoryScan> {
+fn directory_scan_from_file(
+    directory: File,
+    strict_mount_boundary: bool,
+) -> io::Result<DirectoryScan> {
     use std::os::fd::AsRawFd;
 
     let proc_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
     let entries = std::fs::read_dir(proc_path)?;
-    Ok(DirectoryScan { entries, directory })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn directory_scan_from_path(directory: PathBuf) -> io::Result<DirectoryScan> {
     Ok(DirectoryScan {
-        entries: std::fs::read_dir(directory)?,
+        entries,
+        directory,
+        strict_mount_boundary,
     })
 }
 
-#[cfg(target_os = "linux")]
-fn cleanup_directory_from_file(directory: File) -> io::Result<CleanupDirectory> {
+fn cleanup_directory_from_file(
+    directory: File,
+    policy: CleanupPolicy,
+) -> io::Result<CleanupDirectory> {
     use std::os::fd::AsRawFd;
 
     let proc_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
@@ -1104,19 +1507,23 @@ fn cleanup_directory_from_file(directory: File) -> io::Result<CleanupDirectory> 
         directory,
         entries,
         removed_in_pass: false,
-        delete_all: false,
+        policy,
         remove_from: None,
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn cleanup_directory_from_path(directory: PathBuf) -> io::Result<CleanupDirectory> {
-    Ok(CleanupDirectory {
-        entries: std::fs::read_dir(&directory)?,
-        directory,
-        removed_in_pass: false,
-        delete_all: false,
-        remove_from: None,
+fn start_cleanup_from_directory(
+    root: &File,
+    policy: CleanupPolicy,
+) -> io::Result<UploadFragmentCleanup> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = root.try_clone()?;
+    let metadata = root.metadata()?;
+    let directory = cleanup_directory_from_file(root, policy)?;
+    Ok(UploadFragmentCleanup {
+        directories: vec![directory],
+        visited: HashSet::from([(metadata.dev(), metadata.ino())]),
     })
 }
 
@@ -1200,25 +1607,11 @@ impl StagedRename {
     }
 
     fn rollback(&self) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            linux::rename_noreplace(&self.parent, &self.new_name, &self.original_name)?;
-            if let Err(error) = self.parent.sync_all() {
-                tracing::warn!(%error, "rolled back rename but parent sync was uncertain");
-            }
-            Ok(())
+        linux::rename_noreplace(&self.parent, &self.new_name, &self.original_name)?;
+        if let Err(error) = self.parent.sync_all() {
+            tracing::warn!(%error, "rolled back rename but parent sync was uncertain");
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            std::fs::rename(
-                self.parent.join(&self.new_name),
-                self.parent.join(&self.original_name),
-            )?;
-            if let Err(error) = sync_directory_path(&self.parent) {
-                tracing::warn!(%error, "rolled back rename but parent sync was uncertain");
-            }
-            Ok(())
-        }
+        Ok(())
     }
 }
 
@@ -1242,41 +1635,33 @@ impl StagedDelete {
     }
 
     pub fn commit(mut self) -> io::Result<DeleteCommitOutcome> {
-        if self.status.kind == EntryKind::Directory && self.status.directory_non_empty {
-            self.committed = true;
-            return Ok(DeleteCommitOutcome {
-                cleanup_pending: true,
-                tombstone_path: Some(self.tombstone_path.clone()),
-            });
+        // Only a committed name is eligible for restart cleanup. The database
+        // change has already succeeded before this method is called.
+        let committed_tombstone = self.promote_for_cleanup()?;
+        if let Err(error) = self.staging.sync_all() {
+            tracing::warn!(%error, "committed deletion tombstone but staging sync was uncertain");
         }
         self.committed = true;
-        #[cfg(target_os = "linux")]
+        self.release_active();
+        if self.status.kind == EntryKind::Directory && self.status.directory_non_empty {
+            return Ok(DeleteCommitOutcome {
+                cleanup_pending: true,
+                tombstone_path: Some(committed_tombstone),
+            });
+        }
         let removal = match self.status.kind {
-            EntryKind::File => linux::unlink(&self.parent, OsStr::new(&self.tombstone_name)),
-            EntryKind::Directory => linux::rmdir(&self.parent, OsStr::new(&self.tombstone_name)),
-        };
-        #[cfg(not(target_os = "linux"))]
-        let removal = {
-            let tombstone = self.parent.join(&self.tombstone_name);
-            match self.status.kind {
-                EntryKind::File => std::fs::remove_file(tombstone),
-                EntryKind::Directory => std::fs::remove_dir(tombstone),
-            }
+            EntryKind::File => linux::unlink(&self.staging, OsStr::new(&self.tombstone_name)),
+            EntryKind::Directory => linux::rmdir(&self.staging, OsStr::new(&self.tombstone_name)),
         };
         if let Err(error) = removal {
             tracing::warn!(%error, tombstone = %self.tombstone_path, "deletion tombstone cleanup deferred");
             return Ok(DeleteCommitOutcome {
                 cleanup_pending: true,
-                tombstone_path: Some(self.tombstone_path.clone()),
+                tombstone_path: Some(committed_tombstone),
             });
         }
-        #[cfg(target_os = "linux")]
-        if let Err(error) = self.parent.sync_all() {
-            tracing::warn!(%error, "removed deletion tombstone but parent sync was uncertain");
-        }
-        #[cfg(not(target_os = "linux"))]
-        if let Err(error) = sync_directory_path(&self.parent) {
-            tracing::warn!(%error, "removed deletion tombstone but parent sync was uncertain");
+        if let Err(error) = self.staging.sync_all() {
+            tracing::warn!(%error, "removed deletion tombstone but staging sync was uncertain");
         }
         Ok(DeleteCommitOutcome {
             cleanup_pending: false,
@@ -1285,25 +1670,110 @@ impl StagedDelete {
     }
 
     fn rollback(&self) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            linux::rename_noreplace(&self.parent, &self.tombstone_name, &self.original_name)?;
-            if let Err(error) = self.parent.sync_all() {
-                tracing::warn!(%error, "restored deletion target but parent sync was uncertain");
-            }
-            Ok(())
+        linux::rename_noreplace_between(
+            &self.staging,
+            &self.tombstone_name,
+            &self.parent,
+            &self.original_name,
+        )?;
+        self.staging.sync_all()?;
+        self.parent.sync_all()?;
+        if let Err(error) = remove_pending_manifest(&self.staging, &self.manifest_name) {
+            tracing::warn!(%error, manifest = %self.manifest_name, "could not remove durable rollback manifest");
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            std::fs::rename(
-                self.parent.join(&self.tombstone_name),
-                self.parent.join(&self.original_name),
-            )?;
-            if let Err(error) = sync_directory_path(&self.parent) {
-                tracing::warn!(%error, "restored deletion target but parent sync was uncertain");
+        Ok(())
+    }
+
+    fn promote_for_cleanup(&mut self) -> io::Result<String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let pending = linux::openat2(
+            &self.staging,
+            &self.tombstone_name,
+            linux::O_PATH | linux::O_NOFOLLOW,
+        )?;
+        let pending_metadata = pending.metadata()?;
+        let pending_identity = (pending_metadata.dev(), pending_metadata.ino());
+        for _ in 0..16 {
+            let committed_name = deletion_tombstone_name();
+            if !active_upload_fragment_guard().insert(committed_name.clone()) {
+                continue;
             }
-            Ok(())
+            let rename =
+                linux::rename_noreplace(&self.staging, &self.tombstone_name, &committed_name);
+            #[cfg(test)]
+            let rename = inject_error_after_successful_rename(
+                rename,
+                self.next_promotion_rename_error.as_ref(),
+            );
+            match rename {
+                Ok(()) => {
+                    return Ok(self.finish_promotion(committed_name));
+                }
+                Err(error) => {
+                    if entry_matches_identity(
+                        &self.staging,
+                        &committed_name,
+                        pending_identity,
+                        self.status.kind,
+                    ) {
+                        tracing::warn!(%error, tombstone = %committed_name, "committed deletion rename returned an error after the pending entry moved; continuing with verified identity");
+                        return Ok(self.finish_promotion(committed_name));
+                    }
+                    unregister_upload_fragment(&committed_name);
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                }
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate committed deletion tombstone",
+        ))
+    }
+
+    fn finish_promotion(&mut self, committed_name: String) -> String {
+        let mut active = active_upload_fragment_guard();
+        if let Some(previous) = self.active_key.replace(committed_name.clone()) {
+            active.remove(&previous);
+        }
+        self.tombstone_name = committed_name.clone();
+        self.tombstone_path = committed_name.clone();
+        drop(active);
+        match self.staging.sync_all() {
+            Ok(()) => {
+                if let Err(error) = remove_pending_manifest(&self.staging, &self.manifest_name) {
+                    tracing::warn!(%error, manifest = %self.manifest_name, "could not remove committed deletion manifest");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, manifest = %self.manifest_name, "committed deletion rename sync was uncertain; recovery manifest was retained");
+            }
+        }
+        committed_name
+    }
+
+    fn release_active(&mut self) {
+        if let Some(active_key) = self.active_key.take() {
+            unregister_upload_fragment(&active_key);
+        }
+    }
+}
+
+#[cfg(test)]
+fn inject_error_after_successful_rename(
+    rename: io::Result<()>,
+    next_error: &Mutex<Option<io::ErrorKind>>,
+) -> io::Result<()> {
+    rename?;
+    let kind = next_error
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    match kind {
+        Some(kind) => Err(io::Error::new(kind, "injected rename response loss")),
+        None => Ok(()),
     }
 }
 
@@ -1311,33 +1781,46 @@ impl Drop for StagedDelete {
     fn drop(&mut self) {
         if !self.committed {
             if let Err(error) = self.rollback() {
-                tracing::error!(%error, tombstone = %self.tombstone_path, original = %self.original_path, "could not roll back staged deletion");
+                // Pending names are deliberately excluded from every automatic
+                // cleanup pass. If a co-writer occupied the original name, both
+                // objects survive and an operator can recover the pending entry.
+                tracing::error!(%error, recovery_entry = %self.tombstone_path, original = %self.original_path, "could not roll back staged deletion; private recovery entry was preserved");
             }
         }
+        self.release_active();
     }
 }
 
-#[cfg(target_os = "linux")]
 pub struct PendingUpload {
-    directory: File,
+    staging: File,
+    destination: File,
     temporary_name: String,
     file: Option<File>,
     active_key: Option<ActiveUploadFragmentKey>,
+    expected_identity: (u64, u64),
+    allow_replace: bool,
     published: bool,
     #[cfg(test)]
     next_directory_sync_error: Option<io::ErrorKind>,
 }
 
-#[cfg(target_os = "linux")]
 impl PendingUpload {
-    fn new(directory: File) -> io::Result<Self> {
+    fn new(staging: File, destination: File, allow_replace: bool) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
 
-        let mut active = active_upload_fragment_guard();
+        if staging.metadata()?.dev() != destination.metadata()?.dev() {
+            return Err(io::Error::new(
+                io::ErrorKind::CrossesDevices,
+                "upload staging and destination must be on the same filesystem",
+            ));
+        }
         for _ in 0..16 {
             let temporary_name = upload_fragment_name();
+            if !active_upload_fragment_guard().insert(temporary_name.clone()) {
+                continue;
+            }
             match linux::openat2(
-                &directory,
+                &staging,
                 &temporary_name,
                 linux::O_WRONLY | linux::O_CREAT | linux::O_EXCL,
             ) {
@@ -1346,24 +1829,34 @@ impl PendingUpload {
                         Ok(metadata) => metadata,
                         Err(error) => {
                             drop(file);
-                            let _ = linux::unlink(&directory, &temporary_name);
+                            let _ = linux::unlink(&staging, &temporary_name);
+                            unregister_upload_fragment(&temporary_name);
                             return Err(error);
                         }
                     };
-                    let active_key = (metadata.dev(), metadata.ino());
-                    active.insert(active_key);
+                    let expected_identity = (metadata.dev(), metadata.ino());
+                    let active_key = temporary_name.clone();
                     return Ok(Self {
-                        directory,
+                        staging,
+                        destination,
                         temporary_name,
                         file: Some(file),
                         active_key: Some(active_key),
+                        expected_identity,
+                        allow_replace,
                         published: false,
                         #[cfg(test)]
                         next_directory_sync_error: None,
                     });
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    unregister_upload_fragment(&temporary_name);
+                    continue;
+                }
+                Err(error) => {
+                    unregister_upload_fragment(&temporary_name);
+                    return Err(error);
+                }
             }
         }
         Err(io::Error::new(
@@ -1379,14 +1872,81 @@ impl PendingUpload {
 
     pub fn publish(&mut self, name: &str) -> io::Result<PublishOutcome> {
         let name = upload_destination_name(name)?;
-        linux::rename_noreplace(&self.directory, &self.temporary_name, name)?;
+        self.validate_staging_identity()?;
+        let rename = linux::rename_noreplace_between(
+            &self.staging,
+            &self.temporary_name,
+            &self.destination,
+            name,
+        );
+        if let Err(error) = rename {
+            if entry_matches_identity(
+                &self.destination,
+                name,
+                self.expected_identity,
+                EntryKind::File,
+            ) {
+                tracing::warn!(%error, destination = %name, "upload rename returned an error after publication; continuing with verified identity");
+            } else {
+                return Err(error);
+            }
+        }
         Ok(self.finish_publication())
     }
 
     pub fn publish_replace(&mut self, name: &str) -> io::Result<PublishOutcome> {
+        if !self.allow_replace {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "replacement publication is disabled for external-writer storage",
+            ));
+        }
         let name = upload_destination_name(name)?;
-        linux::rename_replace(&self.directory, &self.temporary_name, name)?;
+        self.validate_staging_identity()?;
+        let rename = linux::rename_replace_between(
+            &self.staging,
+            &self.temporary_name,
+            &self.destination,
+            name,
+        );
+        if let Err(error) = rename {
+            if entry_matches_identity(
+                &self.destination,
+                name,
+                self.expected_identity,
+                EntryKind::File,
+            ) {
+                tracing::warn!(%error, destination = %name, "replacement rename returned an error after publication; continuing with verified identity");
+            } else {
+                return Err(error);
+            }
+        }
         Ok(self.finish_publication())
+    }
+
+    fn validate_staging_identity(&self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        if self.active_key.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "upload is no longer active",
+            ));
+        }
+        let expected = self.expected_identity;
+        let current = linux::openat2(
+            &self.staging,
+            &self.temporary_name,
+            linux::O_PATH | linux::O_NOFOLLOW,
+        )?;
+        let metadata = current.metadata()?;
+        if !metadata.is_file() || (metadata.dev(), metadata.ino()) != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "upload staging entry changed before atomic publication",
+            ));
+        }
+        Ok(())
     }
 
     fn finish_publication(&mut self) -> PublishOutcome {
@@ -1407,7 +1967,8 @@ impl PendingUpload {
         if let Some(kind) = self.next_directory_sync_error.take() {
             return Err(io::Error::new(kind, "injected directory sync failure"));
         }
-        self.directory.sync_all()
+        self.destination.sync_all()?;
+        self.staging.sync_all()
     }
 
     #[cfg(test)]
@@ -1416,298 +1977,109 @@ impl PendingUpload {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for PendingUpload {
     fn drop(&mut self) {
-        let mut active = active_upload_fragment_guard();
-        if let Some(active_key) = self.active_key.take() {
-            active.remove(&active_key);
-        }
         if !self.published {
-            let _ = linux::unlink(&self.directory, &self.temporary_name);
+            let _ = linux::unlink(&self.staging, &self.temporary_name);
         }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub struct PendingUpload {
-    temporary: Option<tempfile::NamedTempFile>,
-    directory: PathBuf,
-    active_key: Option<ActiveUploadFragmentKey>,
-    #[cfg(test)]
-    next_reopen_error: Option<io::ErrorKind>,
-    #[cfg(test)]
-    next_directory_sync_error: Option<io::ErrorKind>,
-}
-
-#[cfg(not(target_os = "linux"))]
-impl PendingUpload {
-    fn new(directory: PathBuf) -> io::Result<Self> {
-        let mut active = active_upload_fragment_guard();
-        let temporary = tempfile::Builder::new()
-            .prefix(UPLOAD_FRAGMENT_PREFIX)
-            .suffix(UPLOAD_FRAGMENT_SUFFIX)
-            .rand_bytes(UPLOAD_FRAGMENT_TOKEN_LENGTH)
-            .tempfile_in(&directory)?;
-        let active_key = temporary.path().to_path_buf();
-        active.insert(active_key.clone());
-        Ok(Self {
-            temporary: Some(temporary),
-            directory,
-            active_key: Some(active_key),
-            #[cfg(test)]
-            next_reopen_error: None,
-            #[cfg(test)]
-            next_directory_sync_error: None,
-        })
-    }
-    pub fn take_file(&mut self) -> io::Result<File> {
-        #[cfg(test)]
-        if let Some(kind) = self.next_reopen_error.take() {
-            return Err(io::Error::new(kind, "injected upload reopen failure"));
-        }
-        self.temporary
-            .as_ref()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "upload file already taken")
-            })?
-            .reopen()
-    }
-    pub fn publish(&mut self, name: &str) -> io::Result<PublishOutcome> {
-        let name = upload_destination_name(name)?;
-        let temporary = self.temporary.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "upload already published")
-        })?;
-        let persisted = temporary
-            .persist_noclobber(self.directory.join(name))
-            .map_err(|error| error.error)?;
-        drop(persisted);
-        Ok(self.finish_publication())
-    }
-
-    pub fn publish_replace(&mut self, name: &str) -> io::Result<PublishOutcome> {
-        let name = upload_destination_name(name)?;
-        let temporary = self.temporary.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "upload already published")
-        })?;
-        let persisted = temporary
-            .persist(self.directory.join(name))
-            .map_err(|error| error.error)?;
-        drop(persisted);
-        Ok(self.finish_publication())
-    }
-
-    fn finish_publication(&mut self) -> PublishOutcome {
         if let Some(active_key) = self.active_key.take() {
             unregister_upload_fragment(&active_key);
         }
-        match self.sync_directory() {
-            Ok(()) => PublishOutcome::Durable,
-            Err(error) => PublishOutcome::PublishedSyncUncertain(error),
-        }
-    }
-
-    fn sync_directory(&mut self) -> io::Result<()> {
-        #[cfg(test)]
-        if let Some(kind) = self.next_directory_sync_error.take() {
-            return Err(io::Error::new(kind, "injected directory sync failure"));
-        }
-        sync_directory_path(&self.directory)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_reopen(&mut self, kind: io::ErrorKind) {
-        self.next_reopen_error = Some(kind);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_directory_sync(&mut self, kind: io::ErrorKind) {
-        self.next_directory_sync_error = Some(kind);
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-impl Drop for PendingUpload {
-    fn drop(&mut self) {
-        let mut active = active_upload_fragment_guard();
-        if let Some(active_key) = self.active_key.take() {
-            active.remove(&active_key);
-        }
-        drop(self.temporary.take());
-    }
-}
-
-#[cfg(all(not(target_os = "linux"), windows))]
-fn sync_directory_path(path: &Path) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .sync_all()
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn sync_directory_path(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(target_os = "linux")]
 mod linux {
-    use std::{
-        ffi::CString,
-        fs::File,
-        io,
-        os::unix::ffi::OsStrExt,
-        os::{
-            fd::{AsRawFd, FromRawFd},
-            raw::{c_char, c_int, c_long, c_uint},
-        },
-        path::Path,
+    use std::{fs::File, io, path::Path};
+
+    use rustix::fs::{
+        mkdirat, openat2 as rustix_openat2, renameat, renameat_with, unlinkat, AtFlags, Mode,
+        OFlags, RenameFlags, ResolveFlags,
     };
 
-    pub const O_RDONLY: u64 = 0;
-    pub const O_WRONLY: u64 = 1;
-    pub const O_CREAT: u64 = 0o100;
-    pub const O_EXCL: u64 = 0o200;
-    pub const O_NONBLOCK: u64 = 0o4000;
-    pub const O_NOFOLLOW: u64 = 0o400000;
-    pub const O_DIRECTORY: u64 = 0o200000;
-    pub const O_PATH: u64 = 0o10000000;
-    const O_CLOEXEC: u64 = 0o2000000;
-    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-    const RESOLVE_BENEATH: u64 = 0x08;
-    const RENAME_NOREPLACE: c_uint = 1;
-    const AT_REMOVEDIR: c_int = 0x200;
+    pub type OpenFlags = OFlags;
 
-    #[repr(C)]
-    struct OpenHow {
-        flags: u64,
-        mode: u64,
-        resolve: u64,
+    pub const O_RDONLY: OFlags = OFlags::RDONLY;
+    pub const O_WRONLY: OFlags = OFlags::WRONLY;
+    pub const O_CREAT: OFlags = OFlags::CREATE;
+    pub const O_EXCL: OFlags = OFlags::EXCL;
+    pub const O_NONBLOCK: OFlags = OFlags::NONBLOCK;
+    pub const O_NOFOLLOW: OFlags = OFlags::NOFOLLOW;
+    pub const O_DIRECTORY: OFlags = OFlags::DIRECTORY;
+    pub const O_PATH: OFlags = OFlags::PATH;
+
+    fn std_error(error: rustix::io::Errno) -> io::Error {
+        io::Error::from_raw_os_error(error.raw_os_error())
     }
 
-    extern "C" {
-        fn syscall(number: c_long, ...) -> c_long;
-        fn renameat2(
-            old_dir: c_int,
-            old: *const c_char,
-            new_dir: c_int,
-            new: *const c_char,
-            flags: c_uint,
-        ) -> c_int;
-        fn unlinkat(dir: c_int, path: *const c_char, flags: c_int) -> c_int;
-        fn mkdirat(dir: c_int, path: *const c_char, mode: c_uint) -> c_int;
+    pub fn openat2(directory: &File, path: impl AsRef<Path>, flags: OFlags) -> io::Result<File> {
+        openat2_scoped(directory, path, flags, false)
     }
 
-    #[cfg(target_arch = "x86_64")]
-    const SYS_OPENAT2: c_long = 437;
-    #[cfg(not(target_arch = "x86_64"))]
-    compile_error!("VaultLink Linux builds support amd64 only");
-
-    fn c_path(path: impl AsRef<Path>) -> io::Result<CString> {
-        CString::new(path.as_ref().as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
-    }
-
-    pub fn openat2(directory: &File, path: impl AsRef<Path>, flags: u64) -> io::Result<File> {
-        let path = c_path(path)?;
-        let how = OpenHow {
-            flags: flags | O_CLOEXEC,
-            mode: if flags & O_CREAT != 0 { 0o600 } else { 0 },
-            resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+    pub fn openat2_scoped(
+        directory: &File,
+        path: impl AsRef<Path>,
+        flags: OFlags,
+        forbid_symlinks: bool,
+    ) -> io::Result<File> {
+        let mode = if flags.contains(OFlags::CREATE) {
+            Mode::from_raw_mode(0o600)
+        } else {
+            Mode::empty()
         };
-        // SAFETY: pointers refer to initialized values for the duration of the syscall.
-        let fd = unsafe {
-            syscall(
-                SYS_OPENAT2,
-                directory.as_raw_fd(),
-                path.as_ptr(),
-                &how as *const OpenHow,
-                std::mem::size_of::<OpenHow>(),
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+        let mut resolve = ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS;
+        if forbid_symlinks {
+            resolve |= ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV;
         }
-        // SAFETY: a successful openat2 returns a new owned descriptor.
-        Ok(unsafe { File::from_raw_fd(fd as c_int) })
+        rustix_openat2(
+            directory,
+            path.as_ref(),
+            flags | OFlags::CLOEXEC,
+            mode,
+            resolve,
+        )
+        .map(File::from)
+        .map_err(std_error)
     }
 
     pub fn rename_noreplace(directory: &File, old: &str, new: &str) -> io::Result<()> {
-        let old = c_path(old)?;
-        let new = c_path(new)?;
-        // SAFETY: both C strings and the directory descriptor are valid.
-        let result = unsafe {
-            renameat2(
-                directory.as_raw_fd(),
-                old.as_ptr(),
-                directory.as_raw_fd(),
-                new.as_ptr(),
-                RENAME_NOREPLACE,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        rename_noreplace_between(directory, old, directory, new)
     }
 
-    pub fn rename_replace(directory: &File, old: &str, new: &str) -> io::Result<()> {
-        let old = c_path(old)?;
-        let new = c_path(new)?;
-        // SAFETY: both C strings and the directory descriptor are valid. flags=0 is atomic
-        // same-directory rename and replaces an existing non-directory destination.
-        let result = unsafe {
-            renameat2(
-                directory.as_raw_fd(),
-                old.as_ptr(),
-                directory.as_raw_fd(),
-                new.as_ptr(),
-                0,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+    pub fn rename_noreplace_between(
+        old_directory: &File,
+        old: &str,
+        new_directory: &File,
+        new: &str,
+    ) -> io::Result<()> {
+        renameat_with(
+            old_directory,
+            old,
+            new_directory,
+            new,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(std_error)
+    }
+
+    pub fn rename_replace_between(
+        old_directory: &File,
+        old: &str,
+        new_directory: &File,
+        new: &str,
+    ) -> io::Result<()> {
+        renameat(old_directory, old, new_directory, new).map_err(std_error)
     }
 
     pub fn unlink(directory: &File, name: impl AsRef<Path>) -> io::Result<()> {
-        let name = c_path(name)?;
-        // SAFETY: C string and descriptor are valid; flags=0 removes files only.
-        let result = unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        unlinkat(directory, name.as_ref(), AtFlags::empty()).map_err(std_error)
     }
 
     pub fn rmdir(directory: &File, name: impl AsRef<Path>) -> io::Result<()> {
-        let name = c_path(name)?;
-        // SAFETY: C string and descriptor are valid; AT_REMOVEDIR refuses non-directories.
-        let result = unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), AT_REMOVEDIR) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        unlinkat(directory, name.as_ref(), AtFlags::REMOVEDIR).map_err(std_error)
     }
 
     pub fn mkdir(directory: &File, name: impl AsRef<Path>) -> io::Result<()> {
-        let name = c_path(name)?;
-        // SAFETY: C string and descriptor are valid; mode is intentionally admin-private.
-        let result = unsafe { mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        mkdirat(directory, name.as_ref(), Mode::from_raw_mode(0o700)).map_err(std_error)
     }
 }
 
@@ -1729,31 +2101,6 @@ mod tests {
         ] {
             assert!(!is_upload_fragment_name(OsStr::new(name)), "{name}");
         }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn pending_upload_reopen_and_reuse_fail_without_panicking() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = SecureRoot::open(directory.path()).unwrap();
-
-        let mut missing = root.begin_upload("").unwrap();
-        missing.fail_next_reopen(io::ErrorKind::Other);
-        assert_eq!(
-            missing.take_file().unwrap_err().kind(),
-            io::ErrorKind::Other
-        );
-
-        let mut published = root.begin_upload("").unwrap();
-        published.publish("published.txt").unwrap();
-        assert_eq!(
-            published.take_file().unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            published.publish("again.txt").unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
     }
 
     #[test]
@@ -1824,42 +2171,68 @@ mod tests {
                 break;
             }
         }
-        assert!(std::fs::read_dir(directory.path())
-            .unwrap()
-            .next()
-            .is_none());
+        assert!(root.list("", 0, 10).unwrap().is_empty());
     }
 
     #[test]
-    fn cleanup_removes_only_regular_upload_fragments_recursively() {
+    fn rename_rejects_symlink_sources_without_moving_them() {
+        use std::os::unix::fs::symlink;
+
         let directory = tempfile::tempdir().unwrap();
-        let nested = directory.path().join("nested");
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("target.txt"), b"target").unwrap();
+        symlink("target.txt", directory.path().join("link.txt")).unwrap();
+
+        let error = match root.stage_rename("link.txt", "moved.txt") {
+            Ok(_) => panic!("symlink rename unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(directory.path().join("link.txt").is_symlink());
+        assert!(!directory.path().join("moved.txt").exists());
+    }
+
+    #[test]
+    fn cleanup_removes_only_flat_private_upload_fragments() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let staging = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(UPLOAD_STAGING_DIRECTORY_NAME);
+        let nested = staging.join("nested");
         std::fs::create_dir(&nested).unwrap();
         let first = upload_fragment_name();
         let second = upload_fragment_name();
-        std::fs::write(directory.path().join(&first), b"partial").unwrap();
+        std::fs::write(staging.join(&first), b"partial").unwrap();
         std::fs::write(nested.join(&second), b"partial").unwrap();
-        std::fs::write(directory.path().join("keep.part"), b"keep").unwrap();
-        let matching_directory = upload_fragment_name();
-        std::fs::create_dir(directory.path().join(&matching_directory)).unwrap();
+        let public_fragment = upload_fragment_name();
+        std::fs::write(directory.path().join(&public_fragment), b"client-owned").unwrap();
+        std::fs::write(staging.join("keep.part"), b"keep").unwrap();
+        let matching_directory = staging.join(upload_fragment_name());
+        std::fs::create_dir(&matching_directory).unwrap();
 
-        let root = SecureRoot::open(directory.path()).unwrap();
-        assert_eq!(root.cleanup_upload_fragments(100).unwrap(), 2);
-        assert!(!directory.path().join(first).exists());
-        assert!(!nested.join(second).exists());
+        assert_eq!(root.cleanup_upload_fragments(100).unwrap(), 1);
+        assert!(!staging.join(first).exists());
+        assert_eq!(std::fs::read(nested.join(second)).unwrap(), b"partial");
+        assert_eq!(std::fs::read(staging.join("keep.part")).unwrap(), b"keep");
+        assert!(matching_directory.is_dir());
         assert_eq!(
-            std::fs::read(directory.path().join("keep.part")).unwrap(),
-            b"keep"
+            std::fs::read(directory.path().join(public_fragment)).unwrap(),
+            b"client-owned"
         );
-        assert!(directory.path().join(matching_directory).is_dir());
     }
 
     #[test]
     fn cleanup_stops_at_the_configured_scan_bound() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("one.txt"), b"one").unwrap();
-        std::fs::write(directory.path().join("two.txt"), b"two").unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
+        let staging = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(UPLOAD_STAGING_DIRECTORY_NAME);
+        std::fs::write(staging.join(upload_fragment_name()), b"one").unwrap();
+        std::fs::write(staging.join(upload_fragment_name()), b"two").unwrap();
         assert!(root.cleanup_upload_fragments(1).is_err());
     }
 
@@ -1883,28 +2256,25 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(scanned, 2);
+        assert_eq!(scanned, 3);
         assert_eq!(names, vec!["visible.txt"]);
     }
 
     #[test]
     fn cleanup_continues_across_strictly_bounded_batches() {
         let directory = tempfile::tempdir().unwrap();
-        let nested = directory.path().join("nested");
-        std::fs::create_dir(&nested).unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let staging = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(UPLOAD_STAGING_DIRECTORY_NAME);
         let mut fragments = Vec::new();
         for index in 0usize..16 {
             let fragment = upload_fragment_name();
-            let parent = if index.is_multiple_of(2) {
-                directory.path()
-            } else {
-                &nested
-            };
-            std::fs::write(parent.join(&fragment), b"partial").unwrap();
-            std::fs::write(parent.join(format!("keep-{index}.txt")), b"keep").unwrap();
-            fragments.push(parent.join(fragment));
+            std::fs::write(staging.join(&fragment), b"partial").unwrap();
+            std::fs::write(staging.join(format!("keep-{index}.txt")), b"keep").unwrap();
+            fragments.push(staging.join(fragment));
         }
-        let root = SecureRoot::open(directory.path()).unwrap();
         let mut cleanup = root.start_upload_fragment_cleanup().unwrap();
         let mut removed = 0usize;
         for _ in 0..256 {
@@ -1918,54 +2288,36 @@ mod tests {
 
         assert_eq!(removed, fragments.len());
         assert!(fragments.iter().all(|path| !path.exists()));
-        assert!(directory.path().join("keep-0.txt").is_file());
-        assert!(nested.join("keep-1.txt").is_file());
+        assert!(staging.join("keep-0.txt").is_file());
+        assert!(staging.join("keep-1.txt").is_file());
     }
 
     #[test]
-    fn cleanup_serializes_creation_and_active_registration() {
-        #[cfg(target_os = "linux")]
-        use std::os::unix::fs::MetadataExt;
-
+    fn cleanup_respects_a_fragment_reserved_before_creation() {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         let fragment = upload_fragment_name();
-        let fragment_path = directory.path().join(fragment);
+        let fragment_path = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(UPLOAD_STAGING_DIRECTORY_NAME)
+            .join(&fragment);
 
-        // This is the same critical section used by PendingUpload: while the
-        // fragment becomes visible but is not registered yet, cleanup cannot
-        // perform its check-and-unlink section.
-        let mut active = active_upload_fragment_guard();
+        // PendingUpload reserves the random name before the SMB create, so
+        // cleanup cannot observe an unregistered fragment at any point.
+        let active_key = fragment;
+        assert!(active_upload_fragment_guard().insert(active_key.clone()));
         std::fs::write(&fragment_path, b"active").unwrap();
-        #[cfg(target_os = "linux")]
-        let active_key = {
-            let metadata = std::fs::metadata(&fragment_path).unwrap();
-            (metadata.dev(), metadata.ino())
-        };
-        #[cfg(not(target_os = "linux"))]
-        let active_key = fragment_path.canonicalize().unwrap();
-
-        let (started_sender, started_receiver) = std::sync::mpsc::channel();
-        let cleanup_thread = std::thread::spawn(move || {
-            let mut cleanup = root.start_upload_fragment_cleanup().unwrap();
-            started_sender.send(()).unwrap();
-            let mut removed = 0usize;
-            loop {
-                let batch = cleanup.run_batch(1).unwrap();
-                removed += batch.removed;
-                if batch.complete {
-                    return removed;
-                }
+        let mut cleanup = root.start_upload_fragment_cleanup().unwrap();
+        let mut removed = 0usize;
+        loop {
+            let batch = cleanup.run_batch(1).unwrap();
+            removed += batch.removed;
+            if batch.complete {
+                break;
             }
-        });
-        started_receiver.recv().unwrap();
-        #[cfg(target_os = "linux")]
-        active.insert(active_key);
-        #[cfg(not(target_os = "linux"))]
-        active.insert(active_key.clone());
-        drop(active);
-
-        assert_eq!(cleanup_thread.join().unwrap(), 0);
+        }
+        assert_eq!(removed, 0);
         assert_eq!(std::fs::read(&fragment_path).unwrap(), b"active");
         unregister_upload_fragment(&active_key);
     }
@@ -1991,7 +2343,240 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn upload_staging_is_reserved_hidden_and_separate_from_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let staging = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(UPLOAD_STAGING_DIRECTORY_NAME);
+        let mut pending = root.begin_upload("").unwrap();
+
+        assert!(root.bind_directory(INTERNAL_DIRECTORY_NAME).is_err());
+        assert!(root.list("", 0, 100).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 1);
+        let mut file = pending.take_file().unwrap();
+        file.write_all(b"complete").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        pending.publish("published.txt").unwrap();
+
+        assert_eq!(std::fs::read_dir(staging).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(directory.path().join("published.txt")).unwrap(),
+            b"complete"
+        );
+    }
+
+    #[test]
+    fn cleanup_skips_an_active_deletion_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("keep.txt"), b"keep").unwrap();
+        let staged = root.stage_delete("keep.txt").unwrap();
+        let mut cleanup = root.start_upload_fragment_cleanup().unwrap();
+        let mut removed = 0;
+        loop {
+            let batch = cleanup.run_batch(1).unwrap();
+            removed += batch.removed;
+            if batch.complete {
+                break;
+            }
+        }
+        assert_eq!(removed, 0);
+        drop(staged);
+        assert_eq!(
+            std::fs::read(directory.path().join("keep.txt")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn delete_staging_reconciles_executed_rename_reported_as_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("response-loss.txt"), b"original").unwrap();
+        root.fail_next_delete_staging_rename_after_success(io::ErrorKind::AlreadyExists);
+
+        let staged = root.stage_delete("response-loss.txt").unwrap();
+        assert!(!directory.path().join("response-loss.txt").exists());
+        let recovery_path = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(TOMBSTONE_STAGING_DIRECTORY_NAME)
+            .join(&staged.tombstone_name);
+        assert_eq!(std::fs::read(&recovery_path).unwrap(), b"original");
+        assert!(recovery_path
+            .with_file_name(deletion_manifest_name(&staged.tombstone_name))
+            .is_file());
+
+        drop(staged);
+        assert_eq!(
+            std::fs::read(directory.path().join("response-loss.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read_dir(
+                directory
+                    .path()
+                    .join(INTERNAL_DIRECTORY_NAME)
+                    .join(TOMBSTONE_STAGING_DIRECTORY_NAME)
+            )
+            .unwrap()
+            .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn deletion_promotion_reconciles_response_loss_before_exists_handling() {
+        for error_kind in [io::ErrorKind::AlreadyExists, io::ErrorKind::Other] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = SecureRoot::open(directory.path()).unwrap();
+            std::fs::write(directory.path().join("commit.txt"), b"content").unwrap();
+            let staged = root.stage_delete("commit.txt").unwrap();
+            root.fail_next_delete_promotion_rename_after_success(error_kind);
+
+            let outcome = staged.commit().unwrap();
+            assert_eq!(
+                outcome,
+                DeleteCommitOutcome {
+                    cleanup_pending: false,
+                    tombstone_path: None,
+                }
+            );
+            assert!(!directory.path().join("commit.txt").exists());
+            assert_eq!(
+                std::fs::read_dir(
+                    directory
+                        .path()
+                        .join(INTERNAL_DIRECTORY_NAME)
+                        .join(TOMBSTONE_STAGING_DIRECTORY_NAME)
+                )
+                .unwrap()
+                .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_conflict_preserves_recovery_entry_and_new_external_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("report.txt"), b"original").unwrap();
+        let staged = root.stage_delete("report.txt").unwrap();
+        let recovery_name = staged.tombstone_name.clone();
+
+        // Simulate a co-writer reusing the visible name before rollback.
+        std::fs::write(directory.path().join("report.txt"), b"external").unwrap();
+        drop(staged);
+
+        assert_eq!(
+            std::fs::read(directory.path().join("report.txt")).unwrap(),
+            b"external"
+        );
+        let recovery_path = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(TOMBSTONE_STAGING_DIRECTORY_NAME)
+            .join(&recovery_name);
+        let manifest_path = recovery_path.with_file_name(deletion_manifest_name(&recovery_name));
+        assert_eq!(std::fs::read(&recovery_path).unwrap(), b"original");
+        assert!(manifest_path.is_file());
+        assert_eq!(root.cleanup_upload_fragments(100).unwrap(), 0);
+        assert_eq!(std::fs::read(recovery_path).unwrap(), b"original");
+        drop(root);
+        let reopened = SecureRoot::open(directory.path()).unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join("report.txt")).unwrap(),
+            b"external"
+        );
+        assert!(manifest_path.is_file());
+        drop(reopened);
+    }
+
+    #[test]
+    fn restart_restores_uncommitted_pending_delete_from_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("restore.txt"), b"original").unwrap();
+        let staged = root.stage_delete("restore.txt").unwrap();
+        let active_key = staged.active_key.clone().unwrap();
+
+        // Simulate process loss: Drop cannot run and the in-memory registry is
+        // empty in the next process, while pending data + durable manifest remain.
+        std::mem::forget(staged);
+        unregister_upload_fragment(&active_key);
+        drop(root);
+
+        let reopened = SecureRoot::open(directory.path()).unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join("restore.txt")).unwrap(),
+            b"original"
+        );
+        let tombstones = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(TOMBSTONE_STAGING_DIRECTORY_NAME);
+        assert_eq!(std::fs::read_dir(tombstones).unwrap().count(), 0);
+        drop(reopened);
+    }
+
+    #[test]
+    fn committed_delete_removes_pending_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("delete.txt"), b"content").unwrap();
+        let staged = root.stage_delete("delete.txt").unwrap();
+        assert!(staged.commit().unwrap().tombstone_path.is_none());
+        let tombstones = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(TOMBSTONE_STAGING_DIRECTORY_NAME);
+        assert_eq!(std::fs::read_dir(tombstones).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn preprovisioned_sibling_staging_cannot_be_reached_through_share_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let mount = tempfile::tempdir().unwrap();
+        let shared = mount.path().join("shared");
+        let internal = mount.path().join(INTERNAL_DIRECTORY_NAME);
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::create_dir(&internal).unwrap();
+        std::fs::create_dir(internal.join(UPLOAD_STAGING_DIRECTORY_NAME)).unwrap();
+        std::fs::create_dir(internal.join(TOMBSTONE_STAGING_DIRECTORY_NAME)).unwrap();
+        for path in [
+            internal.as_path(),
+            &internal.join(UPLOAD_STAGING_DIRECTORY_NAME),
+            &internal.join(TOMBSTONE_STAGING_DIRECTORY_NAME),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root = SecureRoot::open_configured(&shared, Some(&internal), true, true).unwrap();
+        symlink("../.vaultlink-internal", shared.join("leak")).unwrap();
+
+        assert!(root.bind_directory("leak/uploads").is_err());
+    }
+
+    #[test]
+    fn insecure_internal_directory_permissions_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let internal = directory.path().join(INTERNAL_DIRECTORY_NAME);
+        std::fs::create_dir(&internal).unwrap();
+        std::fs::set_permissions(&internal, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = match SecureRoot::open(directory.path()) {
+            Ok(_) => panic!("insecure internal directory was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
     #[test]
     fn special_files_are_hidden_and_never_block_regular_file_open() {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
@@ -2013,7 +2598,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn existing_linux_filenames_are_not_reduced_to_windows_upload_policy() {
         let directory = tempfile::tempdir().unwrap();
@@ -2083,12 +2667,48 @@ mod tests {
             std::fs::read(directory.path().join("existing.txt")).unwrap(),
             b"replacement"
         );
-        let remaining_parts = std::fs::read_dir(directory.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
-            .count();
+        let remaining_parts = std::fs::read_dir(
+            directory
+                .path()
+                .join(INTERNAL_DIRECTORY_NAME)
+                .join(UPLOAD_STAGING_DIRECTORY_NAME),
+        )
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+        .count();
         assert_eq!(remaining_parts, 0);
+    }
+
+    #[test]
+    fn external_writer_storage_disables_replace_at_the_filesystem_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mount = tempfile::tempdir().unwrap();
+        let shared = mount.path().join("shared");
+        let internal = mount.path().join(INTERNAL_DIRECTORY_NAME);
+        let uploads = internal.join(UPLOAD_STAGING_DIRECTORY_NAME);
+        let tombstones = internal.join(TOMBSTONE_STAGING_DIRECTORY_NAME);
+        for path in [&shared, &internal, &uploads, &tombstones] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root = SecureRoot::open_configured(&shared, Some(&internal), true, true).unwrap();
+        std::fs::write(shared.join("existing.txt"), b"original").unwrap();
+        let mut upload = root.begin_upload("").unwrap();
+        let mut file = upload.take_file().unwrap();
+        file.write_all(b"replacement").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert_eq!(
+            upload.publish_replace("existing.txt").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read(shared.join("existing.txt")).unwrap(),
+            b"original"
+        );
     }
 
     #[test]
@@ -2101,10 +2721,15 @@ mod tests {
             file.write_all(b"partial").unwrap();
             assert!(root.list("", 0, 100).unwrap().is_empty());
         }
-        let names: Vec<_> = std::fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
+        let names: Vec<_> = std::fs::read_dir(
+            directory
+                .path()
+                .join(INTERNAL_DIRECTORY_NAME)
+                .join(UPLOAD_STAGING_DIRECTORY_NAME),
+        )
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
         assert!(names.is_empty(), "temporary upload remained: {names:?}");
     }
 
@@ -2185,7 +2810,6 @@ mod tests {
         assert!(directory.path().join("same.txt").is_file());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn symlink_escape_is_rejected_for_all_storage_operations() {
         use std::os::unix::fs::symlink;
@@ -2200,7 +2824,6 @@ mod tests {
         assert!(root.begin_upload("escape").is_err());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn share_scope_allows_internal_symlinks_and_blocks_sibling_share_symlinks() {
         use std::io::Read;
@@ -2237,7 +2860,6 @@ mod tests {
         assert_eq!(contents, "secret");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn bound_directory_descriptor_survives_share_path_retargeting() {
         use std::io::Read;

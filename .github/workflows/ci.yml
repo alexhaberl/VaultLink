@@ -15,7 +15,21 @@ concurrency:
 
 jobs:
   ci:
-    runs-on: [self-hosted, Linux, X64, vaultlink]
+    name: Native Linux (${{ matrix.architecture }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runs_on: '["self-hosted", "Linux", "X64", "vaultlink"]'
+            expected_uname: x86_64
+            expected_rust_host: x86_64-unknown-linux-gnu
+          - architecture: arm64
+            runs_on: '["ubuntu-24.04-arm"]'
+            expected_uname: aarch64
+            expected_rust_host: aarch64-unknown-linux-gnu
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
@@ -27,6 +41,12 @@ jobs:
         with:
           toolchain: 1.97.0
           components: rustfmt, clippy
+      - name: Verify native architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "${{ matrix.expected_uname }}"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.expected_rust_host }}"
       - name: Supply-chain policy
         run: sh tools/check-supply-chain-policy.sh
       - name: Formatting
@@ -47,6 +67,6 @@ jobs:
           cargo audit --deny warnings --file fuzz/Cargo.lock
       - name: Setup, API, upgrade, and rollback smoke tests
         run: make docker-smoke
-      - name: Native release build on main
+      - name: Native ${{ matrix.architecture }} release build on main
         if: github.event_name == 'push'
         run: cargo build --locked --release
