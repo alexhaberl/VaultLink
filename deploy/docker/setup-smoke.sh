@@ -57,6 +57,7 @@ fi
 wait_http "http://$SETUP_ADDR/?token=$TOKEN" "200"
 
 curl -sS -f -X POST "http://$SETUP_ADDR/" \
+    -H "Accept-Language: de" \
     --data-urlencode "token=$TOKEN" \
     --data-urlencode "server_mode=development" \
     --data-urlencode "listen_address=$APP_ADDR" \
@@ -88,6 +89,7 @@ curl -sS -f -X POST "http://$SETUP_ADDR/" \
     | grep -q "Setup abgeschlossen"
 
 curl -sS -f -X POST "http://$SETUP_ADDR/complete" \
+    -H "Accept-Language: de" \
     --data-urlencode "token=$TOKEN" \
     | grep -q "Setup best"
 
