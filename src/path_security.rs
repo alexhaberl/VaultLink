@@ -4,6 +4,18 @@ use std::{
 };
 use thiserror::Error;
 
+pub const INTERNAL_STORAGE_DIRECTORY_NAME: &str = ".vaultlink-internal";
+
+/// SMB servers can expose case-insensitive names and commonly ignore trailing
+/// dots or spaces. Treat every such spelling as the private namespace so a
+/// normal client path can never alias VaultLink's staging directory.
+pub fn is_internal_storage_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.trim_end_matches(['.', ' '])
+            .eq_ignore_ascii_case(INTERNAL_STORAGE_DIRECTORY_NAME)
+    })
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum PathError {
     #[error("invalid relative path")]
@@ -30,7 +42,9 @@ pub fn validate_relative(raw: &str) -> Result<PathBuf, PathError> {
     let mut clean = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Normal(v) if v != OsStr::new("") => clean.push(v),
+            Component::Normal(v) if v != OsStr::new("") && !is_internal_storage_name(v) => {
+                clean.push(v)
+            }
             Component::CurDir => {}
             _ => return Err(PathError::Invalid),
         }
@@ -73,6 +87,7 @@ pub fn safe_filename(name: &str) -> Result<&str, PathError> {
         || name == "."
         || name == ".."
         || name.ends_with(['.', ' '])
+        || is_internal_storage_name(OsStr::new(name))
         || name.contains(['/', '\\', '\0', ':', '<', '>', '"', '|', '?', '*'])
         || name.chars().any(|c| c.is_control())
         || windows_reserved
@@ -91,6 +106,8 @@ pub fn safe_admin_filename(name: &str) -> Result<&str, PathError> {
     let name = safe_filename(name)?;
     if private_token_name(name, ".vaultlink-", ".part")
         || private_token_name(name, ".vaultlink-delete-", ".tombstone")
+        || private_token_name(name, ".vaultlink-delete-pending-", ".pending")
+        || is_internal_storage_name(OsStr::new(name))
     {
         return Err(PathError::Invalid);
     }
@@ -119,7 +136,17 @@ mod tests {
     use super::*;
     #[test]
     fn rejects_traversal_and_invalid_decoded_paths() {
-        for p in ["../etc", "/etc", "a\\..\\b", "a\0b"] {
+        for p in [
+            "../etc",
+            "/etc",
+            "a\\..\\b",
+            "a\0b",
+            ".vaultlink-internal",
+            ".VAULTLINK-INTERNAL",
+            ".vaultlink-internal.",
+            "docs/.vaultlink-internal/uploads",
+            "docs/.VaUlTlInK-InTeRnAl /uploads",
+        ] {
             assert!(validate_relative(p).is_err(), "{p}");
         }
     }
@@ -141,6 +168,9 @@ mod tests {
     #[test]
     fn filename_rules() {
         assert!(safe_filename("ok file.txt").is_ok());
+        assert!(safe_admin_filename(INTERNAL_STORAGE_DIRECTORY_NAME).is_err());
+        assert!(safe_admin_filename(".VAULTLINK-INTERNAL").is_err());
+        assert!(safe_admin_filename(".vaultlink-internal.").is_err());
         assert!(safe_filename("../x").is_err());
         for unsafe_name in [
             "C:escape.txt",
@@ -153,7 +183,6 @@ mod tests {
             assert!(safe_filename(unsafe_name).is_err(), "{unsafe_name}");
         }
     }
-    #[cfg(unix)]
     #[test]
     fn rejects_symlink_escape() {
         use std::os::unix::fs::symlink;

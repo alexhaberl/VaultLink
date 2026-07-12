@@ -5,7 +5,7 @@ use vaultlink::{
     auth,
     config::{self, CertificateSource, Config, ServerMode},
     db::{AdminRecoveryOutcome, Database, InitialAdminOutcome},
-    web, AppState,
+    storage_mount, web, AppState,
 };
 
 #[tokio::main]
@@ -63,7 +63,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &config.tls.key_file,
                 )
                 .await?;
-                #[cfg(unix)]
                 install_sighup_handler_for_files(&config, tls.clone());
                 let handle = axum_server::Handle::new();
                 install_server_shutdown(handle.clone());
@@ -73,7 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
             }
             CertificateSource::LetsEncrypt => {
-                #[cfg(unix)]
                 install_noop_sighup_handler("ACME manages certificate renewal internally");
                 let public_url = url::Url::parse(&config.server.public_base_url)?;
                 let domain = public_url
@@ -82,11 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .to_string();
                 let cache_dir = config::letsencrypt_cache_dir(&config.storage, &config.tls)?;
                 std::fs::create_dir_all(&cache_dir)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700))?;
-                }
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700))?;
                 let contact = format!("mailto:{}", config.tls.letsencrypt_contact_email);
                 let mut acme_state = rustls_acme::AcmeConfig::new([domain.clone()])
                     .contact_push(contact)
@@ -117,7 +112,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         _ => {
-            #[cfg(unix)]
             install_noop_sighup_handler("no reloadable TLS configuration in this mode");
             let handle = axum_server::Handle::new();
             install_server_shutdown(handle.clone());
@@ -321,6 +315,9 @@ fn recovery_database_path(
 fn init_admin(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let username = arg(args, "--username").ok_or("--username is required")?;
     validate_admin_username(username)?;
+    if config.storage.require_mount {
+        storage_mount::validate(&config.storage)?;
+    }
     std::fs::create_dir_all(&config.storage.data_directory)?;
     let database = Database::open(config.storage.data_directory.join("data.sqlite"))?;
     if database.admin_count()? != 0 {
@@ -511,29 +508,21 @@ fn install_server_shutdown(handle: axum_server::Handle<std::net::SocketAddr>) {
 }
 
 async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(signal) => signal,
-                Err(error) => {
-                    tracing::error!(%error, "cannot install SIGTERM handler");
-                    let _ = tokio::signal::ctrl_c().await;
-                    return;
-                }
-            };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    let mut terminate =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                tracing::error!(%error, "cannot install SIGTERM handler");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate.recv() => {},
     }
 }
 
-#[cfg(unix)]
 fn install_sighup_handler_for_files(config: &Config, tls: axum_server::tls_rustls::RustlsConfig) {
     if !config.tls.reload_on_cert_change {
         install_noop_sighup_handler("reload_on_cert_change is disabled");
@@ -558,7 +547,6 @@ fn install_sighup_handler_for_files(config: &Config, tls: axum_server::tls_rustl
     });
 }
 
-#[cfg(unix)]
 fn install_noop_sighup_handler(reason: &'static str) {
     tokio::spawn(async move {
         let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -754,7 +742,12 @@ mod tests {
         config.server.listen_address = "127.0.0.1:8443".into();
         config.server.public_base_url = "https://files.example.test".into();
         config.server.production_mode = true;
+        config.storage.root_mount_path = directory.path().join("shared");
         config.storage.data_directory = data_directory.clone();
+        config.storage.internal_directory = Some(directory.path().join(".vaultlink-internal"));
+        config.storage.require_mount = true;
+        config.storage.expected_filesystem_type = Some("ext4".into());
+        config.storage.expected_mount_source = Some("/dev/mapper/vaultlink-test".into());
         config.security.secure_cookie = true;
         config.tls.enabled = true;
         config.tls.certificate_source = CertificateSource::Files;

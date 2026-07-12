@@ -53,6 +53,16 @@ pub struct Server {
 pub struct Storage {
     pub root_mount_path: PathBuf,
     pub data_directory: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub require_mount: bool,
+    #[serde(default)]
+    pub external_writers: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_filesystem_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_mount_source: Option<String>,
     #[serde(default = "default_upload_size")]
     pub max_upload_size: u64,
     #[serde(default = "default_zip_size")]
@@ -456,6 +466,7 @@ impl Config {
                 "storage limits must be positive".into(),
             ));
         }
+        validate_mount_policy(&self.storage, self.server.production_mode)?;
         validate_extensions("preview_extensions", &self.storage.preview_extensions)?;
         validate_extensions(
             "image_preview_extensions",
@@ -490,6 +501,106 @@ impl Config {
     }
 }
 
+fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(), ConfigError> {
+    if production_mode && !storage.require_mount {
+        return Err(ConfigError::Invalid(
+            "production_mode=true requires require_mount=true and an explicit fail-closed mount identity"
+                .into(),
+        ));
+    }
+    if storage.external_writers && !storage.require_mount {
+        return Err(ConfigError::Invalid(
+            "external_writers=true requires require_mount=true and an explicit mount identity"
+                .into(),
+        ));
+    }
+    if let Some(internal) = &storage.internal_directory {
+        if storage.require_mount && !internal.is_absolute() {
+            return Err(ConfigError::Invalid(
+                "require_mount=true requires an absolute internal_directory".into(),
+            ));
+        }
+        if internal.starts_with(&storage.root_mount_path)
+            || storage.root_mount_path.starts_with(internal)
+        {
+            return Err(ConfigError::Invalid(
+                "internal_directory must be a sibling outside the user-visible root_mount_path"
+                    .into(),
+            ));
+        }
+    }
+    if !storage.require_mount {
+        if storage.expected_filesystem_type.is_some() || storage.expected_mount_source.is_some() {
+            return Err(ConfigError::Invalid(
+                "expected_filesystem_type and expected_mount_source require require_mount=true"
+                    .into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if !storage.root_mount_path.is_absolute() || !storage.data_directory.is_absolute() {
+        return Err(ConfigError::Invalid(
+            "require_mount=true requires absolute root_mount_path and data_directory paths".into(),
+        ));
+    }
+    let internal_directory = storage.internal_directory.as_deref().ok_or_else(|| {
+        ConfigError::Invalid(
+            "require_mount=true requires a pre-provisioned internal_directory outside root_mount_path"
+                .into(),
+        )
+    })?;
+    for (name, path) in [
+        ("root_mount_path", storage.root_mount_path.as_path()),
+        ("data_directory", storage.data_directory.as_path()),
+        ("internal_directory", internal_directory),
+    ] {
+        if path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{name} must not contain '.' or '..' components when require_mount=true"
+            )));
+        }
+    }
+    if storage.data_directory.starts_with(&storage.root_mount_path) {
+        return Err(ConfigError::Invalid(
+            "data_directory must not be inside root_mount_path when require_mount=true".into(),
+        ));
+    }
+
+    let filesystem_type = storage.expected_filesystem_type.as_deref().ok_or_else(|| {
+        ConfigError::Invalid("require_mount=true requires expected_filesystem_type".into())
+    })?;
+    if filesystem_type.is_empty()
+        || !filesystem_type
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ConfigError::Invalid(
+            "expected_filesystem_type must be a non-empty Linux filesystem type".into(),
+        ));
+    }
+    if storage.external_writers && !matches!(filesystem_type, "cifs" | "smb3") {
+        return Err(ConfigError::Invalid(
+            "external_writers=true is supported only with the audited cifs/smb3 mount policy"
+                .into(),
+        ));
+    }
+
+    let mount_source = storage.expected_mount_source.as_deref().ok_or_else(|| {
+        ConfigError::Invalid("require_mount=true requires expected_mount_source".into())
+    })?;
+    if mount_source.is_empty() || mount_source.chars().any(char::is_control) {
+        return Err(ConfigError::Invalid(
+            "expected_mount_source must be non-empty and contain no control characters".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn curl_connect_host(host: &str) -> String {
     let bare_host = host
         .strip_prefix('[')
@@ -511,15 +622,12 @@ fn validate_tls_files(tls: &Tls) -> Result<(), ConfigError> {
             )));
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&tls.key_file)?.permissions().mode();
-        if mode & 0o007 != 0 {
-            return Err(ConfigError::Invalid(
-                "TLS private key must not be accessible to other users".into(),
-            ));
-        }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(&tls.key_file)?.permissions().mode();
+    if mode & 0o007 != 0 {
+        return Err(ConfigError::Invalid(
+            "TLS private key must not be accessible to other users".into(),
+        ));
     }
     Ok(())
 }
@@ -623,6 +731,11 @@ mod tests {
             storage: Storage {
                 root_mount_path: ".".into(),
                 data_directory: ".".into(),
+                internal_directory: None,
+                require_mount: false,
+                external_writers: false,
+                expected_filesystem_type: None,
+                expected_mount_source: None,
                 max_upload_size: 10,
                 max_zip_size: 1024,
                 max_zip_files: 10,
@@ -644,6 +757,16 @@ mod tests {
             logging: Logging::default(),
         }
     }
+
+    fn configure_local_mount_policy(config: &mut Config) {
+        config.storage.root_mount_path = "/srv/vaultlink/shared".into();
+        config.storage.data_directory = "/var/lib/vaultlink".into();
+        config.storage.internal_directory = Some("/srv/vaultlink/.vaultlink-internal".into());
+        config.storage.require_mount = true;
+        config.storage.external_writers = false;
+        config.storage.expected_filesystem_type = Some("ext4".into());
+        config.storage.expected_mount_source = Some("/dev/mapper/vaultlink".into());
+    }
     #[test]
     fn development_requires_loopback() {
         let mut c = base();
@@ -657,6 +780,85 @@ mod tests {
         c.storage.max_zip_size = 0;
         c.storage.max_zip_files = 0;
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_storage_configuration_defaults_to_no_mount_requirement() {
+        let serialized = toml::to_string(&base()).unwrap();
+        let legacy = serialized
+            .lines()
+            .filter(|line| {
+                !line.starts_with("require_mount =")
+                    && !line.starts_with("external_writers =")
+                    && !line.starts_with("expected_filesystem_type =")
+                    && !line.starts_with("expected_mount_source =")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: Config = toml::from_str(&legacy).unwrap();
+        assert!(!parsed.storage.require_mount);
+        assert!(!parsed.storage.external_writers);
+        assert_eq!(parsed.storage.expected_filesystem_type, None);
+        assert_eq!(parsed.storage.expected_mount_source, None);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    fn external_mount_policy_requires_complete_explicit_identity() {
+        let mut config = base();
+        config.storage.root_mount_path = "/mnt/vaultlink".into();
+        config.storage.data_directory = "/var/lib/vaultlink".into();
+        config.storage.require_mount = true;
+        assert!(config.validate().is_err());
+
+        config.storage.expected_filesystem_type = Some("cifs".into());
+        assert!(config.validate().is_err());
+
+        config.storage.expected_mount_source = Some("//nas.example/vaultlink".into());
+        config.storage.internal_directory = Some("/mnt/.vaultlink-internal".into());
+        config.storage.external_writers = true;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn production_requires_an_explicit_fail_closed_mount_identity() {
+        let mut config = base();
+        config.server.mode = ServerMode::ReverseProxy;
+        config.server.production_mode = true;
+        config.server.public_base_url = "https://vaultlink.example".into();
+        config.security.secure_cookie = true;
+        config.reverse_proxy.enabled = true;
+        config.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("production_mode=true requires require_mount=true"));
+        configure_local_mount_policy(&mut config);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn external_mount_policy_rejects_ignored_or_overlapping_settings() {
+        let mut config = base();
+        config.storage.external_writers = true;
+        assert!(config.validate().is_err());
+        config.storage.external_writers = false;
+        config.storage.expected_filesystem_type = Some("cifs".into());
+        assert!(config.validate().is_err());
+
+        config.storage.require_mount = true;
+        config.storage.root_mount_path = "/mnt/vaultlink".into();
+        config.storage.data_directory = "/mnt/vaultlink/.state".into();
+        config.storage.expected_mount_source = Some("//nas.example/vaultlink".into());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn required_mount_paths_reject_parent_directory_aliases() {
+        let mut config = base();
+        configure_local_mount_policy(&mut config);
+        config.storage.data_directory = "/var/lib/vaultlink/../state".into();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("must not contain '.' or '..' components"));
     }
 
     #[test]
@@ -699,6 +901,7 @@ mod tests {
         let mut c = base();
         c.server.mode = ServerMode::ReverseProxy;
         c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
         c.server.public_base_url = "https://example.test".into();
         c.reverse_proxy.enabled = true;
         c.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
@@ -710,6 +913,7 @@ mod tests {
         let mut c = base();
         c.server.mode = ServerMode::ReverseProxy;
         c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
         c.server.listen_address = "0.0.0.0:8080".into();
         c.server.public_base_url = "https://vaultlink.example".into();
         c.security.secure_cookie = true;
@@ -731,6 +935,7 @@ mod tests {
         let mut c = base();
         c.server.mode = ServerMode::StandaloneTls;
         c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
         c.server.public_base_url = "https://example.test".into();
         c.security.secure_cookie = true;
         c.tls.enabled = true;
@@ -744,6 +949,7 @@ mod tests {
         let mut c = base();
         c.server.mode = ServerMode::StandaloneTls;
         c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
         c.server.listen_address = "0.0.0.0:443".into();
         c.server.public_base_url = "https://files.example.test".into();
         c.security.secure_cookie = true;
@@ -764,6 +970,7 @@ mod tests {
         let mut c = base();
         c.server.mode = ServerMode::StandaloneTls;
         c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
         c.server.listen_address = "0.0.0.0:443".into();
         c.server.public_base_url = "https://files.example.test".into();
         c.security.secure_cookie = true;
@@ -801,6 +1008,7 @@ mod tests {
         let mut c = base();
         c.server.mode = ServerMode::StandaloneTls;
         c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
         c.server.listen_address = "0.0.0.0:443".into();
         c.server.public_base_url = "https://localhost".into();
         c.security.secure_cookie = true;
@@ -819,6 +1027,7 @@ mod tests {
         let mut c = base();
         c.server.mode = ServerMode::ReverseProxy;
         c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
         c.server.listen_address = "0.0.0.0:8080".into();
         c.server.public_base_url = "https://vaultlink.example".into();
         c.security.secure_cookie = true;
@@ -842,6 +1051,7 @@ mod tests {
         let mut c = base();
         c.server.mode = ServerMode::StandaloneTls;
         c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
         c.server.listen_address = "0.0.0.0:443".into();
         c.server.public_base_url = "https://files.example.test/base/path".into();
         c.security.secure_cookie = true;
@@ -866,6 +1076,7 @@ mod tests {
         let mut c = base();
         c.server.mode = ServerMode::StandaloneTls;
         c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
         c.server.listen_address = "[::]:8443".into();
         c.server.public_base_url = "https://files.example.test:8443".into();
         c.security.secure_cookie = true;

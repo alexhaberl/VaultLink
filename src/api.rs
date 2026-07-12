@@ -816,10 +816,13 @@ async fn create_share(
     } else {
         None
     };
-    let strategy = if metadata.is_dir()
-        && request.permission.can_upload()
-        && request.overwrite_allowed.unwrap_or(false)
-    {
+    let overwrite_requested = request.overwrite_allowed.unwrap_or(false);
+    if overwrite_requested && state.config.storage.external_writers {
+        return Err(ApiError::bad_request(
+            "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+        ));
+    }
+    let strategy = if metadata.is_dir() && request.permission.can_upload() && overwrite_requested {
         UploadConflictStrategy::OverwriteAllowed
     } else {
         UploadConflictStrategy::Reject
@@ -897,6 +900,16 @@ async fn update_share(
 ) -> ApiResult<Json<ShareResponse>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
+    if request
+        .upload_conflict_strategy
+        .as_ref()
+        .is_some_and(UploadConflictStrategy::can_overwrite)
+        && state.config.storage.external_writers
+    {
+        return Err(ApiError::bad_request(
+            "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+        ));
+    }
     if let Some(active) = request.active {
         database(state.db.clone(), move |db| db.set_share_active(id, active)).await?;
         audit(
@@ -1782,6 +1795,11 @@ mod tests {
             storage: Storage {
                 root_mount_path: root.into(),
                 data_directory: data.into(),
+                internal_directory: None,
+                require_mount: false,
+                external_writers: false,
+                expected_filesystem_type: None,
+                expected_mount_source: None,
                 max_upload_size: 1_000_000,
                 max_zip_size: 1_000_000_000,
                 max_zip_files: 100,
@@ -2023,6 +2041,74 @@ mod tests {
         assert!(body.contains("docsapi"));
         assert!(!body.contains("very strong share password"));
         assert!(!body.contains("password_hash"));
+    }
+
+    #[tokio::test]
+    async fn external_writers_reject_api_overwrite_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        let mut state = test_state(root.path(), data.path());
+        let secret = auth::new_totp_secret();
+        let hash = auth::hash_password("correct horse battery staple").unwrap();
+        state.db.create_admin("admin", &hash, &secret).unwrap();
+        let (session_cookie, csrf) = api_login(&state, &secret).await;
+        let mut config = (*state.config).clone();
+        config.storage.external_writers = true;
+        state.config = std::sync::Arc::new(config);
+        let app = crate::web::router(state.clone());
+
+        let mut create = json_request(
+            Method::POST,
+            "/api/v1/shares",
+            r#"{"path":"docs","permission":"download_upload","overwrite_allowed":true}"#,
+        );
+        create.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        create
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.clone().oneshot(create).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let share_id = state
+            .db
+            .create_share(
+                "external-api",
+                None,
+                "docs",
+                true,
+                &Permission::DownloadUpload,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        state.db.set_share_active(share_id, false).unwrap();
+        let mut update = json_request(
+            Method::PATCH,
+            &format!("/api/v1/shares/{share_id}"),
+            r#"{"active":true,"upload_conflict_strategy":"overwrite_allowed"}"#,
+        );
+        update.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        update
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.oneshot(update).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!state.db.list_shares().unwrap()[0].active);
     }
 
     #[tokio::test]
@@ -2610,9 +2696,13 @@ mod tests {
         );
         assert!(!root.path().join("tree").exists());
         let tombstone_exists = || {
-            std::fs::read_dir(root.path()).unwrap().any(|entry| {
-                crate::secure_fs::is_deletion_tombstone_name(&entry.unwrap().file_name())
-            })
+            std::fs::read_dir(
+                root.path()
+                    .join(crate::path_security::INTERNAL_STORAGE_DIRECTORY_NAME)
+                    .join("tombstones"),
+            )
+            .unwrap()
+            .any(|entry| crate::secure_fs::is_deletion_tombstone_name(&entry.unwrap().file_name()))
         };
         assert!(tombstone_exists());
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 — 2026-07-12
+
+- Added native Linux aarch64 support while keeping amd64 CI and release builds on the dedicated local Self-hosted runner; only arm64 uses GitHub's `ubuntu-24.04-arm` runner.
+- Removed Windows host support and retained Windows-compatible filename rules for standard SMB clients.
+- Added fail-closed external CIFS storage validation for mount identity, source, filesystem type, read-write state, SMB 3.1.1 encryption/strict-cache options, local SQLite separation and mount-race detection.
+- Required every production deployment to declare and verify an exact active mount identity; setup and `init-admin` now reject unmounted fallbacks, network SQLite, unsafe ownership/modes and canonical data-path aliases before storing credentials.
+- Split the visible shared tree from pre-provisioned sibling staging protected by server-side SMB ACLs; external-writer paths reject symlinks, nested mounts and overwrite publication.
+- Moved uploads into protected flat staging with cross-directory atomic no-replace publication, rustix-backed `openat2`/`renameat2` operations and startup mutation probes.
+- Made deletion recovery crash-safe by separating uncommitted pending entries from committed cleanup tombstones; rollback conflicts preserve both objects for operator recovery.
+- Added architecture-specific archives, binaries, SBOMs, checksums and Minisign signatures for Debian 13 amd64 and arm64 releases.
+- Upgrades and rollbacks now validate, back up, activate, restore and health-check matching Binary/Config/SQLite triples under a shared maintenance lock.
+
 ## 0.4.0 — 2026-07-11
 
 - Added WebAuthn/FIDO2 security keys such as YubiKey as an alternative admin second factor, with multiple named keys per account, password-confirmed enrollment, TOTP-protected removal, session-bound single-use ceremonies, and stable RP-ID/origin configuration.

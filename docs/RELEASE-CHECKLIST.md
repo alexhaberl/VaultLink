@@ -1,16 +1,16 @@
-# v0.4.0 release checklist
+# v0.4.1 release checklist
 
-Stand: 2026-07-11 nach der 0.4.0-Integration von DE/EN, „Mein Konto“, lokalem Admin-Recovery und dem Headless-Setup über SSH-Tunnel.
+Stand: 2026-07-12 für die native Linux-amd64-/arm64-Freigabe von 0.4.1.
 
-Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschließlich bei sauberem Worktree und vollständig grünen Gates gesetzt.
+Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfolgt über einen eigenen Pull Request; ein Tag wird erst nach dem Merge auf `main`, bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
-## Feature-Scope für 0.4.0
+## Feature-Scope für 0.4.1
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
 - [x] „Mein Konto“ für eigene Passwortänderungen mit aktuellem Passwort sowie zweistufigen MFA-Wechsel; das alte Secret bleibt bis zum bestätigten neuen TOTP-Code aktiv.
 - [x] Lokaler `recover-admin`-Notfallpfad über SSH/Hostzugriff mit `--config` oder direktem `--database`, atomarem Credential-Wechsel, Session-/Pending-Widerruf und secret-freiem Audit.
 - [x] Deutsch/Englisch in Setup-, Auth-, Admin- und Public-Flows; Cookie vor `Accept-Language`, Englisch als Fallback, locale-gerechte Datums-/Zahlen-/JavaScript-Ausgabe.
-- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.4.0.
+- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.4.1.
 - [x] Admin-Dateiverwaltung zum Erstellen von Ordnern, No-Clobber-Umbenennen und permanenten rekursiven Löschen mit serverseitiger Bestätigung sowie clientseitigem Exact-Match-Gating.
 - [x] Begrenzte, neustartfähige Tombstone-Bereinigung mit global serialisierten Cleanup-Workern und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
 - [x] API und UI teilen Auth-, Session-, CSRF-, SecureFS-, SQLite-, Runtime-Settings- und Audit-Logik.
@@ -21,7 +21,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Optionaler Kurzlink-Alias.
 - [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`; HEAD prüft die verfügbare Quote ohne Reservierung oder Zählung, feste Transfer-Grants zählen erst vollständige Antworten und fassen Range-Resumes ohne Sliding-Expiry zusammen.
 - [x] Sichere Uploads mit temporärer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
-- [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink; Default bleibt No-Replace und Public-Uploader müssen Replace pro Upload bestätigen.
+- [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink ohne Co-Writer; bei `external_writers=true` erzwingen UI, API und Publish-Pfad No-Replace.
 - [x] Upload in navigierten Unterordnern für `download_upload`-Ordnerlinks.
 - [x] Upload-only-Freigaben listen keine Ordnerinhalte und erlauben keine Preview/Downloads.
 - [x] Inkrementeller ZIP-Download für Ordnerfreigaben mit durchgehendem ZIP64, Datei-, Scan- und Größenlimits, gecappten Quelldateien, Temp-Budget und backpressured Direct-Stream-Fallback.
@@ -34,6 +34,11 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Loopback-only Setup-UI (`vaultlink setup --config <path> --listen 127.0.0.1:8090`) mit dokumentiertem Headless-Zugriff über einen expliziten IPv4-SSH-Tunnel: `ssh -4 -N -L 127.0.0.1:8090:127.0.0.1:8090 user@server`.
 - [x] Setup überschreibt keine bestehende Konfiguration; Config-ohne-Admin und committed Admin vor verlorener TOTP-Antwort sind wiederaufnehmbar.
 - [x] Pro-Share SecureFS-Capabilities verhindern Symlink-Wechsel in Sibling-Shares für Listing, Preview, Download, ZIP und Upload.
+- [x] Linux-only auf x86_64 und aarch64; Windows-Dateinamensinteroperabilität bleibt für Standard-SMB-Clients erhalten.
+- [x] Externer CIFS-Co-Writer-Modus mit geprüfter Mount-ID/-Quelle/-Optionen, pre-provisioniertem sibling staging, lokalem SQLite und crash-sicherem Pending-/Committed-Delete-Protokoll.
+- [x] Jede Production-Konfiguration verlangt eine exakte fail-closed Mount-Identität; ein ausgefallener CIFS-Mount darf auch dann nicht auf das lokale Fallback-Verzeichnis starten, wenn dort gerade ext4 sichtbar ist. Auditiertes lokales Production-Storage darf SQLite außerhalb des sichtbaren Baums auf demselben lokalen Mount halten.
+- [x] Browser-Setup und `init-admin` prüfen Root/Internal/Data-Mount und kanonische Pfade vor Konfiguration, Datenbank oder Credential-Secrets; Symlink-Aliase in den sichtbaren Baum werden abgewiesen.
+- [x] Upgrade-/Rollback-Backups und Recovery bestehen immer aus einem validierten Binary/Config/SQLite-Tripel; Candidate-Konfigurationen verändern die Live-Konfiguration nicht vor der Downtime.
 - [x] Gepufferte Form-/JSON-Bodies sind klein begrenzt; ausschließlich Uploadrouten erhalten den großen Streaming-Rahmen. Ein konstanter Streaming-Guard begrenzt Präambel und jeden Multipart-Headerblock, zusätzlich sind Feldanzahl und Metadaten klein begrenzt.
 - [x] Reverse-Proxy-Modus, Standalone-TLS-Modus, SIGHUP-Zertifikatsreload für PEM-Dateien.
 - [x] Optionaler Built-in-Let's-Encrypt-Standalone-TLS-Modus über `tls-alpn-01` und `rustls-acme`.
@@ -42,10 +47,9 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Public Upload-Fehlerseiten für validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Größenlimits, fehlende Dateinamen und Speicherfehler.
 - [x] Fuzzing für Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, Upload-Validierung und API-Request-Policy.
 
-## Bewusste Nicht-Ziele für 0.4.0
+## Bewusste Nicht-Ziele für 0.4.1
 
 - DEB-Paket.
-- ARM64-Build.
 - Öffentliches Repository.
 - API-Tokens oder externe API-Clients als stabile Public Contract Garantie.
 - Inline-Preview für alle anderen Dateitypen.
@@ -53,20 +57,20 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - Unbegrenzte ZIPs und Kompression; das durchgehend verwendete ZIP64-Format ändert nichts an den konfigurierten Datei-, Scan- und Größenlimits.
 - Admin-Löschen; Admins können deaktiviert/reaktiviert werden.
 
-## Lokal in dieser Arbeitskopie grün
+## Verbindliche native Linux-Gates
 
-- [x] `cargo check --locked`
+- [ ] `cargo check --locked` auf amd64 und arm64
 - [x] `cargo fmt --all -- --check`
-- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
-- [x] `cargo test --locked --all-targets`
-  - Ergebnis: 173 Library-Tests und 6 Binary-/CLI-Tests unter Windows bestanden.
+- [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` auf amd64 und arm64
+- [ ] `cargo test --locked --all-targets` auf amd64 und arm64
+  - Das verbindliche 0.4.1-Gate sind native Linux-Läufe für amd64 und arm64; frühere Windows-Läufe gelten nicht als Freigabenachweis.
   - Enthalten: Account-Passwort/MFA, Recovery-Races, DE/EN-Hauptrouten und Setup, API Login/MFA/Session/CSRF, Secret-Redaction, Setup-Recovery, UTF-8, SecureFS, Preview, Transfers, ZIP, Multipart, Body-Limits, Upload-Atomizität und Migrationen.
-- [x] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
+- [ ] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
   - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy` und `api_request_policy` kompiliert.
-- [x] `cargo build --release --locked`
+- [ ] `cargo build --release --locked` auf amd64 und arm64
 - [ ] `cargo audit --deny warnings` für beide Lockfiles auf dem finalen Stand wiederholen.
 - [ ] `make policy-check` beziehungsweise das Shell-Skript in einer Umgebung mit `sh` wiederholen.
-- [ ] `make docker-smoke` auf dem finalen 0.4.0-Stand wiederholen.
+- [ ] `make docker-smoke` auf dem finalen 0.4.1-Stand nativ auf amd64 und arm64 wiederholen.
 
 ## Historische Beobachtung vor dem 0.3.2-Upgrade
 
@@ -109,28 +113,53 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
 - [ ] Dabei `Cargo.lock` und `fuzz/Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.
-- [ ] Release-Dry-Run im digest-gepinnten Rust-1.97.0-/Debian-13-amd64-Container mit `--locked` grün.
+- [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `ubuntu-24.04-arm` grün; beide verwenden den gleichen digest-gepinnten Rust-1.97.0-/Debian-13-OCI-Index.
+- [ ] Offline erzeugten Minisign-Public-Key als `release/minisign.pub` committen und `MINISIGN_SECRET_KEY` sowie `MINISIGN_PASSWORD` als GitHub-Actions-Secrets provisionieren; ohne alle drei Werte muss der Tag-Publish absichtlich fehlschlagen.
+- [ ] Ein autorisierter Maintainer pusht den annotierten `v0.4.1`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, Main-Ancestry-Prüfung und der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
 - [ ] Artefakte prüfen:
-  - Binary,
+  - versionierte amd64- und arm64-Archive,
+  - eigenständige, architekturspezifische Binaries,
   - README,
   - LICENSE,
   - Beispielkonfigurationen,
   - systemd/deploy-Dateien,
-  - SHA-256-Prüfsummen,
-  - CycloneDX-SBOM,
+  - `SHA256SUMS-amd64` und `SHA256SUMS-arm64`,
+  - architekturspezifische CycloneDX-SBOMs,
   - deterministisches `tar.gz`,
   - Minisign-Signatur nur beim Tag-Release.
 
 ## Staging- und Public-Gates vor finalem Soak
 
-- [ ] Finalen Release-Candidate auf dem Staging-System bauen/deployen.
+- [ ] Finalen Release-Candidate auf je einem Debian-13-amd64- und Debian-13-arm64-Staging-System deployen.
 - [ ] SQLite-Backup vor Upgrade bei gestopptem Dienst erstellen.
 - [ ] Upgrade-Test durchführen.
+  - getrennte alte/neue Binary+Config-Paare vor Downtime validieren,
+  - 0.4.0→0.4.1 verweigert ein noch aktives `vaultlink.service` vor jeder Mutation,
+  - Backup enthält `vaultlink`, `config.toml` und `data.sqlite` mit restriktiven Ownern/Modi,
+  - Candidate-Failure restauriert das vollständige alte Tripel und prüft dessen eigenen Health-Endpunkt,
+  - paralleles Upgrade/Rollback scheitert vor dem Dienst-Stopp am Maintenance-Lock.
 - [ ] Rollback-Test durchführen:
   - Dienst stoppen,
-  - vorheriges Binary und SQLite-Backup wiederherstellen,
+  - vorheriges Binary, passende Konfiguration und SQLite-Backup wiederherstellen,
   - Dienst starten,
-  - Smoke-Test ausführen.
+  - exakten lokalen Health-/Versions-Smoke ausführen,
+  - fehlgeschlagener Recovery-Stop oder unvollständiger Emergency-Restore bleibt gestoppt.
+- [ ] Reales SMB-3.1.1-Co-Writer-Gate auf einem externen Server:
+  - 0.4.0-Root unter vollständiger Writer-Quiesce inventarisieren; `shared`-/`.vaultlink-internal`-Alias- und alte Fragment/Tombstone-Kollisionen auflösen,
+  - alle sichtbaren Einträge einschließlich Dotfiles serverseitig metadata-/ACL-/xattr-erhaltend in das neue leere `shared/` verschieben und gegen Snapshot/Hashes verifizieren,
+  - separates VaultLink-SMB-Konto sowie normale Windows-, macOS- und Linux-Co-Writer-Konten verwenden,
+  - SMB-Server/Share erzwingt SMB 3.1.1 Signing und Encryption; dies wird für die VaultLink-Mount-Session und jede direkte Windows-/macOS-/Linux-Session separat verifiziert,
+  - `shared/` ist für alle beabsichtigten Co-Writer les-/schreibbar,
+  - Co-Writer besitzen Modify nur innerhalb `shared/`, niemals administrative Rechte auf Share-Root/Mount-Basis,
+  - `.vaultlink-internal/{uploads,tombstones}` ist vorab vorhanden und für Co-Writer weder lesbar noch schreib-, lösch- oder umbenennbar; Parent-`DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` sowie chmod/chown/setfacl-Äquivalente sind verweigert,
+  - `/proc/self/mountinfo` zeigt `vers=3.1.1`, `seal`, `cache=strict`, `nosuid`, `nodev`, `noexec` und keine verbotenen Optionen,
+  - SQLite liegt auf einem separaten lokalen Dateisystem,
+  - paralleles SMB-Put und VaultLink-No-Replace erzeugen exakt einen Gewinner, niemals Mischinhalt oder Clobbering,
+  - bestehende Overwrite-Shares liefern im Co-Writer-Modus 409/400 und ersetzen keine externe Datei,
+  - Disconnect/Reconnect, Dienstneustart, Pending-Delete-Recovery und Mount-Race schlagen sicher beziehungsweise recoverable fehl,
+  - kompletter CIFS-Unmount bei vorhandenem lokalen Mountpoint wird in Production vor jedem Secret-/DB-Zugriff fail-closed abgewiesen,
+  - eine lokale ext4-/XFS-Production-Policy mit Root/Internal/Data auf demselben Mount wird außerhalb des sichtbaren Baums akzeptiert; group-/other-/ACL-schreibbare lokale Roots werden abgewiesen,
+  - direkte SMB-Änderungen erscheinen im SMB-Server-Audit; ihr Bypass von VaultLink-Audit und Linklimits ist abgenommen.
 - [ ] Debian-13-amd64 Lastprofil erneut:
   - 100 parallele Nutzer,
   - 40 Downloadstreams,
@@ -181,8 +210,10 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [ ] `make policy-check` grün; alle Dependabot-Pin-Updates gegen die jeweiligen Upstream-Repositories geprüft.
 - [ ] Staging- und Public-Gates grün.
 - [ ] 72h-Soak bestanden.
-- [ ] Annotierten Tag `v0.4.0` erstellen.
+- [ ] Annotierten Tag `v0.4.1` erstellen.
+- [ ] Tag-Commit ist nachweislich in `origin/main` enthalten; Release-Environment/Secrets sind für den Tag freigegeben.
+- [ ] Offline erzeugtes `release/minisign.pub` ist vor dem Tag committed und die beiden Minisign-Secrets sind provisioniert.
 - [ ] Tag-Release-Workflow prüfen:
   - GitHub Release ist privat,
   - Artefakte stammen ausschließlich aus CI,
-  - Binary und `SHA256SUMS` verifizieren mit Minisign gegen `release/minisign.pub`.
+  - beide Archive, Binaries sowie `SHA256SUMS-amd64` und `SHA256SUMS-arm64` mit den jeweils architekturspezifischen Minisign-Dateien gegen `release/minisign.pub` verifizieren.

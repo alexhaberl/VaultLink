@@ -1,36 +1,51 @@
 #!/bin/sh
 set -eu
+umask 077
 
 service=vaultlink.service
 install_dir=/opt/vaultlink
 live_binary="$install_dir/vaultlink"
 staged_binary="$install_dir/.vaultlink.new"
+restore_binary="$install_dir/.vaultlink.restore"
 data=/var/lib/vaultlink/data.sqlite
-backup_root=/var/lib/vaultlink/backups
+data_dir=/var/lib/vaultlink
+backup_root=/var/lib/vaultlink-backups
+staged_data=
 config_path=/etc/vaultlink/config.toml
+staged_config=/etc/vaultlink/.config.toml.new
+restore_config=/etc/vaultlink/.config.toml.restore
+maintenance_lock=/run/lock/vaultlink-maintenance.lock
 readiness_attempts=${VAULTLINK_READINESS_ATTEMPTS:-30}
 readiness_timeout_seconds=${VAULTLINK_READINESS_TIMEOUT_SECONDS:-60}
 readiness_interval_seconds=${VAULTLINK_READINESS_INTERVAL_SECONDS:-1}
 readiness_connect_timeout_seconds=${VAULTLINK_READINESS_CONNECT_TIMEOUT_SECONDS:-2}
 readiness_max_time_seconds=${VAULTLINK_READINESS_MAX_TIME_SECONDS:-3}
 
-if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
-    echo "usage (as root): vaultlink-upgrade.sh NEW_BINARY" >&2
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 2 ]; then
+    echo "usage (as root): vaultlink-upgrade.sh NEW_BINARY NEW_CONFIG" >&2
     exit 64
 fi
 
 new_binary=$1
+new_config=$2
 [ -x "$new_binary" ] || { echo "new binary is missing or not executable" >&2; exit 1; }
+[ -f "$new_config" ] || { echo "new configuration is missing" >&2; exit 1; }
 [ -x "$live_binary" ] || { echo "installed VaultLink binary is missing or not executable" >&2; exit 1; }
 [ -f "$data" ] || { echo "VaultLink database is missing" >&2; exit 1; }
 [ -f "$config_path" ] || { echo "VaultLink configuration is missing: $config_path" >&2; exit 1; }
 
-for required_command in systemctl sqlite3 install mv rm grep sed sleep date chown chmod curl runuser timeout; do
+for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock; do
     command -v "$required_command" >/dev/null || {
         echo "$required_command is required for a safe upgrade" >&2
         exit 1
     }
 done
+
+exec 9>"$maintenance_lock"
+if ! flock -n 9; then
+    echo "another VaultLink upgrade or rollback is already running" >&2
+    exit 1
+fi
 
 validate_bounded_integer() {
     name=$1
@@ -55,67 +70,66 @@ validate_bounded_integer VAULTLINK_READINESS_INTERVAL_SECONDS "$readiness_interv
 validate_bounded_integer VAULTLINK_READINESS_CONNECT_TIMEOUT_SECONDS "$readiness_connect_timeout_seconds" 1 30
 validate_bounded_integer VAULTLINK_READINESS_MAX_TIME_SECONDS "$readiness_max_time_seconds" 1 60
 
-stamp=$(date -u +%Y%m%dT%H%M%SZ)
-backup_dir="$backup_root/$stamp"
-backup_stage="$backup_root/.$stamp.incomplete.$$"
-[ ! -e "$backup_dir" ] || { echo "backup already exists: $backup_dir" >&2; exit 1; }
-
-was_active=0
-stop_attempted=0
-backup_valid=0
-candidate_activated=0
-
-if systemctl --quiet is-active "$service"; then
-    was_active=1
-fi
-
-restore_verified_backup() {
-    restore_failed=0
-
-    install -o root -g root -m 0755 "$backup_dir/vaultlink" "$live_binary" || restore_failed=1
-    rm -f "$data-wal" "$data-shm" || restore_failed=1
-    install -o vaultlink -g vaultlink -m 0600 "$backup_dir/data.sqlite" "$data" || restore_failed=1
-
-    return "$restore_failed"
+read_bounded_version() {
+    version_binary=$1
+    version_label=$2
+    if ! bounded_version=$(
+        timeout --kill-after=2 5 runuser -u vaultlink -- "$version_binary" --version
+    ); then
+        echo "$version_label does not provide a bounded --version response" >&2
+        return 1
+    fi
+    case "$bounded_version" in
+        ''|*[!0-9A-Za-z.+-]*)
+            echo "$version_label returned an invalid version" >&2
+            return 1
+            ;;
+    esac
+    if [ "${#bounded_version}" -gt 128 ]; then
+        echo "$version_label returned an invalid version" >&2
+        return 1
+    fi
+    printf '%s\n' "$bounded_version"
 }
 
-on_failure() {
-    status=$1
-    trap - 0
-    trap '' 1 2 15
-    set +e
-    restart_allowed=1
-
-    rm -f "$staged_binary"
-
-    if [ "$candidate_activated" -eq 1 ]; then
-        echo "upgrade failed; restoring verified backup $backup_dir" >&2
-        if ! systemctl stop "$service" >/dev/null 2>&1; then
-            echo "CRITICAL: $service could not be stopped; recover manually from $backup_dir" >&2
-            restart_allowed=0
-        elif [ "$backup_valid" -ne 1 ] || ! restore_verified_backup; then
-            echo "CRITICAL: automatic restore failed; recover manually from $backup_dir" >&2
-            restart_allowed=0
-        fi
-    elif [ "$stop_attempted" -eq 1 ]; then
-        echo "upgrade failed before activation; keeping the installed binary and database" >&2
+derive_readiness_target() {
+    target_binary=$1
+    target_config=$2
+    target_label=$3
+    if ! bounded_target=$(
+        timeout --kill-after=2 5 runuser -u vaultlink -- \
+            "$target_binary" readiness-target --config "$target_config"
+    ); then
+        echo "$target_label could not derive the local readiness target" >&2
+        return 1
     fi
-
-    if [ "$stop_attempted" -eq 1 ] && [ "$was_active" -eq 1 ] && [ "$restart_allowed" -eq 1 ]; then
-        if ! systemctl start "$service"; then
-            echo "CRITICAL: $service could not be restarted" >&2
-        elif ! wait_until_active; then
-            echo "CRITICAL: restored $service did not become active" >&2
-        elif ! wait_until_ready "" "restored service readiness"; then
-            echo "CRITICAL: restored $service failed its local readiness check" >&2
-        fi
+    if [ "$(printf '%s\n' "$bounded_target" | sed -n '$=')" -ne 3 ]; then
+        echo "$target_label returned an invalid local readiness target" >&2
+        return 1
     fi
-
-    if [ -n "$backup_stage" ] && [ -d "$backup_stage" ]; then
-        rm -rf "$backup_stage"
-    fi
-
-    exit "$status"
+    target_url=$(printf '%s\n' "$bounded_target" | sed -n '1p')
+    target_connect_to=$(printf '%s\n' "$bounded_target" | sed -n '2p')
+    target_insecure=$(printf '%s\n' "$bounded_target" | sed -n '3p')
+    [ "$target_connect_to" != "-" ] || target_connect_to=
+    case "$target_url" in
+        http://*)
+            if [ "$target_insecure" != 0 ] || [ -n "$target_connect_to" ]; then
+                echo "$target_label returned inconsistent local HTTP readiness settings" >&2
+                return 1
+            fi
+            ;;
+        https://*)
+            if [ "$target_insecure" != 1 ] || [ -z "$target_connect_to" ]; then
+                echo "$target_label returned inconsistent local HTTPS readiness settings" >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "$target_label returned an invalid local readiness URL" >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n%s\n%s\n' "$target_url" "${target_connect_to:--}" "$target_insecure"
 }
 
 wait_until_active() {
@@ -235,80 +249,164 @@ wait_until_ready() {
     return 1
 }
 
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+backup_dir="$backup_root/$stamp"
+backup_stage="$backup_root/.$stamp.incomplete.$$"
+[ ! -e "$backup_dir" ] || { echo "backup already exists: $backup_dir" >&2; exit 1; }
+
+was_active=0
+stop_attempted=0
+backup_valid=0
+candidate_activated=0
+old_readiness_url=
+old_readiness_connect_to=
+old_readiness_insecure=0
+old_health_body=
+readiness_url=
+readiness_connect_to=
+readiness_insecure=0
+
+if systemctl --quiet is-active "$service"; then
+    was_active=1
+fi
+
+restore_verified_backup() {
+    restore_failed=0
+    rm -f "$restore_binary" "$restore_config"
+    if [ -n "$staged_data" ]; then
+        rm -f "$staged_data"
+    fi
+    staged_data=$(mktemp "$data_dir/.data.sqlite.restore.XXXXXX") || return 1
+
+    install -o root -g root -m 0755 "$backup_dir/vaultlink" "$restore_binary" \
+        || restore_failed=1
+    install -o root -g vaultlink -m 0640 "$backup_dir/config.toml" "$restore_config" \
+        || restore_failed=1
+    install -o vaultlink -g vaultlink -m 0600 "$backup_dir/data.sqlite" "$staged_data" \
+        || restore_failed=1
+    if [ "$restore_failed" -eq 0 ]; then
+        sqlite3 "$staged_data" "PRAGMA integrity_check" | grep -qx ok \
+            || restore_failed=1
+    fi
+    if [ "$restore_failed" -ne 0 ]; then
+        rm -f "$restore_binary" "$restore_config" "$staged_data"
+        staged_data=
+        return 1
+    fi
+
+    mv -f "$restore_binary" "$live_binary" || restore_failed=1
+    mv -f "$restore_config" "$config_path" || restore_failed=1
+    rm -f "$data-wal" "$data-shm" || restore_failed=1
+    mv -f "$staged_data" "$data" || restore_failed=1
+    rm -f "$restore_binary" "$restore_config" "$staged_data"
+    staged_data=
+    [ "$restore_failed" -eq 0 ]
+}
+
+on_failure() {
+    status=$1
+    trap - 0
+    trap '' 1 2 15
+    set +e
+    restart_allowed=1
+
+    rm -f "$staged_binary" "$staged_config" "$restore_binary" "$restore_config"
+    if [ -n "$staged_data" ]; then
+        rm -f "$staged_data"
+        staged_data=
+    fi
+
+    if [ "$candidate_activated" -eq 1 ]; then
+        echo "upgrade failed; restoring verified backup $backup_dir" >&2
+        if ! systemctl stop "$service" >/dev/null 2>&1; then
+            echo "CRITICAL: $service could not be stopped; recover manually from $backup_dir" >&2
+            restart_allowed=0
+        elif [ "$backup_valid" -ne 1 ] || ! restore_verified_backup; then
+            echo "CRITICAL: automatic restore failed; recover manually from $backup_dir" >&2
+            restart_allowed=0
+        fi
+    elif [ "$stop_attempted" -eq 1 ]; then
+        echo "upgrade failed before activation; keeping the installed binary, configuration, and database" >&2
+    fi
+
+    if [ "$stop_attempted" -eq 1 ] && [ "$was_active" -eq 1 ] && [ "$restart_allowed" -eq 1 ]; then
+        readiness_url=$old_readiness_url
+        readiness_connect_to=$old_readiness_connect_to
+        readiness_insecure=$old_readiness_insecure
+        if ! systemctl start "$service"; then
+            echo "CRITICAL: $service could not be restarted" >&2
+        elif ! wait_until_active; then
+            echo "CRITICAL: restored $service did not become active" >&2
+        elif ! wait_until_ready "$old_health_body" "restored service readiness"; then
+            echo "CRITICAL: restored $service failed its local readiness check" >&2
+        elif ! sqlite3 "$data" ".timeout 10000" "PRAGMA integrity_check" | grep -qx ok; then
+            echo "CRITICAL: restored VaultLink database failed integrity verification" >&2
+        fi
+    fi
+
+    if [ -n "$backup_stage" ] && [ -d "$backup_stage" ]; then
+        rm -rf "$backup_stage"
+    fi
+
+    exit "$status"
+}
+
 trap 'on_failure $?' 0
 trap 'exit 129' 1
 trap 'exit 130' 2
 trap 'exit 143' 15
 
-# Stage all files that can be prepared safely before downtime.
-install -d -o root -g vaultlink -m 0750 "$backup_root"
-install -d -o root -g vaultlink -m 0750 "$backup_stage"
-install -o root -g root -m 0755 "$live_binary" "$backup_stage/vaultlink"
+# Stage immutable copies on their destination filesystems while the live service
+# and its configuration remain untouched.
+install -d -o root -g root -m 0700 "$backup_root"
+install -d -o root -g root -m 0700 "$backup_stage"
+install -o root -g root -m 0700 "$live_binary" "$backup_stage/vaultlink"
+install -o root -g root -m 0600 "$config_path" "$backup_stage/config.toml"
 install -o root -g root -m 0755 "$new_binary" "$staged_binary"
+install -o root -g vaultlink -m 0640 "$new_config" "$staged_config"
 
-# Inspect the immutable, root-owned staged copy with the same account as the service.
-if ! candidate_version=$(
-    timeout --kill-after=2 5 runuser -u vaultlink -- "$staged_binary" --version
-); then
-    echo "candidate does not provide a bounded --version response" >&2
-    exit 1
-fi
-case "$candidate_version" in
-    ''|*[!0-9A-Za-z.+-]*)
-        echo "candidate returned an invalid version" >&2
-        exit 1
-        ;;
-esac
+# Validate both exact binary/configuration pairs as the service account before
+# entering downtime.
+old_version=$(read_bounded_version "$live_binary" "installed binary")
+old_readiness_target=$(derive_readiness_target \
+    "$live_binary" "$config_path" "installed binary/configuration")
+old_readiness_url=$(printf '%s\n' "$old_readiness_target" | sed -n '1p')
+old_readiness_connect_to=$(printf '%s\n' "$old_readiness_target" | sed -n '2p')
+[ "$old_readiness_connect_to" != "-" ] || old_readiness_connect_to=
+old_readiness_insecure=$(printf '%s\n' "$old_readiness_target" | sed -n '3p')
+old_health_body='{"ok":true,"version":"'"$old_version"'"}'
 
-if ! readiness_target=$(
-    timeout --kill-after=2 5 runuser -u vaultlink -- \
-        "$staged_binary" readiness-target --config "$config_path"
-); then
-    echo "candidate could not derive the local readiness target" >&2
-    exit 1
-fi
-if [ "$(printf '%s\n' "$readiness_target" | sed -n '$=')" -ne 3 ]; then
-    echo "candidate returned an invalid local readiness target" >&2
-    exit 1
-fi
-readiness_url=$(printf '%s\n' "$readiness_target" | sed -n '1p')
-readiness_connect_to=$(printf '%s\n' "$readiness_target" | sed -n '2p')
-readiness_insecure=$(printf '%s\n' "$readiness_target" | sed -n '3p')
+candidate_version=$(read_bounded_version "$staged_binary" "candidate")
+candidate_readiness_target=$(derive_readiness_target \
+    "$staged_binary" "$staged_config" "candidate binary/configuration")
+readiness_url=$(printf '%s\n' "$candidate_readiness_target" | sed -n '1p')
+readiness_connect_to=$(printf '%s\n' "$candidate_readiness_target" | sed -n '2p')
 [ "$readiness_connect_to" != "-" ] || readiness_connect_to=
-case "$readiness_url" in
-    http://*)
-        if [ "$readiness_insecure" != 0 ] || [ -n "$readiness_connect_to" ]; then
-            echo "candidate returned inconsistent local HTTP readiness settings" >&2
-            exit 1
-        fi
-        ;;
-    https://*)
-        if [ "$readiness_insecure" != 1 ] || [ -z "$readiness_connect_to" ]; then
-            echo "candidate returned inconsistent local HTTPS readiness settings" >&2
-            exit 1
-        fi
-        ;;
-    *)
-        echo "candidate returned an invalid local readiness URL" >&2
-        exit 1
-        ;;
-esac
+readiness_insecure=$(printf '%s\n' "$candidate_readiness_target" | sed -n '3p')
 candidate_health_body='{"ok":true,"version":"'"$candidate_version"'"}'
+
+if [ "$old_version" = 0.4.0 ] && [ "$candidate_version" = 0.4.1 ] \
+    && [ "$was_active" -eq 1 ]; then
+    echo "the 0.4.0 to 0.4.1 storage migration requires vaultlink.service to be stopped before upgrade" >&2
+    exit 1
+fi
 
 stop_attempted=1
 systemctl stop "$service"
 
 sqlite3 "$data" ".timeout 10000" ".backup '$backup_stage/data.sqlite'"
-chown root:vaultlink "$backup_stage/data.sqlite"
-chmod 0640 "$backup_stage/data.sqlite"
+chown root:root "$backup_stage/data.sqlite"
+chmod 0600 "$backup_stage/data.sqlite"
 sqlite3 "$backup_stage/data.sqlite" "PRAGMA integrity_check" | grep -qx ok
 mv "$backup_stage" "$backup_dir"
 backup_stage=
 backup_valid=1
 
-# Set the state before mv so even interruption at the activation boundary restores safely.
+# Each rename is atomic on its destination filesystem. The handled-failure trap
+# restores the complete verified triple if any later step fails.
 candidate_activated=1
 mv -f "$staged_binary" "$live_binary"
+mv -f "$staged_config" "$config_path"
 
 systemctl start "$service"
 wait_until_active

@@ -33,6 +33,11 @@ mod tests {
             storage: Storage {
                 root_mount_path: PathBuf::from("."),
                 data_directory: PathBuf::from("."),
+                internal_directory: None,
+                require_mount: false,
+                external_writers: false,
+                expected_filesystem_type: None,
+                expected_mount_source: None,
                 max_upload_size: 1,
                 max_zip_size: 1024,
                 max_zip_files: 10,

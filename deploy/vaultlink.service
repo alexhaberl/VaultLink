@@ -1,6 +1,6 @@
 [Unit]
 Description=VaultLink secure file sharing
-After=network-online.target local-fs.target
+After=network-online.target local-fs.target remote-fs.target
 Wants=network-online.target
 
 [Service]
@@ -32,7 +32,7 @@ RestrictNamespaces=true
 RemoveIPC=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-SystemCallFilter=@system-service openat2 renameat2
+SystemCallFilter=@system-service openat2 renameat2 statx
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

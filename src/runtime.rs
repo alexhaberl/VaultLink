@@ -337,6 +337,11 @@ mod tests {
             storage: Storage {
                 root_mount_path: ".".into(),
                 data_directory: ".".into(),
+                internal_directory: None,
+                require_mount: false,
+                external_writers: false,
+                expected_filesystem_type: None,
+                expected_mount_source: None,
                 max_upload_size: 10,
                 max_zip_size: 20,
                 max_zip_files: 30,
