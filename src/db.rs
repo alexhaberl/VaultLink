@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 pub const TRANSFER_SESSION_TTL_SECONDS: i64 = 15 * 60;
 pub const ADMIN_MFA_ENROLLMENT_TTL_SECONDS: i64 = 10 * 60;
@@ -36,6 +36,16 @@ pub struct Session {
     pub username: String,
     pub csrf_token: String,
     pub mfa_verified: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminWebauthnCredential {
+    pub id: i64,
+    pub label: String,
+    pub credential_id: String,
+    pub credential_json: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,6 +460,24 @@ CREATE INDEX IF NOT EXISTS idx_admin_mfa_enrollments_exp
         )?;
         tx.pragma_update(None, "user_version", 9)?;
     }
+    if version < 10 {
+        tx.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS admin_webauthn_credentials(
+    id INTEGER PRIMARY KEY,
+    admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+    label TEXT NOT NULL CHECK(length(label) BETWEEN 1 AND 80),
+    credential_id TEXT NOT NULL UNIQUE,
+    credential_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_admin_webauthn_credentials_admin
+    ON admin_webauthn_credentials(admin_id);
+"#,
+        )?;
+        tx.pragma_update(None, "user_version", 10)?;
+    }
     tx.commit()
 }
 
@@ -771,6 +799,12 @@ impl Database {
              WHERE id=?1",
             params![admin_id, password_hash, totp_secret],
         )?;
+        if totp_secret.is_some() {
+            transaction.execute(
+                "DELETE FROM admin_webauthn_credentials WHERE admin_id=?1",
+                [admin_id],
+            )?;
+        }
         revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = admin_id.to_string();
         let detail = format!(
@@ -1030,10 +1064,139 @@ impl Database {
                 "UPDATE admins SET totp_secret=?2 WHERE id=?1",
                 params![id, totp_secret],
             )?;
+            transaction.execute(
+                "DELETE FROM admin_webauthn_credentials WHERE admin_id=?1",
+                [id],
+            )?;
             revoke_admin_auth_state(&transaction, id)?;
         }
         transaction.commit()?;
         Ok(username)
+    }
+    pub fn admin_webauthn_credentials(
+        &self,
+        admin_id: i64,
+    ) -> rusqlite::Result<Vec<AdminWebauthnCredential>> {
+        let connection = self.conn();
+        let mut statement = connection.prepare(
+            "SELECT id,label,credential_id,credential_json,created_at,last_used_at
+             FROM admin_webauthn_credentials WHERE admin_id=?1 ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([admin_id], |row| {
+                Ok(AdminWebauthnCredential {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    credential_id: row.get(2)?,
+                    credential_json: row.get(3)?,
+                    created_at: row.get(4)?,
+                    last_used_at: row.get(5)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    pub fn add_admin_webauthn_credential(
+        &self,
+        admin_id: i64,
+        label: &str,
+        credential_id: &str,
+        credential_json: &str,
+    ) -> rusqlite::Result<i64> {
+        let connection = self.conn();
+        connection.execute(
+            "INSERT INTO admin_webauthn_credentials(
+                 admin_id,label,credential_id,credential_json,created_at
+             ) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                admin_id,
+                label,
+                credential_id,
+                credential_json,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn update_admin_webauthn_credential(
+        &self,
+        id: i64,
+        admin_id: i64,
+        credential_json: &str,
+    ) -> rusqlite::Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE admin_webauthn_credentials
+             SET credential_json=?3,last_used_at=?4
+             WHERE id=?1 AND admin_id=?2",
+            params![id, admin_id, credential_json, Utc::now().to_rfc3339()],
+        )? == 1)
+    }
+
+    pub fn complete_webauthn_mfa(
+        &self,
+        session_token: &str,
+        credential_id: i64,
+        admin_id: i64,
+        expected_credential_json: &str,
+        updated_credential_json: &str,
+    ) -> rusqlite::Result<bool> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let credential_updated = transaction.execute(
+            "UPDATE admin_webauthn_credentials
+             SET credential_json=?5,last_used_at=?6
+             WHERE id=?1 AND admin_id=?2 AND credential_json=?3
+               AND EXISTS(
+                   SELECT 1 FROM sessions
+                   WHERE token_hash=?4 AND admin_id=?2 AND mfa_verified=0 AND expires_at>?6
+               )",
+            params![
+                credential_id,
+                admin_id,
+                expected_credential_json,
+                token_hash(session_token),
+                updated_credential_json,
+                Utc::now().to_rfc3339()
+            ],
+        )? == 1;
+        if !credential_updated {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        let session_updated = transaction.execute(
+            "UPDATE sessions SET mfa_verified=1
+             WHERE token_hash=?1 AND admin_id=?2 AND mfa_verified=0 AND expires_at>?3",
+            params![token_hash(session_token), admin_id, Utc::now().to_rfc3339()],
+        )? == 1;
+        if !session_updated {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn webauthn_credential_count(&self) -> rusqlite::Result<u64> {
+        self.conn().query_row(
+            "SELECT COUNT(*) FROM admin_webauthn_credentials",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn delete_admin_webauthn_credential(
+        &self,
+        id: i64,
+        admin_id: i64,
+    ) -> rusqlite::Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM admin_webauthn_credentials
+             WHERE id=?1 AND admin_id=?2
+               AND (SELECT COUNT(*) FROM admin_webauthn_credentials WHERE admin_id=?2) <> 2",
+            params![id, admin_id],
+        )? == 1)
     }
     pub fn create_session(
         &self,
@@ -3258,5 +3421,67 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             TransferLeaseHeartbeatOutcome::NotFound
         );
         assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn webauthn_credentials_are_scoped_unique_and_mutable() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        database.create_admin("other", "hash", "secret").unwrap();
+
+        let id = database
+            .add_admin_webauthn_credential(1, "Primary YubiKey", "credential-a", "{\"v\":1}")
+            .unwrap();
+        let rows = database.admin_webauthn_credentials(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].label, "Primary YubiKey");
+        assert!(rows[0].last_used_at.is_none());
+        assert!(database.admin_webauthn_credentials(2).unwrap().is_empty());
+        assert!(database
+            .add_admin_webauthn_credential(1, "", "credential-empty-label", "{}")
+            .is_err());
+        assert!(database
+            .add_admin_webauthn_credential(1, &"x".repeat(81), "credential-long-label", "{}")
+            .is_err());
+
+        assert!(database
+            .add_admin_webauthn_credential(2, "Duplicate", "credential-a", "{}")
+            .is_err());
+        assert!(!database
+            .update_admin_webauthn_credential(id, 2, "{\"v\":2}")
+            .unwrap());
+        assert!(database
+            .update_admin_webauthn_credential(id, 1, "{\"v\":2}")
+            .unwrap());
+        let rows = database.admin_webauthn_credentials(1).unwrap();
+        assert_eq!(rows[0].credential_json, "{\"v\":2}");
+        assert!(rows[0].last_used_at.is_some());
+
+        assert!(!database.delete_admin_webauthn_credential(id, 2).unwrap());
+        assert!(database.delete_admin_webauthn_credential(id, 1).unwrap());
+        assert!(database.admin_webauthn_credentials(1).unwrap().is_empty());
+
+        let first = database
+            .add_admin_webauthn_credential(1, "Primary", "credential-c", "{}")
+            .unwrap();
+        database
+            .add_admin_webauthn_credential(1, "Backup", "credential-d", "{}")
+            .unwrap();
+        assert!(!database.delete_admin_webauthn_credential(first, 1).unwrap());
+        database
+            .add_admin_webauthn_credential(1, "Replacement", "credential-e", "{}")
+            .unwrap();
+        assert!(database.delete_admin_webauthn_credential(first, 1).unwrap());
+        assert_eq!(database.admin_webauthn_credentials(1).unwrap().len(), 2);
+
+        database
+            .add_admin_webauthn_credential(2, "Backup", "credential-b", "{}")
+            .unwrap();
+        database
+            .conn()
+            .execute("DELETE FROM admins WHERE id=2", [])
+            .unwrap();
+        assert!(database.admin_webauthn_credentials(2).unwrap().is_empty());
     }
 }

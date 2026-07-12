@@ -165,6 +165,12 @@ catalog! {
     ACCOUNT_MFA_CHANGED, "account.mfa_changed", "MFA wurde geändert.", "MFA changed.";
     ACCOUNT_CHANGE_FAILED, "account.change_failed", "Kontoänderung fehlgeschlagen.", "Account change failed.";
 
+    SECURITY_KEYS, "account.security_keys", "Sicherheitsschlüssel (YubiKey/FIDO2)", "Security keys (YubiKey/FIDO2)";
+    SECURITY_KEYS_HELP, "account.security_keys_help", "Schlüssel werden an diese Domain gebunden. WebAuthn wird erst mit mindestens zwei registrierten Schlüsseln aktiviert; TOTP bleibt als Wiederherstellung verfügbar.", "Keys are bound to this domain. WebAuthn is enabled only after at least two keys are registered; TOTP remains available for recovery.";
+    SECURITY_KEYS_EMPTY, "account.security_keys_empty", "Noch kein Sicherheitsschlüssel registriert.", "No security key registered yet.";
+    SECURITY_KEY_LABEL, "account.security_key_label", "Schlüsselname", "Key name";
+    SECURITY_KEY_ADD, "account.security_key_add", "Sicherheitsschlüssel hinzufügen", "Add security key";
+
     LOGIN_TITLE, "auth.login_title", "Login", "Sign in";
     ADMIN_LOGIN, "auth.admin_login", "Admin Login", "Admin sign in";
     USERNAME, "auth.username", "Benutzername", "Username";
@@ -173,6 +179,9 @@ catalog! {
     SECOND_FACTOR, "auth.second_factor", "Zweiter Faktor", "Second factor";
     SIX_DIGIT_TOTP, "auth.six_digit_totp", "6-stelliger TOTP-Code", "6-digit TOTP code";
     VERIFY, "auth.verify", "Verifizieren", "Verify";
+    SECURITY_KEY_USE, "auth.security_key_use", "Mit Sicherheitsschlüssel bestätigen", "Verify with security key";
+    SECURITY_KEY_WAIT, "auth.security_key_wait", "Sicherheitsschlüssel berühren und gegebenenfalls PIN eingeben …", "Touch the security key and enter its PIN if requested…";
+    SECURITY_KEY_FAILED, "auth.security_key_failed", "Sicherheitsschlüssel-Vorgang fehlgeschlagen oder abgebrochen.", "Security key operation failed or was cancelled.";
     PROTECTED_SHARE_TITLE, "public.protected_title", "Geschützte Freigabe", "Protected share";
     ENTER_SHARE_PASSWORD, "public.enter_share_password", "Gib das Freigabepasswort ein, um fortzufahren.", "Enter the share password to continue.";
     UNLOCK, "public.unlock", "Entsperren", "Unlock";
