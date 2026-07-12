@@ -20,7 +20,7 @@ percent-encoding = "2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.8"
 rpassword = "7"
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 rustix = { version = "1", features = ["fs", "process"] }
 rustls-acme = { version = "0.15.3", features = ["axum"] }
 serde = { version = "1", features = ["derive"] }
