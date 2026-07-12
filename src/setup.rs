@@ -10,9 +10,9 @@ use std::{
 
 use axum::{
     extract::{Form, Query, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Json, Router,
 };
@@ -26,6 +26,7 @@ use crate::{
         Tls,
     },
     db::{Database, InitialAdminOutcome},
+    i18n::{self, Locale},
     runtime, ui,
 };
 
@@ -48,6 +49,12 @@ struct TokenQuery {
 #[derive(Deserialize)]
 struct CompleteSetupForm {
     token: String,
+}
+
+#[derive(Deserialize)]
+struct SetupLocaleForm {
+    locale: String,
+    return_to: String,
 }
 
 #[derive(Deserialize)]
@@ -92,9 +99,7 @@ pub async fn run(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     validate_setup_listen(listen)?;
     let token = auth::random_token(32);
-    println!("VaultLink setup URL:");
-    println!("http://{listen}/?token={token}");
-    println!("The setup token is printed once and is required by the browser form.");
+    println!("{}", setup_access_instructions(listen, &token));
     let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
     let start_requested = Arc::new(AtomicBool::new(false));
     let state = SetupState {
@@ -120,12 +125,14 @@ pub async fn run(
 fn setup_router(state: SetupState) -> Router {
     Router::new()
         .route("/", get(setup_page).post(submit_setup))
+        .route("/locale", axum::routing::post(set_setup_locale))
         .route("/complete", axum::routing::post(complete_setup))
         .route("/start", axum::routing::post(start_server))
         .route("/browse", get(setup_browse))
         .route("/assets/vaultlink.css", get(stylesheet_asset))
         .route("/assets/setup.js", get(setup_javascript_asset))
         .layer(middleware::from_fn(setup_security_headers))
+        .layer(middleware::from_fn(setup_locale_context))
         .with_state(state)
 }
 
@@ -141,13 +148,42 @@ async fn stylesheet_asset() -> impl IntoResponse {
 }
 
 async fn setup_javascript_asset() -> impl IntoResponse {
+    let script = i18n::render_markers(i18n::current_locale(), SETUP_JAVASCRIPT);
     (
         [(
             header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
         )],
-        SETUP_JAVASCRIPT,
+        script,
     )
+}
+
+async fn setup_locale_context(request: Request, next: Next) -> Response {
+    let locale = Locale::resolve(request.headers());
+    let return_to = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/")
+        .to_string();
+    i18n::scope(locale, return_to, async move {
+        let mut response = next.run(request).await;
+        let is_localized_content = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.starts_with("text/html") || value.starts_with("application/javascript")
+            });
+        if is_localized_content {
+            response.headers_mut().insert(
+                header::CONTENT_LANGUAGE,
+                HeaderValue::from_static(locale.code()),
+            );
+        }
+        response
+    })
+    .await
 }
 
 async fn setup_security_headers(request: Request, next: Next) -> Response {
@@ -179,30 +215,130 @@ async fn setup_security_headers(request: Request, next: Next) -> Response {
     response
 }
 
+fn safe_setup_return_to(value: &str) -> String {
+    if !value.starts_with('/') || value.starts_with("//") || value.contains('\\') {
+        return "/".to_string();
+    }
+    let Ok(uri) = value.parse::<Uri>() else {
+        return "/".to_string();
+    };
+    if uri.scheme().is_some() || uri.authority().is_some() || uri.path() != "/" {
+        return "/".to_string();
+    }
+    uri.path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string())
+}
+
+async fn set_setup_locale(Form(form): Form<SetupLocaleForm>) -> Response {
+    let Some(locale) = Locale::parse(&form.locale) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(page(
+                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="error.invalid_language"/></p></section>"#,
+                None,
+            )),
+        )
+            .into_response();
+    };
+    let return_to = safe_setup_return_to(&form.return_to);
+    let cookie = format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000",
+        i18n::LOCALE_COOKIE,
+        locale.code()
+    );
+    let mut response = Redirect::to(&return_to).into_response();
+    match HeaderValue::from_str(&cookie) {
+        Ok(cookie) => {
+            response.headers_mut().insert(header::SET_COOKIE, cookie);
+            response
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn setup_return_to(token: Option<&str>) -> String {
+    if let Some(token) = token {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("token", token)
+            .finish();
+        return format!("/?{query}");
+    }
+    safe_setup_return_to(&i18n::current_return_to())
+}
+
+fn setup_locale_switcher(token: Option<&str>) -> String {
+    let locale = i18n::current_locale();
+    let return_to = setup_return_to(token);
+    format!(
+        r#"<form class="vl-locale-switch" method="post" action="/locale" aria-label="{}"><input type="hidden" name="return_to" value="{}"><button class="vl-locale-switch__option" name="locale" value="de" type="submit"{}>DE</button><span aria-hidden="true">/</span><button class="vl-locale-switch__option" name="locale" value="en" type="submit"{}>EN</button></form>"#,
+        esc(i18n::text(locale, i18n::LANGUAGE)),
+        esc(&return_to),
+        if locale == Locale::De {
+            r#" aria-current="true""#
+        } else {
+            ""
+        },
+        if locale == Locale::En {
+            r#" aria-current="true""#
+        } else {
+            ""
+        },
+    )
+}
+
 fn validate_setup_listen(listen: SocketAddr) -> Result<(), &'static str> {
-    if listen.ip().is_loopback() {
+    if listen.port() == 0 {
+        Err("setup port must not be 0")
+    } else if listen.ip().is_loopback() {
         Ok(())
     } else {
         Err("setup bind address must be loopback-only")
     }
 }
 
+fn setup_access_instructions(listen: SocketAddr, token: &str) -> String {
+    let port = listen.port();
+    let tunnel_target = match listen.ip() {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    format!(
+        "VaultLink-Setup lauscht ausschlie\u{00df}lich auf Loopback ({listen}). / VaultLink setup listens only on loopback.\n\
+         Headless-Server / headless server: Auf dem eigenen Rechner in einem zweiten Terminal ausf\u{00fc}hren; replace BENUTZER and SERVER:\n\
+         ssh -4 -N -L 127.0.0.1:{port}:{tunnel_target}:{port} BENUTZER@SERVER\n\
+         Danach diese lokale URL im Browser \u{00f6}ffnen / then open this local browser URL:\n\
+         http://127.0.0.1:{port}/?token={token}\n\
+         Das Setup-Token wird nur einmal ausgegeben und ist f\u{00fc}r das Browserformular erforderlich. / The setup token is printed once and is required by the browser form."
+    )
+}
+
 async fn setup_page(State(state): State<SetupState>, Query(query): Query<TokenQuery>) -> Response {
     if query.token.as_deref() != Some(state.token.as_str()) {
         return (
             StatusCode::UNAUTHORIZED,
-            Html(page("Setup-Token fehlt oder ist ungültig.")),
+            Html(page(
+                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                query.token.as_deref(),
+            )),
         )
             .into_response();
     }
-    Html(page(&setup_form(&state.token, None))).into_response()
+    Html(page(
+        &setup_form(&state.token, None),
+        Some(state.token.as_str()),
+    ))
+    .into_response()
 }
 
 async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupForm>) -> Response {
     if form.token != *state.token {
         return (
             StatusCode::UNAUTHORIZED,
-            Html(page("Setup-Token fehlt oder ist ungültig.")),
+            Html(page(
+                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                Some(&form.token),
+            )),
         )
             .into_response();
     }
@@ -210,34 +346,46 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
     if *completed {
         return (
             StatusCode::CONFLICT,
-            Html(page("Setup wurde bereits abgeschlossen.")),
+            Html(page(
+                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.already_completed"/></p></section>"#,
+                Some(state.token.as_str()),
+            )),
         )
             .into_response();
     }
     match build_and_store(&state.config_path, form).await {
         Ok(result) => match qr_svg(&result.otpauth) {
             Ok(qr) => {
-                Html(page(&format!(
-                    r#"<section><h1>Setup abgeschlossen</h1><p>Config wurde geschrieben und der erste Admin wurde angelegt.</p><p>Das TOTP-Secret bleibt bis zur ausdrücklichen Bestätigung über diesen lokalen Setup-Flow wiederherstellbar. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button>Secret sicher gespeichert</button></form></section>"#,
+                Html(page_without_locale_switcher(
+                    &format!(
+                    r#"<section><h1><vl-i18n key="setup.completed"/></h1><p><vl-i18n key="setup.config_admin_created"/></p><p><vl-i18n key="setup.totp_recovery_help"/></p><div class="qr-card" aria-label="<vl-i18n key="setup.totp_qr_code"/>">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button><vl-i18n key="setup.secret_saved"/></button></form></section>"#,
                     qr,
                     esc(&result.totp_secret),
                     esc(&result.otpauth),
                     esc(&state.token)
-                )))
+                ),
+                ))
                 .into_response()
             }
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html(page(&format!(
-                    "<section><h1>Fehler</h1><p>{}</p></section>",
-                    esc(&error)
-                ))),
+                Html(page(
+                    &format!(
+                        r#"<section><h1><vl-i18n key="common.error"/></h1><p>{}</p></section>"#,
+                        esc(&error)
+                    ),
+                    Some(state.token.as_str()),
+                )),
             )
                 .into_response(),
         },
         Err(error) => {
             let body = setup_form(&state.token, Some(&error));
-            (StatusCode::BAD_REQUEST, Html(page(&body))).into_response()
+            (
+                StatusCode::BAD_REQUEST,
+                Html(page(&body, Some(state.token.as_str()))),
+            )
+                .into_response()
         }
     }
 }
@@ -249,25 +397,31 @@ async fn complete_setup(
     if form.token != *state.token {
         return (
             StatusCode::UNAUTHORIZED,
-            Html(page("Setup-Token fehlt oder ist ungültig.")),
+            Html(page(
+                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                Some(&form.token),
+            )),
         )
             .into_response();
     }
     let mut completed = state.commit.lock().await;
     if *completed {
         return match Config::load(state.config_path.as_ref()) {
-            Ok(config) => Html(page(&setup_confirmed_body(
+            Ok(config) => Html(page_without_locale_switcher(&setup_confirmed_body(
                 &config,
                 state.token.as_ref(),
-                "Die TOTP-Wiederherstellung ist bereits geschlossen.",
+                i18n::text(i18n::current_locale(), i18n::SETUP_TOTP_ALREADY_CLOSED),
             )))
             .into_response(),
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html(page(&format!(
-                    "Konfiguration kann nicht geladen werden: {}",
-                    esc(&error.to_string())
-                ))),
+                Html(page(
+                    &format!(
+                        r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
+                        esc(&error.to_string())
+                    ),
+                    Some(state.token.as_str()),
+                )),
             )
                 .into_response(),
         };
@@ -277,10 +431,13 @@ async fn complete_setup(
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html(page(&format!(
-                    "Konfiguration kann nicht geladen werden: {}",
-                    esc(&error.to_string())
-                ))),
+                Html(page(
+                    &format!(
+                        r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
+                        esc(&error.to_string())
+                    ),
+                    Some(state.token.as_str()),
+                )),
             )
                 .into_response()
         }
@@ -288,19 +445,22 @@ async fn complete_setup(
     match clear_initial_setup_pending(&config.storage.data_directory) {
         Ok(()) => {
             *completed = true;
-            Html(page(&setup_confirmed_body(
+            Html(page_without_locale_switcher(&setup_confirmed_body(
                 &config,
                 state.token.as_ref(),
-                "Die TOTP-Wiederherstellung wurde geschlossen.",
+                i18n::text(i18n::current_locale(), i18n::SETUP_TOTP_CLOSED),
             )))
             .into_response()
         }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Html(page(&format!(
-                "Setup-Bestätigung fehlgeschlagen: {}",
-                esc(&error)
-            ))),
+            Html(page(
+                &format!(
+                    r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.confirmation_failed"/> {}</p></section>"#,
+                    esc(&error)
+                ),
+                Some(state.token.as_str()),
+            )),
         )
             .into_response(),
     }
@@ -313,7 +473,7 @@ fn setup_confirmed_body(config: &Config, token: &str, message: &str) -> String {
         ServerMode::StandaloneTls => "Standalone TLS",
     };
     format!(
-        r#"<section><h1>Setup bestätigt</h1><p>{}</p><p>VaultLink ist für den Modus <strong>{mode}</strong> konfiguriert.</p><form method="post" action="/start"><input type="hidden" name="token" value="{}"><button>VaultLink jetzt starten</button></form><p class="muted">Für den dauerhaften Produktivbetrieb sollte VaultLink anschließend weiterhin über den konfigurierten Systemdienst gestartet werden.</p></section>"#,
+        r#"<section><h1><vl-i18n key="setup.confirmed"/></h1><p>{}</p><p><vl-i18n key="setup.configured_for_mode"/> <strong>{mode}</strong>.</p><form method="post" action="/start"><input type="hidden" name="token" value="{}"><button><vl-i18n key="setup.start_now"/></button></form><p class="muted"><vl-i18n key="setup.service_start_help"/></p></section>"#,
         esc(message),
         esc(token),
     )
@@ -326,14 +486,20 @@ async fn start_server(
     if form.token != *state.token {
         return (
             StatusCode::UNAUTHORIZED,
-            Html(page("Setup-Token fehlt oder ist ungültig.")),
+            Html(page(
+                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                Some(&form.token),
+            )),
         )
             .into_response();
     }
     if !*state.commit.lock().await {
         return (
             StatusCode::CONFLICT,
-            Html(page("Das TOTP-Secret muss zuerst bestätigt werden.")),
+            Html(page(
+                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.totp_confirm_first"/></p></section>"#,
+                Some(state.token.as_str()),
+            )),
         )
             .into_response();
     }
@@ -342,10 +508,13 @@ async fn start_server(
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html(page(&format!(
-                    "Konfiguration kann nicht geladen werden: {}",
-                    esc(&error.to_string())
-                ))),
+                Html(page(
+                    &format!(
+                        r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
+                        esc(&error.to_string())
+                    ),
+                    Some(state.token.as_str()),
+                )),
             )
                 .into_response()
         }
@@ -353,7 +522,10 @@ async fn start_server(
     let Some(sender) = state.start_sender.lock().await.take() else {
         return (
             StatusCode::CONFLICT,
-            Html(page("Der Serverstart wurde bereits angefordert.")),
+            Html(page(
+                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.start_already_requested"/></p></section>"#,
+                Some(state.token.as_str()),
+            )),
         )
             .into_response();
     };
@@ -365,10 +537,12 @@ async fn start_server(
             start_requested.store(false, Ordering::Release);
         }
     });
-    Html(page(&format!(
-        r#"<section><h1>VaultLink wird gestartet</h1><p>Der lokale Setup-Listener wird beendet und VaultLink übernimmt mit der gespeicherten Konfiguration.</p><p><a class="button" href="{}">VaultLink öffnen</a></p><p class="muted">Der Start kann abhängig von TLS und Let&apos;s Encrypt einen Moment dauern.</p></section>"#,
-        esc(&config.server.public_base_url),
-    )))
+    Html(page_without_locale_switcher(
+        &format!(
+            r#"<section><h1><vl-i18n key="setup.starting"/></h1><p><vl-i18n key="setup.listener_transition"/></p><p><a class="button" href="{}"><vl-i18n key="setup.open_vaultlink"/></a></p><p class="muted"><vl-i18n key="setup.start_delay"/></p></section>"#,
+            esc(&config.server.public_base_url),
+        ),
+    ))
     .into_response()
 }
 
@@ -379,24 +553,27 @@ struct SetupResult {
 
 async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupResult, String> {
     if form.admin_password != form.admin_password_confirm {
-        return Err("Admin-Passwörter stimmen nicht überein.".into());
+        return Err(i18n::text(i18n::current_locale(), i18n::PASSWORD_MISMATCH).into());
     }
     if form.admin_password.chars().count() < 14 {
-        return Err("Admin-Passwort muss mindestens 14 Zeichen enthalten.".into());
+        return Err(i18n::text(i18n::current_locale(), i18n::PASSWORD_MIN_14).into());
     }
     if form.admin_username.len() < 3
+        || form.admin_username.len() > 64
         || !form
             .admin_username
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        return Err("Admin-Benutzername muss sichere ASCII-Zeichen verwenden.".into());
+        return Err(i18n::text(i18n::current_locale(), i18n::USERNAME_POLICY).into());
     }
     let mode = match form.server_mode.as_str() {
         "development" => ServerMode::Development,
         "reverse_proxy" => ServerMode::ReverseProxy,
         "standalone_tls" => ServerMode::StandaloneTls,
-        _ => return Err("Ungültiger Servermodus.".into()),
+        _ => {
+            return Err(i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_SERVER_MODE).into())
+        }
     };
     let standalone_tls = matches!(mode, ServerMode::StandaloneTls);
     let reverse_proxy_mode = matches!(mode, ServerMode::ReverseProxy);
@@ -404,11 +581,22 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
     let certificate_source = match form.certificate_source.as_str() {
         "files" => CertificateSource::Files,
         "letsencrypt" => CertificateSource::LetsEncrypt,
-        _ => return Err("Ungültige TLS-Zertifikatsquelle.".into()),
+        _ => {
+            return Err(i18n::text(
+                i18n::current_locale(),
+                i18n::SETUP_INVALID_CERTIFICATE_SOURCE,
+            )
+            .into())
+        }
     };
-    let preview_extensions = runtime::parse_extension_list(&form.preview_extensions)?;
-    let image_preview_extensions = runtime::parse_extension_list(&form.image_preview_extensions)?;
-    let blocked_extensions = runtime::parse_extension_list(&form.blocked_extensions)?;
+    let invalid_extensions =
+        || i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_EXTENSIONS).to_string();
+    let preview_extensions = runtime::parse_extension_list(&form.preview_extensions)
+        .map_err(|_| invalid_extensions())?;
+    let image_preview_extensions = runtime::parse_extension_list(&form.image_preview_extensions)
+        .map_err(|_| invalid_extensions())?;
+    let blocked_extensions = runtime::parse_extension_list(&form.blocked_extensions)
+        .map_err(|_| invalid_extensions())?;
     let trusted_proxies = form
         .trusted_proxies
         .split([',', '\n', '\r', ' ', '\t'])
@@ -417,7 +605,9 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
             (!value.is_empty()).then_some(value.parse())
         })
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "Trusted Proxies enthalten ungültige IPs.".to_string())?;
+        .map_err(|_| {
+            i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_TRUSTED_PROXIES).to_string()
+        })?;
     let config = Config {
         server: Server {
             mode,
@@ -482,18 +672,22 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
             },
         },
     };
-    config.validate().map_err(|error| error.to_string())?;
+    config.validate().map_err(|_| {
+        i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_CONFIGURATION).to_string()
+    })?;
     let serialized = toml::to_string_pretty(&config).map_err(|error| error.to_string())?;
     let recovering_existing_config = if config_path.exists() {
         let existing = Config::load(config_path).map_err(|error| {
-            format!("Vorhandene Konfiguration kann nicht sicher fortgesetzt werden: {error}")
+            let prefix = match i18n::current_locale() {
+                Locale::De => "Vorhandene Konfiguration kann nicht sicher fortgesetzt werden",
+                Locale::En => "Existing configuration cannot be resumed safely",
+            };
+            format!("{prefix}: {error}")
         })?;
         let existing_serialized =
             toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
         if existing_serialized != serialized {
-            return Err(
-                "Konfigurationsdatei existiert bereits und wird nicht überschrieben.".into(),
-            );
+            return Err(i18n::text(i18n::current_locale(), i18n::SETUP_CONFIG_EXISTS).into());
         }
         true
     } else {
@@ -517,7 +711,9 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
             let admin = database
                 .admin(&form.admin_username)
                 .map_err(|error| error.to_string())?
-                .ok_or_else(|| "Initial setup recovery is unavailable".to_string())?;
+                .ok_or_else(|| {
+                    i18n::text(i18n::current_locale(), i18n::SETUP_RECOVERY_UNAVAILABLE).to_string()
+                })?;
             let password_hash = admin.password_hash.clone();
             let password_valid = tokio::task::spawn_blocking(move || {
                 auth::verify_password(&password_hash, &submitted_password)
@@ -525,7 +721,9 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
             .await
             .map_err(|error| error.to_string())?;
             if !password_valid {
-                return Err("Initial setup recovery is unavailable".into());
+                return Err(
+                    i18n::text(i18n::current_locale(), i18n::SETUP_RECOVERY_UNAVAILABLE).into(),
+                );
             }
             let totp_secret = admin.totp_secret;
             let otpauth = format!(
@@ -537,7 +735,7 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
                 otpauth,
             });
         }
-        return Err("Datenbank enthält bereits Admins; Setup legt nur den ersten Admin an.".into());
+        return Err(i18n::text(i18n::current_locale(), i18n::SETUP_INITIAL_ADMIN_EXISTS).into());
     }
     let wrote_config = if recovering_existing_config {
         false
@@ -558,7 +756,7 @@ async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupRes
         Ok(InitialAdminOutcome::Created) => {}
         Ok(InitialAdminOutcome::AlreadyInitialized) => {
             return Err(
-                "Datenbank enthält bereits Admins; Setup legt nur den ersten Admin an.".into(),
+                i18n::text(i18n::current_locale(), i18n::SETUP_INITIAL_ADMIN_EXISTS).into(),
             );
         }
         Err(error) => {
@@ -597,7 +795,7 @@ fn ensure_initial_setup_pending(data_directory: &Path, username: &str) -> Result
         return if existing == username {
             Ok(())
         } else {
-            Err("Pending initial setup belongs to a different administrator".into())
+            Err(i18n::text(i18n::current_locale(), i18n::SETUP_PENDING_OTHER_ADMIN).into())
         };
     }
     let path = initial_setup_pending_path(data_directory);
@@ -640,17 +838,26 @@ fn parse_unit_to_bytes(name: &str, value: &str, unit: u64) -> Result<u64, String
     let value = value
         .trim()
         .parse::<u64>()
-        .map_err(|_| format!("{name} muss eine positive ganze Zahl sein."))?;
+        .map_err(|_| match i18n::current_locale() {
+            Locale::De => format!("{name} muss eine positive ganze Zahl sein."),
+            Locale::En => format!("{name} must be a positive integer."),
+        })?;
     value
         .checked_mul(unit)
-        .ok_or_else(|| format!("{name} ist zu groß."))
+        .ok_or_else(|| match i18n::current_locale() {
+            Locale::De => format!("{name} ist zu groß."),
+            Locale::En => format!("{name} is too large."),
+        })
 }
 
 fn parse_usize(name: &str, value: &str) -> Result<usize, String> {
     value
         .trim()
         .parse::<usize>()
-        .map_err(|_| format!("{name} muss eine positive Zahl sein."))
+        .map_err(|_| match i18n::current_locale() {
+            Locale::De => format!("{name} muss eine positive Zahl sein."),
+            Locale::En => format!("{name} must be a positive number."),
+        })
 }
 
 const MB: u64 = 1_000_000;
@@ -747,98 +954,85 @@ fn setup_form(token: &str, error: Option<&str>) -> String {
     let error = error
         .map(|error| format!(r#"<p class="bad">{}</p>"#, esc(error)))
         .unwrap_or_default();
-    let form = format!(
-        r#"<section class="hero"><div><p class="eyebrow">VaultLink Setup</p><h1>Ersteinrichtung</h1><p class="muted">Lokaler Bootstrap für die initiale Konfiguration und den ersten Admin. Setup bindet ausschließlich an Loopback.</p></div><div class="side-panel"><strong>Sicherheit</strong><p class="muted">Built-in Let&apos;s Encrypt funktioniert nur, wenn VaultLink selbst Port 443 öffentlich erreicht. Hinter Nginx/Caddy bitte Reverse Proxy verwenden.</p></div></section>{error}<form method="post" class="setup-form" data-setup-token="{}"><input type="hidden" name="token" value="{}"><section class="form-card"><h2>Server</h2><div class="form-grid"><label>Modus<br><select name="server_mode"><option value="development">Development</option><option value="reverse_proxy">Reverse Proxy</option><option value="standalone_tls">Standalone TLS</option></select></label><label>Listen-Adresse<br><input name="listen_address" value="127.0.0.1:8080" required></label><label>Public Base URL<br><input name="public_base_url" value="http://localhost:8080" required></label><label>Log Level<br><select name="log_level"><option value="error">error</option><option value="warn">warn</option><option value="info" selected>info</option><option value="debug">debug</option><option value="trace">trace</option></select></label><label class="toggle-card"><input type="checkbox" name="production_mode"><span>Production Mode<small>Aktiviert produktive Startvalidierung.</small></span></label></div></section><section class="form-card"><h2>Storage</h2><div class="form-grid"><label>Root Mount Path<br><div class="input-action"><input name="root_mount_path" value="/tmp/vaultlink-root" required><button class="secondary small" type="button" data-dir-picker="root_mount_path">Durchsuchen</button></div></label><label>Data Directory<br><div class="input-action"><input name="data_directory" value="/tmp/vaultlink-data" required><button class="secondary small" type="button" data-dir-picker="data_directory">Durchsuchen</button></div></label><label>Max. Upload MB<br><input name="max_upload_size_mb" type="number" min="1" step="1" value="100" required></label><label>Blockierte Endungen<br><input name="blocked_extensions" value="exe,sh,php"></label></div></section><section class="form-card"><h2>ZIP, Suche und Preview</h2><div class="form-grid"><label>ZIP Max. GB<br><input name="max_zip_size_gb" type="number" min="1" step="1" value="1" required></label><label>ZIP Max. Dateien<br><input name="max_zip_files" type="number" min="1" value="10000" required></label><label>Suche Max. Einträge<br><input name="max_search_entries" type="number" min="1" value="50000" required></label><label>Suche Max. Treffer<br><input name="max_search_results" type="number" min="1" value="500" required></label><label>Text-Preview Max. MB<br><input name="max_preview_size_mb" type="number" min="1" step="1" value="1" required></label><label>Text-Preview-Endungen<br><input name="preview_extensions" value="txt,log,md,csv,json,toml,yaml,yml,ini,conf" required></label><label>Media-Preview Max. MB<br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="100" required></label><label>Bild-Preview-Endungen<br><input name="image_preview_extensions" value="jpg,jpeg,png,gif,webp,bmp,avif"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" checked><span>PDF-Preview aktiv<small>PDFs werden inline mit sicheren Headern angezeigt.</small></span></label></div></section><section class="form-card"><h2>Proxy und TLS</h2><div class="form-grid"><label class="toggle-card"><input type="checkbox" name="secure_cookie"><span>Secure Cookies<small>Für produktiven HTTPS-Betrieb aktivieren.</small></span></label><label class="toggle-card"><input type="checkbox" name="reverse_proxy_enabled"><span>Reverse Proxy aktiv<small>Forwarded Header nur von Trusted Proxies akzeptieren.</small></span></label><label>Trusted Proxies<br><input name="trusted_proxies" value="127.0.0.1,::1"></label><label class="toggle-card"><input type="checkbox" name="tls_enabled"><span>Standalone TLS aktiv<small>Nur ohne Reverse Proxy verwenden.</small></span></label><label>Zertifikatsquelle<br><select name="certificate_source"><option value="files">PEM-Dateien</option><option value="letsencrypt">Let&apos;s Encrypt Auto</option></select></label><label>TLS Cert File<br><input name="tls_cert_file"></label><label>TLS Key File<br><input name="tls_key_file"></label><label>Let&apos;s Encrypt Kontakt-E-Mail<br><input name="letsencrypt_contact_email" placeholder="admin@example.com"></label><label>ACME Cache Directory<br><div class="input-action"><input name="letsencrypt_cache_dir" value="acme" required><button class="secondary small" type="button" data-dir-picker="letsencrypt_cache_dir">Durchsuchen</button></div></label><label class="toggle-card"><input type="checkbox" name="letsencrypt_staging" checked><span>Let&apos;s Encrypt Staging<small>Für erste Tests ohne Rate-Limit-Risiko.</small></span></label><label class="toggle-card"><input type="checkbox" name="hsts_enabled"><span>HSTS aktiv<small>Nur bei finalem vertrauenswürdigem HTTPS aktivieren.</small></span></label></div></section><section class="form-card"><h2>Erster Admin</h2><div class="form-grid"><label>Benutzername<br><input name="admin_username" value="admin" required></label><label>Passwort<br><input name="admin_password" type="password" minlength="14" required></label><label>Passwort bestätigen<br><input name="admin_password_confirm" type="password" minlength="14" required></label></div></section><p class="form-actions"><button>Setup schreiben</button></p></form><dialog data-dir-dialog class="dir-dialog"><div class="dir-dialog-head"><strong>Verzeichnis auswählen</strong><button class="secondary small" type="button" data-dir-close>Schließen</button></div><p class="muted" data-dir-current>/</p><div class="button-group"><button class="secondary small" type="button" data-dir-up>Hoch</button><button class="small" type="button" data-dir-use>Dieses Verzeichnis übernehmen</button></div><div class="dir-list" data-dir-list></div></dialog>"#,
-        esc(token),
-        esc(token)
-    );
-    let form = form.replace(
-        r#"<section class="form-card"><h2>Erster Admin"#,
-        r#"<section class="form-card"><h2>Audit und Datenschutz</h2><div class="form-grid"><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled"><span>Client-IP im Audit speichern<small>Standardmäßig aus. Bei Aktivierung werden vollständige IP-Adressen unbegrenzt in SQLite gespeichert.</small></span></label></div></section><section class="form-card"><h2>Erster Admin"#,
-    );
-    form.replace(
-        r#"<select name="server_mode">"#,
-        r#"<select name="server_mode" data-server-mode>"#,
-    )
-    .replace(
-        r#"<section class="form-card"><h2>Proxy und TLS</h2>"#,
-        r#"<section class="form-card" data-production-section><h2>Proxy und TLS</h2>"#,
-    )
-    .replace(
-        r#"<label class="toggle-card"><input type="checkbox" name="production_mode"><span>Production Mode<small>Aktiviert produktive Startvalidierung.</small></span></label>"#,
-        "",
-    )
-    .replace(
-        r#"<label class="toggle-card"><input type="checkbox" name="secure_cookie"><span>Secure Cookies<small>Für produktiven HTTPS-Betrieb aktivieren.</small></span></label>"#,
-        "",
-    )
-    .replace(
-        r#"<label class="toggle-card"><input type="checkbox" name="reverse_proxy_enabled"><span>Reverse Proxy aktiv<small>Forwarded Header nur von Trusted Proxies akzeptieren.</small></span></label>"#,
-        "",
-    )
-    .replace(
-        r#"<label class="toggle-card"><input type="checkbox" name="tls_enabled"><span>Standalone TLS aktiv<small>Nur ohne Reverse Proxy verwenden.</small></span></label>"#,
-        "",
-    )
-    .replace(
-        r#"<label>Trusted Proxies<br>"#,
-        r#"<label data-mode-only="reverse_proxy">Trusted Proxies<br>"#,
-    )
-    .replace(
-        r#"<label>Zertifikatsquelle<br>"#,
-        r#"<label data-mode-only="standalone_tls">Zertifikatsquelle<br>"#,
-    )
-    .replace(
-        r#"<select name="certificate_source">"#,
-        r#"<select name="certificate_source" data-certificate-source>"#,
-    )
-    .replace(
-        r#"<label>TLS Cert File<br>"#,
-        r#"<label data-certificate-only="files">TLS Cert File<br>"#,
-    )
-    .replace(
-        r#"<label>TLS Key File<br>"#,
-        r#"<label data-certificate-only="files">TLS Key File<br>"#,
-    )
-    .replace(
-        r#"<input name="tls_cert_file">"#,
-        r#"<div class="input-action"><input name="tls_cert_file"><button class="secondary small" type="button" data-file-picker="tls_cert_file">Durchsuchen</button></div>"#,
-    )
-    .replace(
-        r#"<input name="tls_key_file">"#,
-        r#"<div class="input-action"><input name="tls_key_file"><button class="secondary small" type="button" data-file-picker="tls_key_file">Durchsuchen</button></div>"#,
-    )
-    .replace(
-        r#"<label>Let&apos;s Encrypt Kontakt-E-Mail<br>"#,
-        r#"<label data-certificate-only="letsencrypt">Let&apos;s Encrypt Kontakt-E-Mail<br>"#,
-    )
-    .replace(
-        r#"<label>ACME Cache Directory<br>"#,
-        r#"<label data-certificate-only="letsencrypt">ACME Cache Directory<br>"#,
-    )
-    .replace(
-        r#"<label class="toggle-card"><input type="checkbox" name="letsencrypt_staging""#,
-        r#"<label class="toggle-card" data-certificate-only="letsencrypt"><input type="checkbox" name="letsencrypt_staging""#,
-    )
-    .replace(
-        r#"<div class="dir-list" data-dir-list>"#,
-        r#"<p class="muted">Es werden nur Verzeichnisse im Dateisystem des VaultLink-Servers angezeigt.</p><div class="dir-list" data-dir-list>"#,
-    )
-    .replace(
-        r#"<strong>Verzeichnis auswählen</strong>"#,
-        r#"<strong data-picker-title>Verzeichnis auswählen</strong>"#,
-    )
-    .replace(
-        r#"<p class="muted">Es werden nur Verzeichnisse im Dateisystem des VaultLink-Servers angezeigt.</p>"#,
-        r#"<p class="muted" data-picker-help>Es werden nur Verzeichnisse im Dateisystem des VaultLink-Servers angezeigt.</p>"#,
+    let token = esc(token);
+    format!(
+        r#"
+<section class="hero">
+  <div><p class="eyebrow"><vl-i18n key="setup.title"/></p><h1><vl-i18n key="setup.initial_setup"/></h1><p class="muted"><vl-i18n key="setup.local_bootstrap"/></p></div>
+  <div class="side-panel"><strong><vl-i18n key="setup.security"/></strong><p class="muted"><vl-i18n key="setup.acme_proxy_help"/></p></div>
+</section>
+{error}
+<form method="post" class="setup-form" data-setup-token="{token}">
+  <input type="hidden" name="token" value="{token}">
+  <section class="form-card"><h2><vl-i18n key="setup.server"/></h2><div class="form-grid">
+    <label><vl-i18n key="setup.mode"/><br><select name="server_mode" data-server-mode><option value="development">Development</option><option value="reverse_proxy">Reverse Proxy</option><option value="standalone_tls">Standalone TLS</option></select></label>
+    <label><vl-i18n key="setup.service_address"/><br><input name="listen_address" value="127.0.0.1:8080" required><small class="muted"><vl-i18n key="setup.service_address_help"/></small></label>
+    <label><vl-i18n key="setup.public_base_url"/><br><input name="public_base_url" value="http://localhost:8080" required></label>
+    <label><vl-i18n key="setup.log_level"/><br><select name="log_level"><option value="error">error</option><option value="warn">warn</option><option value="info" selected>info</option><option value="debug">debug</option><option value="trace">trace</option></select></label>
+  </div></section>
+  <section class="form-card"><h2><vl-i18n key="setup.storage"/></h2><div class="form-grid">
+    <label><vl-i18n key="setup.root_mount_path"/><br><div class="input-action"><input name="root_mount_path" value="/tmp/vaultlink-root" required><button class="secondary small" type="button" data-dir-picker="root_mount_path"><vl-i18n key="setup.browse"/></button></div></label>
+    <label><vl-i18n key="setup.data_directory"/><br><div class="input-action"><input name="data_directory" value="/tmp/vaultlink-data" required><button class="secondary small" type="button" data-dir-picker="data_directory"><vl-i18n key="setup.browse"/></button></div></label>
+    <label><vl-i18n key="setup.max_upload_mb"/><br><input name="max_upload_size_mb" type="number" min="1" step="1" value="100" required></label>
+    <label><vl-i18n key="setup.blocked_extensions"/><br><input name="blocked_extensions" value="exe,sh,php"></label>
+  </div></section>
+  <section class="form-card"><h2><vl-i18n key="setup.zip_search_preview"/></h2><div class="form-grid">
+    <label><vl-i18n key="setup.zip_max_gb"/><br><input name="max_zip_size_gb" type="number" min="1" step="1" value="1" required></label>
+    <label><vl-i18n key="setup.zip_max_files"/><br><input name="max_zip_files" type="number" min="1" value="10000" required></label>
+    <label><vl-i18n key="setup.search_max_entries"/><br><input name="max_search_entries" type="number" min="1" value="50000" required></label>
+    <label><vl-i18n key="setup.search_max_results"/><br><input name="max_search_results" type="number" min="1" value="500" required></label>
+    <label><vl-i18n key="setup.text_preview_max_mb"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="1" required></label>
+    <label><vl-i18n key="setup.text_preview_extensions"/><br><input name="preview_extensions" value="txt,log,md,csv,json,toml,yaml,yml,ini,conf" required></label>
+    <label><vl-i18n key="setup.media_preview_max_mb"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="100" required></label>
+    <label><vl-i18n key="setup.image_preview_extensions"/><br><input name="image_preview_extensions" value="jpg,jpeg,png,gif,webp,bmp,avif"></label>
+    <label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" checked><span><vl-i18n key="setup.pdf_preview_enabled"/><small><vl-i18n key="setup.pdf_preview_help"/></small></span></label>
+  </div></section>
+  <section class="form-card" data-production-section><h2><vl-i18n key="setup.proxy_tls"/></h2><div class="form-grid">
+    <label data-mode-only="reverse_proxy"><vl-i18n key="setup.trusted_proxies"/><br><input name="trusted_proxies" value="127.0.0.1,::1"></label>
+    <label data-mode-only="standalone_tls"><vl-i18n key="setup.certificate_source"/><br><select name="certificate_source" data-certificate-source><option value="files"><vl-i18n key="setup.pem_files"/></option><option value="letsencrypt"><vl-i18n key="setup.letsencrypt_auto"/></option></select></label>
+    <label data-certificate-only="files"><vl-i18n key="setup.tls_cert_file"/><br><div class="input-action"><input name="tls_cert_file"><button class="secondary small" type="button" data-file-picker="tls_cert_file"><vl-i18n key="setup.browse"/></button></div></label>
+    <label data-certificate-only="files"><vl-i18n key="setup.tls_key_file"/><br><div class="input-action"><input name="tls_key_file"><button class="secondary small" type="button" data-file-picker="tls_key_file"><vl-i18n key="setup.browse"/></button></div></label>
+    <label data-certificate-only="letsencrypt"><vl-i18n key="setup.letsencrypt_email"/><br><input name="letsencrypt_contact_email" placeholder="admin@example.com"></label>
+    <label data-certificate-only="letsencrypt"><vl-i18n key="setup.acme_cache_directory"/><br><div class="input-action"><input name="letsencrypt_cache_dir" value="acme" required><button class="secondary small" type="button" data-dir-picker="letsencrypt_cache_dir"><vl-i18n key="setup.browse"/></button></div></label>
+    <label class="toggle-card" data-certificate-only="letsencrypt"><input type="checkbox" name="letsencrypt_staging" checked><span><vl-i18n key="setup.letsencrypt_staging"/><small><vl-i18n key="setup.letsencrypt_staging_help"/></small></span></label>
+    <label class="toggle-card"><input type="checkbox" name="hsts_enabled"><span><vl-i18n key="setup.hsts_enabled"/><small><vl-i18n key="setup.hsts_help"/></small></span></label>
+  </div></section>
+  <section class="form-card"><h2><vl-i18n key="setup.audit_privacy"/></h2><div class="form-grid"><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled"><span><vl-i18n key="setup.audit_ip"/><small><vl-i18n key="setup.audit_ip_help"/></small></span></label></div></section>
+  <section class="form-card"><h2><vl-i18n key="setup.first_admin"/></h2><div class="form-grid">
+    <label><vl-i18n key="auth.username"/><br><input name="admin_username" value="admin" minlength="3" maxlength="64" required></label>
+    <label><vl-i18n key="auth.password"/><br><input name="admin_password" type="password" minlength="14" required></label>
+    <label><vl-i18n key="account.confirm_password"/><br><input name="admin_password_confirm" type="password" minlength="14" required></label>
+  </div></section>
+  <p class="form-actions"><button><vl-i18n key="setup.write"/></button></p>
+</form>
+<dialog data-dir-dialog class="dir-dialog"><div class="dir-dialog-head"><strong data-picker-title><vl-i18n key="setup.choose_directory"/></strong><button class="secondary small" type="button" data-dir-close><vl-i18n key="common.close"/></button></div><p class="muted" data-dir-current>/</p><div class="button-group"><button class="secondary small" type="button" data-dir-up><vl-i18n key="files.up"/></button><button class="small" type="button" data-dir-use><vl-i18n key="setup.use_directory"/></button></div><p class="muted" data-picker-help><vl-i18n key="setup.server_directories_help"/></p><div class="dir-list" data-dir-list></div></dialog>
+"#
     )
 }
 
-fn page(body: &str) -> String {
+fn page(body: &str, token: Option<&str>) -> String {
+    render_page(body, &setup_locale_switcher(token))
+}
+
+// Transitional setup responses may contain a one-time TOTP secret or the only
+// button that moves the listener into server mode. They deliberately omit the
+// locale form because those responses are produced by POST and cannot be
+// replayed safely after a locale redirect.
+fn page_without_locale_switcher(body: &str) -> String {
+    render_page(body, "")
+}
+
+fn render_page(body: &str, locale_switcher: &str) -> String {
     let _legacy_logo_kept_for_migration_tests = SETUP_LOGO_SVG;
+    let locale = i18n::current_locale();
+    let body = i18n::render_markers(locale, body);
     format!(
-        r##"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VaultLink Setup</title><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/setup.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">Zum Inhalt springen</a><div class="vl-setup-shell"><main id="main-content" class="vl-setup-main"><header class="vl-setup-header">{}</header>{}</main></div></body></html>"##,
-        ui::brand_lockup("Secure file links"),
+        r##"<!doctype html><html lang="{}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{}</title><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/setup.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">{}</a><div class="vl-setup-shell"><main id="main-content" class="vl-setup-main"><header class="vl-setup-header">{}{}</header>{}</main></div></body></html>"##,
+        locale.code(),
+        esc(i18n::text(locale, i18n::SETUP_TITLE)),
+        i18n::text(locale, i18n::SKIP_TO_CONTENT),
+        ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
+        locale_switcher,
         body
     )
 }
@@ -896,7 +1090,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const response = await fetch(`/browse?token=${encodeURIComponent(token)}&path=${encodeURIComponent(requestedPath)}&mode=${pickerMode}&file_kind=${encodeURIComponent(pickerFileKind)}`);
     if (!response.ok) {
       if (fallbackToRoot && requestedPath !== '/') return load('/', false);
-      list.innerHTML = '<p class="bad">Verzeichnis kann nicht gelesen werden.</p>';
+      list.innerHTML = '<p class="bad"><vl-i18n key="setup.directory_unreadable"/></p>';
       return;
     }
     const data = await response.json();
@@ -923,7 +1117,7 @@ document.addEventListener('DOMContentLoaded', () => {
       list.appendChild(button);
     }
     if (!data.entries.length) {
-      list.innerHTML = `<p class="muted">${pickerMode === 'file' ? 'Keine Dateien oder Unterverzeichnisse.' : 'Keine Unterverzeichnisse.'}</p>`;
+      list.innerHTML = `<p class="muted">${pickerMode === 'file' ? '<vl-i18n key="setup.no_files_or_directories"/>' : '<vl-i18n key="setup.no_subdirectories"/>'}</p>`;
     }
   }
 
@@ -937,12 +1131,12 @@ document.addEventListener('DOMContentLoaded', () => {
     if (pickerMode === 'file' && path !== '/') {
       path = path.slice(0, path.lastIndexOf('/')) || '/';
     }
-    pickerTitle.textContent = pickerMode === 'file' ? 'Datei auswählen' : 'Verzeichnis auswählen';
+    pickerTitle.textContent = pickerMode === 'file' ? '<vl-i18n key="setup.choose_file"/>' : '<vl-i18n key="setup.choose_directory"/>';
     pickerHelp.textContent = pickerMode === 'file'
       ? pickerFileKind === 'certificate'
-        ? 'Es werden nur PEM-, CRT- und CER-Zertifikatsdateien angezeigt.'
-        : 'Es werden nur PEM- und KEY-Dateien für den Private Key angezeigt.'
-      : 'Es werden nur Verzeichnisse im Dateisystem des VaultLink-Servers angezeigt.';
+        ? '<vl-i18n key="setup.certificate_files_help"/>'
+        : '<vl-i18n key="setup.private_key_files_help"/>'
+      : '<vl-i18n key="setup.server_directories_help"/>';
     useDirectory.hidden = pickerMode === 'file';
     load(path, true);
     dialog.showModal();
@@ -984,6 +1178,38 @@ fn esc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Method, Request},
+    };
+    use tower::ServiceExt;
+
+    fn test_setup_state(config_path: PathBuf) -> SetupState {
+        let (start_sender, _start_receiver) = tokio::sync::oneshot::channel();
+        SetupState {
+            config_path: Arc::new(config_path),
+            token: Arc::new("token".into()),
+            commit: Arc::new(tokio::sync::Mutex::new(false)),
+            start_sender: Arc::new(tokio::sync::Mutex::new(Some(start_sender))),
+            start_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn request(method: Method, uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn response_text(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
 
     fn form(root: &Path, data: &Path) -> SetupForm {
         SetupForm {
@@ -1022,16 +1248,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn setup_form_uses_branding_units_log_dropdown_and_directory_picker() {
-        let html = page(&setup_form("token", None));
-        assert!(html.contains("VaultLink<small>Secure file links</small>"));
-        assert!(html.contains("SETUP") || html.contains("Ersteinrichtung"));
+    #[tokio::test]
+    async fn setup_form_uses_branding_units_log_dropdown_and_directory_picker() {
+        let html = i18n::scope(Locale::De, "/?token=token".into(), async {
+            page(&setup_form("token", None), Some("token"))
+        })
+        .await;
+        assert!(html.contains("VaultLink<small>Secure file sharing</small>"));
+        assert!(html.contains(r#"<html lang="de">"#));
+        assert!(html.contains("Ersteinrichtung"));
         assert!(html.contains("name=\"max_upload_size_mb\""));
         assert!(html.contains("name=\"max_zip_size_gb\""));
         assert!(html.contains("name=\"max_preview_size_mb\""));
         assert!(html.contains("name=\"max_media_preview_size_mb\""));
         assert!(html.contains("<select name=\"log_level\">"));
+        assert!(html.contains("VaultLink-Dienstadresse nach dem Setup"));
+        assert!(html.contains("Die lokale Setup-Adresse bleibt davon unabhängig"));
+        assert!(
+            html.contains(r#"name="admin_username" value="admin" minlength="3" maxlength="64""#)
+        );
         assert!(html.contains("data-dir-picker=\"root_mount_path\""));
         assert!(html.contains("data-file-picker=\"tls_cert_file\""));
         assert!(html.contains("data-file-picker=\"tls_key_file\""));
@@ -1047,6 +1282,221 @@ mod tests {
         assert!(!SETUP_JAVASCRIPT.contains("`Ordner ${entry.name}`"));
         assert!(!html.contains("Max Upload Bytes"));
         assert!(!html.contains("Log Level<br><input"));
+        assert!(!html.contains("<vl-i18n"));
+    }
+
+    #[tokio::test]
+    async fn setup_http_locale_uses_cookie_then_accept_language_then_english() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let app = setup_router(test_setup_state(config_dir.path().join("config.toml")));
+
+        let fallback = Request::builder()
+            .uri("/?token=token")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(fallback).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "en");
+        let english = response_text(response).await;
+        assert!(english.contains(r#"<html lang="en">"#));
+        assert!(english.contains("Initial setup"));
+        assert!(english.contains("VaultLink service address after setup"));
+        assert!(english.contains(r#"name="return_to" value="/?token=token""#));
+        assert!(english.contains(r#">DE</button><span aria-hidden="true">/</span>"#));
+        for german_fragment in [
+            "Ersteinrichtung",
+            "Sicherheit",
+            "Durchsuchen",
+            "Datenverzeichnis",
+            "Blockierte Endungen",
+            "Suche Max. Einträge",
+            "Erster Admin",
+            "Benutzername",
+            "Passwort bestätigen",
+            "Setup schreiben",
+            "Verzeichnis auswählen",
+        ] {
+            assert!(!english.contains(german_fragment), "{german_fragment}");
+        }
+        assert!(!english.contains("<vl-i18n"));
+
+        let mut german = request(Method::GET, "/?token=token", "");
+        german.headers_mut().insert(
+            header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("de-AT,de;q=0.9"),
+        );
+        let response = app.clone().oneshot(german).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "de");
+        let german = response_text(response).await;
+        assert!(german.contains(r#"<html lang="de">"#));
+        assert!(german.contains("Ersteinrichtung"));
+        assert!(german.contains("VaultLink-Dienstadresse nach dem Setup"));
+        for english_fragment in [
+            "Initial setup",
+            "Choose directory",
+            "Save setup",
+            "First administrator",
+            "Blocked extensions",
+        ] {
+            assert!(!german.contains(english_fragment), "{english_fragment}");
+        }
+        assert!(!german.contains("<vl-i18n"));
+
+        let mut cookie_override = request(Method::GET, "/?token=token", "");
+        cookie_override.headers_mut().insert(
+            header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+        cookie_override.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_locale=de"),
+        );
+        let response = app.oneshot(cookie_override).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "de");
+        assert!(response_text(response).await.contains("Ersteinrichtung"));
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let unauthorized_app =
+            setup_router(test_setup_state(config_dir.path().join("config.toml")));
+        let unauthorized = unauthorized_app
+            .oneshot(request(Method::GET, "/", ""))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(unauthorized.headers()[header::CONTENT_LANGUAGE], "en");
+        let unauthorized = response_text(unauthorized).await;
+        assert!(unauthorized.contains("The setup token is missing or invalid."));
+        assert!(unauthorized.contains("vl-locale-switch"));
+        assert!(!unauthorized.contains("<vl-i18n"));
+    }
+
+    #[tokio::test]
+    async fn setup_locale_route_preserves_token_and_rejects_external_return() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let app = setup_router(test_setup_state(config_dir.path().join("config.toml")));
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/locale",
+                "locale=de&return_to=%2F%3Ftoken%3Dtoken",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/?token=token");
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.starts_with("vaultlink_locale=de;"));
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+
+        let external = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/locale",
+                "locale=en&return_to=https%3A%2F%2Fevil.example%2F",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(external.headers()[header::LOCATION], "/");
+
+        let non_get_setup_path = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/locale",
+                "locale=en&return_to=%2Fcomplete%3Ftoken%3Dtoken",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(non_get_setup_path.headers()[header::LOCATION], "/");
+
+        let invalid = app
+            .oneshot(request(
+                Method::POST,
+                "/locale",
+                "locale=fr&return_to=%2F%3Ftoken%3Dtoken",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.headers()[header::CONTENT_LANGUAGE], "en");
+        assert!(response_text(invalid).await.contains("Invalid language"));
+    }
+
+    #[tokio::test]
+    async fn transitional_setup_pages_do_not_offer_a_lossy_locale_redirect() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let state = test_setup_state(config_dir.path().join("config.toml"));
+
+        let response = i18n::scope(Locale::En, "/".into(), async {
+            submit_setup(State(state.clone()), Form(form(root.path(), data.path()))).await
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("Secret stored safely"));
+        assert!(!body.contains(r#"action="/locale""#));
+
+        let response = i18n::scope(Locale::En, "/complete".into(), async {
+            complete_setup(
+                State(state),
+                Form(CompleteSetupForm {
+                    token: "token".into(),
+                }),
+            )
+            .await
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("Start VaultLink now"));
+        assert!(!body.contains(r#"action="/locale""#));
+    }
+
+    #[tokio::test]
+    async fn setup_javascript_localizes_visible_picker_text() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let app = setup_router(test_setup_state(config_dir.path().join("config.toml")));
+
+        let english = request(Method::GET, "/assets/setup.js", "");
+        let response = app.clone().oneshot(english).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "en");
+        let english = response_text(response).await;
+        assert!(english.contains("Directory cannot be read."));
+        assert!(english.contains("Choose file"));
+        assert!(!english.contains("Verzeichnis kann nicht gelesen werden."));
+        assert!(!english.contains("<vl-i18n"));
+
+        let mut german = request(Method::GET, "/assets/setup.js", "");
+        german
+            .headers_mut()
+            .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("de"));
+        let response = app.oneshot(german).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "de");
+        let german = response_text(response).await;
+        assert!(german.contains("Verzeichnis kann nicht gelesen werden."));
+        assert!(german.contains("Datei auswählen"));
+        assert!(!german.contains("<vl-i18n"));
+    }
+
+    #[tokio::test]
+    async fn setup_markers_cannot_collide_with_escaped_user_data() {
+        let marker_shaped = r#"><vl-i18n key="setup.server"/>"#;
+        let html = i18n::scope(Locale::En, "/".into(), async {
+            page(
+                &setup_form(marker_shaped, Some(marker_shaped)),
+                Some(marker_shaped),
+            )
+        })
+        .await;
+        assert!(!html.contains("<vl-i18n"));
+        assert!(html.contains(r#"&lt;vl-i18n key=&quot;setup.server&quot;/&gt;"#));
+        assert!(html.contains("Initial setup"));
     }
 
     #[test]
@@ -1059,7 +1509,98 @@ mod tests {
     #[test]
     fn setup_bind_must_be_loopback() {
         assert!(validate_setup_listen("127.0.0.1:8090".parse().unwrap()).is_ok());
+        assert!(validate_setup_listen("127.0.0.1:0".parse().unwrap()).is_err());
         assert!(validate_setup_listen("0.0.0.0:8090".parse().unwrap()).is_err());
+        assert!(validate_setup_listen("192.0.2.10:8090".parse().unwrap()).is_err());
+        assert!(validate_setup_listen("[::]:8090".parse().unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn setup_admin_username_is_three_to_sixty_four_safe_ascii_characters() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+
+        for invalid in ["ab".to_string(), "a".repeat(65), "admín".to_string()] {
+            let mut invalid_form = form(root.path(), data.path());
+            invalid_form.admin_username = invalid;
+            let error = match build_and_store(&config_dir.path().join("invalid.toml"), invalid_form)
+                .await
+            {
+                Ok(_) => panic!("invalid setup username was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error, i18n::text(Locale::En, i18n::USERNAME_POLICY));
+        }
+
+        let max_length_username = "a".repeat(64);
+        let mut valid_form = form(root.path(), data.path());
+        valid_form.admin_username = max_length_username.clone();
+        build_and_store(&config_dir.path().join("config.toml"), valid_form)
+            .await
+            .unwrap();
+        let database = Database::open(data.path().join("data.sqlite")).unwrap();
+        assert!(database.admin(&max_length_username).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn setup_validation_errors_follow_the_selected_locale() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+
+        let mut invalid_extensions = form(root.path(), data.path());
+        invalid_extensions.preview_extensions = "txt,../bad".into();
+        let error = i18n::scope(Locale::De, "/".into(), async {
+            match build_and_store(
+                &config_dir.path().join("invalid-extensions.toml"),
+                invalid_extensions,
+            )
+            .await
+            {
+                Ok(_) => panic!("invalid extension list was accepted"),
+                Err(error) => error,
+            }
+        })
+        .await;
+        assert_eq!(error, "Eine Endungsliste enthält ungültige Werte.");
+
+        let mut invalid_config = form(root.path(), data.path());
+        invalid_config.listen_address = "0.0.0.0:8080".into();
+        let error = i18n::scope(Locale::De, "/".into(), async {
+            match build_and_store(
+                &config_dir.path().join("invalid-config.toml"),
+                invalid_config,
+            )
+            .await
+            {
+                Ok(_) => panic!("invalid setup configuration was accepted"),
+                Err(error) => error,
+            }
+        })
+        .await;
+        assert!(error.starts_with("Die Setup-Eingaben ergeben keine gültige"));
+    }
+
+    #[test]
+    fn setup_terminal_explains_headless_ssh_tunnel_and_local_url() {
+        let output =
+            setup_access_instructions("127.0.0.1:8090".parse().unwrap(), "one-time-setup-token");
+        assert!(output.contains("lauscht ausschließlich auf Loopback"));
+        assert!(output.contains("ssh -4 -N -L 127.0.0.1:8090:127.0.0.1:8090 BENUTZER@SERVER"));
+        assert!(output
+            .lines()
+            .any(|line| line == "http://127.0.0.1:8090/?token=one-time-setup-token"));
+        assert_eq!(output.matches("one-time-setup-token").count(), 1);
+    }
+
+    #[test]
+    fn setup_terminal_formats_ipv6_loopback_for_ssh() {
+        let output = setup_access_instructions("[::1]:8091".parse().unwrap(), "token");
+        assert!(output.contains("ssh -4 -N -L 127.0.0.1:8091:[::1]:8091 BENUTZER@SERVER"));
+        assert!(output
+            .lines()
+            .any(|line| line == "http://127.0.0.1:8091/?token=token"));
     }
 
     #[tokio::test]
@@ -1137,9 +1678,13 @@ mod tests {
         assert!(!result.totp_secret.is_empty());
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.storage.max_preview_size, 1_000_000);
-        let confirmed = setup_confirmed_body(&config, "token", "Secret geschlossen.");
+        let confirmed = i18n::render_markers(
+            Locale::De,
+            &setup_confirmed_body(&config, "token", "Secret geschlossen."),
+        );
         assert!(confirmed.contains("VaultLink jetzt starten"));
         assert!(confirmed.contains("Development"));
+        assert!(!confirmed.contains("<vl-i18n"));
         assert!(!include_str!("setup.rs").contains(concat!("Ctrl", "+C")));
         let database = Database::open(data.path().join("data.sqlite")).unwrap();
         assert_eq!(database.admin_count().unwrap(), 1);
@@ -1165,20 +1710,24 @@ mod tests {
             start_requested: requested.clone(),
         };
 
-        let response = start_server(
-            State(state),
-            Form(CompleteSetupForm {
-                token: "token".into(),
-            }),
-        )
+        let response = i18n::scope(Locale::De, "/start".into(), async {
+            start_server(
+                State(state),
+                Form(CompleteSetupForm {
+                    token: "token".into(),
+                }),
+            )
+            .await
+        })
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(String::from_utf8(body.to_vec())
-            .unwrap()
-            .contains("VaultLink wird gestartet"));
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("VaultLink wird gestartet"));
+        assert!(!body.contains("vl-locale-switch"));
+        assert!(!body.contains("<vl-i18n"));
         tokio::time::timeout(std::time::Duration::from_secs(1), start_receiver)
             .await
             .unwrap()

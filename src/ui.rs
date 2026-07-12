@@ -781,6 +781,16 @@ pub const STYLESHEET: &str = r#"
   }
   .vl-inline-actions form,
   .vl-topbar-actions form { margin: 0; }
+  .vl-locale-switch {
+    display: inline-flex; min-height: var(--vl-control-height); align-items: center; gap: var(--vl-space-1);
+    padding: 0 var(--vl-space-2); border: 1px solid var(--vl-border); border-radius: var(--vl-radius-md);
+    background: rgba(255,255,255,.035); color: var(--vl-text-muted);
+  }
+  .vl-ui .vl-locale-switch__option {
+    min-height: auto; min-width: auto; padding: var(--vl-space-1); border: 0; background: transparent;
+    box-shadow: none; color: var(--vl-text-muted); font-size: var(--vl-text-sm);
+  }
+  .vl-ui .vl-locale-switch__option[aria-current="true"] { color: var(--vl-accent); font-weight: 800; }
 
   .vl-notice {
     padding: var(--vl-space-3) var(--vl-space-4);
@@ -1081,16 +1091,16 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
     const units = ["B", "KB", "MB", "GB", "TB"];
     const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
     const value = bytes / (1024 ** unit);
-    return `${value.toLocaleString("de-DE", { maximumFractionDigits: unit === 0 ? 0 : 1 })} ${units[unit]}`;
+    return `${value.toLocaleString(document.documentElement.lang || "en", { maximumFractionDigits: unit === 0 ? 0 : 1 })} ${units[unit]}`;
   };
 
   const outcomeText = (outcome) => {
     switch (outcome) {
-      case "created": return "Hochgeladen";
-      case "replaced": return "Ersetzt";
-      case "created_uncertain": return "Hochgeladen – Persistenzbestätigung ausstehend";
-      case "replaced_uncertain": return "Ersetzt – Persistenzbestätigung ausstehend";
-      default: return "Hochgeladen";
+      case "created": return '<vl-i18n key="upload.uploaded"/>';
+      case "replaced": return '<vl-i18n key="upload.replaced"/>';
+      case "created_uncertain": return '<vl-i18n key="upload.persist_pending"/>';
+      case "replaced_uncertain": return '<vl-i18n key="upload.replace_pending"/>';
+      default: return '<vl-i18n key="upload.uploaded"/>';
     }
   };
 
@@ -1136,13 +1146,13 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
       const index = items.indexOf(item);
       if (index !== -1) items.splice(index, 1);
       render();
-      setFeedback(items.length === 0 ? "Noch keine Datei ausgewählt." : "Datei aus der Warteschlange entfernt.");
+      setFeedback(items.length === 0 ? '<vl-i18n key="upload.none_selected"/>' : '<vl-i18n key="upload.removed_queue"/>');
     };
 
     const retryItem = async (item) => {
       if (running || item.status !== "error") return;
       item.status = "ready";
-      item.message = "Bereit";
+      item.message = '<vl-i18n key="upload.ready"/>';
       render();
       await processItems([item]);
     };
@@ -1176,10 +1186,10 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
         const actions = document.createElement("div");
         actions.className = "vl-inline";
         if (item.status === "error") {
-          actions.append(actionButton("Erneut versuchen", () => { void retryItem(item); }, running));
+          actions.append(actionButton('<vl-i18n key="upload.retry"/>', () => { void retryItem(item); }, running));
         }
         actions.append(actionButton(
-          item.status === "success" ? "Aus Liste entfernen" : "Entfernen",
+          item.status === "success" ? '<vl-i18n key="upload.remove_list"/>' : '<vl-i18n key="common.remove"/>',
           () => removeItem(item),
           running || item.status === "uploading"
         ));
@@ -1197,14 +1207,14 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
           id: ++sequence,
           file,
           status: "ready",
-          message: "Bereit",
+          message: '<vl-i18n key="upload.ready"/>',
           serverFile: "",
           outcome: ""
         });
       }
       render();
       if (files.length > 0) {
-        setFeedback(`${files.length} ${files.length === 1 ? "Datei wurde" : "Dateien wurden"} hinzugefügt.`);
+        setFeedback(`${files.length} ${files.length === 1 ? '<vl-i18n key="upload.file_added"/>' : '<vl-i18n key="upload.files_added"/>'}`);
       }
     };
 
@@ -1219,7 +1229,7 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
 
     const uploadItem = async (item) => {
       item.status = "uploading";
-      item.message = "Wird hochgeladen …";
+      item.message = '<vl-i18n key="upload.uploading"/>';
       render();
 
       try {
@@ -1234,19 +1244,19 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
         try {
           payload = await response.json();
         } catch (_) {
-          throw new Error(response.ok ? "Ungültige Serverantwort" : `Upload fehlgeschlagen (${response.status})`);
+          throw new Error(response.ok ? '<vl-i18n key="upload.invalid_response"/>' : `<vl-i18n key="upload.failed"/> (${response.status})`);
         }
 
         if (!response.ok || (payload && payload.error)) {
           const error = payload && payload.error;
           const message = error && typeof error.message === "string"
             ? error.message
-            : `Upload fehlgeschlagen (${response.status})`;
+            : `<vl-i18n key="upload.failed"/> (${response.status})`;
           const code = error && typeof error.code === "string" ? ` [${error.code}]` : "";
           throw new Error(`${message}${code}`);
         }
         if (!payload || typeof payload.file !== "string" || typeof payload.outcome !== "string") {
-          throw new Error("Ungültige Serverantwort");
+          throw new Error('<vl-i18n key="upload.invalid_response"/>');
         }
 
         item.status = "success";
@@ -1255,7 +1265,7 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
         item.message = outcomeText(payload.outcome);
       } catch (error) {
         item.status = "error";
-        item.message = error instanceof Error ? error.message : "Upload fehlgeschlagen";
+        item.message = error instanceof Error ? error.message : '<vl-i18n key="upload.failed"/>';
       }
       render();
     };
@@ -1274,8 +1284,8 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
 
       const successful = queue.filter((item) => item.status === "success").length;
       const failed = queue.filter((item) => item.status === "error").length;
-      const result = [`${successful} erfolgreich`];
-      if (failed > 0) result.push(`${failed} fehlgeschlagen – einzeln erneut versuchen`);
+      const result = [`${successful} <vl-i18n key="upload.successful"/>`];
+      if (failed > 0) result.push(`${failed} <vl-i18n key="upload.failed_retry"/>`);
       setFeedback(result.join(", "));
     }
 
@@ -1290,8 +1300,8 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
       const queue = items.filter((item) => item.status === "ready" || item.status === "error");
       if (queue.length === 0) {
         setFeedback(items.some((item) => item.status === "success")
-          ? "Alle ausgewählten Dateien wurden bereits hochgeladen."
-          : "Bitte mindestens eine Datei auswählen.");
+          ? '<vl-i18n key="upload.already_done"/>'
+          : '<vl-i18n key="upload.select_one"/>');
         input.focus();
         return;
       }
@@ -1326,7 +1336,7 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
     input.required = false;
     input.multiple = true;
     form.dataset.uploadQueueReady = "true";
-    setFeedback("Noch keine Datei ausgewählt.");
+    setFeedback('<vl-i18n key="upload.none_selected"/>');
   };
 
   const initializeAll = () => {
@@ -1373,6 +1383,7 @@ pub enum Icon {
     Shield,
     Trash,
     Upload,
+    User,
     Users,
     Warning,
 }
@@ -1419,6 +1430,7 @@ impl Icon {
             }
             Self::Trash => r#"<path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6"/>"#,
             Self::Upload => r#"<path d="M12 16V4M7.5 8.5 12 4l4.5 4.5"/><path d="M4 20h16"/>"#,
+            Self::User => r#"<circle cx="12" cy="8" r="4"/><path d="M4.5 21a7.5 7.5 0 0 1 15 0"/>"#,
             Self::Users => {
                 r#"<circle cx="9" cy="8" r="3"/><path d="M3.5 20v-2a5.5 5.5 0 0 1 11 0v2M16 5.5a3 3 0 0 1 0 5.8M17 14a5 5 0 0 1 3.5 4.8V20"/>"#
             }

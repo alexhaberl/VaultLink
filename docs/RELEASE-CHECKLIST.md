@@ -1,13 +1,16 @@
-# v0.3.5 release checklist
+# v0.4.0 release checklist
 
-Stand: 2026-07-11 nach dem vollständigen SSR-GUI-Redesign, Upload-Queue, Monatsstatistiken, optionalem Audit-IP-Logging und den Setup-/Admin-UI-Abnahmen.
+Stand: 2026-07-11 nach der 0.4.0-Integration von DE/EN, „Mein Konto“, lokalem Admin-Recovery und dem Headless-Setup über SSH-Tunnel.
 
 Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf `main`; ein Tag wird ausschließlich bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
-## Feature-Scope für 0.3.5
+## Feature-Scope für 0.4.0
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
-- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.3.5.
+- [x] „Mein Konto“ für eigene Passwortänderungen mit aktuellem Passwort sowie zweistufigen MFA-Wechsel; das alte Secret bleibt bis zum bestätigten neuen TOTP-Code aktiv.
+- [x] Lokaler `recover-admin`-Notfallpfad über SSH/Hostzugriff mit `--config` oder direktem `--database`, atomarem Credential-Wechsel, Session-/Pending-Widerruf und secret-freiem Audit.
+- [x] Deutsch/Englisch in Setup-, Auth-, Admin- und Public-Flows; Cookie vor `Accept-Language`, Englisch als Fallback, locale-gerechte Datums-/Zahlen-/JavaScript-Ausgabe.
+- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.4.0.
 - [x] Admin-Dateiverwaltung zum Erstellen von Ordnern, No-Clobber-Umbenennen und permanenten rekursiven Löschen mit serverseitiger Bestätigung sowie clientseitigem Exact-Match-Gating.
 - [x] Begrenzte, neustartfähige Tombstone-Bereinigung mit global serialisierten Cleanup-Workern und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
 - [x] API und UI teilen Auth-, Session-, CSRF-, SecureFS-, SQLite-, Runtime-Settings- und Audit-Logik.
@@ -28,18 +31,18 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Admin-UI für zusätzliche Admins; TOTP-Secret wird genau einmal angezeigt. Initial-Setup kann ein noch nicht bestätigtes Secret lokal und passwortgebunden wiederanzeigen.
 - [x] Runtime-editierbare Policy-Settings in SQLite, nicht in `/etc/vaultlink/config.toml`.
 - [x] Audit-Dashboard mit Pagination und Action-Filter.
-- [x] Loopback-only Setup-UI: `vaultlink setup --config <path> --listen 127.0.0.1:8090`.
+- [x] Loopback-only Setup-UI (`vaultlink setup --config <path> --listen 127.0.0.1:8090`) mit dokumentiertem Headless-Zugriff über einen expliziten IPv4-SSH-Tunnel: `ssh -4 -N -L 127.0.0.1:8090:127.0.0.1:8090 user@server`.
 - [x] Setup überschreibt keine bestehende Konfiguration; Config-ohne-Admin und committed Admin vor verlorener TOTP-Antwort sind wiederaufnehmbar.
 - [x] Pro-Share SecureFS-Capabilities verhindern Symlink-Wechsel in Sibling-Shares für Listing, Preview, Download, ZIP und Upload.
 - [x] Gepufferte Form-/JSON-Bodies sind klein begrenzt; ausschließlich Uploadrouten erhalten den großen Streaming-Rahmen. Ein konstanter Streaming-Guard begrenzt Präambel und jeden Multipart-Headerblock, zusätzlich sind Feldanzahl und Metadaten klein begrenzt.
 - [x] Reverse-Proxy-Modus, Standalone-TLS-Modus, SIGHUP-Zertifikatsreload für PEM-Dateien.
 - [x] Optionaler Built-in-Let's-Encrypt-Standalone-TLS-Modus über `tls-alpn-01` und `rustls-acme`.
 - [x] ZeroSSL/acme.sh Renewal-Dokumentation und systemd-Beispiele.
-- [x] UI-/UX-Polish mit getrennten Auth/Public/Admin-Shells, Logo/Favicon, deutschem Date-Time-Picker, dezimalen MB/GB-Einheiten und konsistenten Buttons/Switches.
+- [x] UI-/UX-Polish mit getrennten Auth/Public/Admin-Shells, Logo/Favicon, locale-gerechtem Date-Time-Picker, dezimalen MB/GB-Einheiten und konsistenten Buttons/Switches.
 - [x] Public Upload-Fehlerseiten für validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Größenlimits, fehlende Dateinamen und Speicherfehler.
 - [x] Fuzzing für Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, Upload-Validierung und API-Request-Policy.
 
-## Bewusste Nicht-Ziele für 0.3.5
+## Bewusste Nicht-Ziele für 0.4.0
 
 - DEB-Paket.
 - ARM64-Build.
@@ -56,20 +59,16 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - [x] `cargo test --locked --all-targets`
-  - Ergebnis: 119 Tests unter Windows bestanden; zusätzlich 126 Tests im final neu gebauten Rust-1.97.0-/Debian-13-Container.
-  - Enthalten: API Login/MFA/Session/CSRF, API-URL-/Listen-Restart-Sicherheit, API-scoped Unlock/Media-Preview, Share-Erstellung, Secret-Redaction, Admin-/Settings-API, delegierte API-Uploadfehler als JSON, Setup-UI/-Recovery, UTF-8-Response-/Source-Guards, transaktionale Admin-/Runtime-Pfade, Text-/Bild-/PDF-Preview, Transfer-Grant/Abort/Range-Resume einschließlich HTTP/1-`Content-Length`, Raw-Preview-Token, inkrementelles ZIP, rohe Scanbudgets, Multipart-Präambel/-Header, Body-Limits, `%`-Dateinamens-Roundtrip, Upload-No-Replace/-Replace/-Durability, Share-Rechte, Migrationen und resumierbares Upload-Cleanup.
-- [x] `cargo check --manifest-path fuzz/Cargo.toml --locked`
+  - Ergebnis: 173 Library-Tests und 6 Binary-/CLI-Tests unter Windows bestanden.
+  - Enthalten: Account-Passwort/MFA, Recovery-Races, DE/EN-Hauptrouten und Setup, API Login/MFA/Session/CSRF, Secret-Redaction, Setup-Recovery, UTF-8, SecureFS, Preview, Transfers, ZIP, Multipart, Body-Limits, Upload-Atomizität und Migrationen.
+- [x] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
   - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy` und `api_request_policy` kompiliert.
-- [x] `cargo audit --deny warnings` und `cargo audit --deny warnings --file fuzz/Cargo.lock`
-  - Beide Lockfiles (`Cargo.lock`, `fuzz/Cargo.lock`) ohne bekannte Vulnerabilities/Warnings.
-- [x] `make policy-check`
-  - Externe Actions auf volle Commit-SHAs und Container auf Digests gepinnt; Stable-Rust-Version und Smoke-/Release-Image synchron; Cargo-CI-Tools versioniert; Docker-Secret-Ausschlüsse vorhanden.
-- [x] `make docker-smoke`
-  - Da GNU Make auf dem Windows-Host nicht installiert ist, wurden die identischen Docker-Build-/Run-Befehle direkt ausgeführt.
-  - Ergebnis auf dem final neu gebauten, digest-gepinnten Rust-1.97.0-/Debian-13-Image: Setup-UI, API Login/MFA/CSRF/Files/Share/Public-Upload-JSON-Fehler sowie isolierte Upgrade-/Rollback-Erfolgs- und Fehlerpfade erfolgreich mit `--network none` geprüft.
-  - Zusätzlich im selben Image grün: Linux-Rustfmt, Clippy über alle Targets/Features mit `-D warnings`, 126/126 Tests inklusive `openat2`-/Symlink-/FIFO-Schutz, Release-Build, Fuzz-Crate-Check, ShellCheck und Supply-Chain-Policy.
+- [x] `cargo build --release --locked`
+- [ ] `cargo audit --deny warnings` für beide Lockfiles auf dem finalen Stand wiederholen.
+- [ ] `make policy-check` beziehungsweise das Shell-Skript in einer Umgebung mit `sh` wiederholen.
+- [ ] `make docker-smoke` auf dem finalen 0.4.0-Stand wiederholen.
 
-## Beobachtung vor dem 0.3.2-Upgrade
+## Historische Beobachtung vor dem 0.3.2-Upgrade
 
 - [x] Bestehendes `0.3.0`-Binary auf beiden Testsystemen vor jeder Änderung geprüft; identischer SHA-256 `d6def1640bf8c93ddb5f30689731c4f3f2efb62d13c949b75a0012bd0cfb2946`.
 - [x] Reverse-Proxy-Testsystem nach 10 h 11 min und Standalone-TLS-Testsystem nach 10 h 08 min weiterhin `active/running`, jeweils `NRestarts=0` und ohne fehlgeschlagene systemd-Units.
@@ -77,7 +76,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [x] Aktueller RSS 10.5 MiB auf dem Reverse-Proxy-System und 13.0 MiB auf dem Standalone-TLS-System; im ausgewerteten Dienstjournal keine VaultLink-Warnungen, Panics oder Fehler.
 - [ ] Diese Beobachtung ist kein formaler Soak-Gate: Es lief weder `soak-monitor.sh` noch das Lastprofil. Der finale 72h-Soak wurde bewusst noch nicht gestartet.
 
-## Debian-13-/Docker-Verifikation und noch offene Runtime-Deploys
+## Historische 0.3.x-Debian-/Docker-Verifikation
 
 - [x] Digest-gepinntes Debian-13-amd64-Testimage, Build im Container und read-only Workspace-Mount nur für Fuzz-/Shell-Checks:
   - `cargo fmt --all -- --check`
@@ -182,7 +181,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64. Arbeiten erfolgen direkt auf
 - [ ] `make policy-check` grün; alle Dependabot-Pin-Updates gegen die jeweiligen Upstream-Repositories geprüft.
 - [ ] Staging- und Public-Gates grün.
 - [ ] 72h-Soak bestanden.
-- [ ] Annotierten Tag `v0.3.5` erstellen.
+- [ ] Annotierten Tag `v0.4.0` erstellen.
 - [ ] Tag-Release-Workflow prüfen:
   - GitHub Release ist privat,
   - Artefakte stammen ausschließlich aus CI,

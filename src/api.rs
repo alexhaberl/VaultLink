@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth,
     db::{
-        AdminDeactivationOutcome, AdminSummary, AuditEvent, Permission, Share,
-        UploadConflictStrategy,
+        AdminDeactivationOutcome, AdminSummary, AuditEvent, PasswordSessionCreationOutcome,
+        Permission, Share, UploadConflictStrategy,
     },
     file_ops,
     http_auth::{
@@ -245,9 +245,10 @@ async fn login(
     }
     let username = form.username.clone();
     let admin = database(state.db.clone(), move |db| db.admin(&username)).await?;
-    let password_hash = admin.as_ref().map(|admin| admin.password_hash.clone());
+    let expected_password_hash = admin.as_ref().map(|admin| admin.password_hash.clone());
+    let verification_hash = expected_password_hash.clone();
     let password = form.password;
-    let valid = tokio::task::spawn_blocking(move || match password_hash {
+    let valid = tokio::task::spawn_blocking(move || match verification_hash {
         Some(hash) => auth::verify_password(&hash, &password),
         None => {
             let _ = auth::hash_password(&password);
@@ -266,8 +267,6 @@ async fn login(
             "Ungültige Zugangsdaten",
         ));
     }
-    state.limiter.success(&key);
-    state.limiter.success(&ip_key);
     let admin = admin.expect("valid password requires active admin");
     let token = auth::random_token(32);
     let csrf = auth::random_token(24);
@@ -275,10 +274,29 @@ async fn login(
     let session_token = token.clone();
     let session_csrf = csrf.clone();
     let admin_id = admin.id;
-    database(state.db.clone(), move |db| {
-        db.create_session(&session_token, admin_id, &session_csrf, expires)
+    let expected_password_hash = expected_password_hash.expect("valid password requires a hash");
+    let outcome = database(state.db.clone(), move |db| {
+        db.create_session_for_verified_password(
+            &session_token,
+            admin_id,
+            &expected_password_hash,
+            &session_csrf,
+            expires,
+        )
     })
     .await?;
+    if outcome != PasswordSessionCreationOutcome::Created {
+        state.limiter.failure(&key);
+        state.limiter.failure(&ip_key);
+        audit(&state, form.username, "login_failed", None, None).await;
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Ungültige Zugangsdaten",
+        ));
+    }
+    state.limiter.success(&key);
+    state.limiter.success(&ip_key);
     audit(&state, admin.username, "password_verified", None, None).await;
     let mut response = Json(LoginResponse {
         mfa_required: true,
@@ -1192,7 +1210,7 @@ async fn reset_admin_password(
     csrf_header(&session_data, &headers)?;
     if id == session_data.admin_id {
         return Err(ApiError::bad_request(
-            "Eigenes Passwort wird in 0.3 nicht über diese API geändert",
+            "Das eigene Passwort wird über „Mein Konto“ geändert",
         ));
     }
     validate_admin_password(&request.password)?;
@@ -1227,7 +1245,7 @@ async fn reset_admin_totp(
     csrf_header(&session_data, &headers)?;
     if id == session_data.admin_id {
         return Err(ApiError::bad_request(
-            "Eigene MFA wird in 0.3 nicht über diese API geändert",
+            "Die eigene MFA wird über „Mein Konto“ geändert",
         ));
     }
     let secret = auth::new_totp_secret();

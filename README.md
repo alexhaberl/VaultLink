@@ -2,7 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Zielplattform ist Debian Linux; Entwicklung und Tests funktionieren auch unter Debian/Ubuntu in WSL.
 
-Status: `0.3.5`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
+Status: `0.4.0`-Kandidat für ein privates Debian-13-amd64-Release. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
@@ -92,7 +92,11 @@ ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenz
 | Route | Methode | Zweck |
 |---|---:|---|
 | `/login`, `/mfa`, `/logout` | GET/POST | zweistufige Adminauthentifizierung |
+| `/locale` | POST | Deutsch/Englisch-Auswahl im gehärteten Locale-Cookie speichern |
 | `/admin` | GET | Root-begrenzter Dateibrowser |
+| `/admin/account` | GET | aktuellen Benutzer und eigene Credential-Aktionen anzeigen |
+| `/admin/account/password` | POST | eigenes Passwort nach erneuter Passwortprüfung ändern |
+| `/admin/account/mfa/start`, `/admin/account/mfa/confirm` | POST | MFA-Wechsel beginnen und mit dem neuen TOTP-Code bestätigen |
 | `/admin/preview` | GET | Admin-Preview-Seite |
 | `/admin/preview/raw` | GET/HEAD | Raw-Bild/PDF-Preview für Admins |
 | `/admin/shares` | GET/POST | Links auflisten/erstellen |
@@ -113,7 +117,7 @@ ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenz
 
 `max_downloads` begrenzt abgeschlossene Inhaltsübertragungen (Download, ZIP und gezählte Vorschau), nicht den Aufruf der öffentlichen Metadaten-/Landingpage oder Uploads. `HEAD` liefert nur dann Metadaten, wenn derselbe logische `GET` mit der aktuellen Transfer-Session beginnen dürfte, verbraucht selbst aber keine Quote.
 
-Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.3.x` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
+Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.4.0` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
 
 Wichtige API-Routen:
 
@@ -149,7 +153,11 @@ Interne absolute Pfade, Passwort-Hashes, Session-Hashes, Unlock-/Preview-/Transf
 
 ## 6. UI und UX
 
-Die Admin-UI bietet Login, MFA, Dateibrowser, Linkverwaltung, Admin-Anlage, Einstellungen und Audit. Der Dateibrowser hat Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der aktuellen Auswahl.
+Die Admin-UI bietet Login, MFA, Dateibrowser, Linkverwaltung, Admin-Anlage, Einstellungen, Audit und „Mein Konto“. Dort kann der angemeldete Benutzer nach erneuter Passwortprüfung das eigene Passwort ändern oder MFA zweistufig ersetzen. Das bisherige TOTP-Secret bleibt gültig, bis ein Code des neuen Authenticators erfolgreich bestätigt wurde; danach werden alle Sessions beendet.
+
+Setup, Login, Admin- und Public-Seiten sind auf Deutsch und Englisch verfügbar. Eine explizite Auswahl im `vaultlink_locale`-Cookie hat Vorrang vor `Accept-Language`; für unbekannte oder fehlende Browser-Sprachen ist Englisch der Fallback. Dynamische Benutzernamen, Dateinamen, Aliase und Auditwerte werden dabei nicht übersetzt.
+
+Der Dateibrowser hat Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der aktuellen Auswahl.
 
 Öffentliche Ordnerfreigaben mit Downloadrecht bieten Breadcrumbs, Suche, ZIP, Download und Preview. `download_upload` erlaubt Upload in den aktuell navigierten Unterordner. `upload_only` zeigt keine Dateinamen.
 
@@ -251,17 +259,98 @@ sudo useradd --system --home /var/lib/vaultlink --shell /usr/sbin/nologin vaultl
 sudo install -d -o root -g vaultlink -m 0750 /opt/vaultlink /etc/vaultlink /etc/vaultlink/tls
 sudo install -d -o vaultlink -g vaultlink -m 0750 /var/lib/vaultlink /var/log/vaultlink
 sudo install -o root -g root -m 0755 target/release/vaultlink /opt/vaultlink/vaultlink
-sudo install -o root -g vaultlink -m 0640 config/production-reverse-proxy.toml /etc/vaultlink/config.toml
 sudo install -o root -g root -m 0644 deploy/vaultlink.service /etc/systemd/system/vaultlink.service
 sudo systemctl daemon-reload
 ```
 
-`ReadWritePaths=/mnt/storage` in [deploy/vaultlink.service](deploy/vaultlink.service) an den echten Mount anpassen. Admin initialisieren:
+`ReadWritePaths=/mnt/storage` in [deploy/vaultlink.service](deploy/vaultlink.service) an den echten Mount anpassen. Der Betriebssystembenutzer `vaultlink` benötigt außerdem die beabsichtigten Rechte am Storage-Mount.
+
+### Erstkonfiguration im Browser über SSH-Tunnel
+
+Das Setup lauscht absichtlich nur auf Loopback. Auf einem Server ohne grafische Oberfläche läuft der Browser auf dem eigenen Rechner; der SSH-Tunnel transportiert die Verbindung verschlüsselt zum lokalen Setup-Listener. Zuerst eine normale SSH-Sitzung zum Server öffnen:
 
 ```sh
+ssh admin@server.example.com
+```
+
+In dieser Sitzung das Setup als späteren Dienstbenutzer starten. Die Konfiguration wird zunächst in einem privaten Staging-Verzeichnis abgelegt, weil `/etc/vaultlink` bewusst nicht für den Dienstbenutzer schreibbar ist:
+
+```sh
+sudo install -d -o vaultlink -g vaultlink -m 0700 /var/lib/vaultlink/setup
+sudo -u vaultlink /opt/vaultlink/vaultlink setup \
+  --config /var/lib/vaultlink/setup/config.toml \
+  --listen 127.0.0.1:8090
+```
+
+Das Setup gibt einen expliziten IPv4-Tunnel aus. Diesen in einem zweiten Terminal auf dem eigenen Rechner öffnen und offen lassen; `-4` erzwingt IPv4 auch für die SSH-Verbindung:
+
+```sh
+ssh -4 -N -L 127.0.0.1:8090:127.0.0.1:8090 admin@server.example.com
+```
+
+Danach die ausgegebene lokale URL `http://127.0.0.1:8090/?token=...` auf dem eigenen Rechner öffnen. Für den empfohlenen Reverse-Proxy-Modus sind `127.0.0.1:8080` als **VaultLink-Dienstadresse nach dem Setup**, die öffentliche HTTPS-URL, der echte Storage-Mount und `/var/lib/vaultlink` als Data Directory passende Werte. Der SSH-Tunnel gilt nur für das Setup; die spätere öffentliche URL läuft über den konfigurierten Reverse Proxy.
+
+Nach dem Speichern des TOTP-Secrets auf der Bestätigungsseite nicht den direkten Serverstart wählen, sondern den Setup-Prozess im Serverterminal mit `Strg+C` beenden. Anschließend die erzeugte Konfiguration mit restriktiven Rechten installieren, das Staging-Verzeichnis entfernen und den Systemdienst starten:
+
+```sh
+sudo install -o root -g vaultlink -m 0640 \
+  /var/lib/vaultlink/setup/config.toml /etc/vaultlink/config.toml
+sudo -u vaultlink rm /var/lib/vaultlink/setup/config.toml
+sudo rmdir /var/lib/vaultlink/setup
+sudo -u vaultlink test -r /etc/vaultlink/config.toml
+sudo systemctl enable --now vaultlink
+```
+
+So bleiben Konfiguration und TLS-Pfade unter Kontrolle von `root`, während Datenbank und Laufzeitdaten von Anfang an `vaultlink` gehören. Das Setup darf nicht mit `--listen 0.0.0.0:8090` ins LAN gestellt werden; eine Nicht-Loopback-Ausnahme gibt es bewusst nicht.
+
+### Alternative: Konfiguration ohne Web-Setup
+
+Wer die Beispielkonfiguration manuell anpasst, installiert sie direkt und legt den ersten Admin im Terminal an:
+
+```sh
+sudo install -o root -g vaultlink -m 0640 config/production-reverse-proxy.toml /etc/vaultlink/config.toml
 sudo -u vaultlink /opt/vaultlink/vaultlink init-admin --config /etc/vaultlink/config.toml --username admin
 sudo systemctl enable --now vaultlink
 ```
+
+### Lokale Admin-Wiederherstellung
+
+Wenn Passwort oder MFA des einzigen Admins verloren wurden, erfolgt die Wiederherstellung bewusst über den bereits vorausgesetzten SSH-/Hostzugriff. Den Befehl immer als Dienstbenutzer `vaultlink` ausführen, damit SQLite-Datenbank sowie WAL-/SHM-Dateien nicht versehentlich dem Benutzer `root` gehören:
+
+```sh
+# Nur das Passwort neu setzen
+sudo -u vaultlink /opt/vaultlink/vaultlink recover-admin \
+  --config /etc/vaultlink/config.toml \
+  --username admin \
+  --reset-password
+
+# Nur MFA neu einrichten
+sudo -u vaultlink /opt/vaultlink/vaultlink recover-admin \
+  --config /etc/vaultlink/config.toml \
+  --username admin \
+  --reset-mfa
+
+# Passwort und MFA gemeinsam und atomar ersetzen
+sudo -u vaultlink /opt/vaultlink/vaultlink recover-admin \
+  --config /etc/vaultlink/config.toml \
+  --username admin \
+  --reset-password \
+  --reset-mfa
+```
+
+Der Passwortwert wird interaktiv und ohne Kommandozeilenargument abgefragt. Bei einem MFA-Reset folgt nach dem erfolgreichen Datenbank-Commit ein einmaliger Ausgabeblock mit dem neuen TOTP-Secret und der zugehörigen `otpauth://`-URI. Jede Wiederherstellung widerruft alle Sessions und noch nicht abgeschlossene MFA-Neuregistrierungen dieses Admins und schreibt ein Audit-Ereignis ohne Credential-Inhalte.
+
+Falls die normale Konfiguration beschädigt oder wegen fehlender TLS-Dateien nicht mehr validierbar ist, kann der Notfallpfad direkt auf die Datenbank zeigen:
+
+```sh
+sudo -u vaultlink /opt/vaultlink/vaultlink recover-admin \
+  --database /var/lib/vaultlink/data.sqlite \
+  --username admin \
+  --reset-password \
+  --reset-mfa
+```
+
+Ein stillgelegter Admin bleibt auch nach der Credential-Wiederherstellung stillgelegt. Ein dauerhaft öffentlicher Passwort-/MFA-Reset-Endpunkt ist absichtlich nicht vorhanden.
 
 Firewall: bei Reverse Proxy nur 80/443 für Caddy/Nginx öffnen und VaultLink auf Loopback lassen. Bei Standalone nur 443 öffnen.
 

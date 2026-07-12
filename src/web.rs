@@ -39,9 +39,10 @@ use tower_http::{
 use crate::{
     auth,
     db::{
-        AdminDeactivationOutcome, Database, Permission, Session, Share,
-        TransferAvailabilityOutcome, TransferLeaseBeginOutcome, TransferLeaseCompleteOutcome,
-        UploadConflictStrategy,
+        AdminDeactivationOutcome, AdminMfaEnrollmentActivationOutcome,
+        AdminMfaEnrollmentStartOutcome, AdminPasswordChangeOutcome, Database,
+        PasswordSessionCreationOutcome, Permission, Session, Share, TransferAvailabilityOutcome,
+        TransferLeaseBeginOutcome, TransferLeaseCompleteOutcome, UploadConflictStrategy,
     },
     file_ops,
     http_auth::{
@@ -50,6 +51,7 @@ use crate::{
         redirect_with_cookie, runtime_settings, session, share_is_unlocked, transfer_cookie,
         with_audit_client_ip, MissingSession, TransferCookieScope, UnlockCookieScope,
     },
+    i18n::{self, Locale, MessageKey},
     path_security, proxy,
     range::parse_byte_range,
     runtime,
@@ -71,11 +73,15 @@ impl IntoResponse for AppError {
         if self.0.is_redirection() {
             return Redirect::to(self.1).into_response();
         }
+        let message = i18n::text_from_german(i18n::current_locale(), self.1);
         (
             self.0,
             Html(plain_page(
                 "Fehler",
-                &format!("<section><h1>Fehler</h1><p>{}</p></section>", esc(self.1)),
+                &format!(
+                    r#"<section><h1><vl-i18n key="common.error"/></h1><p>{}</p></section>"#,
+                    esc(&message)
+                ),
             )),
         )
             .into_response()
@@ -100,8 +106,13 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(|| async { Redirect::to("/admin") }))
         .route("/login", get(login_page).post(login))
         .route("/mfa", get(mfa_page).post(mfa))
+        .route("/locale", post(set_locale))
         .route("/logout", post(logout))
         .route("/admin", get(admin_browser))
+        .route("/admin/account", get(account_page))
+        .route("/admin/account/password", post(change_account_password))
+        .route("/admin/account/mfa/start", post(start_account_mfa))
+        .route("/admin/account/mfa/confirm", post(confirm_account_mfa))
         .route("/admin/files/directories", post(create_directory_ui))
         .route(
             "/admin/files/upload",
@@ -189,7 +200,66 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             security_headers,
         ))
+        .layer(middleware::from_fn(locale_context))
         .with_state(state)
+}
+
+async fn locale_context(req: Request, next: Next) -> Response {
+    let locale = Locale::resolve(req.headers());
+    let return_to = locale_return_to(req.method(), req.uri());
+    i18n::scope(locale, return_to, async move {
+        let mut response = next.run(req).await;
+        let is_localized_content = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.starts_with("text/html") || value.starts_with("application/javascript")
+            });
+        if is_localized_content {
+            response.headers_mut().insert(
+                header::CONTENT_LANGUAGE,
+                HeaderValue::from_static(locale.code()),
+            );
+        }
+        response
+    })
+    .await
+}
+
+fn locale_return_to(method: &Method, uri: &Uri) -> String {
+    let current = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    if matches!(*method, Method::GET | Method::HEAD) {
+        return current.to_string();
+    }
+
+    match uri.path() {
+        "/login"
+        | "/mfa"
+        | "/admin/shares"
+        | "/admin/admins"
+        | "/admin/settings"
+        | "/admin/settings/audit-ips/delete" => current.to_string(),
+        "/admin/files/delete" => "/admin".to_string(),
+        "/logout" => "/login".to_string(),
+        path if path.starts_with("/admin/account/") => "/admin/account".to_string(),
+        path if path.starts_with("/admin/files/") => "/admin".to_string(),
+        path if path.starts_with("/admin/shares/") => "/admin/shares".to_string(),
+        path if path.starts_with("/admin/admins/") => "/admin/admins".to_string(),
+        path if path.starts_with("/v/") => {
+            let token = path
+                .strip_prefix("/v/")
+                .and_then(|value| value.split('/').next())
+                .filter(|value| !value.is_empty());
+            token
+                .map(|token| format!("/v/{token}"))
+                .unwrap_or_else(|| "/".to_string())
+        }
+        _ => "/".to_string(),
+    }
 }
 
 async fn audit_client_ip_context(
@@ -271,26 +341,28 @@ async fn stylesheet_asset() -> impl IntoResponse {
 }
 
 async fn app_js() -> impl IntoResponse {
+    let script = format!(
+        "{}\n{}",
+        r#"document.addEventListener('click',async e=>{const closer=e.target.closest('[data-details-close]');if(closer){closer.closest('details')?.removeAttribute('open');return;}const b=e.target.closest('[data-copy]');if(!b)return;try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='<vl-i18n key="common.copied"/>';}catch(_){b.textContent='<vl-i18n key="common.copy_failed"/>';}});
+const pad=n=>String(n).padStart(2,'0');
+function fillSelect(select,from,to,current){select.innerHTML='';for(let i=from;i<=to;i++){const o=document.createElement('option');o.value=String(i);o.textContent=String(i).padStart(select.dataset.pad||0,'0');if(i===current)o.selected=true;select.appendChild(o);}}
+function daysInMonth(y,m){return new Date(y,m,0).getDate();}
+function initDateTimePicker(picker){const input=picker.querySelector('[data-datetime-input]');const pop=picker.querySelector('[data-datetime-popover]');const toggle=picker.querySelector('[data-datetime-toggle]');const year=picker.querySelector('[data-dt-year]');const month=picker.querySelector('[data-dt-month]');const day=picker.querySelector('[data-dt-day]');const hour=picker.querySelector('[data-dt-hour]');const minute=picker.querySelector('[data-dt-minute]');const now=new Date();fillSelect(year,now.getFullYear(),now.getFullYear()+5,now.getFullYear());fillSelect(month,1,12,now.getMonth()+1);fillSelect(hour,0,23,23);fillSelect(minute,0,59,0);function syncDays(){const selected=Number(day.value)||now.getDate();fillSelect(day,1,daysInMonth(Number(year.value),Number(month.value)),Math.min(selected,daysInMonth(Number(year.value),Number(month.value))))}function setOpen(open){pop.hidden=!open;toggle.setAttribute('aria-expanded',String(open));if(open)year.focus();}syncDays();[year,month].forEach(s=>s.addEventListener('change',syncDays));toggle.addEventListener('click',()=>setOpen(pop.hidden));picker.addEventListener('keydown',e=>{if(e.key==='Escape'){setOpen(false);toggle.focus();}});picker.querySelector('[data-datetime-apply]').addEventListener('click',()=>{const date=document.documentElement.lang==='de'?`${pad(day.value)}.${pad(month.value)}.${year.value}`:`${year.value}-${pad(month.value)}-${pad(day.value)}`;input.value=`${date} ${pad(hour.value)}:${pad(minute.value)}`;setOpen(false);});picker.querySelector('[data-datetime-clear]').addEventListener('click',()=>{input.value='';setOpen(false);});}
+function initDeleteConfirmation(form){const input=form.querySelector('[data-confirm-input]');const button=form.querySelector('[data-confirm-delete]');if(!input||!button)return;const sync=()=>{button.disabled=input.value!==form.dataset.requiredName;};input.addEventListener('input',sync);sync();input.focus();}
+document.addEventListener('click',e=>{document.querySelectorAll('[data-datetime-picker]').forEach(p=>{if(!p.contains(e.target)){const pop=p.querySelector('[data-datetime-popover]');const toggle=p.querySelector('[data-datetime-toggle]');if(pop)pop.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');}});});
+function initFileSelection(){const bar=document.querySelector('[data-selection-bar]');const link=bar?.querySelector('[data-selection-share]');const name=bar?.querySelector('[data-selection-name]');if(!bar||!link||!name)return;document.querySelectorAll('[data-file-select]').forEach(input=>input.addEventListener('change',()=>{if(!input.checked)return;name.textContent=`${input.value||'/'} <vl-i18n key="files.selected"/>`;link.href=`/admin/shares/new?path=${encodeURIComponent(input.value)}`;bar.hidden=false;}));}
+function initShareReview(){const form=document.querySelector('[data-share-create]');if(!form)return;const review=form.parentElement.querySelector('[data-share-review]');const passwordToggle=form.querySelector('[data-password-toggle]');const passwordFields=form.querySelector('[data-password-fields]');const uploadRules=form.querySelector('[data-upload-rules]');const permissionLabels={download_only:'<vl-i18n key="share.download_only"/>',upload_only:'<vl-i18n key="share.upload_only"/>',download_upload:'<vl-i18n key="share.download_upload"/>'};const sync=()=>{const permission=form.querySelector('[name="permission"]:checked')?.value||form.querySelector('[name="permission"]')?.value||'download_only';const alias=form.elements.alias?.value.trim();const maximum=form.elements.max_downloads?.value.trim();const protectedShare=Boolean(passwordToggle?.checked);if(review){review.querySelector('[data-review-permission]').textContent=permissionLabels[permission]||permission;review.querySelector('[data-review-password]').textContent=protectedShare?'<vl-i18n key="share.password_protected"/>':'<vl-i18n key="share.no_password"/>';review.querySelector('[data-review-limit]').textContent=maximum?`${maximum} <vl-i18n key="share.transfers"/>`:'<vl-i18n key="common.unlimited"/>';const url=review.querySelector('[data-review-url]');if(url){const base=url.textContent.split('/v/')[0].split('/s/')[0];url.textContent=alias?`${base}/s/${alias}`:`${base}/v/••••••••`;}}if(passwordFields){passwordFields.hidden=!protectedShare;passwordFields.querySelectorAll('input').forEach(input=>{input.disabled=!protectedShare;input.required=protectedShare;});}if(uploadRules)uploadRules.hidden=permission==='download_only';};form.addEventListener('input',sync);form.addEventListener('change',sync);sync();}
+document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);initFileSelection();initShareReview();});
+document.addEventListener('submit',e=>{e.target.querySelectorAll('[data-tz-offset]').forEach(i=>{i.value=String(new Date().getTimezoneOffset())})});"#,
+        crate::ui::UPLOAD_QUEUE_JAVASCRIPT
+    );
+    let script = i18n::render_markers(i18n::current_locale(), &script);
     (
         [(
             header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
         )],
-        format!(
-            "{}\n{}",
-            r#"document.addEventListener('click',async e=>{const closer=e.target.closest('[data-details-close]');if(closer){closer.closest('details')?.removeAttribute('open');return;}const b=e.target.closest('[data-copy]');if(!b)return;try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='Kopiert';}catch(_){b.textContent='Kopieren fehlgeschlagen';}});
-const pad=n=>String(n).padStart(2,'0');
-function fillSelect(select,from,to,current){select.innerHTML='';for(let i=from;i<=to;i++){const o=document.createElement('option');o.value=String(i);o.textContent=String(i).padStart(select.dataset.pad||0,'0');if(i===current)o.selected=true;select.appendChild(o);}}
-function daysInMonth(y,m){return new Date(y,m,0).getDate();}
-function initDateTimePicker(picker){const input=picker.querySelector('[data-datetime-input]');const pop=picker.querySelector('[data-datetime-popover]');const toggle=picker.querySelector('[data-datetime-toggle]');const year=picker.querySelector('[data-dt-year]');const month=picker.querySelector('[data-dt-month]');const day=picker.querySelector('[data-dt-day]');const hour=picker.querySelector('[data-dt-hour]');const minute=picker.querySelector('[data-dt-minute]');const now=new Date();fillSelect(year,now.getFullYear(),now.getFullYear()+5,now.getFullYear());fillSelect(month,1,12,now.getMonth()+1);fillSelect(hour,0,23,23);fillSelect(minute,0,59,0);function syncDays(){const selected=Number(day.value)||now.getDate();fillSelect(day,1,daysInMonth(Number(year.value),Number(month.value)),Math.min(selected,daysInMonth(Number(year.value),Number(month.value))))}function setOpen(open){pop.hidden=!open;toggle.setAttribute('aria-expanded',String(open));if(open)year.focus();}syncDays();[year,month].forEach(s=>s.addEventListener('change',syncDays));toggle.addEventListener('click',()=>setOpen(pop.hidden));picker.addEventListener('keydown',e=>{if(e.key==='Escape'){setOpen(false);toggle.focus();}});picker.querySelector('[data-datetime-apply]').addEventListener('click',()=>{input.value=`${pad(day.value)}.${pad(month.value)}.${year.value} ${pad(hour.value)}:${pad(minute.value)}`;setOpen(false);});picker.querySelector('[data-datetime-clear]').addEventListener('click',()=>{input.value='';setOpen(false);});}
-function initDeleteConfirmation(form){const input=form.querySelector('[data-confirm-input]');const button=form.querySelector('[data-confirm-delete]');if(!input||!button)return;const sync=()=>{button.disabled=input.value!==form.dataset.requiredName;};input.addEventListener('input',sync);sync();input.focus();}
-document.addEventListener('click',e=>{document.querySelectorAll('[data-datetime-picker]').forEach(p=>{if(!p.contains(e.target)){const pop=p.querySelector('[data-datetime-popover]');const toggle=p.querySelector('[data-datetime-toggle]');if(pop)pop.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');}});});
-function initFileSelection(){const bar=document.querySelector('[data-selection-bar]');const link=bar?.querySelector('[data-selection-share]');const name=bar?.querySelector('[data-selection-name]');if(!bar||!link||!name)return;document.querySelectorAll('[data-file-select]').forEach(input=>input.addEventListener('change',()=>{if(!input.checked)return;name.textContent=`${input.value||'/'} ausgewählt`;link.href=`/admin/shares/new?path=${encodeURIComponent(input.value)}`;bar.hidden=false;}));}
-function initShareReview(){const form=document.querySelector('[data-share-create]');if(!form)return;const review=form.parentElement.querySelector('[data-share-review]');const passwordToggle=form.querySelector('[data-password-toggle]');const passwordFields=form.querySelector('[data-password-fields]');const uploadRules=form.querySelector('[data-upload-rules]');const permissionLabels={download_only:'Nur Download',upload_only:'Nur Upload',download_upload:'Download + Upload'};const sync=()=>{const permission=form.querySelector('[name="permission"]:checked')?.value||form.querySelector('[name="permission"]')?.value||'download_only';const alias=form.elements.alias?.value.trim();const maximum=form.elements.max_downloads?.value.trim();const protectedShare=Boolean(passwordToggle?.checked);if(review){review.querySelector('[data-review-permission]').textContent=permissionLabels[permission]||permission;review.querySelector('[data-review-password]').textContent=protectedShare?'Passwort geschützt':'Ohne Passwort';review.querySelector('[data-review-limit]').textContent=maximum?`${maximum} Übertragungen`:'Unbegrenzt';const url=review.querySelector('[data-review-url]');if(url){const base=url.textContent.split('/v/')[0].split('/s/')[0];url.textContent=alias?`${base}/s/${alias}`:`${base}/v/••••••••`;}}if(passwordFields){passwordFields.hidden=!protectedShare;passwordFields.querySelectorAll('input').forEach(input=>{input.disabled=!protectedShare;input.required=protectedShare;});}if(uploadRules)uploadRules.hidden=permission==='download_only';};form.addEventListener('input',sync);form.addEventListener('change',sync);sync();}
-document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);initFileSelection();initShareReview();});
-document.addEventListener('submit',e=>{e.target.querySelectorAll('[data-tz-offset]').forEach(i=>{i.value=String(new Date().getTimezoneOffset())})});"#,
-            crate::ui::UPLOAD_QUEUE_JAVASCRIPT
-        ),
+        script,
     )
 }
 
@@ -324,98 +396,259 @@ async fn favicon_png() -> impl IntoResponse {
 
 const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="VaultLink"><defs><linearGradient id="g" x1="9" y1="7" x2="55" y2="59" gradientUnits="userSpaceOnUse"><stop stop-color="#5aa7ff"/><stop offset="1" stop-color="#7c5cff"/></linearGradient><filter id="s" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="6" stdDeviation="5" flood-color="#193b8f" flood-opacity=".35"/></filter></defs><rect width="64" height="64" rx="18" fill="#081226"/><path filter="url(#s)" d="M32 7 51 15v15c0 13-7.8 22.8-19 27-11.2-4.2-19-14-19-27V15L32 7Z" fill="url(#g)"/><path d="M24.4 36.7a7.5 7.5 0 0 1 0-10.6l4.1-4.1a7.5 7.5 0 0 1 10.6 0 2.8 2.8 0 0 1-4 4 1.9 1.9 0 0 0-2.7 0l-4.1 4.1a1.9 1.9 0 0 0 2.7 2.7 2.8 2.8 0 0 1 4 4 7.5 7.5 0 0 1-10.6-.1Z" fill="#f3f7ff"/><path d="M28.8 42a2.8 2.8 0 0 1 0-4 1.9 1.9 0 0 0 2.7 0l4.1-4.1a1.9 1.9 0 0 0-2.7-2.7 2.8 2.8 0 1 1-4-4 7.5 7.5 0 0 1 10.6 10.7L35.4 42a7.5 7.5 0 0 1-10.6 0Z" fill="#dbeafe" opacity=".95"/><path d="M27 32h10" stroke="#081226" stroke-width="4.2" stroke-linecap="round" opacity=".45"/></svg>"##;
 
-fn plain_page(title: &str, body: &str) -> String {
+#[derive(Deserialize)]
+struct LocaleForm {
+    locale: String,
+    return_to: String,
+}
+
+fn safe_internal_return_to(value: &str) -> String {
+    if !value.starts_with('/') || value.starts_with("//") || value.contains('\\') {
+        return "/".to_string();
+    }
+    let Ok(uri) = value.parse::<Uri>() else {
+        return "/".to_string();
+    };
+    if uri.scheme().is_some() || uri.authority().is_some() || uri.path() == "/locale" {
+        return "/".to_string();
+    }
+    uri.path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string())
+}
+
+async fn set_locale(
+    State(state): State<AppState>,
+    Form(form): Form<LocaleForm>,
+) -> Result<Response> {
+    let locale = Locale::parse(&form.locale)
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "Ungültige Sprache"))?;
+    let return_to = safe_internal_return_to(&form.return_to);
+    let cookie = format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000;{}",
+        i18n::LOCALE_COOKIE,
+        locale.code(),
+        if state.config.security.secure_cookie {
+            " Secure;"
+        } else {
+            ""
+        }
+    );
+    let mut response = Redirect::to(&return_to).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(internal)?,
+    );
+    Ok(response)
+}
+
+fn locale_switcher() -> String {
+    let locale = i18n::current_locale();
+    let label = i18n::text(locale, i18n::LANGUAGE);
+    let return_to = i18n::current_return_to();
     format!(
-        r##"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/app.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">Zum Inhalt springen</a><div class="vl-public-shell"><header class="vl-public-header">{}</header><main id="main-content" class="vl-public-main">{}</main></div></body></html>"##,
-        esc(title),
-        crate::ui::brand_lockup("Secure file links"),
+        r#"<form class="vl-locale-switch" method="post" action="/locale" aria-label="{}"><input type="hidden" name="return_to" value="{}"><button class="vl-locale-switch__option" name="locale" value="de" type="submit"{}>DE</button><span aria-hidden="true">/</span><button class="vl-locale-switch__option" name="locale" value="en" type="submit"{}>EN</button></form>"#,
+        esc(label),
+        esc(&return_to),
+        if locale == Locale::De {
+            r#" aria-current="true""#
+        } else {
+            ""
+        },
+        if locale == Locale::En {
+            r#" aria-current="true""#
+        } else {
+            ""
+        },
+    )
+}
+
+fn plain_page(title: &str, body: &str) -> String {
+    let locale = i18n::current_locale();
+    let title = i18n::text_from_german(locale, title);
+    let body = i18n::render_markers(locale, body);
+    format!(
+        r##"<!doctype html><html lang="{}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/app.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">{}</a><div class="vl-public-shell"><header class="vl-public-header">{}{}</header><main id="main-content" class="vl-public-main">{}</main></div></body></html>"##,
+        locale.code(),
+        esc(&title),
+        i18n::text(locale, i18n::SKIP_TO_CONTENT),
+        crate::ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
+        locale_switcher(),
         body
     )
 }
 
-fn current_nav(title: &str) -> &'static str {
-    match title {
-        "Dateien" | "Vorschau" | "Löschen" | "Löschen bestätigen" => "files",
-        "Links" | "Link erstellen" => "links",
-        "Admins" | "Admin MFA" | "Admin erstellt" | "MFA zurückgesetzt" => "admins",
-        "Einstellungen" => "settings",
-        "Audit" | "Audit & Sicherheit" => "audit",
-        _ => "",
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavSection {
+    Files,
+    Links,
+    Admins,
+    Settings,
+    Audit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageId {
+    Account,
+    Files,
+    Preview,
+    DeleteConfirm,
+    Links,
+    CreateLink,
+    Admins,
+    AdminCreated,
+    MfaReset,
+    Settings,
+    AuditSecurity,
+}
+
+impl PageId {
+    const fn title(self) -> MessageKey {
+        match self {
+            Self::Account => i18n::ACCOUNT,
+            Self::Files => i18n::NAV_FILES,
+            Self::Preview => i18n::TITLE_PREVIEW,
+            Self::DeleteConfirm => i18n::TITLE_DELETE_CONFIRM,
+            Self::Links => i18n::NAV_LINKS,
+            Self::CreateLink => i18n::CREATE_LINK,
+            Self::Admins => i18n::NAV_ADMINS,
+            Self::AdminCreated => i18n::TITLE_ADMIN_CREATED,
+            Self::MfaReset => i18n::TITLE_MFA_RESET,
+            Self::Settings => i18n::NAV_SETTINGS,
+            Self::AuditSecurity => i18n::TITLE_AUDIT_SECURITY,
+        }
+    }
+
+    const fn nav(self) -> Option<NavSection> {
+        match self {
+            Self::Account => None,
+            Self::Files | Self::Preview | Self::DeleteConfirm => Some(NavSection::Files),
+            Self::Links | Self::CreateLink => Some(NavSection::Links),
+            Self::Admins | Self::AdminCreated | Self::MfaReset => Some(NavSection::Admins),
+            Self::Settings => Some(NavSection::Settings),
+            Self::AuditSecurity => Some(NavSection::Audit),
+        }
     }
 }
 
 fn admin_page(
     state: &AppState,
-    title: &str,
+    page: PageId,
     body: &str,
     show_create_link: bool,
     csrf_token: &str,
 ) -> String {
+    admin_page_with_locale_switcher(state, page, body, show_create_link, csrf_token, true)
+}
+
+fn admin_page_without_locale_switcher(
+    state: &AppState,
+    page: PageId,
+    body: &str,
+    show_create_link: bool,
+    csrf_token: &str,
+) -> String {
+    admin_page_with_locale_switcher(state, page, body, show_create_link, csrf_token, false)
+}
+
+fn admin_page_with_locale_switcher(
+    state: &AppState,
+    page: PageId,
+    body: &str,
+    show_create_link: bool,
+    csrf_token: &str,
+    show_locale_switcher: bool,
+) -> String {
+    let locale = i18n::current_locale();
+    let title = i18n::text(locale, page.title());
     let create_link = if show_create_link {
         format!(
-            r#"<a class="vl-button" href="/admin/shares/new">{} Link erstellen</a>"#,
-            crate::ui::icon(crate::ui::Icon::Link)
+            r#"<a class="vl-button" href="/admin/shares/new">{} {}</a>"#,
+            crate::ui::icon(crate::ui::Icon::Link),
+            i18n::text(locale, i18n::CREATE_LINK),
         )
     } else {
         String::new()
     };
-    let active = current_nav(title);
+    let active = page.nav();
     let nav = [
         crate::ui::nav_link(
             "/admin",
-            "Dateien",
+            i18n::text(locale, i18n::NAV_FILES),
             crate::ui::Icon::Folder,
-            active == "files",
+            active == Some(NavSection::Files),
         ),
         crate::ui::nav_link(
             "/admin/shares",
-            "Links",
+            i18n::text(locale, i18n::NAV_LINKS),
             crate::ui::Icon::Link,
-            active == "links",
+            active == Some(NavSection::Links),
         ),
         crate::ui::nav_link(
             "/admin/admins",
-            "Admins",
+            i18n::text(locale, i18n::NAV_ADMINS),
             crate::ui::Icon::Users,
-            active == "admins",
+            active == Some(NavSection::Admins),
         ),
         crate::ui::nav_link(
             "/admin/settings",
-            "Einstellungen",
+            i18n::text(locale, i18n::NAV_SETTINGS),
             crate::ui::Icon::Settings,
-            active == "settings",
+            active == Some(NavSection::Settings),
         ),
         crate::ui::nav_link(
             "/admin/audit",
-            "Audit",
+            i18n::text(locale, i18n::NAV_AUDIT),
             crate::ui::Icon::Audit,
-            active == "audit",
+            active == Some(NavSection::Audit),
         ),
     ]
     .join("");
+    let body = i18n::render_markers(locale, body);
     let body = body.replacen("<h1>", "<h2>", usize::MAX);
     let body = body.replacen("</h1>", "</h2>", usize::MAX);
+    let system_panel = i18n::render_markers(locale, &system_panel(state));
+    let locale_switcher = if show_locale_switcher {
+        locale_switcher()
+    } else {
+        String::new()
+    };
     format!(
-        r##"<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/app.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">Zum Inhalt springen</a><div class="vl-app-shell"><aside class="vl-sidebar">{}<nav class="vl-nav" aria-label="Hauptnavigation">{}</nav><div class="vl-system-card"><strong><span aria-hidden="true">●</span> VaultLink erreichbar</strong><span>{}</span></div></aside><div class="vl-content"><header class="vl-topbar"><div><p class="vl-eyebrow">VaultLink Admin</p><h1>{}</h1></div><div class="vl-topbar-actions">{}<form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--secondary">{} Abmelden</button></form></div></header><main id="main-content" class="vl-main">{}</main></div></div></body></html>"##,
+        r##"<!doctype html><html lang="{}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/app.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">{}</a><div class="vl-app-shell"><aside class="vl-sidebar">{}<nav class="vl-nav" aria-label="{}">{}</nav><div class="vl-system-card"><strong><span aria-hidden="true">●</span> {}</strong><span>{}</span></div></aside><div class="vl-content"><header class="vl-topbar"><div><p class="vl-eyebrow">{}</p><h1>{}</h1></div><div class="vl-topbar-actions">{}{}<a class="vl-button vl-button--ghost" href="/admin/account">{} {}</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--secondary">{} {}</button></form></div></header><main id="main-content" class="vl-main">{}</main></div></div></body></html>"##,
+        locale.code(),
         esc(title),
-        crate::ui::brand_lockup("Secure file links"),
+        i18n::text(locale, i18n::SKIP_TO_CONTENT),
+        crate::ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
+        i18n::text(locale, i18n::MAIN_NAVIGATION),
         nav,
-        system_panel(state),
+        i18n::text(locale, i18n::VAULTLINK_AVAILABLE),
+        system_panel,
+        i18n::text(locale, i18n::VAULTLINK_ADMIN),
         esc(title),
         create_link,
+        locale_switcher,
+        crate::ui::icon(crate::ui::Icon::User),
+        i18n::text(locale, i18n::ACCOUNT_LINK),
         esc(csrf_token),
         crate::ui::icon(crate::ui::Icon::Logout),
+        i18n::text(locale, i18n::LOG_OUT),
         body
     )
 }
 
 fn system_panel(state: &AppState) -> String {
     let disk = disk_stats(state.secure_root.display_root())
-        .map(|d| format!("Speicher: {} frei / {}", human(d.free), human(d.total)))
-        .unwrap_or_else(|| "Speicher: n/v".into());
+        .map(|d| {
+            format!(
+                r#"<vl-i18n key="audit.storage"/>: {} <vl-i18n key="common.free"/> / {}"#,
+                human(d.free),
+                human(d.total)
+            )
+        })
+        .unwrap_or_else(|| r#"<vl-i18n key="audit.storage"/>: n/a"#.to_string());
     format!(
-        "{}<br>URL: {}<br>Modus: {:?}",
-        esc(&disk),
+        "{}<br>URL: {}<br><vl-i18n key=\"audit.server_mode\"/>: {:?}",
+        disk,
         esc(&runtime_settings(state).public_base_url),
         state.config.server.mode
     )
@@ -899,6 +1132,7 @@ fn public_upload_error(
     status: StatusCode,
     message: &str,
 ) -> Response {
+    let message = i18n::text_from_german(i18n::current_locale(), message);
     let back = if upload_subdir.is_empty() {
         format!("/v/{token}")
     } else {
@@ -909,8 +1143,8 @@ fn public_upload_error(
         Html(plain_page(
             "Fehler",
             &format!(
-                r#"<section><h1>Fehler</h1><p>{}</p><p><a class="button secondary" href="{}">Zurück zur Freigabe</a></p></section>"#,
-                esc(message),
+            r#"<section><h1><vl-i18n key="common.error"/></h1><p>{}</p><p><a class="button secondary" href="{}"><vl-i18n key="share.back"/></a></p></section>"#,
+                esc(&message),
                 esc(&back)
             ),
         )),
@@ -921,17 +1155,31 @@ fn public_upload_error(
 fn format_audit_time(value: &str) -> String {
     DateTime::parse_from_rfc3339(value)
         .map(|dt| {
-            dt.with_timezone(&Utc)
-                .format("%d.%m.%Y %H:%M:%S")
-                .to_string()
+            let utc = dt.with_timezone(&Utc);
+            match i18n::current_locale() {
+                Locale::De => utc.format("%d.%m.%Y %H:%M:%S").to_string(),
+                Locale::En => utc.format("%Y-%m-%d %H:%M:%S").to_string(),
+            }
         })
         .unwrap_or_else(|_| value.to_string())
 }
 
 fn format_file_time(value: std::time::SystemTime) -> String {
-    DateTime::<Utc>::from(value)
-        .format("%d.%m.%Y %H:%M UTC")
-        .to_string()
+    format_utc_minute(DateTime::<Utc>::from(value))
+}
+
+fn format_utc_minute(value: DateTime<Utc>) -> String {
+    match i18n::current_locale() {
+        Locale::De => value.format("%d.%m.%Y %H:%M UTC").to_string(),
+        Locale::En => value.format("%Y-%m-%d %H:%M UTC").to_string(),
+    }
+}
+
+fn format_public_date(value: DateTime<Utc>) -> String {
+    match i18n::current_locale() {
+        Locale::De => value.format("%d.%m.%Y").to_string(),
+        Locale::En => value.format("%Y-%m-%d").to_string(),
+    }
 }
 
 fn internal<T>(_: T) -> AppError {
@@ -940,7 +1188,7 @@ fn internal<T>(_: T) -> AppError {
 async fn login_page() -> Html<String> {
     Html(plain_page(
         "Login",
-        r#"<section><h1>Admin Login</h1><form method="post"><label>Benutzername<br><input name="username" autocomplete="username" required></label><label>Passwort<br><input name="password" type="password" autocomplete="current-password" required></label><button>Anmelden</button></form></section>"#,
+        r#"<section><h1><vl-i18n key="auth.admin_login"/></h1><form method="post"><label><vl-i18n key="auth.username"/><br><input name="username" autocomplete="username" required></label><label><vl-i18n key="auth.password"/><br><input name="password" type="password" autocomplete="current-password" required></label><button><vl-i18n key="auth.sign_in"/></button></form></section>"#,
     ))
 }
 #[derive(Deserialize)]
@@ -965,9 +1213,10 @@ async fn login(
     }
     let username = form.username.clone();
     let admin = database(state.db.clone(), move |db| db.admin(&username)).await?;
-    let password_hash = admin.as_ref().map(|admin| admin.password_hash.clone());
+    let expected_password_hash = admin.as_ref().map(|admin| admin.password_hash.clone());
+    let verification_hash = expected_password_hash.clone();
     let password = form.password;
-    let valid = tokio::task::spawn_blocking(move || match password_hash {
+    let valid = tokio::task::spawn_blocking(move || match verification_hash {
         Some(hash) => auth::verify_password(&hash, &password),
         None => {
             let _ = auth::hash_password(&password);
@@ -982,8 +1231,6 @@ async fn login(
         audit(&state, form.username, "login_failed", None, None).await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    state.limiter.success(&key);
-    state.limiter.success(&ip_key);
     let a = admin.unwrap();
     let token = auth::random_token(32);
     let csrf = auth::random_token(24);
@@ -991,10 +1238,25 @@ async fn login(
     let session_csrf = csrf.clone();
     let expires = Utc::now() + Duration::hours(state.config.security.session_hours);
     let admin_id = a.id;
-    database(state.db.clone(), move |db| {
-        db.create_session(&session_token, admin_id, &session_csrf, expires)
+    let expected_password_hash = expected_password_hash.expect("valid password requires a hash");
+    let outcome = database(state.db.clone(), move |db| {
+        db.create_session_for_verified_password(
+            &session_token,
+            admin_id,
+            &expected_password_hash,
+            &session_csrf,
+            expires,
+        )
     })
     .await?;
+    if outcome != PasswordSessionCreationOutcome::Created {
+        state.limiter.failure(&key);
+        state.limiter.failure(&ip_key);
+        audit(&state, form.username, "login_failed", None, None).await;
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    state.limiter.success(&key);
+    state.limiter.success(&ip_key);
     audit(&state, a.username, "password_verified", None, None).await;
     Ok(redirect_with_cookie(
         "/mfa",
@@ -1005,7 +1267,7 @@ async fn mfa_page(State(state): State<AppState>, headers: HeaderMap) -> Result<H
     session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     Ok(Html(plain_page(
         "MFA",
-        r#"<section><h1>Zweiter Faktor</h1><form method="post"><label>6-stelliger TOTP-Code<br><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" required></label><button>Verifizieren</button></form></section>"#,
+        r#"<section><h1><vl-i18n key="auth.second_factor"/></h1><form method="post"><label><vl-i18n key="auth.six_digit_totp"/><br><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" required></label><button><vl-i18n key="auth.verify"/></button></form></section>"#,
     )))
 }
 #[derive(Deserialize)]
@@ -1152,10 +1414,15 @@ async fn delete_file_confirmation(
     let inspection = file_ops::inspect_delete(&state, &query.path)
         .await
         .map_err(file_operation_app_error)?;
+    let locale = i18n::current_locale();
     let kind = if inspection.status.kind == crate::secure_fs::EntryKind::Directory {
-        "Ordner"
+        i18n::text(locale, i18n::FOLDER)
     } else {
-        "Datei"
+        i18n::text(locale, i18n::FILE)
+    };
+    let heading = match locale {
+        Locale::De => format!("{kind} permanent löschen?"),
+        Locale::En => format!("Delete {kind} permanently?"),
     };
     let (confirmation, form_attributes, button_attributes) = if inspection
         .status
@@ -1163,7 +1430,7 @@ async fn delete_file_confirmation(
     {
         (
             format!(
-                r#"<div class="form-card"><p class="bad"><strong>Warnung:</strong> Dieser Ordner ist nicht leer. Sein gesamter Inhalt wird permanent gelöscht.</p><label>Zur Bestätigung den Ordnernamen <code>{}</code> eingeben<input name="confirm_name" autocomplete="off" data-confirm-input autofocus required></label></div>"#,
+                r#"<div class="form-card"><p class="bad"><strong><vl-i18n key="common.warning"/></strong> <vl-i18n key="files.folder_not_empty"/></p><label><vl-i18n key="files.confirm_folder_name"/> <code>{}</code> <vl-i18n key="files.enter"/><input name="confirm_name" autocomplete="off" data-confirm-input autofocus required></label></div>"#,
                 esc(&inspection.name)
             ),
             format!(
@@ -1176,7 +1443,8 @@ async fn delete_file_confirmation(
         (String::new(), String::new(), "")
     };
     let body = format!(
-        r#"<section><h1>{kind} permanent löschen?</h1><p><code>/{}</code></p><p class="bad">Diese Aktion kann nicht rückgängig gemacht werden.</p><p>Betroffene aktive Freigaben: <strong>{}</strong></p><form method="post" action="/admin/files/delete"{form_attributes}><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}">{}<div class="actions"><button class="danger"{button_attributes}>Permanent löschen</button><a class="button secondary" href="/admin?path={}">Abbrechen</a></div></form></section>"#,
+        r#"<section><h1>{}</h1><p><code>/{}</code></p><p class="bad"><vl-i18n key="files.delete_irreversible"/></p><p><vl-i18n key="files.affected_shares"/> <strong>{}</strong></p><form method="post" action="/admin/files/delete"{form_attributes}><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}">{}<div class="actions"><button class="danger"{button_attributes}><vl-i18n key="files.permanent_delete"/></button><a class="button secondary" href="/admin?path={}"><vl-i18n key="common.cancel"/></a></div></form></section>"#,
+        esc(&heading),
         esc(&inspection.path),
         inspection.affected_shares,
         esc(&admin.csrf_token),
@@ -1186,7 +1454,7 @@ async fn delete_file_confirmation(
     );
     Ok(Html(admin_page(
         &state,
-        "Löschen bestätigen",
+        PageId::DeleteConfirm,
         &body,
         false,
         &admin.csrf_token,
@@ -1569,7 +1837,7 @@ fn file_operation_app_error(error: file_ops::FileOperationError) -> AppError {
 
 fn file_row_actions(path: &str, name: &str, csrf_token: &str) -> String {
     format!(
-        r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/shares/new?path={}">Freigeben</a><details class="vl-action-details"><summary class="vl-icon-button" aria-label="Weitere Aktionen">{}</summary><div class="vl-action-panel"><form method="post" action="/admin/files/rename" class="vl-stack"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label class="vl-field">Neuer Name<input name="name" value="{}" maxlength="255" required></label><button class="vl-button vl-button--small">Umbenennen</button></form><a class="vl-button vl-button--danger vl-button--small" href="/admin/files/delete?path={}">{} Löschen</a></div></details>"#,
+        r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/shares/new?path={}"><vl-i18n key="files.share_action"/></a><details class="vl-action-details"><summary class="vl-icon-button" aria-label="<vl-i18n key="share.more_aria"/>">{}</summary><div class="vl-action-panel"><form method="post" action="/admin/files/rename" class="vl-stack"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label class="vl-field"><vl-i18n key="files.new_name"/><input name="name" value="{}" maxlength="255" required></label><button class="vl-button vl-button--small"><vl-i18n key="common.rename"/></button></form><a class="vl-button vl-button--danger vl-button--small" href="/admin/files/delete?path={}">{} <vl-i18n key="common.delete"/></a></div></details>"#,
         encoded(path),
         crate::ui::icon(crate::ui::Icon::More),
         esc(csrf_token),
@@ -1649,7 +1917,7 @@ async fn admin_browser(
             let actions = file_row_actions(&hit.relative_path, &hit.entry.name, &s.csrf_token);
             let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings) {
                 format!(
-                    r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/preview?path={target}">Ansehen</a> "#
+                    r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/preview?path={target}"><vl-i18n key="common.view"/></a> "#
                 )
             } else {
                 String::new()
@@ -1660,9 +1928,16 @@ async fn admin_browser(
                 .map(format_file_time)
                 .unwrap_or_else(|| "—".into());
             rows += &format!(
-                r#"<tr><td data-label="Name">{}</td><td data-label="Typ">{}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion"><div class="vl-inline-actions">{}{}</div></td></tr>"#,
+                r#"<tr><td data-label="<vl-i18n key="common.name"/>">{}</td><td data-label="<vl-i18n key="common.type"/>">{}</td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>"><div class="vl-inline-actions">{}{}</div></td></tr>"#,
                 file_name_cell(&hit.relative_path, &hit.relative_path, hit.entry.is_dir),
-                if hit.entry.is_dir { "Ordner" } else { "Datei" },
+                i18n::text(
+                    i18n::current_locale(),
+                    if hit.entry.is_dir {
+                        i18n::FOLDER
+                    } else {
+                        i18n::FILE
+                    }
+                ),
                 if hit.entry.is_dir {
                     "—".into()
                 } else {
@@ -1694,15 +1969,18 @@ async fn admin_browser(
             let display = file_name_cell(&child, &name, is_dir);
             let preview = if !is_dir && preview_allowed(&child, &settings) {
                 format!(
-                    r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/preview?path={target}">Ansehen</a> "#
+                    r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/preview?path={target}"><vl-i18n key="common.view"/></a> "#
                 )
             } else {
                 String::new()
             };
             let modified = modified.map(format_file_time).unwrap_or_else(|| "—".into());
             rows += &format!(
-                r#"<tr><td data-label="Name">{display}</td><td data-label="Typ">{}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion"><div class="vl-inline-actions">{}{}</div></td></tr>"#,
-                if is_dir { "Ordner" } else { "Datei" },
+                r#"<tr><td data-label="<vl-i18n key="common.name"/>">{display}</td><td data-label="<vl-i18n key="common.type"/>">{}</td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>"><div class="vl-inline-actions">{}{}</div></td></tr>"#,
+                i18n::text(
+                    i18n::current_locale(),
+                    if is_dir { i18n::FOLDER } else { i18n::FILE }
+                ),
                 if is_dir { "—".into() } else { human(size) },
                 modified,
                 preview,
@@ -1710,7 +1988,8 @@ async fn admin_browser(
             );
         }
         if truncated {
-            rows += r#"<tr><td colspan="5" class="muted">Verzeichnis-Scanlimit erreicht; weitere Einträge werden aus Sicherheitsgründen nicht gelesen.</td></tr>"#;
+            rows +=
+                r#"<tr><td colspan="5" class="muted"><vl-i18n key="files.scan_limit"/></td></tr>"#;
         }
     }
     let encoded_path = encoded(&rel);
@@ -1727,7 +2006,7 @@ async fn admin_browser(
     };
     let previous = if page_number > 0 {
         format!(
-            "<a href=\"/admin?path={encoded_path}&page={}{}\">Zurück</a>",
+            "<a href=\"/admin?path={encoded_path}&page={}{}\"><vl-i18n key=\"common.back\"/></a>",
             page_number - 1,
             search_param
         )
@@ -1736,7 +2015,7 @@ async fn admin_browser(
     };
     let next = if has_next {
         format!(
-            "<a href=\"/admin?path={encoded_path}&page={}{}\">Weiter</a>",
+            "<a href=\"/admin?path={encoded_path}&page={}{}\"><vl-i18n key=\"common.continue\"/></a>",
             page_number + 1,
             search_param
         )
@@ -1746,20 +2025,20 @@ async fn admin_browser(
     let up = parent_path(&rel)
         .map(|parent| {
             format!(
-                r#"<a class="vl-button vl-button--ghost" href="/admin?path={}">Hoch</a>"#,
+                r#"<a class="vl-button vl-button--ghost" href="/admin?path={}"><vl-i18n key="files.up"/></a>"#,
                 encoded(&parent)
             )
         })
         .unwrap_or_default();
     let notice = match q.notice.as_deref() {
-        Some("directory_created") => "<p class=\"vl-notice vl-notice--success\">Ordner wurde erstellt.</p>",
-        Some("path_renamed") => "<p class=\"vl-notice vl-notice--success\">Eintrag wurde umbenannt.</p>",
-        Some("path_deleted") => "<p class=\"vl-notice vl-notice--success\">Eintrag wurde permanent gelöscht.</p>",
+        Some("directory_created") => "<p class=\"vl-notice vl-notice--success\"><vl-i18n key=\"files.folder_created\"/></p>",
+        Some("path_renamed") => "<p class=\"vl-notice vl-notice--success\"><vl-i18n key=\"files.entry_renamed\"/></p>",
+        Some("path_deleted") => "<p class=\"vl-notice vl-notice--success\"><vl-i18n key=\"files.entry_deleted\"/></p>",
         Some("path_delete_queued") => {
-            "<p class=\"vl-notice vl-notice--success\">Eintrag wurde entfernt; die Bereinigung läuft im Hintergrund.</p>"
+            "<p class=\"vl-notice vl-notice--success\"><vl-i18n key=\"files.entry_removed_cleanup\"/></p>"
         }
         Some("upload_ok") => {
-            "<p class=\"vl-notice vl-notice--success\">Datei wurde erfolgreich hochgeladen.</p>"
+            "<p class=\"vl-notice vl-notice--success\"><vl-i18n key=\"files.uploaded\"/></p>"
         }
         _ => "",
     };
@@ -1776,18 +2055,18 @@ async fn admin_browser(
         next
     );
     let create_form = format!(
-        r#"<details class="vl-create-folder"><summary class="vl-button vl-button--secondary">Neuer Ordner</summary><form method="post" action="/admin/files/directories" class="vl-create-folder__form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="parent" value="{}"><label class="vl-field vl-create-folder__field"><span>Ordnername</span><input name="name" maxlength="255" required></label><button class="vl-button">Ordner erstellen</button></form></details>"#,
+        r#"<details class="vl-create-folder"><summary class="vl-button vl-button--secondary"><vl-i18n key="files.new_folder"/></summary><form method="post" action="/admin/files/directories" class="vl-create-folder__form"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="parent" value="{}"><label class="vl-field vl-create-folder__field"><span><vl-i18n key="files.folder_name"/></span><input name="name" maxlength="255" required></label><button class="vl-button"><vl-i18n key="files.create_folder"/></button></form></details>"#,
         esc(&s.csrf_token),
         esc(&rel),
     );
     let upload_form = format!(
-        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} Dateien hochladen</summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><div class="vl-panel-head"><div><strong>Admin-Upload</strong><p class="vl-muted">Dateien werden nacheinander und atomar veröffentlicht.</p></div><button class="vl-button vl-button--ghost vl-button--small" type="button" data-details-close>Schließen</button></div><label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span>Konfliktdatei ersetzen<small>Nur nach einem konkreten Namenskonflikt verwenden.</small></span></label><label class="vl-upload-dropzone" data-upload-dropzone><strong>Datei hier ablegen</strong><span class="vl-muted">Oder über die Dateiauswahl hinzufügen.</span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>Upload starten</button></form></details>"#,
+        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} <vl-i18n key="upload.files"/></summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><div class="vl-panel-head"><div><strong><vl-i18n key="upload.admin"/></strong><p class="vl-muted"><vl-i18n key="upload.sequential"/></p></div><button class="vl-button vl-button--ghost vl-button--small" type="button" data-details-close><vl-i18n key="common.close"/></button></div><label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_conflict"/><small><vl-i18n key="share.after_conflict"/></small></span></label><label class="vl-upload-dropzone" data-upload-dropzone><strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_add"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit><vl-i18n key="upload.start"/></button></form></details>"#,
         crate::ui::icon(crate::ui::Icon::Upload),
         esc(&rel),
         esc(&s.csrf_token),
     );
     let listing = format!(
-        r#"<section class="vl-stat-strip" aria-label="Speicherübersicht"><div><strong>{}</strong><span>belegt</span></div><div><strong>{}</strong><span>frei</span></div><div><strong>{}</strong><span>aktive Links</span></div></section><section class="vl-panel"><div class="vl-browser-head"><div>{}<p class="vl-muted">Relativer Pfad: /{}</p></div><div class="vl-inline-actions">{}{}{}<a class="vl-button" href="/admin/shares/new?path={}">Aktuellen Ordner freigeben</a></div></div><form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only">Dateien durchsuchen</span><input name="q" value="{}" placeholder="Dateien durchsuchen"></label><button class="vl-button">Suchen</button></form><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th>Name</th><th>Typ</th><th>Größe</th><th>Geändert</th><th>Aktion</th></tr></thead><tbody>{}</tbody></table></div><nav class="vl-pagination" aria-label="Dateiseiten">{} {}</nav><p class="vl-muted">100 Einträge pro Seite. Die Suche bleibt auf den aktuellen Ordner begrenzt.</p></section><div class="vl-selection-bar" data-selection-bar hidden><span data-selection-name>Ein Ziel ausgewählt</span><a class="vl-button" data-selection-share href="/admin/shares/new">Link für Auswahl erstellen</a></div>"#,
+        r#"<section class="vl-stat-strip" aria-label="<vl-i18n key="audit.storage_aria"/>"><div><strong>{}</strong><span><vl-i18n key="common.used"/></span></div><div><strong>{}</strong><span><vl-i18n key="common.free"/></span></div><div><strong>{}</strong><span><vl-i18n key="share.active_links"/></span></div></section><section class="vl-panel"><div class="vl-browser-head"><div>{}<p class="vl-muted"><vl-i18n key="files.relative_path"/>: /{}</p></div><div class="vl-inline-actions">{}{}{}<a class="vl-button" href="/admin/shares/new?path={}"><vl-i18n key="share.current_folder"/></a></div></div><form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="files.browse"/></span><input name="q" value="{}" placeholder="<vl-i18n key="files.search_placeholder"/>"></label><button class="vl-button"><vl-i18n key="common.search"/></button></form><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th><vl-i18n key="common.name"/></th><th><vl-i18n key="common.type"/></th><th><vl-i18n key="common.size"/></th><th><vl-i18n key="common.changed"/></th><th><vl-i18n key="common.action"/></th></tr></thead><tbody>{}</tbody></table></div><nav class="vl-pagination" aria-label="<vl-i18n key="files.pages_aria"/>">{} {}</nav><p class="vl-muted"><vl-i18n key="files.entries_page"/></p></section><div class="vl-selection-bar" data-selection-bar hidden><span data-selection-name><vl-i18n key="share.one_selected"/></span><a class="vl-button" data-selection-share href="/admin/shares/new"><vl-i18n key="share.selection"/></a></div>"#,
         esc(&used_storage),
         esc(&free_storage),
         active_links,
@@ -1806,7 +2085,7 @@ async fn admin_browser(
     let body = format!("{notice}{listing}");
     Ok(Html(admin_page(
         &state,
-        "Dateien",
+        PageId::Files,
         &body,
         false,
         &s.csrf_token,
@@ -1852,7 +2131,7 @@ async fn admin_preview(
             preview_too_large_body(&rel, size, "Datei ist größer als das Preview-Limit.", None)
         }
         PreviewContent::Text(text) => format!(
-            r#"<section><p class="preview-actions"><a href="/admin?path={}">Zurück zum Ordner</a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
+            r#"<section><p class="preview-actions"><a href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
             encoded(parent_path(&rel).as_deref().unwrap_or("")),
             esc(&rel),
             esc(&text)
@@ -1861,7 +2140,7 @@ async fn admin_preview(
     };
     Ok(Html(admin_page(
         &state,
-        "Vorschau",
+        PageId::Preview,
         &body,
         false,
         &session.csrf_token,
@@ -1904,7 +2183,7 @@ fn admin_media_preview_body(path: &str, kind: PreviewKind, size: u64) -> String 
     let raw = format!("/admin/preview/raw?path={}", encoded(path));
     let viewer = media_viewer(kind, &raw);
     format!(
-        r#"<section><p class="preview-actions"><a href="/admin?path={}">Zurück zum Ordner</a></p><p><code>/{}</code> <span class="muted">{}</span></p>{}</section>"#,
+        r#"<section><p class="preview-actions"><a href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a></p><p><code>/{}</code> <span class="muted">{}</span></p>{}</section>"#,
         encoded(parent_path(path).as_deref().unwrap_or("")),
         esc(path),
         human(size),
@@ -1915,11 +2194,11 @@ fn admin_media_preview_body(path: &str, kind: PreviewKind, size: u64) -> String 
 fn media_viewer(kind: PreviewKind, raw_url: &str) -> String {
     match kind {
         PreviewKind::Image(_) => format!(
-            r#"<img class="vl-media-preview vl-media-preview--image" src="{}" alt="Vorschau">"#,
+            r#"<img class="vl-media-preview vl-media-preview--image" src="{}" alt="<vl-i18n key="files.preview_alt"/>">"#,
             esc(raw_url)
         ),
         PreviewKind::Pdf => format!(
-            r#"<iframe class="vl-media-preview vl-media-preview--pdf" src="{}" title="PDF-Vorschau"></iframe>"#,
+            r#"<iframe class="vl-media-preview vl-media-preview--pdf" src="{}" title="<vl-i18n key="files.pdf_preview"/>"></iframe>"#,
             esc(raw_url)
         ),
         PreviewKind::Text => String::new(),
@@ -1932,28 +2211,33 @@ fn preview_too_large_body(
     message: &str,
     download_link: Option<&str>,
 ) -> String {
+    let message = i18n::text_from_german(i18n::current_locale(), message);
     let is_public = download_link.is_some();
     let back = if is_public {
         String::new()
     } else {
         format!(
-            r#"<a href="/admin?path={}">Zurück zum Ordner</a>"#,
+            r#"<a href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a>"#,
             encoded(parent_path(path).as_deref().unwrap_or(""))
         )
     };
-    let heading = if is_public { "<h1>Vorschau</h1>" } else { "" };
+    let heading = if is_public {
+        r#"<h1><vl-i18n key="files.preview"/></h1>"#
+    } else {
+        ""
+    };
     format!(
-        r#"<section>{}<p class="preview-actions">{}</p><p><code>/{}</code></p><p class="muted">{} Größe: {}.</p></section>"#,
+        r#"<section>{}<p class="preview-actions">{}</p><p><code>/{}</code></p><p class="muted">{} <vl-i18n key="files.size_label"/>: {}.</p></section>"#,
         heading,
         back,
         esc(path),
-        esc(message),
+        esc(&message),
         human(size)
     )
 }
 
 fn human(n: u64) -> String {
-    if n >= GB {
+    let mut value = if n >= GB {
         format!("{:.1} GB", n as f64 / GB as f64)
     } else if n >= MB {
         format!("{:.1} MB", n as f64 / MB as f64)
@@ -1961,7 +2245,11 @@ fn human(n: u64) -> String {
         format!("{:.1} KB", n as f64 / 1_000.)
     } else {
         format!("{n} B")
+    };
+    if i18n::current_locale() == Locale::De {
+        value = value.replace('.', ",");
     }
+    value
 }
 
 fn upload_limit_label(bytes: u64) -> String {
@@ -1974,7 +2262,7 @@ fn display_limit_unit_floor(bytes: u64, unit: u64) -> String {
 
 fn expiry_picker_html() -> String {
     format!(
-        r#"<label class="vl-field">Ablauf (optional)<div class="vl-datetime-picker vl-input-action" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="TT.MM.JJJJ HH:MM" autocomplete="off" inputmode="numeric"><button class="vl-button vl-button--secondary" type="button" data-datetime-toggle aria-label="Datum und Uhrzeit auswählen" aria-expanded="false">{}</button><div class="vl-datetime-popover" data-datetime-popover hidden><div class="vl-datetime-popover__grid"><label>Jahr<select data-dt-year></select></label><label>Monat<select data-dt-month data-pad="2"></select></label><label>Tag<select data-dt-day data-pad="2"></select></label><label>Stunde<select data-dt-hour data-pad="2"></select></label><label>Minute<select data-dt-minute data-pad="2"></select></label></div><div class="vl-datetime-popover__actions"><button class="vl-button vl-button--secondary vl-button--small" type="button" data-datetime-clear>Löschen</button><button class="vl-button vl-button--small" type="button" data-datetime-apply>Übernehmen</button></div></div></div><small>Format: TT.MM.JJJJ HH:MM</small></label>"#,
+        r#"<label class="vl-field"><vl-i18n key="share.expires_optional"/><div class="vl-datetime-picker vl-input-action" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="<vl-i18n key="date.placeholder"/>" autocomplete="off" inputmode="numeric"><button class="vl-button vl-button--secondary" type="button" data-datetime-toggle aria-label="<vl-i18n key="share.date_select"/>" aria-expanded="false">{}</button><div class="vl-datetime-popover" data-datetime-popover hidden><div class="vl-datetime-popover__grid"><label><vl-i18n key="date.year"/><select data-dt-year></select></label><label><vl-i18n key="date.month"/><select data-dt-month data-pad="2"></select></label><label><vl-i18n key="date.day"/><select data-dt-day data-pad="2"></select></label><label><vl-i18n key="date.hour"/><select data-dt-hour data-pad="2"></select></label><label><vl-i18n key="date.minute"/><select data-dt-minute data-pad="2"></select></label></div><div class="vl-datetime-popover__actions"><button class="vl-button vl-button--secondary vl-button--small" type="button" data-datetime-clear><vl-i18n key="common.delete"/></button><button class="vl-button vl-button--small" type="button" data-datetime-apply><vl-i18n key="common.apply"/></button></div></div></div><small><vl-i18n key="date.format"/></small></label>"#,
         crate::ui::icon(crate::ui::Icon::Calendar)
     )
 }
@@ -3026,10 +3314,11 @@ pub(crate) struct PreviewRawQuery {
 }
 
 fn share_permission_label(permission: &Permission) -> &'static str {
+    let locale = i18n::current_locale();
     match permission {
-        Permission::DownloadOnly => "Nur Download",
-        Permission::UploadOnly => "Nur Upload",
-        Permission::DownloadUpload => "Download + Upload",
+        Permission::DownloadOnly => i18n::text(locale, i18n::DOWNLOAD_ONLY),
+        Permission::UploadOnly => i18n::text(locale, i18n::UPLOAD_ONLY),
+        Permission::DownloadUpload => i18n::text(locale, i18n::DOWNLOAD_UPLOAD),
     }
 }
 
@@ -3050,14 +3339,15 @@ fn share_is_available(share: &Share) -> bool {
 }
 
 fn share_primary_status(share: &Share) -> (&'static str, &'static str) {
+    let locale = i18n::current_locale();
     if !share.active {
-        ("Deaktiviert", "neutral")
+        (i18n::text(locale, i18n::INACTIVE), "neutral")
     } else if share_is_expired(share) {
-        ("Abgelaufen", "warning")
+        (i18n::text(locale, i18n::EXPIRED), "warning")
     } else if share_limit_reached(share) {
-        ("Limit erreicht", "warning")
+        (i18n::text(locale, i18n::LIMIT_REACHED), "warning")
     } else {
-        ("Aktiv", "success")
+        (i18n::text(locale, i18n::ACTIVE), "success")
     }
 }
 
@@ -3109,12 +3399,7 @@ async fn share_index_page(
     })
     .await?;
     let statistics_started_label = DateTime::parse_from_rfc3339(&statistics_started_at)
-        .map(|value| {
-            value
-                .with_timezone(&Utc)
-                .format("%d.%m.%Y %H:%M UTC")
-                .to_string()
-        })
+        .map(|value| format_utc_minute(value.with_timezone(&Utc)))
         .unwrap_or(statistics_started_at);
     let active_count = all_shares
         .iter()
@@ -3176,10 +3461,10 @@ async fn share_index_page(
             .as_deref()
             .or_else(|| share.relative_path.rsplit('/').next())
             .filter(|name| !name.is_empty())
-            .unwrap_or("Freigabe");
+            .unwrap_or_else(|| i18n::text(i18n::current_locale(), i18n::DEFAULT_SHARE_NAME));
         let (status_label, status_tone) = share_primary_status(share);
         let password_badge = if share.password_hash.is_some() {
-            r#"<span class="vl-badge vl-badge--neutral">Passwort</span>"#
+            r#"<span class="vl-badge vl-badge--neutral"><vl-i18n key="auth.password"/></span>"#
         } else {
             ""
         };
@@ -3205,7 +3490,7 @@ async fn share_index_page(
                 ""
             };
             format!(
-                r#"<details><summary>Upload-Regeln</summary><form method="post" action="/admin/shares/{}/upload-conflict" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1" {}><span>Überschreiben erlauben<small>Uploader bestätigen jedes Ersetzen zusätzlich.</small></span></label><button class="vl-button vl-button--secondary">Übernehmen</button></form></details>"#,
+                r#"<details><summary><vl-i18n key="share.upload_rules"/></summary><form method="post" action="/admin/shares/{}/upload-conflict" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1" {}><span><vl-i18n key="share.allow_overwrite"/><small><vl-i18n key="share.uploader_confirm_each"/></small></span></label><button class="vl-button vl-button--secondary"><vl-i18n key="common.apply"/></button></form></details>"#,
                 share.id,
                 esc(&session_data.csrf_token),
                 checked
@@ -3218,7 +3503,7 @@ async fn share_index_page(
             .map(upload_limit_label)
             .unwrap_or_else(|| format!("global {}", human(settings.max_upload_size)));
         share_rows += &format!(
-            r#"<article class="vl-share-row"><div class="vl-share-identity"><span class="vl-file-kind" aria-hidden="true"></span><div><strong>{}</strong><span class="vl-muted">/{}</span></div></div><div class="vl-share-url"><code>{}</code><button class="vl-button vl-button--secondary vl-button--small vl-copy-button" type="button" data-copy="{}" aria-label="Link kopieren">Kopieren</button></div><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span><span class="vl-badge vl-badge--{}">{}</span>{}</div><div class="vl-share-quota"><span>{} / {} gezählte Übertragungen</span>{}<small class="vl-muted">Uploadlimit: {}</small></div><details class="vl-action-details"><summary class="vl-icon-button">Aktionen</summary><div class="vl-action-panel"><a class="vl-button vl-button--ghost" href="{}">Öffnen</a><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--ghost">{}</button></form><details><summary>Passwort ändern</summary><form method="post" action="/admin/shares/{}/password" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field">Neues Passwort<input type="password" name="password" minlength="{}" maxlength="{}"></label><label class="vl-field">Bestätigen<input type="password" name="password_confirm"></label><div class="vl-inline-actions"><button class="vl-button">Setzen</button><button class="vl-button vl-button--secondary" name="remove" value="1">Entfernen</button></div></form></details>{}<form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--danger">Löschen</button></form></div></details></article>"#,
+            r#"<article class="vl-share-row"><div class="vl-share-identity"><span class="vl-file-kind" aria-hidden="true"></span><div><strong>{}</strong><span class="vl-muted">/{}</span></div></div><div class="vl-share-url"><code>{}</code><button class="vl-button vl-button--secondary vl-button--small vl-copy-button" type="button" data-copy="{}" aria-label="<vl-i18n key="share.copy_aria"/>"><vl-i18n key="common.copy"/></button></div><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span><span class="vl-badge vl-badge--{}">{}</span>{}</div><div class="vl-share-quota"><span>{} / {} <vl-i18n key="share.counted_transfers"/></span>{}<small class="vl-muted"><vl-i18n key="share.upload_limit_label"/>: {}</small></div><details class="vl-action-details"><summary class="vl-icon-button"><vl-i18n key="common.actions"/></summary><div class="vl-action-panel"><a class="vl-button vl-button--ghost" href="{}"><vl-i18n key="common.open"/></a><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--ghost">{}</button></form><details><summary><vl-i18n key="account.change_password"/></summary><form method="post" action="/admin/shares/{}/password" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="account.new_password"/><input type="password" name="password" minlength="{}" maxlength="{}"></label><label class="vl-field"><vl-i18n key="common.confirm"/><input type="password" name="password_confirm"></label><div class="vl-inline-actions"><button class="vl-button"><vl-i18n key="common.set"/></button><button class="vl-button vl-button--secondary" name="remove" value="1"><vl-i18n key="common.remove"/></button></div></form></details>{}<form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--danger"><vl-i18n key="common.delete"/></button></form></div></details></article>"#,
             esc(display_name),
             esc(&share.relative_path),
             esc(&url),
@@ -3235,9 +3520,9 @@ async fn share_index_page(
             share.id,
             esc(&session_data.csrf_token),
             if share.active {
-                "Deaktivieren"
+                i18n::text(i18n::current_locale(), i18n::DEACTIVATE_COMMON)
             } else {
-                "Aktivieren"
+                i18n::text(i18n::current_locale(), i18n::ACTIVATE)
             },
             share.id,
             esc(&session_data.csrf_token),
@@ -3249,12 +3534,12 @@ async fn share_index_page(
         );
     }
     if share_rows.is_empty() {
-        share_rows = r#"<div class="vl-empty"><strong>Keine Links gefunden</strong><p class="vl-muted">Passe Suche oder Filter an oder erstelle einen neuen Link.</p></div>"#.into();
+        share_rows = r#"<div class="vl-empty"><strong><vl-i18n key="share.no_links"/></strong><p class="vl-muted"><vl-i18n key="share.adjust_filters"/></p></div>"#.into();
     }
     let previous = (page > 0).then(|| share_list_url(&query, status, sort, page - 1));
     let next = (page + 1 < total_pages).then(|| share_list_url(&query, status, sort, page + 1));
     let body = format!(
-        r#"<section class="vl-stat-strip" aria-label="Linkübersicht"><div><strong>{active_count}</strong><span>aktive Links</span></div><div><strong>{protected_count}</strong><span>passwortgeschützt</span></div><div><strong>{}</strong><span>Datei · {}</span></div><div><strong>{}</strong><span>ZIP · {}</span></div><div><strong>{}</strong><span>Vorschau · {}</span></div></section><p class="vl-muted">Monatswerte in UTC, Erfassung seit {}.</p><section class="vl-panel"><form method="get" class="vl-toolbar"><label class="vl-field vl-search"><span class="vl-sr-only">Links durchsuchen</span><input name="q" value="{}" placeholder="Links durchsuchen"></label><label class="vl-field"><span class="vl-sr-only">Status</span><select name="status"><option value="all" {}>Alle</option><option value="active" {}>Aktiv</option><option value="protected" {}>Geschützt</option><option value="expired" {}>Abgelaufen</option><option value="limit" {}>Limit erreicht</option><option value="inactive" {}>Deaktiviert</option></select></label><label class="vl-field"><span class="vl-sr-only">Sortierung</span><select name="sort"><option value="newest" {}>Neueste zuerst</option><option value="oldest" {}>Älteste zuerst</option></select></label><button class="vl-button">Filtern</button></form><div class="vl-share-list">{share_rows}</div><nav class="vl-pagination" aria-label="Seitennavigation">{}<span>Seite {} von {}</span>{}</nav></section>"#,
+        r#"<section class="vl-stat-strip" aria-label="<vl-i18n key="share.overview_aria"/>"><div><strong>{active_count}</strong><span><vl-i18n key="share.active_links"/></span></div><div><strong>{protected_count}</strong><span><vl-i18n key="share.password_protected_lower"/></span></div><div><strong>{}</strong><span><vl-i18n key="files.file"/> · {}</span></div><div><strong>{}</strong><span>ZIP · {}</span></div><div><strong>{}</strong><span><vl-i18n key="files.preview"/> · {}</span></div></section><p class="vl-muted"><vl-i18n key="share.monthly_values"/> {}.</p><section class="vl-panel"><form method="get" class="vl-toolbar"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="share.search_links"/></span><input name="q" value="{}" placeholder="<vl-i18n key="share.search_links"/>"></label><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="common.status"/></span><select name="status"><option value="all" {}><vl-i18n key="common.all"/></option><option value="active" {}><vl-i18n key="common.active"/></option><option value="protected" {}><vl-i18n key="common.protected"/></option><option value="expired" {}><vl-i18n key="common.expired"/></option><option value="limit" {}><vl-i18n key="share.limit_reached"/></option><option value="inactive" {}><vl-i18n key="common.inactive"/></option></select></label><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="files.sorting"/></span><select name="sort"><option value="newest" {}><vl-i18n key="files.newest_first"/></option><option value="oldest" {}><vl-i18n key="files.oldest_first"/></option></select></label><button class="vl-button"><vl-i18n key="common.filter"/></button></form><div class="vl-share-list">{share_rows}</div><nav class="vl-pagination" aria-label="<vl-i18n key="common.page_navigation"/>">{}<span><vl-i18n key="common.page_of"/> {} <vl-i18n key="common.of"/> {}</span>{}</nav></section>"#,
         monthly.download,
         esc(&monthly.month),
         monthly.zip_download,
@@ -3273,21 +3558,21 @@ async fn share_index_page(
         selected(sort, "oldest"),
         previous
             .map(|url| format!(
-                r#"<a class="vl-button vl-button--ghost" href="{}">Zurück</a>"#,
+                r#"<a class="vl-button vl-button--ghost" href="{}"><vl-i18n key="common.back"/></a>"#,
                 esc(&url)
             ))
             .unwrap_or_default(),
         page + 1,
         total_pages,
         next.map(|url| format!(
-            r#"<a class="vl-button vl-button--ghost" href="{}">Weiter</a>"#,
+            r#"<a class="vl-button vl-button--ghost" href="{}"><vl-i18n key="common.continue"/></a>"#,
             esc(&url)
         ))
         .unwrap_or_default(),
     );
     Ok(Html(admin_page(
         &state,
-        "Links",
+        PageId::Links,
         &body,
         false,
         &session_data.csrf_token,
@@ -3304,10 +3589,10 @@ async fn share_create_page(
         session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let settings = runtime_settings(&state);
     let Some(raw_path) = query.path.as_deref().filter(|path| !path.is_empty()) else {
-        let body = r#"<section class="vl-panel vl-empty"><strong>Wähle zuerst ein Ziel aus</strong><p class="vl-muted">Öffne den Dateibrowser und wähle eine Datei oder einen Ordner für die Freigabe.</p><a class="vl-button" href="/admin">Zum Dateibrowser</a></section>"#;
+        let body = r#"<section class="vl-panel vl-empty"><strong><vl-i18n key="share.select_target"/></strong><p class="vl-muted"><vl-i18n key="share.open_browser"/></p><a class="vl-button" href="/admin"><vl-i18n key="share.to_browser"/></a></section>"#;
         return Ok(Html(admin_page(
             &state,
-            "Link erstellen",
+            PageId::CreateLink,
             body,
             false,
             &session_data.csrf_token,
@@ -3325,13 +3610,13 @@ async fn share_create_page(
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
     let is_directory = metadata.is_dir();
     let permission_fields = if is_directory {
-        r#"<div class="vl-segmented" role="radiogroup" aria-label="Berechtigung"><label><input type="radio" name="permission" value="download_only" checked><span>Nur Download</span></label><label><input type="radio" name="permission" value="upload_only"><span>Nur Upload</span></label><label><input type="radio" name="permission" value="download_upload"><span>Download + Upload</span></label></div>"#
+        r#"<div class="vl-segmented" role="radiogroup" aria-label="<vl-i18n key="share.permission_aria"/>"><label><input type="radio" name="permission" value="download_only" checked><span><vl-i18n key="share.download_only"/></span></label><label><input type="radio" name="permission" value="upload_only"><span><vl-i18n key="share.upload_only"/></span></label><label><input type="radio" name="permission" value="download_upload"><span><vl-i18n key="share.download_upload"/></span></label></div>"#
     } else {
-        r#"<input type="hidden" name="permission" value="download_only"><span class="vl-badge vl-badge--accent">Nur Download</span><p class="vl-muted">Uploadrechte sind ausschließlich für Ordner verfügbar.</p>"#
+        r#"<input type="hidden" name="permission" value="download_only"><span class="vl-badge vl-badge--accent"><vl-i18n key="share.download_only"/></span><p class="vl-muted"><vl-i18n key="share.upload_folder_only"/></p>"#
     };
     let upload_rules = if is_directory {
         format!(
-            r#"<section class="vl-form-section" data-upload-rules><h2>4. Upload-Regeln</h2><div class="vl-form-grid"><label class="vl-field">Max. Dateigröße in GB<input name="max_upload_size_gb" type="number" min="1" step="1" placeholder="Global: {} GB"><small>Leer verwendet das globale Limit.</small></label><label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1"><span>Bestehende Dateien dürfen ersetzt werden<small>Uploader müssen jede Ersetzung zusätzlich bestätigen.</small></span></label></div></section>"#,
+            r#"<section class="vl-form-section" data-upload-rules><h2><vl-i18n key="share.step_upload"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.max_file"/><input name="max_upload_size_gb" type="number" min="1" step="1" placeholder="Global: {} GB"><small><vl-i18n key="share.empty_global"/></small></label><label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1"><span><vl-i18n key="share.existing_replace"/><small><vl-i18n key="share.uploader_confirm"/></small></span></label></div></section>"#,
             display_limit_unit_floor(settings.max_upload_size, GB)
         )
     } else {
@@ -3342,11 +3627,18 @@ async fn share_create_page(
         settings.public_base_url.trim_end_matches('/')
     );
     let body = format!(
-        r#"<div class="vl-create-layout"><form method="post" action="/admin/shares" class="vl-panel vl-stack" data-share-create><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><section class="vl-target-card"><div><span class="vl-eyebrow">Ausgewähltes Ziel</span><strong>/{}</strong><small class="vl-muted">{}</small></div><a class="vl-button vl-button--ghost" href="/admin">Ziel ändern</a></section><section class="vl-form-section"><h2>1. Berechtigung</h2>{permission_fields}</section><section class="vl-form-section"><h2>2. Link &amp; Zugriff</h2><div class="vl-form-grid"><label class="vl-field">Kurzer Alias<input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}" data-share-alias><small>Optional, 3–32 Zeichen.</small></label>{}<label class="vl-field">Max. gezählte Übertragungen<input name="max_downloads" type="number" min="1"><small>Leer bedeutet unbegrenzt.</small></label></div></section><section class="vl-form-section"><h2>3. Schutz</h2><label class="vl-switch"><input type="checkbox" data-password-toggle><span>Passwortschutz<small>Aktiviert die beiden Passwortfelder.</small></span></label><div class="vl-form-grid" data-password-fields><label class="vl-field">Passwort<input name="password" type="password" minlength="{}" maxlength="{}" autocomplete="new-password"></label><label class="vl-field">Passwort bestätigen<input name="password_confirm" type="password" autocomplete="new-password"></label></div></section>{upload_rules}<button class="vl-button vl-button--primary" type="submit">Sicheren Link erstellen</button></form><aside class="vl-panel vl-review-card" data-share-review><h2>Freigabe prüfen</h2><dl class="vl-review-list"><div><dt>Ziel</dt><dd>/{}</dd></div><div><dt>Berechtigung</dt><dd data-review-permission>Nur Download</dd></div><div><dt>Passwort</dt><dd data-review-password>Ohne Passwort</dd></div><div><dt>Limit</dt><dd data-review-limit>Unbegrenzt</dd></div></dl><div class="vl-field"><span>Vorschau der URL</span><code data-review-url>{}</code></div><p class="vl-muted">Die Erstellung wird im Audit protokolliert.</p></aside></div>"#,
+        r#"<div class="vl-create-layout"><form method="post" action="/admin/shares" class="vl-panel vl-stack" data-share-create><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><section class="vl-target-card"><div><span class="vl-eyebrow"><vl-i18n key="share.selected_target"/></span><strong>/{}</strong><small class="vl-muted">{}</small></div><a class="vl-button vl-button--ghost" href="/admin"><vl-i18n key="share.change_target"/></a></section><section class="vl-form-section"><h2><vl-i18n key="share.step_permission"/></h2>{permission_fields}</section><section class="vl-form-section"><h2><vl-i18n key="share.step_link"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.short_alias"/><input name="alias" pattern="[A-Za-z0-9_-]{{3,32}}" data-share-alias><small><vl-i18n key="share.alias_help"/></small></label>{}<label class="vl-field"><vl-i18n key="share.max_transfers"/><input name="max_downloads" type="number" min="1"><small><vl-i18n key="share.empty_unlimited"/></small></label></div></section><section class="vl-form-section"><h2><vl-i18n key="share.step_protection"/></h2><label class="vl-switch"><input type="checkbox" data-password-toggle><span><vl-i18n key="share.password_protection"/><small><vl-i18n key="share.password_enable"/></small></span></label><div class="vl-form-grid" data-password-fields><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="{}" maxlength="{}" autocomplete="new-password"></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" autocomplete="new-password"></label></div></section>{upload_rules}<button class="vl-button vl-button--primary" type="submit"><vl-i18n key="share.create_secure"/></button></form><aside class="vl-panel vl-review-card" data-share-review><h2><vl-i18n key="share.review"/></h2><dl class="vl-review-list"><div><dt><vl-i18n key="common.target"/></dt><dd>/{}</dd></div><div><dt><vl-i18n key="share.permission"/></dt><dd data-review-permission><vl-i18n key="share.download_only"/></dd></div><div><dt><vl-i18n key="auth.password"/></dt><dd data-review-password><vl-i18n key="share.no_password"/></dd></div><div><dt><vl-i18n key="share.limit"/></dt><dd data-review-limit><vl-i18n key="common.unlimited"/></dd></div></dl><div class="vl-field"><span><vl-i18n key="share.url_preview"/></span><code data-review-url>{}</code></div><p class="vl-muted"><vl-i18n key="share.audit_help"/></p></aside></div>"#,
         esc(&session_data.csrf_token),
         esc(&relative_path),
         esc(&relative_path),
-        if is_directory { "Ordner" } else { "Datei" },
+        i18n::text(
+            i18n::current_locale(),
+            if is_directory {
+                i18n::FOLDER
+            } else {
+                i18n::FILE
+            }
+        ),
         expiry_picker_html(),
         settings.share_password_min_length,
         settings.share_password_max_length,
@@ -3360,7 +3652,7 @@ async fn share_create_page(
     );
     Ok(Html(admin_page(
         &state,
-        "Link erstellen",
+        PageId::CreateLink,
         &body,
         false,
         &session_data.csrf_token,
@@ -3490,7 +3782,7 @@ async fn share_create_page_legacy(
     );
     Ok(Html(admin_page(
         &state,
-        "Links",
+        PageId::Links,
         &body,
         false,
         &s.csrf_token,
@@ -3833,6 +4125,253 @@ async fn delete_share(
     Ok(Redirect::to("/admin/shares"))
 }
 
+async fn account_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
+    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let body = format!(
+        r#"<div class="vl-create-layout"><section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.current_user"/></p><h2>{username}</h2></div><form method="post" action="/admin/account/password" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><h2><vl-i18n key="account.change_password"/></h2><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.new_password"/><input name="new_password" type="password" minlength="14" autocomplete="new-password" required><small><vl-i18n key="error.password_min"/></small></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" minlength="14" autocomplete="new-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.change_password"/></button></form></section><aside class="vl-panel vl-stack"><h2><vl-i18n key="account.change_mfa"/></h2><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><form method="post" action="/admin/account/mfa/start" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.current_mfa_code"/><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button" type="submit"><vl-i18n key="common.continue"/></button></form></aside></div>"#,
+        username = esc(&session.username),
+        csrf = esc(&session.csrf_token),
+    );
+    Ok(Html(admin_page(
+        &state,
+        PageId::Account,
+        &body,
+        false,
+        &session.csrf_token,
+    )))
+}
+
+#[derive(Deserialize)]
+struct AccountPasswordForm {
+    csrf: String,
+    current_password: String,
+    new_password: String,
+    password_confirm: String,
+}
+
+async fn change_account_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AccountPasswordForm>,
+) -> Result<Response> {
+    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&session, &form.csrf)?;
+    let limiter_key = format!("account-password:{}", session.admin_id);
+    if !state.limiter.allowed(&limiter_key) {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele Passwortversuche",
+        ));
+    }
+
+    let username = session.username.clone();
+    let admin = database(state.db.clone(), move |db| db.admin(&username))
+        .await?
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+    let expected_hash = admin.password_hash.clone();
+    let verification_hash = expected_hash.clone();
+    let current_password = form.current_password;
+    let current_password_valid = tokio::task::spawn_blocking(move || {
+        auth::verify_password(&verification_hash, &current_password)
+    })
+    .await
+    .map_err(internal)?;
+    if !current_password_valid {
+        state.limiter.failure(&limiter_key);
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    state.limiter.success(&limiter_key);
+
+    if form.new_password != form.password_confirm {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Passwörter stimmen nicht überein",
+        ));
+    }
+    if form.new_password.chars().count() < 14 {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Passwort muss mindestens 14 Zeichen enthalten",
+        ));
+    }
+    let new_password = form.new_password;
+    let new_hash = tokio::task::spawn_blocking(move || auth::hash_password(&new_password))
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+    let admin_id = session.admin_id;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let outcome = database(state.db.clone(), move |db| {
+        db.change_admin_password_cas(
+            admin_id,
+            &expected_hash,
+            &new_hash,
+            audit_client_ip.as_deref(),
+        )
+    })
+    .await?;
+    match outcome {
+        AdminPasswordChangeOutcome::Changed => Ok(redirect_with_cookie(
+            "/login",
+            clear_session_cookie(&state),
+        )?),
+        AdminPasswordChangeOutcome::StalePassword => Err(AppError(
+            StatusCode::CONFLICT,
+            "Kontoänderung fehlgeschlagen.",
+        )),
+        AdminPasswordChangeOutcome::Inactive | AdminPasswordChangeOutcome::NotFound => {
+            Err(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AccountMfaStartForm {
+    csrf: String,
+    current_password: String,
+    current_code: String,
+}
+
+async fn start_account_mfa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AccountMfaStartForm>,
+) -> Result<Html<String>> {
+    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&session, &form.csrf)?;
+    let limiter_key = format!("account-mfa-start:{}", session.admin_id);
+    if !state.limiter.allowed(&limiter_key) {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele MFA-Versuche",
+        ));
+    }
+
+    let username = session.username.clone();
+    let admin = database(state.db.clone(), move |db| db.admin(&username))
+        .await?
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+    let verification_hash = admin.password_hash;
+    let current_password = form.current_password;
+    let current_password_valid = tokio::task::spawn_blocking(move || {
+        auth::verify_password(&verification_hash, &current_password)
+    })
+    .await
+    .map_err(internal)?;
+    let current_mfa_valid = auth::verify_totp_now(&admin.totp_secret, &form.current_code);
+    if !current_password_valid || !current_mfa_valid {
+        state.limiter.failure(&limiter_key);
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    state.limiter.success(&limiter_key);
+
+    let enrollment_token = auth::random_token(32);
+    let new_secret = auth::new_totp_secret();
+    let admin_id = session.admin_id;
+    let token_for_db = enrollment_token.clone();
+    let secret_for_db = new_secret.clone();
+    let outcome = database(state.db.clone(), move |db| {
+        db.start_admin_mfa_enrollment(admin_id, &token_for_db, &secret_for_db)
+    })
+    .await?;
+    let expires_at = match outcome {
+        AdminMfaEnrollmentStartOutcome::Started { expires_at } => expires_at,
+        AdminMfaEnrollmentStartOutcome::AdminInactive
+        | AdminMfaEnrollmentStartOutcome::AdminNotFound => {
+            return Err(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"));
+        }
+    };
+    let expires_at = DateTime::parse_from_rfc3339(&expires_at)
+        .map(|value| format_utc_minute(value.with_timezone(&Utc)))
+        .unwrap_or(expires_at);
+    let otpauth = otpauth_url(&session.username, &new_secret);
+    let qr = qr_svg(&otpauth)?;
+    let body = format!(
+        r#"<section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.change_mfa"/></p><h2><vl-i18n key="account.mfa_enrollment_flow"/></h2></div><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><div class="qr-card" aria-label="TOTP QR-Code">{qr}</div><div class="secret-block"><code>{secret}</code><code>{otpauth}</code></div><p class="vl-muted"><vl-i18n key="public.valid_until"/>: {expires_at}</p><form method="post" action="/admin/account/mfa/confirm" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="enrollment_token" value="{token}"><label class="vl-field"><vl-i18n key="account.new_mfa_test_code"/><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><div class="vl-inline-actions"><button class="vl-button" type="submit"><vl-i18n key="common.confirm"/></button><a class="vl-button vl-button--secondary" href="/admin/account"><vl-i18n key="common.cancel"/></a></div></form></section>"#,
+        qr = qr,
+        secret = esc(&new_secret),
+        otpauth = esc(&otpauth),
+        expires_at = esc(&expires_at),
+        csrf = esc(&session.csrf_token),
+        token = esc(&enrollment_token),
+    );
+    Ok(Html(admin_page_without_locale_switcher(
+        &state,
+        PageId::Account,
+        &body,
+        false,
+        &session.csrf_token,
+    )))
+}
+
+#[derive(Deserialize)]
+struct AccountMfaConfirmForm {
+    csrf: String,
+    enrollment_token: String,
+    code: String,
+}
+
+async fn confirm_account_mfa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AccountMfaConfirmForm>,
+) -> Result<Response> {
+    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&session, &form.csrf)?;
+    if form.enrollment_token.is_empty() || form.enrollment_token.len() > 256 {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Kontoänderung fehlgeschlagen.",
+        ));
+    }
+    let limiter_key = format!("account-mfa-confirm:{}", session.admin_id);
+    if !state.limiter.allowed(&limiter_key) {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele MFA-Versuche",
+        ));
+    }
+    let admin_id = session.admin_id;
+    let lookup_token = form.enrollment_token.clone();
+    let enrollment = database(state.db.clone(), move |db| {
+        db.admin_mfa_enrollment(admin_id, &lookup_token)
+    })
+    .await?
+    .ok_or(AppError(
+        StatusCode::CONFLICT,
+        "Kontoänderung fehlgeschlagen.",
+    ))?;
+    if !auth::verify_totp_now(&enrollment.totp_secret, &form.code) {
+        state.limiter.failure(&limiter_key);
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
+    }
+    state.limiter.success(&limiter_key);
+    let activation_token = form.enrollment_token;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let outcome = database(state.db.clone(), move |db| {
+        db.activate_admin_mfa_enrollment(admin_id, &activation_token, audit_client_ip.as_deref())
+    })
+    .await?;
+    match outcome {
+        AdminMfaEnrollmentActivationOutcome::Activated => Ok(redirect_with_cookie(
+            "/login",
+            clear_session_cookie(&state),
+        )?),
+        AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired => Err(AppError(
+            StatusCode::CONFLICT,
+            "Kontoänderung fehlgeschlagen.",
+        )),
+    }
+}
+
 fn valid_username(username: &str) -> bool {
     username.len() >= 3
         && username.len() <= 64
@@ -3852,24 +4391,24 @@ async fn admins_page_v3(
     let mut inactive_rows = String::new();
     for admin in admins {
         let action = if admin.id == session.admin_id {
-            r#"<div class="admin-actions"><span class="pill">Aktueller Admin</span><small class="muted">Eigene Passwort- und MFA-Änderungen erfolgen später über „Mein Konto“.</small></div>"#
+            r#"<div class="admin-actions"><span class="pill"><vl-i18n key="admins.current"/></span></div>"#
                 .to_string()
         } else {
             let status_action = if admin.active {
                 format!(
-                    r#"<form method="post" action="/admin/admins/{}/deactivate"><input type="hidden" name="csrf" value="{}"><button class="secondary">Stilllegen</button></form>"#,
+                    r#"<form method="post" action="/admin/admins/{}/deactivate"><input type="hidden" name="csrf" value="{}"><button class="secondary"><vl-i18n key="admins.deactivate"/></button></form>"#,
                     admin.id,
                     esc(&session.csrf_token)
                 )
             } else {
                 format!(
-                    r#"<form method="post" action="/admin/admins/{}/activate"><input type="hidden" name="csrf" value="{}"><button>Aktivieren</button></form>"#,
+                    r#"<form method="post" action="/admin/admins/{}/activate"><input type="hidden" name="csrf" value="{}"><button><vl-i18n key="admins.activate"/></button></form>"#,
                     admin.id,
                     esc(&session.csrf_token)
                 )
             };
             format!(
-                r#"<div class="admin-actions"><div class="button-group">{}<form method="post" action="/admin/admins/{}/totp"><input type="hidden" name="csrf" value="{}"><button class="secondary">MFA zurücksetzen</button></form></div><form method="post" action="/admin/admins/{}/password" class="admin-reset-form"><input type="hidden" name="csrf" value="{}"><label>Neues Passwort<input name="password" type="password" minlength="14" required></label><label>Bestätigen<input name="password_confirm" type="password" minlength="14" required></label><button>Passwort setzen</button></form></div>"#,
+                r#"<div class="admin-actions"><div class="button-group">{}<form method="post" action="/admin/admins/{}/totp"><input type="hidden" name="csrf" value="{}"><button class="secondary"><vl-i18n key="admins.reset_mfa"/></button></form></div><form method="post" action="/admin/admins/{}/password" class="admin-reset-form"><input type="hidden" name="csrf" value="{}"><label><vl-i18n key="account.new_password"/><input name="password" type="password" minlength="14" required></label><label><vl-i18n key="common.confirm"/><input name="password_confirm" type="password" minlength="14" required></label><button><vl-i18n key="admins.set_password"/></button></form></div>"#,
                 status_action,
                 admin.id,
                 esc(&session.csrf_token),
@@ -3891,26 +4430,26 @@ async fn admins_page_v3(
         }
     }
     if active_rows.is_empty() {
-        active_rows
-            .push_str(r#"<tr><td colspan="4" class="muted">Keine aktiven Admins.</td></tr>"#);
+        active_rows.push_str(
+            r#"<tr><td colspan="4" class="muted"><vl-i18n key="admins.no_active"/></td></tr>"#,
+        );
     }
     if inactive_rows.is_empty() {
-        inactive_rows
-            .push_str(r#"<tr><td colspan="4" class="muted">Keine stillgelegten Admins.</td></tr>"#);
+        inactive_rows.push_str(
+            r#"<tr><td colspan="4" class="muted"><vl-i18n key="admins.no_inactive"/></td></tr>"#,
+        );
     }
     let notice = match query.notice.as_deref() {
-        Some("password_reset") => {
-            r#"<p class="notice">Passwort wurde gesetzt. Bestehende Sessions dieses Admins wurden beendet.</p>"#
-        }
+        Some("password_reset") => r#"<p class="notice"><vl-i18n key="admins.password_set"/></p>"#,
         _ => "",
     };
     let body = format!(
-        r#"<section><h1>Admins</h1>{notice}<div class="admin-columns"><details class="admin-column" open><summary>Aktive Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{active_rows}</table></details><details class="admin-column" open><summary>Stillgelegte Admins</summary><table><tr><th>ID</th><th>Benutzername</th><th>Erstellt</th><th>Aktion</th></tr>{inactive_rows}</table></details></div></section><section><h2>Admin erstellen</h2><form method="post" class="vl-admin-create-form"><input type="hidden" name="csrf" value="{}"><label class="vl-field">Benutzername<input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label class="vl-field">Passwort<input name="password" type="password" minlength="14" required></label><label class="vl-field">Passwort bestätigen<input name="password_confirm" type="password" required></label><button class="vl-button">Erstellen</button></form></section>"#,
+        r#"<section><h1><vl-i18n key="nav.admins"/></h1>{notice}<div class="admin-columns"><details class="admin-column" open><summary><vl-i18n key="admins.active"/></summary><table><tr><th>ID</th><th><vl-i18n key="auth.username"/></th><th><vl-i18n key="common.created"/></th><th><vl-i18n key="common.action"/></th></tr>{active_rows}</table></details><details class="admin-column" open><summary><vl-i18n key="admins.inactive"/></summary><table><tr><th>ID</th><th><vl-i18n key="auth.username"/></th><th><vl-i18n key="common.created"/></th><th><vl-i18n key="common.action"/></th></tr>{inactive_rows}</table></details></div></section><section><h2><vl-i18n key="admins.create"/></h2><form method="post" class="vl-admin-create-form"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="auth.username"/><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="14" required></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" required></label><button class="vl-button"><vl-i18n key="common.create"/></button></form></section>"#,
         esc(&session.csrf_token)
     );
     Ok(Html(admin_page(
         &state,
-        "Admins",
+        PageId::Admins,
         &body,
         false,
         &session.csrf_token,
@@ -3987,15 +4526,15 @@ async fn create_admin_ui(
     let otpauth = otpauth_url(&username, &secret);
     let qr = qr_svg(&otpauth)?;
     let body = format!(
-        r#"<section><h1>Admin erstellt</h1><p>Dieses TOTP-Secret wird nur jetzt angezeigt. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins">Zur Adminliste</a></p></section>"#,
+        r#"<section><h1><vl-i18n key="title.admin_created"/></h1><p><vl-i18n key="admins.secret_once"/></p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
         esc(&username),
         qr,
         esc(&secret),
         esc(&otpauth)
     );
-    Ok(Html(admin_page(
+    Ok(Html(admin_page_without_locale_switcher(
         &state,
-        "Admin erstellt",
+        PageId::AdminCreated,
         &body,
         false,
         &session.csrf_token,
@@ -4083,15 +4622,15 @@ async fn reset_admin_totp(
     let otpauth = otpauth_url(&username, &secret);
     let qr = qr_svg(&otpauth)?;
     let body = format!(
-        r#"<section><h1>MFA zurückgesetzt</h1><p>Dieses neue TOTP-Secret wird nur jetzt angezeigt. QR-Code mit der Authenticator-App scannen oder Secret manuell eintragen.</p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins">Zur Adminliste</a></p></section>"#,
+        r#"<section><h1><vl-i18n key="title.mfa_reset"/></h1><p><vl-i18n key="admins.new_secret_once"/></p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
         esc(&username),
         qr,
         esc(&secret),
         esc(&otpauth)
     );
-    Ok(Html(admin_page(
+    Ok(Html(admin_page_without_locale_switcher(
         &state,
-        "MFA zurückgesetzt",
+        PageId::MfaReset,
         &body,
         false,
         &session.csrf_token,
@@ -4192,7 +4731,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     let body = settings_form(&session, &settings, ip_count, "");
     Ok(Html(admin_page(
         &state,
-        "Einstellungen",
+        PageId::Settings,
         &body,
         false,
         &session.csrf_token,
@@ -4208,18 +4747,21 @@ fn settings_form(
     let message = if message.is_empty() {
         String::new()
     } else {
-        format!(r#"<p class="muted">{}</p>"#, esc(message))
+        format!(
+            r#"<p class="muted">{}</p>"#,
+            esc(&i18n::text_from_german(i18n::current_locale(), message))
+        )
     };
     let purge_link = if !settings.audit_client_ip_enabled && audit_ip_count > 0 {
         format!(
-            r#"<p><a class="vl-button vl-button--danger" href="/admin/settings/audit-ips/delete">{} gespeicherte IP-Adressen löschen</a></p>"#,
+            r#"<p><a class="vl-button vl-button--danger" href="/admin/settings/audit-ips/delete">{} <vl-i18n key="settings.delete_ips"/></a></p>"#,
             audit_ip_count
         )
     } else {
         String::new()
     };
     format!(
-        r#"<section class="vl-panel"><h2>Runtime-Einstellungen</h2>{message}<p class="vl-muted">Runtime-Policy wird in SQLite gespeichert. Servermodus, Bind-Adresse, TLS-Dateien, Trusted Proxies, Root-Mount und Data-Dir bleiben file-/restart-basiert.</p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label>Globales Uploadlimit GB<br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label>Blockierte Endungen<br><input name="blocked_extensions" value="{}"></label><label>Share-Passwort Min. Zeichen<br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label>Share-Passwort Max. Zeichen<br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label>Unlock Minuten<br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label>ZIP Max. GB<br><input name="max_zip_size_gb" type="number" min="1" step="1" value="{}" required></label><label>ZIP Max. Dateien<br><input name="max_zip_files" type="number" min="1" value="{}" required></label><label>Suche Max. Einträge<br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label>Suche Max. Treffer<br><input name="max_search_results" type="number" min="1" value="{}" required></label><label>Text-Preview Max. MB<br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Text-Preview-Endungen<br><input name="preview_extensions" value="{}" required></label><label>Media-Preview Max. MB<br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>Bild-Preview-Endungen<br><input name="image_preview_extensions" value="{}"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" {}><span>PDF-Preview aktiv<small>PDFs werden inline mit sicheren Headern angezeigt.</small></span></label><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled" {}><span>Client-IP im Audit erfassen<small>Standardmäßig aus. Bei Aktivierung wird die aufgelöste vollständige IP in SQLite gespeichert, nicht zusätzlich ins Serverlog geschrieben.</small></span></label><button>Speichern</button></form>{purge_link}</section>"#,
+        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label><vl-i18n key="settings.upload_limit"/><br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.blocked"/><br><input name="blocked_extensions" value="{}"></label><label><vl-i18n key="settings.password_min"/><br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.password_max"/><br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.unlock_minutes"/><br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.zip_gb"/><br><input name="max_zip_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.zip_files"/><br><input name="max_zip_files" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_entries"/><br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_results"/><br><input name="max_search_results" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.text_preview"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.text_extensions"/><br><input name="preview_extensions" value="{}" required></label><label><vl-i18n key="settings.media_preview"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.image_extensions"/><br><input name="image_preview_extensions" value="{}"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" {}><span><vl-i18n key="settings.pdf_active"/><small><vl-i18n key="settings.pdf_help"/></small></span></label><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled" {}><span><vl-i18n key="settings.audit_ip"/><small><vl-i18n key="settings.audit_ip_help"/></small></span></label><button><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
         esc(&session.csrf_token),
         esc(&settings.public_base_url),
         display_limit_unit_floor(settings.max_upload_size, GB),
@@ -4351,7 +4893,7 @@ async fn update_settings(
     let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
     Ok(Html(admin_page(
         &state,
-        "Einstellungen",
+        PageId::Settings,
         &settings_form(&session, &next, ip_count, "Einstellungen gespeichert."),
         false,
         &session.csrf_token,
@@ -4377,12 +4919,12 @@ async fn audit_ips_delete_confirmation(
     }
     let count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
     let body = format!(
-        r#"<section class="vl-panel vl-confirm-card"><h2>Audit-IP-Daten löschen?</h2><p>Es werden <strong>{count}</strong> gespeicherte Client-IP-Werte permanent entfernt. Andere Auditdaten bleiben erhalten.</p><form method="post" action="/admin/settings/audit-ips/delete" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field">Zur Bestätigung <code>IP-DATEN LÖSCHEN</code> eingeben<input name="confirmation" autocomplete="off" required></label><div class="vl-inline-actions"><button class="vl-button vl-button--danger">IP-Daten löschen</button><a class="vl-button vl-button--secondary" href="/admin/settings">Abbrechen</a></div></form></section>"#,
+        r#"<section class="vl-panel vl-confirm-card"><h2><vl-i18n key="settings.delete_ip_data"/></h2><p><vl-i18n key="settings.values_prefix"/> <strong>{count}</strong> <vl-i18n key="settings.delete_ip_values"/></p><form method="post" action="/admin/settings/audit-ips/delete" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="settings.enter_confirm"/> <code>IP-DATEN LÖSCHEN</code><input name="confirmation" autocomplete="off" required></label><div class="vl-inline-actions"><button class="vl-button vl-button--danger"><vl-i18n key="settings.delete_ip_action"/></button><a class="vl-button vl-button--secondary" href="/admin/settings"><vl-i18n key="common.cancel"/></a></div></form></section>"#,
         esc(&session.csrf_token),
     );
     Ok(Html(admin_page(
         &state,
-        "Einstellungen",
+        PageId::Settings,
         &body,
         false,
         &session.csrf_token,
@@ -4454,14 +4996,14 @@ async fn audit_page(
     for event in events {
         let client_ip = if client_ip_enabled {
             format!(
-                r#"<td class="vl-audit-ip" data-label="Client-IP">{}</td>"#,
+                r#"<td class="vl-audit-ip" data-label="Client IP">{}</td>"#,
                 event.client_ip.as_deref().map(esc).unwrap_or_default()
             )
         } else {
             String::new()
         };
         rows += &format!(
-            r#"<tr><td class="vl-audit-time" data-label="Zeit">{}</td><td class="vl-audit-user" data-label="User">{}</td><td class="vl-audit-action" data-label="Aktion"><code>{}</code></td><td class="vl-audit-object" data-label="Objekt">{}</td><td class="vl-audit-detail" data-label="Detail">{}</td>{client_ip}</tr>"#,
+            r#"<tr><td class="vl-audit-time" data-label="<vl-i18n key="common.time"/>">{}</td><td class="vl-audit-user" data-label="User">{}</td><td class="vl-audit-action" data-label="<vl-i18n key="common.action"/>"><code>{}</code></td><td class="vl-audit-object" data-label="<vl-i18n key="common.object"/>">{}</td><td class="vl-audit-detail" data-label="<vl-i18n key="common.detail"/>">{}</td>{client_ip}</tr>"#,
             esc(&format_audit_time(&event.occurred_at)),
             esc(&event.actor),
             esc(&event.action),
@@ -4474,7 +5016,7 @@ async fn audit_page(
         percent_encoding::utf8_percent_encode(filter_value, percent_encoding::NON_ALPHANUMERIC);
     let previous = if page_number > 0 {
         format!(
-            r#"<a class="vl-button vl-button--ghost" href="/admin/audit?action={encoded_filter}&page={}">Zurück</a>"#,
+            r#"<a class="vl-button vl-button--ghost" href="/admin/audit?action={encoded_filter}&page={}"><vl-i18n key="common.back"/></a>"#,
             page_number - 1
         )
     } else {
@@ -4482,7 +5024,7 @@ async fn audit_page(
     };
     let next = if has_next {
         format!(
-            r#"<a class="vl-button vl-button--ghost" href="/admin/audit?action={encoded_filter}&page={}">Weiter</a>"#,
+            r#"<a class="vl-button vl-button--ghost" href="/admin/audit?action={encoded_filter}&page={}"><vl-i18n key="common.continue"/></a>"#,
             page_number + 1
         )
     } else {
@@ -4496,10 +5038,10 @@ async fn audit_page(
     let url_scheme = url::Url::parse(&settings.public_base_url)
         .ok()
         .map(|url| url.scheme().to_uppercase())
-        .unwrap_or_else(|| "unbekannt".into());
+        .unwrap_or_else(|| i18n::text(i18n::current_locale(), i18n::UNKNOWN).into());
     let trusted_proxy_count = state.config.reverse_proxy.trusted_proxies.len();
     let body = format!(
-        r#"<div class="vl-audit-layout"><section class="vl-panel"><div class="vl-panel-head"><div><p class="vl-eyebrow">Nachvollziehbarkeit</p><h2>Audit-Ereignisse</h2></div><form method="get" class="vl-inline-actions"><label class="vl-field"><span class="vl-sr-only">Action-Filter</span><input name="action" value="{}" placeholder="Action filtern"></label><button class="vl-button">Filtern</button></form></div><div class="vl-table-wrap"><table class="vl-data-table vl-audit-table"><thead><tr><th class="vl-audit-time">Zeit</th><th class="vl-audit-user">User</th><th class="vl-audit-action">Aktion</th><th class="vl-audit-object">Objekt</th><th class="vl-audit-detail">Detail</th>{ip_header}</tr></thead><tbody>{rows}</tbody></table></div><nav class="vl-pagination" aria-label="Audit-Seiten">{previous}<span>Seite {} von {}</span>{next}</nav></section><aside class="vl-panel vl-security-facts"><p class="vl-eyebrow">Security-Status</p><h2>Belegte Konfiguration</h2><dl><div><dt>MFA</dt><dd>Für Admin-Sitzungen verpflichtend</dd></div><div><dt>Servermodus</dt><dd>{:?}</dd></div><div><dt>Öffentliches URL-Schema</dt><dd>{}</dd></div><div><dt>Trusted Proxies</dt><dd>{}</dd></div><div><dt>Audit-IP-Erfassung</dt><dd>{}</dd></div><div><dt>Protokollierung</dt><dd>SQLite + strukturiertes Serverlog</dd></div></dl></aside></div>"#,
+        r#"<div class="vl-audit-layout"><section class="vl-panel"><div class="vl-panel-head"><div><p class="vl-eyebrow"><vl-i18n key="audit.traceability"/></p><h2><vl-i18n key="audit.events"/></h2></div><form method="get" class="vl-inline-actions"><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="audit.action_filter"/></span><input name="action" value="{}" placeholder="<vl-i18n key="audit.filter_action"/>"></label><button class="vl-button"><vl-i18n key="common.filter"/></button></form></div><div class="vl-table-wrap"><table class="vl-data-table vl-audit-table"><thead><tr><th class="vl-audit-time"><vl-i18n key="common.time"/></th><th class="vl-audit-user">User</th><th class="vl-audit-action"><vl-i18n key="common.action"/></th><th class="vl-audit-object"><vl-i18n key="common.object"/></th><th class="vl-audit-detail"><vl-i18n key="common.detail"/></th>{ip_header}</tr></thead><tbody>{rows}</tbody></table></div><nav class="vl-pagination" aria-label="<vl-i18n key="audit.pages"/>">{previous}<span><vl-i18n key="common.page_of"/> {} <vl-i18n key="common.of"/> {}</span>{next}</nav></section><aside class="vl-panel vl-security-facts"><p class="vl-eyebrow"><vl-i18n key="audit.security_status"/></p><h2><vl-i18n key="audit.proven_config"/></h2><dl><div><dt>MFA</dt><dd><vl-i18n key="audit.mfa_required"/></dd></div><div><dt><vl-i18n key="audit.server_mode"/></dt><dd>{:?}</dd></div><div><dt><vl-i18n key="audit.url_scheme"/></dt><dd>{}</dd></div><div><dt>Trusted Proxies</dt><dd>{}</dd></div><div><dt><vl-i18n key="audit.ip_capture"/></dt><dd>{}</dd></div><div><dt><vl-i18n key="audit.logging"/></dt><dd><vl-i18n key="audit.structured"/></dd></div></dl></aside></div>"#,
         esc(filter_value),
         page_number + 1,
         total_pages,
@@ -4507,14 +5049,14 @@ async fn audit_page(
         esc(&url_scheme),
         trusted_proxy_count,
         if client_ip_enabled {
-            "aktiv"
+            i18n::text(i18n::current_locale(), i18n::ENABLED)
         } else {
-            "deaktiviert"
+            i18n::text(i18n::current_locale(), i18n::DISABLED)
         },
     );
     Ok(Html(admin_page(
         &state,
-        "Audit & Sicherheit",
+        PageId::AuditSecurity,
         &body,
         false,
         &session.csrf_token,
@@ -4614,20 +5156,20 @@ async fn public_page(
     let settings = runtime_settings(&state);
     if !share_is_unlocked(&state, &headers, &sh).await? {
         let body = format!(
-            r#"<section class="vl-panel vl-auth-card"><p class="vl-eyebrow">Sichere Freigabe</p><h1>Geschützte Freigabe</h1><p class="vl-muted">Gib das Freigabepasswort ein, um fortzufahren.</p><form method="post" action="/v/{0}/unlock" class="vl-stack"><label class="vl-field">Passwort<input type="password" name="password" autocomplete="current-password" required></label><button class="vl-button">{1} Entsperren</button></form></section>"#,
+            r#"<section class="vl-panel vl-auth-card"><p class="vl-eyebrow"><vl-i18n key="share.secure"/></p><h1><vl-i18n key="public.protected_title"/></h1><p class="vl-muted"><vl-i18n key="public.enter_share_password"/></p><form method="post" action="/v/{0}/unlock" class="vl-stack"><label class="vl-field"><vl-i18n key="auth.password"/><input type="password" name="password" autocomplete="current-password" required></label><button class="vl-button">{1} <vl-i18n key="public.unlock"/></button></form></section>"#,
             esc(&token),
             crate::ui::icon(crate::ui::Icon::Lock),
         );
         return Ok(Html(plain_page("Geschützte Freigabe", &body)));
     }
     let display_name = if sh.permission == Permission::UploadOnly {
-        "Datei hochladen".to_string()
+        i18n::text(i18n::current_locale(), i18n::UPLOAD_FILE).to_string()
     } else {
         sh.relative_path
             .rsplit('/')
             .next()
             .filter(|name| !name.is_empty())
-            .unwrap_or("Freigabe")
+            .unwrap_or_else(|| i18n::text(i18n::current_locale(), i18n::DEFAULT_SHARE_NAME))
             .to_string()
     };
     let secure_transport = url::Url::parse(&settings.public_base_url)
@@ -4637,13 +5179,15 @@ async fn public_page(
         .expires_at
         .map(|expires_at| {
             format!(
-                r#"<span class="vl-badge">Gültig bis {}</span>"#,
-                expires_at.format("%d.%m.%Y")
+                r#"<span class="vl-badge"><vl-i18n key="public.valid_until"/> {}</span>"#,
+                format_public_date(expires_at)
             )
         })
-        .unwrap_or_else(|| r#"<span class="vl-badge">Kein Ablauf</span>"#.into());
+        .unwrap_or_else(|| {
+            r#"<span class="vl-badge"><vl-i18n key="share.no_expiry"/></span>"#.into()
+        });
     let password_badge = if sh.password_hash.is_some() {
-        r#"<span class="vl-badge vl-badge--neutral">Passwort geschützt</span>"#
+        r#"<span class="vl-badge vl-badge--neutral"><vl-i18n key="share.password_protected"/></span>"#
     } else {
         ""
     };
@@ -4653,29 +5197,27 @@ async fn public_page(
             .saturating_mul(100)
             .saturating_div(maximum.max(1))
             .min(100);
-        format!(r#"<div class="vl-public-quota"><span>{} von {} gezählten Übertragungen verwendet</span><progress class="vl-public-progress" max="100" value="{value}">{value}%</progress></div>"#, sh.download_count, maximum)
+        format!(r#"<div class="vl-public-quota"><span>{} <vl-i18n key="public.transfers_used_prefix"/> {} <vl-i18n key="public.transfers_used_suffix"/></span><progress class="vl-public-progress" max="100" value="{value}">{value}%</progress></div>"#, sh.download_count, maximum)
     }).unwrap_or_default();
     let mut body = format!(
-        r#"<section class="vl-panel vl-public-hero"><div><p class="vl-eyebrow">Sichere Freigabe</p><h1>{}</h1><p class="vl-muted">Bereitgestellt über {}</p><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span>{password_badge}{expiry_badge}</div></div><div>{}<p class="vl-muted">{}</p></div></section>"#,
+        r#"<section class="vl-panel vl-public-hero"><div><p class="vl-eyebrow"><vl-i18n key="share.secure"/></p><h1>{}</h1><p class="vl-muted"><vl-i18n key="public.provided_by"/> {}</p><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span>{password_badge}{expiry_badge}</div></div><div>{}<p class="vl-muted">{}</p></div></section>"#,
         esc(&display_name),
         esc(&settings.public_base_url),
         esc(share_permission_label(&sh.permission)),
         quota,
         if secure_transport {
-            "HTTPS · sicher übertragen"
+            i18n::text(i18n::current_locale(), i18n::HTTPS_SECURE)
         } else {
-            "Lokale HTTP-Verbindung"
+            i18n::text(i18n::current_locale(), i18n::LOCAL_HTTP)
         },
     );
     if let Some(upload_status) = q.upload.as_deref() {
         let message = match upload_status {
-            "replaced" => "Datei erfolgreich ersetzt.",
-            "ok" => "Upload erfolgreich abgeschlossen.",
-            "uncertain" => {
-                "Upload veröffentlicht; die dauerhafte Speicherung konnte nicht bestätigt werden."
-            }
+            "replaced" => i18n::text(i18n::current_locale(), i18n::FILE_REPLACED_SUCCESS),
+            "ok" => i18n::text(i18n::current_locale(), i18n::UPLOAD_COMPLETED),
+            "uncertain" => i18n::text(i18n::current_locale(), i18n::UPLOAD_STORAGE_UNCONFIRMED),
             "replaced_uncertain" => {
-                "Datei ersetzt; die dauerhafte Speicherung konnte nicht bestätigt werden."
+                i18n::text(i18n::current_locale(), i18n::REPLACE_STORAGE_UNCONFIRMED)
             }
             _ => "",
         };
@@ -4708,12 +5250,12 @@ async fn public_page(
         body += &public_breadcrumbs(&token, &clean_sub);
         if let Some(parent) = parent_path(&clean_sub) {
             body += &format!(
-                r#"<p><a href="/v/{token}?path={}">Hoch</a></p>"#,
+                r#"<p><a href="/v/{token}?path={}"><vl-i18n key="files.up"/></a></p>"#,
                 encoded(&parent)
             );
         }
         body += &format!(
-            r#"<form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only">Dateien durchsuchen</span><input name="q" value="{}" placeholder="Dateien durchsuchen"></label><button class="vl-button">Suchen</button><a class="vl-button vl-button--secondary" href="/v/{token}/download.zip?path={}">Ordner als ZIP</a></form>"#,
+            r#"<form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="files.browse"/></span><input name="q" value="{}" placeholder="<vl-i18n key="files.search_placeholder"/>"></label><button class="vl-button"><vl-i18n key="common.search"/></button><a class="vl-button vl-button--secondary" href="/v/{token}/download.zip?path={}"><vl-i18n key="files.folder_zip"/></a></form>"#,
             esc(&clean_sub),
             esc(search.as_deref().unwrap_or("")),
             encoded(&clean_sub)
@@ -4735,7 +5277,7 @@ async fn public_page(
                 let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings)
                 {
                     format!(
-                        r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}/preview?path={target}">Ansehen</a> "#
+                        r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}/preview?path={target}"><vl-i18n key="common.view"/></a> "#
                     )
                 } else {
                     String::new()
@@ -4759,7 +5301,7 @@ async fn public_page(
                     )
                 };
                 rows += &format!(
-                    r#"<tr><td data-label="Name">{name}</td><td data-label="Größe">{}</td><td data-label="Geändert">{modified}</td><td data-label="Aktion" class="vl-inline-actions">{}{preview}</td></tr>"#,
+                    r#"<tr><td data-label="<vl-i18n key="common.name"/>">{name}</td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{modified}</td><td data-label="<vl-i18n key="common.action"/>" class="vl-inline-actions">{}{preview}</td></tr>"#,
                     if hit.entry.is_dir {
                         "—".into()
                     } else {
@@ -4767,11 +5309,11 @@ async fn public_page(
                     },
                     if hit.entry.is_dir {
                         format!(
-                            r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}">Öffnen</a>"#
+                            r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}"><vl-i18n key="common.open"/></a>"#
                         )
                     } else {
                         format!(
-                            r#"<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}">Download</a>"#
+                            r#"<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}"><vl-i18n key="common.download"/></a>"#
                         )
                     },
                 );
@@ -4791,7 +5333,7 @@ async fn public_page(
                 let target = encoded(&rel);
                 if entry.is_dir {
                     rows += &format!(
-                        r#"<tr><td data-label="Name">{} <a href="/v/{token}?path={target}">{name}</a></td><td data-label="Größe">—</td><td data-label="Geändert">{}</td><td data-label="Aktion"><a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}">Öffnen</a></td></tr>"#,
+                        r#"<tr><td data-label="<vl-i18n key="common.name"/>">{} <a href="/v/{token}?path={target}">{name}</a></td><td data-label="<vl-i18n key="common.size"/>">—</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>"><a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}"><vl-i18n key="common.open"/></a></td></tr>"#,
                         crate::ui::icon(crate::ui::Icon::Folder),
                         entry
                             .modified
@@ -4801,13 +5343,13 @@ async fn public_page(
                 } else {
                     let preview = if preview_allowed(&rel, &settings) {
                         format!(
-                            r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}/preview?path={target}">Ansehen</a> "#
+                            r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}/preview?path={target}"><vl-i18n key="common.view"/></a> "#
                         )
                     } else {
                         String::new()
                     };
                     rows += &format!(
-                        r#"<tr><td data-label="Name">{} {name}</td><td data-label="Größe">{}</td><td data-label="Geändert">{}</td><td data-label="Aktion" class="vl-inline-actions">{}<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}">Download</a></td></tr>"#,
+                        r#"<tr><td data-label="<vl-i18n key="common.name"/>">{} {name}</td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>" class="vl-inline-actions">{}<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}"><vl-i18n key="common.download"/></a></td></tr>"#,
                         crate::ui::icon(crate::ui::Icon::File),
                         human(entry.len),
                         entry
@@ -4819,10 +5361,10 @@ async fn public_page(
                 }
             }
             if truncated {
-                rows += r#"<tr><td colspan="4" class="vl-muted">Verzeichnis-Scanlimit erreicht; weitere Einträge werden aus Sicherheitsgründen nicht gelesen.</td></tr>"#;
+                rows += r#"<tr><td colspan="4" class="vl-muted"><vl-i18n key="files.scan_limit"/></td></tr>"#;
             }
         }
-        body += "<div class=\"vl-table-wrap\"><table class=\"vl-data-table\"><thead><tr><th>Name</th><th>Größe</th><th>Geändert</th><th>Aktion</th></tr></thead><tbody>";
+        body += "<div class=\"vl-table-wrap\"><table class=\"vl-data-table\"><thead><tr><th><vl-i18n key=\"common.name\"/></th><th><vl-i18n key=\"common.size\"/></th><th><vl-i18n key=\"common.changed\"/></th><th><vl-i18n key=\"common.action\"/></th></tr></thead><tbody>";
         body += &rows;
         body += "</tbody></table></div>";
         let encoded_sub = encoded(&clean_sub);
@@ -4832,14 +5374,14 @@ async fn public_page(
             .unwrap_or_default();
         if page_number > 0 {
             body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\">Zurück</a>",
+                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\"><vl-i18n key=\"common.back\"/></a>",
                 page_number - 1,
                 search_param
             );
         }
         if has_next {
             body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\">Weiter</a>",
+                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\"><vl-i18n key=\"common.continue\"/></a>",
                 page_number + 1,
                 search_param
             );
@@ -4854,13 +5396,13 @@ async fn public_page(
             .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabedatei nicht verfügbar"))?;
         let preview = if preview_allowed(&sh.relative_path, &settings) {
             format!(
-                r#"<a class="vl-button vl-button--secondary" href="/v/{token}/preview">Im Browser ansehen</a> "#
+                r#"<a class="vl-button vl-button--secondary" href="/v/{token}/preview"><vl-i18n key="files.view_browser"/></a> "#
             )
         } else {
             String::new()
         };
         body += &format!(
-            r#"<section class="vl-panel"><p class="vl-muted">{} · geändert {}</p><div class="vl-inline-actions">{}<a class="vl-button" href="/v/{token}/download">Datei herunterladen</a></div></section>"#,
+            r#"<section class="vl-panel"><p class="vl-muted">{} · <vl-i18n key="files.modified_label"/> {}</p><div class="vl-inline-actions">{}<a class="vl-button" href="/v/{token}/download"><vl-i18n key="files.download_file"/></a></div></section>"#,
             human(metadata.len()),
             metadata
                 .modified()
@@ -4879,25 +5421,26 @@ async fn public_page(
             String::new()
         };
         let overwrite_checkbox = if sh.upload_conflict_strategy.can_overwrite() {
-            r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span>Bestehende Datei ersetzen<small>Nur für die konkrete Datei und nach ausdrücklicher Bestätigung.</small></span></label>"#
+            r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_existing_file"/><small><vl-i18n key="share.replace_concrete"/></small></span></label>"#
         } else {
             ""
         };
         let target_hint = if sh.permission == Permission::UploadOnly {
-            r#"<p class="vl-notice"><strong>Vorhandene Dateien und Ordner bleiben verborgen.</strong></p>"#.to_string()
+            r#"<p class="vl-notice"><strong><vl-i18n key="share.existing_hidden"/></strong></p>"#
+                .to_string()
         } else {
             format!(
-                r#"<p class="vl-muted">Zielordner innerhalb der Freigabe: /{}</p>"#,
+                r#"<p class="vl-muted"><vl-i18n key="public.target_folder"/>: /{}</p>"#,
                 esc(&upload_path)
             )
         };
         let panel_tag = if split_layout { "aside" } else { "section" };
         body += &format!(
-            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong>Datei hier ablegen</strong><span class="vl-muted">oder über den Dateidialog auswählen</span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label>{}<div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>{} Sicher hochladen</button><p class="vl-muted">Vorhandene Dateien werden standardmäßig nicht ersetzt. Erfolgreiche Uploads werden protokolliert.</p></form></{panel_tag}>"#,
+            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_choose"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label>{}<div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>{} <vl-i18n key="upload.securely"/></button><p class="vl-muted"><vl-i18n key="share.no_replace_help"/></p></form></{panel_tag}>"#,
             if sh.permission == Permission::UploadOnly {
-                "Datei hochladen"
+                i18n::text(i18n::current_locale(), i18n::UPLOAD_FILE)
             } else {
-                "Dateien hochladen"
+                i18n::text(i18n::current_locale(), i18n::UPLOAD_FILES_PUBLIC)
             },
             esc(&upload_path),
             crate::ui::icon(crate::ui::Icon::Upload),
@@ -4942,14 +5485,19 @@ fn add_public_preview_actions(
     download_link: Option<&str>,
 ) -> String {
     let download = download_link
-        .map(|link| format!(r#"<a href="{}">Herunterladen</a>"#, esc(link)))
+        .map(|link| {
+            format!(
+                r#"<a href="{}"><vl-i18n key="common.download"/></a>"#,
+                esc(link)
+            )
+        })
         .unwrap_or_default();
     let action = format!(
-        r#"<h1>Vorschau</h1><p class="preview-actions"><a href="{}">Zurück zur Freigabe</a>{}</p>"#,
+        r#"<h1><vl-i18n key="files.preview"/></h1><p class="preview-actions"><a href="{}"><vl-i18n key="share.back"/></a>{}</p>"#,
         esc(back_link),
         download
     );
-    body.replacen("<h1>Vorschau</h1>", &action, 1)
+    body.replacen(r#"<h1><vl-i18n key="files.preview"/></h1>"#, &action, 1)
 }
 
 pub(crate) async fn public_preview(
@@ -5030,7 +5578,7 @@ pub(crate) async fn public_preview(
             Some(&download_link),
         ),
         PreviewContent::Text(text) => format!(
-            r#"<section><h1>Vorschau</h1><pre>{}</pre></section>"#,
+            r#"<section><h1><vl-i18n key="files.preview"/></h1><pre>{}</pre></section>"#,
             esc(&text)
         ),
         PreviewContent::Media { kind, size } => {
@@ -5061,7 +5609,7 @@ pub(crate) async fn public_preview(
             };
             let viewer = media_viewer(kind, &raw_url);
             format!(
-                r#"<section><h1>Vorschau</h1><p class="muted">{} - Raw-Token läuft nach wenigen Minuten ab.</p>{}</section>"#,
+                r#"<section><h1><vl-i18n key="files.preview"/></h1><p class="muted">{} - <vl-i18n key="files.raw_token"/></p>{}</section>"#,
                 human(size),
                 viewer
             )
@@ -5903,6 +6451,7 @@ struct UploadQueueError {
 }
 
 fn upload_queue_error_response(status: StatusCode, message: &str) -> Response {
+    let message = i18n::text_from_german(i18n::current_locale(), message);
     let code = match status {
         StatusCode::BAD_REQUEST => "invalid_upload",
         StatusCode::UNAUTHORIZED => "share_locked",
@@ -5919,7 +6468,7 @@ fn upload_queue_error_response(status: StatusCode, message: &str) -> Response {
         Json(UploadQueueErrorEnvelope {
             error: UploadQueueError {
                 code: code.to_string(),
-                message: message.to_string(),
+                message,
             },
         }),
     )
@@ -6043,6 +6592,7 @@ mod tests {
             .method(method)
             .uri(uri)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::ACCEPT_LANGUAGE, "de")
             .body(Body::from(body.to_string()))
             .unwrap();
         request.extensions_mut().insert(ConnectInfo(
@@ -6489,6 +7039,7 @@ mod tests {
         let mut request = Request::builder()
             .method(Method::POST)
             .uri(uri)
+            .header(header::ACCEPT_LANGUAGE, "de")
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -6538,6 +7089,7 @@ mod tests {
         let mut request = Request::builder()
             .method(Method::POST)
             .uri(uri)
+            .header(header::ACCEPT_LANGUAGE, "de")
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -6676,6 +7228,31 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(response.headers().get(header::LOCATION).is_none());
     }
+
+    #[test]
+    fn post_locale_return_targets_are_get_safe() {
+        let uri = |value: &str| value.parse::<Uri>().unwrap();
+        assert_eq!(
+            locale_return_to(&Method::POST, &uri("/admin/account/password")),
+            "/admin/account"
+        );
+        assert_eq!(
+            locale_return_to(&Method::POST, &uri("/admin/admins/42/totp")),
+            "/admin/admins"
+        );
+        assert_eq!(
+            locale_return_to(&Method::POST, &uri("/admin/files/delete")),
+            "/admin"
+        );
+        assert_eq!(
+            locale_return_to(&Method::POST, &uri("/v/share-token/upload/queue")),
+            "/v/share-token"
+        );
+        assert_eq!(
+            locale_return_to(&Method::GET, &uri("/admin?path=folder")),
+            "/admin?path=folder"
+        );
+    }
     #[test]
     fn permissions() {
         assert!(!Permission::DownloadOnly.can_upload());
@@ -6750,12 +7327,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn admin_shell_renders_nav_icons_and_system_panel() {
+    #[tokio::test]
+    async fn admin_shell_renders_nav_icons_and_system_panel() {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let state = test_state(root.path(), data.path());
-        let html = admin_page(&state, "Dateien", "<section></section>", true, "csrf");
+        let html = i18n::scope(Locale::De, "/admin".into(), async {
+            admin_page(&state, PageId::Files, "<section></section>", true, "csrf")
+        })
+        .await;
         assert!(html.contains("<title>Dateien · VaultLink</title>"));
         for label in ["Dateien", "Links", "Admins", "Einstellungen", "Audit"] {
             assert!(html.contains(&format!("<span>{label}</span>")));
@@ -6769,8 +7349,246 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn locale_route_sets_hardened_cookie_and_rejects_external_return_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let app = router(test_state(root.path(), data.path()));
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/locale",
+                "locale=en&return_to=%2Flogin%3Ffrom%3Dswitch",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/login?from=switch"
+        );
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("vaultlink_locale=en;"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Path=/"));
+        assert!(!cookie.contains(" Secure;"));
+
+        let response = app
+            .oneshot(request(
+                Method::POST,
+                "/locale",
+                "locale=de&return_to=https%3A%2F%2Fevil.example",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/");
+
+        let mut secure_state = test_state(root.path(), data.path());
+        Arc::make_mut(&mut secure_state.config)
+            .security
+            .secure_cookie = true;
+        let secure_response = router(secure_state)
+            .oneshot(request(
+                Method::POST,
+                "/locale",
+                "locale=en&return_to=%2Flogin",
+            ))
+            .await
+            .unwrap();
+        assert!(secure_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(" Secure;"));
+    }
+
+    #[tokio::test]
+    async fn http_locale_resolution_uses_accept_language_then_english_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let app = router(test_state(root.path(), data.path()));
+
+        let request_without_language = Request::builder()
+            .uri("/login")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request_without_language).await.unwrap();
+        assert_eq!(
+            response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+            "en"
+        );
+        assert!(response_text(response).await.contains("Admin sign in"));
+
+        let mut german = request(Method::GET, "/login", "");
+        german.headers_mut().insert(
+            header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("de-AT,de;q=0.9"),
+        );
+        let response = app.clone().oneshot(german).await.unwrap();
+        assert_eq!(
+            response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+            "de"
+        );
+        assert!(response_text(response).await.contains("Admin Login"));
+
+        let mut cookie_override = request(Method::GET, "/login", "");
+        cookie_override.headers_mut().insert(
+            header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+        cookie_override.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_locale=de"),
+        );
+        let response = app.oneshot(cookie_override).await.unwrap();
+        assert_eq!(
+            response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+            "de"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_errors_localize_message_without_changing_machine_code() {
+        let response = i18n::scope(Locale::En, "/v/token".into(), async {
+            upload_queue_error_response(
+                StatusCode::CONFLICT,
+                "Datei existiert bereits; Ersetzen muss für diese Datei bestätigt werden",
+            )
+        })
+        .await;
+        let body = response_text(response).await;
+        assert!(body.contains(r#""code":"file_exists""#));
+        assert!(body.contains("File already exists"));
+        assert!(!body.contains("Datei existiert"));
+    }
+
+    #[tokio::test]
+    async fn english_locale_covers_main_routes_without_touching_user_values() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Dateien"), b"public").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("Abmelden", "hash", "secret").unwrap();
+        state
+            .db
+            .create_session(
+                "locale-session",
+                1,
+                "locale-csrf",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap();
+        state.db.verify_mfa("locale-session").unwrap();
+        state
+            .db
+            .create_share(
+                "locale-public",
+                None,
+                "Dateien",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = router(state);
+        let routes = [
+            ("/login", false),
+            ("/admin", true),
+            ("/admin/account", true),
+            ("/admin/shares", true),
+            ("/admin/admins", true),
+            ("/admin/settings", true),
+            ("/admin/audit", true),
+            ("/v/locale-public", false),
+        ];
+        let forbidden_static_german = [
+            "Zum Inhalt springen",
+            "Dateibrowser",
+            "Dateien durchsuchen",
+            "Aktuellen Ordner freigeben",
+            "Einstellungen",
+            "Nachvollziehbarkeit",
+            "Sichere Freigabe",
+            "Benutzername",
+            "Speichern",
+            ">Abmelden</button>",
+            ">Zurück<",
+            ">Weiter<",
+            ">Suchen<",
+            ">Löschen<",
+            ">Ansehen<",
+            ">Erstellen<",
+            ">Aktiv<",
+            ">Abgelaufen<",
+            ">Geschützt<",
+            ">Passwort<",
+            ">Größe<",
+            ">Geändert<",
+            ">Aktion<",
+            ">Vorschau<",
+        ];
+
+        for (uri, authenticated) in routes {
+            let mut request = request(Method::GET, uri, "");
+            let cookie = if authenticated {
+                "vaultlink_locale=en; vaultlink_session=locale-session"
+            } else {
+                "vaultlink_locale=en"
+            };
+            request
+                .headers_mut()
+                .insert(header::COOKIE, HeaderValue::from_static(cookie));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "route {uri}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+                "en",
+                "route {uri}"
+            );
+            let html = response_text(response).await;
+            assert!(html.contains(r#"<html lang="en">"#), "route {uri}");
+            assert!(!html.contains("<vl-i18n"), "unresolved marker on {uri}");
+            for fragment in forbidden_static_german {
+                assert!(
+                    !html.contains(fragment),
+                    "route {uri} still contains German UI fragment {fragment:?}"
+                );
+            }
+            assert!(
+                !html
+                    .chars()
+                    .any(|ch| matches!(ch, 'ä' | 'ö' | 'ü' | 'Ä' | 'Ö' | 'Ü' | 'ß')),
+                "route {uri} still contains a German-specific character"
+            );
+            if uri == "/admin" || uri == "/v/locale-public" {
+                assert!(html.contains("Dateien"), "user file name changed on {uri}");
+            }
+            if uri == "/admin/admins" {
+                assert!(html.contains("Abmelden"), "user name was translated");
+                assert!(html.contains("Log out"), "logout action was not translated");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn login_page_serves_correct_utf8() {
-        let response = login_page().await.into_response();
+        let response = i18n::scope(Locale::De, "/login".into(), login_page())
+            .await
+            .into_response();
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
@@ -6816,8 +7634,8 @@ mod tests {
         assert_no_mojibake("broken folder icon", &broken_folder);
     }
 
-    #[test]
-    fn settings_form_uses_decimal_whole_preview_defaults() {
+    #[tokio::test]
+    async fn settings_form_uses_decimal_whole_preview_defaults() {
         let session = Session {
             admin_id: 1,
             username: "admin".into(),
@@ -6833,7 +7651,10 @@ mod tests {
         settings.max_preview_size = 1_000_000;
         settings.max_media_preview_size = 100_000_000;
 
-        let html = settings_form(&session, &settings, 0, "");
+        let html = i18n::scope(Locale::De, "/admin/settings".into(), async {
+            i18n::render_markers(Locale::De, &settings_form(&session, &settings, 0, ""))
+        })
+        .await;
         assert!(
             html.contains(r#"name="max_upload_size_gb" type="number" min="1" step="1" value="53""#)
         );
@@ -6852,18 +7673,30 @@ mod tests {
     #[test]
     fn custom_datetime_picker_replaces_native_browser_picker() {
         let css = app_css();
+        let picker = i18n::render_markers(Locale::De, &expiry_picker_html());
         assert!(css.contains(".datetime-popover"));
         assert!(!css.contains(r#"datetime-local"]::-webkit-calendar-picker-indicator"#));
-        assert!(expiry_picker_html().contains("data-datetime-picker"));
-        assert!(expiry_picker_html().contains(r#"name="expires_local""#));
-        assert!(expiry_picker_html().contains("TT.MM.JJJJ HH:MM"));
-        assert!(!expiry_picker_html().contains(r#"type="datetime-local""#));
+        assert!(picker.contains("data-datetime-picker"));
+        assert!(picker.contains(r#"name="expires_local""#));
+        assert!(picker.contains("TT.MM.JJJJ HH:MM"));
+        assert!(!picker.contains(r#"type="datetime-local""#));
     }
 
-    #[test]
-    fn file_time_uses_german_date_order() {
+    #[tokio::test]
+    async fn file_time_uses_locale_date_order() {
         let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(60 * 60 * 20 + 32 * 60);
-        assert_eq!(format_file_time(time), "01.01.1970 20:32 UTC");
+        let de = i18n::scope(Locale::De, "/".into(), async { format_file_time(time) }).await;
+        let en = i18n::scope(Locale::En, "/".into(), async { format_file_time(time) }).await;
+        assert_eq!(de, "01.01.1970 20:32 UTC");
+        assert_eq!(en, "1970-01-01 20:32 UTC");
+    }
+
+    #[tokio::test]
+    async fn byte_sizes_use_locale_decimal_separator() {
+        let de = i18n::scope(Locale::De, "/".into(), async { human(1_500_000_000) }).await;
+        let en = i18n::scope(Locale::En, "/".into(), async { human(1_500_000_000) }).await;
+        assert_eq!(de, "1,5 GB");
+        assert_eq!(en, "1.5 GB");
     }
 
     #[test]
@@ -6874,8 +7707,13 @@ mod tests {
 
     #[test]
     fn public_preview_actions_are_rendered_above_content() {
-        let body = r#"<section><h1>Vorschau</h1><pre>long text</pre></section>"#.to_string();
-        let html = add_public_preview_actions(body, "/v/token", Some("/v/token/download"));
+        let body =
+            r#"<section><h1><vl-i18n key="files.preview"/></h1><pre>long text</pre></section>"#
+                .to_string();
+        let html = i18n::render_markers(
+            Locale::De,
+            &add_public_preview_actions(body, "/v/token", Some("/v/token/download")),
+        );
         let actions = html.find("Zurück zur Freigabe").unwrap();
         let content = html.find("<pre>long text</pre>").unwrap();
         assert!(actions < content);
@@ -7711,6 +8549,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let current_password = "current-admin-password";
+        let replacement_password = "replacement-admin-password";
+        let password_hash = auth::hash_password(current_password).unwrap();
+        let old_secret = auth::new_totp_secret();
+        state.runtime.write().unwrap().audit_client_ip_enabled = true;
+        state
+            .db
+            .create_admin("admin", &password_hash, &old_secret)
+            .unwrap();
+        state
+            .db
+            .create_session(
+                "account-session",
+                1,
+                "account-csrf",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap();
+        state.db.verify_mfa("account-session").unwrap();
+        let app = router(state.clone());
+        let account_cookie = HeaderValue::from_static("vaultlink_session=account-session");
+
+        let mut account_request = request(Method::GET, "/admin/account", "");
+        account_request
+            .headers_mut()
+            .insert(header::COOKIE, account_cookie.clone());
+        let account_html = response_text(app.clone().oneshot(account_request).await.unwrap()).await;
+        assert!(account_html.contains("Mein Konto"));
+        assert!(account_html.contains("Aktueller Benutzer"));
+        assert!(account_html.contains(">admin<"));
+        assert!(account_html.contains(r#"action="/admin/account/password""#));
+        assert!(account_html.contains(r#"action="/admin/account/mfa/start""#));
+        assert!(account_html.contains(r#"action="/locale""#));
+
+        let mut wrong_password = request(
+            Method::POST,
+            "/admin/account/password",
+            "csrf=account-csrf&current_password=wrong-password&new_password=replacement-admin-password&password_confirm=replacement-admin-password",
+        );
+        wrong_password
+            .headers_mut()
+            .insert(header::COOKIE, account_cookie.clone());
+        assert_eq!(
+            app.clone().oneshot(wrong_password).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(state.db.session("account-session").unwrap().is_some());
+        assert!(auth::verify_password(
+            &state.db.admin("admin").unwrap().unwrap().password_hash,
+            current_password
+        ));
+
+        let mut change_password = request(
+            Method::POST,
+            "/admin/account/password",
+            "csrf=account-csrf&current_password=current-admin-password&new_password=replacement-admin-password&password_confirm=replacement-admin-password",
+        );
+        change_password
+            .headers_mut()
+            .insert(header::COOKIE, account_cookie);
+        let changed = app.clone().oneshot(change_password).await.unwrap();
+        assert_eq!(changed.status(), StatusCode::SEE_OTHER);
+        assert_eq!(changed.headers().get(header::LOCATION).unwrap(), "/login");
+        assert!(changed
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+        assert!(state.db.session("account-session").unwrap().is_none());
+        assert!(auth::verify_password(
+            &state.db.admin("admin").unwrap().unwrap().password_hash,
+            replacement_password
+        ));
+
+        state
+            .db
+            .create_session(
+                "account-mfa-session",
+                1,
+                "account-mfa-csrf",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap();
+        state.db.verify_mfa("account-mfa-session").unwrap();
+        let mfa_cookie = HeaderValue::from_static("vaultlink_session=account-mfa-session");
+
+        let mut rejected_start = request(
+            Method::POST,
+            "/admin/account/mfa/start",
+            "csrf=account-mfa-csrf&current_password=replacement-admin-password&current_code=abcdef",
+        );
+        rejected_start
+            .headers_mut()
+            .insert(header::COOKIE, mfa_cookie.clone());
+        assert_eq!(
+            app.clone().oneshot(rejected_start).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            state.db.admin("admin").unwrap().unwrap().totp_secret,
+            old_secret
+        );
+        assert!(state.db.session("account-mfa-session").unwrap().is_some());
+
+        let current_step = Utc::now().timestamp() as u64 / 30;
+        let current_code = auth::totp_code(&old_secret, current_step).unwrap();
+        let mut start_mfa = request(
+            Method::POST,
+            "/admin/account/mfa/start",
+            &format!("csrf=account-mfa-csrf&current_password=replacement-admin-password&current_code={current_code}"),
+        );
+        start_mfa
+            .headers_mut()
+            .insert(header::COOKIE, mfa_cookie.clone());
+        let start_response = app.clone().oneshot(start_mfa).await.unwrap();
+        assert_eq!(start_response.status(), StatusCode::OK);
+        let start_html = response_text(start_response).await;
+        assert!(start_html.contains("Die bisherige MFA bleibt"));
+        assert!(!start_html.contains(r#"action="/locale""#));
+        let token_marker = r#"name="enrollment_token" value=""#;
+        let token_start = start_html.find(token_marker).unwrap() + token_marker.len();
+        let enrollment_token = start_html[token_start..]
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
+        let secret_marker = "otpauth://totp/VaultLink:admin?secret=";
+        let secret_start = start_html.find(secret_marker).unwrap() + secret_marker.len();
+        let new_secret = start_html[secret_start..]
+            .split('&')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_ne!(new_secret, old_secret);
+        assert_eq!(
+            state.db.admin("admin").unwrap().unwrap().totp_secret,
+            old_secret
+        );
+
+        let mut wrong_confirmation = request(
+            Method::POST,
+            "/admin/account/mfa/confirm",
+            &format!("csrf=account-mfa-csrf&enrollment_token={enrollment_token}&code=abcdef"),
+        );
+        wrong_confirmation
+            .headers_mut()
+            .insert(header::COOKIE, mfa_cookie.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(wrong_confirmation)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            state.db.admin("admin").unwrap().unwrap().totp_secret,
+            old_secret
+        );
+        assert!(state.db.session("account-mfa-session").unwrap().is_some());
+
+        let new_code = auth::totp_code(&new_secret, Utc::now().timestamp() as u64 / 30).unwrap();
+        let mut confirm_mfa = request(
+            Method::POST,
+            "/admin/account/mfa/confirm",
+            &format!("csrf=account-mfa-csrf&enrollment_token={enrollment_token}&code={new_code}"),
+        );
+        confirm_mfa.headers_mut().insert(header::COOKIE, mfa_cookie);
+        let confirmed = app.clone().oneshot(confirm_mfa).await.unwrap();
+        assert_eq!(confirmed.status(), StatusCode::SEE_OTHER);
+        assert_eq!(confirmed.headers().get(header::LOCATION).unwrap(), "/login");
+        assert!(confirmed
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+        assert_eq!(
+            state.db.admin("admin").unwrap().unwrap().totp_secret,
+            new_secret
+        );
+        assert!(state.db.session("account-mfa-session").unwrap().is_none());
+        assert_eq!(
+            state
+                .db
+                .count_audit(Some("account_password_changed"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state.db.count_audit(Some("account_mfa_changed")).unwrap(),
+            1
+        );
+        for action in ["account_password_changed", "account_mfa_changed"] {
+            let events = state.db.list_audit(Some(action), 10, 0).unwrap();
+            assert_eq!(events[0].client_ip.as_deref(), Some("127.0.0.1"));
+        }
+    }
+
+    #[tokio::test]
     async fn admin_ui_creates_admin_and_updates_runtime_settings() {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -7755,6 +8800,7 @@ mod tests {
         assert!(created_admin_page.contains("TOTP QR-Code"));
         assert!(created_admin_page.contains("<svg"));
         assert!(created_admin_page.contains("otpauth://totp/VaultLink:ops"));
+        assert!(!created_admin_page.contains(r#"action="/locale""#));
         assert!(created_admin_page.contains(r#"class="button secondary" href="/admin/admins""#));
         assert!(state.db.admin("ops").unwrap().is_some());
 
@@ -7803,6 +8849,7 @@ mod tests {
         assert!(admin_list_html.contains("Stillgelegte Admins"));
         assert!(!admin_list_html.contains("Admin-Löschen ist bewusst nicht enthalten"));
         assert!(admin_list_html.contains("Aktueller Admin"));
+        assert!(!admin_list_html.contains("Eigene Passwort- und MFA-Änderungen"));
         assert_eq!(admin_list_html.matches("Passwort setzen").count(), 2);
         assert!(
             admin_list_html.find("<td>1</td>").unwrap()
@@ -7884,6 +8931,7 @@ mod tests {
         assert!(reset_totp_html.contains("MFA zurückgesetzt"));
         assert!(reset_totp_html.contains("TOTP QR-Code"));
         assert!(reset_totp_html.contains("otpauth://totp/VaultLink:later"));
+        assert!(!reset_totp_html.contains(r#"action="/locale""#));
 
         let mut settings_request = request(
             Method::POST,

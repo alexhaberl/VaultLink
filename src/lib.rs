@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod file_ops;
 pub mod http_auth;
+pub mod i18n;
 pub mod multipart_guard;
 pub mod path_security;
 pub mod proxy;

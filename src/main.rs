@@ -1,8 +1,10 @@
 use futures_util::StreamExt;
+use serde::Deserialize;
 use std::{env, path::PathBuf};
 use vaultlink::{
     auth,
     config::{self, CertificateSource, Config, ServerMode},
+    db::{AdminRecoveryOutcome, Database, InitialAdminOutcome},
     web, AppState,
 };
 
@@ -10,13 +12,24 @@ use vaultlink::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.get(1).is_some_and(|value| value == "--version") {
+        if args.len() != 2 {
+            return Err("--version does not accept additional arguments".into());
+        }
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.get(1).is_some_and(|value| value == "recover-admin") {
+        let options = RecoverAdminOptions::parse(&args).map_err(std::io::Error::other)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .init();
+        return recover_admin(&options);
+    }
+    let mode = command_mode(&args).map_err(std::io::Error::other)?;
     let config_path = arg(&args, "--config")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
-    if args.get(1).is_some_and(|value| value == "setup") {
+    if mode == CommandMode::Setup {
         let listen = arg(&args, "--listen").unwrap_or("127.0.0.1:8090");
         let listen: std::net::SocketAddr = listen.parse()?;
         if !vaultlink::setup::run(config_path.clone(), listen).await? {
@@ -24,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let config = Config::load(&config_path)?;
-    if args.get(1).is_some_and(|value| value == "readiness-target") {
+    if mode == CommandMode::ReadinessTarget {
         let target = config.local_readiness_target()?;
         println!("{}", target.url);
         println!("{}", target.connect_to.as_deref().unwrap_or("-"));
@@ -34,31 +47,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = tracing_subscriber::EnvFilter::try_new(&config.logging.level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
-    let state = AppState::new(config.clone())?;
-    if args.get(1).is_some_and(|v| v == "init-admin") {
-        let username = arg(&args, "--username").ok_or("--username is required")?;
-        if username.len() < 3
-            || !username
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err("username must be 3+ safe ASCII characters".into());
-        }
-        let password = rpassword::prompt_password("New admin password: ")?;
-        if password.len() < 14 {
-            return Err("password must contain at least 14 characters".into());
-        }
-        let confirm = rpassword::prompt_password("Confirm password: ")?;
-        if password != confirm {
-            return Err("passwords do not match".into());
-        }
-        let secret = auth::new_totp_secret();
-        let hash = auth::hash_password(&password)
-            .map_err(|error| std::io::Error::other(format!("password hashing failed: {error}")))?;
-        state.db.create_admin(username, &hash, &secret)?;
-        println!("Admin created. Add this secret to the authenticator exactly once:\n{secret}\notpauth://totp/VaultLink:{username}?secret={secret}&issuer=VaultLink");
-        return Ok(());
+    if mode == CommandMode::InitAdmin {
+        return init_admin(&config, &args);
     }
+    let state = AppState::new(config.clone())?;
     start_upload_fragment_cleanup(&state);
     let addr: std::net::SocketAddr = config.server.listen_address.parse()?;
     let app = web::router(state);
@@ -134,6 +126,296 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
         }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandMode {
+    Serve,
+    Setup,
+    InitAdmin,
+    ReadinessTarget,
+}
+
+fn command_mode(args: &[String]) -> Result<CommandMode, String> {
+    match args.get(1).map(String::as_str) {
+        None => Ok(CommandMode::Serve),
+        Some("--config") => {
+            validate_value_options(args, 1, &["--config"])?;
+            Ok(CommandMode::Serve)
+        }
+        Some("setup") => {
+            validate_value_options(args, 2, &["--config", "--listen"])?;
+            Ok(CommandMode::Setup)
+        }
+        Some("init-admin") => {
+            validate_value_options(args, 2, &["--config", "--username"])?;
+            Ok(CommandMode::InitAdmin)
+        }
+        Some("readiness-target") => {
+            validate_value_options(args, 2, &["--config"])?;
+            Ok(CommandMode::ReadinessTarget)
+        }
+        Some(option) if option.starts_with('-') => {
+            Err(format!("unknown VaultLink option: {option}"))
+        }
+        Some(command) => Err(format!("unknown VaultLink command: {command}")),
+    }
+}
+
+fn validate_value_options(args: &[String], start: usize, allowed: &[&str]) -> Result<(), String> {
+    let mut seen = Vec::new();
+    let mut index = start;
+    while index < args.len() {
+        let option = args[index].as_str();
+        if !option.starts_with('-') {
+            return Err(format!("unexpected positional argument: {option}"));
+        }
+        if !allowed.contains(&option) {
+            return Err(format!("unknown option: {option}"));
+        }
+        if seen.contains(&option) {
+            return Err(format!("{option} may only be provided once"));
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{option} requires one non-option value"))?;
+        if value.is_empty() || value.starts_with('-') {
+            return Err(format!("{option} requires one non-option value"));
+        }
+        seen.push(option);
+        index += 2;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RecoveryDatabaseSource {
+    Config(PathBuf),
+    Database(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecoverAdminOptions {
+    source: RecoveryDatabaseSource,
+    username: String,
+    reset_password: bool,
+    reset_mfa: bool,
+}
+
+impl RecoverAdminOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        if args.get(1).map(String::as_str) != Some("recover-admin") {
+            return Err("recover-admin parser requires the recover-admin command".into());
+        }
+        let mut config_path = None;
+        let mut database_path = None;
+        let mut username = None;
+        let mut reset_password = false;
+        let mut reset_mfa = false;
+        let mut index = 2;
+        while index < args.len() {
+            let option = args[index].as_str();
+            match option {
+                "--config" | "--database" | "--username" => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| format!("{option} requires one non-option value"))?;
+                    if value.is_empty() || value.starts_with('-') {
+                        return Err(format!("{option} requires one non-option value"));
+                    }
+                    let duplicate = match option {
+                        "--config" => config_path.replace(PathBuf::from(value)).is_some(),
+                        "--database" => database_path.replace(PathBuf::from(value)).is_some(),
+                        "--username" => username.replace(value.clone()).is_some(),
+                        _ => unreachable!(),
+                    };
+                    if duplicate {
+                        return Err(format!("{option} may only be provided once"));
+                    }
+                    index += 2;
+                }
+                option if option.starts_with("--username=") => {
+                    let value = option
+                        .strip_prefix("--username=")
+                        .expect("guard checked the prefix");
+                    if value.is_empty() {
+                        return Err("--username requires a non-empty value".into());
+                    }
+                    if username.replace(value.to_string()).is_some() {
+                        return Err("--username may only be provided once".into());
+                    }
+                    index += 1;
+                }
+                "--reset-password" => {
+                    if reset_password {
+                        return Err("--reset-password may only be provided once".into());
+                    }
+                    reset_password = true;
+                    index += 1;
+                }
+                "--reset-mfa" => {
+                    if reset_mfa {
+                        return Err("--reset-mfa may only be provided once".into());
+                    }
+                    reset_mfa = true;
+                    index += 1;
+                }
+                unknown if unknown.starts_with('-') => {
+                    return Err(format!("unknown recover-admin option: {unknown}"));
+                }
+                positional => {
+                    return Err(format!(
+                        "unexpected recover-admin positional argument: {positional}"
+                    ));
+                }
+            }
+        }
+        let source = match (config_path, database_path) {
+            (Some(path), None) => RecoveryDatabaseSource::Config(path),
+            (None, Some(path)) => RecoveryDatabaseSource::Database(path),
+            (None, None) => {
+                return Err("recover-admin requires exactly one of --config or --database".into())
+            }
+            (Some(_), Some(_)) => {
+                return Err("recover-admin accepts only one of --config or --database".into())
+            }
+        };
+        let username = username.ok_or_else(|| "recover-admin requires --username".to_string())?;
+        if !reset_password && !reset_mfa {
+            return Err("recover-admin requires --reset-password and/or --reset-mfa".into());
+        }
+        Ok(Self {
+            source,
+            username,
+            reset_password,
+            reset_mfa,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct RecoveryConfigFile {
+    storage: RecoveryStorageConfig,
+}
+
+#[derive(Deserialize)]
+struct RecoveryStorageConfig {
+    data_directory: PathBuf,
+}
+
+fn recovery_database_path(
+    source: &RecoveryDatabaseSource,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match source {
+        RecoveryDatabaseSource::Database(path) => Ok(path.clone()),
+        RecoveryDatabaseSource::Config(path) => {
+            let serialized = std::fs::read_to_string(path)?;
+            let config: RecoveryConfigFile = toml::from_str(&serialized)?;
+            Ok(config.storage.data_directory.join("data.sqlite"))
+        }
+    }
+}
+
+fn init_admin(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let username = arg(args, "--username").ok_or("--username is required")?;
+    validate_admin_username(username)?;
+    std::fs::create_dir_all(&config.storage.data_directory)?;
+    let database = Database::open(config.storage.data_directory.join("data.sqlite"))?;
+    if database.admin_count()? != 0 {
+        return Err(
+            "administrators already exist; init-admin is only available for initial setup".into(),
+        );
+    }
+    let password = prompt_new_admin_password()?;
+    let secret = auth::new_totp_secret();
+    let hash = auth::hash_password(&password)
+        .map_err(|error| std::io::Error::other(format!("password hashing failed: {error}")))?;
+    match database.create_initial_admin(username, &hash, &secret)? {
+        InitialAdminOutcome::Created => {
+            println!("Administrator created. One-time credential output follows; save it now:\nSecret: {secret}\notpauth://totp/VaultLink:{username}?secret={secret}&issuer=VaultLink");
+            Ok(())
+        }
+        InitialAdminOutcome::AlreadyInitialized => Err(
+            "administrators already exist; init-admin is only available for initial setup".into(),
+        ),
+    }
+}
+
+fn recover_admin(options: &RecoverAdminOptions) -> Result<(), Box<dyn std::error::Error>> {
+    validate_admin_username(&options.username)?;
+    let database_path = recovery_database_path(&options.source)?;
+    if !database_path.is_file() {
+        return Err(format!(
+            "VaultLink database not found at {}",
+            database_path.display()
+        )
+        .into());
+    }
+    let database = Database::open(database_path)?;
+    let password_hash =
+        if options.reset_password {
+            let password = prompt_new_admin_password()?;
+            Some(auth::hash_password(&password).map_err(|error| {
+                std::io::Error::other(format!("password hashing failed: {error}"))
+            })?)
+        } else {
+            None
+        };
+    let totp_secret = options.reset_mfa.then(auth::new_totp_secret);
+    match database.recover_admin(
+        &options.username,
+        password_hash.as_deref(),
+        totp_secret.as_deref(),
+    )? {
+        AdminRecoveryOutcome::NotFound => {
+            Err(format!("administrator not found: {}", options.username).into())
+        }
+        AdminRecoveryOutcome::Recovered {
+            admin_id,
+            username,
+            active,
+        } => {
+            println!(
+                "Administrator recovered: {username} (id {admin_id}). All sessions were revoked."
+            );
+            if !active {
+                println!("Warning: this administrator remains inactive.");
+            }
+            if let Some(secret) = totp_secret {
+                println!("One-time credential output follows; save it now:\nSecret: {secret}\notpauth://totp/VaultLink:{username}?secret={secret}&issuer=VaultLink");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_admin_username(username: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if username.len() < 3
+        || username.len() > 64
+        || !username.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+    {
+        return Err("username must contain 3-64 safe ASCII characters".into());
+    }
+    Ok(())
+}
+
+fn prompt_new_admin_password() -> Result<String, Box<dyn std::error::Error>> {
+    let password = rpassword::prompt_password("New admin password: ")?;
+    validate_admin_password(&password)?;
+    let confirmation = rpassword::prompt_password("Confirm password: ")?;
+    if password != confirmation {
+        return Err("passwords do not match".into());
+    }
+    Ok(password)
+}
+
+fn validate_admin_password(password: &str) -> Result<(), &'static str> {
+    if password.chars().count() < 14 {
+        return Err("password must contain at least 14 characters");
     }
     Ok(())
 }
@@ -295,4 +577,217 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .position(|v| v == name)
         .and_then(|i| args.get(i + 1))
         .map(String::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn recover_admin_parser_accepts_exactly_one_database_source() {
+        assert_eq!(
+            RecoverAdminOptions::parse(&arguments(&[
+                "vaultlink",
+                "recover-admin",
+                "--config",
+                "config.toml",
+                "--username",
+                "admin",
+                "--reset-password",
+                "--reset-mfa",
+            ]))
+            .unwrap(),
+            RecoverAdminOptions {
+                source: RecoveryDatabaseSource::Config("config.toml".into()),
+                username: "admin".into(),
+                reset_password: true,
+                reset_mfa: true,
+            }
+        );
+        assert_eq!(
+            RecoverAdminOptions::parse(&arguments(&[
+                "vaultlink",
+                "recover-admin",
+                "--database",
+                "data.sqlite",
+                "--username",
+                "admin",
+                "--reset-mfa",
+            ]))
+            .unwrap()
+            .source,
+            RecoveryDatabaseSource::Database("data.sqlite".into())
+        );
+        assert_eq!(
+            RecoverAdminOptions::parse(&arguments(&[
+                "vaultlink",
+                "recover-admin",
+                "--database",
+                "data.sqlite",
+                "--username=--ops",
+                "--reset-mfa",
+            ]))
+            .unwrap()
+            .username,
+            "--ops"
+        );
+    }
+
+    #[test]
+    fn recover_admin_parser_rejects_ambiguous_or_unknown_arguments() {
+        for invalid in [
+            vec![
+                "vaultlink",
+                "recover-admin",
+                "--config",
+                "config.toml",
+                "--username",
+                "admin",
+            ],
+            vec![
+                "vaultlink",
+                "recover-admin",
+                "--config",
+                "--username",
+                "admin",
+                "--reset-mfa",
+            ],
+            vec![
+                "vaultlink",
+                "recover-admin",
+                "--config",
+                "one.toml",
+                "--config",
+                "two.toml",
+                "--username",
+                "admin",
+                "--reset-mfa",
+            ],
+            vec![
+                "vaultlink",
+                "recover-admin",
+                "--config",
+                "config.toml",
+                "--database",
+                "data.sqlite",
+                "--username",
+                "admin",
+                "--reset-mfa",
+            ],
+            vec![
+                "vaultlink",
+                "recover-admin",
+                "--database",
+                "data.sqlite",
+                "--username",
+                "admin",
+                "--reset-mfa",
+                "--reset-mfa",
+            ],
+            vec![
+                "vaultlink",
+                "recover-admin",
+                "--database",
+                "data.sqlite",
+                "--username",
+                "admin",
+                "--unknown",
+                "--reset-mfa",
+            ],
+            vec![
+                "vaultlink",
+                "recover-admin",
+                "--database",
+                "data.sqlite",
+                "--username",
+                "admin",
+                "positional",
+                "--reset-mfa",
+            ],
+        ] {
+            assert!(RecoverAdminOptions::parse(&arguments(&invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn command_dispatch_rejects_typos_without_breaking_config_only_server_start() {
+        assert_eq!(
+            command_mode(&arguments(&["vaultlink"])).unwrap(),
+            CommandMode::Serve
+        );
+        assert_eq!(
+            command_mode(&arguments(&["vaultlink", "--config", "config.toml"])).unwrap(),
+            CommandMode::Serve
+        );
+        assert_eq!(
+            command_mode(&arguments(&[
+                "vaultlink",
+                "setup",
+                "--listen",
+                "127.0.0.1:8090"
+            ]))
+            .unwrap(),
+            CommandMode::Setup
+        );
+        assert!(command_mode(&arguments(&["vaultlink", "recover-adminn"])).is_err());
+        assert!(command_mode(&arguments(&["vaultlink", "--unknown"])).is_err());
+        assert!(command_mode(&arguments(&[
+            "vaultlink",
+            "--config",
+            "config.toml",
+            "unexpected"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn recovery_config_resolution_does_not_require_runtime_tls_validity() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_directory = directory.path().join("data");
+        let config_path = directory.path().join("recovery.toml");
+        let mut config = Config::load("config/development.toml").unwrap();
+        config.server.mode = ServerMode::StandaloneTls;
+        config.server.listen_address = "127.0.0.1:8443".into();
+        config.server.public_base_url = "https://files.example.test".into();
+        config.server.production_mode = true;
+        config.storage.data_directory = data_directory.clone();
+        config.security.secure_cookie = true;
+        config.tls.enabled = true;
+        config.tls.certificate_source = CertificateSource::Files;
+        config.tls.cert_file = directory.path().join("missing-cert.pem");
+        config.tls.key_file = directory.path().join("missing-key.pem");
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        assert!(Config::load(&config_path).is_err());
+        assert_eq!(
+            recovery_database_path(&RecoveryDatabaseSource::Config(config_path)).unwrap(),
+            data_directory.join("data.sqlite")
+        );
+    }
+
+    #[test]
+    fn recovery_config_accepts_a_minimal_storage_section() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("minimal.toml");
+        let serialized = format!(
+            "[storage]\ndata_directory = '{}'\n[tls]\ncert_file = 'missing.pem'\n",
+            directory.path().display()
+        );
+        std::fs::write(&config_path, serialized).unwrap();
+
+        assert_eq!(
+            recovery_database_path(&RecoveryDatabaseSource::Config(config_path)).unwrap(),
+            directory.path().join("data.sqlite")
+        );
+    }
+
+    #[test]
+    fn admin_password_minimum_counts_characters_instead_of_bytes() {
+        assert!(validate_admin_password("äääääääääääää").is_err());
+        assert!(validate_admin_password("ääääääääääääää").is_ok());
+    }
 }

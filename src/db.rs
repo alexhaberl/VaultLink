@@ -7,9 +7,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 pub const TRANSFER_SESSION_TTL_SECONDS: i64 = 15 * 60;
+pub const ADMIN_MFA_ENROLLMENT_TTL_SECONDS: i64 = 10 * 60;
 
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
@@ -38,9 +39,55 @@ pub struct Session {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordSessionCreationOutcome {
+    Created,
+    StalePassword,
+    AdminInactive,
+    AdminNotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitialAdminOutcome {
     Created,
     AlreadyInitialized,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminRecoveryOutcome {
+    Recovered {
+        admin_id: i64,
+        username: String,
+        active: bool,
+    },
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminPasswordChangeOutcome {
+    Changed,
+    StalePassword,
+    Inactive,
+    NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingAdminMfaEnrollment {
+    pub admin_id: i64,
+    pub totp_secret: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminMfaEnrollmentStartOutcome {
+    Started { expires_at: String },
+    AdminInactive,
+    AdminNotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminMfaEnrollmentActivationOutcome {
+    Activated,
+    NotFoundOrExpired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,6 +434,22 @@ CREATE TABLE IF NOT EXISTS transfer_statistics(
         )?;
         tx.pragma_update(None, "user_version", 8)?;
     }
+    if version < 9 {
+        tx.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS admin_mfa_enrollments(
+    admin_id INTEGER PRIMARY KEY REFERENCES admins(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    totp_secret TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_admin_mfa_enrollments_exp
+    ON admin_mfa_enrollments(expires_at);
+"#,
+        )?;
+        tx.pragma_update(None, "user_version", 9)?;
+    }
     tx.commit()
 }
 
@@ -442,6 +505,48 @@ fn cleanup_transfer_state(transaction: &Transaction<'_>, now: &str) -> rusqlite:
                 WHERE leases.grant_id=public_transfer_grants.id AND leases.expires_at>?1
             ))",
         [now],
+    )?;
+    Ok(())
+}
+
+fn cleanup_admin_mfa_enrollments(
+    transaction: &Transaction<'_>,
+    now: &str,
+) -> rusqlite::Result<usize> {
+    transaction.execute(
+        "DELETE FROM admin_mfa_enrollments WHERE expires_at<=?1",
+        [now],
+    )
+}
+
+fn insert_audit_event(
+    transaction: &Transaction<'_>,
+    actor: &str,
+    action: &str,
+    object_id: Option<&str>,
+    detail: Option<&str>,
+    client_ip: Option<&str>,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            Utc::now().to_rfc3339(),
+            actor,
+            action,
+            object_id,
+            detail,
+            client_ip
+        ],
+    )?;
+    Ok(())
+}
+
+fn revoke_admin_auth_state(transaction: &Transaction<'_>, admin_id: i64) -> rusqlite::Result<()> {
+    transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [admin_id])?;
+    transaction.execute(
+        "DELETE FROM admin_mfa_enrollments WHERE admin_id=?1",
+        [admin_id],
     )?;
     Ok(())
 }
@@ -605,7 +710,7 @@ impl Database {
             Some(false) => {
                 // Preserve the session-revocation invariant even if an older database
                 // somehow contains sessions for an already inactive administrator.
-                transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
+                revoke_admin_auth_state(&transaction, id)?;
                 AdminDeactivationOutcome::AlreadyInactive
             }
             Some(true) => {
@@ -616,7 +721,7 @@ impl Database {
                     [id],
                 )? == 1;
                 if changed {
-                    transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
+                    revoke_admin_auth_state(&transaction, id)?;
                     AdminDeactivationOutcome::Deactivated
                 } else {
                     AdminDeactivationOutcome::LastActive
@@ -627,22 +732,294 @@ impl Database {
         Ok(outcome)
     }
 
+    /// Applies a local operator recovery as one credential/session/audit transaction.
+    /// Credential values are deliberately excluded from the persisted and tracing audit data.
+    pub fn recover_admin(
+        &self,
+        username: &str,
+        password_hash: Option<&str>,
+        totp_secret: Option<&str>,
+    ) -> rusqlite::Result<AdminRecoveryOutcome> {
+        if password_hash.is_none() && totp_secret.is_none() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "password_hash or totp_secret".into(),
+            ));
+        }
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let admin = transaction
+            .query_row(
+                "SELECT id,username,active FROM admins WHERE username=?1",
+                [username],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((admin_id, canonical_username, active)) = admin else {
+            transaction.commit()?;
+            return Ok(AdminRecoveryOutcome::NotFound);
+        };
+        transaction.execute(
+            "UPDATE admins
+             SET password_hash=COALESCE(?2,password_hash),
+                 totp_secret=COALESCE(?3,totp_secret)
+             WHERE id=?1",
+            params![admin_id, password_hash, totp_secret],
+        )?;
+        revoke_admin_auth_state(&transaction, admin_id)?;
+        let object_id = admin_id.to_string();
+        let detail = format!(
+            "reset_password={};reset_mfa={}",
+            password_hash.is_some(),
+            totp_secret.is_some()
+        );
+        insert_audit_event(
+            &transaction,
+            "local_recovery",
+            "admin_recovered",
+            Some(&object_id),
+            Some(&detail),
+            None,
+        )?;
+        transaction.commit()?;
+        tracing::warn!(
+            target: "vaultlink::audit",
+            actor = "local_recovery",
+            action = "admin_recovered",
+            object_id = object_id,
+            username = canonical_username,
+            reset_password = password_hash.is_some(),
+            reset_mfa = totp_secret.is_some(),
+            "local administrator recovery completed"
+        );
+        Ok(AdminRecoveryOutcome::Recovered {
+            admin_id,
+            username: canonical_username,
+            active,
+        })
+    }
+
+    /// Changes an administrator password only if the hash verified by the caller is still current.
+    pub fn change_admin_password_cas(
+        &self,
+        id: i64,
+        expected_password_hash: &str,
+        new_password_hash: &str,
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<AdminPasswordChangeOutcome> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let admin = transaction
+            .query_row(
+                "SELECT username,password_hash,active FROM admins WHERE id=?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((username, current_password_hash, active)) = admin else {
+            transaction.commit()?;
+            return Ok(AdminPasswordChangeOutcome::NotFound);
+        };
+        if !active {
+            transaction.commit()?;
+            return Ok(AdminPasswordChangeOutcome::Inactive);
+        }
+        if current_password_hash != expected_password_hash {
+            transaction.commit()?;
+            return Ok(AdminPasswordChangeOutcome::StalePassword);
+        }
+        let changed = transaction.execute(
+            "UPDATE admins SET password_hash=?3 WHERE id=?1 AND password_hash=?2",
+            params![id, expected_password_hash, new_password_hash],
+        )?;
+        if changed != 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        revoke_admin_auth_state(&transaction, id)?;
+        let object_id = id.to_string();
+        insert_audit_event(
+            &transaction,
+            &username,
+            "account_password_changed",
+            Some(&object_id),
+            None,
+            client_ip,
+        )?;
+        transaction.commit()?;
+        tracing::info!(target: "vaultlink::audit", actor = username, action = "account_password_changed", object_id, "audit event");
+        Ok(AdminPasswordChangeOutcome::Changed)
+    }
+
+    /// Starts or replaces one short-lived enrollment. Only a hash of `token` is persisted.
+    pub fn start_admin_mfa_enrollment(
+        &self,
+        admin_id: i64,
+        token: &str,
+        totp_secret: &str,
+    ) -> rusqlite::Result<AdminMfaEnrollmentStartOutcome> {
+        let now = Utc::now();
+        let now_string = now.to_rfc3339();
+        let expires_at = (now + Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS)).to_rfc3339();
+        let enrollment_token_hash = token_hash(token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_admin_mfa_enrollments(&transaction, &now_string)?;
+        let active = transaction
+            .query_row("SELECT active FROM admins WHERE id=?1", [admin_id], |row| {
+                row.get::<_, i64>(0).map(|active| active != 0)
+            })
+            .optional()?;
+        match active {
+            None => {
+                transaction.commit()?;
+                return Ok(AdminMfaEnrollmentStartOutcome::AdminNotFound);
+            }
+            Some(false) => {
+                transaction.commit()?;
+                return Ok(AdminMfaEnrollmentStartOutcome::AdminInactive);
+            }
+            Some(true) => {}
+        }
+        transaction.execute(
+            "INSERT INTO admin_mfa_enrollments(
+                 admin_id,token_hash,totp_secret,created_at,expires_at
+             ) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(admin_id) DO UPDATE SET
+                 token_hash=excluded.token_hash,
+                 totp_secret=excluded.totp_secret,
+                 created_at=excluded.created_at,
+                 expires_at=excluded.expires_at",
+            params![
+                admin_id,
+                enrollment_token_hash,
+                totp_secret,
+                now_string,
+                expires_at
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(AdminMfaEnrollmentStartOutcome::Started { expires_at })
+    }
+
+    /// Returns a pending secret only to a caller presenting the raw enrollment token.
+    pub fn admin_mfa_enrollment(
+        &self,
+        admin_id: i64,
+        token: &str,
+    ) -> rusqlite::Result<Option<PendingAdminMfaEnrollment>> {
+        let now = Utc::now().to_rfc3339();
+        let enrollment_token_hash = token_hash(token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_admin_mfa_enrollments(&transaction, &now)?;
+        let enrollment = transaction
+            .query_row(
+                "SELECT admin_mfa_enrollments.admin_id,
+                        admin_mfa_enrollments.totp_secret,
+                        admin_mfa_enrollments.expires_at
+                 FROM admin_mfa_enrollments
+                 JOIN admins ON admins.id=admin_mfa_enrollments.admin_id
+                 WHERE admin_mfa_enrollments.admin_id=?1
+                   AND admin_mfa_enrollments.token_hash=?2
+                   AND admin_mfa_enrollments.expires_at>?3
+                   AND admins.active=1",
+                params![admin_id, enrollment_token_hash, now],
+                |row| {
+                    Ok(PendingAdminMfaEnrollment {
+                        admin_id: row.get(0)?,
+                        totp_secret: row.get(1)?,
+                        expires_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        transaction.commit()?;
+        Ok(enrollment)
+    }
+
+    /// Activates and consumes an enrollment after the caller verified a code against its secret.
+    /// The secret is never included in the audit event.
+    pub fn activate_admin_mfa_enrollment(
+        &self,
+        admin_id: i64,
+        token: &str,
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<AdminMfaEnrollmentActivationOutcome> {
+        let now = Utc::now().to_rfc3339();
+        let enrollment_token_hash = token_hash(token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_admin_mfa_enrollments(&transaction, &now)?;
+        let enrollment = transaction
+            .query_row(
+                "SELECT admins.username,admin_mfa_enrollments.totp_secret
+                 FROM admin_mfa_enrollments
+                 JOIN admins ON admins.id=admin_mfa_enrollments.admin_id
+                 WHERE admin_mfa_enrollments.admin_id=?1
+                   AND admin_mfa_enrollments.token_hash=?2
+                   AND admin_mfa_enrollments.expires_at>?3
+                   AND admins.active=1",
+                params![admin_id, enrollment_token_hash, now],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((username, totp_secret)) = enrollment else {
+            transaction.commit()?;
+            return Ok(AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired);
+        };
+        transaction.execute(
+            "UPDATE admins SET totp_secret=?2 WHERE id=?1",
+            params![admin_id, totp_secret],
+        )?;
+        revoke_admin_auth_state(&transaction, admin_id)?;
+        let object_id = admin_id.to_string();
+        insert_audit_event(
+            &transaction,
+            &username,
+            "account_mfa_changed",
+            Some(&object_id),
+            None,
+            client_ip,
+        )?;
+        transaction.commit()?;
+        tracing::info!(target: "vaultlink::audit", actor = username, action = "account_mfa_changed", object_id, "audit event");
+        Ok(AdminMfaEnrollmentActivationOutcome::Activated)
+    }
+
+    pub fn cleanup_expired_admin_mfa_enrollments(&self) -> rusqlite::Result<usize> {
+        self.conn().execute(
+            "DELETE FROM admin_mfa_enrollments WHERE expires_at<=?1",
+            [Utc::now().to_rfc3339()],
+        )
+    }
+
     pub fn reset_admin_password(&self, id: i64, password_hash: &str) -> rusqlite::Result<bool> {
         let mut connection = self.conn();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE admins SET password_hash=?2 WHERE id=?1",
             params![id, password_hash],
         )? == 1;
         if changed {
-            transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
+            revoke_admin_auth_state(&transaction, id)?;
         }
         transaction.commit()?;
         Ok(changed)
     }
     pub fn reset_admin_totp(&self, id: i64, totp_secret: &str) -> rusqlite::Result<Option<String>> {
         let mut connection = self.conn();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let username = transaction
             .query_row("SELECT username FROM admins WHERE id=?1", [id], |row| {
                 row.get::<_, String>(0)
@@ -653,7 +1030,7 @@ impl Database {
                 "UPDATE admins SET totp_secret=?2 WHERE id=?1",
                 params![id, totp_secret],
             )?;
-            transaction.execute("DELETE FROM sessions WHERE admin_id=?1", [id])?;
+            revoke_admin_auth_state(&transaction, id)?;
         }
         transaction.commit()?;
         Ok(username)
@@ -676,6 +1053,58 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Creates a pre-MFA session only while the password hash verified by the caller is current.
+    /// The active/hash predicate and insertion intentionally share one SQL statement.
+    pub fn create_session_for_verified_password(
+        &self,
+        token: &str,
+        admin_id: i64,
+        expected_password_hash: &str,
+        csrf: &str,
+        expires: DateTime<Utc>,
+    ) -> rusqlite::Result<PasswordSessionCreationOutcome> {
+        let now = Utc::now().to_rfc3339();
+        let session_token_hash = token_hash(token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM sessions WHERE expires_at < ?1", [&now])?;
+        let created = transaction.execute(
+            "INSERT INTO sessions(token_hash,admin_id,csrf_token,expires_at)
+             SELECT ?1,admins.id,?4,?5
+             FROM admins
+             WHERE admins.id=?2 AND admins.password_hash=?3 AND admins.active=1",
+            params![
+                session_token_hash,
+                admin_id,
+                expected_password_hash,
+                csrf,
+                expires.to_rfc3339()
+            ],
+        )?;
+        let outcome = if created == 1 {
+            PasswordSessionCreationOutcome::Created
+        } else {
+            let admin = transaction
+                .query_row(
+                    "SELECT password_hash,active FROM admins WHERE id=?1",
+                    [admin_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+                )
+                .optional()?;
+            match admin {
+                None => PasswordSessionCreationOutcome::AdminNotFound,
+                Some((_, false)) => PasswordSessionCreationOutcome::AdminInactive,
+                Some((password_hash, true)) if password_hash != expected_password_hash => {
+                    PasswordSessionCreationOutcome::StalePassword
+                }
+                Some(_) => return Err(rusqlite::Error::InvalidQuery),
+            }
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
     pub fn session(&self, token: &str) -> rusqlite::Result<Option<Session>> {
         self.conn().query_row("SELECT a.id,a.username,s.csrf_token,s.mfa_verified FROM sessions s JOIN admins a ON a.id=s.admin_id WHERE s.token_hash=?1 AND s.expires_at>?2 AND a.active=1",params![token_hash(token),Utc::now().to_rfc3339()],|r|Ok(Session{admin_id:r.get(0)?,username:r.get(1)?,csrf_token:r.get(2)?,mfa_verified:r.get::<_,i64>(3)?!=0})).optional()
     }
@@ -1541,6 +1970,102 @@ mod tests {
     }
 
     #[test]
+    fn verified_password_session_creation_rejects_a_stale_hash_without_a_zombie_session() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .create_admin("admin", "verified-hash", "secret")
+            .unwrap();
+        database.reset_admin_password(1, "rotated-hash").unwrap();
+
+        assert_eq!(
+            database
+                .create_session_for_verified_password(
+                    "stale-session",
+                    1,
+                    "verified-hash",
+                    "csrf",
+                    Utc::now() + Duration::hours(1),
+                )
+                .unwrap(),
+            PasswordSessionCreationOutcome::StalePassword
+        );
+        assert!(database.session("stale-session").unwrap().is_none());
+        assert_eq!(
+            database
+                .conn()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM sessions WHERE token_hash=?1",
+                    [token_hash("stale-session")],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn verified_password_session_creation_rejects_an_inactive_admin_without_a_zombie_session() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .create_admin("disabled", "verified-hash", "secret")
+            .unwrap();
+        database
+            .create_admin("survivor", "other-hash", "other-secret")
+            .unwrap();
+        assert_eq!(
+            database.deactivate_admin(1).unwrap(),
+            AdminDeactivationOutcome::Deactivated
+        );
+
+        assert_eq!(
+            database
+                .create_session_for_verified_password(
+                    "inactive-session",
+                    1,
+                    "verified-hash",
+                    "csrf",
+                    Utc::now() + Duration::hours(1),
+                )
+                .unwrap(),
+            PasswordSessionCreationOutcome::AdminInactive
+        );
+        assert!(database.session("inactive-session").unwrap().is_none());
+        assert_eq!(
+            database
+                .conn()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM sessions WHERE token_hash=?1",
+                    [token_hash("inactive-session")],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn verified_password_session_creation_accepts_the_current_active_hash() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .create_admin("admin", "verified-hash", "secret")
+            .unwrap();
+
+        assert_eq!(
+            database
+                .create_session_for_verified_password(
+                    "current-session",
+                    1,
+                    "verified-hash",
+                    "csrf",
+                    Utc::now() + Duration::hours(1),
+                )
+                .unwrap(),
+            PasswordSessionCreationOutcome::Created
+        );
+        assert!(database.session("current-session").unwrap().is_some());
+    }
+
+    #[test]
     fn audit_client_ips_are_optional_listed_and_purgeable_without_deleting_events() {
         let database = Database::open(":memory:").unwrap();
         database
@@ -1601,6 +2126,372 @@ mod tests {
             1
         );
         assert_eq!(database.admin_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn initial_admin_creation_refuses_an_initialized_database() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .create_admin("existing", "existing-hash", "existing-secret")
+            .unwrap();
+
+        assert_eq!(
+            database
+                .create_initial_admin("second", "second-hash", "second-secret")
+                .unwrap(),
+            InitialAdminOutcome::AlreadyInitialized
+        );
+        assert_eq!(database.admin_count().unwrap(), 1);
+        assert!(database.admin("second").unwrap().is_none());
+    }
+
+    #[test]
+    fn combined_admin_recovery_is_atomic_and_revokes_sessions() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .create_admin("admin", "old-hash", "old-secret")
+            .unwrap();
+        database
+            .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+            .unwrap();
+        database
+            .start_admin_mfa_enrollment(1, "stale-enrollment", "stale-pending-secret")
+            .unwrap();
+
+        let outcome = database
+            .recover_admin("ADMIN", Some("new-hash"), Some("new-secret"))
+            .unwrap();
+        assert_eq!(
+            outcome,
+            AdminRecoveryOutcome::Recovered {
+                admin_id: 1,
+                username: "admin".into(),
+                active: true,
+            }
+        );
+        let admin = database.admin("admin").unwrap().unwrap();
+        assert_eq!(admin.password_hash, "new-hash");
+        assert_eq!(admin.totp_secret, "new-secret");
+        assert!(database.session("session-token").unwrap().is_none());
+        assert_eq!(
+            database
+                .activate_admin_mfa_enrollment(1, "stale-enrollment", None)
+                .unwrap(),
+            AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired
+        );
+        assert_eq!(
+            database.admin("admin").unwrap().unwrap().totp_secret,
+            "new-secret"
+        );
+        let events = database.list_audit(Some("admin_recovered"), 10, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "local_recovery");
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some("reset_password=true;reset_mfa=true")
+        );
+        assert!(events[0].client_ip.is_none());
+        let serialized_event = format!("{events:?}");
+        assert!(!serialized_event.contains("new-hash"));
+        assert!(!serialized_event.contains("new-secret"));
+    }
+
+    #[test]
+    fn combined_admin_recovery_rolls_back_all_changes_when_audit_fails() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .create_admin("admin", "old-hash", "old-secret")
+            .unwrap();
+        database
+            .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+            .unwrap();
+        database
+            .start_admin_mfa_enrollment(1, "pending-token", "pending-secret")
+            .unwrap();
+        database
+            .conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_admin_recovery_audit
+                 BEFORE INSERT ON audit
+                 WHEN NEW.action='admin_recovered'
+                 BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+            )
+            .unwrap();
+
+        assert!(database
+            .recover_admin("admin", Some("new-hash"), Some("new-secret"))
+            .is_err());
+        let admin = database.admin("admin").unwrap().unwrap();
+        assert_eq!(admin.password_hash, "old-hash");
+        assert_eq!(admin.totp_secret, "old-secret");
+        assert!(database.session("session-token").unwrap().is_some());
+        assert!(database
+            .admin_mfa_enrollment(1, "pending-token")
+            .unwrap()
+            .is_some());
+        assert_eq!(database.count_audit(Some("admin_recovered")).unwrap(), 0);
+    }
+
+    #[test]
+    fn admin_recovery_returns_not_found_without_side_effects() {
+        let database = Database::open(":memory:").unwrap();
+
+        assert_eq!(
+            database
+                .recover_admin("missing", Some("new-hash"), None)
+                .unwrap(),
+            AdminRecoveryOutcome::NotFound
+        );
+        assert_eq!(database.admin_count().unwrap(), 0);
+        assert_eq!(database.count_audit(Some("admin_recovered")).unwrap(), 0);
+    }
+
+    #[test]
+    fn password_change_compare_and_swap_allows_only_one_racing_update() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .create_admin("admin", "old-hash", "secret")
+            .unwrap();
+        database
+            .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for new_hash in ["first-hash", "second-hash"] {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                database
+                    .change_admin_password_cas(1, "old-hash", new_hash, Some("198.51.100.10"))
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == AdminPasswordChangeOutcome::Changed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == AdminPasswordChangeOutcome::StalePassword)
+                .count(),
+            1
+        );
+        let admin = database.admin("admin").unwrap().unwrap();
+        assert!(matches!(
+            admin.password_hash.as_str(),
+            "first-hash" | "second-hash"
+        ));
+        assert!(database.session("session-token").unwrap().is_none());
+        assert_eq!(
+            database
+                .count_audit(Some("account_password_changed"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .list_audit(Some("account_password_changed"), 10, 0)
+                .unwrap()[0]
+                .client_ip
+                .as_deref(),
+            Some("198.51.100.10")
+        );
+    }
+
+    #[test]
+    fn pending_mfa_enrollment_has_a_ttl_and_replaces_the_previous_token() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+
+        let first = database
+            .start_admin_mfa_enrollment(1, "first-token", "first-secret")
+            .unwrap();
+        let AdminMfaEnrollmentStartOutcome::Started { expires_at } = first else {
+            panic!("known administrator must start an enrollment");
+        };
+        let expires_at = DateTime::parse_from_rfc3339(&expires_at).unwrap();
+        let remaining = expires_at.signed_duration_since(Utc::now());
+        assert!(remaining <= Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS));
+        assert!(remaining > Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS - 5));
+        assert_eq!(
+            database
+                .admin_mfa_enrollment(1, "first-token")
+                .unwrap()
+                .unwrap()
+                .totp_secret,
+            "first-secret"
+        );
+
+        database
+            .start_admin_mfa_enrollment(1, "second-token", "second-secret")
+            .unwrap();
+        assert!(database
+            .admin_mfa_enrollment(1, "first-token")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            database
+                .admin_mfa_enrollment(1, "second-token")
+                .unwrap()
+                .unwrap()
+                .totp_secret,
+            "second-secret"
+        );
+        let stored_token_hash = database
+            .conn()
+            .query_row::<String, _, _>(
+                "SELECT token_hash FROM admin_mfa_enrollments WHERE admin_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_token_hash, token_hash("second-token"));
+        assert_ne!(stored_token_hash, "second-token");
+
+        database
+            .conn()
+            .execute(
+                "UPDATE admin_mfa_enrollments SET expires_at=?1 WHERE admin_id=1",
+                [Utc::now()
+                    .checked_sub_signed(Duration::seconds(1))
+                    .unwrap()
+                    .to_rfc3339()],
+            )
+            .unwrap();
+        assert_eq!(database.cleanup_expired_admin_mfa_enrollments().unwrap(), 1);
+        assert!(database
+            .admin_mfa_enrollment(1, "second-token")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pending_mfa_activation_is_single_use_and_revokes_sessions() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .create_admin("admin", "hash", "old-secret")
+            .unwrap();
+        database
+            .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+            .unwrap();
+        database
+            .start_admin_mfa_enrollment(1, "enrollment-token", "new-secret")
+            .unwrap();
+
+        assert_eq!(
+            database
+                .activate_admin_mfa_enrollment(1, "enrollment-token", Some("203.0.113.24"),)
+                .unwrap(),
+            AdminMfaEnrollmentActivationOutcome::Activated
+        );
+        assert_eq!(
+            database.admin("admin").unwrap().unwrap().totp_secret,
+            "new-secret"
+        );
+        assert!(database.session("session-token").unwrap().is_none());
+        assert!(database
+            .admin_mfa_enrollment(1, "enrollment-token")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            database
+                .activate_admin_mfa_enrollment(1, "enrollment-token", None)
+                .unwrap(),
+            AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired
+        );
+        let events = database
+            .list_audit(Some("account_mfa_changed"), 10, 0)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].detail.is_none());
+        assert_eq!(events[0].client_ip.as_deref(), Some("203.0.113.24"));
+        assert!(!format!("{events:?}").contains("new-secret"));
+    }
+
+    #[test]
+    fn deactivation_removes_pending_mfa_and_blocks_inactive_account_operations() {
+        let database = Database::open(":memory:").unwrap();
+        database
+            .create_admin("one", "one-hash", "one-secret")
+            .unwrap();
+        database
+            .create_admin("two", "two-hash", "two-secret")
+            .unwrap();
+        database
+            .start_admin_mfa_enrollment(1, "pending-token", "pending-secret")
+            .unwrap();
+
+        assert_eq!(
+            database.deactivate_admin(1).unwrap(),
+            AdminDeactivationOutcome::Deactivated
+        );
+        assert_eq!(
+            database
+                .conn()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM admin_mfa_enrollments WHERE admin_id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .start_admin_mfa_enrollment(1, "new-token", "new-secret")
+                .unwrap(),
+            AdminMfaEnrollmentStartOutcome::AdminInactive
+        );
+        assert_eq!(
+            database
+                .change_admin_password_cas(1, "one-hash", "new-hash", None)
+                .unwrap(),
+            AdminPasswordChangeOutcome::Inactive
+        );
+
+        database
+            .conn()
+            .execute(
+                "INSERT INTO admin_mfa_enrollments(
+                    admin_id,token_hash,totp_secret,created_at,expires_at
+                 ) VALUES(1,?1,'injected-secret',?2,?3)",
+                params![
+                    token_hash("injected-token"),
+                    Utc::now().to_rfc3339(),
+                    (Utc::now() + Duration::minutes(5)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+        assert!(database
+            .admin_mfa_enrollment(1, "injected-token")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            database
+                .activate_admin_mfa_enrollment(1, "injected-token", None)
+                .unwrap(),
+            AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired
+        );
+        let inactive = database
+            .conn()
+            .query_row::<(String, String), _, _>(
+                "SELECT password_hash,totp_secret FROM admins WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(inactive, ("one-hash".into(), "one-secret".into()));
     }
 
     #[test]

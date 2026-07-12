@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-`0.3.5` is a private release. Security fixes are made only on the latest private release.
+`0.4.0` is a private release. Security fixes are made only on the latest private release.
 
 ## Build and release security
 
@@ -23,4 +23,5 @@ Do not open a public issue. Use GitHub's private vulnerability reporting for thi
 - The mountpoint and data directory are not writable by unrelated users.
 - One VaultLink process owns a storage-root/data-directory pair; active-active multi-process operation on the same pair is unsupported.
 - Configuration, SQLite data, TLS keys, and ACME credentials use the documented restrictive permissions.
+- Administrator recovery assumes SSH/host access and is performed locally with `recover-admin` as the `vaultlink` service user; VaultLink deliberately exposes no public password-reset endpoint.
 - Linux kernels must support `openat2(2)`; VaultLink refuses to start otherwise.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 — 2026-07-11
+
+- Added a German/English interface with explicit language selection, browser-language detection, localized server-rendered pages and locale-aware browser behavior.
+- Added “My account” for current-user password changes and response-loss-safe, two-step MFA replacement that keeps the previous authenticator valid until the new code is confirmed.
+- Added the local `recover-admin` break-glass command for atomic password and/or MFA recovery through SSH/host access, including session and pending-enrollment revocation plus secret-free auditing.
+- Kept the privileged setup UI loopback-only while adding an explicit IPv4 SSH-tunnel workflow, clearer post-setup listen-address labeling, and hardened setup boundary validation.
+- Bound Web and API session creation atomically to the still-current password hash and active administrator state so concurrent credential rotation or deactivation cannot create a stale session.
+- Renamed the product tagline to “Secure file sharing”, restricted `init-admin` to initial bootstrap, and made CLI command/option parsing fail closed.
+
 ## 0.3.5 — 2026-07-11
 
 - Rebuilt the server-rendered setup, admin, and public interfaces around a shared dark VaultLink design system with responsive navigation, accessible controls, inline SVG icons, and self-hosted assets.
