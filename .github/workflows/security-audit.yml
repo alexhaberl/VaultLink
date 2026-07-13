@@ -15,7 +15,7 @@ concurrency:
 jobs:
   rustsec:
     name: RustSec advisories
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, Linux, X64, vaultlink]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
