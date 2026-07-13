@@ -19,6 +19,8 @@ RUN apt-get update \
 WORKDIR /work
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
+COPY fuzz/Cargo.toml ./fuzz/Cargo.toml
+COPY fuzz/fuzz_targets ./fuzz/fuzz_targets
 COPY deploy/docker ./deploy/docker
 COPY deploy/vaultlink-upgrade.sh deploy/vaultlink-rollback.sh \
     deploy/vaultlink.service deploy/vaultlink-cert-renew.service \

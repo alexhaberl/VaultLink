@@ -18,7 +18,8 @@ const CEREMONY_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_PENDING_CEREMONIES: usize = 1024;
 
 fn session_key(session_token: &str) -> String {
-    format!("{:x}", Sha256::digest(session_token.as_bytes()))
+    let digest = Sha256::digest(session_token.as_bytes());
+    data_encoding::HEXLOWER.encode(digest.as_ref())
 }
 
 fn make_room<T>(pending: &mut HashMap<String, T>) {
@@ -192,5 +193,18 @@ impl WebAuthnService {
             .iter_mut()
             .position(|key| key.update_credential(&result).is_some())
             .ok_or_else(|| "authenticated credential is not registered".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_key_keeps_lowercase_sha256_encoding() {
+        assert_eq!(
+            session_key("test"),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
     }
 }

@@ -10,6 +10,7 @@ use std::{
 };
 
 const SCHEMA_VERSION: i64 = 10;
+pub(crate) const MAX_SQLITE_UNSIGNED: u64 = i64::MAX as u64;
 
 pub const TRANSFER_SESSION_TTL_SECONDS: i64 = 15 * 60;
 pub const TRANSFER_LEASE_MAX_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
@@ -257,7 +258,8 @@ impl TransferMonthlyCounts {
 }
 
 fn token_hash(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
+    let digest = Sha256::digest(token.as_bytes());
+    data_encoding::HEXLOWER.encode(digest.as_ref())
 }
 
 impl Database {
@@ -2135,6 +2137,46 @@ pub fn rewrite_share_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_hash_keeps_lowercase_sha256_encoding() {
+        assert_eq!(
+            token_hash("test"),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[test]
+    fn fallible_unsigned_sqlite_values_reject_out_of_range_data() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute("CREATE TABLE numbers(value INTEGER NOT NULL)", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO numbers(value) VALUES(?1)",
+                [MAX_SQLITE_UNSIGNED],
+            )
+            .unwrap();
+        let maximum: u64 = connection
+            .query_row("SELECT value FROM numbers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(maximum, MAX_SQLITE_UNSIGNED);
+        assert!(connection
+            .execute(
+                "INSERT INTO numbers(value) VALUES(?1)",
+                [MAX_SQLITE_UNSIGNED + 1]
+            )
+            .is_err());
+
+        connection.execute("DELETE FROM numbers", []).unwrap();
+        connection
+            .execute("INSERT INTO numbers(value) VALUES(-1)", [])
+            .unwrap();
+        assert!(connection
+            .query_row("SELECT value FROM numbers", [], |row| row.get::<_, u64>(0))
+            .is_err());
+    }
 
     #[test]
     fn persistent_database_is_regular_private_and_not_linked() {

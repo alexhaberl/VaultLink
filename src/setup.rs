@@ -23,7 +23,7 @@ use crate::{
     auth,
     config::{
         CertificateSource, Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage,
-        Tls,
+        Tls, MAX_TEXT_PREVIEW_SIZE,
     },
     db::{Database, InitialAdminOutcome},
     i18n::{self, Locale},
@@ -991,6 +991,7 @@ fn setup_form(token: &str, error: Option<&str>) -> String {
         .map(|error| format!(r#"<p class="bad">{}</p>"#, esc(error)))
         .unwrap_or_default();
     let token = esc(token);
+    let max_text_preview_size_mb = MAX_TEXT_PREVIEW_SIZE / 1_000_000;
     format!(
         r#"
 <section class="hero">
@@ -1022,7 +1023,7 @@ fn setup_form(token: &str, error: Option<&str>) -> String {
     <label><vl-i18n key="setup.zip_max_files"/><br><input name="max_zip_files" type="number" min="0" value="10000" required></label>
     <label><vl-i18n key="setup.search_max_entries"/><br><input name="max_search_entries" type="number" min="1" value="50000" required></label>
     <label><vl-i18n key="setup.search_max_results"/><br><input name="max_search_results" type="number" min="1" value="500" required></label>
-    <label><vl-i18n key="setup.text_preview_max_mb"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="1" required></label>
+    <label><vl-i18n key="setup.text_preview_max_mb"/><br><input name="max_preview_size_mb" type="number" min="1" max="{max_text_preview_size_mb}" step="1" value="1" required></label>
     <label><vl-i18n key="setup.text_preview_extensions"/><br><input name="preview_extensions" value="txt,log,md,csv,json,toml,yaml,yml,ini,conf" required></label>
     <label><vl-i18n key="setup.media_preview_max_mb"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="100" required></label>
     <label><vl-i18n key="setup.image_preview_extensions"/><br><input name="image_preview_extensions" value="jpg,jpeg,png,gif,webp,bmp,avif"></label>
@@ -1324,7 +1325,9 @@ mod tests {
         assert!(html.contains("Ersteinrichtung"));
         assert!(html.contains("name=\"max_upload_size_mb\""));
         assert!(html.contains("name=\"max_zip_size_gb\""));
-        assert!(html.contains("name=\"max_preview_size_mb\""));
+        assert!(html.contains(
+            r#"name="max_preview_size_mb" type="number" min="1" max="64" step="1" value="1""#
+        ));
         assert!(html.contains("name=\"max_media_preview_size_mb\""));
         assert!(html.contains("<select name=\"log_level\">"));
         assert!(html.contains("VaultLink-Dienstadresse nach dem Setup"));

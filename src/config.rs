@@ -240,6 +240,7 @@ const MAX_AUTH_ATTEMPTS: usize = 100;
 const MAX_LOGIN_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const MAX_SHARE_PASSWORD_LENGTH: usize = 1_024;
 const MAX_SHARE_UNLOCK_MINUTES: i64 = 30 * 24 * 60;
+pub(crate) const MAX_TEXT_PREVIEW_SIZE: u64 = 64_000_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -487,6 +488,11 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "storage limits must be positive".into(),
             ));
+        }
+        if self.storage.max_preview_size > MAX_TEXT_PREVIEW_SIZE {
+            return Err(ConfigError::Invalid(format!(
+                "max_preview_size must not exceed {MAX_TEXT_PREVIEW_SIZE} bytes"
+            )));
         }
         validate_mount_policy(&self.storage, self.server.production_mode)?;
         validate_extensions("preview_extensions", &self.storage.preview_extensions)?;
@@ -758,6 +764,20 @@ fn validate_extensions(name: &str, values: &[String]) -> Result<(), ConfigError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_toml_examples_deserialize_with_current_parser() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+                continue;
+            }
+            let serialized = std::fs::read_to_string(&path).unwrap();
+            toml::from_str::<Config>(&serialized)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        }
+    }
     fn base() -> Config {
         Config {
             server: Server {
@@ -955,6 +975,13 @@ mod tests {
         c.security.share_password_max_length = MAX_SHARE_PASSWORD_LENGTH + 1;
         assert!(c.validate().is_err(), "accepted excessive password length");
         c.security.share_password_max_length = default_share_password_max();
+
+        c.storage.max_preview_size = MAX_TEXT_PREVIEW_SIZE + 1;
+        assert!(
+            c.validate().is_err(),
+            "accepted excessive text preview size"
+        );
+        c.storage.max_preview_size = MAX_TEXT_PREVIEW_SIZE;
 
         for invalid in [0, MAX_AUTH_ATTEMPTS + 1] {
             c.security.share_password_attempts = invalid;

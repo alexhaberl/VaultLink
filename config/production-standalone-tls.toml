@@ -21,6 +21,7 @@ max_zip_size = 1073741824
 max_zip_files = 10000
 max_search_entries = 50000
 max_search_results = 500
+# Text previews are limited to at most 64 MB.
 max_preview_size = 1048576
 preview_extensions = ["txt", "log", "md", "csv", "json", "toml", "yaml", "yml", "ini", "conf"]
 image_preview_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"]

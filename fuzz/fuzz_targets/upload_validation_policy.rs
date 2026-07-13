@@ -69,7 +69,17 @@ fn decide_upload(
     }
 }
 
-fuzz_target!(|input: (bool, u8, String, String, String, Vec<u16>, u16, bool, String)| {
+fuzz_target!(|input: (
+    bool,
+    u8,
+    String,
+    String,
+    String,
+    Vec<u16>,
+    u16,
+    bool,
+    String
+)| {
     let (
         is_directory,
         permission_byte,
@@ -122,13 +132,16 @@ fuzz_target!(|input: (bool, u8, String, String, String, Vec<u16>, u16, bool, Str
         assert!(is_directory);
         assert!(permission.can_upload());
         assert!(path_security::safe_filename(&filename).is_ok());
-        assert!(!runtime::extension_is_blocked(&filename, &blocked_extensions));
+        assert!(!runtime::extension_is_blocked(
+            &filename,
+            &blocked_extensions
+        ));
         if permission == Permission::DownloadUpload {
             assert!(path_security::validate_relative(&upload_subdir).is_ok());
         }
-        let total = chunks
-            .iter()
-            .try_fold(0u64, |total, chunk| add_upload_bytes(total, u64::from(*chunk), maximum));
+        let total = chunks.iter().try_fold(0u64, |total, chunk| {
+            add_upload_bytes(total, u64::from(*chunk), maximum)
+        });
         assert!(total.is_some());
     }
 });
