@@ -109,7 +109,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
   - Upload-Validierungslogik,
   - API-Request-Policy,
   - Admin-Dateimutations- und Share-Teilbaumpolicy.
-  - Der Workflow läuft zusätzlich wöchentlich als einzelner Self-hosted-Job, der alle acht Targets mit vier Workern in zwei Gruppen ausführt; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
+  - Der Workflow läuft zusätzlich wöchentlich als einzelner Self-hosted-Job, der alle acht Targets mit vier Workern in zwei Gruppen und einem 60-Minuten-Timeout ausführt; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
 - [ ] Dabei das gemeinsame Workspace-`Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.

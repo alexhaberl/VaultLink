@@ -37,7 +37,9 @@ compiling. Superseded pull-request runs are cancelled automatically.
 
 The weekly and manually dispatched fuzz campaign runs on the self-hosted arm64
 runner. It runs all eight targets for ten minutes each across four workers
-(`FUZZ_JOBS=4`), matching the runner's four vCPUs. Security auditing,
+(`FUZZ_JOBS=4`), matching the runner's four vCPUs.
+The workflow has a 60-minute timeout so a cold instrumented Nightly build and
+both target waves have sufficient headroom. Security auditing,
 release-environment resolution, combined
 artifact verification, signing, publishing, and release dry runs also use the
 arm64 runner because they do not require an amd64 host. The amd64 runner is
