@@ -113,7 +113,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
 - [ ] Dabei das gemeinsame Workspace-`Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.
-- [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `ubuntu-24.04-arm` grün; beide verwenden den zu `rust-toolchain.toml` passenden, digest-gepinnten Debian-13-/Rust-OCI-Index.
+- [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `[self-hosted, Linux, ARM64, vaultlink]` grün; beide verwenden den zu `rust-toolchain.toml` passenden, digest-gepinnten Debian-13-/Rust-OCI-Index. Architekturunabhängige Release-Jobs laufen auf arm64.
 - [ ] Offline erzeugten Minisign-Public-Key als `release/minisign.pub` committen und `MINISIGN_SECRET_KEY` sowie `MINISIGN_PASSWORD` als GitHub-Actions-Secrets provisionieren; ohne alle drei Werte muss der Tag-Publish absichtlich fehlschlagen.
 - [ ] Ein autorisierter Maintainer pusht den annotierten `v0.4.1`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, Main-Ancestry-Prüfung und der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
 - [ ] Artefakte prüfen:

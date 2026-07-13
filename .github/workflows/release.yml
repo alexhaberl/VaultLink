@@ -17,7 +17,7 @@ jobs:
   release_environment:
     name: Resolve pinned release environment
     if: github.repository_visibility == 'private'
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, Linux, ARM64, vaultlink]
     outputs:
       image: ${{ steps.image.outputs.image }}
     steps:
@@ -54,10 +54,10 @@ jobs:
             expected_rust_host: x86_64-unknown-linux-gnu
             self_hosted: true
           - release_architecture: arm64
-            runs_on: '["ubuntu-24.04-arm"]'
+            runs_on: '["self-hosted", "Linux", "ARM64", "vaultlink"]'
             expected_uname: aarch64
             expected_rust_host: aarch64-unknown-linux-gnu
-            self_hosted: false
+            self_hosted: true
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     timeout-minutes: 90
     container: ${{ needs.release_environment.outputs.image }}
@@ -101,18 +101,23 @@ jobs:
             git merge-base --is-ancestor "$tag_commit" "$main_commit"
           fi
           sh tools/check-supply-chain-policy.sh
-      - name: Install release gates
+      - name: Install pinned SBOM tool
         run: |
-          cargo install --locked cargo-audit --version 0.22.2
           cargo install --locked cargo-cyclonedx --version 0.5.9
-      - name: Quality and dependency gates
+      - name: Install pinned audit tool
+        if: matrix.release_architecture == 'arm64'
+        run: cargo install --locked cargo-audit --version 0.22.2
+      - name: Architecture-independent quality and dependency gates
+        if: matrix.release_architecture == 'arm64'
         run: |
           cargo fmt --all -- --check
+          shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
+          cargo audit --deny warnings
+      - name: Native compilation and test gates
+        run: |
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets
           cargo check --manifest-path fuzz/Cargo.toml --locked
-          shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
-          cargo audit --deny warnings
       - name: Build and SBOM
         run: |
           cargo build --locked --release
@@ -171,7 +176,7 @@ jobs:
     name: Verify, sign, and publish
     if: github.repository_visibility == 'private' && startsWith(github.ref, 'refs/tags/v')
     needs: [release_environment, build]
-    runs-on: [self-hosted, Linux, X64, vaultlink]
+    runs-on: [self-hosted, Linux, ARM64, vaultlink]
     timeout-minutes: 30
     permissions:
       contents: write
@@ -279,7 +284,7 @@ jobs:
     name: Verify combined dry run
     if: github.repository_visibility == 'private' && !startsWith(github.ref, 'refs/tags/v')
     needs: [release_environment, build]
-    runs-on: [self-hosted, Linux, X64, vaultlink]
+    runs-on: [self-hosted, Linux, ARM64, vaultlink]
     timeout-minutes: 20
     permissions:
       contents: read

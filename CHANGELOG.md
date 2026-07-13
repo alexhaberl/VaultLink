@@ -2,7 +2,7 @@
 
 ## 0.4.1 — 2026-07-12
 
-- Added native Linux aarch64 support while keeping amd64 CI and release builds on the dedicated local Self-hosted runner; only arm64 uses GitHub's `ubuntu-24.04-arm` runner.
+- Added native Linux aarch64 support with dedicated Self-hosted amd64 and arm64 runners; architecture-independent Actions jobs run on arm64 and no workflow uses GitHub-hosted compute.
 - Removed Windows host support and retained Windows-compatible filename rules for standard SMB clients.
 - Added fail-closed external CIFS storage validation for mount identity, source, filesystem type, read-write state, SMB 3.1.1 encryption/strict-cache options, local SQLite separation and mount-race detection.
 - Required every production deployment to declare and verify an exact active mount identity; setup and `init-admin` now reject unmounted fallbacks, network SQLite, unsafe ownership/modes and canonical data-path aliases before storing credentials.

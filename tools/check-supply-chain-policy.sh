@@ -65,19 +65,15 @@ for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
     if ! grep -F -q '["self-hosted", "Linux", "X64", "vaultlink"]' "$workflow"; then
         report "$workflow must keep amd64 on the dedicated self-hosted runner"
     fi
-    if ! grep -F -q '["ubuntu-24.04-arm"]' "$workflow"; then
-        report "$workflow must run arm64 natively on the GitHub-hosted ARM runner"
-    fi
-    if grep -F -q '["ubuntu-24.04"]' "$workflow" || grep -F -q 'ubuntu-latest' "$workflow"; then
-        report "$workflow must not move amd64 to a GitHub-hosted runner"
+    if ! grep -F -q '["self-hosted", "Linux", "ARM64", "vaultlink"]' "$workflow"; then
+        report "$workflow must keep arm64 on the dedicated self-hosted runner"
     fi
 done
 
-unexpected_hosted_runners=$(grep -R -n -E 'runs[_-]on:.*ubuntu-' .github/workflows \
-    | grep -F -v 'ubuntu-24.04-arm' || true)
+unexpected_hosted_runners=$(grep -R -n -E 'runs[_-]on:.*(ubuntu-|windows-|macos-)' .github/workflows || true)
 if [ -n "$unexpected_hosted_runners" ]; then
     printf '%s\n' "$unexpected_hosted_runners" >&2
-    report "only the arm64 ubuntu-24.04-arm runner may be GitHub-hosted"
+    report "workflows must not use GitHub-hosted compute"
 fi
 
 for architecture in amd64 arm64; do
@@ -217,8 +213,15 @@ for target in path_normalization byte_range filename zip_search_preview_paths up
     fi
 done
 
-if ! grep -F -q 'runs-on: [self-hosted, Linux, X64, vaultlink]' .github/workflows/fuzz.yml; then
-    report "fuzz workflow must use the dedicated self-hosted runner"
+for workflow in .github/workflows/fuzz.yml .github/workflows/security-audit.yml; do
+    if ! grep -F -q 'runs-on: [self-hosted, Linux, ARM64, vaultlink]' "$workflow"; then
+        report "$workflow must use the dedicated self-hosted arm64 runner"
+    fi
+done
+
+arm64_release_jobs=$(grep -F -c 'runs-on: [self-hosted, Linux, ARM64, vaultlink]' .github/workflows/release.yml || true)
+if [ "$arm64_release_jobs" -ne 3 ]; then
+    report "architecture-independent release jobs must use the self-hosted arm64 runner"
 fi
 
 if ! grep -F -q 'run: make fuzz-parallel' .github/workflows/fuzz.yml; then

@@ -2,7 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Rust-Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Unterstützte Hostplattformen sind Linux x86_64 und aarch64; Windows-Hostsupport ist ab 0.4.1 entfernt. Windows-, macOS- und Linux-Clients bleiben über einen externen Standard-SMB-Server interoperabel.
 
-Status: `0.4.1`-Kandidat für ein privates Debian-13-amd64-/arm64-Release. amd64 läuft auf dem lokalen Self-hosted-Runner, arm64 vorerst nativ auf `ubuntu-24.04-arm`. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
+Status: `0.4.1`-Kandidat für ein privates Debian-13-amd64-/arm64-Release. Native amd64- und arm64-Gates laufen ausschließlich auf den dedizierten Self-hosted-Runnern; architekturunabhängige Jobs nutzen den arm64-Runner. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 

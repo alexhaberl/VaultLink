@@ -18,9 +18,9 @@ The current release container starts from an immutable Debian-13/Rust image, but
 
 ## Multi-architecture assets
 
-Release builds are native: amd64 runs on the dedicated self-hosted x64 runner,
-while arm64 runs on GitHub's `ubuntu-24.04-arm` runner. Both jobs use the same
-digest-pinned multi-platform Debian 13/Rust OCI index selected by
+Release builds are native: amd64 and arm64 run on their dedicated self-hosted
+runners. Architecture-independent release jobs run on arm64. Both builds use
+the same digest-pinned multi-platform Debian 13/Rust OCI index selected by
 `rust-toolchain.toml` and verify the host
 architecture before compiling.
 
