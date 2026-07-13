@@ -2,8 +2,8 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use data_encoding::BASE32_NOPAD;
-use hmac::{Hmac, Mac};
-use rand::{rngs::OsRng, TryRngCore};
+use hmac::{Hmac, KeyInit, Mac};
+use rand::{rngs::SysRng, TryRng};
 use sha1::Sha1;
 use std::{
     collections::{hash_map::RandomState, HashMap},
@@ -18,7 +18,7 @@ const OVERFLOW_BUCKETS: usize = 256;
 const GLOBAL_CLEANUP_INTERVAL: u64 = 64;
 
 fn fill_random(bytes: &mut [u8]) {
-    OsRng
+    SysRng
         .try_fill_bytes(bytes)
         .expect("operating system CSPRNG unavailable");
 }
