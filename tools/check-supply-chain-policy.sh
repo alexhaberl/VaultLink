@@ -97,6 +97,114 @@ if [ -n "$bad_cargo_installs" ]; then
     report "cargo-installed CI tools must use an exact --version"
 fi
 
+dependabot_config=.github/dependabot.yml
+stable_minor_dependencies='data-encoding http mime_guess percent-encoding rpassword rustix serde serde_json subtle tempfile thiserror tokio toml url uuid'
+if ! awk '
+    $0 == "  - package-ecosystem: cargo" {
+        cargo = 1
+        cargo_found = 1
+        next
+    }
+    cargo && /^  - package-ecosystem:/ {
+        cargo = 0
+    }
+    !cargo { next }
+    /^    (allow|ignore):/ {
+        print "dependabot policy: Cargo updates must not be filtered by allow or ignore" > "/dev/stderr"
+        failed = 1
+    }
+    $0 == "    open-pull-requests-limit: 10" { open_limit++ }
+    END {
+        if (!cargo_found || open_limit != 1) {
+            print "dependabot policy: Cargo updates need ten visible PR slots" > "/dev/stderr"
+            failed = 1
+        }
+        exit failed
+    }
+' "$dependabot_config"; then
+    report "Dependabot Cargo updates must keep every finding visible"
+fi
+
+if ! dependabot_grouped_minors=$(awk '
+    function invalid(message) {
+        print "dependabot groups: " message > "/dev/stderr"
+        failed = 1
+    }
+    function finish_group() {
+        if (group_name == "")
+            return
+        if (group_name == "cargo-patch-updates") {
+            patch_groups++
+            if (applies_to != "version-updates" || patterns != "*" || update_types != "patch")
+                invalid("cargo-patch-updates must group version patch updates")
+        } else if (group_name == "cargo-stable-minor-updates") {
+            minor_groups++
+            if (applies_to != "version-updates" || update_types != "minor")
+                invalid("cargo-stable-minor-updates must group version minor updates")
+            grouped_minors = patterns
+        }
+        group_name = ""
+        applies_to = ""
+        patterns = ""
+        update_types = ""
+        section = ""
+    }
+    $0 == "  - package-ecosystem: cargo" { cargo = 1; next }
+    cargo && /^  - package-ecosystem:/ {
+        finish_group()
+        cargo = 0
+    }
+    !cargo { next }
+    /^      [[:alnum:]_-]+:$/ {
+        finish_group()
+        group_name = $0
+        sub(/^      /, "", group_name)
+        sub(/:$/, "", group_name)
+        next
+    }
+    group_name != "" && /^        applies-to: / {
+        applies_to = $0
+        sub(/^        applies-to: /, "", applies_to)
+        next
+    }
+    group_name != "" && $0 == "        patterns:" { section = "patterns"; next }
+    group_name != "" && $0 == "        update-types:" { section = "update-types"; next }
+    group_name != "" && /^          - / {
+        value = $0
+        sub(/^          - /, "", value)
+        gsub(/^"|"$/, "", value)
+        if (section == "patterns")
+            patterns = patterns (patterns == "" ? "" : " ") value
+        else if (section == "update-types")
+            update_types = update_types (update_types == "" ? "" : " ") value
+        next
+    }
+    END {
+        finish_group()
+        if (patch_groups != 1 || minor_groups != 1)
+            invalid("expected exactly one patch group and one stable-minor group")
+        print grouped_minors
+        exit failed
+    }
+' "$dependabot_config"); then
+    report "Dependabot Cargo update groups are invalid"
+    dependabot_grouped_minors=
+fi
+
+dependabot_grouped_minor_count=0
+for dependency in $dependabot_grouped_minors; do
+    dependabot_grouped_minor_count=$((dependabot_grouped_minor_count + 1))
+done
+if [ "$dependabot_grouped_minor_count" -ne 15 ]; then
+    report "Dependabot Cargo stable-minor group has the wrong size"
+fi
+for dependency in $stable_minor_dependencies; do
+    case " $dependabot_grouped_minors " in
+        *" $dependency "*) ;;
+        *) report "Dependabot Cargo stable-minor group is missing $dependency" ;;
+    esac
+done
+
 for pattern in /config.toml .env '.env.*' '*.sqlite*'; do
     if ! grep -F -x -q "$pattern" .dockerignore; then
         report ".dockerignore is missing $pattern"
