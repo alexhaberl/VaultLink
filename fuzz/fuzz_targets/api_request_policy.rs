@@ -113,15 +113,21 @@ fuzz_target!(|input: (
         assert!(permission.can_upload());
     }
 
-    let effective_strategy =
-        if share_permission_is_accepted && is_directory && permission.can_upload() && overwrite_requested {
+    let effective_strategy = if share_permission_is_accepted
+        && is_directory
+        && permission.can_upload()
+        && overwrite_requested
+    {
         UploadConflictStrategy::OverwriteAllowed
     } else {
         UploadConflictStrategy::Reject
     };
     assert_eq!(
         effective_strategy.can_overwrite(),
-        share_permission_is_accepted && is_directory && permission.can_upload() && overwrite_requested
+        share_permission_is_accepted
+            && is_directory
+            && permission.can_upload()
+            && overwrite_requested
     );
     if !strategy.can_overwrite() {
         assert!(!strategy.can_overwrite());

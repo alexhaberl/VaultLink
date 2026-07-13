@@ -1,9 +1,9 @@
-use argon2::password_hash::{rand_core::OsRng, SaltString};
+use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::{rngs::OsRng, TryRngCore};
 use sha1::Sha1;
 use std::{
     collections::{hash_map::RandomState, HashMap},
@@ -17,9 +17,18 @@ const MAX_LIMITER_KEYS: usize = 10_000;
 const OVERFLOW_BUCKETS: usize = 256;
 const GLOBAL_CLEANUP_INTERVAL: u64 = 64;
 
+fn fill_random(bytes: &mut [u8]) {
+    OsRng
+        .try_fill_bytes(bytes)
+        .expect("operating system CSPRNG unavailable");
+}
+
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
+    let mut salt_bytes = [0u8; 16];
+    fill_random(&mut salt_bytes);
+    let salt = SaltString::encode_b64(&salt_bytes)?;
     Argon2::default()
-        .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+        .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
 }
 pub fn verify_password(hash: &str, password: &str) -> bool {
@@ -42,12 +51,12 @@ pub fn valid_admin_username(username: &str) -> bool {
 
 pub fn random_token(bytes: usize) -> String {
     let mut b = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut b);
+    fill_random(&mut b);
     URL_SAFE_NO_PAD.encode(b)
 }
 pub fn new_totp_secret() -> String {
     let mut b = [0u8; 20];
-    rand::thread_rng().fill_bytes(&mut b);
+    fill_random(&mut b);
     BASE32_NOPAD.encode(&b)
 }
 pub fn verify_totp(secret: &str, code: &str, now: u64) -> bool {
@@ -302,9 +311,30 @@ mod tests {
     use super::*;
     #[test]
     fn password_round_trip() {
-        let h = hash_password("correct horse battery staple").unwrap();
-        assert!(verify_password(&h, "correct horse battery staple"));
-        assert!(!verify_password(&h, "wrong"));
+        let first = hash_password("correct horse battery staple").unwrap();
+        let second = hash_password("correct horse battery staple").unwrap();
+        assert_ne!(first, second);
+        assert!(verify_password(&first, "correct horse battery staple"));
+        assert!(verify_password(&second, "correct horse battery staple"));
+        assert!(!verify_password(&first, "wrong"));
+    }
+
+    #[test]
+    fn generated_tokens_and_totp_secrets_have_expected_lengths() {
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(random_token(32).as_bytes())
+                .unwrap()
+                .len(),
+            32
+        );
+        assert_eq!(
+            BASE32_NOPAD
+                .decode(new_totp_secret().as_bytes())
+                .unwrap()
+                .len(),
+            20
+        );
     }
     #[test]
     fn rfc_totp() {

@@ -36,7 +36,8 @@ self-hosted amd64 runner. It runs all eight ten-minute fuzz targets concurrently
 (`FUZZ_JOBS=8`). A single registered runner service serializes amd64 CI, fuzz,
 and release work so that CPU-intensive workloads cannot compete on that host.
 
-Release builds use the same digest-pinned Debian 13/Rust 1.97.0 OCI index on
+Release builds use the same digest-pinned Debian 13/Rust OCI index selected by
+`rust-toolchain.toml` on
 both native runners. The pin contains both linux/amd64 and linux/arm64 images.
 The build jobs have read-only repository permissions and upload separate,
 short-lived unsigned inputs. The final self-hosted job downloads both immutable

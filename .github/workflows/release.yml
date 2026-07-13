@@ -14,9 +14,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release_environment:
+    name: Resolve pinned release environment
+    if: github.repository_visibility == 'private'
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Validate pinned release image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(sh tools/rust-toolchain-channel.sh)
+          image=$(sed -n 's/^FROM[[:space:]]\+\([^[:space:]]\+\)$/\1/p' deploy/docker/Dockerfile.setup-smoke)
+          test "$(printf '%s\n' "$image" | grep -c .)" -eq 1
+          case "$image" in
+            "rust:${channel}-trixie@sha256:"*) ;;
+            *) echo "release image does not match rust-toolchain.toml" >&2; exit 1 ;;
+          esac
+          digest=${image##*@sha256:}
+          printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$'
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+
   build:
     name: Native Debian 13 (${{ matrix.release_architecture }})
     if: github.repository_visibility == 'private'
+    needs: release_environment
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +60,7 @@ jobs:
             self_hosted: false
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     timeout-minutes: 90
-    container: rust:1.97.0-trixie@sha256:44637ff22d0a6571a221bfaf137849711ad02ff4723dbb4736e297538f6a3e60
+    container: ${{ needs.release_environment.outputs.image }}
     env:
       CARGO_TERM_COLOR: always
       SOURCE_DATE_EPOCH: "0"
@@ -59,7 +86,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(rustc --version | awk '{print $2}')" = "1.97.0"
+          expected_rust_version=$(sh tools/rust-toolchain-channel.sh)
+          test "$(rustc --version | awk '{print $2}')" = "$expected_rust_version"
           test "$(uname -m)" = "$EXPECTED_UNAME"
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_RUST_HOST"
           package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
@@ -85,7 +113,6 @@ jobs:
           cargo check --manifest-path fuzz/Cargo.toml --locked
           shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
           cargo audit --deny warnings
-          cargo audit --deny warnings --file fuzz/Cargo.lock
       - name: Build and SBOM
         run: |
           cargo build --locked --release
@@ -143,12 +170,12 @@ jobs:
   publish:
     name: Verify, sign, and publish
     if: github.repository_visibility == 'private' && startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [release_environment, build]
     runs-on: [self-hosted, Linux, X64, vaultlink]
     timeout-minutes: 30
     permissions:
       contents: write
-    container: rust:1.97.0-trixie@sha256:44637ff22d0a6571a221bfaf137849711ad02ff4723dbb4736e297538f6a3e60
+    container: ${{ needs.release_environment.outputs.image }}
     steps:
       - name: Install release tools
         run: |
@@ -251,12 +278,12 @@ jobs:
   dry-run:
     name: Verify combined dry run
     if: github.repository_visibility == 'private' && !startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [release_environment, build]
     runs-on: [self-hosted, Linux, X64, vaultlink]
     timeout-minutes: 20
     permissions:
       contents: read
-    container: rust:1.97.0-trixie@sha256:44637ff22d0a6571a221bfaf137849711ad02ff4723dbb4736e297538f6a3e60
+    container: ${{ needs.release_environment.outputs.image }}
     steps:
       - name: Install verification tools
         run: |

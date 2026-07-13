@@ -8,7 +8,7 @@
 
 - GitHub Actions are pinned to full commit SHAs and build containers to SHA-256 manifest digests. Human-readable versions remain beside the pins and Dependabot proposes reviewed updates.
 - Rust toolchains and CI-installed Cargo tools use exact versions. `tools/check-supply-chain-policy.sh` rejects mutable workflow references, remote `curl | sh`, and missing Docker build-context exclusions.
-- Push and pull-request CI audits both `Cargo.lock` and `fuzz/Cargo.lock`, compiles every fuzz target, and runs setup, API, upgrade, and rollback Docker smokes without external runtime networking.
+- Push and pull-request CI audits the shared workspace `Cargo.lock`, compiles every fuzz target, and runs setup, API, upgrade, and rollback Docker smokes without external runtime networking.
 - Local `.env`, root `config.toml`, and SQLite files are excluded from the Docker context; the smoke image copies only build inputs and deploy tests explicitly.
 - Debian APT packages still come from the signed live Debian repositories. The image digest fixes the starting filesystem, but bit-for-bit rebuilds require a separately maintained Debian snapshot and are not claimed yet.
 

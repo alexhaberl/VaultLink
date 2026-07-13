@@ -1,4 +1,11 @@
 version: 2
+multi-ecosystem-groups:
+  rust-runtime:
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:30"
+      timezone: Europe/Vienna
 updates:
   - package-ecosystem: cargo
     directory: "/"
@@ -8,14 +15,33 @@ updates:
       time: "03:30"
       timezone: Europe/Vienna
     open-pull-requests-limit: 5
-  - package-ecosystem: cargo
-    directory: "/fuzz"
-    schedule:
-      interval: weekly
-      day: monday
-      time: "03:45"
-      timezone: Europe/Vienna
-    open-pull-requests-limit: 3
+    groups:
+      cargo-patch-updates:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - patch
+      cargo-stable-minor-updates:
+        applies-to: version-updates
+        patterns:
+          - data-encoding
+          - http
+          - mime_guess
+          - percent-encoding
+          - rpassword
+          - rustix
+          - serde
+          - serde_json
+          - subtle
+          - tempfile
+          - thiserror
+          - tokio
+          - toml
+          - url
+          - uuid
+        update-types:
+          - minor
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -24,11 +50,13 @@ updates:
       time: "04:00"
       timezone: Europe/Vienna
     open-pull-requests-limit: 5
+  - package-ecosystem: rust-toolchain
+    directory: "/"
+    patterns:
+      - "*"
+    multi-ecosystem-group: rust-runtime
   - package-ecosystem: docker
     directory: "/deploy/docker"
-    schedule:
-      interval: weekly
-      day: monday
-      time: "04:30"
-      timezone: Europe/Vienna
-    open-pull-requests-limit: 3
+    patterns:
+      - rust
+    multi-ecosystem-group: rust-runtime

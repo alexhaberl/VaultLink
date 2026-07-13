@@ -37,9 +37,13 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+      - name: Resolve pinned Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: echo "channel=$(sh tools/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
-          toolchain: 1.97.0
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
           components: rustfmt, clippy
       - name: Verify native architecture
         shell: bash
@@ -61,10 +65,8 @@ jobs:
         run: shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
       - name: Install pinned cargo-audit
         run: cargo install --locked cargo-audit --version 0.22.2
-      - name: Audit application and fuzz lockfiles
-        run: |
-          cargo audit --deny warnings
-          cargo audit --deny warnings --file fuzz/Cargo.lock
+      - name: Audit workspace lockfile
+        run: cargo audit --deny warnings
       - name: Setup, API, upgrade, and rollback smoke tests
         run: make docker-smoke
       - name: Native ${{ matrix.architecture }} release build on main

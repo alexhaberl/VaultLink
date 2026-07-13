@@ -39,11 +39,13 @@ use tower_http::{
 
 use crate::{
     auth,
+    config::MAX_TEXT_PREVIEW_SIZE,
     db::{
         AdminDeactivationOutcome, AdminMfaEnrollmentActivationOutcome,
         AdminMfaEnrollmentStartOutcome, AdminPasswordChangeOutcome, Database,
         PasswordSessionCreationOutcome, Permission, Session, Share, TransferAvailabilityOutcome,
         TransferLeaseBeginOutcome, TransferLeaseCompleteOutcome, UploadConflictStrategy,
+        MAX_SQLITE_UNSIGNED,
     },
     file_ops,
     http_auth::{
@@ -3410,8 +3412,13 @@ fn read_preview_opened(
         });
     }
     let mut bytes = Vec::new();
-    file.take(settings.max_preview_size + 1)
-        .read_to_end(&mut bytes)?;
+    let read_limit = settings.max_preview_size.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preview size limit is too large",
+        )
+    })?;
+    file.take(read_limit).read_to_end(&mut bytes)?;
     if bytes.contains(&0) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -4023,6 +4030,12 @@ async fn create_share(
             "Das Übertragungslimit muss mindestens 1 sein",
         ));
     }
+    if max_downloads.is_some_and(|value| value > MAX_SQLITE_UNSIGNED) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Das Übertragungslimit ist zu groß",
+        ));
+    }
     let max_upload_size = f
         .max_upload_size_gb
         .as_deref()
@@ -4034,6 +4047,12 @@ async fn create_share(
         return Err(AppError(
             StatusCode::BAD_REQUEST,
             "Uploadlimit muss mindestens 1 Byte sein",
+        ));
+    }
+    if max_upload_size.is_some_and(|value| value > MAX_SQLITE_UNSIGNED) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Das Uploadlimit ist zu groß",
         ));
     }
     let overwrite_requested = f.overwrite_allowed.as_deref() == Some("1");
@@ -5099,6 +5118,13 @@ fn settings_form(
         } else {
             ""
         },
+    )
+    .replace(
+        r#"name="max_preview_size_mb" type="number" min="1""#,
+        &format!(
+            r#"name="max_preview_size_mb" type="number" min="1" max="{}""#,
+            MAX_TEXT_PREVIEW_SIZE / MB
+        ),
     )
 }
 
@@ -8011,9 +8037,9 @@ mod tests {
             html.contains(r#"name="max_upload_size_gb" type="number" min="1" step="1" value="53""#)
         );
         assert!(html.contains(r#"name="max_zip_size_gb" type="number" min="0" step="1" value="1""#));
-        assert!(
-            html.contains(r#"name="max_preview_size_mb" type="number" min="1" step="1" value="1""#)
-        );
+        assert!(html.contains(
+            r#"name="max_preview_size_mb" type="number" min="1" max="64" step="1" value="1""#
+        ));
         assert!(html.contains(
             r#"name="max_media_preview_size_mb" type="number" min="1" step="1" value="100""#
         ));
@@ -8349,6 +8375,24 @@ mod tests {
         );
         assert_eq!(
             app.clone().oneshot(rejected_zero).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut rejected_oversized = request(
+            Method::POST,
+            "/admin/shares",
+            "csrf=csrf-token&path=uploads&permission=upload_only&alias=&max_downloads=9223372036854775808&password=&password_confirm=",
+        );
+        rejected_oversized.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=session-token"),
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(rejected_oversized)
+                .await
+                .unwrap()
+                .status(),
             StatusCode::BAD_REQUEST
         );
 

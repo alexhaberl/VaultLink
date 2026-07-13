@@ -68,7 +68,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [ ] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
   - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy` und `api_request_policy` kompiliert.
 - [ ] `cargo build --release --locked` auf amd64 und arm64
-- [ ] `cargo audit --deny warnings` für beide Lockfiles auf dem finalen Stand wiederholen.
+- [ ] `cargo audit --deny warnings` für das gemeinsame Workspace-Lockfile auf dem finalen Stand wiederholen.
 - [ ] `make policy-check` beziehungsweise das Shell-Skript in einer Umgebung mit `sh` wiederholen.
 - [ ] `make docker-smoke` auf dem finalen 0.4.1-Stand nativ auf amd64 und arm64 wiederholen.
 
@@ -111,9 +111,9 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
   - Admin-Dateimutations- und Share-Teilbaumpolicy.
   - Der Workflow läuft zusätzlich wöchentlich als einzelner Self-hosted-Job, der alle acht Targets intern parallel ausführt; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
-- [ ] Dabei `Cargo.lock` und `fuzz/Cargo.lock` prüfen.
+- [ ] Dabei das gemeinsame Workspace-`Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.
-- [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `ubuntu-24.04-arm` grün; beide verwenden den gleichen digest-gepinnten Rust-1.97.0-/Debian-13-OCI-Index.
+- [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `ubuntu-24.04-arm` grün; beide verwenden den zu `rust-toolchain.toml` passenden, digest-gepinnten Debian-13-/Rust-OCI-Index.
 - [ ] Offline erzeugten Minisign-Public-Key als `release/minisign.pub` committen und `MINISIGN_SECRET_KEY` sowie `MINISIGN_PASSWORD` als GitHub-Actions-Secrets provisionieren; ohne alle drei Werte muss der Tag-Publish absichtlich fehlschlagen.
 - [ ] Ein autorisierter Maintainer pusht den annotierten `v0.4.1`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, Main-Ancestry-Prüfung und der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
 - [ ] Artefakte prüfen:

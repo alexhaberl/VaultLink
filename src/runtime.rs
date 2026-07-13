@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, MAX_TEXT_PREVIEW_SIZE};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeSettings {
@@ -165,6 +165,11 @@ impl RuntimeSettings {
             || self.max_media_preview_size == 0
         {
             return Err("runtime limits must be positive".into());
+        }
+        if self.max_preview_size > MAX_TEXT_PREVIEW_SIZE {
+            return Err(format!(
+                "max_preview_size must not exceed {MAX_TEXT_PREVIEW_SIZE} bytes"
+            ));
         }
         if self.share_password_min_length < 8
             || self.share_password_max_length < self.share_password_min_length
@@ -486,6 +491,9 @@ mod tests {
         assert!(settings.validate().is_err());
         settings.share_unlock_minutes = 60;
         settings.share_password_max_length = 1_025;
+        assert!(settings.validate().is_err());
+        settings.share_password_max_length = 128;
+        settings.max_preview_size = MAX_TEXT_PREVIEW_SIZE + 1;
         assert!(settings.validate().is_err());
     }
 }

@@ -17,7 +17,7 @@ use crate::{
     auth,
     db::{
         AdminDeactivationOutcome, AdminSummary, AuditEvent, PasswordSessionCreationOutcome,
-        Permission, Share, UploadConflictStrategy,
+        Permission, Share, UploadConflictStrategy, MAX_SQLITE_UNSIGNED,
     },
     file_ops,
     http_auth::{
@@ -808,10 +808,22 @@ async fn create_share(
             "Das Übertragungslimit muss mindestens 1 sein",
         ));
     }
+    if request
+        .max_downloads
+        .is_some_and(|value| value > MAX_SQLITE_UNSIGNED)
+    {
+        return Err(ApiError::bad_request("Das Übertragungslimit ist zu groß"));
+    }
     if request.max_upload_size == Some(0) {
         return Err(ApiError::bad_request(
             "Uploadlimit muss mindestens 1 Byte sein",
         ));
+    }
+    if request
+        .max_upload_size
+        .is_some_and(|value| value > MAX_SQLITE_UNSIGNED)
+    {
+        return Err(ApiError::bad_request("Das Uploadlimit ist zu groß"));
     }
     if request
         .expires_at
@@ -2073,6 +2085,23 @@ mod tests {
             .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
         assert_eq!(
             app.clone().oneshot(invalid_limit).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut oversized_limit = json_request(
+            Method::POST,
+            "/api/v1/shares",
+            r#"{"path":"docs","permission":"download_only","max_downloads":9223372036854775808}"#,
+        );
+        oversized_limit.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        oversized_limit
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.clone().oneshot(oversized_limit).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
 
