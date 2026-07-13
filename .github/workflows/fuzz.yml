@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
-      FUZZ_JOBS: 8
+      FUZZ_JOBS: 4
       FUZZ_MAX_TOTAL_TIME: 600
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -30,7 +30,7 @@ jobs:
           toolchain: nightly-2026-07-01
       - name: Install pinned cargo-fuzz
         run: cargo install --locked cargo-fuzz --version 0.13.2
-      - name: Run all targets in parallel for 10 minutes
+      - name: Run all targets with four workers for 10 minutes each
         run: make fuzz-parallel
         env:
           FUZZ_LOG_DIR: ${{ runner.temp }}/vaultlink-fuzz-logs

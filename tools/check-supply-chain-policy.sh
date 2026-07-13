@@ -228,8 +228,8 @@ if ! grep -F -q 'run: make fuzz-parallel' .github/workflows/fuzz.yml; then
     report "fuzz workflow must run all targets through the parallel Make target"
 fi
 
-if ! grep -E -q '^[[:space:]]+FUZZ_JOBS:[[:space:]]+8$' .github/workflows/fuzz.yml; then
-    report "fuzz workflow must run all eight targets concurrently"
+if ! grep -E -q '^[[:space:]]+FUZZ_JOBS:[[:space:]]+4$' .github/workflows/fuzz.yml; then
+    report "fuzz workflow must run all eight targets across four workers"
 fi
 
 if ! grep -E -q '^[[:space:]]+cancel-in-progress:[[:space:]]+true$' .github/workflows/fuzz.yml; then
