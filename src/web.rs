@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     io::{self, Read, Seek, Write},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     pin::Pin,
     sync::{
@@ -47,17 +47,24 @@ use crate::{
     config::MAX_TEXT_PREVIEW_SIZE,
     db::{
         AdminDeactivationOutcome, AdminMfaEnrollmentActivationOutcome,
-        AdminMfaEnrollmentStartOutcome, AdminPasswordChangeOutcome, Database,
-        PasswordSessionCreationOutcome, Permission, Session, Share, TransferAvailabilityOutcome,
-        TransferLeaseBeginOutcome, TransferLeaseCompleteOutcome, UploadConflictStrategy,
-        MAX_SQLITE_UNSIGNED,
+        AdminMfaEnrollmentStartOutcome, AdminPasswordChangeOutcome,
+        AdminWebauthnCredentialDeletionOutcome, AdminWebauthnCredentialRegistrationOutcome,
+        AuditClientIpDeletionOutcome, Database, PasswordSessionCreationOutcome, Permission,
+        PreviewSessionCreateOutcome, Session, Share, ShareControlsUpdateOutcome,
+        TransferAvailabilityOutcome, TransferLeaseBeginOutcome, TransferLeaseCompleteOutcome,
+        UploadConflictStrategy, UploadReservationBeginOutcome, UploadReservationCommitOutcome,
+        UploadReservationExtendOutcome, DEFAULT_SHARE_UPLOAD_FILE_COUNT,
+        DEFAULT_SHARE_UPLOAD_TOTAL_SIZE, MAX_SQLITE_UNSIGNED,
     },
     file_ops,
     http_auth::{
-        audit, clear_session_cookie, commit_runtime_settings, csrf, current_audit_client_ip,
-        database, make_session_cookie, make_transfer_cookie, make_unlock_cookie,
-        redirect_with_cookie, runtime_settings, session, share_is_unlocked, transfer_cookie,
-        with_audit_client_ip, MissingSession, TransferCookieScope, UnlockCookieScope,
+        audit, audit_sync, clear_session_cookie, commit_runtime_settings, csrf,
+        current_audit_client_ip, current_client_limit_key, database, enabled_audit_client_ip,
+        hash_password_admitted, make_session_cookie, make_transfer_cookie, make_unlock_cookie,
+        redirect_with_cookie, runtime_settings, session, share_is_unlocked, share_unlock_csrf,
+        transfer_cookie, try_acquire_client_activity, verify_password_admitted,
+        with_audit_client_ip, ClientActivityPermit, MissingSession, TransferCookieScope,
+        UnlockCookieScope,
     },
     i18n::{self, Locale, MessageKey},
     path_security, proxy,
@@ -68,19 +75,212 @@ use crate::{
     AppState,
 };
 
-pub(crate) const HARD_MULTIPART_LIMIT: u64 = 128 * 1024 * 1024 * 1024;
+pub(crate) const HARD_MULTIPART_LIMIT: u64 = crate::config::MAX_MULTIPART_BODY_SIZE;
 const DEFAULT_REQUEST_BODY_LIMIT: usize = 1024 * 1024;
 const MAX_UPLOAD_PATH_FIELD_BYTES: usize = 4 * 1024;
 const MAX_UPLOAD_OPTION_FIELD_BYTES: usize = 16;
-const MAX_UPLOAD_MULTIPART_FIELDS: usize = 4;
+const MAX_UPLOAD_MULTIPART_FIELDS: usize = 5;
+const MAX_SEARCH_QUERY_BYTES: usize = 256;
+const BUFFERED_RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
+const BUFFERED_RESPONSE_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const REQUEST_BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_REQUEST_BODY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+const UPLOAD_REQUEST_BODY_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+const UPLOAD_QUOTA_RESERVATION_STEP: u64 = 1024 * 1024;
+const UPLOAD_QUOTA_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const TEXT_PREVIEW_RENDER_UNIT_BYTES: u64 = 1_000_000;
+const MAX_RENDERED_TEXT_PREVIEW_BYTES: usize = MAX_TEXT_PREVIEW_SIZE as usize;
+// This includes markup so escaped dynamic values can never collide with it.
+const TEXT_PREVIEW_STREAM_MARKER: &str = "<!--VAULTLINK_ESCAPED_TEXT_PREVIEW_STREAM-->";
 
-struct ResponseAdmissionBody {
+struct AbsoluteDeadlineBody {
+    inner: Body,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    timed_out: bool,
+}
+
+impl HttpBody for AbsoluteDeadlineBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.timed_out {
+            return Poll::Ready(None);
+        }
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            this.timed_out = true;
+            return Poll::Ready(Some(Err(axum::Error::new(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "absolute request body deadline exceeded",
+            )))));
+        }
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.timed_out || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+struct PermitBody {
     inner: Body,
     _permit: OwnedSemaphorePermit,
 }
 
-impl HttpBody for ResponseAdmissionBody {
+struct PeerPermitBody {
+    inner: Body,
+    _permit: ClientActivityPermit,
+}
+
+struct StreamAdmissionBody {
+    inner: Body,
+    _permit: OwnedSemaphorePermit,
+    _peer_permit: ClientActivityPermit,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    complete: bool,
+}
+
+struct BufferedAdmissionBody {
+    inner: Body,
+    _permit: OwnedSemaphorePermit,
+    _peer_permit: ClientActivityPermit,
+    pending: Option<Bytes>,
+    complete: bool,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl HttpBody for BufferedAdmissionBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.complete {
+            return Poll::Ready(None);
+        }
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            this.complete = true;
+            this.pending.take();
+            return Poll::Ready(Some(Err(axum::Error::new(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "buffered response lifetime exceeded",
+            )))));
+        }
+        if let Some(pending) = this.pending.take() {
+            let length = pending.len().min(BUFFERED_RESPONSE_CHUNK_BYTES);
+            let chunk = Bytes::copy_from_slice(&pending[..length]);
+            if length < pending.len() {
+                this.pending = Some(pending.slice(length..));
+            }
+            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => {
+                    let length = data.len().min(BUFFERED_RESPONSE_CHUNK_BYTES);
+                    let chunk = Bytes::copy_from_slice(&data[..length]);
+                    if length < data.len() {
+                        this.pending = Some(data.slice(length..));
+                    }
+                    Poll::Ready(Some(Ok(Frame::data(chunk))))
+                }
+                Err(frame) => Poll::Ready(Some(Ok(frame))),
+            },
+            Poll::Ready(Some(Err(error))) => {
+                this.complete = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.complete = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.complete
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+impl HttpBody for StreamAdmissionBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.complete {
+            return Poll::Ready(None);
+        }
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            this.complete = true;
+            return Poll::Ready(Some(Err(axum::Error::new(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "stream response lifetime exceeded",
+            )))));
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(None) => {
+                this.complete = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.complete = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.complete || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl HttpBody for PermitBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl HttpBody for PeerPermitBody {
     type Data = Bytes;
     type Error = axum::Error;
 
@@ -239,6 +439,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/favicon-32.png", get(favicon_png))
         .route("/favicon.ico", get(favicon_png))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT))
+        .layer(middleware::from_fn(absolute_request_body_deadline))
         .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_IDLE_TIMEOUT))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
@@ -271,18 +472,18 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(middleware::from_fn(locale_context))
         .layer(middleware::from_fn_with_state(
-            state.response_admission.clone(),
+            state.clone(),
             response_admission,
         ))
         .with_state(state)
 }
 
 async fn response_admission(
-    State(admission): State<Arc<tokio::sync::Semaphore>>,
+    State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    let permit = match admission.try_acquire_owned() {
+    let permit = match state.response_admission.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             let mut response = (
@@ -296,15 +497,169 @@ async fn response_admission(
             return response;
         }
     };
-    let response = next.run(request).await;
-    let (parts, body) = response.into_parts();
-    Response::from_parts(
-        parts,
-        Body::new(ResponseAdmissionBody {
-            inner: body,
-            _permit: permit,
-        }),
-    )
+    let streaming = streaming_response_path(request.uri().path());
+    let head_request = request.method() == Method::HEAD;
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| {
+            proxy::client_limit_key(proxy::effective_client_ip(
+                peer.ip(),
+                request.headers(),
+                &state.config,
+            ))
+        })
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let (body_permit, body_peer_permit) = if streaming {
+        let global = match state.stream_admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                drop(permit);
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Zu viele gleichzeitige Downloads",
+                )
+                    .into_response();
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return response;
+            }
+        };
+        let peer_permit = match try_acquire_client_activity(
+            state.stream_peer_admission.clone(),
+            peer,
+            crate::MAX_IN_FLIGHT_STREAMS_PER_CLIENT,
+        ) {
+            Ok(Some(permit)) => permit,
+            Ok(None) => {
+                drop(global);
+                drop(permit);
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Zu viele gleichzeitige Downloads dieses Clients",
+                )
+                    .into_response();
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return response;
+            }
+            Err(_) => {
+                drop(global);
+                drop(permit);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Interner Fehler").into_response();
+            }
+        };
+        (global, peer_permit)
+    } else {
+        let global = match state
+            .buffered_response_admission
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                drop(permit);
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Zu viele gleichzeitige Antworten",
+                )
+                    .into_response();
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return response;
+            }
+        };
+        let peer_permit = match try_acquire_client_activity(
+            state.buffered_peer_admission.clone(),
+            peer,
+            crate::MAX_IN_FLIGHT_BUFFERED_RESPONSES_PER_CLIENT,
+        ) {
+            Ok(Some(permit)) => permit,
+            Ok(None) => {
+                drop(global);
+                drop(permit);
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Zu viele gleichzeitige Antworten dieses Clients",
+                )
+                    .into_response();
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return response;
+            }
+            Err(_) => {
+                drop(global);
+                drop(permit);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Interner Fehler").into_response();
+            }
+        };
+        (global, peer_permit)
+    };
+    let mut response = next.run(request).await;
+    drop(permit);
+    if streaming {
+        let (parts, body) = response.into_parts();
+        Response::from_parts(
+            parts,
+            Body::new(StreamAdmissionBody {
+                inner: body,
+                _permit: body_permit,
+                _peer_permit: body_peer_permit,
+                deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(
+                    crate::db::TRANSFER_LEASE_MAX_LIFETIME_SECONDS as u64,
+                ))),
+                complete: false,
+            }),
+        )
+    } else {
+        if !head_request {
+            response.headers_mut().remove(header::CONTENT_LENGTH);
+        }
+        let (parts, body) = response.into_parts();
+        Response::from_parts(
+            parts,
+            Body::new(BufferedAdmissionBody {
+                inner: body,
+                _permit: body_permit,
+                _peer_permit: body_peer_permit,
+                pending: None,
+                complete: false,
+                deadline: Box::pin(tokio::time::sleep(BUFFERED_RESPONSE_MAX_LIFETIME)),
+            }),
+        )
+    }
+}
+
+fn streaming_response_path(path: &str) -> bool {
+    path == "/admin/preview/raw"
+        || path.ends_with("/download")
+        || path.ends_with("/download.zip")
+        || path.ends_with("/preview/raw")
+        || (path.ends_with("/preview")
+            && (path.starts_with("/v/") || path.starts_with("/api/v1/public/shares/")))
+}
+
+fn upload_request_path(path: &str) -> bool {
+    path.ends_with("/upload") || path.ends_with("/upload/queue")
+}
+
+async fn absolute_request_body_deadline(request: Request, next: Next) -> Response {
+    let duration = if upload_request_path(request.uri().path()) {
+        UPLOAD_REQUEST_BODY_DEADLINE
+    } else {
+        DEFAULT_REQUEST_BODY_DEADLINE
+    };
+    let (parts, body) = request.into_parts();
+    let body = Body::new(AbsoluteDeadlineBody {
+        inner: body,
+        deadline: Box::pin(tokio::time::sleep(duration)),
+        timed_out: false,
+    });
+    next.run(Request::from_parts(parts, body)).await
 }
 
 async fn locale_context(req: Request, next: Next) -> Response {
@@ -411,11 +766,36 @@ pub(crate) async fn guard_multipart_upload(request: Request, next: Next) -> Resp
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+    let mut escaped = String::with_capacity(
+        escaped_html_len(s).expect("an existing string has a representable escaped length"),
+    );
+    for character in s.chars() {
+        push_html_escaped(&mut escaped, character);
+    }
+    escaped
+}
+
+fn push_html_escaped(escaped: &mut String, character: char) {
+    match character {
+        '&' => escaped.push_str("&amp;"),
+        '<' => escaped.push_str("&lt;"),
+        '>' => escaped.push_str("&gt;"),
+        '"' => escaped.push_str("&quot;"),
+        '\'' => escaped.push_str("&#39;"),
+        character => escaped.push(character),
+    }
+}
+
+fn escaped_html_len(value: &str) -> Option<usize> {
+    value.chars().try_fold(0usize, |length, character| {
+        length.checked_add(match character {
+            '&' => 5,
+            '<' | '>' => 4,
+            '"' => 6,
+            '\'' => 5,
+            character => character.len_utf8(),
+        })
+    })
 }
 
 async fn stylesheet_asset() -> impl IntoResponse {
@@ -442,7 +822,7 @@ function webauthnBase64(value){const bytes=new Uint8Array(value);let raw='';byte
 function webauthnOptions(options){options.publicKey.challenge=webauthnBuffer(options.publicKey.challenge);if(options.publicKey.user)options.publicKey.user.id=webauthnBuffer(options.publicKey.user.id);for(const key of ['allowCredentials','excludeCredentials'])for(const item of options.publicKey[key]||[])item.id=webauthnBuffer(item.id);return options;}
 function webauthnCredential(credential){const response={};for(const key of ['attestationObject','clientDataJSON','authenticatorData','signature','userHandle'])if(credential.response[key])response[key]=webauthnBase64(credential.response[key]);if(credential.response.getTransports)response.transports=credential.response.getTransports();return{id:credential.id,rawId:webauthnBase64(credential.rawId),type:credential.type,response,clientExtensionResults:credential.getClientExtensionResults(),authenticatorAttachment:credential.authenticatorAttachment};}
 async function webauthnPost(url,body){const response=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});if(!response.ok)throw new Error(await response.text());return response.json();}
-function initSecurityKeyLogin(){const button=document.querySelector('[data-security-key-login]');if(!button)return;const status=document.querySelector('[data-security-key-status]');button.addEventListener('click',async()=>{button.disabled=true;status.textContent='<vl-i18n key="auth.security_key_wait"/>';try{const options=webauthnOptions(await webauthnPost('/mfa/security-key/start'));const credential=await navigator.credentials.get(options);const result=await webauthnPost('/mfa/security-key/finish',{credential:webauthnCredential(credential)});location.assign(result.redirect);}catch(error){status.textContent='<vl-i18n key="auth.security_key_failed"/>';button.disabled=false;}});}
+function initSecurityKeyLogin(){const button=document.querySelector('[data-security-key-login]');if(!button)return;const status=document.querySelector('[data-security-key-status]');const csrf=button.dataset.csrf;button.addEventListener('click',async()=>{button.disabled=true;status.textContent='<vl-i18n key="auth.security_key_wait"/>';try{const options=webauthnOptions(await webauthnPost('/mfa/security-key/start',{csrf}));const credential=await navigator.credentials.get(options);const result=await webauthnPost('/mfa/security-key/finish',{csrf,credential:webauthnCredential(credential)});location.assign(result.redirect);}catch(error){status.textContent='<vl-i18n key="auth.security_key_failed"/>';button.disabled=false;}});}
 function initSecurityKeyRegistration(){const form=document.querySelector('[data-security-key-register]');if(!form)return;const status=form.querySelector('[data-security-key-status]');form.addEventListener('submit',async event=>{event.preventDefault();const button=form.querySelector('button');button.disabled=true;status.textContent='<vl-i18n key="auth.security_key_wait"/>';const label=form.elements.label.value.trim();try{const options=webauthnOptions(await webauthnPost('/admin/account/security-keys/register/start',{csrf:form.dataset.csrf,current_password:form.elements.current_password.value,label}));const credential=await navigator.credentials.create(options);const result=await webauthnPost('/admin/account/security-keys/register/finish',{csrf:form.dataset.csrf,label,credential:webauthnCredential(credential)});location.assign(result.redirect);}catch(error){status.textContent='<vl-i18n key="auth.security_key_failed"/>';button.disabled=false;}});}
 document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);initFileSelection();initShareReview();initSecurityKeyLogin();initSecurityKeyRegistration();});
 document.addEventListener('submit',e=>{e.target.querySelectorAll('[data-tz-offset]').forEach(i=>{i.value=String(new Date().getTimezoneOffset())})});"#,
@@ -830,6 +1210,23 @@ struct PublicTransferLease {
     client_ip: Option<String>,
 }
 
+struct PendingReservationOwnership<T> {
+    outcome: T,
+    ownership_sender: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl<T: Copy> PendingReservationOwnership<T> {
+    fn outcome(&self) -> T {
+        self.outcome
+    }
+
+    fn claim(mut self) {
+        if let Some(sender) = self.ownership_sender.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
 impl PublicTransferLease {
     fn into_stream_parts(
         mut self,
@@ -955,6 +1352,16 @@ async fn begin_public_transfer(
     resource_key: String,
     action: &'static str,
 ) -> Result<PublicTransferLease> {
+    let client_key = current_client_limit_key();
+    if !state
+        .public_transfer_limiter
+        .check_and_record_attempt(&format!("public-transfer:{}:{client_key}", share.id))
+    {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele öffentliche Übertragungen",
+        ));
+    }
     let session_token = transfer_cookie(headers, share.id)
         .map(str::to_string)
         .unwrap_or_else(|| auth::random_token(32));
@@ -962,24 +1369,23 @@ async fn begin_public_transfer(
     let session_for_db = session_token.clone();
     let lease_for_db = lease_token.clone();
     let share_id = share.id;
-    let outcome = database(state.db.clone(), move |database| {
-        database.begin_transfer_lease(
-            &session_for_db,
-            &lease_for_db,
-            share_id,
-            &resource_key,
-            action,
-        )
-    })
+    let pending_ownership = begin_transfer_lease_cancellation_safe(
+        state.db.clone(),
+        session_for_db,
+        lease_for_db,
+        share_id,
+        resource_key,
+        action,
+    )
     .await?;
-    match outcome {
+    match pending_ownership.outcome() {
         TransferLeaseBeginOutcome::NewLease | TransferLeaseBeginOutcome::AlreadyCounted => {
             let client_ip = runtime_settings(state)
                 .audit_client_ip_enabled
                 .then(current_audit_client_ip)
                 .flatten()
                 .map(|ip| ip.to_string());
-            Ok(PublicTransferLease {
+            let lease = PublicTransferLease {
                 heartbeat_stop: start_transfer_heartbeat(
                     state.db.clone(),
                     state.runtime.clone(),
@@ -992,7 +1398,11 @@ async fn begin_public_transfer(
                 cookie: make_transfer_cookie(state, share, &session_token, transfer_scope(uri)),
                 database: state.db.clone(),
                 client_ip,
-            })
+            };
+            // Acknowledgement is deliberately last: until the RAII owner exists,
+            // dropping this request makes the blocking worker cancel the lease.
+            pending_ownership.claim();
+            Ok(lease)
         }
         TransferLeaseBeginOutcome::LimitReached => {
             Err(AppError(StatusCode::GONE, "Übertragungslimit erreicht"))
@@ -1001,6 +1411,51 @@ async fn begin_public_transfer(
             Err(AppError(StatusCode::GONE, "Freigabe nicht verfügbar"))
         }
     }
+}
+
+async fn begin_transfer_lease_cancellation_safe(
+    database: Database,
+    session_token: String,
+    lease_token: String,
+    share_id: i64,
+    resource_key: String,
+    action: &'static str,
+) -> Result<PendingReservationOwnership<TransferLeaseBeginOutcome>> {
+    let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
+    let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let outcome = database.begin_transfer_lease(
+            &session_token,
+            &lease_token,
+            share_id,
+            &resource_key,
+            action,
+        );
+        let reserved = matches!(
+            outcome,
+            Ok(TransferLeaseBeginOutcome::NewLease) | Ok(TransferLeaseBeginOutcome::AlreadyCounted)
+        );
+        if outcome_sender.send(outcome).is_err() {
+            if reserved {
+                let _ = database.cancel_transfer_lease(&lease_token);
+            }
+            return;
+        }
+        if reserved && ownership_receiver.blocking_recv().is_err() {
+            // The async receiver disappeared after SQLite committed but before
+            // a PublicTransferLease could take ownership. Cancel synchronously
+            // in this already-blocking worker so no detached lease survives.
+            let _ = database.cancel_transfer_lease(&lease_token);
+        }
+    });
+    let outcome = outcome_receiver
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+    Ok(PendingReservationOwnership {
+        outcome,
+        ownership_sender: Some(ownership_sender),
+    })
 }
 
 async fn check_public_transfer_availability(
@@ -1058,13 +1513,22 @@ fn transfer_complete_future(
                         client_ip.as_deref(),
                     )
                     .is_err();
-            Ok::<_, rusqlite::Error>(audit_failed)
+            Ok::<_, rusqlite::Error>((outcome, audit_failed))
         })
         .await
         .map_err(|error| io::Error::other(error.to_string()))?;
         match result {
-            Ok(true) => tracing::warn!(share_id, action, "could not audit completed transfer"),
-            Ok(false) => {}
+            Ok((TransferLeaseCompleteOutcome::Counted, true)) => {
+                tracing::warn!(share_id, action, "could not audit completed transfer")
+            }
+            Ok((TransferLeaseCompleteOutcome::Counted, false))
+            | Ok((TransferLeaseCompleteOutcome::AlreadyCounted, _)) => {}
+            Ok((TransferLeaseCompleteOutcome::NotFound, _)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "public transfer lease expired before completion",
+                ));
+            }
             Err(error) => {
                 tracing::warn!(share_id, action, %error, "could not finalize public transfer lease");
                 return Err(io::Error::other(error.to_string()));
@@ -1078,10 +1542,81 @@ fn spawn_transfer_cancel(database: Database, lease_token: String) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    handle.spawn(async move {
-        let _ =
-            tokio::task::spawn_blocking(move || database.cancel_transfer_lease(&lease_token)).await;
+    handle.spawn_blocking(move || {
+        let _ = database.cancel_transfer_lease(&lease_token);
     });
+}
+
+struct UploadQuotaReservation {
+    database: Database,
+    token: Option<String>,
+    reserved_bytes: u64,
+    last_heartbeat: std::time::Instant,
+}
+
+impl UploadQuotaReservation {
+    fn new(database: Database, token: String) -> Self {
+        Self {
+            database,
+            token: Some(token),
+            reserved_bytes: 0,
+            last_heartbeat: std::time::Instant::now(),
+        }
+    }
+
+    fn token(&self) -> &str {
+        self.token.as_deref().expect("active upload reservation")
+    }
+
+    fn committed(&mut self) {
+        self.token.take();
+    }
+}
+
+impl Drop for UploadQuotaReservation {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        let database = self.database.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                let _ = database.cancel_upload_reservation(&token);
+            });
+        }
+    }
+}
+
+async fn begin_upload_reservation_cancellation_safe(
+    database: Database,
+    reservation_token: String,
+    share_id: i64,
+) -> Result<PendingReservationOwnership<UploadReservationBeginOutcome>> {
+    let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
+    let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let outcome = database.begin_upload_reservation(&reservation_token, share_id);
+        let reserved = matches!(outcome, Ok(UploadReservationBeginOutcome::Reserved));
+        if outcome_sender.send(outcome).is_err() {
+            if reserved {
+                let _ = database.cancel_upload_reservation(&reservation_token);
+            }
+            return;
+        }
+        if reserved && ownership_receiver.blocking_recv().is_err() {
+            // See the transfer counterpart above: ownership either reaches an
+            // RAII guard or the reservation is removed before this worker exits.
+            let _ = database.cancel_upload_reservation(&reservation_token);
+        }
+    });
+    let outcome = outcome_receiver
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+    Ok(PendingReservationOwnership {
+        outcome,
+        ownership_sender: Some(ownership_sender),
+    })
 }
 
 struct TransferBodyStream {
@@ -1093,31 +1628,89 @@ struct TransferBodyStream {
     action: &'static str,
     share_id: i64,
     heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
-    finalize: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
+    finalize: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    pending_chunk: Option<Bytes>,
     remaining_bytes: Option<u64>,
-    pending_final_chunk: Option<Bytes>,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    timed_out: bool,
+    complete: bool,
+}
+
+impl TransferBodyStream {
+    fn start_finalize(&mut self) {
+        self.heartbeat_stop.take();
+        let Some(token) = self.lease_token.take() else {
+            return;
+        };
+        let future = transfer_complete_future(
+            self.database.clone(),
+            self.runtime.clone(),
+            token,
+            self.action,
+            self.share_id,
+            self.client_ip.take(),
+        );
+        // Dropping a JoinHandle detaches the task. Once payload bytes are ready
+        // to be emitted, completion must therefore survive a client disconnect.
+        self.finalize = Some(tokio::spawn(future));
+    }
 }
 
 impl Stream for TransferBodyStream {
     type Item = io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.timed_out || self.complete {
+            return Poll::Ready(None);
+        }
+        if self.deadline.as_mut().poll(context).is_ready() {
+            self.timed_out = true;
+            self.heartbeat_stop.take();
+            self.finalize.take();
+            if let Some(token) = self.lease_token.take() {
+                spawn_transfer_cancel(self.database.clone(), token);
+            }
+            return Poll::Ready(Some(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "public transfer lifetime exceeded",
+            ))));
+        }
         loop {
             if let Some(finalize) = self.finalize.as_mut() {
-                return match finalize.as_mut().poll(context) {
+                return match Pin::new(finalize).poll(context) {
                     Poll::Pending => Poll::Pending,
-                    Poll::Ready(Ok(())) => {
+                    Poll::Ready(Ok(Ok(()))) => {
                         self.finalize.take();
-                        match self.pending_final_chunk.take() {
-                            Some(chunk) => Poll::Ready(Some(Ok(chunk))),
-                            None => Poll::Ready(None),
+                        if let Some(chunk) = self.pending_chunk.take() {
+                            // A known-length body may have more source chunks
+                            // after the first payload chunk that triggered the
+                            // commit. Only an exactly exhausted body ends here.
+                            if self.remaining_bytes == Some(0) {
+                                self.complete = true;
+                            }
+                            Poll::Ready(Some(Ok(chunk)))
+                        } else {
+                            self.complete = true;
+                            Poll::Ready(None)
                         }
+                    }
+                    Poll::Ready(Ok(Err(error))) => {
+                        self.finalize.take();
+                        self.pending_chunk.take();
+                        self.complete = true;
+                        Poll::Ready(Some(Err(error)))
                     }
                     Poll::Ready(Err(error)) => {
                         self.finalize.take();
-                        Poll::Ready(Some(Err(error)))
+                        self.pending_chunk.take();
+                        self.complete = true;
+                        Poll::Ready(Some(Err(io::Error::other(error.to_string()))))
                     }
                 };
+            }
+            if self.remaining_bytes == Some(0) && self.lease_token.is_some() {
+                self.start_finalize();
+                continue;
             }
             match self.inner.as_mut().poll_next(context) {
                 Poll::Ready(None) => {
@@ -1131,18 +1724,11 @@ impl Stream for TransferBodyStream {
                             "transfer source ended before Content-Length",
                         ))));
                     }
-                    self.heartbeat_stop.take();
-                    if let Some(token) = self.lease_token.take() {
-                        self.finalize = Some(transfer_complete_future(
-                            self.database.clone(),
-                            self.runtime.clone(),
-                            token,
-                            self.action,
-                            self.share_id,
-                            self.client_ip.take(),
-                        ));
+                    if self.lease_token.is_some() {
+                        self.start_finalize();
                         continue;
                     }
+                    self.complete = true;
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Some(Err(error))) => {
@@ -1167,21 +1753,25 @@ impl Stream for TransferBodyStream {
                         }
                         let remaining = remaining - chunk_length;
                         self.remaining_bytes = Some(remaining);
-                        if remaining == 0 {
-                            self.heartbeat_stop.take();
-                            if let Some(token) = self.lease_token.take() {
-                                self.pending_final_chunk = Some(chunk);
-                                self.finalize = Some(transfer_complete_future(
-                                    self.database.clone(),
-                                    self.runtime.clone(),
-                                    token,
-                                    self.action,
-                                    self.share_id,
-                                    self.client_ip.take(),
-                                ));
-                                continue;
-                            }
+                        if !chunk.is_empty() && self.lease_token.is_some() {
+                            // A positive known-length transfer is consumed as
+                            // soon as any usable payload can leave the server.
+                            // Waiting for the last byte lets a client repeatedly
+                            // abort after N-1 bytes without using its limit.
+                            self.pending_chunk = Some(chunk);
+                            self.start_finalize();
+                            continue;
                         }
+                        if remaining == 0 {
+                            self.complete = true;
+                        }
+                    } else if !chunk.is_empty() && self.lease_token.is_some() {
+                        // Direct ZIP generation has no known final length. Count
+                        // it before yielding its first usable payload bytes so a
+                        // close-before-EOF cannot evade the transfer limit.
+                        self.pending_chunk = Some(chunk);
+                        self.start_finalize();
+                        continue;
                     }
                     return Poll::Ready(Some(Ok(chunk)));
                 }
@@ -1222,9 +1812,152 @@ where
         share_id,
         heartbeat_stop,
         finalize: None,
+        pending_chunk: None,
         remaining_bytes: expected_bytes,
-        pending_final_chunk: None,
+        deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(
+            crate::db::TRANSFER_LEASE_MAX_LIFETIME_SECONDS as u64,
+        ))),
+        timed_out: false,
+        complete: false,
     })
+}
+
+struct EscapedTextPageStream {
+    page: Bytes,
+    prefix_end: usize,
+    prefix_offset: usize,
+    suffix_offset: usize,
+    text: String,
+    text_offset: usize,
+    escaped_remaining: usize,
+    phase: u8,
+}
+
+impl Stream for EscapedTextPageStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match this.phase {
+                0 => {
+                    if this.prefix_offset >= this.prefix_end {
+                        this.phase = 1;
+                        continue;
+                    }
+                    let end = this
+                        .prefix_offset
+                        .saturating_add(BUFFERED_RESPONSE_CHUNK_BYTES)
+                        .min(this.prefix_end);
+                    let chunk = this.page.slice(this.prefix_offset..end);
+                    this.prefix_offset = end;
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                1 => {
+                    if this.text_offset >= this.text.len() {
+                        if this.escaped_remaining != 0 {
+                            this.phase = 3;
+                            return Poll::Ready(Some(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "escaped preview length mismatch",
+                            ))));
+                        }
+                        this.phase = 2;
+                        continue;
+                    }
+                    let mut chunk = String::with_capacity(BUFFERED_RESPONSE_CHUNK_BYTES);
+                    while this.text_offset < this.text.len() {
+                        let character = this.text[this.text_offset..]
+                            .chars()
+                            .next()
+                            .expect("text offset is a UTF-8 boundary");
+                        let escaped_length = match character {
+                            '&' => 5,
+                            '<' | '>' => 4,
+                            '"' => 6,
+                            '\'' => 5,
+                            character => character.len_utf8(),
+                        };
+                        if !chunk.is_empty()
+                            && chunk.len().saturating_add(escaped_length)
+                                > BUFFERED_RESPONSE_CHUNK_BYTES
+                        {
+                            break;
+                        }
+                        if escaped_length > this.escaped_remaining {
+                            this.phase = 3;
+                            return Poll::Ready(Some(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "escaped preview exceeds its output cap",
+                            ))));
+                        }
+                        push_html_escaped(&mut chunk, character);
+                        this.text_offset += character.len_utf8();
+                        this.escaped_remaining -= escaped_length;
+                    }
+                    return Poll::Ready(Some(Ok(Bytes::from(chunk))));
+                }
+                2 => {
+                    let suffix_end = this.page.len();
+                    if this.suffix_offset >= suffix_end {
+                        this.phase = 3;
+                        continue;
+                    }
+                    let end = this
+                        .suffix_offset
+                        .saturating_add(BUFFERED_RESPONSE_CHUNK_BYTES)
+                        .min(suffix_end);
+                    let chunk = this.page.slice(this.suffix_offset..end);
+                    this.suffix_offset = end;
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                _ => return Poll::Ready(None),
+            }
+        }
+    }
+}
+
+fn escaped_text_page_stream(
+    page_template: String,
+    text: String,
+) -> io::Result<(EscapedTextPageStream, u64)> {
+    let marker_index = page_template
+        .find(TEXT_PREVIEW_STREAM_MARKER)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "preview marker is missing"))?;
+    let suffix_start = marker_index + TEXT_PREVIEW_STREAM_MARKER.len();
+    if page_template[suffix_start..].contains(TEXT_PREVIEW_STREAM_MARKER) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "preview marker is ambiguous",
+        ));
+    }
+    let escaped_length = escaped_html_len(&text)
+        .filter(|length| *length <= MAX_RENDERED_TEXT_PREVIEW_BYTES)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "escaped preview exceeds its output cap",
+            )
+        })?;
+    let page_length = marker_index
+        .checked_add(escaped_length)
+        .and_then(|length| length.checked_add(page_template.len() - suffix_start))
+        .and_then(|length| u64::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "preview size overflow"))?;
+    let page = Bytes::from(page_template);
+    Ok((
+        EscapedTextPageStream {
+            page,
+            prefix_end: marker_index,
+            prefix_offset: 0,
+            suffix_offset: suffix_start,
+            text,
+            text_offset: 0,
+            escaped_remaining: escaped_length,
+            phase: 0,
+        },
+        page_length,
+    ))
 }
 
 async fn complete_transfer_without_body(
@@ -1365,7 +2098,11 @@ async fn login(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Result<Response> {
-    let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
+    let ip = proxy::client_limit_key(proxy::effective_client_ip(
+        peer.ip(),
+        &headers,
+        &state.config,
+    ));
     let ip_key = format!("ip:{ip}");
     if !auth::valid_admin_username(&form.username) {
         if !state.limiter.check_and_record_attempt(&ip_key) {
@@ -1391,15 +2128,7 @@ async fn login(
     let expected_password_hash = admin.as_ref().map(|admin| admin.password_hash.clone());
     let verification_hash = expected_password_hash.clone();
     let password = form.password;
-    let valid = tokio::task::spawn_blocking(move || match verification_hash {
-        Some(hash) => auth::verify_password(&hash, &password),
-        None => {
-            let _ = auth::hash_password(&password);
-            false
-        }
-    })
-    .await
-    .map_err(internal)?;
+    let valid = verify_password_admitted(&state, verification_hash, password).await?;
     if !valid {
         audit(&state, form.username, "login_failed", None, None).await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
@@ -1411,24 +2140,37 @@ async fn login(
     let session_csrf = csrf.clone();
     let expires = Utc::now() + Duration::hours(state.config.security.session_hours);
     let admin_id = a.id;
+    let audit_actor = a.username;
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let expected_password_hash = expected_password_hash.expect("valid password requires a hash");
     let outcome = database(state.db.clone(), move |db| {
-        db.create_session_for_verified_password(
+        let outcome = db.create_session_for_verified_password(
             &session_token,
             admin_id,
             &expected_password_hash,
             &session_csrf,
             expires,
-        )
+        )?;
+        if outcome == PasswordSessionCreationOutcome::Created {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "password_verified",
+                None,
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(outcome)
     })
     .await?;
     if outcome != PasswordSessionCreationOutcome::Created {
         audit(&state, form.username, "login_failed", None, None).await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    state.limiter.success(&key);
-    state.limiter.success(&ip_key);
-    audit(&state, a.username, "password_verified", None, None).await;
+    // Successful password verifications remain in the fixed window as well. This
+    // bounds Argon2 work, pre-MFA session creation and audit growth for valid but
+    // compromised credentials.
     Ok(redirect_with_cookie(
         "/mfa",
         make_session_cookie(&state, &token),
@@ -1444,27 +2186,33 @@ async fn mfa_page(State(state): State<AppState>, headers: HeaderMap) -> Result<H
     })
     .await?;
     let security_key_button = if security_key_count >= 2 {
-        r#"<hr><button type="button" data-security-key-login><vl-i18n key="auth.security_key_use"/></button><p class="vl-muted" data-security-key-status></p>"#
+        format!(
+            r#"<hr><button type="button" data-security-key-login data-csrf="{}"><vl-i18n key="auth.security_key_use"/></button><p class="vl-muted" data-security-key-status></p>"#,
+            esc(&current_session.csrf_token)
+        )
     } else {
-        ""
+        String::new()
     };
     Ok(Html(plain_page(
         "MFA",
         &format!(
-            r#"<section class="vl-panel vl-auth-card"><h1><vl-i18n key="auth.second_factor"/></h1><form method="post" class="vl-stack"><label class="vl-field"><vl-i18n key="auth.six_digit_totp"/><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button"><vl-i18n key="auth.verify"/></button></form>{security_key_button}</section>"#
+            r#"<section class="vl-panel vl-auth-card"><h1><vl-i18n key="auth.second_factor"/></h1><form method="post" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="auth.six_digit_totp"/><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button"><vl-i18n key="auth.verify"/></button></form>{security_key_button}</section>"#,
+            esc(&current_session.csrf_token)
         ),
     )))
 }
 #[derive(Deserialize)]
 struct MfaForm {
+    csrf: String,
     code: String,
 }
 async fn mfa(
     State(state): State<AppState>,
     headers: HeaderMap,
     Form(form): Form<MfaForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let (token, s) = session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
+    csrf(&s, &form.csrf)?;
     let key = format!("mfa:{}", s.username.to_lowercase());
     if !state.limiter.check_and_record_attempt(&key) {
         return Err(AppError(
@@ -1481,8 +2229,31 @@ async fn mfa(
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
     };
     let admin_id = s.admin_id;
+    let new_token = auth::random_token(32);
+    let new_csrf = auth::random_token(24);
+    let rotated_token = new_token.clone();
+    let rotated_csrf = new_csrf.clone();
+    let audit_actor = s.username.clone();
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let accepted = database(state.db.clone(), move |db| {
-        db.verify_mfa_with_totp_step(&token, admin_id, totp_step)
+        let accepted = db.verify_mfa_with_totp_step(
+            &token,
+            &rotated_token,
+            &rotated_csrf,
+            admin_id,
+            totp_step,
+        )?;
+        if accepted {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "login_success",
+                None,
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(accepted)
     })
     .await?;
     if !accepted {
@@ -1490,8 +2261,10 @@ async fn mfa(
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
     }
     state.limiter.success(&key);
-    audit(&state, s.username, "login_success", None, None).await;
-    Ok(Redirect::to("/admin"))
+    Ok(redirect_with_cookie(
+        "/admin",
+        make_session_cookie(&state, &new_token),
+    )?)
 }
 
 fn decode_security_keys(
@@ -1505,6 +2278,7 @@ fn decode_security_keys(
 async fn start_security_key_authentication(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Json(body): Json<CsrfForm>,
 ) -> Result<Json<webauthn_rs::prelude::RequestChallengeResponse>> {
     let (token, session) =
         session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
@@ -1512,6 +2286,14 @@ async fn start_security_key_authentication(
         return Err(AppError(
             StatusCode::CONFLICT,
             "MFA wurde bereits bestätigt",
+        ));
+    }
+    csrf(&session, &body.csrf)?;
+    let start_key = format!("mfa-webauthn-start:{}", session.username.to_lowercase());
+    if !state.limiter.check_and_record_attempt(&start_key) {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele Sicherheitsschluessel-Anfragen",
         ));
     }
     let admin_id = session.admin_id;
@@ -1544,6 +2326,7 @@ async fn start_security_key_authentication(
 
 #[derive(Deserialize)]
 struct SecurityKeyAuthenticationFinish {
+    csrf: String,
     credential: webauthn_rs::prelude::PublicKeyCredential,
 }
 
@@ -1551,13 +2334,21 @@ async fn finish_security_key_authentication(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<SecurityKeyAuthenticationFinish>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     let (token, session) =
         session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     if session.mfa_verified {
         return Err(AppError(
             StatusCode::CONFLICT,
             "MFA wurde bereits bestätigt",
+        ));
+    }
+    csrf(&session, &body.csrf)?;
+    let attempt_key = format!("mfa:{}", session.username.to_lowercase());
+    if !state.limiter.check_and_record_attempt(&attempt_key) {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele MFA-Versuche",
         ));
     }
     let admin_id = session.admin_id;
@@ -1578,14 +2369,33 @@ async fn finish_security_key_authentication(
     let credential_id = row.id;
     let expected_credential_json = row.credential_json.clone();
     let credential_json = serde_json::to_string(&keys[index]).map_err(internal)?;
+    let new_token = auth::random_token(32);
+    let new_csrf = auth::random_token(24);
+    let rotated_token = new_token.clone();
+    let rotated_csrf = new_csrf.clone();
+    let audit_actor = session.username.clone();
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let completed = database(state.db.clone(), move |db| {
-        db.complete_webauthn_mfa(
+        let completed = db.complete_webauthn_mfa(
             &token,
+            &rotated_token,
+            &rotated_csrf,
             credential_id,
             admin_id,
             &expected_credential_json,
             &credential_json,
-        )
+        )?;
+        if completed {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "login_success_webauthn",
+                None,
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(completed)
     })
     .await?;
     if !completed {
@@ -1594,15 +2404,13 @@ async fn finish_security_key_authentication(
             "Sicherheitsschlüssel wurde gleichzeitig geändert",
         ));
     }
-    audit(
-        &state,
-        session.username,
-        "login_success_webauthn",
-        None,
-        None,
-    )
-    .await;
-    Ok(Json(serde_json::json!({"redirect":"/admin"})))
+    state.limiter.success(&attempt_key);
+    let mut response = Json(serde_json::json!({"redirect":"/admin"})).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&make_session_cookie(&state, &new_token)).map_err(internal)?,
+    );
+    Ok(response)
 }
 #[derive(Deserialize)]
 struct CsrfForm {
@@ -1615,8 +2423,21 @@ async fn logout(
 ) -> Result<Response> {
     let (token, s) = session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     csrf(&s, &form.csrf)?;
-    database(state.db.clone(), move |db| db.delete_session(&token)).await?;
-    audit(&state, s.username, "logout", None, None).await;
+    let audit_actor = s.username;
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    database(state.db.clone(), move |db| {
+        db.delete_session(&token)?;
+        audit_sync(
+            &db,
+            &audit_actor,
+            "logout",
+            None,
+            None,
+            audit_client_ip.as_deref(),
+        );
+        Ok(())
+    })
+    .await?;
     Ok(redirect_with_cookie(
         "/login",
         clear_session_cookie(&state),
@@ -1665,17 +2486,27 @@ async fn create_directory_ui(
 ) -> Result<Redirect> {
     let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&admin, &form.csrf)?;
-    let result = file_ops::create_directory(&state, &form.parent, &form.name)
-        .await
-        .map_err(file_operation_app_error)?;
-    audit(
-        &state,
-        admin.username,
-        "directory_created",
-        Some(result.path),
-        None,
-    )
-    .await;
+    let task_state = state.clone();
+    let operation_parent = form.parent.clone();
+    let operation_name = form.name;
+    let username = admin.username;
+    let audit_client_ip = current_audit_client_ip();
+    tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+        let result =
+            file_ops::create_directory(&task_state, &operation_parent, &operation_name).await?;
+        audit(
+            &task_state,
+            username,
+            "directory_created",
+            Some(result.path),
+            None,
+        )
+        .await;
+        Ok::<_, file_ops::FileOperationError>(())
+    }))
+    .await
+    .map_err(internal)?
+    .map_err(file_operation_app_error)?;
     Ok(Redirect::to(&browser_redirect(
         &form.parent,
         "directory_created",
@@ -1691,20 +2522,29 @@ async fn rename_file_ui(
     csrf(&admin, &form.csrf)?;
     let old_path = form.path.clone();
     let parent = parent_path(&form.path).unwrap_or_default();
-    let result = file_ops::rename(&state, &form.path, &form.name)
-        .await
-        .map_err(file_operation_app_error)?;
-    audit(
-        &state,
-        admin.username,
-        "path_renamed",
-        Some(result.path),
-        Some(format!(
-            "old_path={old_path};updated_shares={}",
-            result.updated_shares
-        )),
-    )
-    .await;
+    let task_state = state.clone();
+    let operation_path = form.path;
+    let operation_name = form.name;
+    let username = admin.username;
+    let audit_client_ip = current_audit_client_ip();
+    tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+        let result = file_ops::rename(&task_state, &operation_path, &operation_name).await?;
+        audit(
+            &task_state,
+            username,
+            "path_renamed",
+            Some(result.path),
+            Some(format!(
+                "old_path={old_path};updated_shares={}",
+                result.updated_shares
+            )),
+        )
+        .await;
+        Ok::<_, file_ops::FileOperationError>(())
+    }))
+    .await
+    .map_err(internal)?
+    .map_err(file_operation_app_error)?;
     Ok(Redirect::to(&browser_redirect(&parent, "path_renamed")))
 }
 
@@ -1772,31 +2612,41 @@ async fn delete_file_ui(
     let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&admin, &form.csrf)?;
     let parent = parent_path(&form.path).unwrap_or_default();
-    let result = file_ops::delete(&state, &form.path, form.confirm_name.as_deref())
-        .await
-        .map_err(file_operation_app_error)?;
-    let notice = if result.cleanup_pending {
+    let task_state = state.clone();
+    let operation_path = form.path;
+    let confirm_name = form.confirm_name;
+    let username = admin.username;
+    let audit_client_ip = current_audit_client_ip();
+    let cleanup_pending = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+        let result =
+            file_ops::delete(&task_state, &operation_path, confirm_name.as_deref()).await?;
+        audit(
+            &task_state,
+            username,
+            "path_deleted",
+            Some(result.path),
+            Some(format!(
+                "kind={};deactivated_shares={};cleanup={}",
+                file_ops::kind_name(result.kind),
+                result.deactivated_shares,
+                if result.cleanup_pending {
+                    "pending"
+                } else {
+                    "complete"
+                }
+            )),
+        )
+        .await;
+        Ok::<_, file_ops::FileOperationError>(result.cleanup_pending)
+    }))
+    .await
+    .map_err(internal)?
+    .map_err(file_operation_app_error)?;
+    let notice = if cleanup_pending {
         "path_delete_queued"
     } else {
         "path_deleted"
     };
-    audit(
-        &state,
-        admin.username,
-        "path_deleted",
-        Some(result.path),
-        Some(format!(
-            "kind={};deactivated_shares={};cleanup={}",
-            file_ops::kind_name(result.kind),
-            result.deactivated_shares,
-            if result.cleanup_pending {
-                "pending"
-            } else {
-                "complete"
-            }
-        )),
-    )
-    .await;
     Ok(Redirect::to(&browser_redirect(&parent, notice)))
 }
 
@@ -1816,15 +2666,9 @@ async fn stage_admin_upload(
     let file_name = field
         .file_name()
         .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateiname fehlt"))?;
-    let name = path_security::safe_filename(file_name)
+    let name = path_security::safe_admin_filename(file_name)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Dateiname"))?
         .to_string();
-    if crate::secure_fs::is_upload_fragment_name(std::ffi::OsStr::new(&name)) {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Dateiname ist für interne Uploadfragmente reserviert",
-        ));
-    }
     if extension_is_blocked(&name, blocked_extensions) {
         return Err(AppError(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -1899,6 +2743,16 @@ async fn process_admin_upload(
                 "Zu viele gleichzeitige Uploads",
             )
         })?;
+    let _upload_peer_permit = try_acquire_client_activity(
+        state.upload_peer_admission.clone(),
+        current_client_limit_key(),
+        crate::MAX_IN_FLIGHT_UPLOADS_PER_CLIENT,
+    )
+    .map_err(internal)?
+    .ok_or(AppError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Zu viele gleichzeitige Uploads dieses Clients",
+    ))?;
     let settings = runtime_settings(state);
     if headers
         .get(header::CONTENT_LENGTH)
@@ -2035,68 +2889,105 @@ async fn process_admin_upload(
     {
         pending.fail_next_directory_sync(kind);
     }
-    let _storage_guard = state.storage_mutation.lock().await;
-    let existed = match state.secure_root.metadata(&destination) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(internal(error)),
-    };
-    let publish_result = tokio::task::spawn_blocking(move || {
-        if overwrite_existing {
-            pending.publish_replace(&publish_name)
-        } else {
-            pending.publish(&publish_name)
-        }
-    })
-    .await
-    .map_err(internal)?;
-    let publish_outcome = match publish_result {
-        Ok(outcome) => outcome,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+    let task_state = state.clone();
+    let upload_permit = _upload_permit;
+    let upload_peer_permit = _upload_peer_permit;
+    let audit_client_ip = current_audit_client_ip();
+    let finalizer = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+        let _upload_permit = upload_permit;
+        let _upload_peer_permit = upload_peer_permit;
+        let state = &task_state;
+        let storage_guard = state.storage_mutation.clone().lock_owned().await;
+        let storage_guard =
+            file_ops::recover_pending_file_operations_with_guard(state, storage_guard)
+                .await
+                .map_err(|_| {
+                    AppError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Speicherzustand wird wiederhergestellt",
+                    )
+                })?;
+        let current_destination = state.secure_root.bind_directory(&directory).map_err(|_| {
+            AppError(
+                StatusCode::CONFLICT,
+                "Uploadziel wurde zwischenzeitlich geändert",
+            )
+        })?;
+        if !pending
+            .destination_matches(&current_destination)
+            .map_err(internal)?
+        {
             return Err(AppError(
                 StatusCode::CONFLICT,
-                "Datei existiert bereits; Ersetzen muss für diese Datei bestätigt werden",
-            ))
+                "Uploadziel wurde zwischenzeitlich geändert",
+            ));
         }
-        Err(error) => return Err(upload_io_error(error)),
-    };
-    let replaced = overwrite_existing && existed;
-    let durability_uncertain = !publish_outcome.is_durable();
-    let detail = format!("file={name};bytes={total};path={destination}");
-    if let Some(error) = publish_outcome.sync_error() {
-        tracing::warn!(file = %name, %error, "admin upload published but directory fsync failed");
+        let existed = match state.secure_root.metadata(&destination) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(internal(error)),
+        };
+        let publish_result = tokio::task::spawn_blocking(move || {
+            // Publishing is not cancelled with the HTTP request. Retain the
+            // mutation lock in the blocking task until the namespace change ends.
+            let _storage_guard = storage_guard;
+            if overwrite_existing {
+                pending.publish_replace(&publish_name)
+            } else {
+                pending.publish(&publish_name)
+            }
+        })
+        .await
+        .map_err(internal)?;
+        let publish_outcome = match publish_result {
+            Ok(outcome) => outcome,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(AppError(
+                    StatusCode::CONFLICT,
+                    "Datei existiert bereits; Ersetzen muss für diese Datei bestätigt werden",
+                ))
+            }
+            Err(error) => return Err(upload_io_error(error)),
+        };
+        let replaced = overwrite_existing && existed;
+        let durability_uncertain = !publish_outcome.is_durable();
+        let detail = format!("file={name};bytes={total};path={destination}");
+        if let Some(error) = publish_outcome.sync_error() {
+            tracing::warn!(file = %name, %error, "admin upload published but directory fsync failed");
+            audit(
+                state,
+                admin.username.clone(),
+                "admin_upload_durability_uncertain",
+                Some(destination.clone()),
+                Some(detail.clone()),
+            )
+            .await;
+        }
         audit(
             state,
-            admin.username.clone(),
-            "admin_upload_durability_uncertain",
-            Some(destination.clone()),
-            Some(detail.clone()),
+            admin.username,
+            if replaced {
+                "admin_upload_replaced"
+            } else {
+                "admin_upload"
+            },
+            Some(destination),
+            Some(detail),
         )
         .await;
-    }
-    audit(
-        state,
-        admin.username,
-        if replaced {
-            "admin_upload_replaced"
-        } else {
-            "admin_upload"
-        },
-        Some(destination),
-        Some(detail),
-    )
-    .await;
-    let outcome = match (replaced, durability_uncertain) {
-        (true, true) => "replaced_uncertain",
-        (false, true) => "created_uncertain",
-        (true, false) => "replaced",
-        (false, false) => "created",
-    };
-    Ok(AdminUploadSuccess {
-        file: name,
-        outcome: outcome.to_string(),
-        directory,
-    })
+        let outcome = match (replaced, durability_uncertain) {
+            (true, true) => "replaced_uncertain",
+            (false, true) => "created_uncertain",
+            (true, false) => "replaced",
+            (false, false) => "created",
+        };
+        Ok(AdminUploadSuccess {
+            file: name,
+            outcome: outcome.to_string(),
+            directory,
+        })
+    }));
+    finalizer.await.map_err(internal)?
 }
 
 async fn admin_upload(
@@ -2217,11 +3108,37 @@ async fn admin_browser(
     let search =
         q.q.map(|value| value.trim().to_string())
             .filter(|v| !v.is_empty());
+    if search
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_SEARCH_QUERY_BYTES)
+    {
+        return Err(AppError(StatusCode::BAD_REQUEST, "Suchbegriff ist zu lang"));
+    }
     let rel = path_security::validate_relative(&raw)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
         .to_string_lossy()
         .replace('\\', "/");
     let secure_root = state.secure_root.clone();
+    let _scan_peer_permit = try_acquire_client_activity(
+        state.expensive_peer_admission.clone(),
+        current_client_limit_key(),
+        crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
+    )
+    .map_err(internal)?
+    .ok_or(AppError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
+    ))?;
+    let _scan_permit = state
+        .search_admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Zu viele gleichzeitige Dateisuchen",
+            )
+        })?;
     let mut rows = String::new();
     let mut has_next = false;
     if let Some(search) = search.clone() {
@@ -2410,7 +3327,7 @@ async fn admin_preview(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<ShareQuery>,
-) -> Result<Html<String>> {
+) -> Result<Response> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let raw = q
         .path
@@ -2420,6 +3337,22 @@ async fn admin_preview(
         .to_string_lossy()
         .replace('\\', "/");
     let settings = runtime_settings(&state);
+    let mut text_render_permit = if preview_kind(&rel, &settings) == Some(PreviewKind::Text) {
+        Some(
+            state
+                .preview_render_admission
+                .clone()
+                .try_acquire_many_owned(text_preview_render_permits(settings.max_preview_size))
+                .map_err(|_| {
+                    AppError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Zu viele gleichzeitige Textvorschauen",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let secure_root = state.secure_root.clone();
     let preview_path = rel.clone();
     let content =
@@ -2427,6 +3360,17 @@ async fn admin_preview(
             .await
             .map_err(internal)?
             .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;
+    let content = match content {
+        PreviewContent::Text(text)
+            if escaped_html_len(&text)
+                .is_none_or(|length| length > MAX_RENDERED_TEXT_PREVIEW_BYTES) =>
+        {
+            PreviewContent::TooLarge {
+                size: text.len() as u64,
+            }
+        }
+        content => content,
+    };
     let preview_detail = match &content {
         PreviewContent::TooLarge { size } => format!("kind=too_large;bytes={size}"),
         PreviewContent::Text(text) => format!("kind=text;bytes={}", text.len()),
@@ -2440,25 +3384,56 @@ async fn admin_preview(
         Some(preview_detail),
     )
     .await;
-    let body = match content {
-        PreviewContent::TooLarge { size } => {
-            preview_too_large_body(&rel, size, "Datei ist größer als das Preview-Limit.", None)
+    match content {
+        PreviewContent::Text(text) => {
+            let body = format!(
+                r#"<section class="vl-panel"><p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
+                encoded(parent_path(&rel).as_deref().unwrap_or("")),
+                esc(&rel),
+                TEXT_PREVIEW_STREAM_MARKER
+            );
+            let page = admin_page(&state, PageId::Preview, &body, false, &session.csrf_token);
+            let (stream, page_length) = escaped_text_page_stream(page, text).map_err(internal)?;
+            let mut response = Response::new(Body::new(PermitBody {
+                inner: Body::from_stream(stream),
+                _permit: text_render_permit
+                    .take()
+                    .expect("text previews reserve render memory before reading"),
+            }));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&page_length.to_string()).map_err(internal)?,
+            );
+            Ok(response)
         }
-        PreviewContent::Text(text) => format!(
-            r#"<section class="vl-panel"><p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
-            encoded(parent_path(&rel).as_deref().unwrap_or("")),
-            esc(&rel),
-            esc(&text)
-        ),
-        PreviewContent::Media { kind, size } => admin_media_preview_body(&rel, kind, size),
-    };
-    Ok(Html(admin_page(
-        &state,
-        PageId::Preview,
-        &body,
-        false,
-        &session.csrf_token,
-    )))
+        PreviewContent::TooLarge { size } => {
+            let body =
+                preview_too_large_body(&rel, size, "Datei ist größer als das Preview-Limit.", None);
+            Ok(Html(admin_page(
+                &state,
+                PageId::Preview,
+                &body,
+                false,
+                &session.csrf_token,
+            ))
+            .into_response())
+        }
+        PreviewContent::Media { kind, size } => {
+            let body = admin_media_preview_body(&rel, kind, size);
+            Ok(Html(admin_page(
+                &state,
+                PageId::Preview,
+                &body,
+                false,
+                &session.csrf_token,
+            ))
+            .into_response())
+        }
+    }
 }
 
 async fn admin_preview_raw(
@@ -2572,6 +3547,10 @@ fn upload_limit_label(bytes: u64) -> String {
 
 fn display_limit_unit_floor(bytes: u64, unit: u64) -> String {
     format_unit_floor(bytes, unit)
+}
+
+fn display_limit_unit_ceil(bytes: u64, unit: u64) -> String {
+    bytes.div_ceil(unit).to_string()
 }
 
 fn expiry_picker_html() -> String {
@@ -3430,6 +4409,64 @@ enum PreviewContent {
     Media { kind: PreviewKind, size: u64 },
 }
 
+#[cfg(test)]
+struct TextPreviewReadTestHook {
+    path: String,
+    entered: std::sync::atomic::AtomicUsize,
+    released: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl TextPreviewReadTestHook {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+struct TextPreviewReadTestGuard(Arc<TextPreviewReadTestHook>);
+
+#[cfg(test)]
+impl Drop for TextPreviewReadTestGuard {
+    fn drop(&mut self) {
+        self.0.release();
+        let mut slot = TEXT_PREVIEW_READ_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &self.0))
+        {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+static TEXT_PREVIEW_READ_TEST_HOOK: OnceLock<
+    std::sync::Mutex<Option<Arc<TextPreviewReadTestHook>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn block_text_preview_read_for_test(path: &str) {
+    let hook = TEXT_PREVIEW_READ_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    let Some(hook) = hook.filter(|hook| hook.path == path) else {
+        return;
+    };
+    hook.entered.fetch_add(1, Ordering::AcqRel);
+    let mut released = hook.released.lock().unwrap();
+    while !*released {
+        released = hook.wake.wait(released).unwrap();
+    }
+}
+
 fn read_preview<D: DirectoryAccess>(
     secure_root: D,
     path: &str,
@@ -3483,14 +4520,33 @@ fn read_preview_opened(
             size: metadata.len(),
         });
     }
-    let mut bytes = Vec::new();
+    #[cfg(test)]
+    block_text_preview_read_for_test(path);
     let read_limit = settings.max_preview_size.checked_add(1).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "preview size limit is too large",
         )
     })?;
-    file.take(read_limit).read_to_end(&mut bytes)?;
+    let allocation = usize::try_from(read_limit).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "preview size does not fit in memory",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(allocation)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut file = file.take(read_limit);
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
     if bytes.len() as u64 > settings.max_preview_size {
         return Ok(PreviewContent::TooLarge {
             size: metadata.len().max(bytes.len() as u64),
@@ -3502,9 +4558,13 @@ fn read_preview_opened(
             "binary content is not previewed",
         ));
     }
-    Ok(PreviewContent::Text(
-        String::from_utf8_lossy(&bytes).into_owned(),
-    ))
+    let text = String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "text preview is not valid UTF-8",
+        )
+    })?;
+    Ok(PreviewContent::Text(text))
 }
 
 async fn raw_preview_response<D: DirectoryAccess>(
@@ -3814,28 +4874,55 @@ async fn share_index_page(
                 format!(r#"<progress max="100" value="{value}">{value}%</progress>"#)
             })
             .unwrap_or_default();
-        let upload_settings = if share.is_directory
-            && share.permission.can_upload()
-            && !state.config.storage.external_writers
-        {
-            let checked = if share.upload_conflict_strategy.can_overwrite() {
-                "checked"
+        let upload_settings = if share.is_directory && share.permission.can_upload() {
+            let overwrite_control = if state.config.storage.external_writers {
+                String::new()
             } else {
-                ""
+                let checked = if share.upload_conflict_strategy.can_overwrite() {
+                    "checked"
+                } else {
+                    ""
+                };
+                format!(
+                    r#"<label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1" {checked}><span><vl-i18n key="share.allow_overwrite"/><small><vl-i18n key="share.uploader_confirm_each"/></small></span></label>"#
+                )
             };
             format!(
-                r#"<details><summary><vl-i18n key="share.upload_rules"/></summary><form method="post" action="/admin/shares/{}/upload-conflict" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1" {}><span><vl-i18n key="share.allow_overwrite"/><small><vl-i18n key="share.uploader_confirm_each"/></small></span></label><button class="vl-button vl-button--secondary"><vl-i18n key="common.apply"/></button></form></details>"#,
+                r#"<details><summary><vl-i18n key="share.upload_rules"/></summary><form method="post" action="/admin/shares/{}/upload-conflict" class="vl-stack"><input type="hidden" name="csrf" value="{}">{}<label class="vl-field">Kumulatives Uploadlimit (Bytes)<input name="max_upload_total_size" type="number" min="1" value="{}" required></label><label class="vl-field">Maximale Upload-Dateien<input name="max_upload_files" type="number" min="1" value="{}" required></label><button class="vl-button vl-button--secondary"><vl-i18n key="common.apply"/></button></form></details>"#,
                 share.id,
                 esc(&session_data.csrf_token),
-                checked
+                overwrite_control,
+                share
+                    .max_upload_total_size
+                    .unwrap_or(DEFAULT_SHARE_UPLOAD_TOTAL_SIZE),
+                share
+                    .max_upload_files
+                    .unwrap_or(DEFAULT_SHARE_UPLOAD_FILE_COUNT),
             )
         } else {
             String::new()
         };
-        let upload_limit = share
+        let single_upload_limit = share
             .max_upload_size
             .map(upload_limit_label)
             .unwrap_or_else(|| format!("global {}", human(settings.max_upload_size)));
+        let upload_limit = if share.permission.can_upload() {
+            format!(
+                "{single_upload_limit}; kumulativ {} / {}; Dateien {} / {}",
+                human(share.uploaded_bytes),
+                share
+                    .max_upload_total_size
+                    .map(human)
+                    .unwrap_or_else(|| "—".into()),
+                share.uploaded_files,
+                share
+                    .max_upload_files
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            )
+        } else {
+            single_upload_limit
+        };
         share_rows += &format!(
             r#"<article class="vl-share-row"><div class="vl-share-identity"><span class="vl-file-kind" aria-hidden="true"></span><div><strong>{}</strong><span class="vl-muted">/{}</span></div></div><div class="vl-share-url"><code>{}</code><button class="vl-button vl-button--secondary vl-button--small vl-copy-button" type="button" data-copy="{}" aria-label="<vl-i18n key="share.copy_aria"/>"><vl-i18n key="common.copy"/></button></div><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span><span class="vl-badge vl-badge--{}">{}</span>{}</div><div class="vl-share-quota"><span>{} / {} <vl-i18n key="share.counted_transfers"/></span>{}<small class="vl-muted"><vl-i18n key="share.upload_limit_label"/>: {}</small></div><details class="vl-action-details"><summary class="vl-icon-button"><vl-i18n key="common.actions"/></summary><div class="vl-action-panel"><a class="vl-button vl-button--ghost" href="{}"><vl-i18n key="common.open"/></a><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--ghost">{}</button></form><details><summary><vl-i18n key="account.change_password"/></summary><form method="post" action="/admin/shares/{}/password" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="account.new_password"/><input type="password" name="password" minlength="{}" maxlength="{}"></label><label class="vl-field"><vl-i18n key="common.confirm"/><input type="password" name="password_confirm"></label><div class="vl-inline-actions"><button class="vl-button"><vl-i18n key="common.set"/></button><button class="vl-button vl-button--secondary" name="remove" value="1"><vl-i18n key="common.remove"/></button></div></form></details>{}<form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--danger"><vl-i18n key="common.delete"/></button></form></div></details></article>"#,
             esc(display_name),
@@ -3955,8 +5042,14 @@ async fn share_create_page(
     };
     let upload_rules = if is_directory {
         format!(
-            r#"<section class="vl-form-section" data-upload-rules><h2><vl-i18n key="share.step_upload"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.max_file"/><input name="max_upload_size_gb" type="number" min="1" step="1" placeholder="Global: {} GB"><small><vl-i18n key="share.empty_global"/></small></label>{}</div></section>"#,
+            r#"<section class="vl-form-section" data-upload-rules><h2><vl-i18n key="share.step_upload"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.max_file"/><input name="max_upload_size_gb" type="number" min="1" max="{}" step="1" placeholder="Global: {} GB"><small><vl-i18n key="share.empty_global"/></small></label><label class="vl-field">Kumulatives Uploadlimit (GB)<input name="max_upload_total_size_gb" type="number" min="1" step="1" value="{}" required></label><label class="vl-field">Maximale Upload-Dateien<input name="max_upload_files" type="number" min="1" value="{}" required></label>{}</div></section>"#,
+            display_limit_unit_floor(crate::config::MAX_UPLOAD_SIZE, GB),
             display_limit_unit_floor(settings.max_upload_size, GB),
+            display_limit_unit_ceil(
+                DEFAULT_SHARE_UPLOAD_TOTAL_SIZE.max(settings.max_upload_size),
+                GB,
+            ),
+            DEFAULT_SHARE_UPLOAD_FILE_COUNT,
             overwrite_rule,
         )
     } else {
@@ -4009,6 +5102,8 @@ struct CreateShare {
     expires_tz_offset_minutes: Option<String>,
     max_downloads: Option<String>,
     max_upload_size_gb: Option<String>,
+    max_upload_total_size_gb: Option<String>,
+    max_upload_files: Option<String>,
     password: Option<String>,
     password_confirm: Option<String>,
     password_enabled: Option<String>,
@@ -4021,25 +5116,12 @@ async fn create_share(
 ) -> Result<Redirect> {
     let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&s, &f.csrf)?;
-    let _storage_guard = state.storage_mutation.lock().await;
     let rel = path_security::validate_relative(&f.path)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?
         .to_string_lossy()
         .replace('\\', "/");
-    let secure_root = state.secure_root.clone();
-    let metadata_path = rel.clone();
-    let target_metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
-        .await
-        .map_err(internal)?
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
     let permission = Permission::parse(&f.permission)
         .ok_or(AppError(StatusCode::BAD_REQUEST, "Ungültige Berechtigung"))?;
-    if target_metadata.is_file() && permission.can_upload() {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Uploads sind nur für Ordnerlinks erlaubt",
-        ));
-    }
     let alias = f.alias.filter(|value| !value.is_empty());
     if let Some(alias) = alias.as_deref() {
         path_security::validate_share_alias(alias)
@@ -4077,15 +5159,37 @@ async fn create_share(
     let password_protected = password.is_some();
     let password_hash = if let Some(password) = password {
         validate_share_password(&settings, &password)?;
-        Some(
-            tokio::task::spawn_blocking(move || auth::hash_password(&password))
-                .await
-                .map_err(internal)?
-                .map_err(internal)?,
-        )
+        Some(hash_password_admitted(&state, password).await?)
     } else {
         None
     };
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let storage_guard = file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
+        .await
+        .map_err(|_| {
+            AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Speicherzustand wird wiederhergestellt",
+            )
+        })?;
+    let secure_root = state.secure_root.clone();
+    let metadata_path = rel.clone();
+    let target_metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
+        .await
+        .map_err(internal)?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
+    if !target_metadata.is_file() && !target_metadata.is_dir() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Freigaben sind nur für reguläre Dateien oder Ordner erlaubt",
+        ));
+    }
+    if target_metadata.is_file() && permission.can_upload() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Uploads sind nur für Ordnerlinks erlaubt",
+        ));
+    }
     let permission_detail = permission.as_str().to_string();
     let is_directory = target_metadata.is_dir();
     let max_downloads = f
@@ -4121,10 +5225,54 @@ async fn create_share(
             "Uploadlimit muss mindestens 1 Byte sein",
         ));
     }
-    if max_upload_size.is_some_and(|value| value > MAX_SQLITE_UNSIGNED) {
+    if max_upload_size.is_some_and(|value| value > crate::config::MAX_UPLOAD_SIZE) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
             "Das Uploadlimit ist zu groß",
+        ));
+    }
+    let effective_single_upload_limit = max_upload_size
+        .unwrap_or(settings.max_upload_size)
+        .min(crate::config::MAX_UPLOAD_SIZE);
+    let max_upload_total_size = if is_directory && permission.can_upload() {
+        Some(
+            f.max_upload_total_size_gb
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| parse_unit_to_bytes(value, GB, "Ungültiges kumulatives Uploadlimit"))
+                .transpose()?
+                .unwrap_or(DEFAULT_SHARE_UPLOAD_TOTAL_SIZE.max(effective_single_upload_limit)),
+        )
+    } else {
+        None
+    };
+    if max_upload_total_size
+        .is_some_and(|value| value < effective_single_upload_limit || value > MAX_SQLITE_UNSIGNED)
+    {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Das kumulative Uploadlimit ist ungültig",
+        ));
+    }
+    let max_upload_files = if is_directory && permission.can_upload() {
+        Some(
+            f.max_upload_files
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::parse::<u64>)
+                .transpose()
+                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Upload-Dateilimit"))?
+                .unwrap_or(DEFAULT_SHARE_UPLOAD_FILE_COUNT),
+        )
+    } else {
+        None
+    };
+    if max_upload_files.is_some_and(|value| value == 0 || value > MAX_SQLITE_UNSIGNED) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Das Upload-Dateilimit ist ungültig",
         ));
     }
     let overwrite_requested = f.overwrite_allowed.as_deref() == Some("1");
@@ -4141,16 +5289,31 @@ async fn create_share(
         UploadConflictStrategy::Reject
     };
     let audit_detail = format!(
-        "path={rel};permission={permission_detail};alias={};expires_at={};transfer_limit={};upload_limit={};password_protected={password_protected};overwrite_allowed={}",
+        "path={rel};permission={permission_detail};alias={};expires_at={};transfer_limit={};upload_limit={};upload_total_limit={};upload_file_limit={};password_protected={password_protected};overwrite_allowed={}",
         alias.as_deref().unwrap_or(""),
         exp.map(|value| value.to_rfc3339()).unwrap_or_default(),
         max_downloads.map(|value| value.to_string()).unwrap_or_default(),
         max_upload_size.map(|value| value.to_string()).unwrap_or_default(),
+        max_upload_total_size
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        max_upload_files
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
         upload_conflict_strategy.can_overwrite(),
     );
     let admin_id = s.admin_id;
-    let id = database(state.db.clone(), move |db| {
-        db.create_share(
+    let username = s.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    database(state.db.clone(), move |db| {
+        // Keep target revalidation and the non-cancellable SQLite create
+        // serialized even when the client disconnects mid-request.
+        let _storage_guard = storage_guard;
+        let id = db.create_share_with_upload_limits(
             &token,
             alias.as_deref(),
             &rel,
@@ -4159,21 +5322,25 @@ async fn create_share(
             exp,
             max_downloads,
             max_upload_size,
+            max_upload_total_size,
+            max_upload_files,
             admin_id,
             password_hash.as_deref(),
             &upload_conflict_strategy,
-        )
+        )?;
+        let object = id.to_string();
+        audit_sync(
+            &db,
+            &username,
+            "share_created",
+            Some(&object),
+            Some(&audit_detail),
+            audit_client_ip.as_deref(),
+        );
+        Ok(())
     })
     .await
     .map_err(|_| AppError(StatusCode::CONFLICT, "Token oder Alias bereits vorhanden"))?;
-    audit(
-        &state,
-        s.username,
-        "share_created",
-        Some(id.to_string()),
-        Some(audit_detail),
-    )
-    .await;
     Ok(Redirect::to("/admin/shares"))
 }
 async fn toggle_share(
@@ -4189,21 +5356,32 @@ async fn toggle_share(
         .into_iter()
         .find(|v| v.id == id)
         .ok_or(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"))?;
+    let active = !sh.active;
+    let username = s.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
     let changed = database(state.db.clone(), move |db| {
-        db.set_share_active(id, !sh.active)
+        let changed = db.set_share_active(id, active)?;
+        if changed {
+            let object = id.to_string();
+            audit_sync(
+                &db,
+                &username,
+                "share_toggled",
+                Some(&object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(changed)
     })
     .await?;
     if !changed {
         return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
     }
-    audit(
-        &state,
-        s.username,
-        "share_toggled",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Redirect::to("/admin/shares"))
 }
 
@@ -4212,6 +5390,8 @@ struct UploadConflictForm {
     csrf: String,
     strategy: Option<String>,
     overwrite_allowed: Option<String>,
+    max_upload_total_size: Option<String>,
+    max_upload_files: Option<String>,
 }
 
 async fn set_share_upload_conflict(
@@ -4249,22 +5429,97 @@ async fn set_share_upload_conflict(
             "Überschreiben ist nur für Ordnerlinks mit Uploadrecht erlaubt",
         ));
     }
+    let total_limit = form
+        .max_upload_total_size
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::parse::<u64>)
+        .transpose()
+        .map_err(|_| {
+            AppError(
+                StatusCode::BAD_REQUEST,
+                "Ungültiges kumulatives Uploadlimit",
+            )
+        })?
+        .unwrap_or_else(|| {
+            share
+                .max_upload_total_size
+                .unwrap_or(DEFAULT_SHARE_UPLOAD_TOTAL_SIZE)
+        });
+    let file_limit = form
+        .max_upload_files
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::parse::<u64>)
+        .transpose()
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Upload-Dateilimit"))?
+        .unwrap_or_else(|| {
+            share
+                .max_upload_files
+                .unwrap_or(DEFAULT_SHARE_UPLOAD_FILE_COUNT)
+        });
+    let effective_single = share
+        .max_upload_size
+        .unwrap_or_else(|| runtime_settings(&state).max_upload_size)
+        .min(crate::config::MAX_UPLOAD_SIZE);
+    if total_limit < effective_single
+        || total_limit < share.uploaded_bytes
+        || total_limit > MAX_SQLITE_UNSIGNED
+        || file_limit == 0
+        || file_limit < share.uploaded_files
+        || file_limit > MAX_SQLITE_UNSIGNED
+    {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Ungültige kumulative Uploadlimits",
+        ));
+    }
     let stored_strategy = strategy.clone();
-    let changed = database(state.db.clone(), move |db| {
-        db.set_upload_conflict_strategy(id, &stored_strategy)
+    let username = session.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let outcome = database(state.db.clone(), move |db| {
+        let outcome = db.update_share_controls(
+            id,
+            None,
+            Some(&stored_strategy),
+            Some((total_limit, file_limit)),
+        )?;
+        if outcome == ShareControlsUpdateOutcome::Updated {
+            let object = id.to_string();
+            let detail = format!(
+                "strategy={};bytes={total_limit};files={file_limit}",
+                strategy.as_str()
+            );
+            audit_sync(
+                &db,
+                &username,
+                "share_upload_conflict_updated",
+                Some(&object),
+                Some(&detail),
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(outcome)
     })
     .await?;
-    if !changed {
-        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+    match outcome {
+        ShareControlsUpdateOutcome::Updated => {}
+        ShareControlsUpdateOutcome::NotFound => {
+            return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+        }
+        ShareControlsUpdateOutcome::QuotaConflict => {
+            return Err(AppError(
+                StatusCode::CONFLICT,
+                "Uploadlimit wird von laufenden Uploads belegt",
+            ));
+        }
     }
-    audit(
-        &state,
-        session.username,
-        "share_upload_conflict_updated",
-        Some(id.to_string()),
-        Some(strategy.as_str().to_string()),
-    )
-    .await;
     Ok(Redirect::to("/admin/shares"))
 }
 
@@ -4304,26 +5559,38 @@ async fn set_share_password(
         }
         let settings = runtime_settings(&state);
         validate_share_password(&settings, &password)?;
-        Some(
-            tokio::task::spawn_blocking(move || auth::hash_password(&password))
-                .await
-                .map_err(internal)?
-                .map_err(internal)?,
-        )
+        Some(hash_password_admitted(&state, password).await?)
     };
-    let changed = database(state.db.clone(), move |db| {
-        db.set_share_password(id, password_hash.as_deref())
-    })
-    .await?;
-    if !changed {
-        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
-    }
     let action = if remove {
         "share_password_removed"
     } else {
         "share_password_set"
     };
-    audit(&state, session.username, action, Some(id.to_string()), None).await;
+    let username = session.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let changed = database(state.db.clone(), move |db| {
+        let changed = db.set_share_password(id, password_hash.as_deref())?;
+        if changed {
+            let object = id.to_string();
+            audit_sync(
+                &db,
+                &username,
+                action,
+                Some(&object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(changed)
+    })
+    .await?;
+    if !changed {
+        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+    }
     Ok(Redirect::to("/admin/shares"))
 }
 
@@ -4335,18 +5602,31 @@ async fn delete_share(
 ) -> Result<Redirect> {
     let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&s, &f.csrf)?;
-    let deleted = database(state.db.clone(), move |db| db.delete_share(id)).await?;
+    let username = s.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let deleted = database(state.db.clone(), move |db| {
+        let deleted = db.delete_share(id)?;
+        if deleted {
+            let object = id.to_string();
+            audit_sync(
+                &db,
+                &username,
+                "share_deleted",
+                Some(&object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(deleted)
+    })
+    .await?;
     if !deleted {
         return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
     }
-    audit(
-        &state,
-        s.username,
-        "share_deleted",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Redirect::to("/admin/shares"))
 }
 
@@ -4395,11 +5675,8 @@ async fn start_security_key_registration(
         .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    let password_valid = tokio::task::spawn_blocking(move || {
-        auth::verify_password(&password_hash, &current_password)
-    })
-    .await
-    .map_err(internal)?;
+    let password_valid =
+        verify_password_admitted(&state, Some(password_hash), current_password).await?;
     if !password_valid {
         audit(
             &state,
@@ -4411,7 +5688,7 @@ async fn start_security_key_registration(
         .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    state.limiter.success(&limiter_key);
+    // Successful password reauthentication remains rate-limited.
     let admin_id = session.admin_id;
     let rows = database(state.db.clone(), move |db| {
         db.admin_webauthn_credentials(admin_id)
@@ -4455,7 +5732,7 @@ async fn finish_security_key_registration(
             "Ungültiger Schlüsselname",
         ));
     }
-    let security_settings_guard = state.security_settings_mutation.lock().await;
+    let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
     let webauthn = state
         .webauthn
         .read()
@@ -4472,8 +5749,23 @@ async fn finish_security_key_registration(
     let credential_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.cred_id());
     let credential_json = serde_json::to_string(&key).map_err(internal)?;
     let admin_id = session.admin_id;
-    database(state.db.clone(), move |db| {
-        db.add_admin_webauthn_credential(admin_id, &label, &credential_id, &credential_json)
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let registration = database(state.db.clone(), move |db| {
+        // Keep origin changes serialized even if the HTTP request is cancelled
+        // after this non-cancellable database task has started.
+        let _security_settings_guard = security_settings_guard;
+        db.add_admin_webauthn_credential_for_session(
+            &token,
+            admin_id,
+            &label,
+            &credential_id,
+            &credential_json,
+            audit_client_ip.as_deref(),
+        )
     })
     .await
     .map_err(|_| {
@@ -4482,15 +5774,9 @@ async fn finish_security_key_registration(
             "Sicherheitsschlüssel ist bereits registriert",
         )
     })?;
-    drop(security_settings_guard);
-    audit(
-        &state,
-        session.username,
-        "webauthn_credential_added",
-        None,
-        None,
-    )
-    .await;
+    if registration == AdminWebauthnCredentialRegistrationOutcome::SessionUnavailable {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"));
+    }
     Ok(Json(serde_json::json!({"redirect":"/admin/account"})))
 }
 
@@ -4507,7 +5793,7 @@ async fn delete_security_key(
     AxPath(id): AxPath<i64>,
     Form(form): Form<DeleteSecurityKeyForm>,
 ) -> Result<Redirect> {
-    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let (token, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
     let limiter_key = format!("security-key-delete:{}", session.admin_id);
     if !state.limiter.check_and_record_attempt(&limiter_key) {
@@ -4520,7 +5806,8 @@ async fn delete_security_key(
     let admin = database(state.db.clone(), move |db| db.admin(&username))
         .await?
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
-    let password_hash = admin.password_hash;
+    let expected_password_hash = admin.password_hash;
+    let expected_totp_secret = admin.totp_secret;
     let password = form.current_password;
     if password.len() > auth::MAX_PASSWORD_BYTES {
         audit(
@@ -4534,22 +5821,11 @@ async fn delete_security_key(
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
     let password_valid =
-        tokio::task::spawn_blocking(move || auth::verify_password(&password_hash, &password))
-            .await
-            .map_err(internal)?;
-    let totp_step = password_valid
-        .then(|| auth::matching_totp_step_now(&admin.totp_secret, &form.current_code))
-        .flatten();
-    let totp_valid = if let Some(totp_step) = totp_step {
-        let admin_id = session.admin_id;
-        database(state.db.clone(), move |db| {
-            db.consume_admin_totp_step(admin_id, totp_step)
-        })
-        .await?
-    } else {
-        false
-    };
-    if !password_valid || !totp_valid {
+        verify_password_admitted(&state, Some(expected_password_hash.clone()), password).await?;
+    let Some(totp_step) = password_valid
+        .then(|| auth::matching_totp_step_now(&expected_totp_secret, &form.current_code))
+        .flatten()
+    else {
         audit(
             &state,
             session.username,
@@ -4559,28 +5835,41 @@ async fn delete_security_key(
         )
         .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
-    }
-    state.limiter.success(&limiter_key);
+    };
+    // Successful password reauthentication remains rate-limited.
     let admin_id = session.admin_id;
-    let deleted = database(state.db.clone(), move |db| {
-        db.delete_admin_webauthn_credential(id, admin_id)
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let outcome = database(state.db.clone(), move |db| {
+        db.delete_admin_webauthn_credential_with_totp(
+            &token,
+            id,
+            admin_id,
+            &expected_password_hash,
+            &expected_totp_secret,
+            totp_step,
+            audit_client_ip.as_deref(),
+        )
     })
     .await?;
-    if !deleted {
-        return Err(AppError(
+    match outcome {
+        AdminWebauthnCredentialDeletionOutcome::Deleted => Ok(Redirect::to("/admin/account")),
+        AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected
+        | AdminWebauthnCredentialDeletionOutcome::TotpRejected => {
+            audit(
+                &state,
+                session.username,
+                "security_key_reauth_failed",
+                Some(id.to_string()),
+                None,
+            )
+            .await;
+            Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"))
+        }
+        AdminWebauthnCredentialDeletionOutcome::NotDeleted => Err(AppError(
             StatusCode::CONFLICT,
             "Sicherheitsschlüssel nicht gefunden",
-        ));
+        )),
     }
-    audit(
-        &state,
-        session.username,
-        "webauthn_credential_deleted",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
-    Ok(Redirect::to("/admin/account"))
 }
 
 async fn account_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
@@ -4652,15 +5941,12 @@ async fn change_account_password(
     if current_password.len() > auth::MAX_PASSWORD_BYTES {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    let current_password_valid = tokio::task::spawn_blocking(move || {
-        auth::verify_password(&verification_hash, &current_password)
-    })
-    .await
-    .map_err(internal)?;
+    let current_password_valid =
+        verify_password_admitted(&state, Some(verification_hash), current_password).await?;
     if !current_password_valid {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    state.limiter.success(&limiter_key);
+    // Successful password reauthentication remains rate-limited.
 
     if form.new_password != form.password_confirm {
         return Err(AppError(
@@ -4674,11 +5960,7 @@ async fn change_account_password(
             "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
         ));
     }
-    let new_password = form.new_password;
-    let new_hash = tokio::task::spawn_blocking(move || auth::hash_password(&new_password))
-        .await
-        .map_err(internal)?
-        .map_err(internal)?;
+    let new_hash = hash_password_admitted(&state, form.new_password).await?;
     let admin_id = session.admin_id;
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
@@ -4740,11 +6022,8 @@ async fn start_account_mfa(
     if current_password.len() > auth::MAX_PASSWORD_BYTES {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    let current_password_valid = tokio::task::spawn_blocking(move || {
-        auth::verify_password(&verification_hash, &current_password)
-    })
-    .await
-    .map_err(internal)?;
+    let current_password_valid =
+        verify_password_admitted(&state, Some(verification_hash), current_password).await?;
     let totp_step = current_password_valid
         .then(|| auth::matching_totp_step_now(&admin.totp_secret, &form.current_code))
         .flatten();
@@ -4760,7 +6039,7 @@ async fn start_account_mfa(
     if !current_password_valid || !current_mfa_valid {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    state.limiter.success(&limiter_key);
+    // Successful password reauthentication remains rate-limited.
 
     let enrollment_token = auth::random_token(32);
     let new_secret = auth::new_totp_secret();
@@ -4996,26 +6275,25 @@ async fn create_admin_ui(
     }
     let username = form.username.clone();
     let secret = auth::new_totp_secret();
-    let password = form.password;
-    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&password))
-        .await
-        .map_err(internal)?
-        .map_err(internal)?;
+    let hash = hash_password_admitted(&state, form.password).await?;
     let created_username = username.clone();
     let created_secret = secret.clone();
+    let audit_actor = session.username;
+    let audit_client_ip = enabled_audit_client_ip(&state);
     database(state.db.clone(), move |db| {
-        db.create_admin(&created_username, &hash, &created_secret)
+        db.create_admin(&created_username, &hash, &created_secret)?;
+        audit_sync(
+            &db,
+            &audit_actor,
+            "admin_created",
+            Some(&created_username),
+            None,
+            audit_client_ip.as_deref(),
+        );
+        Ok(())
     })
     .await
     .map_err(|_| AppError(StatusCode::CONFLICT, "Benutzername existiert bereits"))?;
-    audit(
-        &state,
-        session.username,
-        "admin_created",
-        Some(username.clone()),
-        None,
-    )
-    .await;
     let otpauth = otpauth_url(&username, &secret);
     let qr = qr_svg(&otpauth)?;
     let body = format!(
@@ -5060,26 +6338,28 @@ async fn reset_admin_password(
             "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
         ));
     }
-    let password = form.password;
-    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&password))
-        .await
-        .map_err(internal)?
-        .map_err(internal)?;
+    let hash = hash_password_admitted(&state, form.password).await?;
+    let audit_actor = session.username;
+    let audit_object = id.to_string();
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let changed = database(state.db.clone(), move |db| {
-        db.reset_admin_password(id, &hash)
+        let changed = db.reset_admin_password(id, &hash)?;
+        if changed {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "admin_password_reset",
+                Some(&audit_object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(changed)
     })
     .await?;
     if !changed {
         return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
     }
-    audit(
-        &state,
-        session.username,
-        "admin_password_reset",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Redirect::to("/admin/admins?notice=password_reset"))
 }
 
@@ -5099,19 +6379,25 @@ async fn reset_admin_totp(
     }
     let secret = auth::new_totp_secret();
     let reset_secret = secret.clone();
+    let audit_actor = session.username;
+    let audit_object = id.to_string();
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let username = database(state.db.clone(), move |db| {
-        db.reset_admin_totp(id, &reset_secret)
+        let username = db.reset_admin_totp(id, &reset_secret)?;
+        if username.is_some() {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "admin_totp_reset",
+                Some(&audit_object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(username)
     })
     .await?
     .ok_or(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"))?;
-    audit(
-        &state,
-        session.username,
-        "admin_totp_reset",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     let otpauth = otpauth_url(&username, &secret);
     let qr = qr_svg(&otpauth)?;
     let body = format!(
@@ -5144,7 +6430,28 @@ async fn deactivate_admin(
             "Eigener Admin kann nicht stillgelegt werden",
         ));
     }
-    match database(state.db.clone(), move |db| db.deactivate_admin(id)).await? {
+    let audit_actor = session.username;
+    let audit_object = id.to_string();
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let outcome = database(state.db.clone(), move |db| {
+        let outcome = db.deactivate_admin(id)?;
+        if matches!(
+            outcome,
+            AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive
+        ) {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "admin_deactivated",
+                Some(&audit_object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(outcome)
+    })
+    .await?;
+    match outcome {
         AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive => {}
         AdminDeactivationOutcome::LastActive => {
             return Err(AppError(
@@ -5156,14 +6463,6 @@ async fn deactivate_admin(
             return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
         }
     }
-    audit(
-        &state,
-        session.username,
-        "admin_deactivated",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Redirect::to("/admin/admins"))
 }
 
@@ -5175,18 +6474,27 @@ async fn activate_admin(
 ) -> Result<Redirect> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
-    let changed = database(state.db.clone(), move |db| db.activate_admin(id)).await?;
+    let audit_actor = session.username;
+    let audit_object = id.to_string();
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let changed = database(state.db.clone(), move |db| {
+        let changed = db.activate_admin(id)?;
+        if changed {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "admin_activated",
+                Some(&audit_object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(changed)
+    })
+    .await?;
     if !changed {
         return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
     }
-    audit(
-        &state,
-        session.username,
-        "admin_activated",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Redirect::to("/admin/admins"))
 }
 
@@ -5215,7 +6523,9 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let settings = runtime_settings(&state);
     let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
-    let body = settings_form(&session, &settings, ip_count, "");
+    let public_url_locked = state.config.server.mode == crate::config::ServerMode::StandaloneTls
+        && state.config.tls.certificate_source == crate::config::CertificateSource::LetsEncrypt;
+    let body = settings_form(&session, &settings, ip_count, "", public_url_locked);
     Ok(Html(admin_page(
         &state,
         PageId::Settings,
@@ -5230,6 +6540,7 @@ fn settings_form(
     settings: &RuntimeSettings,
     audit_ip_count: u64,
     message: &str,
+    public_url_locked: bool,
 ) -> String {
     let message = if message.is_empty() {
         String::new()
@@ -5247,10 +6558,22 @@ fn settings_form(
     } else {
         String::new()
     };
+    let public_url_attributes = if public_url_locked {
+        "readonly aria-readonly=\"true\""
+    } else {
+        ""
+    };
+    let public_url_hint = if public_url_locked {
+        "Im Let's-Encrypt-Modus wird diese URL durch die statische TLS-Konfiguration festgelegt."
+    } else {
+        ""
+    };
     format!(
-        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="vl-form-grid"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label><vl-i18n key="settings.upload_limit"/><br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.blocked"/><br><input name="blocked_extensions" value="{}"></label><label><vl-i18n key="settings.password_min"/><br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.password_max"/><br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.unlock_minutes"/><br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.zip_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="{}" required></label><label><vl-i18n key="settings.zip_files"/><br><input name="max_zip_files" type="number" min="0" value="{}" required></label><label><vl-i18n key="settings.search_entries"/><br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_results"/><br><input name="max_search_results" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.text_preview"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.text_extensions"/><br><input name="preview_extensions" value="{}" required></label><label><vl-i18n key="settings.media_preview"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.image_extensions"/><br><input name="image_preview_extensions" value="{}"></label><label class="vl-toggle"><input type="checkbox" name="pdf_preview_enabled" {}><span><vl-i18n key="settings.pdf_active"/><small><vl-i18n key="settings.pdf_help"/></small></span></label><label class="vl-toggle"><input type="checkbox" name="audit_client_ip_enabled" {}><span><vl-i18n key="settings.audit_ip"/><small><vl-i18n key="settings.audit_ip_help"/></small></span></label><button class="vl-button"><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
+        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="vl-form-grid"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" {} required><small>{}</small></label><label><vl-i18n key="settings.upload_limit"/><br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.blocked"/><br><input name="blocked_extensions" value="{}"></label><label><vl-i18n key="settings.password_min"/><br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.password_max"/><br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.unlock_minutes"/><br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.zip_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="{}" required></label><label><vl-i18n key="settings.zip_files"/><br><input name="max_zip_files" type="number" min="0" value="{}" required></label><label><vl-i18n key="settings.search_entries"/><br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_results"/><br><input name="max_search_results" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.text_preview"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.text_extensions"/><br><input name="preview_extensions" value="{}" required></label><label><vl-i18n key="settings.media_preview"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.image_extensions"/><br><input name="image_preview_extensions" value="{}"></label><label class="vl-toggle"><input type="checkbox" name="pdf_preview_enabled" {}><span><vl-i18n key="settings.pdf_active"/><small><vl-i18n key="settings.pdf_help"/></small></span></label><label class="vl-toggle"><input type="checkbox" name="audit_client_ip_enabled" {}><span><vl-i18n key="settings.audit_ip"/><small><vl-i18n key="settings.audit_ip_help"/></small></span></label><button class="vl-button"><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
         esc(&session.csrf_token),
         esc(&settings.public_base_url),
+        public_url_attributes,
+        public_url_hint,
         display_limit_unit_floor(settings.max_upload_size, GB),
         esc(&settings.blocked_extensions.join(",")),
         settings.share_password_min_length,
@@ -5280,6 +6603,13 @@ fn settings_form(
         &format!(
             r#"name="max_preview_size_mb" type="number" min="1" max="{}""#,
             MAX_TEXT_PREVIEW_SIZE / MB
+        ),
+    )
+    .replace(
+        r#"name="max_upload_size_gb" type="number" min="1""#,
+        &format!(
+            r#"name="max_upload_size_gb" type="number" min="1" max="{}""#,
+            display_limit_unit_floor(crate::config::MAX_UPLOAD_SIZE, GB)
         ),
     )
 }
@@ -5363,22 +6693,29 @@ async fn update_settings(
     }
     let admin_id = session.admin_id;
     let previous = runtime_settings(&state);
-    commit_runtime_settings(&state, next.clone(), admin_id).await?;
     let actor = session.username.clone();
     let changed = previous.changed_keys(&next);
-    audit(
+    commit_runtime_settings(
         &state,
+        next.clone(),
+        admin_id,
         actor,
-        "settings_updated",
-        None,
-        Some(format!("changed_keys={}", changed.join(","))),
+        format!("changed_keys={}", changed.join(",")),
     )
-    .await;
+    .await?;
     let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
     Ok(Html(admin_page(
         &state,
         PageId::Settings,
-        &settings_form(&session, &next, ip_count, "Einstellungen gespeichert."),
+        &settings_form(
+            &session,
+            &next,
+            ip_count,
+            "Einstellungen gespeichert.",
+            state.config.server.mode == crate::config::ServerMode::StandaloneTls
+                && state.config.tls.certificate_source
+                    == crate::config::CertificateSource::LetsEncrypt,
+        ),
         false,
         &session.csrf_token,
     )))
@@ -5428,21 +6765,31 @@ async fn delete_audit_ips_ui(
             "Exakte Bestätigung IP-DATEN LÖSCHEN erforderlich",
         ));
     }
-    if runtime_settings(&state).audit_client_ip_enabled {
+    let fallback_logging_enabled = runtime_settings(&state).audit_client_ip_enabled;
+    let audit_actor = session.username;
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let outcome = database(state.db.clone(), move |db| {
+        let outcome = db.delete_audit_client_ips_if_disabled(fallback_logging_enabled)?;
+        if let AuditClientIpDeletionOutcome::Deleted(deleted) = outcome {
+            let detail = format!("deleted={deleted}");
+            audit_sync(
+                &db,
+                &audit_actor,
+                "audit_client_ips_deleted",
+                None,
+                Some(&detail),
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(outcome)
+    })
+    .await?;
+    let AuditClientIpDeletionOutcome::Deleted(_) = outcome else {
         return Err(AppError(
             StatusCode::CONFLICT,
             "IP-Erfassung muss vor dem Löschen deaktiviert werden",
         ));
-    }
-    let deleted = database(state.db.clone(), |db| db.delete_audit_client_ips()).await?;
-    audit(
-        &state,
-        session.username,
-        "audit_client_ips_deleted",
-        None,
-        Some(format!("deleted={deleted}")),
-    )
-    .await;
+    };
     Ok(Redirect::to("/admin/settings"))
 }
 
@@ -5566,6 +6913,30 @@ async fn get_share(state: &AppState, token: &str) -> Result<Share> {
     Ok(sh)
 }
 
+async fn get_storage_share(
+    state: &AppState,
+    token: &str,
+    expected_id: i64,
+) -> Result<(Share, tokio::sync::OwnedMutexGuard<()>)> {
+    let guard = state.storage_mutation.clone().lock_owned().await;
+    let guard = file_ops::recover_pending_file_operations_with_guard(state, guard)
+        .await
+        .map_err(|_| {
+            AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Speicherzustand wird wiederhergestellt",
+            )
+        })?;
+    let share = get_share(state, token).await?;
+    if share.id != expected_id {
+        return Err(AppError(
+            StatusCode::GONE,
+            "Freigabe wurde zwischenzeitlich geändert",
+        ));
+    }
+    Ok((share, guard))
+}
+
 #[derive(Deserialize)]
 struct UnlockForm {
     password: String,
@@ -5582,7 +6953,13 @@ async fn unlock_share(
     let Some(password_hash) = share.password_hash.clone() else {
         return Ok(Redirect::to(&format!("/v/{token}")).into_response());
     };
-    let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
+    let expected_password_hash = password_hash.clone();
+    let expected_upload_policy_epoch = share.upload_policy_epoch;
+    let ip = proxy::client_limit_key(proxy::effective_client_ip(
+        peer.ip(),
+        &headers,
+        &state.config,
+    ));
     let key = format!("share:{}:{ip}", share.id);
     if !state.share_limiter.check_and_record_attempt(&key) {
         return Err(AppError(
@@ -5602,10 +6979,7 @@ async fn unlock_share(
         .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiges Passwort"));
     }
-    let valid =
-        tokio::task::spawn_blocking(move || auth::verify_password(&password_hash, &password))
-            .await
-            .map_err(internal)?;
+    let valid = verify_password_admitted(&state, Some(password_hash), password).await?;
     if !valid {
         audit(
             &state,
@@ -5617,27 +6991,62 @@ async fn unlock_share(
         .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiges Passwort"));
     }
-    state.share_limiter.success(&key);
+    // Do not clear successful unlock attempts: a known share password must not
+    // provide an unlimited Argon2/session/audit oracle.
     let unlock_token = auth::random_token(32);
+    let unlock_csrf = auth::random_token(24);
     let stored_unlock_token = unlock_token.clone();
+    let stored_unlock_csrf = unlock_csrf.clone();
     let share_id = share.id;
     let expires = Utc::now() + Duration::minutes(runtime_settings(&state).share_unlock_minutes);
-    database(state.db.clone(), move |db| {
-        db.create_unlock_session(&stored_unlock_token, share_id, expires)
+    let audit_object = share_id.to_string();
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let created = database(state.db.clone(), move |db| {
+        let created = db.create_unlock_session_for_verified_password(
+            &stored_unlock_token,
+            share_id,
+            &expected_password_hash,
+            expected_upload_policy_epoch,
+            &stored_unlock_csrf,
+            expires,
+        )?;
+        if created {
+            audit_sync(
+                &db,
+                "public",
+                "share_unlock_success",
+                Some(&audit_object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(created)
     })
     .await?;
-    audit(
-        &state,
-        "public".into(),
-        "share_unlock_success",
-        Some(share.id.to_string()),
-        None,
-    )
-    .await;
+    if !created {
+        audit(
+            &state,
+            "public".into(),
+            "share_unlock_failed",
+            Some(share.id.to_string()),
+            None,
+        )
+        .await;
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiges Passwort"));
+    }
     Ok(redirect_with_cookie(
         &format!("/v/{token}"),
         make_unlock_cookie(&state, &share, &unlock_token, UnlockCookieScope::Web),
     )?)
+}
+
+fn protected_share_page(token: &str) -> Html<String> {
+    let body = format!(
+        r#"<section class="vl-panel vl-auth-card"><p class="vl-eyebrow"><vl-i18n key="share.secure"/></p><h1><vl-i18n key="public.protected_title"/></h1><p class="vl-muted"><vl-i18n key="public.enter_share_password"/></p><form method="post" action="/v/{0}/unlock" class="vl-stack"><label class="vl-field"><vl-i18n key="auth.password"/><input type="password" name="password" autocomplete="current-password" required></label><button class="vl-button">{1} <vl-i18n key="public.unlock"/></button></form></section>"#,
+        esc(token),
+        crate::ui::icon(crate::ui::Icon::Lock),
+    );
+    Html(plain_page("Geschützte Freigabe", &body))
 }
 
 async fn public_page(
@@ -5647,15 +7056,27 @@ async fn public_page(
     Query(q): Query<BrowseQuery>,
 ) -> Result<Html<String>> {
     let sh = get_share(&state, &token).await?;
-    let settings = runtime_settings(&state);
     if !share_is_unlocked(&state, &headers, &sh).await? {
-        let body = format!(
-            r#"<section class="vl-panel vl-auth-card"><p class="vl-eyebrow"><vl-i18n key="share.secure"/></p><h1><vl-i18n key="public.protected_title"/></h1><p class="vl-muted"><vl-i18n key="public.enter_share_password"/></p><form method="post" action="/v/{0}/unlock" class="vl-stack"><label class="vl-field"><vl-i18n key="auth.password"/><input type="password" name="password" autocomplete="current-password" required></label><button class="vl-button">{1} <vl-i18n key="public.unlock"/></button></form></section>"#,
-            esc(&token),
-            crate::ui::icon(crate::ui::Icon::Lock),
-        );
-        return Ok(Html(plain_page("Geschützte Freigabe", &body)));
+        return Ok(protected_share_page(&token));
     }
+    let expected_id = sh.id;
+    let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Ok(protected_share_page(&token));
+    }
+    let settings = runtime_settings(&state);
+    let upload_csrf = share_unlock_csrf(&state, &headers, &sh).await?;
+    let share_scope = if sh.is_directory && sh.permission.can_download() {
+        Some(
+            state
+                .secure_root
+                .bind_directory(&sh.relative_path)
+                .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?,
+        )
+    } else {
+        None
+    };
+    drop(storage_guard);
     let display_name = if sh.permission == Permission::UploadOnly {
         i18n::text(i18n::current_locale(), i18n::UPLOAD_FILE).to_string()
     } else {
@@ -5732,15 +7153,38 @@ async fn public_page(
         let search =
             q.q.map(|value| value.trim().to_string())
                 .filter(|v| !v.is_empty());
+        if search
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_SEARCH_QUERY_BYTES)
+        {
+            return Err(AppError(StatusCode::BAD_REQUEST, "Suchbegriff ist zu lang"));
+        }
         let clean_sub = path_security::validate_relative(&sub)
             .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
             .to_string_lossy()
             .replace('\\', "/");
         let relative_dir = clean_sub.clone();
-        let share_scope = state
-            .secure_root
-            .bind_directory(&sh.relative_path)
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+        let share_scope = share_scope.expect("downloadable directory share is bound");
+        let _scan_peer_permit = try_acquire_client_activity(
+            state.expensive_peer_admission.clone(),
+            current_client_limit_key(),
+            crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
+        )
+        .map_err(internal)?
+        .ok_or(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
+        ))?;
+        let _scan_permit = state
+            .search_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                AppError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Zu viele gleichzeitige Dateisuchen",
+                )
+            })?;
         body += &public_breadcrumbs(&token, &clean_sub);
         if let Some(parent) = parent_path(&clean_sub) {
             body += &format!(
@@ -5932,13 +7376,14 @@ async fn public_page(
         };
         let panel_tag = if split_layout { "aside" } else { "section" };
         body += &format!(
-            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_choose"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label>{}<div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>{} <vl-i18n key="upload.securely"/></button><p class="vl-muted"><vl-i18n key="share.no_replace_help"/></p></form></{panel_tag}>"#,
+            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_choose"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label>{}<div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>{} <vl-i18n key="upload.securely"/></button><p class="vl-muted"><vl-i18n key="share.no_replace_help"/></p></form></{panel_tag}>"#,
             if sh.permission == Permission::UploadOnly {
                 i18n::text(i18n::current_locale(), i18n::UPLOAD_FILE)
             } else {
                 i18n::text(i18n::current_locale(), i18n::UPLOAD_FILES_PUBLIC)
             },
             esc(&upload_path),
+            esc(upload_csrf.as_deref().unwrap_or("")),
             crate::ui::icon(crate::ui::Icon::Upload),
             overwrite_checkbox,
             crate::ui::icon(crate::ui::Icon::Upload),
@@ -6001,6 +7446,12 @@ fn add_public_preview_actions(
     )
 }
 
+fn text_preview_render_permits(max_preview_size: u64) -> u32 {
+    max_preview_size
+        .div_ceil(TEXT_PREVIEW_RENDER_UNIT_BYTES)
+        .clamp(1, crate::TEXT_PREVIEW_RENDER_BUDGET_PERMITS as u64) as u32
+}
+
 pub(crate) async fn public_preview(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -6009,6 +7460,14 @@ pub(crate) async fn public_preview(
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response> {
     let sh = get_share(&state, &token).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    if !sh.permission.can_download() {
+        return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
+    }
+    let expected_id = sh.id;
+    let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
     }
@@ -6024,20 +7483,76 @@ pub(crate) async fn public_preview(
     } else {
         sh.relative_path.clone()
     };
+    let (preview_scope, preview_file) = if sh.is_directory {
+        (
+            Some(
+                state
+                    .secure_root
+                    .bind_directory(&sh.relative_path)
+                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?,
+            ),
+            None,
+        )
+    } else {
+        (
+            None,
+            Some(
+                state
+                    .secure_root
+                    .bind_file(&sh.relative_path)
+                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?,
+            ),
+        )
+    };
+    drop(storage_guard);
     let settings = runtime_settings(&state);
+    let is_text_preview = preview_kind(&relative_file, &settings) == Some(PreviewKind::Text);
+    let mut text_render_permit = if is_text_preview {
+        Some(
+            state
+                .preview_render_admission
+                .clone()
+                .try_acquire_many_owned(text_preview_render_permits(settings.max_preview_size))
+                .map_err(|_| {
+                    AppError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Zu viele gleichzeitige Textvorschauen",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let preview_resource_key = if sh.is_directory {
+        requested_path.clone()
+    } else {
+        sh.relative_path.clone()
+    };
+    // Hold the transfer reservation while reading and escaping a text preview.
+    // A mere availability check here would allow concurrent requests to all do
+    // the expensive work before racing to acquire the final remaining slot.
+    let mut text_transfer = if is_text_preview {
+        Some(
+            begin_public_transfer(
+                &state,
+                &headers,
+                &uri,
+                &sh,
+                preview_resource_key.clone(),
+                "preview",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let preview_path = relative_file.clone();
     let content = if sh.is_directory {
-        let scope = state
-            .secure_root
-            .bind_directory(&sh.relative_path)
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+        let scope = preview_scope.expect("directory preview scope is bound");
         let requested = requested_path.clone();
         tokio::task::spawn_blocking(move || read_preview(scope, &requested, &settings)).await
     } else {
-        let file = state
-            .secure_root
-            .bind_file(&sh.relative_path)
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
+        let file = preview_file.expect("file preview is bound");
         tokio::task::spawn_blocking(move || {
             read_preview_secure_file(file, &preview_path, &settings)
         })
@@ -6045,6 +7560,17 @@ pub(crate) async fn public_preview(
     }
     .map_err(internal)?
     .map_err(public_preview_error)?;
+    let content = match content {
+        PreviewContent::Text(text)
+            if escaped_html_len(&text)
+                .is_none_or(|length| length > MAX_RENDERED_TEXT_PREVIEW_BYTES) =>
+        {
+            PreviewContent::TooLarge {
+                size: text.len() as u64,
+            }
+        }
+        content => content,
+    };
     let share_rel = if sh.is_directory {
         requested_path
     } else {
@@ -6070,21 +7596,61 @@ pub(crate) async fn public_preview(
         );
         return Ok(Html(plain_page("Vorschau", &body)).into_response());
     }
-    let count_html_preview = matches!(&content, PreviewContent::Text(_));
-    let body = match content {
-        PreviewContent::TooLarge { size } => preview_too_large_body(
-            &share_rel,
-            size,
-            "Datei ist größer als das Preview-Limit.",
-            Some(&download_link),
-        ),
-        PreviewContent::Text(text) => format!(
-            r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><pre>{}</pre></section>"#,
-            esc(&text)
-        ),
+    let mut response = match content {
+        PreviewContent::TooLarge { .. } => {
+            unreachable!("oversized previews return before response rendering")
+        }
+        PreviewContent::Text(text) => {
+            let body = format!(
+                r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><pre>{}</pre></section>"#,
+                TEXT_PREVIEW_STREAM_MARKER
+            );
+            let body = add_public_preview_actions(
+                body,
+                &public_back_link(&public_route, &share_rel, sh.is_directory),
+                Some(&download_link),
+            );
+            let page = plain_page("Vorschau", &body);
+            let (stream, page_length) = escaped_text_page_stream(page, text).map_err(internal)?;
+            let transfer = text_transfer
+                .take()
+                .expect("text previews reserve their transfer before reading");
+            let transfer_cookie_value = transfer.cookie.clone();
+            let transfer_body = transfer_body(
+                stream,
+                &state,
+                transfer,
+                "preview",
+                sh.id,
+                Some(page_length),
+            );
+            let mut response = Response::new(Body::new(PermitBody {
+                inner: transfer_body,
+                _permit: text_render_permit
+                    .take()
+                    .expect("text previews reserve render memory before reading"),
+            }));
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&page_length.to_string()).map_err(internal)?,
+            );
+            set_transfer_cookie(&mut response, &transfer_cookie_value)?;
+            response
+        }
         PreviewContent::Media { kind, size } => {
+            let owner_key = current_client_limit_key().to_string();
+            if !state
+                .preview_token_limiter
+                .check_and_record_attempt(&format!("preview-token:{}:{owner_key}", sh.id))
+            {
+                return Err(AppError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Zu viele Vorschau-Anfragen",
+                ));
+            }
             let preview_token = auth::random_token(32);
             let stored_preview_token = preview_token.clone();
+            let stored_owner_key = owner_key;
             let share_id = sh.id;
             let token_path = if sh.is_directory {
                 share_rel.clone()
@@ -6092,10 +7658,27 @@ pub(crate) async fn public_preview(
                 String::new()
             };
             let expires = Utc::now() + Duration::minutes(5);
-            database(state.db.clone(), move |db| {
-                db.create_preview_session(&stored_preview_token, share_id, &token_path, expires)
+            let preview_outcome = database(state.db.clone(), move |db| {
+                db.create_preview_session(
+                    &stored_preview_token,
+                    &stored_owner_key,
+                    share_id,
+                    &token_path,
+                    expires,
+                )
             })
             .await?;
+            match preview_outcome {
+                PreviewSessionCreateOutcome::Created => {}
+                PreviewSessionCreateOutcome::OwnerCapacityReached
+                | PreviewSessionCreateOutcome::ShareCapacityReached
+                | PreviewSessionCreateOutcome::GlobalCapacityReached => {
+                    return Err(AppError(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Zu viele aktive Vorschau-Sitzungen",
+                    ));
+                }
+            }
             let raw_url = if sh.is_directory {
                 format!(
                     "{public_route}/preview/raw?path={}&preview_token={}",
@@ -6109,42 +7692,18 @@ pub(crate) async fn public_preview(
                 )
             };
             let viewer = media_viewer(kind, &raw_url);
-            format!(
+            let body = format!(
                 r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><p class="vl-muted">{} - <vl-i18n key="files.raw_token"/></p>{}</section>"#,
                 human(size),
                 viewer
-            )
+            );
+            let body = add_public_preview_actions(
+                body,
+                &public_back_link(&public_route, &share_rel, sh.is_directory),
+                Some(&download_link),
+            );
+            Response::new(Body::from(plain_page("Vorschau", &body)))
         }
-    };
-    let body = add_public_preview_actions(
-        body,
-        &public_back_link(&public_route, &share_rel, sh.is_directory),
-        Some(&download_link),
-    );
-    let page = plain_page("Vorschau", &body);
-    let mut response = if count_html_preview {
-        let resource_key = if sh.is_directory {
-            share_rel.clone()
-        } else {
-            sh.relative_path.clone()
-        };
-        let transfer =
-            begin_public_transfer(&state, &headers, &uri, &sh, resource_key, "preview").await?;
-        let transfer_cookie_value = transfer.cookie.clone();
-        let page_length = page.len() as u64;
-        let stream = futures_util::stream::once(async move { Ok(Bytes::from(page)) });
-        let mut response = Response::new(transfer_body(
-            stream,
-            &state,
-            transfer,
-            "preview",
-            sh.id,
-            Some(page_length),
-        ));
-        set_transfer_cookie(&mut response, &transfer_cookie_value)?;
-        response
-    } else {
-        Response::new(Body::from(page))
     };
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -6168,6 +7727,14 @@ pub(crate) async fn public_preview_raw(
     if !sh.permission.can_download() {
         return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
     }
+    let expected_id = sh.id;
+    let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    if !sh.permission.can_download() {
+        return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
+    }
     let requested_path = q.path.clone().unwrap_or_default();
     let relative_file = if sh.is_directory {
         if requested_path.is_empty() {
@@ -6177,6 +7744,28 @@ pub(crate) async fn public_preview_raw(
     } else {
         sh.relative_path.clone()
     };
+    let (preview_scope, preview_file) = if sh.is_directory {
+        (
+            Some(
+                state
+                    .secure_root
+                    .bind_directory(&sh.relative_path)
+                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?,
+            ),
+            None,
+        )
+    } else {
+        (
+            None,
+            Some(
+                state
+                    .secure_root
+                    .bind_file(&sh.relative_path)
+                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?,
+            ),
+        )
+    };
+    drop(storage_guard);
     let preview_token = q
         .preview_token
         .ok_or(AppError(StatusCode::FORBIDDEN, "Preview-Token fehlt"))?;
@@ -6204,10 +7793,7 @@ pub(crate) async fn public_preview_raw(
             "Vorschau nicht erlaubt",
         ))?;
     let mut response = if sh.is_directory {
-        let scope = state
-            .secure_root
-            .bind_directory(&sh.relative_path)
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+        let scope = preview_scope.expect("directory raw preview scope is bound");
         raw_preview_response(
             scope,
             method.clone(),
@@ -6218,10 +7804,7 @@ pub(crate) async fn public_preview_raw(
         )
         .await?
     } else {
-        let file = state
-            .secure_root
-            .bind_file(&sh.relative_path)
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
+        let file = preview_file.expect("file raw preview is bound");
         raw_preview_secure_file_response(
             file,
             method.clone(),
@@ -6255,6 +7838,8 @@ pub(crate) async fn public_preview_raw(
                 .map(|item| item.map_err(io::Error::other));
             *response.body_mut() =
                 transfer_body(stream, &state, transfer, "preview", sh.id, expected_bytes);
+            // TransferBodyStream commits before yielding the first non-empty
+            // payload chunk, so disconnects cannot leak uncounted partial data.
         }
         set_transfer_cookie(&mut response, &transfer_cookie_value)?;
     }
@@ -6278,15 +7863,51 @@ pub(crate) async fn download_zip(
             "ZIP-Download nicht erlaubt",
         ));
     }
+    let expected_id = sh.id;
+    let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    if !sh.is_directory || !sh.permission.can_download() {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            "ZIP-Download nicht erlaubt",
+        ));
+    }
     let sub = path_security::validate_relative(q.path.as_deref().unwrap_or_default())
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger ZIP-Pfad"))?
         .to_string_lossy()
         .replace('\\', "/");
+    let mut expensive_peer_permit = Some(
+        try_acquire_client_activity(
+            state.expensive_peer_admission.clone(),
+            current_client_limit_key(),
+            crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
+        )
+        .map_err(internal)?
+        .ok_or(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
+        ))?,
+    );
+    let mut zip_permit = Some(
+        state
+            .zip_generation_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                AppError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Zu viele gleichzeitige ZIP-Erstellungen",
+                )
+            })?,
+    );
     let settings = runtime_settings(&state);
     let secure_root = state
         .secure_root
         .bind_directory(&sh.relative_path)
         .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+    drop(storage_guard);
     let resource_key = if sub.is_empty() {
         ".".to_string()
     } else {
@@ -6304,7 +7925,7 @@ pub(crate) async fn download_zip(
             .await
             .map_err(internal)?
             .map_err(zip_error)?;
-    let mut content_length = None;
+    let mut direct_generation = false;
     let body = if let Some(reservation) = ZipTempReservation::acquire(plan.estimated_archive_size) {
         let temp_scope = secure_root.clone();
         let temp_plan = plan.clone();
@@ -6313,7 +7934,7 @@ pub(crate) async fn download_zip(
             .map_err(internal)?
         {
             Ok(file) => {
-                content_length = file.metadata().ok().map(|metadata| metadata.len());
+                let content_length = file.metadata().ok().map(|metadata| metadata.len());
                 let stream = ReservedZipStream {
                     inner: ReaderStream::new(tokio::fs::File::from_std(file)),
                     _reservation: reservation,
@@ -6329,6 +7950,7 @@ pub(crate) async fn download_zip(
             }
             Err(error) if error.is_output_capacity_error() => {
                 drop(reservation);
+                direct_generation = true;
                 transfer_body(
                     direct_zip_stream(secure_root, plan),
                     &state,
@@ -6354,6 +7976,7 @@ pub(crate) async fn download_zip(
             }
         }
     } else {
+        direct_generation = true;
         transfer_body(
             direct_zip_stream(secure_root, plan),
             &state,
@@ -6368,6 +7991,24 @@ pub(crate) async fn download_zip(
         .and_then(|value| value.to_str())
         .unwrap_or("vaultlink");
     let filename = encoded(&format!("{name}.zip"));
+    let body = if direct_generation {
+        let body = Body::new(PeerPermitBody {
+            inner: body,
+            _permit: expensive_peer_permit
+                .take()
+                .expect("ZIP peer generation permit"),
+        });
+        Body::new(PermitBody {
+            inner: body,
+            _permit: zip_permit.take().expect("ZIP generation permit"),
+        })
+    } else {
+        // The archive has already been materialized. Slow network reads retain
+        // only the bounded temp-file reservation, not a scarce generation slot.
+        drop(zip_permit.take());
+        drop(expensive_peer_permit.take());
+        body
+    };
     let mut response = Response::new(body);
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -6378,12 +8019,8 @@ pub(crate) async fn download_zip(
         HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{filename}"))
             .map_err(internal)?,
     );
-    if let Some(length) = content_length {
-        response.headers_mut().insert(
-            header::CONTENT_LENGTH,
-            HeaderValue::from_str(&length.to_string()).map_err(internal)?,
-        );
-    }
+    // Deliberately omit Content-Length for counted GETs. Hyper must poll the
+    // wrapped stream through EOF before the transfer lease can be committed.
     set_transfer_cookie(&mut response, &transfer_cookie_value)?;
     Ok(response)
 }
@@ -6403,6 +8040,14 @@ pub(crate) async fn download(
     if !sh.permission.can_download() {
         return Err(AppError(StatusCode::FORBIDDEN, "Download nicht erlaubt"));
     }
+    let expected_id = sh.id;
+    let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    if !sh.permission.can_download() {
+        return Err(AppError(StatusCode::FORBIDDEN, "Download nicht erlaubt"));
+    }
     let relative_file = if sh.is_directory {
         let rel = q
             .path
@@ -6414,6 +8059,20 @@ pub(crate) async fn download(
     } else {
         sh.relative_path.clone()
     };
+    let file = if sh.is_directory {
+        state
+            .secure_root
+            .bind_directory(&sh.relative_path)
+            .and_then(|directory| directory.open_file(&relative_file))
+            .map(SecureFile::into_file)
+    } else {
+        state
+            .secure_root
+            .bind_file(&sh.relative_path)
+            .map(SecureFile::into_file)
+    }
+    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
+    drop(storage_guard);
     if method == Method::HEAD {
         check_public_transfer_availability(
             &state,
@@ -6424,25 +8083,6 @@ pub(crate) async fn download(
         )
         .await?;
     }
-    let secure_root = state.secure_root.clone();
-    let open_path = relative_file.clone();
-    let share_path = sh.relative_path.clone();
-    let directory_share = sh.is_directory;
-    let file = tokio::task::spawn_blocking(move || {
-        if directory_share {
-            secure_root
-                .bind_directory(&share_path)?
-                .open_file(&open_path)
-                .map(SecureFile::into_file)
-        } else {
-            secure_root
-                .bind_file(&share_path)
-                .map(SecureFile::into_file)
-        }
-    })
-    .await
-    .map_err(internal)?
-    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
     if !file.metadata().map_err(internal)?.is_file() {
         return Err(AppError(StatusCode::BAD_REQUEST, "Keine Datei"));
     }
@@ -6560,6 +8200,28 @@ pub(crate) async fn upload(
     if !sh.is_directory || !sh.permission.can_upload() {
         return Err(AppError(StatusCode::FORBIDDEN, "Upload nicht erlaubt"));
     }
+    let required_csrf = share_unlock_csrf(&state, &headers, &sh).await?;
+    if sh.password_hash.is_some() && required_csrf.is_none() {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    let expected_id = sh.id;
+    let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
+    if !share_is_unlocked(&state, &headers, &sh).await? {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    if !sh.is_directory || !sh.permission.can_upload() {
+        return Err(AppError(StatusCode::FORBIDDEN, "Upload nicht erlaubt"));
+    }
+    let required_csrf = share_unlock_csrf(&state, &headers, &sh).await?;
+    if sh.password_hash.is_some() && required_csrf.is_none() {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+    }
+    let csrf_header_valid = required_csrf.as_deref().is_some_and(|expected| {
+        headers
+            .get("x-vaultlink-upload-csrf")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.as_bytes() == expected.as_bytes())
+    });
     let _upload_permit = state
         .upload_admission
         .clone()
@@ -6570,12 +8232,28 @@ pub(crate) async fn upload(
                 "Zu viele gleichzeitige Uploads",
             )
         })?;
+    let _upload_peer_permit = try_acquire_client_activity(
+        state.upload_peer_admission.clone(),
+        current_client_limit_key(),
+        crate::MAX_IN_FLIGHT_UPLOADS_PER_CLIENT,
+    )
+    .map_err(internal)?
+    .ok_or(AppError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Zu viele gleichzeitige Uploads dieses Clients",
+    ))?;
     let share_scope = state
         .secure_root
         .bind_directory(&sh.relative_path)
         .map_err(|_| AppError(StatusCode::NOT_FOUND, "Zielordner nicht verfügbar"))?;
+    // The descriptor remains bound to the revalidated directory after releasing
+    // the mutation lock, so a long request body cannot block admin operations.
+    drop(storage_guard);
     let settings = runtime_settings(&state);
-    let maximum = sh.max_upload_size.unwrap_or(settings.max_upload_size);
+    let maximum = sh
+        .max_upload_size
+        .unwrap_or(settings.max_upload_size)
+        .min(crate::config::MAX_UPLOAD_SIZE);
     if headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -6594,6 +8272,9 @@ pub(crate) async fn upload(
     let mut fields_seen = 0usize;
     let mut saw_path = false;
     let mut saw_overwrite = false;
+    let mut saw_csrf = false;
+    let mut csrf_validated = required_csrf.is_none() || csrf_header_valid;
+    let mut quota_reservation: Option<UploadQuotaReservation> = None;
     let mut prepared_upload: Option<(PendingUpload, String, u64)> = None;
     while let Some(field) = match multipart.next_field().await {
         Ok(field) => field,
@@ -6682,6 +8363,39 @@ pub(crate) async fn upload(
             }
             continue;
         }
+        if field_name == "csrf" {
+            if std::mem::replace(&mut saw_csrf, true) || prepared_upload.is_some() {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::BAD_REQUEST,
+                    "CSRF-Token wurde mehrfach oder zu spät übermittelt",
+                ));
+            }
+            let value = match limited_multipart_text(field, 256).await {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(public_upload_error(
+                        &token,
+                        &upload_subdir,
+                        StatusCode::FORBIDDEN,
+                        "Ungültiges CSRF-Token",
+                    ))
+                }
+            };
+            csrf_validated = required_csrf
+                .as_deref()
+                .is_none_or(|expected| value.as_bytes() == expected.as_bytes());
+            if !csrf_validated {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::FORBIDDEN,
+                    "Ungültiges CSRF-Token",
+                ));
+            }
+            continue;
+        }
         if field_name != "file" {
             return Ok(public_upload_error(
                 &token,
@@ -6698,6 +8412,14 @@ pub(crate) async fn upload(
                 "Pro Request ist genau eine Datei erlaubt",
             ));
         }
+        if !csrf_validated {
+            return Ok(public_upload_error(
+                &token,
+                &upload_subdir,
+                StatusCode::FORBIDDEN,
+                "CSRF-Token fehlt",
+            ));
+        }
         let Some(file_name) = field.file_name() else {
             return Ok(public_upload_error(
                 &token,
@@ -6706,7 +8428,7 @@ pub(crate) async fn upload(
                 "Dateiname fehlt",
             ));
         };
-        let name = match path_security::safe_filename(file_name) {
+        let name = match path_security::safe_admin_filename(file_name) {
             Ok(name) => name.to_string(),
             Err(_) => {
                 return Ok(public_upload_error(
@@ -6717,14 +8439,6 @@ pub(crate) async fn upload(
                 ))
             }
         };
-        if crate::secure_fs::is_upload_fragment_name(std::ffi::OsStr::new(&name)) {
-            return Ok(public_upload_error(
-                &token,
-                &upload_subdir,
-                StatusCode::BAD_REQUEST,
-                "Dateiname ist für interne Uploadfragmente reserviert",
-            ));
-        }
         if extension_is_blocked(&name, &settings.blocked_extensions) {
             return Ok(public_upload_error(
                 &token,
@@ -6732,6 +8446,47 @@ pub(crate) async fn upload(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "Dateityp blockiert",
             ));
+        }
+        let reservation_token = auth::random_token(32);
+        let share_id = sh.id;
+        let pending_ownership = begin_upload_reservation_cancellation_safe(
+            state.db.clone(),
+            reservation_token.clone(),
+            share_id,
+        )
+        .await?;
+        match pending_ownership.outcome() {
+            UploadReservationBeginOutcome::Reserved => {
+                quota_reservation = Some(UploadQuotaReservation::new(
+                    state.db.clone(),
+                    reservation_token,
+                ));
+                pending_ownership.claim();
+            }
+            UploadReservationBeginOutcome::ByteQuotaReached => {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "Kumulatives Uploadlimit erreicht",
+                ));
+            }
+            UploadReservationBeginOutcome::FileQuotaReached => {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "Maximale Anzahl hochgeladener Dateien erreicht",
+                ));
+            }
+            UploadReservationBeginOutcome::ShareUnavailable => {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::GONE,
+                    "Freigabe nicht verfügbar",
+                ));
+            }
         }
         let secure_root = share_scope.clone();
         let upload_directory = upload_subdir.clone();
@@ -6780,6 +8535,71 @@ pub(crate) async fn upload(
                     "Upload ist zu groß",
                 ));
             };
+            let reservation = quota_reservation
+                .as_mut()
+                .expect("file field has an upload quota reservation");
+            if new_total > reservation.reserved_bytes
+                || reservation.last_heartbeat.elapsed() >= UPLOAD_QUOTA_HEARTBEAT_INTERVAL
+            {
+                let rounded_target = if new_total > reservation.reserved_bytes {
+                    new_total
+                        .checked_add(UPLOAD_QUOTA_RESERVATION_STEP - 1)
+                        .map(|value| value / UPLOAD_QUOTA_RESERVATION_STEP)
+                        .and_then(|value| value.checked_mul(UPLOAD_QUOTA_RESERVATION_STEP))
+                        .unwrap_or(new_total)
+                        .min(maximum)
+                } else {
+                    reservation.reserved_bytes
+                };
+                let reservation_token = reservation.token().to_string();
+                let outcome = database(state.db.clone(), move |database| {
+                    database.extend_upload_reservation(&reservation_token, rounded_target)
+                })
+                .await?;
+                let mut accepted_target = rounded_target;
+                let outcome = if outcome == UploadReservationExtendOutcome::ByteQuotaReached
+                    && rounded_target != new_total
+                {
+                    accepted_target = new_total;
+                    let reservation_token = reservation.token().to_string();
+                    database(state.db.clone(), move |database| {
+                        database.extend_upload_reservation(&reservation_token, new_total)
+                    })
+                    .await?
+                } else {
+                    outcome
+                };
+                match outcome {
+                    UploadReservationExtendOutcome::Extended => {
+                        reservation.reserved_bytes = accepted_target;
+                        reservation.last_heartbeat = std::time::Instant::now();
+                    }
+                    UploadReservationExtendOutcome::ByteQuotaReached => {
+                        return Ok(public_upload_error(
+                            &token,
+                            &upload_subdir,
+                            StatusCode::INSUFFICIENT_STORAGE,
+                            "Kumulatives Uploadlimit erreicht",
+                        ));
+                    }
+                    UploadReservationExtendOutcome::NotFound => {
+                        return Ok(public_upload_error(
+                            &token,
+                            &upload_subdir,
+                            StatusCode::REQUEST_TIMEOUT,
+                            "Uploadreservierung ist abgelaufen",
+                        ));
+                    }
+                    UploadReservationExtendOutcome::ShareUnavailable => {
+                        return Ok(public_upload_error(
+                            &token,
+                            &upload_subdir,
+                            StatusCode::GONE,
+                            "Freigabe wurde während des Uploads deaktiviert",
+                        ));
+                    }
+                }
+            }
             let Some(_reservation) = UploadChunkReservation::acquire(
                 state.secure_root.display_root(),
                 chunk.len() as u64,
@@ -6832,48 +8652,97 @@ pub(crate) async fn upload(
         drop(output);
         prepared_upload = Some((pending, name, total));
     }
-    let Some((mut pending, name, total)) = prepared_upload else {
-        return Ok(public_upload_error(
-            &token,
-            &upload_subdir,
-            StatusCode::BAD_REQUEST,
-            "Datei fehlt",
-        ));
-    };
-    let publish_name = name.clone();
-    let allow_replace = !state.config.storage.external_writers
-        && sh.upload_conflict_strategy.can_overwrite()
-        && overwrite_existing;
-    #[cfg(test)]
-    if let Some(kind) = state
-        .upload_directory_sync_failure
-        .lock()
-        .expect("upload sync fault lock")
-        .take()
-    {
-        pending.fail_next_directory_sync(kind);
-    }
-    let _storage_guard = state.storage_mutation.lock().await;
-    let destination = join_display(&upload_subdir, &name);
-    let existed = match share_scope.metadata(&destination) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(internal(error)),
-    };
-    let replaced = allow_replace && existed;
-    let publish_result = tokio::task::spawn_blocking(move || {
-        if allow_replace {
-            pending.publish_replace(&publish_name)
-        } else {
-            pending.publish(&publish_name)
-        }
-    })
-    .await
-    .map_err(internal)?;
-    let publish_outcome = match publish_result {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
+    // Finalization continues independently of the request future. In
+    // particular, cancellation must not stop between the non-cancellable quota
+    // commit and publication, otherwise quota could be consumed without a
+    // corresponding file ever becoming visible.
+    let upload_permit = _upload_permit;
+    let upload_peer_permit = _upload_peer_permit;
+    let audit_client_ip = current_audit_client_ip();
+    let locale = i18n::current_locale();
+    let return_to = i18n::current_return_to();
+    let finalizer = tokio::spawn(with_audit_client_ip(
+        audit_client_ip,
+        i18n::scope(locale, return_to, async move {
+            let _upload_permit = upload_permit;
+            let _upload_peer_permit = upload_peer_permit;
+            let Some((mut pending, name, total)) = prepared_upload else {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::BAD_REQUEST,
+                    "Datei fehlt",
+                ));
+            };
+            let publish_name = name.clone();
+            let allow_replace = !state.config.storage.external_writers
+                && sh.upload_conflict_strategy.can_overwrite()
+                && overwrite_existing;
+            #[cfg(test)]
+            if let Some(kind) = state
+                .upload_directory_sync_failure
+                .lock()
+                .expect("upload sync fault lock")
+                .take()
+            {
+                pending.fail_next_directory_sync(kind);
+            }
+            let storage_guard = state.storage_mutation.clone().lock_owned().await;
+            let storage_guard =
+                file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
+                    .await
+                    .map_err(|_| {
+                        AppError(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Speicherzustand wird wiederhergestellt",
+                        )
+                    })?;
+            let current_share = get_share(&state, &token).await?;
+            if current_share.id != sh.id
+                || !current_share.is_directory
+                || !current_share.permission.can_upload()
+            {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::GONE,
+                    "Freigabe wurde während des Uploads geändert",
+                ));
+            }
+            let current_destination = match state
+                .secure_root
+                .bind_directory(&current_share.relative_path)
+                .and_then(|scope| scope.bind_directory(&upload_subdir))
+            {
+                Ok(directory) => directory,
+                Err(_) => {
+                    return Ok(public_upload_error(
+                        &token,
+                        &upload_subdir,
+                        StatusCode::CONFLICT,
+                        "Uploadziel wurde während des Uploads geändert",
+                    ));
+                }
+            };
+            if !pending
+                .destination_matches(&current_destination)
+                .map_err(internal)?
+            {
+                return Ok(public_upload_error(
+                    &token,
+                    &upload_subdir,
+                    StatusCode::CONFLICT,
+                    "Uploadziel wurde während des Uploads geändert",
+                ));
+            }
+            let destination = join_display(&upload_subdir, &name);
+            let existed = match share_scope.metadata(&destination) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(internal(error)),
+            };
+            let replaced = allow_replace && existed;
+            if existed && !allow_replace {
                 return Ok(public_upload_error(
                     &token,
                     &upload_subdir,
@@ -6881,80 +8750,136 @@ pub(crate) async fn upload(
                     "Datei existiert bereits.",
                 ));
             }
-            return if storage_full_error(&error) {
-                Ok(public_upload_error(
-                    &token,
-                    &upload_subdir,
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "Nicht genug freier Speicher",
-                ))
-            } else {
-                Err(internal(error))
+            // Account for the upload before making the filesystem name visible. A crash
+            // can therefore consume quota without publishing a file, but can never leave
+            // a published file uncounted and reopen the storage-exhaustion bypass.
+            let reservation = quota_reservation
+                .as_mut()
+                .expect("prepared upload has a quota reservation");
+            let reservation_token = reservation.token().to_string();
+            let quota_commit = database(state.db.clone(), move |database| {
+                database.commit_upload_reservation(&reservation_token, total)
+            })
+            .await?;
+            match quota_commit {
+                UploadReservationCommitOutcome::Committed => reservation.committed(),
+                UploadReservationCommitOutcome::NotFound => {
+                    return Ok(public_upload_error(
+                        &token,
+                        &upload_subdir,
+                        StatusCode::REQUEST_TIMEOUT,
+                        "Uploadreservierung ist abgelaufen",
+                    ));
+                }
+                UploadReservationCommitOutcome::ShareUnavailable => {
+                    return Ok(public_upload_error(
+                        &token,
+                        &upload_subdir,
+                        StatusCode::GONE,
+                        "Freigabe wurde während des Uploads deaktiviert",
+                    ));
+                }
+            }
+            let publish_result = tokio::task::spawn_blocking(move || {
+                // A disconnected client drops the future, but the filesystem publish
+                // continues. Keep it serialized until that blocking task really ends.
+                let _storage_guard = storage_guard;
+                if allow_replace {
+                    pending.publish_replace(&publish_name)
+                } else {
+                    pending.publish(&publish_name)
+                }
+            })
+            .await
+            .map_err(internal)?;
+            let publish_outcome = match publish_result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        return Ok(public_upload_error(
+                            &token,
+                            &upload_subdir,
+                            StatusCode::CONFLICT,
+                            "Datei existiert bereits.",
+                        ));
+                    }
+                    return if storage_full_error(&error) {
+                        Ok(public_upload_error(
+                            &token,
+                            &upload_subdir,
+                            StatusCode::INSUFFICIENT_STORAGE,
+                            "Nicht genug freier Speicher",
+                        ))
+                    } else {
+                        Err(internal(error))
+                    };
+                }
             };
-        }
-    };
-    let durability_uncertain = !publish_outcome.is_durable();
-    let audit_detail = format!("file={name};bytes={total}");
-    if let Some(error) = publish_outcome.sync_error() {
-        tracing::warn!(share_id = sh.id, file = %name, %error, "upload published but directory fsync failed");
-        audit(
-            &state,
-            "public".into(),
-            "upload_durability_uncertain",
-            Some(sh.id.to_string()),
-            Some(audit_detail.clone()),
-        )
-        .await;
-    }
-    audit(
-        &state,
-        "public".into(),
-        if replaced {
-            "upload_replaced"
-        } else {
-            "upload"
-        },
-        Some(sh.id.to_string()),
-        Some(audit_detail),
-    )
-    .await;
-    let upload_status = match (replaced, durability_uncertain) {
-        (true, true) => "replaced_uncertain",
-        (false, true) => "uncertain",
-        (true, false) => "replaced",
-        (false, false) => "ok",
-    };
-    let public_route = public_share_route(&uri, &token);
-    let target = if upload_subdir.is_empty() {
-        format!("{public_route}?upload={upload_status}")
-    } else {
-        format!(
-            "{public_route}?path={}&upload={upload_status}",
-            encoded(&upload_subdir)
-        )
-    };
-    let outcome = match upload_status {
-        "replaced_uncertain" => "replaced_uncertain",
-        "uncertain" => "created_uncertain",
-        "replaced" => "replaced",
-        _ => "created",
-    };
-    let mut response = Redirect::to(&target).into_response();
-    response.headers_mut().insert(
-        "x-vaultlink-upload-file",
-        HeaderValue::from_str(&encoded(&name)).map_err(internal)?,
-    );
-    response.headers_mut().insert(
-        "x-vaultlink-upload-outcome",
-        HeaderValue::from_static(outcome),
-    );
-    if durability_uncertain {
-        response.headers_mut().insert(
-            "x-vaultlink-durability",
-            HeaderValue::from_static("uncertain"),
-        );
-    }
-    Ok(response)
+            let durability_uncertain = !publish_outcome.is_durable();
+            let audit_detail = format!("file={name};bytes={total}");
+            if let Some(error) = publish_outcome.sync_error() {
+                tracing::warn!(share_id = sh.id, file = %name, %error, "upload published but directory fsync failed");
+                audit(
+                    &state,
+                    "public".into(),
+                    "upload_durability_uncertain",
+                    Some(sh.id.to_string()),
+                    Some(audit_detail.clone()),
+                )
+                .await;
+            }
+            audit(
+                &state,
+                "public".into(),
+                if replaced {
+                    "upload_replaced"
+                } else {
+                    "upload"
+                },
+                Some(sh.id.to_string()),
+                Some(audit_detail),
+            )
+            .await;
+            let upload_status = match (replaced, durability_uncertain) {
+                (true, true) => "replaced_uncertain",
+                (false, true) => "uncertain",
+                (true, false) => "replaced",
+                (false, false) => "ok",
+            };
+            let public_route = public_share_route(&uri, &token);
+            let target = if upload_subdir.is_empty() {
+                format!("{public_route}?upload={upload_status}")
+            } else {
+                format!(
+                    "{public_route}?path={}&upload={upload_status}",
+                    encoded(&upload_subdir)
+                )
+            };
+            let outcome = match upload_status {
+                "replaced_uncertain" => "replaced_uncertain",
+                "uncertain" => "created_uncertain",
+                "replaced" => "replaced",
+                _ => "created",
+            };
+            let mut response = Redirect::to(&target).into_response();
+            response.headers_mut().insert(
+                "x-vaultlink-upload-file",
+                HeaderValue::from_str(&encoded(&name)).map_err(internal)?,
+            );
+            response.headers_mut().insert(
+                "x-vaultlink-upload-outcome",
+                HeaderValue::from_static(outcome),
+            );
+            if durability_uncertain {
+                response.headers_mut().insert(
+                    "x-vaultlink-durability",
+                    HeaderValue::from_static("uncertain"),
+                );
+            }
+            Ok(response)
+        }),
+    ));
+    finalizer.await.map_err(internal)?
 }
 
 #[derive(Serialize)]
@@ -7044,7 +8969,11 @@ async fn short_redirect(
     headers: HeaderMap,
     AxPath(alias): AxPath<String>,
 ) -> Result<Redirect> {
-    let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
+    let ip = proxy::client_limit_key(proxy::effective_client_ip(
+        peer.ip(),
+        &headers,
+        &state.config,
+    ));
     if !state
         .alias_limiter
         .check_and_record_attempt(&format!("alias:{ip}"))
@@ -7352,27 +9281,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_admission_holds_a_slot_until_the_body_is_dropped() {
+    async fn response_admission_releases_handlers_but_bounds_stream_bodies() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut state = test_state(root.path(), data.path());
         let admission = Arc::new(tokio::sync::Semaphore::new(1));
-        let app =
-            Router::new()
-                .route("/", get(|| async { "ok" }))
-                .layer(middleware::from_fn_with_state(
-                    admission.clone(),
-                    response_admission,
-                ));
+        let streams = Arc::new(tokio::sync::Semaphore::new(1));
+        state.response_admission = admission.clone();
+        state.stream_admission = streams.clone();
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route("/download", get(|| async { "stream" }))
+            .layer(middleware::from_fn_with_state(state, response_admission));
 
         let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(streams.available_permits(), 0);
+
+        let normal = app
             .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-        assert_eq!(admission.available_permits(), 0);
+        assert_eq!(normal.status(), StatusCode::OK);
+        assert_eq!(admission.available_permits(), 1);
 
         let saturated = app
             .clone()
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -7382,14 +9333,468 @@ mod tests {
         );
 
         drop(first);
-        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(streams.available_permits(), 1);
         assert_eq!(
-            app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-                .await
-                .unwrap()
-                .status(),
+            app.oneshot(
+                Request::builder()
+                    .uri("/download")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn absolute_body_deadline_stops_a_body_that_never_yields() {
+        let inner = Body::from_stream(futures_util::stream::pending::<io::Result<Bytes>>());
+        let body = Body::new(AbsoluteDeadlineBody {
+            inner,
+            deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))),
+            timed_out: false,
+        });
+        let error = axum::body::to_bytes(body, 1024)
+            .await
+            .expect_err("pending body must hit its absolute deadline");
+        assert!(error.to_string().contains("deadline"));
+        assert!(!upload_request_path("/login"));
+        assert!(upload_request_path("/v/token/upload"));
+        assert!(upload_request_path("/api/v1/public/shares/token/upload"));
+    }
+
+    #[tokio::test]
+    async fn public_transfer_deadline_stops_a_stream_that_never_yields() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let mut stream = TransferBodyStream {
+            inner: Box::pin(futures_util::stream::pending()),
+            database: state.db,
+            runtime: state.runtime,
+            lease_token: None,
+            client_ip: None,
+            action: "download",
+            share_id: 1,
+            heartbeat_stop: None,
+            finalize: None,
+            pending_chunk: None,
+            remaining_bytes: None,
+            deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))),
+            timed_out: false,
+            complete: false,
+        };
+        let error = tokio::time::timeout(std::time::Duration::from_millis(250), stream.next())
+            .await
+            .expect("transfer deadline must wake the stream")
+            .expect("deadline returns one terminal error")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_cancellation_releases_unclaimed_transfer_and_upload_begins() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        let transfer_share = state
+            .db
+            .create_share(
+                "cancelled-transfer",
+                None,
+                "file.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let upload_share = state
+            .db
+            .create_share_with_upload_limits(
+                "cancelled-upload",
+                None,
+                "uploads",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                Some(10),
+                Some(100),
+                Some(10),
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+
+        let transfer_database = state.db.clone();
+        let (transfer_ready_sender, transfer_ready_receiver) = tokio::sync::oneshot::channel();
+        let transfer_request = tokio::spawn(async move {
+            let pending = begin_transfer_lease_cancellation_safe(
+                transfer_database,
+                "cancelled-session".into(),
+                "cancelled-lease".into(),
+                transfer_share,
+                "file.txt".into(),
+                "download",
+            )
+            .await
+            .unwrap();
+            assert_eq!(pending.outcome(), TransferLeaseBeginOutcome::NewLease);
+            transfer_ready_sender.send(()).unwrap();
+            std::future::pending::<()>().await;
+            pending.claim();
+        });
+        transfer_ready_receiver.await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .active_transfer_reservations(transfer_share)
+                .unwrap(),
+            1
+        );
+        transfer_request.abort();
+        let _ = transfer_request.await;
+        for _ in 0..100 {
+            if state
+                .db
+                .active_transfer_reservations(transfer_share)
+                .unwrap()
+                == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            state
+                .db
+                .active_transfer_reservations(transfer_share)
+                .unwrap(),
+            0
+        );
+
+        let upload_database = state.db.clone();
+        let (upload_ready_sender, upload_ready_receiver) = tokio::sync::oneshot::channel();
+        let upload_request = tokio::spawn(async move {
+            let pending = begin_upload_reservation_cancellation_safe(
+                upload_database,
+                "cancelled-upload-reservation".into(),
+                upload_share,
+            )
+            .await
+            .unwrap();
+            assert_eq!(pending.outcome(), UploadReservationBeginOutcome::Reserved);
+            upload_ready_sender.send(()).unwrap();
+            std::future::pending::<()>().await;
+            pending.claim();
+        });
+        upload_ready_receiver.await.unwrap();
+        assert_eq!(
+            state.db.active_upload_reservations(upload_share).unwrap(),
+            1
+        );
+        upload_request.abort();
+        let _ = upload_request.await;
+        for _ in 0..100 {
+            if state.db.active_upload_reservations(upload_share).unwrap() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            state.db.active_upload_reservations(upload_share).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn reservation_drop_schedules_blocking_cleanup_before_immediate_runtime_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        let transfer_share = state
+            .db
+            .create_share(
+                "shutdown-transfer",
+                None,
+                "file.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let upload_share = state
+            .db
+            .create_share_with_upload_limits(
+                "shutdown-upload",
+                None,
+                "uploads",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                Some(10),
+                Some(100),
+                Some(10),
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let database = state.db.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert_eq!(
+                database
+                    .begin_transfer_lease(
+                        "shutdown-session",
+                        "shutdown-lease",
+                        transfer_share,
+                        "file.txt",
+                        "download",
+                    )
+                    .unwrap(),
+                TransferLeaseBeginOutcome::NewLease
+            );
+            assert_eq!(
+                database
+                    .begin_upload_reservation("shutdown-upload-reservation", upload_share)
+                    .unwrap(),
+                UploadReservationBeginOutcome::Reserved
+            );
+            let _transfer = PublicTransferLease {
+                lease_token: Some("shutdown-lease".into()),
+                cookie: String::new(),
+                heartbeat_stop: None,
+                database: database.clone(),
+                client_ip: None,
+            };
+            let _upload =
+                UploadQuotaReservation::new(database.clone(), "shutdown-upload-reservation".into());
+        });
+        drop(runtime);
+
+        assert_eq!(
+            database
+                .active_transfer_reservations(transfer_share)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database.active_upload_reservations(upload_share).unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_length_transfer_counts_before_its_first_payload_chunk_is_yielded() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = state
+            .db
+            .create_share(
+                "direct-stream",
+                None,
+                "file.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .begin_transfer_lease(
+                    "direct-session",
+                    "direct-lease",
+                    share_id,
+                    ".",
+                    "zip_download",
+                )
+                .unwrap(),
+            TransferLeaseBeginOutcome::NewLease
+        );
+        let transfer = PublicTransferLease {
+            lease_token: Some("direct-lease".into()),
+            cookie: String::new(),
+            heartbeat_stop: None,
+            database: state.db.clone(),
+            client_ip: None,
+        };
+        let source = futures_util::stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"first")),
+            Ok(Bytes::from_static(b"second")),
+        ]);
+        let mut body = transfer_body(source, &state, transfer, "zip_download", share_id, None)
+            .into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"first");
+        drop(body); // no EOF poll and no second payload chunk
+        assert_eq!(
+            state
+                .db
+                .share_by_token("direct-stream")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
+        assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn known_length_transfer_counts_before_n_minus_one_bytes_are_yielded() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        let share_id = state
+            .db
+            .create_share(
+                "known-stream",
+                None,
+                "file.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .begin_transfer_lease("known-session", "known-lease", share_id, ".", "download",)
+                .unwrap(),
+            TransferLeaseBeginOutcome::NewLease
+        );
+        let transfer = PublicTransferLease {
+            lease_token: Some("known-lease".into()),
+            cookie: String::new(),
+            heartbeat_stop: None,
+            database: state.db.clone(),
+            client_ip: None,
+        };
+        let source = futures_util::stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"abcde")),
+            Ok(Bytes::from_static(b"f")),
+        ]);
+        let mut body = transfer_body(source, &state, transfer, "download", share_id, Some(6))
+            .into_data_stream();
+
+        assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"abcde");
+        assert_eq!(
+            state
+                .db
+                .share_by_token("known-stream")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
+        assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 0);
+        drop(body); // the final byte is never requested
+    }
+
+    #[tokio::test]
+    async fn response_body_wrappers_chunk_buffered_data_and_deadline_streams() {
+        let counts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let peer = "192.0.2.1".parse().unwrap();
+        let buffered_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let buffered_permit = buffered_slots.clone().try_acquire_owned().unwrap();
+        let buffered_peer = try_acquire_client_activity(counts.clone(), peer, 1)
+            .unwrap()
+            .unwrap();
+        let input = vec![7u8; BUFFERED_RESPONSE_CHUNK_BYTES * 2 + 17];
+        let body = Body::new(BufferedAdmissionBody {
+            inner: Body::from(input.clone()),
+            _permit: buffered_permit,
+            _peer_permit: buffered_peer,
+            pending: None,
+            complete: false,
+            deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(1))),
+        });
+        let mut stream = body.into_data_stream();
+        let mut output = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= BUFFERED_RESPONSE_CHUNK_BYTES);
+            output.extend_from_slice(&chunk);
+        }
+        assert_eq!(output, input);
+        drop(stream);
+        assert_eq!(buffered_slots.available_permits(), 1);
+        assert!(counts.lock().unwrap().is_empty());
+
+        let stream_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let stream_permit = stream_slots.clone().try_acquire_owned().unwrap();
+        let stream_peer = try_acquire_client_activity(counts.clone(), peer, 1)
+            .unwrap()
+            .unwrap();
+        let body = Body::new(StreamAdmissionBody {
+            inner: Body::from_stream(futures_util::stream::pending::<io::Result<Bytes>>()),
+            _permit: stream_permit,
+            _peer_permit: stream_peer,
+            deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))),
+            complete: false,
+        });
+        let error = axum::body::to_bytes(body, 1024)
+            .await
+            .expect_err("pending stream must hit the response deadline");
+        assert!(error.to_string().contains("lifetime"));
+        assert_eq!(stream_slots.available_permits(), 1);
+        assert!(counts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn client_activity_limits_group_ipv6_prefixes_and_release_on_drop() {
+        let counts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let first = proxy::client_limit_key("2001:db8:1:2::1".parse().unwrap());
+        let rotated = proxy::client_limit_key("2001:db8:1:2:ffff::99".parse().unwrap());
+        let other_prefix = proxy::client_limit_key("2001:db8:1:3::1".parse().unwrap());
+        assert_eq!(first, rotated);
+        let permit = try_acquire_client_activity(counts.clone(), first, 1)
+            .unwrap()
+            .unwrap();
+        assert!(try_acquire_client_activity(counts.clone(), rotated, 1)
+            .unwrap()
+            .is_none());
+        let other = try_acquire_client_activity(counts.clone(), other_prefix, 1)
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert!(try_acquire_client_activity(counts.clone(), first, 1)
+            .unwrap()
+            .is_some());
+        drop(other);
     }
 
     #[tokio::test]
@@ -7649,6 +10054,44 @@ mod tests {
         request
     }
 
+    fn public_multipart_request_with_csrf(
+        uri: &str,
+        name: &str,
+        content: &[u8],
+        csrf: &str,
+    ) -> Request {
+        let boundary = "vaultlink-public-csrf-boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{csrf}\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::ACCEPT_LANGUAGE, "de")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        request
+    }
+
     fn admin_multipart_request(
         uri: &str,
         path: &str,
@@ -7813,6 +10256,50 @@ mod tests {
     }
 
     #[test]
+    fn text_preview_budget_tracks_the_retained_input_buffer() {
+        // Escaped HTML is emitted in bounded chunks, so the only large retained
+        // allocation is the pre-sized source buffer guarded by these permits.
+        assert_eq!(text_preview_render_permits(1_000_000), 1);
+        assert_eq!(text_preview_render_permits(MAX_TEXT_PREVIEW_SIZE), 64);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            crate::TEXT_PREVIEW_RENDER_BUDGET_PERMITS,
+        ));
+        let held = (0..crate::TEXT_PREVIEW_RENDER_BUDGET_PERMITS)
+            .map(|_| {
+                semaphore
+                    .clone()
+                    .try_acquire_many_owned(text_preview_render_permits(1_000_000))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(semaphore
+            .clone()
+            .try_acquire_many_owned(text_preview_render_permits(1_000_000))
+            .is_err());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn text_preview_stream_escapes_in_bounded_chunks_and_enforces_the_output_cap() {
+        let text = "<&\"'ä".repeat(20_000);
+        let expected = format!("prefix{}suffix", esc(&text));
+        let template = format!("prefix{TEXT_PREVIEW_STREAM_MARKER}suffix");
+        let (mut stream, declared_length) = escaped_text_page_stream(template, text).unwrap();
+        let mut rendered = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= BUFFERED_RESPONSE_CHUNK_BYTES);
+            rendered.extend_from_slice(&chunk);
+        }
+        assert_eq!(declared_length, rendered.len() as u64);
+        assert_eq!(rendered, expected.as_bytes());
+
+        let oversized = "\"".repeat(MAX_RENDERED_TEXT_PREVIEW_BYTES / 6 + 1);
+        let template = format!("prefix{TEXT_PREVIEW_STREAM_MARKER}suffix");
+        assert!(escaped_text_page_stream(template, oversized).is_err());
+    }
+
+    #[test]
     fn missing_session_error_redirects_to_login() {
         let response = AppError(StatusCode::SEE_OTHER, "/login").into_response();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -7881,11 +10368,16 @@ mod tests {
             expires_at,
             max_downloads: None,
             max_upload_size: None,
+            max_upload_total_size: None,
+            max_upload_files: None,
+            uploaded_bytes: 0,
+            uploaded_files: 0,
             download_count: 0,
             active,
             password_hash: None,
             upload_conflict_strategy: UploadConflictStrategy::Reject,
             created_at: Utc::now().to_rfc3339(),
+            upload_policy_epoch: 0,
         };
         assert!(usable(&share(false, None)).is_err());
         assert!(usable(&share(true, Some(Utc::now() - Duration::seconds(1)))).is_err());
@@ -7904,6 +10396,11 @@ mod tests {
         assert_eq!(human(1_500_000_000), "1.5 GB");
         assert_eq!(format_unit_floor(53_687_091_200, GB), "53");
         assert_eq!(display_limit_unit_floor(1_073_741_824, GB), "1");
+        assert_eq!(display_limit_unit_ceil(120_000_000_001, GB), "121");
+        assert_eq!(
+            display_limit_unit_ceil(u64::MAX, GB),
+            u64::MAX.div_ceil(GB).to_string()
+        );
         assert_eq!(
             parse_unit_to_bytes("1.5", GB, "bad").unwrap(),
             1_500_000_000
@@ -8277,12 +10774,16 @@ mod tests {
         settings.max_media_preview_size = 100_000_000;
 
         let html = i18n::scope(Locale::De, "/admin/settings".into(), async {
-            i18n::render_markers(Locale::De, &settings_form(&session, &settings, 0, ""))
+            i18n::render_markers(
+                Locale::De,
+                &settings_form(&session, &settings, 0, "", false),
+            )
         })
         .await;
-        assert!(
-            html.contains(r#"name="max_upload_size_gb" type="number" min="1" step="1" value="53""#)
-        );
+        assert!(html.contains(&format!(
+            r#"name="max_upload_size_gb" type="number" min="1" max="{}" step="1" value="53""#,
+            display_limit_unit_floor(crate::config::MAX_UPLOAD_SIZE, GB)
+        )));
         assert!(html.contains(r#"name="max_zip_size_gb" type="number" min="0" step="1" value="1""#));
         assert!(html.contains(
             r#"name="max_preview_size_mb" type="number" min="1" max="64" step="1" value="1""#
@@ -8396,6 +10897,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webauthn_mfa_start_is_rate_limited_before_credential_work() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut state = test_state(root.path(), data.path());
+        state.limiter = crate::auth::LoginLimiter::new(1, std::time::Duration::from_secs(300));
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_session(
+                "webauthn-pending",
+                1,
+                "webauthn-csrf",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap();
+        let app = router(state);
+
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mfa/security-key/start")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, "vaultlink_session=webauthn-pending")
+                .body(Body::from(r#"{"csrf":"webauthn-csrf"}"#))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
     async fn http_login_mfa_csrf_session_and_logout() {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -8432,7 +10970,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(login.status(), StatusCode::SEE_OTHER);
-        let cookie = login
+        let pre_mfa_cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let pre_mfa_session_token = pre_mfa_cookie.split_once('=').unwrap().1.to_string();
+        let pre_mfa_csrf = state
+            .db
+            .session(&pre_mfa_session_token)
+            .unwrap()
+            .unwrap()
+            .csrf_token;
+        let mut mfa_page_request = request(Method::GET, "/mfa", "");
+        mfa_page_request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&pre_mfa_cookie).unwrap(),
+        );
+        let mfa_page = response_text(app.clone().oneshot(mfa_page_request).await.unwrap()).await;
+        assert!(mfa_page.contains(&format!("name=\"csrf\" value=\"{pre_mfa_csrf}\"")));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let code = auth::totp_code(&secret, now / 30).unwrap();
+        let mut wrong_mfa_csrf = request(Method::POST, "/mfa", &format!("csrf=wrong&code={code}"));
+        wrong_mfa_csrf.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&pre_mfa_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(wrong_mfa_csrf).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut mfa_request = request(
+            Method::POST,
+            "/mfa",
+            &format!("csrf={pre_mfa_csrf}&code={code}"),
+        );
+        mfa_request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&pre_mfa_cookie).unwrap(),
+        );
+        let mfa = app.clone().oneshot(mfa_request).await.unwrap();
+        assert_eq!(mfa.status(), StatusCode::SEE_OTHER);
+        let cookie = mfa
             .headers()
             .get(header::SET_COOKIE)
             .unwrap()
@@ -8443,17 +11030,7 @@ mod tests {
             .unwrap()
             .to_string();
         let session_token = cookie.split_once('=').unwrap().1.to_string();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let code = auth::totp_code(&secret, now / 30).unwrap();
-        let mut mfa_request = request(Method::POST, "/mfa", &format!("code={code}"));
-        mfa_request
-            .headers_mut()
-            .insert(header::COOKIE, HeaderValue::from_str(&cookie).unwrap());
-        let mfa = app.clone().oneshot(mfa_request).await.unwrap();
-        assert_eq!(mfa.status(), StatusCode::SEE_OTHER);
+        assert!(state.db.session(&pre_mfa_session_token).unwrap().is_none());
 
         let mut admin_request = request(Method::GET, "/admin", "");
         admin_request
@@ -8498,6 +11075,7 @@ mod tests {
         std::fs::write(root.path().join("file.txt"), b"file").unwrap();
         std::fs::create_dir(root.path().join("uploads")).unwrap();
         let state = test_state(root.path(), data.path());
+        state.runtime.write().unwrap().max_upload_size = 120_000_000_001;
         state.db.create_admin("admin", "hash", "secret").unwrap();
         state
             .db
@@ -8580,6 +11158,9 @@ mod tests {
         assert!(folder.contains(r#"<input type="hidden" name="path" value="uploads">"#));
         assert!(folder.contains(r#"pattern="[A-Za-z0-9_-]{12,32}""#));
         assert!(folder.contains(r#"value="upload_only""#));
+        assert!(folder.contains(
+            r#"name="max_upload_total_size_gb" type="number" min="1" step="1" value="121" required"#
+        ));
 
         let mut file_request = request(Method::GET, "/admin/shares/new?path=file.txt", "");
         file_request.headers_mut().insert(header::COOKIE, cookie);
@@ -8831,7 +11412,7 @@ mod tests {
                 &UploadConflictStrategy::Reject,
             )
             .unwrap();
-        state
+        let known_length_id = state
             .db
             .create_share(
                 "known-length",
@@ -9034,8 +11615,8 @@ mod tests {
             StatusCode::OK
         );
 
-        // HTTP/1 stops polling a response body after exactly Content-Length bytes.
-        // The final chunk therefore must not become visible until the lease is counted.
+        // The first non-empty known-length payload chunk consumes the transfer
+        // before it is yielded, even if the consumer never polls source EOF.
         let known_length = app
             .clone()
             .oneshot(request(Method::GET, "/v/known-length/download", ""))
@@ -9045,6 +11626,17 @@ mod tests {
         let mut body = known_length.into_body().into_data_stream();
         assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"abcdef");
         drop(body); // deliberately never poll the stream to EOF
+        for _ in 0..100 {
+            if state
+                .db
+                .active_transfer_reservations(known_length_id)
+                .unwrap()
+                == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
         assert_eq!(
             state
                 .db
@@ -9053,6 +11645,14 @@ mod tests {
                 .unwrap()
                 .download_count,
             1
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/known-length/download", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
         );
 
         let empty = app
@@ -9115,6 +11715,155 @@ mod tests {
                 .download_count,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn hyper_http1_counts_a_known_length_download_before_connection_close() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("http.txt"), b"abcdef").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "http-count",
+                None,
+                "http.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                b"GET /v/http-count/download HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.to_ascii_lowercase().contains("content-length: 6"));
+        assert!(!response
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"));
+        assert!(response.contains("abcdef"));
+        assert_eq!(
+            state
+                .db
+                .share_by_token("http-count")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            1
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn locked_public_shares_are_rejected_before_the_global_storage_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("protected.txt"), b"secret").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        let password_hash = auth::hash_password("share password 123").unwrap();
+        state
+            .db
+            .create_share(
+                "locked-fast",
+                None,
+                "protected.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                Some(password_hash.as_str()),
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = router(state.clone());
+
+        let _storage_guard = state.storage_mutation.lock().await;
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.clone()
+                .oneshot(request(Method::GET, "/v/locked-fast", "")),
+        )
+        .await
+        .expect("locked share page waited for the storage mutation lock")
+        .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(response_text(page).await.contains("Geschützte Freigabe"));
+
+        let download = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.oneshot(request(Method::GET, "/v/locked-fast/download", "")),
+        )
+        .await
+        .expect("locked download waited for the storage mutation lock")
+        .unwrap();
+        assert_eq!(download.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn detached_public_upload_finalizer_preserves_the_audit_client_ip() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("uploads")).unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "audit-upload",
+                None,
+                "uploads",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        state.runtime.write().unwrap().audit_client_ip_enabled = true;
+        let response = router(state.clone())
+            .oneshot(multipart_request(
+                "/v/audit-upload/upload",
+                "audit.txt",
+                b"content",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let events = state.db.list_audit(Some("upload"), 10, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].client_ip.as_deref(), Some("127.0.0.1"));
     }
 
     #[tokio::test]
@@ -9830,6 +12579,239 @@ mod tests {
         assert!(!javascript.contains("Promise.all"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn text_preview_reserves_transfer_and_render_capacity_before_reading() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        let preview_path = "lease-race-preview.txt";
+        std::fs::write(root.path().join("docs").join(preview_path), b"preview").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "preview-race",
+                None,
+                "docs",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                Some(1),
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let hook = Arc::new(TextPreviewReadTestHook {
+            path: preview_path.to_string(),
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            released: std::sync::Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
+        let hook_slot = TEXT_PREVIEW_READ_TEST_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+        assert!(hook_slot.lock().unwrap().replace(hook.clone()).is_none());
+        let hook_guard = TextPreviewReadTestGuard(hook.clone());
+
+        let app = router(state);
+        let first_app = app.clone();
+        let first = tokio::spawn(async move {
+            first_app
+                .oneshot(request(
+                    Method::GET,
+                    "/v/preview-race/preview?path=lease-race-preview.txt",
+                    "",
+                ))
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while hook.entered.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let second_app = app.clone();
+        let second = tokio::spawn(async move {
+            second_app
+                .oneshot(request(
+                    Method::GET,
+                    "/v/preview-race/preview?path=lease-race-preview.txt",
+                    "",
+                ))
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if second.is_finished() || hook.entered.load(Ordering::Acquire) >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let reads_before_release = hook.entered.load(Ordering::Acquire);
+        hook.release();
+
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        drop(hook_guard);
+        assert_eq!(reads_before_release, 1);
+        assert!(matches!(
+            (first.status(), second.status()),
+            (StatusCode::OK, StatusCode::GONE) | (StatusCode::GONE, StatusCode::OK)
+        ));
+        drop(first);
+        drop(second);
+
+        let render_root = tempfile::tempdir().unwrap();
+        let render_data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(render_root.path().join("docs")).unwrap();
+        let render_path = "render-budget-preview.txt";
+        std::fs::write(
+            render_root.path().join("docs").join(render_path),
+            b"preview",
+        )
+        .unwrap();
+        let render_state = test_state(render_root.path(), render_data.path());
+        render_state.runtime.write().unwrap().max_preview_size = MAX_TEXT_PREVIEW_SIZE;
+        render_state
+            .db
+            .create_admin("admin", "hash", "secret")
+            .unwrap();
+        render_state
+            .db
+            .create_share(
+                "preview-render-race",
+                None,
+                "docs",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let render_hook = Arc::new(TextPreviewReadTestHook {
+            path: render_path.to_string(),
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            released: std::sync::Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
+        assert!(hook_slot
+            .lock()
+            .unwrap()
+            .replace(render_hook.clone())
+            .is_none());
+        let render_hook_guard = TextPreviewReadTestGuard(render_hook.clone());
+        let render_app = router(render_state);
+        let first_render_app = render_app.clone();
+        let first_render = tokio::spawn(async move {
+            first_render_app
+                .oneshot(request(
+                    Method::GET,
+                    "/v/preview-render-race/preview?path=render-budget-preview.txt",
+                    "",
+                ))
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while render_hook.entered.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second_render = render_app
+            .oneshot(request(
+                Method::GET,
+                "/v/preview-render-race/preview?path=render-budget-preview.txt",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second_render.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(render_hook.entered.load(Ordering::Acquire), 1);
+        render_hook.release();
+        assert_eq!(first_render.await.unwrap().status(), StatusCode::OK);
+        drop(render_hook_guard);
+    }
+
+    #[tokio::test]
+    async fn public_zip_and_directory_scans_have_dedicated_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/note.txt"), b"note").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "admission",
+                None,
+                "docs",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let _zip_permits = state
+            .zip_generation_admission
+            .clone()
+            .try_acquire_many_owned(crate::MAX_CONCURRENT_ZIP_GENERATIONS as u32)
+            .unwrap();
+        let _search_permits = state
+            .search_admission
+            .clone()
+            .try_acquire_many_owned(crate::MAX_CONCURRENT_SEARCHES as u32)
+            .unwrap();
+        let app = router(state);
+
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/admission/download.zip", "",))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Method::GET, "/v/admission?q=note", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let long_query = "x".repeat(MAX_SEARCH_QUERY_BYTES + 1);
+        assert_eq!(
+            app.oneshot(request(
+                Method::GET,
+                &format!("/v/admission?q={long_query}"),
+                "",
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     #[tokio::test]
     async fn public_folder_preview_zip_search_and_subfolder_upload() {
         let root = tempfile::tempdir().unwrap();
@@ -10361,6 +13343,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("uploads")).unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        let password_hash = auth::hash_password("correct horse battery staple").unwrap();
+        let share_id = state
+            .db
+            .create_share_with_upload_limits(
+                "protected-upload",
+                None,
+                "uploads",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                Some(5),
+                Some(5),
+                Some(2),
+                1,
+                Some(&password_hash),
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let app = router(state.clone());
+
+        let unlock = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/v/protected-upload/unlock",
+                "password=correct+horse+battery+staple",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unlock.status(), StatusCode::SEE_OTHER);
+        let unlock_cookie = unlock
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let mut page_request = request(Method::GET, "/v/protected-upload", "");
+        page_request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        let page = response_text(app.clone().oneshot(page_request).await.unwrap()).await;
+        let csrf_marker = "name=\"csrf\" value=\"";
+        let csrf_start = page.find(csrf_marker).unwrap() + csrf_marker.len();
+        let csrf_end = csrf_start + page[csrf_start..].find('"').unwrap();
+        let upload_csrf = page[csrf_start..csrf_end].to_string();
+        assert!(!upload_csrf.is_empty());
+
+        let mut missing_csrf = multipart_request("/v/protected-upload/upload", "missing.txt", b"x");
+        missing_csrf.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(missing_csrf).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let mut wrong_csrf = public_multipart_request_with_csrf(
+            "/v/protected-upload/upload",
+            "wrong.txt",
+            b"x",
+            "wrong",
+        );
+        wrong_csrf.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(wrong_csrf).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let mut duplicate_cookie = public_multipart_request_with_csrf(
+            "/v/protected-upload/upload",
+            "duplicate.txt",
+            b"x",
+            &upload_csrf,
+        );
+        duplicate_cookie.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{unlock_cookie}; {}=attacker",
+                crate::http_auth::unlock_cookie_name(share_id)
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(duplicate_cookie)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let reserved_name = format!(".vaultlink-delete-{}.tombstone", "A".repeat(24));
+        let mut reserved = public_multipart_request_with_csrf(
+            "/v/protected-upload/upload",
+            &reserved_name,
+            b"x",
+            &upload_csrf,
+        );
+        reserved.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(reserved).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!root.path().join("uploads").join(&reserved_name).exists());
+        assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+        let share = state
+            .db
+            .share_by_token("protected-upload")
+            .unwrap()
+            .unwrap();
+        assert_eq!((share.uploaded_bytes, share.uploaded_files), (0, 0));
+
+        let mut accepted = public_multipart_request_with_csrf(
+            "/v/protected-upload/upload",
+            "first.txt",
+            b"1234",
+            &upload_csrf,
+        );
+        accepted.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(accepted).await.unwrap().status(),
+            StatusCode::SEE_OTHER
+        );
+        let share = state
+            .db
+            .share_by_token("protected-upload")
+            .unwrap()
+            .unwrap();
+        assert_eq!((share.uploaded_bytes, share.uploaded_files), (4, 1));
+
+        let mut conflict = public_multipart_request_with_csrf(
+            "/v/protected-upload/upload",
+            "first.txt",
+            b"5",
+            &upload_csrf,
+        );
+        conflict.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(conflict).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        for _ in 0..100 {
+            if state.db.active_upload_reservations(share_id).unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+
+        let mut over_quota =
+            multipart_request("/v/protected-upload/upload", "too-large.txt", b"56");
+        over_quota.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        over_quota.headers_mut().insert(
+            "x-vaultlink-upload-csrf",
+            HeaderValue::from_str(&upload_csrf).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(over_quota).await.unwrap().status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        for _ in 0..100 {
+            if state.db.active_upload_reservations(share_id).unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let share = state
+            .db
+            .share_by_token("protected-upload")
+            .unwrap()
+            .unwrap();
+        assert_eq!((share.uploaded_bytes, share.uploaded_files), (4, 1));
+        assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+
+        let mut exact_quota = multipart_request("/v/protected-upload/upload", "last.txt", b"5");
+        exact_quota.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&unlock_cookie).unwrap(),
+        );
+        exact_quota.headers_mut().insert(
+            "x-vaultlink-upload-csrf",
+            HeaderValue::from_str(&upload_csrf).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(exact_quota).await.unwrap().status(),
+            StatusCode::SEE_OTHER
+        );
+        let share = state
+            .db
+            .share_by_token("protected-upload")
+            .unwrap()
+            .unwrap();
+        assert_eq!((share.uploaded_bytes, share.uploaded_files), (5, 2));
+    }
+
+    #[tokio::test]
     async fn external_writers_disable_saved_public_overwrite_policy() {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -10368,6 +13574,16 @@ mod tests {
         std::fs::write(root.path().join("uploads/report.txt"), b"external").unwrap();
         let mut state = test_state(root.path(), data.path());
         state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_session(
+                "external-admin-session",
+                1,
+                "external-csrf",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap();
+        state.db.verify_mfa("external-admin-session").unwrap();
         state
             .db
             .create_share(
@@ -10397,6 +13613,17 @@ mod tests {
         )
         .await;
         assert!(!page.contains("overwrite_existing"));
+
+        let mut admin_request = request(Method::GET, "/admin/shares", "");
+        admin_request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=external-admin-session"),
+        );
+        let admin_page = response_text(app.clone().oneshot(admin_request).await.unwrap()).await;
+        assert!(admin_page.contains("max_upload_total_size"));
+        assert!(admin_page.contains("max_upload_files"));
+        assert!(!admin_page.contains("overwrite_allowed"));
+
         let response = app
             .oneshot(multipart_request_with_options(
                 "/v/external-writers/upload",

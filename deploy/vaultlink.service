@@ -4,6 +4,8 @@ After=network-online.target local-fs.target remote-fs.target
 Wants=network-online.target
 
 [Service]
+# Exactly one serving unit may use a given storage.internal_directory. VaultLink
+# enforces this with its private lifetime lock and fails startup on contention.
 Type=simple
 User=vaultlink
 Group=vaultlink

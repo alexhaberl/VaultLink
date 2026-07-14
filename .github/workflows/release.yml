@@ -98,7 +98,7 @@ jobs:
             test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
             tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
             main_commit=$(git rev-parse refs/remotes/origin/main)
-            git merge-base --is-ancestor "$tag_commit" "$main_commit"
+            test "$tag_commit" = "$main_commit"
           fi
           sh tools/check-supply-chain-policy.sh
       - name: Install pinned SBOM tool
@@ -134,12 +134,13 @@ jobs:
           sbom_name="vaultlink-${version}-debian13-${arch}.cdx.json"
           checksums="SHA256SUMS-${arch}"
           test ! -e dist
-          install -d "dist/$root/bin" "dist/$root/config" "dist/$root/deploy"
+          install -d "dist/$root/bin" "dist/$root/config" "dist/$root/deploy" "dist/$root/docs"
           install -m 0755 target/release/vaultlink "dist/$root/bin/vaultlink"
           install -m 0755 target/release/vaultlink "dist/$binary"
           install -m 0644 README.md CHANGELOG.md SECURITY.md LICENSE rust-toolchain.toml "dist/$root/"
           cp config/*.toml "dist/$root/config/"
           cp -R deploy/. "dist/$root/deploy/"
+          cp -R docs/. "dist/$root/docs/"
           if [ -s release/minisign.pub ]; then cp release/minisign.pub "dist/$root/"; fi
           sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print -quit)
           test -n "$sbom"
@@ -207,7 +208,7 @@ jobs:
             test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
             tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
             main_commit=$(git rev-parse refs/remotes/origin/main)
-            git merge-base --is-ancestor "$tag_commit" "$main_commit"
+            test "$tag_commit" = "$main_commit"
           fi
           sh tools/check-supply-chain-policy.sh
       - name: Download native build outputs
@@ -323,11 +324,28 @@ jobs:
           test "$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 8
           cd dist
           for arch in amd64 arm64; do
-            test -s "VaultLink-${PACKAGE_VERSION}-debian13-${arch}.tar.gz"
+            root="VaultLink-${PACKAGE_VERSION}-debian13-${arch}"
+            archive="${root}.tar.gz"
+            test -s "$archive"
             test -s "vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
             test -s "vaultlink-${PACKAGE_VERSION}-debian13-${arch}.cdx.json"
             test -s "SHA256SUMS-${arch}"
             sha256sum -c "SHA256SUMS-${arch}"
+            archive_listing=$(tar -tzf "$archive")
+            for required_path in \
+              "$root/README.md" \
+              "$root/bin/vaultlink" \
+              "$root/config/production-reverse-proxy.toml" \
+              "$root/deploy/vaultlink-upgrade.sh" \
+              "$root/deploy/vaultlink-rollback.sh" \
+              "$root/docs/RELEASE-CHECKLIST.md" \
+              "$root/docs/UPGRADE-ROLLBACK.md"; do
+              grep -F -x -q "$required_path" <<<"$archive_listing"
+            done
+            if grep -E -q '(^|/)vaultlink-(staging-deploy|cert-renew|cert-deploy)' <<<"$archive_listing"; then
+              echo "$archive contains a removed legacy deployment component" >&2
+              exit 1
+            fi
           done
       - name: Upload combined dry-run artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -62,10 +62,10 @@ immutable workflow artifacts, verifies `SHA256SUMS-amd64` and
 Release asset names identify version, Debian baseline, and architecture, for
 example:
 
-- `VaultLink-0.4.2-debian13-amd64.tar.gz`
-- `VaultLink-0.4.2-debian13-arm64.tar.gz`
-- `vaultlink-0.4.2-debian13-ARCH`
-- `vaultlink-0.4.2-debian13-ARCH.cdx.json`
+- `VaultLink-0.4.3-debian13-amd64.tar.gz`
+- `VaultLink-0.4.3-debian13-arm64.tar.gz`
+- `vaultlink-0.4.3-debian13-ARCH`
+- `vaultlink-0.4.3-debian13-ARCH.cdx.json`
 - `SHA256SUMS-ARCH`
 
 Archives, standalone binaries, and checksum manifests receive separate

@@ -1,12 +1,14 @@
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::{
+    collections::{HashMap, HashSet},
     env,
     future::Future,
     io,
+    net::IpAddr,
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
@@ -25,28 +27,96 @@ use vaultlink::{
 };
 
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
-const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
-const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ACTIVE_CONNECTIONS: usize = 256;
+const MAX_ACTIVE_CONNECTIONS_PER_PEER: usize = 32;
+const CONNECTION_ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
+const RESPONSE_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone)]
 struct ConnectionLimitAcceptor<A> {
     inner: A,
     permits: Arc<Semaphore>,
+    peer_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    trusted_proxy_peers: Arc<HashSet<IpAddr>>,
+    max_connections_per_peer: usize,
+    accept_timeout: Duration,
 }
 
 impl<A> ConnectionLimitAcceptor<A> {
-    fn new(inner: A) -> Self {
+    fn new(inner: A, trusted_proxy_peers: Arc<HashSet<IpAddr>>) -> Self {
         Self {
             inner,
             permits: Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS)),
+            peer_connections: Arc::new(Mutex::new(HashMap::new())),
+            trusted_proxy_peers,
+            max_connections_per_peer: MAX_ACTIVE_CONNECTIONS_PER_PEER,
+            accept_timeout: CONNECTION_ACCEPT_TIMEOUT,
+        }
+    }
+}
+
+struct ConnectionPermit {
+    _global: OwnedSemaphorePermit,
+    peer_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    peer: IpAddr,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let Ok(mut peers) = self.peer_connections.lock() else {
+            return;
+        };
+        if let Some(count) = peers.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                peers.remove(&self.peer);
+            }
         }
     }
 }
 
 struct ConnectionLimitedIo<I> {
     inner: I,
-    _permit: OwnedSemaphorePermit,
+    _permit: ConnectionPermit,
+    write_timeout: Option<Pin<Box<tokio::time::Sleep>>>,
+    write_idle_timeout: Duration,
+    connection_deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<I> ConnectionLimitedIo<I> {
+    fn poll_write_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if self.connection_deadline.as_mut().poll(cx).is_ready() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "absolute HTTP connection lifetime exceeded",
+            ));
+        }
+        if self
+            .write_timeout
+            .as_mut()
+            .is_some_and(|timeout| timeout.as_mut().poll(cx).is_ready())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP response write made no progress before the deadline",
+            ));
+        }
+        Ok(())
+    }
+
+    fn track_incomplete_write(&mut self, cx: &mut Context<'_>, incomplete: bool) {
+        if incomplete {
+            if self.write_timeout.is_none() {
+                self.write_timeout = Some(Box::pin(tokio::time::sleep(self.write_idle_timeout)));
+            }
+            if let Some(timeout) = self.write_timeout.as_mut() {
+                let _ = timeout.as_mut().poll(cx);
+            }
+        } else {
+            self.write_timeout = None;
+        }
+    }
 }
 
 impl<I: AsyncRead + Unpin> AsyncRead for ConnectionLimitedIo<I> {
@@ -55,7 +125,14 @@ impl<I: AsyncRead + Unpin> AsyncRead for ConnectionLimitedIo<I> {
         cx: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buffer)
+        let this = self.get_mut();
+        if this.connection_deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "absolute HTTP connection lifetime exceeded",
+            )));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buffer)
     }
 }
 
@@ -65,15 +142,38 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
         cx: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buffer)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_write_deadline(cx) {
+            return Poll::Ready(Err(error));
+        }
+        let result = Pin::new(&mut this.inner).poll_write(cx, buffer);
+        let incomplete = match &result {
+            Poll::Pending => true,
+            Poll::Ready(Ok(written)) => *written < buffer.len(),
+            Poll::Ready(Err(_)) => false,
+        };
+        this.track_incomplete_write(cx, incomplete);
+        result
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_write_deadline(cx) {
+            return Poll::Ready(Err(error));
+        }
+        let result = Pin::new(&mut this.inner).poll_flush(cx);
+        this.track_incomplete_write(cx, result.is_pending());
+        result
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_write_deadline(cx) {
+            return Poll::Ready(Err(error));
+        }
+        let result = Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.track_incomplete_write(cx, result.is_pending());
+        result
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -85,13 +185,25 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
         cx: &mut Context<'_>,
         buffers: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, buffers)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_write_deadline(cx) {
+            return Poll::Ready(Err(error));
+        }
+        let result = Pin::new(&mut this.inner).poll_write_vectored(cx, buffers);
+        let requested = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+        let incomplete = match &result {
+            Poll::Pending => true,
+            Poll::Ready(Ok(written)) => *written < requested,
+            Poll::Ready(Err(_)) => false,
+        };
+        this.track_incomplete_write(cx, incomplete);
+        result
     }
 }
 
-impl<I, S, A> Accept<I, S> for ConnectionLimitAcceptor<A>
+impl<S, A> Accept<tokio::net::TcpStream, S> for ConnectionLimitAcceptor<A>
 where
-    A: Accept<I, S>,
+    A: Accept<tokio::net::TcpStream, S>,
     A::Future: Send + 'static,
     A::Stream: Send + 'static,
     A::Service: Send + 'static,
@@ -101,7 +213,17 @@ where
     type Future =
         Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send + 'static>>;
 
-    fn accept(&self, stream: I, service: S) -> Self::Future {
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let raw_peer = match stream.peer_addr() {
+            Ok(address) => address.ip(),
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        let peer = vaultlink::proxy::client_limit_key(raw_peer);
+        let max_connections_per_peer = peer_connection_limit(
+            raw_peer,
+            &self.trusted_proxy_peers,
+            self.max_connections_per_peer,
+        );
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -113,17 +235,70 @@ where
                 });
             }
         };
+        {
+            let mut peers = match self.peer_connections.lock() {
+                Ok(peers) => peers,
+                Err(_) => {
+                    return Box::pin(async {
+                        Err(io::Error::other("connection limiter lock poisoned"))
+                    });
+                }
+            };
+            let count = peers.entry(peer).or_default();
+            if *count >= max_connections_per_peer {
+                return Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "per-peer HTTP connection limit reached",
+                    ))
+                });
+            }
+            *count += 1;
+        }
+        let connection_permit = ConnectionPermit {
+            _global: permit,
+            peer_connections: self.peer_connections.clone(),
+            peer,
+        };
         let future = self.inner.accept(stream, service);
+        let accept_timeout = self.accept_timeout;
         Box::pin(async move {
-            let (inner, service) = future.await?;
+            // `inner.accept` includes the TLS/ACME handshake. HTTP header/body
+            // deadlines only begin afterwards, so bound this phase separately.
+            let (inner, service) = tokio::time::timeout(accept_timeout, future)
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "connection accept or TLS handshake timed out",
+                    )
+                })??;
             Ok((
                 ConnectionLimitedIo {
                     inner,
-                    _permit: permit,
+                    _permit: connection_permit,
+                    write_timeout: None,
+                    write_idle_timeout: RESPONSE_WRITE_IDLE_TIMEOUT,
+                    connection_deadline: Box::pin(tokio::time::sleep(MAX_CONNECTION_LIFETIME)),
                 },
                 service,
             ))
         })
+    }
+}
+
+fn peer_connection_limit(
+    raw_peer: IpAddr,
+    trusted_proxy_peers: &HashSet<IpAddr>,
+    untrusted_limit: usize,
+) -> usize {
+    if trusted_proxy_peers.contains(&raw_peer) {
+        // All connections from a trusted reverse proxy commonly arrive from one
+        // raw socket peer. Give only that explicitly configured peer the global
+        // budget; direct clients keep the smaller per-peer abuse boundary.
+        MAX_ACTIVE_CONNECTIONS
+    } else {
+        untrusted_limit
     }
 }
 
@@ -137,13 +312,6 @@ fn harden_http_server<Addr: axum_server::Address, Acceptor>(
         .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT))
         .max_headers(64)
         .max_buf_size(64 * 1024);
-    server
-        .http_builder()
-        .http2()
-        .timer(TokioTimer::new())
-        .max_concurrent_streams(Some(64))
-        .keep_alive_interval(Some(HTTP2_KEEP_ALIVE_INTERVAL))
-        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
 }
 
 #[tokio::main]
@@ -189,23 +357,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return init_admin(&config, &args);
     }
     let state = AppState::new(config.clone())?;
+    vaultlink::file_ops::recover_pending_file_operations(&state).await?;
+    let effective_public_base_url = state
+        .runtime
+        .read()
+        .map_err(|_| io::Error::other("runtime settings lock poisoned"))?
+        .public_base_url
+        .clone();
     start_upload_fragment_cleanup(&state);
     let addr: std::net::SocketAddr = config.server.listen_address.parse()?;
+    let trusted_proxy_peers = Arc::new(if config.server.mode == ServerMode::ReverseProxy {
+        config
+            .reverse_proxy
+            .trusted_proxies
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    });
     let app = web::router(state);
     tracing::info!(%addr,mode=?config.server.mode,"VaultLink starting");
     match config.server.mode {
         ServerMode::StandaloneTls => match config.tls.certificate_source {
             CertificateSource::Files => {
-                let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                    &config.tls.cert_file,
-                    &config.tls.key_file,
-                )
-                .await?;
+                let tls =
+                    load_http1_rustls_config(&config.tls.cert_file, &config.tls.key_file).await?;
                 install_sighup_handler_for_files(&config, tls.clone());
                 let handle = axum_server::Handle::new();
                 install_server_shutdown(handle.clone());
-                let mut server =
-                    axum_server::bind_rustls(addr, tls).map(ConnectionLimitAcceptor::new);
+                // HTTP/2 can retain an already-buffered DATA frame without polling
+                // the response Body again when peer flow-control is zero. That
+                // bypasses Body deadlines and can pin ZIP/memory permits forever.
+                // HTTP/1.1 plus the socket write-idle timeout gives every response
+                // an independently enforceable progress boundary.
+                let mut server = axum_server::bind_rustls(addr, tls)
+                    .map(|acceptor| {
+                        ConnectionLimitAcceptor::new(acceptor, trusted_proxy_peers.clone())
+                    })
+                    .http1_only();
                 harden_http_server(&mut server);
                 server
                     .handle(handle)
@@ -214,7 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             CertificateSource::LetsEncrypt => {
                 install_noop_sighup_handler("ACME manages certificate renewal internally");
-                let public_url = url::Url::parse(&config.server.public_base_url)?;
+                let public_url = url::Url::parse(&effective_public_base_url)?;
                 let domain = public_url
                     .host_str()
                     .ok_or("public_base_url must contain a DNS host")?
@@ -247,7 +437,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 install_server_shutdown(handle.clone());
                 let mut server = axum_server::bind(addr)
                     .acceptor(acceptor)
-                    .map(ConnectionLimitAcceptor::new);
+                    .map(|acceptor| {
+                        ConnectionLimitAcceptor::new(acceptor, trusted_proxy_peers.clone())
+                    })
+                    .http1_only();
                 harden_http_server(&mut server);
                 server
                     .handle(handle)
@@ -259,7 +452,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             install_noop_sighup_handler("no reloadable TLS configuration in this mode");
             let handle = axum_server::Handle::new();
             install_server_shutdown(handle.clone());
-            let mut server = axum_server::bind(addr).map(ConnectionLimitAcceptor::new);
+            let mut server = axum_server::bind(addr)
+                .map(|acceptor| ConnectionLimitAcceptor::new(acceptor, trusted_proxy_peers.clone()))
+                .http1_only();
             harden_http_server(&mut server);
             server
                 .handle(handle)
@@ -461,11 +656,12 @@ fn recovery_database_path(
 fn init_admin(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let username = arg(args, "--username").ok_or("--username is required")?;
     validate_admin_username(username)?;
-    if config.storage.require_mount {
-        storage_mount::validate(&config.storage)?;
+    if !config.storage.require_mount {
+        std::fs::create_dir_all(&config.storage.data_directory)?;
     }
-    std::fs::create_dir_all(&config.storage.data_directory)?;
-    let database = Database::open(config.storage.data_directory.join("data.sqlite"))?;
+    let validated_storage = storage_mount::validate_and_open(&config.storage)?;
+    validated_storage.verify_path_bindings(&config.storage)?;
+    let database = Database::open_in_directory(validated_storage.data_file()?)?;
     if database.admin_count()? != 0 {
         return Err(
             "administrators already exist; init-admin is only available for initial setup".into(),
@@ -560,82 +756,77 @@ fn validate_admin_password(password: &str) -> Result<(), &'static str> {
 
 fn start_upload_fragment_cleanup(state: &AppState) {
     const CLEANUP_BATCH_ENTRIES: usize = 4096;
+    const CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(30);
 
     let secure_root = state.secure_root.clone();
     let cleanup_lock = state.storage_cleanup.clone();
-    let mut cleanup = match secure_root.start_upload_fragment_cleanup() {
-        Ok(cleanup) => cleanup,
-        Err(error) => {
-            tracing::warn!(%error, "could not start stale upload fragment cleanup");
-            return;
-        }
-    };
     tokio::spawn(async move {
-        let mut cleanup_guard = Some(cleanup_lock.lock().await);
-        let mut scanned = 0usize;
-        let mut removed = 0usize;
-        let mut failed = 0usize;
         loop {
-            let result = tokio::task::spawn_blocking(move || {
-                let batch = cleanup.run_batch(CLEANUP_BATCH_ENTRIES);
-                (cleanup, batch)
+            let cleanup_guard = cleanup_lock.clone().lock_owned().await;
+            let start_root = secure_root.clone();
+            let (mut cleanup_guard, mut cleanup) = match tokio::task::spawn_blocking(move || {
+                let cleanup = start_root.start_upload_fragment_cleanup();
+                (cleanup_guard, cleanup)
             })
-            .await;
-            let (next_cleanup, batch) = match result {
-                Ok(result) => result,
+            .await
+            {
+                Ok((cleanup_guard, Ok(cleanup))) => (cleanup_guard, cleanup),
+                Ok((_cleanup_guard, Err(error))) => {
+                    tracing::warn!(%error, "could not start stale upload fragment cleanup; retrying");
+                    tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
+                    continue;
+                }
                 Err(error) => {
-                    tracing::warn!(%error, "stale upload fragment cleanup task failed");
-                    return;
+                    tracing::warn!(%error, "stale upload fragment cleanup start task failed; retrying");
+                    tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
+                    continue;
                 }
             };
-            cleanup = next_cleanup;
-            let batch = match batch {
-                Ok(batch) => batch,
-                Err(error) => {
-                    tracing::warn!(%error, "could not continue stale upload fragment cleanup");
-                    return;
-                }
-            };
-            scanned = scanned.saturating_add(batch.scanned);
-            removed = removed.saturating_add(batch.removed);
-            failed = failed.saturating_add(batch.failed);
-            if batch.complete {
-                if removed > 0 || failed > 0 {
-                    tracing::info!(
-                        scanned,
-                        removed,
-                        failed,
-                        "stale upload fragment cleanup completed"
-                    );
-                }
-                if failed == 0 {
-                    return;
-                }
-                cleanup_guard.take();
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                cleanup_guard = Some(cleanup_lock.lock().await);
-                let restart_root = secure_root.clone();
-                cleanup = match tokio::task::spawn_blocking(move || {
-                    restart_root.start_upload_fragment_cleanup()
+            let mut scanned = 0usize;
+            let mut removed = 0usize;
+            let mut failed = 0usize;
+            let retry = loop {
+                let result = tokio::task::spawn_blocking(move || {
+                    let batch = cleanup.run_batch(CLEANUP_BATCH_ENTRIES);
+                    (cleanup, cleanup_guard, batch)
                 })
-                .await
-                {
-                    Ok(Ok(cleanup)) => cleanup,
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "could not restart stale storage cleanup");
-                        return;
-                    }
+                .await;
+                let (next_cleanup, next_guard, batch) = match result {
+                    Ok(result) => result,
                     Err(error) => {
-                        tracing::warn!(%error, "stale storage cleanup restart failed");
-                        return;
+                        tracing::warn!(%error, "stale upload fragment cleanup task failed; retrying");
+                        break true;
                     }
                 };
-                scanned = 0;
-                removed = 0;
-                failed = 0;
-                continue;
+                cleanup = next_cleanup;
+                cleanup_guard = next_guard;
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not continue stale upload fragment cleanup; retrying");
+                        break true;
+                    }
+                };
+                scanned = scanned.saturating_add(batch.scanned);
+                removed = removed.saturating_add(batch.removed);
+                failed = failed.saturating_add(batch.failed);
+                if batch.complete {
+                    if removed > 0 || failed > 0 {
+                        tracing::info!(
+                            scanned,
+                            removed,
+                            failed,
+                            "stale upload fragment cleanup completed"
+                        );
+                    }
+                    break failed > 0;
+                }
+                tokio::task::yield_now().await;
+            };
+            if !retry {
+                return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
         }
     });
 }
@@ -678,14 +869,29 @@ fn install_sighup_handler_for_files(config: &Config, tls: axum_server::tls_rustl
             return;
         };
         while signal.recv().await.is_some() {
-            match tls.reload_from_pem_file(&cert_file, &key_file).await {
-                Ok(()) => tracing::info!("TLS certificate reloaded after SIGHUP"),
+            match load_http1_rustls_config(&cert_file, &key_file).await {
+                Ok(replacement) => {
+                    tls.reload_from_config(replacement.get_inner());
+                    tracing::info!("TLS certificate reloaded after SIGHUP");
+                }
                 Err(error) => {
                     tracing::error!(%error, "TLS certificate reload failed; previous certificate remains active")
                 }
             }
         }
     });
+}
+
+async fn load_http1_rustls_config(
+    cert_file: impl AsRef<std::path::Path>,
+    key_file: impl AsRef<std::path::Path>,
+) -> io::Result<axum_server::tls_rustls::RustlsConfig> {
+    let loaded = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_file, key_file).await?;
+    let mut server_config = (*loaded.get_inner()).clone();
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        Arc::new(server_config),
+    ))
 }
 
 fn install_noop_sighup_handler(reason: &'static str) {
@@ -711,6 +917,31 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct PendingAcceptor;
+
+    impl<S> Accept<tokio::net::TcpStream, S> for PendingAcceptor
+    where
+        S: Send + 'static,
+    {
+        type Stream = tokio::net::TcpStream;
+        type Service = S;
+        type Future = Pin<
+            Box<
+                dyn Future<Output = io::Result<(tokio::net::TcpStream, Self::Service)>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
+        fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+            Box::pin(async move {
+                let _held = (stream, service);
+                std::future::pending::<io::Result<(tokio::net::TcpStream, S)>>().await
+            })
+        }
+    }
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -932,11 +1163,15 @@ mod tests {
         let limiter = ConnectionLimitAcceptor {
             inner: axum_server::accept::DefaultAcceptor::new(),
             permits: Arc::new(Semaphore::new(1)),
+            peer_connections: Arc::new(Mutex::new(HashMap::new())),
+            trusted_proxy_peers: Arc::new(HashSet::new()),
+            max_connections_per_peer: 2,
+            accept_timeout: CONNECTION_ACCEPT_TIMEOUT,
         };
-        let (_first_client, first_server) = tokio::io::duplex(64);
+        let (_first_client, first_server) = tcp_pair().await;
         let (held_connection, ()) = limiter.accept(first_server, ()).await.unwrap();
 
-        let (_second_client, second_server) = tokio::io::duplex(64);
+        let (_second_client, second_server) = tcp_pair().await;
         let error = limiter
             .accept(second_server, ())
             .await
@@ -945,7 +1180,131 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
 
         drop(held_connection);
-        let (_third_client, third_server) = tokio::io::duplex(64);
+        let (_third_client, third_server) = tcp_pair().await;
         assert!(limiter.accept(third_server, ()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connection_limiter_enforces_and_releases_the_peer_budget() {
+        let limiter = ConnectionLimitAcceptor {
+            inner: axum_server::accept::DefaultAcceptor::new(),
+            permits: Arc::new(Semaphore::new(2)),
+            peer_connections: Arc::new(Mutex::new(HashMap::new())),
+            trusted_proxy_peers: Arc::new(HashSet::new()),
+            max_connections_per_peer: 1,
+            accept_timeout: CONNECTION_ACCEPT_TIMEOUT,
+        };
+        let (_first_client, first_server) = tcp_pair().await;
+        let (held_connection, ()) = limiter.accept(first_server, ()).await.unwrap();
+
+        let (_second_client, second_server) = tcp_pair().await;
+        let error = limiter
+            .accept(second_server, ())
+            .await
+            .err()
+            .expect("the peer limit must reject the second connection");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+
+        drop(held_connection);
+        let (_third_client, third_server) = tcp_pair().await;
+        assert!(limiter.accept(third_server, ()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connection_limiter_times_out_stalled_tls_accept_and_releases_budgets() {
+        let limiter = ConnectionLimitAcceptor {
+            inner: PendingAcceptor,
+            permits: Arc::new(Semaphore::new(1)),
+            peer_connections: Arc::new(Mutex::new(HashMap::new())),
+            trusted_proxy_peers: Arc::new(HashSet::new()),
+            max_connections_per_peer: 1,
+            accept_timeout: Duration::from_millis(20),
+        };
+        let (_client, server) = tcp_pair().await;
+        let error = tokio::time::timeout(Duration::from_millis(250), limiter.accept(server, ()))
+            .await
+            .expect("the connection accept deadline must wake the task")
+            .err()
+            .expect("a stalled connection accept must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(limiter.permits.available_permits(), 1);
+        assert!(limiter.peer_connections.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn connection_peer_keys_group_ipv6_prefixes_and_mapped_ipv4() {
+        assert_eq!(
+            vaultlink::proxy::client_limit_key("2001:db8:1234:5678::1".parse().unwrap()),
+            "2001:db8:1234:5678::".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            vaultlink::proxy::client_limit_key("::ffff:192.0.2.7".parse().unwrap()),
+            "192.0.2.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn only_exact_trusted_proxy_peers_receive_the_global_budget() {
+        let trusted_peer = "192.0.2.10".parse::<IpAddr>().unwrap();
+        let trusted_proxy_peers = HashSet::from([trusted_peer]);
+        assert_eq!(
+            peer_connection_limit(
+                trusted_peer,
+                &trusted_proxy_peers,
+                MAX_ACTIVE_CONNECTIONS_PER_PEER,
+            ),
+            MAX_ACTIVE_CONNECTIONS
+        );
+        assert_eq!(
+            peer_connection_limit(
+                "192.0.2.11".parse().unwrap(),
+                &trusted_proxy_peers,
+                MAX_ACTIVE_CONNECTIONS_PER_PEER,
+            ),
+            MAX_ACTIVE_CONNECTIONS_PER_PEER
+        );
+        assert_eq!(
+            peer_connection_limit(
+                "::ffff:192.0.2.10".parse().unwrap(),
+                &trusted_proxy_peers,
+                MAX_ACTIVE_CONNECTIONS_PER_PEER,
+            ),
+            MAX_ACTIVE_CONNECTIONS_PER_PEER
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_io_times_out_when_response_writes_make_no_progress() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let peer = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let peer_connections = Arc::new(Mutex::new(HashMap::from([(peer, 1)])));
+        let global = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let (_client, server) = tokio::io::duplex(1);
+        let mut limited = ConnectionLimitedIo {
+            inner: server,
+            _permit: ConnectionPermit {
+                _global: global,
+                peer_connections,
+                peer,
+            },
+            write_timeout: None,
+            write_idle_timeout: Duration::from_millis(20),
+            connection_deadline: Box::pin(tokio::time::sleep(Duration::from_secs(1))),
+        };
+        limited.write_all(b"x").await.unwrap();
+        let error = tokio::time::timeout(Duration::from_millis(250), limited.write_all(b"y"))
+            .await
+            .expect("write deadline must wake the task")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
     }
 }

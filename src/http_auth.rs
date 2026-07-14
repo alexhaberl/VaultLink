@@ -1,5 +1,11 @@
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-use std::{future::Future, net::IpAddr};
+use std::{
+    collections::HashMap,
+    future::Future,
+    io,
+    net::{IpAddr, Ipv4Addr},
+    sync::{Arc, Mutex},
+};
 
 use axum::response::{IntoResponse, Redirect, Response};
 
@@ -10,6 +16,7 @@ use crate::{
 };
 
 pub const SESSION_COOKIE: &str = "vaultlink_session";
+pub const SECURE_SESSION_COOKIE: &str = "__Host-vaultlink_session";
 const TRANSFER_COOKIE_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 
 tokio::task_local! {
@@ -28,6 +35,72 @@ pub fn current_audit_client_ip() -> Option<IpAddr> {
         .try_with(|client_ip| *client_ip)
         .ok()
         .flatten()
+}
+
+pub fn enabled_audit_client_ip(state: &AppState) -> Option<String> {
+    runtime_settings(state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string())
+}
+
+/// Synchronous audit companion for mutations already running in a blocking
+/// database task. Calling this before that task returns guarantees the audit is
+/// attempted even if its HTTP request or the async runtime is shutting down.
+pub fn audit_sync(
+    database: &Database,
+    actor: &str,
+    action: &'static str,
+    object: Option<&str>,
+    detail: Option<&str>,
+    client_ip: Option<&str>,
+) {
+    if let Err(error) = database.audit_with_client_ip(actor, action, object, detail, client_ip) {
+        tracing::error!(?error, action, "could not persist audit event");
+    }
+}
+
+pub fn current_client_limit_key() -> IpAddr {
+    crate::proxy::client_limit_key(
+        current_audit_client_ip().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+    )
+}
+
+pub(crate) struct ClientActivityPermit {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    peer: IpAddr,
+}
+
+impl Drop for ClientActivityPermit {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.counts.lock() else {
+            return;
+        };
+        if let Some(count) = counts.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.peer);
+            }
+        }
+    }
+}
+
+pub(crate) fn try_acquire_client_activity(
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    peer: IpAddr,
+    maximum: usize,
+) -> io::Result<Option<ClientActivityPermit>> {
+    let mut active = counts
+        .lock()
+        .map_err(|_| io::Error::other("client admission lock poisoned"))?;
+    let count = active.entry(peer).or_default();
+    if *count >= maximum {
+        return Ok(None);
+    }
+    *count += 1;
+    drop(active);
+    Ok(Some(ClientActivityPermit { counts, peer }))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +140,56 @@ pub fn internal<T>(_: T) -> HttpAuthError {
     HttpAuthError::status(StatusCode::INTERNAL_SERVER_ERROR, "Interner Fehler")
 }
 
+fn argon2_busy<T>(_: T) -> HttpAuthError {
+    HttpAuthError::status(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Passwortverarbeitung vorübergehend ausgelastet",
+    )
+}
+
+pub async fn hash_password_admitted(state: &AppState, password: String) -> Result<String> {
+    let permit = state
+        .argon2_admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(argon2_busy)?;
+    tokio::task::spawn_blocking(move || {
+        // Keep the owned permit in the blocking task so cancelling the request
+        // cannot release capacity while Argon2 is still consuming CPU and RAM.
+        let _permit = permit;
+        crate::auth::hash_password(&password)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)
+}
+
+pub async fn verify_password_admitted(
+    state: &AppState,
+    password_hash: Option<String>,
+    password: String,
+) -> Result<bool> {
+    let permit = state
+        .argon2_admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(argon2_busy)?;
+    tokio::task::spawn_blocking(move || {
+        // Acquire before branching so known and unknown users receive the same
+        // overload response and both paths consume one admitted Argon2 job.
+        let _permit = permit;
+        match password_hash {
+            Some(hash) => crate::auth::verify_password(&hash, &password),
+            None => {
+                let _ = crate::auth::hash_password(&password);
+                false
+            }
+        }
+    })
+    .await
+    .map_err(internal)
+}
+
 pub async fn database<T, F>(database: Database, operation: F) -> Result<T>
 where
     T: Send + 'static,
@@ -85,11 +208,7 @@ pub async fn audit(
     object: Option<String>,
     detail: Option<String>,
 ) {
-    let client_ip = runtime_settings(state)
-        .audit_client_ip_enabled
-        .then(current_audit_client_ip)
-        .flatten()
-        .map(|ip| ip.to_string());
+    let client_ip = enabled_audit_client_ip(state);
     let result = database(state.db.clone(), move |db| {
         db.audit_with_client_ip(
             &actor,
@@ -117,8 +236,10 @@ pub async fn commit_runtime_settings(
     state: &AppState,
     next: RuntimeSettings,
     admin_id: i64,
+    audit_actor: String,
+    audit_detail: String,
 ) -> Result<()> {
-    let _security_settings_guard = state.security_settings_mutation.lock().await;
+    let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
     next.validate_for_config(&state.config)
         .map_err(|_| HttpAuthError::status(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
     let public_url_changed = runtime_settings(state).public_base_url != next.public_base_url;
@@ -150,12 +271,32 @@ pub async fn commit_runtime_settings(
     }
     let runtime = state.runtime.clone();
     let webauthn = state.webauthn.clone();
+    // Match the previous post-commit audit semantics: an update that enables
+    // client-IP auditing may record this request, while a disabling update may
+    // not. The database still re-checks the persisted setting at insert time.
+    let audit_client_ip = next
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
     database(state.db.clone(), move |database| {
+        // A cancelled request drops only the JoinHandle; the blocking database
+        // operation keeps this owned guard until the runtime/WebAuthn snapshot
+        // and SQLite commit have advanced together.
+        let _security_settings_guard = security_settings_guard;
         // Settings commits always acquire locks in Runtime -> Database order. Readers
         // therefore see the old snapshot until SQLite has committed the replacement.
         let mut current = runtime.write().expect("runtime settings lock poisoned");
         let pairs = next.pairs();
         database.replace_runtime_settings(&pairs, admin_id)?;
+        audit_sync(
+            &database,
+            &audit_actor,
+            "settings_updated",
+            None,
+            Some(&audit_detail),
+            audit_client_ip.as_deref(),
+        );
         *current = next;
         if let Some(replacement) = replacement_webauthn {
             *webauthn.write().expect("WebAuthn service lock poisoned") = replacement;
@@ -166,19 +307,37 @@ pub async fn commit_runtime_settings(
 }
 
 pub fn named_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .find_map(|p| {
-            let (k, v) = p.trim().split_once('=')?;
-            (k == name).then_some(v)
-        })
+    let mut found = None;
+    for header_value in headers.get_all(header::COOKIE) {
+        let value = header_value.to_str().ok()?;
+        for pair in value.split(';') {
+            let Some((key, value)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            if key != name {
+                continue;
+            }
+            // Ambiguous cookies are rejected instead of relying on ordering that
+            // differs between browsers and can be influenced by sibling domains.
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value);
+        }
+    }
+    found
 }
 
-pub fn session_cookie(headers: &HeaderMap) -> Option<&str> {
-    named_cookie(headers, SESSION_COOKIE)
+fn session_cookie_name(state: &AppState) -> &'static str {
+    if state.config.security.secure_cookie {
+        SECURE_SESSION_COOKIE
+    } else {
+        SESSION_COOKIE
+    }
+}
+
+pub fn session_cookie<'a>(state: &AppState, headers: &'a HeaderMap) -> Option<&'a str> {
+    named_cookie(headers, session_cookie_name(state))
 }
 
 pub async fn session(
@@ -187,7 +346,7 @@ pub async fn session(
     require_mfa: bool,
     missing: MissingSession,
 ) -> Result<(String, Session)> {
-    let token = session_cookie(headers).ok_or_else(|| match missing {
+    let token = session_cookie(state, headers).ok_or_else(|| match missing {
         MissingSession::RedirectToLogin => HttpAuthError::redirect("/login"),
         MissingSession::Unauthorized => {
             HttpAuthError::status(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich")
@@ -230,8 +389,9 @@ pub fn csrf_header(session: &Session, headers: &HeaderMap) -> Result<()> {
 }
 
 pub fn make_session_cookie(state: &AppState, token: &str) -> String {
+    let name = session_cookie_name(state);
     format!(
-        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={};{}",
+        "{name}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={};{}",
         state.config.security.session_hours * 3600,
         if state.config.security.secure_cookie {
             " Secure"
@@ -242,8 +402,9 @@ pub fn make_session_cookie(state: &AppState, token: &str) -> String {
 }
 
 pub fn clear_session_cookie(state: &AppState) -> String {
+    let name = session_cookie_name(state);
     format!(
-        "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0;{}",
+        "{name}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0;{}",
         if state.config.security.secure_cookie {
             " Secure"
         } else {
@@ -279,6 +440,28 @@ pub async fn share_is_unlocked(
     let share_id = share.id;
     database(state.db.clone(), move |db| {
         db.unlock_session(&token, share_id)
+    })
+    .await
+}
+
+/// Returns the CSRF token bound to the current password-unlock cookie. Passwordless
+/// capability URLs do not use ambient cookie authority and therefore return `None`.
+pub async fn share_unlock_csrf(
+    state: &AppState,
+    headers: &HeaderMap,
+    share: &Share,
+) -> Result<Option<String>> {
+    if share.password_hash.is_none() {
+        return Ok(None);
+    }
+    let name = unlock_cookie_name(share.id);
+    let Some(token) = named_cookie(headers, &name) else {
+        return Ok(None);
+    };
+    let token = token.to_string();
+    let share_id = share.id;
+    database(state.db.clone(), move |db| {
+        db.unlock_session_csrf(&token, share_id)
     })
     .await
 }
@@ -361,5 +544,64 @@ mod tests {
         let error = redirect_with_cookie("/", "cookie=value\r\nbad=value".to_string())
             .expect_err("invalid cookie header must be rejected");
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn duplicate_named_cookies_are_rejected_across_cookie_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("other=x; session=one"),
+        );
+        headers.append(header::COOKIE, HeaderValue::from_static("session=two"));
+        assert_eq!(named_cookie(&headers, "session"), None);
+
+        let mut single = HeaderMap::new();
+        single.insert(
+            header::COOKIE,
+            HeaderValue::from_static("session=one; other=x"),
+        );
+        assert_eq!(named_cookie(&single, "session"), Some("one"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn security_mutation_inline_audit_survives_cancelled_database_await() {
+        let db = Database::open(":memory:").unwrap();
+        db.create_admin("admin", "old-hash", "secret").unwrap();
+        let operation_database = db.clone();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
+
+        let request = tokio::spawn(async move {
+            database(operation_database, move |database| {
+                let _ = started_sender.send(());
+                release_receiver.recv().unwrap();
+                assert!(database.reset_admin_password(1, "new-hash")?);
+                audit_sync(
+                    &database,
+                    "admin",
+                    "admin_password_reset",
+                    Some("1"),
+                    None,
+                    None,
+                );
+                let _ = finished_sender.send(());
+                Ok(())
+            })
+            .await
+        });
+
+        started_receiver.await.unwrap();
+        request.abort();
+        release_sender.send(()).unwrap();
+        finished_receiver.await.unwrap();
+        let _ = request.await;
+
+        assert_eq!(
+            db.admin("admin").unwrap().unwrap().password_hash,
+            "new-hash"
+        );
+        assert_eq!(db.count_audit(Some("admin_password_reset")).unwrap(), 1);
     }
 }

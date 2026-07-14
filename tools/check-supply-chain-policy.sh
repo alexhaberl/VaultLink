@@ -8,6 +8,10 @@ report() {
     fail=1
 }
 
+if ! sh tools/check-deployment-assets.sh; then
+    report "deployment samples and legacy-component policy failed"
+fi
+
 uses_lines=$(grep -R -n -E '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]+' .github/workflows || true)
 bad_uses=$(printf '%s\n' "$uses_lines" | grep -E -v 'uses:[[:space:]]+\./|@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)
 if [ -n "$bad_uses" ]; then
@@ -23,6 +27,8 @@ literal_dollar='$'
 release_container_value="${literal_dollar}{{ needs.release_environment.outputs.image }}"
 toolchain_resolver_reference="channel=${literal_dollar}(sh tools/rust-toolchain-channel.sh)"
 toolchain_output_value="${literal_dollar}{{ steps.rust_toolchain.outputs.channel }}"
+exact_main_tag_reference="test \"${literal_dollar}tag_commit\" = \"${literal_dollar}main_commit\""
+ancestor_tag_reference="git merge-base --is-ancestor \"${literal_dollar}tag_commit\" \"${literal_dollar}main_commit\""
 release_container_values=$(sed -n 's/^[[:space:]]*container:[[:space:]]*//p' .github/workflows/release.yml)
 release_container_count=$(printf '%s\n' "$release_container_values" | grep -c . || true)
 bad_release_containers=$(printf '%s\n' "$release_container_values" | grep -F -x -v "$release_container_value" || true)
@@ -82,6 +88,12 @@ for architecture in amd64 arm64; do
     fi
 done
 
+exact_main_tag_gates=$(grep -F -c "$exact_main_tag_reference" .github/workflows/release.yml || true)
+if [ "$exact_main_tag_gates" -ne 2 ] \
+    || grep -F -q "$ancestor_tag_reference" .github/workflows/release.yml; then
+    report "release tags must target the exact approved origin/main candidate in build and publish jobs"
+fi
+
 if grep -R -n -E 'curl[^|]*\|[[:space:]]*(ba)?sh' .github/workflows; then
     report "workflows must not pipe remote scripts into a shell"
 fi
@@ -94,7 +106,7 @@ if [ -n "$bad_cargo_installs" ]; then
 fi
 
 dependabot_config=.github/dependabot.yml
-stable_minor_dependencies='data-encoding http mime_guess percent-encoding rpassword rustix serde serde_json subtle tempfile thiserror tokio toml url uuid'
+stable_minor_dependencies='data-encoding http mime_guess percent-encoding rpassword rustix serde serde_json subtle tempfile thiserror tokio toml url'
 if ! awk '
     $0 == "  - package-ecosystem: cargo" {
         cargo = 1
@@ -191,7 +203,7 @@ dependabot_grouped_minor_count=0
 for dependency in $dependabot_grouped_minors; do
     dependabot_grouped_minor_count=$((dependabot_grouped_minor_count + 1))
 done
-if [ "$dependabot_grouped_minor_count" -ne 15 ]; then
+if [ "$dependabot_grouped_minor_count" -ne 14 ]; then
     report "Dependabot Cargo stable-minor group has the wrong size"
 fi
 for dependency in $stable_minor_dependencies; do

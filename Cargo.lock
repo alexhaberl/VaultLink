@@ -2430,7 +2430,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vaultlink"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "argon2",
  "axum",
@@ -2466,7 +2466,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "uuid",
  "webauthn-rs",
 ]
 

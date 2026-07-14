@@ -1,11 +1,11 @@
 use std::{
     ffi::{OsStr, OsString},
-    fs,
+    fs::{self, File},
     os::unix::{ffi::OsStringExt, fs::MetadataExt},
     path::{Path, PathBuf},
 };
 
-use rustix::fs::{statx, AtFlags, StatxFlags, CWD};
+use rustix::fs::{open, statx, AtFlags, Mode, OFlags, StatxFlags};
 use thiserror::Error;
 
 use crate::config::Storage;
@@ -36,6 +36,138 @@ struct PathMountIdentity {
     device_minor: u32,
 }
 
+#[derive(Debug)]
+struct ValidatedDirectory {
+    file: File,
+    canonical_path: PathBuf,
+    mount_identity: PathMountIdentity,
+    device: u64,
+    inode: u64,
+}
+
+/// Directory capabilities captured while the mount policy is validated.
+///
+/// Callers must hand these descriptors to the storage lock, `SecureRoot`, and
+/// SQLite instead of resolving the configured paths a second time. Path
+/// binding checks can detect replacement before startup continues, while the
+/// descriptors make a replacement after the check unable to redirect I/O.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct ValidatedStorage {
+    root: ValidatedDirectory,
+    internal: Option<ValidatedDirectory>,
+    data: ValidatedDirectory,
+}
+
+impl ValidatedStorage {
+    pub(crate) fn root_file(&self) -> std::io::Result<File> {
+        self.root.file.try_clone()
+    }
+
+    pub(crate) fn internal_file(&self) -> std::io::Result<Option<File>> {
+        self.internal
+            .as_ref()
+            .map(|directory| directory.file.try_clone())
+            .transpose()
+    }
+
+    #[doc(hidden)]
+    pub fn data_file(&self) -> std::io::Result<File> {
+        self.data.file.try_clone()
+    }
+
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root.canonical_path
+    }
+
+    pub(crate) fn internal_path(&self) -> Option<&Path> {
+        self.internal
+            .as_ref()
+            .map(|directory| directory.canonical_path.as_path())
+    }
+
+    #[doc(hidden)]
+    pub fn verify_path_bindings(&self, storage: &Storage) -> Result<(), StorageMountError> {
+        self.root
+            .verify_path_binding(&storage.root_mount_path, "root_mount_path")?;
+        self.data
+            .verify_path_binding(&storage.data_directory, "data_directory")?;
+        match (
+            self.internal.as_ref(),
+            storage.internal_directory.as_deref(),
+        ) {
+            (Some(directory), Some(path)) => {
+                directory.verify_path_binding(path, "internal_directory")?;
+            }
+            (Some(_), None) | (None, Some(_)) if storage.require_mount => {
+                return Err(mount_error(
+                    "internal_directory changed while its validated capability was handed off",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl ValidatedDirectory {
+    fn open(path: &Path, label: &str) -> Result<Self, StorageMountError> {
+        let canonical_path = fs::canonicalize(path).map_err(|error| {
+            mount_error(format!(
+                "cannot resolve {label} {}: {error}",
+                path.display()
+            ))
+        })?;
+        let file = open(
+            &canonical_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            mount_error(format!(
+                "cannot open {label} {} without following links: {error}",
+                canonical_path.display()
+            ))
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            mount_error(format!(
+                "cannot inspect {label} {}: {error}",
+                canonical_path.display()
+            ))
+        })?;
+        if !metadata.is_dir() {
+            return Err(mount_error(format!(
+                "{label} {} is not a directory",
+                canonical_path.display()
+            )));
+        }
+        let mount_identity = mount_identity_for_file(&file, &canonical_path)?;
+        Ok(Self {
+            file,
+            canonical_path,
+            mount_identity,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn verify_path_binding(&self, path: &Path, label: &str) -> Result<(), StorageMountError> {
+        let current = Self::open(path, label)?;
+        if current.canonical_path != self.canonical_path
+            || current.mount_identity != self.mount_identity
+            || current.device != self.device
+            || current.inode != self.inode
+        {
+            return Err(mount_error(format!(
+                "{label} {} no longer names the directory identity validated at startup",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct IdentifiedPath<'a> {
     path: &'a Path,
@@ -47,45 +179,30 @@ fn identified(path: &Path, identity: PathMountIdentity) -> IdentifiedPath<'_> {
 }
 
 pub fn validate(storage: &Storage) -> Result<(), StorageMountError> {
+    validate_and_open(storage).map(|_| ())
+}
+
+#[doc(hidden)]
+pub fn validate_and_open(storage: &Storage) -> Result<ValidatedStorage, StorageMountError> {
     if !storage.require_mount {
         return reject_unconfigured_remote_storage(storage);
     }
 
-    let root_path = fs::canonicalize(&storage.root_mount_path).map_err(|error| {
-        mount_error(format!(
-            "cannot resolve required storage mount {}: {error}",
-            storage.root_mount_path.display()
-        ))
-    })?;
-    let data_path = fs::canonicalize(&storage.data_directory).map_err(|error| {
-        mount_error(format!(
-            "cannot resolve pre-provisioned data_directory {}: {error}",
-            storage.data_directory.display()
-        ))
-    })?;
-    if !data_path.is_dir() {
-        return Err(mount_error(format!(
-            "pre-provisioned data_directory {} is not a directory",
-            data_path.display()
-        )));
-    }
+    let root = ValidatedDirectory::open(&storage.root_mount_path, "required root_mount_path")?;
+    let data = ValidatedDirectory::open(&storage.data_directory, "pre-provisioned data_directory")?;
     let internal_path = storage
         .internal_directory
         .as_deref()
         .ok_or_else(|| mount_error("internal_directory is missing"))?;
-    let internal_path = fs::canonicalize(internal_path).map_err(|error| {
-        mount_error(format!(
-            "cannot resolve pre-provisioned internal_directory {}: {error}",
-            internal_path.display()
-        ))
-    })?;
-    validate_canonical_relationships(&root_path, &internal_path, &data_path)?;
-    validate_service_owned_directory(&root_path, "root_mount_path")?;
-    validate_service_owned_directory(&internal_path, "internal_directory")?;
-    validate_service_owned_directory(&data_path, "data_directory")?;
-    let root_identity = mount_identity_for_path(&root_path)?;
-    let internal_identity = mount_identity_for_path(&internal_path)?;
-    let data_identity = mount_identity_for_path(&data_path)?;
+    let internal = ValidatedDirectory::open(internal_path, "pre-provisioned internal_directory")?;
+    validate_canonical_relationships(
+        &root.canonical_path,
+        &internal.canonical_path,
+        &data.canonical_path,
+    )?;
+    validate_service_owned_directory_capability(&root, "root_mount_path")?;
+    validate_service_owned_directory_capability(&internal, "internal_directory")?;
+    validate_service_owned_directory_capability(&data, "data_directory")?;
     let mountinfo = fs::read(MOUNTINFO_PATH).map_err(|error| {
         mount_error(format!(
             "cannot read the Linux mount table from {MOUNTINFO_PATH}: {error}"
@@ -95,46 +212,55 @@ pub fn validate(storage: &Storage) -> Result<(), StorageMountError> {
 
     validate_identity(
         storage,
-        identified(&root_path, root_identity),
-        identified(&internal_path, internal_identity),
-        identified(&data_path, data_identity),
+        identified(&root.canonical_path, root.mount_identity),
+        identified(&internal.canonical_path, internal.mount_identity),
+        identified(&data.canonical_path, data.mount_identity),
         &mounts,
     )?;
 
-    if mount_identity_for_path(&root_path)? != root_identity
-        || mount_identity_for_path(&internal_path)? != internal_identity
-        || mount_identity_for_path(&data_path)? != data_identity
-    {
-        return Err(mount_error(
-            "root_mount_path or data_directory changed mount identity during validation",
-        ));
-    }
-
-    Ok(())
+    let validated = ValidatedStorage {
+        root,
+        internal: Some(internal),
+        data,
+    };
+    validated.verify_path_bindings(storage)?;
+    Ok(validated)
 }
 
-fn reject_unconfigured_remote_storage(storage: &Storage) -> Result<(), StorageMountError> {
-    let root_path = fs::canonicalize(&storage.root_mount_path).map_err(|error| {
-        mount_error(format!(
-            "cannot resolve storage root {}: {error}",
-            storage.root_mount_path.display()
-        ))
-    })?;
-    let identity = mount_identity_for_path(&root_path)?;
+fn reject_unconfigured_remote_storage(
+    storage: &Storage,
+) -> Result<ValidatedStorage, StorageMountError> {
+    let root = ValidatedDirectory::open(&storage.root_mount_path, "storage root")?;
+    let data = ValidatedDirectory::open(&storage.data_directory, "data_directory")?;
+    validate_service_owned_directory_capability(&data, "data_directory")?;
     let mountinfo = fs::read(MOUNTINFO_PATH).map_err(|error| {
         mount_error(format!(
             "cannot read the Linux mount table from {MOUNTINFO_PATH}: {error}"
         ))
     })?;
     let mounts = parse_mountinfo(&mountinfo)?;
-    let mount = unique_mount_for_identity(identity, &mounts, &root_path)?;
+    let mount = unique_mount_for_identity(root.mount_identity, &mounts, &root.canonical_path)?;
     if is_remote_filesystem(&mount.filesystem_type) {
         return Err(mount_error(format!(
             "remote filesystem type {:?} requires require_mount=true, an explicit mount identity, and pre-provisioned sibling staging",
             mount.filesystem_type
         )));
     }
-    Ok(())
+    let data_mount = unique_mount_for_identity(data.mount_identity, &mounts, &data.canonical_path)?;
+    if is_remote_filesystem(&data_mount.filesystem_type) {
+        return Err(mount_error(format!(
+            "data_directory {} uses remote filesystem type {:?}; SQLite/WAL requires local storage",
+            data.canonical_path.display(),
+            data_mount.filesystem_type
+        )));
+    }
+    let validated = ValidatedStorage {
+        root,
+        internal: None,
+        data,
+    };
+    validated.verify_path_bindings(storage)?;
+    Ok(validated)
 }
 
 fn validate_identity(
@@ -338,23 +464,26 @@ fn is_remote_filesystem(filesystem_type: &str) -> bool {
     )
 }
 
-fn mount_identity_for_path(path: &Path) -> Result<PathMountIdentity, StorageMountError> {
+fn mount_identity_for_file(
+    file: &File,
+    display_path: &Path,
+) -> Result<PathMountIdentity, StorageMountError> {
     let stat = statx(
-        CWD,
-        path,
-        AtFlags::NO_AUTOMOUNT,
+        file,
+        "",
+        AtFlags::EMPTY_PATH | AtFlags::NO_AUTOMOUNT,
         StatxFlags::MNT_ID | StatxFlags::BASIC_STATS,
     )
     .map_err(|error| {
         mount_error(format!(
-            "cannot obtain the Linux mount ID for {}: {error}",
-            path.display()
+            "cannot obtain the Linux mount ID for {} from its open directory capability: {error}",
+            display_path.display()
         ))
     })?;
     if stat.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
         return Err(mount_error(format!(
-            "the kernel did not return a mount ID for {}; require_mount needs Linux statx mount-ID support",
-            path.display()
+            "the kernel did not return a mount ID for {}; secure storage startup needs Linux statx mount-ID support",
+            display_path.display()
         )));
     }
     Ok(PathMountIdentity {
@@ -384,6 +513,7 @@ fn validate_canonical_relationships(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_service_owned_directory(path: &Path, label: &str) -> Result<(), StorageMountError> {
     let metadata = fs::metadata(path).map_err(|error| {
         mount_error(format!(
@@ -408,6 +538,38 @@ fn validate_service_owned_directory(path: &Path, label: &str) -> Result<(), Stor
         return Err(mount_error(format!(
             "{label} {} must not be writable by group, other users, or a POSIX ACL mask",
             path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_service_owned_directory_capability(
+    directory: &ValidatedDirectory,
+    label: &str,
+) -> Result<(), StorageMountError> {
+    let metadata = directory.file.metadata().map_err(|error| {
+        mount_error(format!(
+            "cannot inspect {label} {} through its validated capability: {error}",
+            directory.canonical_path.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(mount_error(format!(
+            "{label} {} is not a directory",
+            directory.canonical_path.display()
+        )));
+    }
+    let effective_uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != effective_uid {
+        return Err(mount_error(format!(
+            "{label} {} must be owned by the VaultLink service uid {effective_uid}",
+            directory.canonical_path.display()
+        )));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(mount_error(format!(
+            "{label} {} must not be writable by group, other users, or a POSIX ACL mask",
+            directory.canonical_path.display()
         )));
     }
     Ok(())
@@ -602,6 +764,18 @@ mod tests {
         )
     }
 
+    fn unmounted_storage(root: &Path, data: &Path) -> Storage {
+        let mut storage = storage();
+        storage.root_mount_path = root.to_path_buf();
+        storage.data_directory = data.to_path_buf();
+        storage.internal_directory = None;
+        storage.require_mount = false;
+        storage.external_writers = false;
+        storage.expected_filesystem_type = None;
+        storage.expected_mount_source = None;
+        storage
+    }
+
     #[test]
     fn parses_escaped_mount_identity() {
         let mounts = mounts();
@@ -611,6 +785,58 @@ mod tests {
         assert!(mounts[0].read_write);
         assert_eq!(mounts[0].filesystem_type, "cifs");
         assert_eq!(mounts[0].source, OsStr::new("//nas.example/vault link"));
+    }
+
+    #[test]
+    fn validated_root_capability_detects_a_path_replacement() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("root");
+        let displaced = parent.path().join("root-validated");
+        let data = parent.path().join("data");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let storage = unmounted_storage(&root, &data);
+        let validated = validate_and_open(&storage).unwrap();
+
+        std::fs::rename(&root, &displaced).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let error = validated.verify_path_bindings(&storage).unwrap_err();
+        assert!(error.to_string().contains("root_mount_path"));
+        assert_eq!(
+            validated.root.file.metadata().unwrap().ino(),
+            std::fs::metadata(&displaced).unwrap().ino()
+        );
+        assert_ne!(
+            validated.root.file.metadata().unwrap().ino(),
+            std::fs::metadata(&root).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn validated_data_capability_detects_a_path_replacement() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("root");
+        let data = parent.path().join("data");
+        let displaced = parent.path().join("data-validated");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let storage = unmounted_storage(&root, &data);
+        let validated = validate_and_open(&storage).unwrap();
+
+        std::fs::rename(&data, &displaced).unwrap();
+        std::fs::create_dir(&data).unwrap();
+
+        let error = validated.verify_path_bindings(&storage).unwrap_err();
+        assert!(error.to_string().contains("data_directory"));
+        assert_eq!(
+            validated.data.file.metadata().unwrap().ino(),
+            std::fs::metadata(&displaced).unwrap().ino()
+        );
+        assert_ne!(
+            validated.data.file.metadata().unwrap().ino(),
+            std::fs::metadata(&data).unwrap().ino()
+        );
     }
 
     #[test]

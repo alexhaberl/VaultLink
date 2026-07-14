@@ -197,6 +197,7 @@ MFA_CODE="$(totp_now "$TOTP_SECRET")"
 MFA_JSON="$(
     curl -sS -f -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
         -H "content-type: application/json" \
+        -H "x-csrf-token: $CSRF" \
         -X POST "http://$APP_ADDR/api/v1/session/mfa" \
         -d "{\"code\":\"$MFA_CODE\"}"
 )"

@@ -41,7 +41,6 @@ updates:
           - tokio
           - toml
           - url
-          - uuid
         update-types:
           - minor
   - package-ecosystem: github-actions

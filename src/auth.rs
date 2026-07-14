@@ -170,9 +170,11 @@ impl LoginLimiter {
 
     /// Atomically checks the limit and records the admitted attempt.
     ///
-    /// Callers should invoke [`Self::success`] after successful authentication.
-    /// Failed attempts remain recorded until the configured window expires. This
-    /// check-and-record operation must happen before expensive credential
+    /// Attempts remain recorded until the configured window expires. Callers may
+    /// invoke [`Self::success`] only for cheap, replay-protected follow-up factors;
+    /// successful password checks deliberately stay in the budget so valid
+    /// credentials cannot be abused for unbounded Argon2 work or session creation.
+    /// This check-and-record operation must happen before expensive credential
     /// verification so concurrent requests cannot all pass an unconsumed check.
     pub fn check_and_record_attempt(&self, key: &str) -> bool {
         self.check_and_record_attempts(&[key])
