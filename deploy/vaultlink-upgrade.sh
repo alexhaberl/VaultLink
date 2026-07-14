@@ -34,7 +34,7 @@ new_config=$2
 [ -f "$data" ] || { echo "VaultLink database is missing" >&2; exit 1; }
 [ -f "$config_path" ] || { echo "VaultLink configuration is missing: $config_path" >&2; exit 1; }
 
-for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock od tr; do
+for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock od tr awk; do
     command -v "$required_command" >/dev/null || {
         echo "$required_command is required for a safe upgrade" >&2
         exit 1
@@ -94,6 +94,118 @@ read_bounded_version() {
         return 1
     fi
     printf '%s\n' "$bounded_version"
+}
+
+# Print -1, 0 or 1 using SemVer precedence. Build metadata is intentionally
+# ignored, while pre-release identifiers retain their specified ordering.
+compare_semver() {
+    left_version=$1
+    right_version=$2
+    LC_ALL=C awk -v left="$left_version" -v right="$right_version" '
+        function invalid(version) {
+            print "invalid semantic version: " version > "/dev/stderr"
+            exit 2
+        }
+        function identifiers_are_valid(value, reject_numeric_leading_zero, parts, count, i) {
+            if (value == "")
+                return 0
+            count = split(value, parts, ".")
+            for (i = 1; i <= count; i++) {
+                if (parts[i] == "" || parts[i] !~ /^[0-9A-Za-z-]+$/)
+                    return 0
+                if (reject_numeric_leading_zero && parts[i] ~ /^[0-9]+$/ \
+                    && length(parts[i]) > 1 && substr(parts[i], 1, 1) == "0")
+                    return 0
+            }
+            return 1
+        }
+        function normalize(version, core, prerelease, build, separator, parts, count, i) {
+            separator = index(version, "+")
+            if (separator) {
+                build = substr(version, separator + 1)
+                version = substr(version, 1, separator - 1)
+                if (!identifiers_are_valid(build, 0) || index(build, "+"))
+                    invalid(version "+" build)
+            }
+            separator = index(version, "-")
+            if (separator) {
+                prerelease = substr(version, separator + 1)
+                core = substr(version, 1, separator - 1)
+                if (!identifiers_are_valid(prerelease, 1))
+                    invalid(version)
+            } else {
+                prerelease = ""
+                core = version
+            }
+            count = split(core, parts, ".")
+            if (count != 3)
+                invalid(version)
+            for (i = 1; i <= 3; i++) {
+                if (parts[i] !~ /^[0-9]+$/ \
+                    || (length(parts[i]) > 1 && substr(parts[i], 1, 1) == "0"))
+                    invalid(version)
+            }
+            return parts[1] "|" parts[2] "|" parts[3] "|" prerelease
+        }
+        function numeric_compare(left_number, right_number) {
+            if (length(left_number) != length(right_number))
+                return length(left_number) < length(right_number) ? -1 : 1
+            if (left_number == right_number)
+                return 0
+            return ("x" left_number) < ("x" right_number) ? -1 : 1
+        }
+        function prerelease_compare(left_prerelease, right_prerelease, left_parts, right_parts, left_count, right_count, count, i, order, left_numeric, right_numeric) {
+            if (left_prerelease == "" || right_prerelease == "") {
+                if (left_prerelease == right_prerelease)
+                    return 0
+                return left_prerelease == "" ? 1 : -1
+            }
+            left_count = split(left_prerelease, left_parts, ".")
+            right_count = split(right_prerelease, right_parts, ".")
+            count = left_count < right_count ? left_count : right_count
+            for (i = 1; i <= count; i++) {
+                left_numeric = left_parts[i] ~ /^[0-9]+$/
+                right_numeric = right_parts[i] ~ /^[0-9]+$/
+                if (left_numeric && right_numeric) {
+                    order = numeric_compare(left_parts[i], right_parts[i])
+                } else if (left_numeric != right_numeric) {
+                    order = left_numeric ? -1 : 1
+                } else if (left_parts[i] == right_parts[i]) {
+                    order = 0
+                } else {
+                    order = ("x" left_parts[i]) < ("x" right_parts[i]) ? -1 : 1
+                }
+                if (order != 0)
+                    return order
+            }
+            if (left_count == right_count)
+                return 0
+            return left_count < right_count ? -1 : 1
+        }
+        BEGIN {
+            split(normalize(left), left_parts, "|")
+            split(normalize(right), right_parts, "|")
+            for (i = 1; i <= 3; i++) {
+                order = numeric_compare(left_parts[i], right_parts[i])
+                if (order != 0) {
+                    print order
+                    exit
+                }
+            }
+            print prerelease_compare(left_parts[4], right_parts[4])
+        }
+    '
+}
+
+storage_layout_generation() {
+    # 0.4.1 pre-releases already use the sibling staging layout. The synthetic
+    # -0 boundary sorts before every valid 0.4.1 pre-release.
+    layout_order=$(compare_semver "$1" "0.4.1-0") || return 1
+    if [ "$layout_order" -lt 0 ]; then
+        printf '%s\n' legacy
+    else
+        printf '%s\n' sibling
+    fi
 }
 
 derive_readiness_target() {
@@ -520,9 +632,16 @@ readiness_connect_to=$(printf '%s\n' "$candidate_readiness_target" | sed -n '2p'
 readiness_insecure=$(printf '%s\n' "$candidate_readiness_target" | sed -n '3p')
 candidate_health_body='{"ok":true,"version":"'"$candidate_version"'"}'
 
-if [ "$old_version" = 0.4.0 ] && [ "$candidate_version" != 0.4.0 ] \
-    && [ "$was_active" -eq 1 ]; then
-    echo "an upgrade from 0.4.0 requires vaultlink.service to be stopped before the storage migration" >&2
+version_order=$(compare_semver "$candidate_version" "$old_version")
+if [ "$version_order" -lt 0 ]; then
+    echo "candidate version $candidate_version is older than installed version $old_version; use the rollback script" >&2
+    exit 1
+fi
+
+old_layout=$(storage_layout_generation "$old_version")
+candidate_layout=$(storage_layout_generation "$candidate_version")
+if [ "$old_layout" != "$candidate_layout" ] && [ "$was_active" -eq 1 ]; then
+    echo "an upgrade across the pre-0.4.1 storage-layout boundary requires vaultlink.service to be stopped before the storage migration" >&2
     exit 1
 fi
 

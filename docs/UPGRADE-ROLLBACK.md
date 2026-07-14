@@ -2,11 +2,11 @@
 
 Never upgrade a running process in place. Select the release matching the host architecture and verify its Minisign signatures and checksum manifest first.
 
-## Mandatory 0.4.0 to 0.4.1 storage migration
+## Mandatory pre-0.4.1 to 0.4.1+ storage migration
 
-Before upgrading a deployment whose visible tree is on SMB/CIFS, quiesce public traffic, stop VaultLink and stop every direct SMB writer. Keep the service inactive for the entire storage migration. Take a server-side snapshot or metadata-preserving backup of the complete SMB tree and save the complete 0.4.0 configuration. A 0.4.0 binary cannot parse the new 0.4.1 storage fields.
+Before upgrading any pre-0.4.1 deployment whose visible tree is on SMB/CIFS, quiesce public traffic, stop VaultLink and stop every direct SMB writer. Keep the service inactive for the entire storage migration. Take a server-side snapshot or metadata-preserving backup of the complete SMB tree and save the complete legacy configuration. Pre-0.4.1 binaries cannot parse the new 0.4.1 storage fields.
 
-Inventory the old visible root before creating anything. Resolve every existing `shared`, `.vaultlink-internal`, case-insensitive/trailing-dot/space alias of those names, old `.vaultlink-*.part` upload fragment and delete-tombstone collision as user data; never let 0.4.1 mistake an old user entry for its private namespace. Create a new empty `shared/`, then move every existing visible entry, including dotfiles, into it with one quiesced server-side operation that preserves ownership, ACLs and extended attributes. Verify counts, paths and content hashes against the snapshot before changing the SMB client export or starting VaultLink.
+Inventory the old visible root before creating anything. Resolve every existing `shared`, `.vaultlink-internal`, case-insensitive/trailing-dot/space alias of those names, old `.vaultlink-*.part` upload fragment and delete-tombstone collision as user data; never let 0.4.1+ mistake an old user entry for its private namespace. Create a new empty `shared/`, then move every existing visible entry, including dotfiles, into it with one quiesced server-side operation that preserves ownership, ACLs and extended attributes. Verify counts, paths and content hashes against the snapshot before changing the SMB client export or starting VaultLink.
 
 Provision the sibling `.vaultlink-internal/{uploads,tombstones}` only after the inventory is clean. Use a dedicated VaultLink SMB account. Co-writers receive Modify rights only within `shared/` and no administrative rights on the share root. Server ACLs must deny them read, write, delete, rename, parent `DELETE_CHILD`, ACL/owner changes (`WRITE_DAC`/`WRITE_OWNER`) and chmod/chown/setfacl-equivalent access to the internal tree. Then install the hardened mount unit/drop-in and prepare a **separate candidate configuration** with:
 
@@ -22,14 +22,16 @@ expected_mount_source = "//fileserver.example/vaultlink"
 
 Verify the visible-tree migration and server ACLs with the VaultLink account and with every co-writer account before starting the candidate. The candidate requires an explicit mount identity in every production mode, rejects an unmounted local fallback, and rejects SQLite/WAL on a network filesystem. Do not replace `/etc/vaultlink/config.toml` manually: it must remain the old live configuration until the upgrade script activates the new Binary/Config pair with the service stopped.
 
-For rollback to 0.4.0, stop VaultLink and every SMB writer first. Reverse the server-side layout from the snapshot, restore the previous export/ACL boundary and verify it before invoking the rollback script. The script refuses this rollback while `vaultlink.service` is active, but it cannot inspect or reverse the external SMB-server migration. Do not point 0.4.0 at the new Co-Writer layout: its old in-tree staging model is not safe for this mode. The rollback backup contains the matching 0.4.0 Binary/Config/SQLite triple.
+The serving process derives one canonical lifetime-lock domain from the visible root. With `require_mount = true`, `internal_directory` must be the direct sibling `<root-parent>/.vaultlink-internal`; development uses `<root_mount_path>/.vaultlink-internal`. Rename or migrate a differently named legacy private directory while every VaultLink process is stopped, and update the candidate configuration before running the upgrade. Never create a second private sibling to bypass lock contention.
+
+For rollback from 0.4.1+ to any pre-0.4.1 version, stop VaultLink and every SMB writer first. Reverse the server-side layout from the snapshot, restore the previous export/ACL boundary and verify it before invoking the rollback script. The script refuses every rollback across this storage-layout boundary while `vaultlink.service` is active, but it cannot inspect or reverse the external SMB-server migration. Do not point a pre-0.4.1 binary at the new Co-Writer layout: its old in-tree staging model is not safe for this mode. The rollback backup contains the matching Binary/Config/SQLite triple.
 
 ## Upgrade
 
 1. Map `x86_64` to the `amd64` release and `aarch64`/`arm64` to the `arm64` release. Download the matching archive, standalone binary, SBOM, `SHA256SUMS-ARCH`, and their available `.minisig` files. Reject all other host architectures.
 2. Extract it outside `/opt/vaultlink`.
-3. Keep the current live configuration untouched and run `sudo deploy/vaultlink-upgrade.sh /path/to/new/vaultlink /path/to/new-config.toml`. For every upgrade from 0.4.0 to a newer candidate, the script verifies that `vaultlink.service` was already stopped; it refuses to perform this external-storage migration from an active service.
-4. The script requires an existing executable, configuration, and database plus `curl`, `flock`, `runuser`, `sqlite3`, GNU `timeout`, `od`, `tr`, and a readable `/dev/urandom`. A shared non-blocking maintenance lock excludes concurrent upgrades and rollbacks. Before downtime it stages both Binary/Config pairs on their destination filesystems, validates each pair as the unprivileged `vaultlink` account and derives separate old/new readiness targets. It stops VaultLink, creates and verifies a consistent SQLite backup, publishes a complete old `vaultlink`/`config.toml`/`data.sqlite` backup set below the root-only `/var/lib/vaultlink-backups/` (`0700`, files `0700/0600/0600`), then activates the staged candidate Binary and Config with per-file atomic renames before starting the service.
+3. Keep the current live configuration untouched and run `sudo deploy/vaultlink-upgrade.sh /path/to/new/vaultlink /path/to/new-config.toml`. For every upgrade across the pre-0.4.1/0.4.1+ storage-layout boundary, the script verifies that `vaultlink.service` was already stopped; it refuses to perform this external-storage migration from an active service. The upgrade entry point rejects every semantic version downgrade and directs operators to the rollback script; the rollback entry point likewise rejects semantic roll-forwards and directs operators to the upgrade script.
+4. The script requires an existing executable, configuration, and database plus `awk`, `curl`, `flock`, `runuser`, `sqlite3`, GNU `timeout`, `od`, `tr`, and a readable `/dev/urandom`. A shared non-blocking maintenance lock excludes concurrent upgrades and rollbacks. Before downtime it stages both Binary/Config pairs on their destination filesystems, validates each pair as the unprivileged `vaultlink` account and derives separate old/new readiness targets. It stops VaultLink, creates and verifies a consistent SQLite backup, publishes a complete old `vaultlink`/`config.toml`/`data.sqlite` backup set below the root-only `/var/lib/vaultlink-backups/` (`0700`, files `0700/0600/0600`), then activates the staged candidate Binary and Config with per-file atomic renames before starting the service.
 5. While the service is stopped and after that backup is durable, the script atomically replaces every non-empty share alias shorter than 12 ASCII bytes. It retains the old alias as a prefix and adds 20 lowercase hexadecimal characters (80 bits from `/dev/urandom`), keeping the result within the supported 12-to-32-character URL-safe policy. A malformed legacy value, changed row, or `UNIQUE` collision aborts the transaction and restores the verified backup. The candidate rejects 1-to-11-character alias lookups after this rotation, so bypassing the upgrade script would leave historical short links unavailable. If aliases were changed successfully, the root-only backup directory contains `share-alias-migration.tsv` (`root:root`, `0600`) with `share_id`, `old_alias`, and `new_alias`. This file contains working share locators: never copy it to tickets, chat, shell history, or unprotected logs. Securely distribute replacement links to their intended recipients, then delete the mapping when the old links are no longer needed.
 6. After the local gate succeeds, verify the exact public HTTP status and candidate health body from an external vantage with the separate check below. Then check `systemctl status vaultlink`, the journal, login/MFA, one protected share, upload, full download, and range download through the public URL.
 
@@ -39,7 +41,7 @@ containing all four architecture-specific release inputs, verify before
 extraction:
 
 ```sh
-version=0.4.2
+version=0.4.3
 case "$(uname -m)" in
     x86_64) arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
@@ -55,7 +57,7 @@ sha256sum -c "$checksums"
 ```
 
 ```sh
-expected_version=0.4.2
+expected_version=0.4.3
 response=$(curl --disable --silent --show-error --noproxy '*' --proto '=https' \
     --connect-timeout 5 --max-time 15 --header 'Accept: application/json' \
     --output - --write-out '\n%{http_code}' \
@@ -80,7 +82,7 @@ The three live files reside on different filesystems and cannot be committed by 
 
 ### Local readiness gate
 
-The automatic rollback decision uses only a direct request to the local VaultLink listener. It retries for up to 30 attempts within an overall 60-second budget, with a one-second interval, a two-second connect timeout, and a three-second total timeout per request. Responses are capped at 4 KiB. Success requires HTTP 200 and the candidate's exact compact response, for example `{"ok":true,"version":"0.4.2"}`. A delayed listener is retried; HTTP 500, malformed JSON, a wrong version, oversized responses, and transport timeouts fail the gate.
+The automatic rollback decision uses only a direct request to the local VaultLink listener. It retries for up to 30 attempts within an overall 60-second budget, with a one-second interval, a two-second connect timeout, and a three-second total timeout per request. Responses are capped at 4 KiB. Success requires HTTP 200 and the candidate's exact compact response, for example `{"ok":true,"version":"0.4.3"}`. A delayed listener is retried; HTTP 500, malformed JSON, a wrong version, oversized responses, and transport timeouts fail the gate.
 
 In reverse-proxy mode the request goes directly to local HTTP. In standalone-TLS mode curl keeps the public hostname for the TLS SNI value but uses `--connect-to` to reach the local listener, `--noproxy '*'` to bypass proxy environment variables, and `--insecure` for this local application gate only. Public DNS, proxy routing, certificate trust, and certificate expiry therefore cannot trigger a database rollback.
 
@@ -94,6 +96,6 @@ Retain backups until the soak gate has passed. Backups contain the full configur
 
 Every `.vaultlink-internal/tombstones/*.pending` entry has a durable sibling `*.pending.manifest` containing the original relative path as a JSON string. VaultLink normally restores an uncommitted pending delete with a no-clobber rename during startup and removes the manifest only after both directory renames are durable. If a co-writer reused the visible name, both objects and the manifest are retained and the journal reports `private recovery entry was preserved` with the full path.
 
-For manual recovery, stop VaultLink, validate the manifest and both objects, then restore only with a no-clobber rename after confirming the visible destination is free. Never automatically delete pending entries or orphan manifests: a manifest can be deliberately retained after an uncertain directory sync and is the crash journal if the server later exposes the pending state again.
+For manual recovery, stop every VaultLink server that points at this `internal_directory` and confirm that no process holds `.vaultlink-instance.lock`. Validate the manifest and both objects, then restore only with a no-clobber rename after confirming the visible destination is free. Never automatically delete pending entries or orphan manifests: a manifest can be deliberately retained after an uncertain directory sync and is the crash journal if the server later exposes the pending state again. A deployment may have only one serving process per shared lock domain; blue/green or rolling upgrades must stop the old process before the candidate enters storage recovery.
 
 An automatic rollback restores the database snapshot taken before the candidate started. Writes accepted during the short candidate health-check window can therefore be lost. Quiesce public traffic for upgrades where that window is unacceptable.

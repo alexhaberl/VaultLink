@@ -2,7 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Rust-Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Unterstützte Hostplattformen sind Linux x86_64 und aarch64; Windows-Hostsupport ist ab 0.4.1 entfernt. Windows-, macOS- und Linux-Clients bleiben über einen externen Standard-SMB-Server interoperabel.
 
-Status: `0.4.2`-Kandidat für ein privates Debian-13-amd64-/arm64-Release. Native amd64- und arm64-Gates laufen ausschließlich auf den dedizierten Self-hosted-Runnern; architekturunabhängige Jobs nutzen den arm64-Runner. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
+Status: `0.4.3`-Kandidat für ein privates Debian-13-amd64-/arm64-Release. Native amd64- und arm64-Gates laufen ausschließlich auf den dedizierten Self-hosted-Runnern; architekturunabhängige Jobs nutzen den arm64-Runner. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
@@ -46,7 +46,7 @@ VaultLink/
 │   ├── webauthn.rs         WebAuthn-Ceremony-State und Credentials
 │   └── web.rs              Routen, HTML, Upload/Download/ZIP/Preview
 ├── config/                 Beispielkonfigurationen
-├── deploy/                 systemd, Caddy, ACME-Hook
+├── deploy/                 systemd, Caddy, Upgrade/Rollback
 ├── docs/                   Upgrade, Rollback, Release-Gates
 ├── fuzz/                   Pfad-, Range-, Multipart-, Preview-, Upload- und API-Policy-Fuzzing
 ├── Makefile
@@ -55,9 +55,9 @@ VaultLink/
 
 ## 3. Daten- und Persistenzmodell
 
-SQLite ist bewusst gewählt: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `runtime_settings`, `audit`, `transfer_monthly_counts`, `transfer_statistics`, `admin_mfa_enrollments`, `admin_webauthn_credentials` und `admin_totp_replay`.
+SQLite ist bewusst gewählt: eindeutige Aliase, parallele Sessions, atomare Transferlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `public_upload_usage`, `public_upload_reservations`, `runtime_settings`, `audit`, `transfer_monthly_counts`, `transfer_statistics`, `admin_mfa_enrollments`, `admin_webauthn_credentials` und `admin_totp_replay`.
 
-`shares.max_upload_size` ist optional; `NULL` nutzt das globale Runtime-Limit. Migrationen laufen transaktional über `PRAGMA user_version`; unbekannte neuere Schemas verweigern den Start. Die Datenbank liegt standardmäßig in `/var/lib/vaultlink/data.sqlite` und muss `vaultlink:vaultlink 0600` gehören.
+`shares.max_upload_size` ist das optionale Einzeldateilimit; `NULL` nutzt das globale Runtime-Limit. Upload-Shares besitzen zusätzlich die kumulativen Grenzen `max_upload_total_size` und `max_upload_files`, mit einer Basispolicy von 100.000.000.000 Byte und 1000 fail-closed verbuchten Uploads. Das Gesamtlimit wird bei der Erstellung mindestens auf das wirksame Einzeldateilimit angehoben. Byte- und Dateiverbrauch werden vor dem sichtbaren Publish atomar verbucht; scheitert das Publish danach, bleibt der Quotenverbrauch absichtlich bestehen, damit nie eine sichtbare Datei ungezählt bleibt. Migrationen laufen transaktional über `PRAGMA user_version`; unbekannte neuere Schemas verweigern den Start. Die Datenbank liegt standardmäßig in `/var/lib/vaultlink/data.sqlite` und muss `vaultlink:vaultlink 0600` gehören.
 
 Upgrade mit Backup bei gestopptem Dienst:
 
@@ -110,23 +110,27 @@ VaultLink hostet keinen SMB-Server. Es mountet als Linux-SMB-Client einen besteh
 //fileserver.example/vaultlink  ->  /mnt/storage
 ├── shared/                     -> root_mount_path, normale SMB-Clients schreibbar
 └── .vaultlink-internal/        -> internal_directory, nur VaultLink-SMB-Konto
+    ├── .vaultlink-instance.lock
     ├── uploads/
     └── tombstones/
 ```
 
 Die drei internen Verzeichnisse müssen **vor dem ersten Start serverseitig** provisioniert werden. Ihre Server-ACL erlaubt ausschließlich dem separaten VaultLink-SMB-Dienstkonto Lesen, Schreiben, Löschen und Umbenennen. Co-Writer erhalten Modify-Rechte ausschließlich unter `shared/`, aber keine administrativen Rechte auf Share-Root oder Mount-Basis. Für `.vaultlink-internal` müssen Lesen, Schreiben, Löschen, Umbenennen, Parent-`DELETE_CHILD`, ACL-/Owner-Änderungen (`WRITE_DAC`/`WRITE_OWNER`) sowie `chmod`/`chown`/`setfacl`-Äquivalente verweigert sein. Die lokal sichtbaren CIFS-Modi `0700`/`0600` sind nur eine zusätzliche Prüfung und kein Beweis für diese Server-ACL.
 
+Pro Storage-Root darf genau **eine** VaultLink-Serverinstanz aktiv sein. Die Lock-Domain ist deshalb nicht frei wählbar: Development verwendet ausschließlich `<root_mount_path>/.vaultlink-internal`, bei `require_mount = true` muss `internal_directory` exakt der direkte private Geschwisterpfad `<root-parent>/.vaultlink-internal` sein. Vor Storage-Mutationsproben, Journal-Recovery und Fragment-Cleanup öffnet VaultLink dort `.vaultlink-instance.lock`, prüft die Lock-Semantik mit zwei unabhängigen Deskriptoren und erwirbt einen exklusiven, nicht blockierenden Linux-`flock` bis zum Ende der Serverlaufzeit. Dieselbe bereits gesperrte Internal-Directory-Capability wird an SecureFS übergeben; Device/Inode des konfigurierten Pfads werden vor jeder Startup-Mutation erneut dagegen geprüft, sodass ein Verzeichnistausch während des Handoffs fail-closed endet. Eine zweite Instanz beendet den Start mit einer klaren Fehlermeldung. Active/active-Replikate, Rolling Starts mit überlappenden Prozessen oder getrennte Kopien des internen Verzeichnisses sind nicht unterstützt. Alle Prozesse für dasselbe sichtbare Storage müssen denselben kanonischen Pfad im selben kohärenten Kernel-/SMB-Lock-Domain sehen; ein nur gleichnamiger Pfad auf einem anderen Mount oder Host schützt die Journals nicht. Die Server-ACL muss außerdem verhindern, dass Co-Writer die Lockdatei löschen oder ersetzen.
+
 Für den auditierten Co-Writer-Modus gelten:
 
 - `require_mount = true`, `external_writers = true`, `expected_filesystem_type = "cifs"` und die erwartete UNC-Quelle sind Pflicht.
 - Der Kernel muss `statx`-Mount-IDs unterstützen (Linux 5.8 oder neuer). Root und interner Geschwisterpfad müssen dieselbe geprüfte Mount-ID nutzen; nur so bleiben Cross-Directory-Renames atomar.
+- Client, Mount und SMB-Server müssen kohärente exklusive `flock`-/SMB-Byte-Range-Locks für `.vaultlink-instance.lock` durchsetzen. Schlägt die lokale Semantikprüfung fehl, startet VaultLink fail-closed; mehrere Hosts mit unabhängig gecachten oder getrennten Lockdateien sind keine unterstützte HA-Konfiguration.
 - VaultLink prüft `vers=3.1.1`, `seal`, `cache=strict`, `serverino`, `nosuid`, `nodev`, `noexec`, Read-write-Status und verbietet unter anderem `cache=loose`, `nostrictsync`, `noperm`, `noserverino` und `multiuser`.
 - Userpfade dürfen weder Symlinks noch verschachtelte Mounts/DFS-Submounts durchqueren.
 - `data_directory` und SQLite/WAL bleiben auf einem separaten, explizit unterstützten lokalen Dateisystem; CIFS/NFS für SQLite wird abgewiesen.
 - Externe Writer gelten als vertrauenswürdige Publisher des sichtbaren Inhalts. Sie können Dateien verändern oder ersetzen, die ein bestehender VaultLink-Link ausliefert. Diese direkten SMB-Aktionen umgehen VaultLink-Audit, Share-Limits und Web-Policy und müssen deshalb am SMB-Server selbst auditiert werden.
 - VaultLinks Linux-Mount erzwingt Transportverschlüsselung per SMB `seal`. Zusätzlich muss der externe SMB-Server SMB 3.1.1 Signing und Encryption für **jede** direkte Windows-, macOS- und Linux-Co-Writer-Session verpflichtend machen; VaultLink kann diese separaten Sessions nicht erzwingen. Verschlüsselung ruhender Daten ist Aufgabe des SMB-Servers. Transparenter Zugriff mit Standard-SMB-Clients ist nicht mit einer ausschließlich von VaultLink kontrollierten clientseitigen Inhaltsverschlüsselung vereinbar.
 
-Andere Netzwerkdateisysteme mit externen Schreibern sind in 0.4.2 nicht freigegeben. Ein erkanntes Remote-Dateisystem ohne explizite Mount-Policy wird beim Start abgewiesen. Production verlangt die Policy unabhängig vom gerade erkannten Dateisystem, sodass auch ein ausgefallener CIFS-Mount mit lokal sichtbarem Fallback-Verzeichnis fail-closed bleibt.
+Andere Netzwerkdateisysteme mit externen Schreibern sind in 0.4.3 nicht freigegeben. Ein erkanntes Remote-Dateisystem ohne explizite Mount-Policy wird beim Start abgewiesen. Production verlangt die Policy unabhängig vom gerade erkannten Dateisystem, sodass auch ein ausgefallener CIFS-Mount mit lokal sichtbarem Fallback-Verzeichnis fail-closed bleibt.
 
 Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadlimit, blockierte Endungen, Share-Passwortpolitik, Unlock-Dauer, ZIP-/Search-/Text-/Media-Preview-Limits, Text-/Bild-Preview-Endungen und PDF-Preview-Status. Servermodus, Bind-Adresse, TLS-Pfade, Trusted Proxies, Root-Mount, Data-Dir und ACME-Modus bleiben file-/restart-basiert.
 
@@ -165,9 +169,11 @@ ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenz
 
 `max_downloads` begrenzt abgeschlossene Inhaltsübertragungen (Download, ZIP und gezählte Vorschau), nicht den Aufruf der öffentlichen Metadaten-/Landingpage oder Uploads. `HEAD` liefert nur dann Metadaten, wenn derselbe logische `GET` mit der aktuellen Transfer-Session beginnen dürfte, verbraucht selbst aber keine Quote.
 
-Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.4.2` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
+Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.4.3` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
 
-Bei passwortgeschützten öffentlichen Shares liefert die Metadatenroute vor dem Unlock ausschließlich `{"locked":true}`. Clients müssen nach erfolgreichem Unlock mit dem gesetzten API-Cookie erneut abfragen; Pfad, Berechtigung und Transferzähler werden vorher nicht offengelegt.
+Nach erfolgreichem `/api/v1/session/mfa` rotiert VaultLink Sessioncookie und CSRF-Wert. API-Clients müssen deshalb sowohl den neuen `Set-Cookie`-Wert als auch `csrf_token` aus der MFA-Antwort übernehmen; das Pre-MFA-Token ist anschließend ungültig.
+
+Bei passwortgeschützten öffentlichen Shares liefert die Metadatenroute vor dem Unlock ausschließlich `{"locked":true}`. Clients müssen nach erfolgreichem Unlock mit dem gesetzten API-Cookie erneut abfragen; Pfad, Berechtigung und Transferzähler werden vorher nicht offengelegt. Die Unlock-Antwort liefert außerdem `csrf_token`: Browserformulare senden diesen Upload-CSRF-Wert als Multipart-Feld `csrf`, API-Clients im Header `X-VaultLink-Upload-CSRF`.
 
 Wichtige API-Routen:
 
@@ -175,7 +181,7 @@ Wichtige API-Routen:
 |---|---:|---|
 | `/api/v1/health` | GET | Health/Version |
 | `/api/v1/session/login` | POST | Passwortprüfung, setzt Session-Cookie |
-| `/api/v1/session/mfa` | POST | TOTP-Verifikation |
+| `/api/v1/session/mfa` | POST | TOTP-Verifikation und Rotation von Session/CSRF |
 | `/api/v1/session/logout` | POST | Session löschen |
 | `/api/v1/session/me` | GET | aktuelle Session |
 | `/api/v1/files` | GET | Dateibrowser als JSON |
@@ -247,7 +253,7 @@ sudo systemctl restart vaultlink
 
 ### Standalone TLS mit Built-in Let's Encrypt
 
-`certificate_source = "letsencrypt"` nutzt `rustls-acme` mit `tls-alpn-01` auf Port 443. Es gibt keine OS-Abhängigkeit auf certbot, acme.sh oder Nginx. Der ACME-Cache liegt unter `data_directory`, z. B. `/var/lib/vaultlink/acme`, und enthält Account-/Zertifikatsdaten.
+`certificate_source = "letsencrypt"` nutzt `rustls-acme` mit `tls-alpn-01` auf Port 443 und benötigt keinen externen ACME-Client oder Reverse Proxy. Der ACME-Cache liegt unter `data_directory`, z. B. `/var/lib/vaultlink/acme`, und enthält Account-/Zertifikatsdaten. In diesem Modus darf die Runtime-Einstellung `public_base_url` nicht von der Zertifikatsdomain in `config.toml` abweichen; ein Domainwechsel erfolgt in der Datei und wird erst mit einem Neustart aktiviert.
 
 Minimal:
 
@@ -271,35 +277,7 @@ letsencrypt_cache_dir = "acme"
 letsencrypt_staging = true
 ```
 
-Erst mit `letsencrypt_staging = true` und `hsts_enabled = false` testen. Staging-Zertifikate sind absichtlich nicht browser-vertrauenswürdig; HSTS darf dabei nicht aktiv sein. Für Production auf `letsencrypt_staging = false` setzen und danach `hsts_enabled = true` aktivieren. Dieser Modus funktioniert nur, wenn VaultLink selbst aus dem Internet auf Port 443 erreichbar ist.
-
-### ZeroSSL Auto-Renewal Setup
-
-ZeroSSL/acme.sh bleibt als externe Alternative dokumentiert und ist vor allem für Reverse-Proxy- oder PEM-Standalone-Betrieb sinnvoll. EAB-Credentials gehören in `/etc/vaultlink/zerossl.env` mit `0600`, niemals in Logs oder systemd-Argumente.
-
-```sh
-sudo install -o root -g root -m 0600 /dev/null /etc/vaultlink/zerossl.env
-sudoedit /etc/vaultlink/zerossl.env
-```
-
-Beispielinhalt:
-
-```sh
-ZEROSSL_EAB_KID='...'
-ZEROSSL_EAB_HMAC_KEY='...'
-VAULTLINK_DOMAIN='files.example.com'
-```
-
-Timer:
-
-```sh
-sudo install -m 0644 deploy/vaultlink-cert-renew.{service,timer} /etc/systemd/system/
-sudo install -o root -g root -m 0755 deploy/vaultlink-cert-deploy.sh /usr/local/libexec/vaultlink-cert-deploy.sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now vaultlink-cert-renew.timer
-```
-
-Der Hook installiert PEMs nach `/etc/vaultlink/tls/` mit `root:vaultlink 0640` und ruft `systemctl reload-or-restart vaultlink` auf.
+Erst mit `letsencrypt_staging = true` und `hsts_enabled = false` testen. Staging-Zertifikate sind absichtlich nicht browser-vertrauenswürdig; HSTS darf dabei nicht aktiv sein. Für Production auf `letsencrypt_staging = false` setzen und danach `hsts_enabled = true` aktivieren. Dieser Modus funktioniert nur, wenn VaultLink selbst aus dem Internet auf Port 443 erreichbar ist. Zertifikatsausstellung und -erneuerung erfolgen vollständig im VaultLink-Prozess.
 
 ## 8. Debian-Deployment
 

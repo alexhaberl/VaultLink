@@ -1,6 +1,26 @@
 use crate::config::{Config, ServerMode};
 use http::HeaderMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
+
+/// Returns the stable key used by abuse and concurrency limits.
+///
+/// IPv6 clients commonly rotate privacy addresses within one delegated prefix,
+/// so exact-address keys are trivially bypassed. Group native IPv6 by /64 while
+/// preserving IPv4 (including IPv4-mapped IPv6) as an individual address.
+pub fn client_limit_key(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                IpAddr::V4(mapped)
+            } else {
+                let mut segments = address.segments();
+                segments[4..].fill(0);
+                IpAddr::V6(Ipv6Addr::from(segments))
+            }
+        }
+        address => address,
+    }
+}
 
 pub fn effective_client_ip(peer: IpAddr, headers: &HeaderMap, config: &Config) -> IpAddr {
     if config.server.mode != ServerMode::ReverseProxy
@@ -154,6 +174,22 @@ mod tests {
         assert_eq!(
             effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
             "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn limiter_keys_group_ipv6_privacy_addresses_by_prefix() {
+        assert_eq!(
+            client_limit_key("2001:db8:1234:5678::1".parse().unwrap()),
+            client_limit_key("2001:db8:1234:5678:ffff::2".parse().unwrap())
+        );
+        assert_ne!(
+            client_limit_key("2001:db8:1234:5678::1".parse().unwrap()),
+            client_limit_key("2001:db8:1234:5679::1".parse().unwrap())
+        );
+        assert_eq!(
+            client_limit_key("::ffff:192.0.2.7".parse().unwrap()),
+            "192.0.2.7".parse::<IpAddr>().unwrap()
         );
     }
 }

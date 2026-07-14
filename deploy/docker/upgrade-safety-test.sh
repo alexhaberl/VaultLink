@@ -242,6 +242,13 @@ def read_text(path, default):
         return default
 
 
+def binary_version(binary_text):
+    for line in binary_text.splitlines():
+        if line.startswith("VERSION='") and line.endswith("'"):
+            return line[len("VERSION='"):-1]
+    return "0.0.0-invalid-fixture"
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         return
@@ -263,8 +270,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         installed = read_text(live_binary, "")
+        version = binary_version(installed)
         if "binary-marker:candidate" not in installed:
-            self.respond(200, '{"ok":true,"version":"0.3.0"}')
+            self.respond(200, f'{{"ok":true,"version":"{version}"}}')
             return
 
         mode = read_text(state_dir / "health.mode", "success")
@@ -277,10 +285,10 @@ class Handler(BaseHTTPRequestHandler):
             if count <= ready_after:
                 self.respond(503, '{"ok":false}')
                 return
-            self.respond(200, '{"ok":true,"version":"0.3.2"}')
+            self.respond(200, f'{{"ok":true,"version":"{version}"}}')
             return
         if mode == "http500":
-            self.respond(500, '{"ok":false,"version":"0.3.2"}')
+            self.respond(500, f'{{"ok":false,"version":"{version}"}}')
             return
         if mode == "wrong-version":
             self.respond(200, '{"ok":true,"version":"0.3.0"}')
@@ -290,19 +298,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if mode == "timeout":
             time.sleep(3)
-            self.respond(200, '{"ok":true,"version":"0.3.2"}')
+            self.respond(200, f'{{"ok":true,"version":"{version}"}}')
             return
         if mode == "mutate-then-500":
             if count == 1:
                 with sqlite3.connect(database) as connection:
                     connection.execute("UPDATE marker SET value='candidate-write'")
                 (state_dir / "health-mutation.done").write_text("yes", encoding="utf-8")
-            self.respond(500, '{"ok":false,"version":"0.3.2"}')
+            self.respond(500, f'{{"ok":false,"version":"{version}"}}')
             return
         if mode != "success":
             self.respond(500, '{"ok":false,"error":"unknown test mode"}')
             return
-        self.respond(200, '{"ok":true,"version":"0.3.2"}')
+        self.respond(200, f'{{"ok":true,"version":"{version}"}}')
 
 
 server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
@@ -606,27 +614,101 @@ test_upgrade_maintenance_lock_fails_before_stop() {
     echo "upgrade and rollback shared maintenance lock passed"
 }
 
-test_040_migration_requires_an_inactive_service_for_all_newer_candidates() {
-    for candidate_version in 0.4.1 0.4.2; do
+test_storage_layout_upgrade_requires_an_inactive_service() {
+    for installed_version in 0.3.9 0.4.0; do
+        for candidate_version in 0.4.1 0.4.2; do
+            initialize_live original original
+            write_binary /opt/vaultlink/vaultlink original "$HEALTH_URL" - 0 "$installed_version"
+            write_binary "$TEST_ROOT/candidate" candidate "$HEALTH_URL" - 0 "$candidate_version"
+            write_config "$TEST_ROOT/candidate.toml" candidate
+            log_name="upgrade-${installed_version//./}-${candidate_version//./}-active"
+
+            expect_failure "$log_name" \
+                "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
+            grep -q 'upgrade across the pre-0.4.1 storage-layout boundary requires vaultlink.service to be stopped' \
+                "$TEST_ROOT/$log_name.log" \
+                || fail "active migration from $installed_version to $candidate_version did not explain the quiesce gate"
+            assert_binary original
+            assert_config original
+            assert_database original
+            assert_service_active
+            [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+                || fail "active $installed_version to $candidate_version migration stopped the service itself"
+        done
+    done
+    echo "semantic storage-layout upgrade gates passed"
+}
+
+test_upgrade_rejects_semantic_downgrades_before_stop() {
+    for candidate_version in 0.4.1 0.3.9; do
         initialize_live original original
-        write_binary /opt/vaultlink/vaultlink original "$HEALTH_URL" - 0 0.4.0
+        write_binary /opt/vaultlink/vaultlink original "$HEALTH_URL" - 0 0.4.2
         write_binary "$TEST_ROOT/candidate" candidate "$HEALTH_URL" - 0 "$candidate_version"
         write_config "$TEST_ROOT/candidate.toml" candidate
-        log_name="upgrade-040-${candidate_version//./}-active"
+        log_name="upgrade-downgrade-${candidate_version//./}"
 
         expect_failure "$log_name" \
             "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
-        grep -q 'upgrade from 0.4.0 requires vaultlink.service to be stopped' \
+        grep -q "candidate version $candidate_version is older than installed version 0.4.2; use the rollback script" \
             "$TEST_ROOT/$log_name.log" \
-            || fail "active migration to $candidate_version did not explain the quiesce gate"
+            || fail "semantic downgrade to $candidate_version was not explained"
         assert_binary original
         assert_config original
         assert_database original
         assert_service_active
         [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
-            || fail "active 0.4.0 to $candidate_version migration stopped the service itself"
+            || fail "semantic downgrade to $candidate_version stopped the service"
     done
-    echo "0.4.0 inactive-service migration gates passed for current and future candidates"
+    echo "upgrade semantic-downgrade gates passed"
+}
+
+test_semver_prerelease_build_and_validation_rules() {
+    initialize_live original original
+    write_binary /opt/vaultlink/vaultlink original "$HEALTH_URL" - 0 '1.0.0-alpha.1+old'
+    write_binary "$TEST_ROOT/candidate" candidate "$HEALTH_URL" - 0 '1.0.0-alpha.2+new'
+    write_config "$TEST_ROOT/candidate.toml" candidate
+    "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml" >/dev/null
+    assert_binary candidate
+    assert_config candidate
+    assert_service_active
+
+    initialize_live original original
+    write_binary /opt/vaultlink/vaultlink original "$HEALTH_URL" - 0 '1.0.0+old'
+    write_binary "$TEST_ROOT/candidate" candidate "$HEALTH_URL" - 0 '1.0.0+new'
+    write_config "$TEST_ROOT/candidate.toml" candidate
+    "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml" >/dev/null
+    assert_binary candidate
+    assert_config candidate
+    assert_service_active
+
+    initialize_live original original
+    write_binary /opt/vaultlink/vaultlink original "$HEALTH_URL" - 0 '1.0.0'
+    write_binary "$TEST_ROOT/candidate" candidate "$HEALTH_URL" - 0 '1.0.0-rc.1+build.7'
+    write_config "$TEST_ROOT/candidate.toml" candidate
+    expect_failure upgrade-prerelease-downgrade \
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
+    grep -q 'candidate version 1.0.0-rc.1+build.7 is older than installed version 1.0.0' \
+        "$TEST_ROOT/upgrade-prerelease-downgrade.log" \
+        || fail "SemVer prerelease downgrade was not rejected"
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "SemVer prerelease downgrade stopped the service"
+
+    invalid_index=0
+    for invalid_version in '01.0.0' '1.0' '1.0.0-01' '1.0.0+'; do
+        invalid_index=$((invalid_index + 1))
+        initialize_live original original
+        write_binary /opt/vaultlink/vaultlink original "$HEALTH_URL" - 0 '1.0.0'
+        write_binary "$TEST_ROOT/candidate" candidate "$HEALTH_URL" - 0 "$invalid_version"
+        write_config "$TEST_ROOT/candidate.toml" candidate
+        log_name="upgrade-invalid-semver-$invalid_index"
+        expect_failure "$log_name" \
+            "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
+        grep -q 'invalid semantic version:' "$TEST_ROOT/$log_name.log" \
+            || fail "invalid semantic version $invalid_version was not explained"
+        [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+            || fail "invalid semantic version $invalid_version stopped the service"
+    done
+    echo "SemVer prerelease, build metadata, and validation rules passed"
 }
 
 test_upgrade_backup_failure() {
@@ -974,25 +1056,51 @@ test_rollback_rejects_mismatched_pair_before_stop() {
     echo "rollback binary/configuration pairing preflight passed"
 }
 
-test_rollback_to_040_requires_an_inactive_service_and_legacy_layout() {
+test_rollback_across_storage_layout_requires_an_inactive_service() {
+    for requested_version in 0.3.9 0.4.0; do
+        for current_version in 0.4.1 0.4.2; do
+            initialize_live original original
+            source_backup=$(make_source_backup)
+            write_binary "$source_backup/vaultlink" original "$HEALTH_URL" - 0 "$requested_version"
+            write_binary /opt/vaultlink/vaultlink candidate "$HEALTH_URL" - 0 "$current_version"
+            write_config "$CONFIG_PATH" candidate
+            "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite "UPDATE marker SET value='candidate'"
+            log_name="rollback-${current_version//./}-${requested_version//./}-active"
+
+            expect_failure "$log_name" "$ROLLBACK" "$source_backup"
+            grep -q 'rollback across the pre-0.4.1 storage-layout boundary requires vaultlink.service to be stopped and the matching storage layout to be restored first' \
+                "$TEST_ROOT/$log_name.log" \
+                || fail "rollback from $current_version to $requested_version did not explain the storage-layout prerequisite"
+            assert_binary candidate
+            assert_config candidate
+            assert_database candidate
+            assert_service_active
+            [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+                || fail "unsafe rollback from $current_version to $requested_version stopped the service before rejection"
+        done
+    done
+    echo "semantic rollback storage-layout gates passed"
+}
+
+test_rollback_rejects_semantic_roll_forward_before_stop() {
     initialize_live original original
     source_backup=$(make_source_backup)
-    write_binary "$source_backup/vaultlink" original "$HEALTH_URL" - 0 0.4.0
-    write_binary /opt/vaultlink/vaultlink candidate "$HEALTH_URL" - 0 0.4.2
+    write_binary "$source_backup/vaultlink" original "$HEALTH_URL" - 0 '0.4.2'
+    write_binary /opt/vaultlink/vaultlink candidate "$HEALTH_URL" - 0 '0.4.1'
     write_config "$CONFIG_PATH" candidate
     "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite "UPDATE marker SET value='candidate'"
 
-    expect_failure rollback-042-040-active "$ROLLBACK" "$source_backup"
-    grep -q 'rollback to 0.4.0 requires vaultlink.service to be stopped and the legacy storage layout to be restored first' \
-        "$TEST_ROOT/rollback-042-040-active.log" \
-        || fail "legacy rollback did not explain the storage-layout prerequisite"
+    expect_failure rollback-roll-forward "$ROLLBACK" "$source_backup"
+    grep -q 'requested version 0.4.2 is newer than installed version 0.4.1; use the upgrade script' \
+        "$TEST_ROOT/rollback-roll-forward.log" \
+        || fail "semantic rollback roll-forward was not explained"
     assert_binary candidate
     assert_config candidate
     assert_database candidate
     assert_service_active
     [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
-        || fail "unsafe legacy rollback stopped the service before rejecting the request"
-    echo "rollback to 0.4.0 legacy-layout gate passed"
+        || fail "semantic rollback roll-forward stopped the service"
+    echo "rollback semantic roll-forward gate passed"
 }
 
 test_rollback_recovery_stop_failure_stays_fail_closed() {
@@ -1021,7 +1129,9 @@ test_upgrade_migrates_short_share_aliases_and_protects_mapping
 test_upgrade_alias_collision_is_atomic_and_restores_backup
 test_upgrade_rejects_mismatched_binary_configuration_pair_before_stop
 test_upgrade_maintenance_lock_fails_before_stop
-test_040_migration_requires_an_inactive_service_for_all_newer_candidates
+test_storage_layout_upgrade_requires_an_inactive_service
+test_upgrade_rejects_semantic_downgrades_before_stop
+test_semver_prerelease_build_and_validation_rules
 test_upgrade_backup_failure
 test_upgrade_start_failure
 test_upgrade_integrity_failure
@@ -1037,7 +1147,8 @@ test_rollback_success
 test_rollback_start_failure
 test_rollback_rejects_incomplete_backup_before_stop
 test_rollback_rejects_mismatched_pair_before_stop
-test_rollback_to_040_requires_an_inactive_service_and_legacy_layout
+test_rollback_across_storage_layout_requires_an_inactive_service
+test_rollback_rejects_semantic_roll_forward_before_stop
 test_rollback_recovery_stop_failure_stays_fail_closed
 
 echo "VaultLink upgrade and rollback safety tests passed"

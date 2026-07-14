@@ -1,4 +1,6 @@
-use crate::config::{Config, MAX_TEXT_PREVIEW_SIZE};
+use crate::config::{
+    CertificateSource, Config, ServerMode, MAX_TEXT_PREVIEW_SIZE, MAX_UPLOAD_SIZE,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeSettings {
@@ -171,6 +173,11 @@ impl RuntimeSettings {
                 "max_preview_size must not exceed {MAX_TEXT_PREVIEW_SIZE} bytes"
             ));
         }
+        if self.max_upload_size > MAX_UPLOAD_SIZE {
+            return Err(format!(
+                "max_upload_size must not exceed {MAX_UPLOAD_SIZE} bytes"
+            ));
+        }
         if self.share_password_min_length < 8
             || self.share_password_max_length < self.share_password_min_length
             || self.share_password_max_length > 1_024
@@ -206,6 +213,15 @@ impl RuntimeSettings {
                 .is_none_or(|url| url.scheme() != "https")
         {
             return Err("production public_base_url must use HTTPS".into());
+        }
+        if config.server.mode == ServerMode::StandaloneTls
+            && config.tls.certificate_source == CertificateSource::LetsEncrypt
+            && self.public_base_url != config.server.public_base_url
+        {
+            return Err(
+                "public_base_url must be changed in config.toml and VaultLink restarted when Let's Encrypt manages TLS"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -507,5 +523,22 @@ mod tests {
         settings.share_password_max_length = 128;
         settings.max_preview_size = MAX_TEXT_PREVIEW_SIZE + 1;
         assert!(settings.validate().is_err());
+        settings.max_preview_size = MAX_TEXT_PREVIEW_SIZE;
+        settings.max_upload_size = MAX_UPLOAD_SIZE + 1;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn letsencrypt_runtime_url_must_match_the_certificate_domain() {
+        let mut config = config();
+        config.server.mode = ServerMode::StandaloneTls;
+        config.server.production_mode = true;
+        config.server.public_base_url = "https://files.example.test".into();
+        config.tls.certificate_source = CertificateSource::LetsEncrypt;
+
+        let mut settings = RuntimeSettings::from_config(&config);
+        assert!(settings.validate_for_config(&config).is_ok());
+        settings.public_base_url = "https://other.example.test".into();
+        assert!(settings.validate_for_config(&config).is_err());
     }
 }

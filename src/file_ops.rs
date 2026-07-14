@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     path_security,
-    secure_fs::{EntryKind, EntryStatus, SecureRoot, UploadFragmentCleanup},
+    secure_fs::{EntryKind, EntryStatus, FileOperationRecovery, SecureRoot, UploadFragmentCleanup},
     AppState,
 };
 
@@ -76,11 +76,15 @@ pub async fn create_directory(
 ) -> Result<CreateDirectoryResult, FileOperationError> {
     let parent = normalize(parent, true)?;
     let name = validate_name(name)?;
-    let _guard = state.storage_mutation.lock().await;
+    let guard = state.storage_mutation.clone().lock_owned().await;
+    let guard = recover_pending_file_operations_with_guard(state, guard).await?;
     let secure_root = state.secure_root.clone();
-    let path = tokio::task::spawn_blocking(move || secure_root.create_directory(&parent, &name))
-        .await?
-        .map_err(map_io)?;
+    let path = tokio::task::spawn_blocking(move || {
+        let _storage_guard = guard;
+        secure_root.create_directory(&parent, &name)
+    })
+    .await?
+    .map_err(map_io)?;
     Ok(CreateDirectoryResult { path })
 }
 
@@ -92,17 +96,20 @@ pub async fn rename(
     let plan = plan_rename(path, new_name)?;
     let path = plan.path;
     let new_name = plan.new_name;
-    let _guard = state.storage_mutation.lock().await;
+    let guard = state.storage_mutation.clone().lock_owned().await;
+    let guard = recover_pending_file_operations_with_guard(state, guard).await?;
     let secure_root = state.secure_root.clone();
     let database = state.db.clone();
     tokio::task::spawn_blocking(move || {
-        let staged = secure_root.stage_rename(&path, &new_name).map_err(map_io)?;
+        let _storage_guard = guard;
+        let mut staged = secure_root.stage_rename(&path, &new_name).map_err(map_io)?;
         let old_path = staged.original_path().to_string();
         let new_path = staged.new_path().to_string();
         let kind = staged.kind();
+        staged.begin_database_commit();
         let updated_shares =
             database.rename_share_paths(&old_path, &new_path, kind == EntryKind::Directory)?;
-        staged.commit();
+        staged.commit().map_err(map_io)?;
         Ok(RenameResult {
             path: new_path,
             kind,
@@ -143,12 +150,14 @@ pub async fn delete(
 ) -> Result<DeleteResult, FileOperationError> {
     let path = normalize(path, false)?;
     let confirmation = confirm_name.map(str::to_string);
-    let _guard = state.storage_mutation.lock().await;
+    let guard = state.storage_mutation.clone().lock_owned().await;
+    let guard = recover_pending_file_operations_with_guard(state, guard).await?;
     let secure_root = state.secure_root.clone();
     let cleanup_root = secure_root.clone();
     let cleanup_lock = state.storage_cleanup.clone();
     let database = state.db.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let _storage_guard = guard;
         let inspected = secure_root.entry_status(&path).map_err(map_io)?;
         validate_delete_confirmation(
             &path,
@@ -165,24 +174,112 @@ pub async fn delete(
             confirmation.as_deref(),
         )?;
         let original_path = staged.original_path().to_string();
+        let allow_recursive = confirmation.as_deref() == original_path.rsplit('/').next();
+        let committed = staged
+            .commit(allow_recursive)
+            .map_err(|error| map_delete_commit_io(error, &original_path))?;
+        // The durable filesystem intent now makes this SQLite update
+        // recoverable. If SQLite fails (including an uncertain commit), Drop
+        // deliberately leaves the intent for startup reconciliation.
         let deactivated_shares = database
             .deactivate_shares_for_path(&original_path, status.kind == EntryKind::Directory)?;
-        let committed = staged.commit().map_err(map_io)?;
-        Ok::<_, FileOperationError>((
-            DeleteResult {
-                path: original_path,
-                kind: status.kind,
-                deactivated_shares,
-                cleanup_pending: committed.cleanup_pending,
-            },
-            committed.tombstone_path,
-        ))
+        let committed = committed.complete().map_err(map_io)?;
+        if let Some(tombstone_path) = committed.tombstone_path {
+            // Enqueue cleanup from the non-cancellable blocking finalizer. If
+            // the HTTP future is dropped, a journal-free tombstone must not be
+            // stranded until the next process restart.
+            spawn_deletion_cleanup(cleanup_root, cleanup_lock, tombstone_path);
+        }
+        Ok::<_, FileOperationError>(DeleteResult {
+            path: original_path,
+            kind: status.kind,
+            deactivated_shares,
+            cleanup_pending: committed.cleanup_pending,
+        })
     })
     .await??;
-    if let Some(tombstone_path) = result.1 {
-        spawn_deletion_cleanup(cleanup_root, cleanup_lock, tombstone_path);
+    Ok(result)
+}
+
+/// Reconciles durable filesystem intents with SQLite before any route or
+/// background cleanup is allowed to observe storage. The operation is
+/// idempotent: on error the current journal remains and the next startup retries
+/// it. Call this once immediately after `AppState::new`.
+pub async fn recover_pending_file_operations(state: &AppState) -> Result<(), FileOperationError> {
+    let guard = state.storage_mutation.clone().lock_owned().await;
+    recover_pending_file_operations_with_guard(state, guard)
+        .await
+        .map(drop)
+}
+
+pub(crate) async fn recover_pending_file_operations_with_guard(
+    state: &AppState,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, FileOperationError> {
+    let secure_root = state.secure_root.clone();
+    let database = state.db.clone();
+    let cleanup_root = secure_root.clone();
+    let cleanup_lock = state.storage_cleanup.clone();
+    let guard = tokio::task::spawn_blocking(move || {
+        // spawn_blocking tasks continue after their awaiting request is
+        // cancelled. Owning the guard here keeps recovery serialized until the
+        // task has actually finished.
+        let cleanup_paths = recover_pending_file_operations_blocking(&secure_root, &database)?;
+        for tombstone_path in cleanup_paths {
+            // Schedule before returning the guard/result: spawn_blocking keeps
+            // running after request cancellation, while code after `.await`
+            // would be skipped with its result discarded.
+            spawn_deletion_cleanup(cleanup_root.clone(), cleanup_lock.clone(), tombstone_path);
+        }
+        Ok::<_, FileOperationError>(guard)
+    })
+    .await??;
+    Ok(guard)
+}
+
+fn recover_pending_file_operations_blocking(
+    secure_root: &SecureRoot,
+    database: &crate::db::Database,
+) -> Result<Vec<String>, FileOperationError> {
+    let mut cleanup_paths = Vec::new();
+    for pending in secure_root.pending_file_operations().map_err(map_io)? {
+        match secure_root
+            .recover_file_operation(&pending)
+            .map_err(map_io)?
+        {
+            FileOperationRecovery::Rename {
+                original_path,
+                new_path,
+                is_directory,
+            } => {
+                database.rename_share_paths(&original_path, &new_path, is_directory)?;
+                secure_root
+                    .complete_file_operation(&pending)
+                    .map_err(map_io)?;
+                tracing::warn!(from = %original_path, to = %new_path, "completed interrupted rename operation");
+            }
+            FileOperationRecovery::Delete {
+                original_path,
+                is_directory,
+                tombstone_path,
+            } => {
+                database.deactivate_shares_for_path(&original_path, is_directory)?;
+                secure_root
+                    .complete_file_operation(&pending)
+                    .map_err(map_io)?;
+                if let Some(tombstone_path) = tombstone_path {
+                    cleanup_paths.push(tombstone_path);
+                }
+                tracing::warn!(path = %original_path, "completed interrupted delete operation");
+            }
+            FileOperationRecovery::Cancelled => {
+                tracing::warn!(
+                    "cancelled an interrupted filesystem operation without changing SQLite"
+                );
+            }
+        }
     }
-    Ok(result.0)
+    Ok(cleanup_paths)
 }
 
 pub fn plan_rename(path: &str, new_name: &str) -> Result<RenamePlan, FileOperationError> {
@@ -253,6 +350,19 @@ fn map_io(error: io::Error) -> FileOperationError {
     }
 }
 
+fn map_delete_commit_io(error: io::Error, original_path: &str) -> FileOperationError {
+    if error.kind() == io::ErrorKind::DirectoryNotEmpty {
+        return FileOperationError::ConfirmationRequired {
+            required_name: original_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(original_path)
+                .to_string(),
+        };
+    }
+    map_io(error)
+}
+
 fn spawn_deletion_cleanup(
     secure_root: SecureRoot,
     cleanup_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -260,53 +370,56 @@ fn spawn_deletion_cleanup(
 ) {
     tokio::spawn(async move {
         loop {
-            let cleanup_guard = cleanup_lock.lock().await;
+            let cleanup_guard = cleanup_lock.clone().lock_owned().await;
             let start_root = secure_root.clone();
             let start_path = tombstone_path.clone();
             let cleanup = tokio::task::spawn_blocking(move || {
-                start_root
+                let cleanup = start_root
                     .start_deletion_cleanup(&start_path)
-                    .or_else(|_| start_root.start_upload_fragment_cleanup())
+                    .or_else(|_| start_root.start_upload_fragment_cleanup());
+                (cleanup_guard, cleanup)
             })
             .await;
-            let cleanup = match cleanup {
-                Ok(Ok(cleanup)) => cleanup,
-                Ok(Err(error)) => {
+            let (cleanup_guard, cleanup) = match cleanup {
+                Ok((cleanup_guard, Ok(cleanup))) => (cleanup_guard, cleanup),
+                Ok((_cleanup_guard, Err(error))) => {
                     tracing::warn!(%error, %tombstone_path, "could not start deletion cleanup");
-                    drop(cleanup_guard);
                     tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
                     continue;
                 }
                 Err(error) => {
                     tracing::warn!(%error, %tombstone_path, "deletion cleanup task failed to start");
-                    drop(cleanup_guard);
                     tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
                     continue;
                 }
             };
-            if run_cleanup(cleanup, &tombstone_path).await {
+            if run_cleanup(cleanup, &tombstone_path, cleanup_guard).await {
                 return;
             }
-            drop(cleanup_guard);
             tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
         }
     });
 }
 
-async fn run_cleanup(mut cleanup: UploadFragmentCleanup, tombstone_path: &str) -> bool {
+async fn run_cleanup(
+    mut cleanup: UploadFragmentCleanup,
+    tombstone_path: &str,
+    mut cleanup_guard: tokio::sync::OwnedMutexGuard<()>,
+) -> bool {
     let mut failures = 0usize;
     loop {
         let result = tokio::task::spawn_blocking(move || {
             let batch = cleanup.run_batch(CLEANUP_BATCH_ENTRIES);
-            (cleanup, batch)
+            (cleanup, cleanup_guard, batch)
         })
         .await;
         let batch = match result {
-            Ok((next, Ok(batch))) => {
+            Ok((next, next_guard, Ok(batch))) => {
                 cleanup = next;
+                cleanup_guard = next_guard;
                 batch
             }
-            Ok((_next, Err(error))) => {
+            Ok((_next, _cleanup_guard, Err(error))) => {
                 tracing::warn!(%error, %tombstone_path, "could not continue deletion cleanup");
                 return false;
             }
@@ -446,6 +559,48 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_cleanup_task_keeps_mutex_until_blocking_batch_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        state.secure_root.before_next_cleanup_batch(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let cleanup = state.secure_root.start_upload_fragment_cleanup().unwrap();
+        let cleanup_guard = state.storage_cleanup.clone().lock_owned().await;
+        let worker = tokio::spawn(run_cleanup(cleanup, "test-cleanup", cleanup_guard));
+
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("cleanup batch did not reach the test hook");
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                state.storage_cleanup.clone().lock_owned(),
+            )
+            .await
+            .is_err(),
+            "cancelling the async wrapper released the cleanup mutex early"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.storage_cleanup.clone().lock_owned(),
+        )
+        .await
+        .expect("cleanup mutex was not released after the blocking batch returned");
+    }
+
     #[tokio::test]
     async fn deleting_a_regular_file_finishes_without_pending_cleanup() {
         let root = tempfile::tempdir().unwrap();
@@ -457,5 +612,151 @@ mod tests {
         assert!(!result.cleanup_pending);
         assert!(tombstone_paths(root.path()).is_empty());
         assert!(!root.path().join("single.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_rename_is_reconciled_with_share_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("old.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "rename-token",
+                None,
+                "old.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let fault = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+        fault
+            .execute_batch(
+                "CREATE TRIGGER fail_share_rename
+                 BEFORE UPDATE OF relative_path ON shares
+                 BEGIN SELECT RAISE(ABORT, 'injected rename failure'); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            rename(&state, "old.txt", "new.txt").await,
+            Err(FileOperationError::Database(_))
+        ));
+        assert!(!root.path().join("old.txt").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("new.txt")).unwrap(),
+            b"content"
+        );
+        assert_eq!(
+            state
+                .db
+                .share_by_token("rename-token")
+                .unwrap()
+                .unwrap()
+                .relative_path,
+            "old.txt"
+        );
+        assert_eq!(
+            state.secure_root.pending_file_operations().unwrap().len(),
+            1
+        );
+
+        fault
+            .execute_batch("DROP TRIGGER fail_share_rename;")
+            .unwrap();
+        recover_pending_file_operations(&state).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .share_by_token("rename-token")
+                .unwrap()
+                .unwrap()
+                .relative_path,
+            "new.txt"
+        );
+        assert!(state
+            .secure_root
+            .pending_file_operations()
+            .unwrap()
+            .is_empty());
+        recover_pending_file_operations(&state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_delete_is_reconciled_with_share_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("remove.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "delete-token",
+                None,
+                "remove.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        let fault = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+        fault
+            .execute_batch(
+                "CREATE TRIGGER fail_share_deactivate
+                 BEFORE UPDATE OF active ON shares
+                 BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            delete(&state, "remove.txt", None).await,
+            Err(FileOperationError::Database(_))
+        ));
+        assert!(!root.path().join("remove.txt").exists());
+        assert!(
+            state
+                .db
+                .share_by_token("delete-token")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert_eq!(
+            state.secure_root.pending_file_operations().unwrap().len(),
+            1
+        );
+
+        fault
+            .execute_batch("DROP TRIGGER fail_share_deactivate;")
+            .unwrap();
+        recover_pending_file_operations(&state).await.unwrap();
+        assert!(
+            !state
+                .db
+                .share_by_token("delete-token")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert!(state
+            .secure_root
+            .pending_file_operations()
+            .unwrap()
+            .is_empty());
+        recover_pending_file_operations(&state).await.unwrap();
     }
 }

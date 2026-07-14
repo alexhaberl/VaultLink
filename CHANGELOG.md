@@ -1,11 +1,17 @@
 # Changelog
 
-## 0.4.2 — 2026-07-14
+## 0.4.3 — 2026-07-14
 
 - Prevented TOTP replay across concurrent sessions with an atomic per-admin counter claim (schema 11).
 - Unified admin password validation across setup, CLI, UI and API, including the 1024-byte login boundary.
 - Added HTTP header/body idle limits, bounded concurrent uploads, safer WebAuthn reauthentication, and hard share-password input limits.
-- Hardened 0.4.0 storage migration and rollback gates for newer direct upgrade paths, and removed obsolete UI/SecureFS compatibility symbols.
+- Added cumulative byte/file quotas for public upload shares and bound password-protected public uploads to their unlock session with a dedicated CSRF value.
+- Hardened semantic pre-0.4.1 storage-layout migration and rollback gates, rejected downgrades through the upgrade entry point and roll-forwards through the rollback entry point, and removed obsolete UI/SecureFS compatibility symbols.
+- Added a canonical per-storage lifetime lock, acquired before recovery and cleanup, with cross-process contention, backend-semantics, lock-file identity and locked-directory capability-handoff checks; overlapping serving instances and handoff replacements now fail startup.
+- Bound SQLite, SecureFS, cleanup and mutation work to the validated storage directory capabilities, closed mount/path replacement races, and made rename/delete recovery durable across intent, publish, rollback and cancellation boundaries.
+- Made successful login, MFA, logout, administrator, settings, audit-purge, share-unlock and WebAuthn mutations cancellation-safe; security-key deletion now validates the live MFA session and credential snapshot while replay claim, deletion policy and audit commit atomically.
+- Added fail-closed upload policy epochs, persistent reservations and cumulative quotas, corrected transfer accounting before the first response payload, and bounded request, multipart, preview, Argon2, connection and response resources.
+- Removed the remaining external certificate-renewal and staging deployment components, added regression policy against their return, and hardened release, upgrade and rollback gates around exact SemVer, binary/config/database pairing and readiness recovery.
 - Rejected non-startable empty preview-extension configurations and fixed expiry-offset and growing-text-preview edge cases.
 - Added WebAuthn ceremony-state invariants, injected deletion-cleanup retry tests, and production multipart-stream fuzzing.
 - Capped accepted HTTP connections and in-flight response bodies, added systemd FD/task ceilings, rotated short share aliases during upgrades and retired their lookup path, removed the legacy CSS delivery path, and replaced the placeholder PNG with a real 32×32 favicon.

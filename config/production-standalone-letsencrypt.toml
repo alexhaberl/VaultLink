@@ -16,17 +16,18 @@ require_mount = true
 external_writers = true
 expected_filesystem_type = "cifs"
 expected_mount_source = "//fileserver.example/vaultlink"
-max_upload_size = 1073741824
-max_zip_size = 1073741824
+# Setup/UI units are decimal: 1 MB = 1,000,000 bytes; 1 GB = 1,000,000,000 bytes.
+max_upload_size = 1000000000
+max_zip_size = 1000000000
 max_zip_files = 10000
 max_search_entries = 50000
 max_search_results = 500
 # Text previews are limited to at most 64 MB.
-max_preview_size = 1048576
+max_preview_size = 1000000
 preview_extensions = ["txt", "log", "md", "csv", "json", "toml", "yaml", "yml", "ini", "conf"]
 image_preview_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "avif"]
 pdf_preview_enabled = true
-max_media_preview_size = 104857600
+max_media_preview_size = 100000000
 blocked_extensions = ["exe", "dll", "com", "bat", "cmd", "ps1", "sh"]
 
 [security]

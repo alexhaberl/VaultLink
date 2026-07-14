@@ -1,16 +1,16 @@
-# v0.4.2 release checklist
+# v0.4.3 release checklist
 
-Stand: 2026-07-14 für die native Linux-amd64-/arm64-Freigabe von 0.4.2.
+Stand: 2026-07-14 für die native Linux-amd64-/arm64-Freigabe von 0.4.3.
 
 Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfolgt über einen eigenen Pull Request; ein Tag wird erst nach dem Merge auf `main`, bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
-## Feature-Scope für 0.4.2
+## Feature-Scope für 0.4.3
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
 - [x] „Mein Konto“ für eigene Passwortänderungen mit aktuellem Passwort sowie zweistufigen MFA-Wechsel; das alte Secret bleibt bis zum bestätigten neuen TOTP-Code aktiv.
 - [x] Lokaler `recover-admin`-Notfallpfad über SSH/Hostzugriff mit `--config` oder direktem `--database`, atomarem Credential-Wechsel, Session-/Pending-Widerruf und secret-freiem Audit.
 - [x] Deutsch/Englisch in Setup-, Auth-, Admin- und Public-Flows; Cookie vor `Accept-Language`, Englisch als Fallback, locale-gerechte Datums-/Zahlen-/JavaScript-Ausgabe.
-- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.4.2.
+- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.4.3.
 - [x] Admin-Dateiverwaltung zum Erstellen von Ordnern, No-Clobber-Umbenennen und permanenten rekursiven Löschen mit serverseitiger Bestätigung sowie clientseitigem Exact-Match-Gating.
 - [x] Begrenzte, neustartfähige Tombstone-Bereinigung mit global serialisierten Cleanup-Workern und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
 - [x] API und UI teilen Auth-, Session-, CSRF-, SecureFS-, SQLite-, Runtime-Settings- und Audit-Logik.
@@ -36,18 +36,18 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [x] Pro-Share SecureFS-Capabilities verhindern Symlink-Wechsel in Sibling-Shares für Listing, Preview, Download, ZIP und Upload.
 - [x] Linux-only auf x86_64 und aarch64; Windows-Dateinamensinteroperabilität bleibt für Standard-SMB-Clients erhalten.
 - [x] Externer CIFS-Co-Writer-Modus mit geprüfter Mount-ID/-Quelle/-Optionen, pre-provisioniertem sibling staging, lokalem SQLite und crash-sicherem Pending-/Committed-Delete-Protokoll.
+- [x] Exklusiver, nicht blockierender Lifetime-Lock im gemeinsamen `internal_directory` wird vor Storage-Recovery/Cleanup erworben, auf wirksame Lock-Semantik geprüft und verhindert überlappende VaultLink-Server für dieselbe Journal-Domain.
 - [x] Jede Production-Konfiguration verlangt eine exakte fail-closed Mount-Identität; ein ausgefallener CIFS-Mount darf auch dann nicht auf das lokale Fallback-Verzeichnis starten, wenn dort gerade ext4 sichtbar ist. Auditiertes lokales Production-Storage darf SQLite außerhalb des sichtbaren Baums auf demselben lokalen Mount halten.
 - [x] Browser-Setup und `init-admin` prüfen Root/Internal/Data-Mount und kanonische Pfade vor Konfiguration, Datenbank oder Credential-Secrets; Symlink-Aliase in den sichtbaren Baum werden abgewiesen.
 - [x] Upgrade-/Rollback-Backups und Recovery bestehen immer aus einem validierten Binary/Config/SQLite-Tripel; Candidate-Konfigurationen verändern die Live-Konfiguration nicht vor der Downtime.
 - [x] Gepufferte Form-/JSON-Bodies sind klein begrenzt; ausschließlich Uploadrouten erhalten den großen Streaming-Rahmen. Ein konstanter Streaming-Guard begrenzt Präambel und jeden Multipart-Headerblock, zusätzlich sind Feldanzahl und Metadaten klein begrenzt.
 - [x] Reverse-Proxy-Modus, Standalone-TLS-Modus, SIGHUP-Zertifikatsreload für PEM-Dateien.
 - [x] Optionaler Built-in-Let's-Encrypt-Standalone-TLS-Modus über `tls-alpn-01` und `rustls-acme`.
-- [x] ZeroSSL/acme.sh Renewal-Dokumentation und systemd-Beispiele.
 - [x] UI-/UX-Polish mit getrennten Auth/Public/Admin-Shells, Logo/Favicon, locale-gerechtem Date-Time-Picker, dezimalen MB/GB-Einheiten und konsistenten Buttons/Switches.
 - [x] Public Upload-Fehlerseiten für validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Größenlimits, fehlende Dateinamen und Speicherfehler.
 - [x] Fuzzing für Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, Upload-Validierung, API-Request-Policy, Dateimutationen und Multipart-Streaming.
 
-## Bewusste Nicht-Ziele für 0.4.2
+## Bewusste Nicht-Ziele für 0.4.3
 
 - DEB-Paket.
 - Öffentliches Repository.
@@ -63,14 +63,14 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [x] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` auf amd64 und arm64
 - [ ] `cargo test --locked --all-targets` auf amd64 und arm64
-  - Das verbindliche 0.4.2-Gate sind native Linux-Läufe für amd64 und arm64; frühere Windows-Läufe gelten nicht als Freigabenachweis.
+  - Das verbindliche 0.4.3-Gate sind native Linux-Läufe für amd64 und arm64; frühere Windows-Läufe gelten nicht als Freigabenachweis.
   - Enthalten: Account-Passwort/MFA, Recovery-Races, DE/EN-Hauptrouten und Setup, API Login/MFA/Session/CSRF, Secret-Redaction, Setup-Recovery, UTF-8, SecureFS, Preview, Transfers, ZIP, Multipart, Body-Limits, Upload-Atomizität und Migrationen.
 - [ ] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
   - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy`, `api_request_policy`, `file_mutation_policy` und `multipart_guard` kompiliert.
 - [ ] `cargo build --release --locked` auf amd64 und arm64
 - [ ] `cargo audit --deny warnings` für das gemeinsame Workspace-Lockfile auf dem finalen Stand wiederholen.
 - [ ] `make policy-check` beziehungsweise das Shell-Skript in einer Umgebung mit `sh` wiederholen.
-- [ ] `make docker-smoke` auf dem finalen 0.4.2-Stand nativ auf amd64 und arm64 wiederholen.
+- [ ] `make docker-smoke` auf dem finalen 0.4.3-Stand nativ auf amd64 und arm64 wiederholen.
 
 ## Historische Beobachtung vor dem 0.3.2-Upgrade
 
@@ -116,7 +116,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [ ] GitHub Actions CI auf finalem `main` grün.
 - [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `[self-hosted, Linux, ARM64, vaultlink]` grün; beide verwenden den zu `rust-toolchain.toml` passenden, digest-gepinnten Debian-13-/Rust-OCI-Index. Architekturunabhängige Release-Jobs laufen auf arm64.
 - [ ] Offline erzeugten Minisign-Public-Key als `release/minisign.pub` committen und `MINISIGN_SECRET_KEY` sowie `MINISIGN_PASSWORD` als GitHub-Actions-Secrets provisionieren; ohne alle drei Werte muss der Tag-Publish absichtlich fehlschlagen.
-- [ ] Ein autorisierter Maintainer pusht den annotierten `v0.4.2`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, Main-Ancestry-Prüfung und der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
+- [ ] Ein autorisierter Maintainer pusht den annotierten `v0.4.3`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, exakte Gleichheit von Tag-Commit und `origin/main` sowie der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
 - [ ] Artefakte prüfen:
   - versionierte amd64- und arm64-Archive,
   - eigenständige, architekturspezifische Binaries,
@@ -135,10 +135,12 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [ ] SQLite-Backup vor Upgrade bei gestopptem Dienst erstellen.
 - [ ] Upgrade-Test durchführen.
   - getrennte alte/neue Binary+Config-Paare vor Downtime validieren,
-  - 0.4.0→0.4.1 verweigert ein noch aktives `vaultlink.service` vor jeder Mutation,
+  - jedes pre-0.4.1→0.4.1+-Upgrade verweigert ein noch aktives `vaultlink.service` vor jeder Mutation; semantische Downgrades werden vom Upgrade- und Roll-forwards vom Rollback-Einstiegspunkt abgelehnt,
   - Backup enthält `vaultlink`, `config.toml` und `data.sqlite` mit restriktiven Ownern/Modi,
   - Candidate-Failure restauriert das vollständige alte Tripel und prüft dessen eigenen Health-Endpunkt,
   - paralleles Upgrade/Rollback scheitert vor dem Dienst-Stopp am Maintenance-Lock.
+- [ ] Passwortgeschützte Public-Uploads akzeptieren den Unlock-gebundenen CSRF-Wert als Multipart-Feld beziehungsweise `X-VaultLink-Upload-CSRF` und lehnen fehlende/fremde Werte ab.
+- [ ] Upload-Shares erzwingen Einzeldatei-, kumulatives Byte- und Dateianzahllimit auch bei parallelen Queue-Uploads und Overwrite-Versuchen.
 - [ ] Rollback-Test durchführen:
   - Dienst stoppen,
   - vorheriges Binary, passende Konfiguration und SQLite-Backup wiederherstellen,
@@ -146,7 +148,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
   - exakten lokalen Health-/Versions-Smoke ausführen,
   - fehlgeschlagener Recovery-Stop oder unvollständiger Emergency-Restore bleibt gestoppt.
 - [ ] Reales SMB-3.1.1-Co-Writer-Gate auf einem externen Server:
-  - 0.4.0-Root unter vollständiger Writer-Quiesce inventarisieren; `shared`-/`.vaultlink-internal`-Alias- und alte Fragment/Tombstone-Kollisionen auflösen,
+  - pre-0.4.1-Root unter vollständiger Writer-Quiesce inventarisieren; `shared`-/`.vaultlink-internal`-Alias- und alte Fragment/Tombstone-Kollisionen auflösen,
   - alle sichtbaren Einträge einschließlich Dotfiles serverseitig metadata-/ACL-/xattr-erhaltend in das neue leere `shared/` verschieben und gegen Snapshot/Hashes verifizieren,
   - separates VaultLink-SMB-Konto sowie normale Windows-, macOS- und Linux-Co-Writer-Konten verwenden,
   - SMB-Server/Share erzwingt SMB 3.1.1 Signing und Encryption; dies wird für die VaultLink-Mount-Session und jede direkte Windows-/macOS-/Linux-Session separat verifiziert,
@@ -212,8 +214,8 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [ ] `make policy-check` grün; alle Dependabot-Pin-Updates gegen die jeweiligen Upstream-Repositories geprüft.
 - [ ] Staging- und Public-Gates grün.
 - [ ] 72h-Soak bestanden.
-- [ ] Annotierten Tag `v0.4.2` erstellen.
-- [ ] Tag-Commit ist nachweislich in `origin/main` enthalten; Release-Environment/Secrets sind für den Tag freigegeben.
+- [ ] Annotierten Tag `v0.4.3` erstellen.
+- [ ] Tag-Commit entspricht exakt dem freigegebenen `origin/main`-Commit; Release-Environment/Secrets sind für den Tag freigegeben.
 - [ ] Offline erzeugtes `release/minisign.pub` ist vor dem Tag committed und die beiden Minisign-Secrets sind provisioniert.
 - [ ] Tag-Release-Workflow prüfen:
   - GitHub Release ist privat,

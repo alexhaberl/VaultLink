@@ -16,19 +16,25 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth,
     db::{
-        AdminDeactivationOutcome, AdminSummary, AuditEvent, PasswordSessionCreationOutcome,
-        Permission, Share, UploadConflictStrategy, MAX_SQLITE_UNSIGNED,
+        AdminDeactivationOutcome, AdminSummary, AuditClientIpDeletionOutcome, AuditEvent,
+        PasswordSessionCreationOutcome, Permission, Share, ShareControlsUpdateOutcome,
+        UploadConflictStrategy, DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE,
+        MAX_SQLITE_UNSIGNED,
     },
     file_ops,
     http_auth::{
-        audit, clear_session_cookie, commit_runtime_settings, csrf_header, database,
-        make_session_cookie, make_unlock_cookie, runtime_settings, session, share_is_unlocked,
-        MissingSession, UnlockCookieScope,
+        audit, audit_sync, clear_session_cookie, commit_runtime_settings, csrf_header,
+        current_audit_client_ip, current_client_limit_key, database, enabled_audit_client_ip,
+        hash_password_admitted, make_session_cookie, make_unlock_cookie, runtime_settings, session,
+        share_is_unlocked, try_acquire_client_activity, verify_password_admitted,
+        with_audit_client_ip, MissingSession, UnlockCookieScope,
     },
     path_security, proxy,
     runtime::RuntimeSettings,
     AppState,
 };
+
+const MAX_SEARCH_QUERY_BYTES: usize = 256;
 
 #[derive(Debug)]
 struct ApiError {
@@ -234,7 +240,11 @@ async fn login(
     headers: HeaderMap,
     Json(form): Json<LoginRequest>,
 ) -> ApiResult<Response> {
-    let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
+    let ip = proxy::client_limit_key(proxy::effective_client_ip(
+        peer.ip(),
+        &headers,
+        &state.config,
+    ));
     let ip_key = format!("ip:{ip}");
     if !auth::valid_admin_username(&form.username) {
         if !state.limiter.check_and_record_attempt(&ip_key) {
@@ -270,15 +280,7 @@ async fn login(
     let expected_password_hash = admin.as_ref().map(|admin| admin.password_hash.clone());
     let verification_hash = expected_password_hash.clone();
     let password = form.password;
-    let valid = tokio::task::spawn_blocking(move || match verification_hash {
-        Some(hash) => auth::verify_password(&hash, &password),
-        None => {
-            let _ = auth::hash_password(&password);
-            false
-        }
-    })
-    .await
-    .map_err(ApiError::internal)?;
+    let valid = verify_password_admitted(&state, verification_hash, password).await?;
     if !valid {
         audit(&state, form.username, "login_failed", None, None).await;
         return Err(ApiError::new(
@@ -294,15 +296,28 @@ async fn login(
     let session_token = token.clone();
     let session_csrf = csrf.clone();
     let admin_id = admin.id;
+    let audit_actor = admin.username;
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let expected_password_hash = expected_password_hash.expect("valid password requires a hash");
     let outcome = database(state.db.clone(), move |db| {
-        db.create_session_for_verified_password(
+        let outcome = db.create_session_for_verified_password(
             &session_token,
             admin_id,
             &expected_password_hash,
             &session_csrf,
             expires,
-        )
+        )?;
+        if outcome == PasswordSessionCreationOutcome::Created {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "password_verified",
+                None,
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(outcome)
     })
     .await?;
     if outcome != PasswordSessionCreationOutcome::Created {
@@ -313,9 +328,8 @@ async fn login(
             "Ungültige Zugangsdaten",
         ));
     }
-    state.limiter.success(&key);
-    state.limiter.success(&ip_key);
-    audit(&state, admin.username, "password_verified", None, None).await;
+    // Successful password checks consume the same fixed-window budget so valid
+    // compromised credentials cannot create unbounded sessions/audit traffic.
     let mut response = Json(LoginResponse {
         mfa_required: true,
         csrf_token: csrf,
@@ -337,9 +351,10 @@ async fn mfa(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(form): Json<MfaRequest>,
-) -> ApiResult<Json<MeResponse>> {
+) -> ApiResult<Response> {
     let (token, session_data) =
         session(&state, &headers, false, MissingSession::Unauthorized).await?;
+    csrf_header(&session_data, &headers)?;
     let key = format!("mfa:{}", session_data.username.to_lowercase());
     if !state.limiter.check_and_record_attempt(&key) {
         return Err(ApiError::new(
@@ -361,8 +376,31 @@ async fn mfa(
         ));
     };
     let admin_id = session_data.admin_id;
+    let new_token = auth::random_token(32);
+    let new_csrf = auth::random_token(24);
+    let rotated_token = new_token.clone();
+    let rotated_csrf = new_csrf.clone();
+    let audit_actor = session_data.username.clone();
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let accepted = database(state.db.clone(), move |db| {
-        db.verify_mfa_with_totp_step(&token, admin_id, totp_step)
+        let accepted = db.verify_mfa_with_totp_step(
+            &token,
+            &rotated_token,
+            &rotated_csrf,
+            admin_id,
+            totp_step,
+        )?;
+        if accepted {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "login_success",
+                None,
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(accepted)
     })
     .await?;
     if !accepted {
@@ -374,29 +412,41 @@ async fn mfa(
         ));
     }
     state.limiter.success(&key);
-    audit(
-        &state,
-        session_data.username.clone(),
-        "login_success",
-        None,
-        None,
-    )
-    .await;
-    Ok(Json(MeResponse {
+    let mut response = Json(MeResponse {
         authenticated: true,
         admin_id: session_data.admin_id,
         username: session_data.username,
         mfa_verified: true,
-        csrf_token: session_data.csrf_token,
-    }))
+        csrf_token: new_csrf,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&make_session_cookie(&state, &new_token))
+            .map_err(ApiError::internal)?,
+    );
+    Ok(response)
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let (token, session_data) =
         session(&state, &headers, false, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    database(state.db.clone(), move |db| db.delete_session(&token)).await?;
-    audit(&state, session_data.username, "logout", None, None).await;
+    let audit_actor = session_data.username;
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    database(state.db.clone(), move |db| {
+        db.delete_session(&token)?;
+        audit_sync(
+            &db,
+            &audit_actor,
+            "logout",
+            None,
+            None,
+            audit_client_ip.as_deref(),
+        );
+        Ok(())
+    })
+    .await?;
     let mut response = Json(SimpleResponse { ok: true }).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -511,9 +561,49 @@ async fn files(
         .q
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    if search
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_SEARCH_QUERY_BYTES)
+    {
+        return Err(ApiError::bad_request("Suchbegriff ist zu lang"));
+    }
+    let (scan_peer_permit, scan_permit) = if search.is_some() {
+        let peer = try_acquire_client_activity(
+            state.expensive_peer_admission.clone(),
+            current_client_limit_key(),
+            crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
+        )
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "search_busy",
+                "Zu viele gleichzeitige Dateisuchen dieses Clients",
+            )
+        })?;
+        let global = state
+            .search_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "search_busy",
+                    "Zu viele gleichzeitige Dateisuchen",
+                )
+            })?;
+        (Some(peer), Some(global))
+    } else {
+        (None, None)
+    };
     let secure_root = state.secure_root.clone();
     let scan_limit = settings.max_search_entries;
     let (entries, truncated) = tokio::task::spawn_blocking(move || {
+        // Blocking filesystem scans are not cancelled when the request future is
+        // dropped. Keep both permits in this closure so disconnects cannot
+        // create unbounded detached search work.
+        let _scan_peer_permit = scan_peer_permit;
+        let _scan_permit = scan_permit;
         list_file_page(secure_root, &rel, page, search.as_deref(), scan_limit)
     })
     .await
@@ -600,17 +690,25 @@ async fn create_directory(
 ) -> ApiResult<Response> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    let result = file_ops::create_directory(&state, &request.parent, &request.name)
-        .await
-        .map_err(file_operation_error)?;
-    audit(
-        &state,
-        session_data.username,
-        "directory_created",
-        Some(result.path.clone()),
-        None,
-    )
-    .await;
+    let task_state = state.clone();
+    let audit_client_ip = current_audit_client_ip();
+    let username = session_data.username;
+    let result = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+        let result =
+            file_ops::create_directory(&task_state, &request.parent, &request.name).await?;
+        audit(
+            &task_state,
+            username,
+            "directory_created",
+            Some(result.path.clone()),
+            None,
+        )
+        .await;
+        Ok::<_, file_ops::FileOperationError>(result)
+    }))
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(file_operation_error)?;
     Ok((
         StatusCode::CREATED,
         Json(CreatedDirectoryResponse {
@@ -630,20 +728,27 @@ async fn rename_file_entry(
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
     let old_path = request.path.clone();
-    let result = file_ops::rename(&state, &request.path, &request.name)
-        .await
-        .map_err(file_operation_error)?;
-    audit(
-        &state,
-        session_data.username,
-        "path_renamed",
-        Some(result.path.clone()),
-        Some(format!(
-            "old_path={old_path};updated_shares={}",
-            result.updated_shares
-        )),
-    )
-    .await;
+    let task_state = state.clone();
+    let audit_client_ip = current_audit_client_ip();
+    let username = session_data.username;
+    let result = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+        let result = file_ops::rename(&task_state, &request.path, &request.name).await?;
+        audit(
+            &task_state,
+            username,
+            "path_renamed",
+            Some(result.path.clone()),
+            Some(format!(
+                "old_path={old_path};updated_shares={}",
+                result.updated_shares
+            )),
+        )
+        .await;
+        Ok::<_, file_ops::FileOperationError>(result)
+    }))
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(file_operation_error)?;
     Ok(Json(RenamedFileResponse {
         ok: true,
         path: result.path,
@@ -659,26 +764,34 @@ async fn delete_file_entry(
 ) -> ApiResult<Response> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    let result = file_ops::delete(&state, &request.path, request.confirm_name.as_deref())
-        .await
-        .map_err(file_operation_error)?;
-    audit(
-        &state,
-        session_data.username,
-        "path_deleted",
-        Some(result.path.clone()),
-        Some(format!(
-            "kind={};deactivated_shares={};cleanup={}",
-            file_ops::kind_name(result.kind),
-            result.deactivated_shares,
-            if result.cleanup_pending {
-                "pending"
-            } else {
-                "complete"
-            }
-        )),
-    )
-    .await;
+    let task_state = state.clone();
+    let audit_client_ip = current_audit_client_ip();
+    let username = session_data.username;
+    let result = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+        let result =
+            file_ops::delete(&task_state, &request.path, request.confirm_name.as_deref()).await?;
+        audit(
+            &task_state,
+            username,
+            "path_deleted",
+            Some(result.path.clone()),
+            Some(format!(
+                "kind={};deactivated_shares={};cleanup={}",
+                file_ops::kind_name(result.kind),
+                result.deactivated_shares,
+                if result.cleanup_pending {
+                    "pending"
+                } else {
+                    "complete"
+                }
+            )),
+        )
+        .await;
+        Ok::<_, file_ops::FileOperationError>(result)
+    }))
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(file_operation_error)?;
     let status = if result.cleanup_pending {
         StatusCode::ACCEPTED
     } else {
@@ -735,6 +848,10 @@ struct ShareResponse {
     expires_at: Option<DateTime<Utc>>,
     max_downloads: Option<u64>,
     max_upload_size: Option<u64>,
+    max_upload_total_size: Option<u64>,
+    max_upload_files: Option<u64>,
+    uploaded_bytes: u64,
+    uploaded_files: u64,
     download_count: u64,
     active: bool,
     password_protected: bool,
@@ -762,6 +879,10 @@ fn share_response(settings: &RuntimeSettings, share: Share) -> ShareResponse {
         expires_at: share.expires_at,
         max_downloads: share.max_downloads,
         max_upload_size: share.max_upload_size,
+        max_upload_total_size: share.max_upload_total_size,
+        max_upload_files: share.max_upload_files,
+        uploaded_bytes: share.uploaded_bytes,
+        uploaded_files: share.uploaded_files,
         download_count: share.download_count,
         active: share.active,
         password_protected: share.password_hash.is_some(),
@@ -792,6 +913,8 @@ struct CreateShareRequest {
     expires_at: Option<DateTime<Utc>>,
     max_downloads: Option<u64>,
     max_upload_size: Option<u64>,
+    max_upload_total_size: Option<u64>,
+    max_upload_files: Option<u64>,
     password: Option<String>,
     overwrite_allowed: Option<bool>,
 }
@@ -803,18 +926,8 @@ async fn create_share(
 ) -> ApiResult<Json<ShareResponse>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    let _storage_guard = state.storage_mutation.lock().await;
     let settings = runtime_settings(&state);
     let rel = validate_rel(&request.path)?;
-    let metadata = state
-        .secure_root
-        .metadata(&rel)
-        .map_err(|_| ApiError::not_found("Ziel nicht gefunden"))?;
-    if metadata.is_file() && request.permission.can_upload() {
-        return Err(ApiError::bad_request(
-            "Upload-Rechte sind für Datei-Freigaben nicht erlaubt",
-        ));
-    }
     if request.max_downloads == Some(0) {
         return Err(ApiError::bad_request(
             "Das Übertragungslimit muss mindestens 1 sein",
@@ -833,9 +946,53 @@ async fn create_share(
     }
     if request
         .max_upload_size
-        .is_some_and(|value| value > MAX_SQLITE_UNSIGNED)
+        .is_some_and(|value| value > crate::config::MAX_UPLOAD_SIZE)
     {
         return Err(ApiError::bad_request("Das Uploadlimit ist zu groß"));
+    }
+    if request.max_upload_total_size == Some(0)
+        || request
+            .max_upload_total_size
+            .is_some_and(|value| value > MAX_SQLITE_UNSIGNED)
+    {
+        return Err(ApiError::bad_request(
+            "Das kumulative Uploadlimit ist ungültig",
+        ));
+    }
+    if request.max_upload_files == Some(0)
+        || request
+            .max_upload_files
+            .is_some_and(|value| value > MAX_SQLITE_UNSIGNED)
+    {
+        return Err(ApiError::bad_request("Das Upload-Dateilimit ist ungültig"));
+    }
+    if !request.permission.can_upload()
+        && (request.max_upload_size.is_some()
+            || request.max_upload_total_size.is_some()
+            || request.max_upload_files.is_some())
+    {
+        return Err(ApiError::bad_request(
+            "Uploadlimits sind nur für Upload-Freigaben erlaubt",
+        ));
+    }
+    let effective_single_upload_limit = request
+        .max_upload_size
+        .unwrap_or(settings.max_upload_size)
+        .min(crate::config::MAX_UPLOAD_SIZE);
+    let upload_total_limit = request.permission.can_upload().then(|| {
+        request
+            .max_upload_total_size
+            .unwrap_or(DEFAULT_SHARE_UPLOAD_TOTAL_SIZE.max(effective_single_upload_limit))
+    });
+    let upload_file_limit = request.permission.can_upload().then(|| {
+        request
+            .max_upload_files
+            .unwrap_or(DEFAULT_SHARE_UPLOAD_FILE_COUNT)
+    });
+    if upload_total_limit.is_some_and(|value| value < effective_single_upload_limit) {
+        return Err(ApiError::bad_request(
+            "Das kumulative Uploadlimit darf nicht kleiner als das Einzeldateilimit sein",
+        ));
     }
     if request
         .expires_at
@@ -857,15 +1014,7 @@ async fn create_share(
         .filter(|value| !value.trim().is_empty())
     {
         validate_share_password(&settings, password)?;
-        Some(
-            tokio::task::spawn_blocking({
-                let password = password.to_string();
-                move || auth::hash_password(&password)
-            })
-            .await
-            .map_err(ApiError::internal)?
-            .map_err(ApiError::internal)?,
-        )
+        Some(hash_password_admitted(&state, password.to_string()).await?)
     } else {
         None
     };
@@ -875,13 +1024,37 @@ async fn create_share(
             "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
         ));
     }
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let storage_guard = file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_recovery",
+                "Speicherzustand wird wiederhergestellt",
+            )
+        })?;
+    let metadata = state
+        .secure_root
+        .metadata(&rel)
+        .map_err(|_| ApiError::not_found("Ziel nicht gefunden"))?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(ApiError::bad_request(
+            "Freigaben sind nur für reguläre Dateien oder Ordner erlaubt",
+        ));
+    }
+    if metadata.is_file() && request.permission.can_upload() {
+        return Err(ApiError::bad_request(
+            "Upload-Rechte sind für Datei-Freigaben nicht erlaubt",
+        ));
+    }
     let strategy = if metadata.is_dir() && request.permission.can_upload() && overwrite_requested {
         UploadConflictStrategy::OverwriteAllowed
     } else {
         UploadConflictStrategy::Reject
     };
     let audit_detail = format!(
-        "path={rel};permission={};alias={};expires_at={};transfer_limit={};upload_limit={};password_protected={};overwrite_allowed={}",
+        "path={rel};permission={};alias={};expires_at={};transfer_limit={};upload_limit={};upload_total_limit={};upload_file_limit={};password_protected={};overwrite_allowed={}",
         request.permission.as_str(),
         alias.as_deref().unwrap_or(""),
         request
@@ -894,6 +1067,12 @@ async fn create_share(
             .unwrap_or_default(),
         request
             .max_upload_size
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        upload_total_limit
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        upload_file_limit
             .map(|value| value.to_string())
             .unwrap_or_default(),
         password_hash.is_some(),
@@ -909,8 +1088,18 @@ async fn create_share(
     let admin_id = session_data.admin_id;
     let password_hash_for_db = password_hash.clone();
     let strategy_for_db = strategy.clone();
-    let share_id = database(state.db.clone(), move |db| {
-        db.create_share(
+    let username = session_data.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    database(state.db.clone(), move |db| {
+        // The database task is not cancelled with the request. Retain the
+        // storage lock in the task so rename/delete cannot interleave after
+        // the target metadata check and create a share for a stale path.
+        let _storage_guard = storage_guard;
+        let share_id = db.create_share_with_upload_limits(
             &token_for_db,
             alias.as_deref(),
             &rel_for_db,
@@ -919,20 +1108,24 @@ async fn create_share(
             expires_at,
             max_downloads,
             max_upload_size,
+            upload_total_limit,
+            upload_file_limit,
             admin_id,
             password_hash_for_db.as_deref(),
             &strategy_for_db,
-        )
+        )?;
+        let object = share_id.to_string();
+        audit_sync(
+            &db,
+            &username,
+            "share_created",
+            Some(&object),
+            Some(&audit_detail),
+            audit_client_ip.as_deref(),
+        );
+        Ok(())
     })
     .await?;
-    audit(
-        &state,
-        session_data.username,
-        "share_created",
-        Some(share_id.to_string()),
-        Some(audit_detail),
-    )
-    .await;
     let share = database(state.db.clone(), move |db| db.share_by_token(&token))
         .await?
         .ok_or_else(|| ApiError::internal(()))?;
@@ -943,6 +1136,8 @@ async fn create_share(
 struct UpdateShareRequest {
     active: Option<bool>,
     upload_conflict_strategy: Option<UploadConflictStrategy>,
+    max_upload_total_size: Option<u64>,
+    max_upload_files: Option<u64>,
 }
 
 async fn update_share(
@@ -953,50 +1148,118 @@ async fn update_share(
 ) -> ApiResult<Json<ShareResponse>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
+    let current_share = find_share_by_id(&state, id).await?;
     if request
         .upload_conflict_strategy
         .as_ref()
-        .is_some_and(UploadConflictStrategy::can_overwrite)
-        && state.config.storage.external_writers
+        .is_some_and(|strategy| {
+            strategy.can_overwrite()
+                && (state.config.storage.external_writers
+                    || !current_share.is_directory
+                    || !current_share.permission.can_upload())
+        })
     {
         return Err(ApiError::bad_request(
-            "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+            "Überschreiben ist für diese Freigabe nicht erlaubt",
         ));
     }
-    if let Some(active) = request.active {
-        let changed = database(state.db.clone(), move |db| db.set_share_active(id, active)).await?;
-        if !changed {
+    let upload_limits =
+        if request.max_upload_total_size.is_some() || request.max_upload_files.is_some() {
+            if !current_share.is_directory || !current_share.permission.can_upload() {
+                return Err(ApiError::bad_request(
+                    "Uploadlimits sind nur für Upload-Freigaben erlaubt",
+                ));
+            }
+            let total = request
+                .max_upload_total_size
+                .or(current_share.max_upload_total_size)
+                .ok_or_else(|| ApiError::internal(()))?;
+            let files = request
+                .max_upload_files
+                .or(current_share.max_upload_files)
+                .ok_or_else(|| ApiError::internal(()))?;
+            let effective_single = current_share
+                .max_upload_size
+                .unwrap_or_else(|| runtime_settings(&state).max_upload_size)
+                .min(crate::config::MAX_UPLOAD_SIZE);
+            if total < effective_single
+                || total < current_share.uploaded_bytes
+                || total > MAX_SQLITE_UNSIGNED
+                || files == 0
+                || files < current_share.uploaded_files
+                || files > MAX_SQLITE_UNSIGNED
+            {
+                return Err(ApiError::bad_request("Ungültige kumulative Uploadlimits"));
+            }
+            Some((total, files))
+        } else {
+            None
+        };
+    let active = request.active;
+    let strategy = request.upload_conflict_strategy.clone();
+    let strategy_for_db = strategy.clone();
+    let username = session_data.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let outcome = database(state.db.clone(), move |db| {
+        let outcome =
+            db.update_share_controls(id, active, strategy_for_db.as_ref(), upload_limits)?;
+        if outcome == ShareControlsUpdateOutcome::Updated {
+            let object = id.to_string();
+            if let Some(active) = active {
+                audit_sync(
+                    &db,
+                    &username,
+                    if active {
+                        "share_activated"
+                    } else {
+                        "share_deactivated"
+                    },
+                    Some(&object),
+                    None,
+                    audit_client_ip.as_deref(),
+                );
+            }
+            if strategy.is_some() {
+                audit_sync(
+                    &db,
+                    &username,
+                    "share_upload_conflict_updated",
+                    Some(&object),
+                    None,
+                    audit_client_ip.as_deref(),
+                );
+            }
+            if let Some((total, files)) = upload_limits {
+                let detail = format!("bytes={total};files={files}");
+                audit_sync(
+                    &db,
+                    &username,
+                    "share_upload_limits_updated",
+                    Some(&object),
+                    Some(&detail),
+                    audit_client_ip.as_deref(),
+                );
+            }
+        }
+        Ok(outcome)
+    })
+    .await?;
+    match outcome {
+        ShareControlsUpdateOutcome::Updated => {}
+        ShareControlsUpdateOutcome::NotFound => {
             return Err(ApiError::not_found("Freigabe nicht gefunden"));
         }
-        audit(
-            &state,
-            session_data.username.clone(),
-            if active {
-                "share_activated"
-            } else {
-                "share_deactivated"
-            },
-            Some(id.to_string()),
-            None,
-        )
-        .await;
-    }
-    if let Some(strategy) = request.upload_conflict_strategy {
-        let changed = database(state.db.clone(), move |db| {
-            db.set_upload_conflict_strategy(id, &strategy)
-        })
-        .await?;
-        if !changed {
-            return Err(ApiError::not_found("Freigabe nicht gefunden"));
+        ShareControlsUpdateOutcome::QuotaConflict => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "upload_quota_in_use",
+                "Uploadlimit wird von laufenden Uploads belegt",
+            ));
         }
-        audit(
-            &state,
-            session_data.username,
-            "share_upload_conflict_updated",
-            Some(id.to_string()),
-            None,
-        )
-        .await;
     }
     let settings = runtime_settings(&state);
     let share = find_share_by_id(&state, id).await?;
@@ -1027,22 +1290,35 @@ async fn set_share_active_api(
 ) -> ApiResult<Json<SimpleResponse>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    let changed = database(state.db.clone(), move |db| db.set_share_active(id, active)).await?;
+    let username = session_data.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let changed = database(state.db.clone(), move |db| {
+        let changed = db.set_share_active(id, active)?;
+        if changed {
+            let object = id.to_string();
+            audit_sync(
+                &db,
+                &username,
+                if active {
+                    "share_activated"
+                } else {
+                    "share_deactivated"
+                },
+                Some(&object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(changed)
+    })
+    .await?;
     if !changed {
         return Err(ApiError::not_found("Freigabe nicht gefunden"));
     }
-    audit(
-        &state,
-        session_data.username,
-        if active {
-            "share_activated"
-        } else {
-            "share_deactivated"
-        },
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Json(SimpleResponse { ok: true }))
 }
 
@@ -1053,18 +1329,31 @@ async fn delete_share(
 ) -> ApiResult<Json<SimpleResponse>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    let deleted = database(state.db.clone(), move |db| db.delete_share(id)).await?;
+    let username = session_data.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let deleted = database(state.db.clone(), move |db| {
+        let deleted = db.delete_share(id)?;
+        if deleted {
+            let object = id.to_string();
+            audit_sync(
+                &db,
+                &username,
+                "share_deleted",
+                Some(&object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(deleted)
+    })
+    .await?;
     if !deleted {
         return Err(ApiError::not_found("Freigabe nicht gefunden"));
     }
-    audit(
-        &state,
-        session_data.username,
-        "share_deleted",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Json(SimpleResponse { ok: true }))
 }
 
@@ -1082,25 +1371,32 @@ async fn set_share_password(
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
     validate_share_password(&runtime_settings(&state), &request.password)?;
-    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&request.password))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::internal)?;
+    let hash = hash_password_admitted(&state, request.password).await?;
+    let username = session_data.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
     let changed = database(state.db.clone(), move |db| {
-        db.set_share_password(id, Some(&hash))
+        let changed = db.set_share_password(id, Some(&hash))?;
+        if changed {
+            let object = id.to_string();
+            audit_sync(
+                &db,
+                &username,
+                "share_password_set",
+                Some(&object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(changed)
     })
     .await?;
     if !changed {
         return Err(ApiError::not_found("Freigabe nicht gefunden"));
     }
-    audit(
-        &state,
-        session_data.username,
-        "share_password_set",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Json(SimpleResponse { ok: true }))
 }
 
@@ -1111,18 +1407,31 @@ async fn remove_share_password(
 ) -> ApiResult<Json<SimpleResponse>> {
     let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
     csrf_header(&session_data, &headers)?;
-    let changed = database(state.db.clone(), move |db| db.set_share_password(id, None)).await?;
+    let username = session_data.username;
+    let audit_client_ip = runtime_settings(&state)
+        .audit_client_ip_enabled
+        .then(current_audit_client_ip)
+        .flatten()
+        .map(|ip| ip.to_string());
+    let changed = database(state.db.clone(), move |db| {
+        let changed = db.set_share_password(id, None)?;
+        if changed {
+            let object = id.to_string();
+            audit_sync(
+                &db,
+                &username,
+                "share_password_removed",
+                Some(&object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(changed)
+    })
+    .await?;
     if !changed {
         return Err(ApiError::not_found("Freigabe nicht gefunden"));
     }
-    audit(
-        &state,
-        session_data.username,
-        "share_password_removed",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Json(SimpleResponse { ok: true }))
 }
 
@@ -1175,34 +1484,29 @@ async fn create_admin(
     csrf_header(&session_data, &headers)?;
     validate_admin_username(&request.username)?;
     validate_admin_password(&request.password)?;
-    let password_hash = tokio::task::spawn_blocking({
-        let password = request.password.clone();
-        move || auth::hash_password(&password)
-    })
-    .await
-    .map_err(ApiError::internal)?
-    .map_err(ApiError::internal)?;
+    let password_hash = hash_password_admitted(&state, request.password.clone()).await?;
     let secret = auth::new_totp_secret();
     let username = request.username.clone();
     let secret_for_db = secret.clone();
-    database(state.db.clone(), move |db| {
-        db.create_admin(&username, &password_hash, &secret_for_db)
+    let audit_actor = session_data.username;
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let admin = database(state.db.clone(), move |db| {
+        db.create_admin(&username, &password_hash, &secret_for_db)?;
+        let admin = db
+            .admin(&username)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let object = admin.id.to_string();
+        audit_sync(
+            &db,
+            &audit_actor,
+            "admin_created",
+            Some(&object),
+            None,
+            audit_client_ip.as_deref(),
+        );
+        Ok(admin)
     })
     .await?;
-    let admin = database(state.db.clone(), {
-        let username = request.username.clone();
-        move |db| db.admin(&username)
-    })
-    .await?
-    .ok_or_else(|| ApiError::internal(()))?;
-    audit(
-        &state,
-        session_data.username,
-        "admin_created",
-        Some(admin.id.to_string()),
-        None,
-    )
-    .await;
     Ok(Json(CreatedAdminResponse {
         id: admin.id,
         username: admin.username.clone(),
@@ -1243,12 +1547,48 @@ async fn set_admin_active_api(
             "Eigener Admin kann nicht stillgelegt werden",
         ));
     }
+    let audit_actor = session_data.username;
+    let audit_object = id.to_string();
+    let audit_client_ip = enabled_audit_client_ip(&state);
     if active {
-        if !database(state.db.clone(), move |db| db.activate_admin(id)).await? {
+        let changed = database(state.db.clone(), move |db| {
+            let changed = db.activate_admin(id)?;
+            if changed {
+                audit_sync(
+                    &db,
+                    &audit_actor,
+                    "admin_activated",
+                    Some(&audit_object),
+                    None,
+                    audit_client_ip.as_deref(),
+                );
+            }
+            Ok(changed)
+        })
+        .await?;
+        if !changed {
             return Err(ApiError::not_found("Admin nicht gefunden"));
         }
     } else {
-        match database(state.db.clone(), move |db| db.deactivate_admin(id)).await? {
+        let outcome = database(state.db.clone(), move |db| {
+            let outcome = db.deactivate_admin(id)?;
+            if matches!(
+                outcome,
+                AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive
+            ) {
+                audit_sync(
+                    &db,
+                    &audit_actor,
+                    "admin_deactivated",
+                    Some(&audit_object),
+                    None,
+                    audit_client_ip.as_deref(),
+                );
+            }
+            Ok(outcome)
+        })
+        .await?;
+        match outcome {
             AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive => {}
             AdminDeactivationOutcome::LastActive => {
                 return Err(ApiError::bad_request(
@@ -1260,18 +1600,6 @@ async fn set_admin_active_api(
             }
         }
     }
-    audit(
-        &state,
-        session_data.username,
-        if active {
-            "admin_activated"
-        } else {
-            "admin_deactivated"
-        },
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Json(SimpleResponse { ok: true }))
 }
 
@@ -1289,25 +1617,28 @@ async fn reset_admin_password(
         ));
     }
     validate_admin_password(&request.password)?;
-    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&request.password))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::internal)?;
+    let hash = hash_password_admitted(&state, request.password).await?;
+    let audit_actor = session_data.username;
+    let audit_object = id.to_string();
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let changed = database(state.db.clone(), move |db| {
-        db.reset_admin_password(id, &hash)
+        let changed = db.reset_admin_password(id, &hash)?;
+        if changed {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "admin_password_reset",
+                Some(&audit_object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(changed)
     })
     .await?;
     if !changed {
         return Err(ApiError::not_found("Admin nicht gefunden"));
     }
-    audit(
-        &state,
-        session_data.username,
-        "admin_password_reset",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Json(SimpleResponse { ok: true }))
 }
 
@@ -1325,19 +1656,25 @@ async fn reset_admin_totp(
     }
     let secret = auth::new_totp_secret();
     let secret_for_db = secret.clone();
+    let audit_actor = session_data.username;
+    let audit_object = id.to_string();
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let username = database(state.db.clone(), move |db| {
-        db.reset_admin_totp(id, &secret_for_db)
+        let username = db.reset_admin_totp(id, &secret_for_db)?;
+        if username.is_some() {
+            audit_sync(
+                &db,
+                &audit_actor,
+                "admin_totp_reset",
+                Some(&audit_object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(username)
     })
     .await?
     .ok_or_else(|| ApiError::not_found("Admin nicht gefunden"))?;
-    audit(
-        &state,
-        session_data.username,
-        "admin_totp_reset",
-        Some(id.to_string()),
-        None,
-    )
-    .await;
     Ok(Json(CreatedAdminResponse {
         id,
         username: username.clone(),
@@ -1458,15 +1795,14 @@ async fn update_settings(
         .map_err(|_| ApiError::bad_request("Ungültige Einstellung"))?;
     let admin_id = session_data.admin_id;
     let changed_keys = current.changed_keys(&next).join(",");
-    commit_runtime_settings(&state, next.clone(), admin_id).await?;
-    audit(
+    commit_runtime_settings(
         &state,
+        next.clone(),
+        admin_id,
         session_data.username,
-        "settings_updated",
-        None,
-        Some(format!("changed_keys={changed_keys}")),
+        format!("changed_keys={changed_keys}"),
     )
-    .await;
+    .await?;
     Ok(Json(settings_body(next)))
 }
 
@@ -1544,11 +1880,6 @@ async fn list_audit(
     }))
 }
 
-enum AuditClientIpDeletion {
-    LoggingEnabled,
-    Deleted(usize),
-}
-
 #[derive(Serialize)]
 struct DeletedAuditClientIpsResponse {
     deleted: usize,
@@ -1573,35 +1904,32 @@ async fn delete_audit_client_ips(
             "Exakte Bestätigung IP-DATEN LÖSCHEN erforderlich",
         ));
     }
-    let runtime = state.runtime.clone();
+    let fallback_logging_enabled = runtime_settings(&state).audit_client_ip_enabled;
+    let audit_actor = session_data.username;
+    let audit_client_ip = enabled_audit_client_ip(&state);
     let outcome = database(state.db.clone(), move |db| {
-        let logging_enabled = runtime
-            .read()
-            .map(|settings| settings.audit_client_ip_enabled)
-            .unwrap_or(true);
-        if logging_enabled {
-            Ok(AuditClientIpDeletion::LoggingEnabled)
-        } else {
-            db.delete_audit_client_ips()
-                .map(AuditClientIpDeletion::Deleted)
+        let outcome = db.delete_audit_client_ips_if_disabled(fallback_logging_enabled)?;
+        if let AuditClientIpDeletionOutcome::Deleted(deleted) = outcome {
+            let detail = format!("deleted={deleted}");
+            audit_sync(
+                &db,
+                &audit_actor,
+                "audit_client_ips_deleted",
+                None,
+                Some(&detail),
+                audit_client_ip.as_deref(),
+            );
         }
+        Ok(outcome)
     })
     .await?;
-    let AuditClientIpDeletion::Deleted(deleted) = outcome else {
+    let AuditClientIpDeletionOutcome::Deleted(deleted) = outcome else {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "client_ip_logging_enabled",
             "Client-IP-Logging muss vor dem Löschen deaktiviert werden",
         ));
     };
-    audit(
-        &state,
-        session_data.username,
-        "audit_client_ips_deleted",
-        None,
-        Some(format!("deleted={deleted}")),
-    )
-    .await;
     Ok(Json(DeletedAuditClientIpsResponse { deleted }))
 }
 
@@ -1624,6 +1952,16 @@ struct PublicShareResponse {
     download_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_downloads: Option<Option<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_upload_size: Option<Option<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_upload_total_size: Option<Option<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_upload_files: Option<Option<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uploaded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uploaded_files: Option<u64>,
 }
 
 async fn public_share(
@@ -1644,6 +1982,11 @@ async fn public_share(
             expires_at: None,
             download_count: None,
             max_downloads: None,
+            max_upload_size: None,
+            max_upload_total_size: None,
+            max_upload_files: None,
+            uploaded_bytes: None,
+            uploaded_files: None,
         }));
     }
     let public_path = if share.permission == Permission::UploadOnly {
@@ -1661,12 +2004,23 @@ async fn public_share(
         expires_at: Some(share.expires_at),
         download_count: Some(share.download_count),
         max_downloads: Some(share.max_downloads),
+        max_upload_size: Some(share.max_upload_size),
+        max_upload_total_size: Some(share.max_upload_total_size),
+        max_upload_files: Some(share.max_upload_files),
+        uploaded_bytes: Some(share.uploaded_bytes),
+        uploaded_files: Some(share.uploaded_files),
     }))
 }
 
 #[derive(Deserialize)]
 struct UnlockRequest {
     password: String,
+}
+
+#[derive(Serialize)]
+struct UnlockResponse {
+    ok: bool,
+    csrf_token: Option<String>,
 }
 
 async fn unlock_share(
@@ -1678,9 +2032,19 @@ async fn unlock_share(
 ) -> ApiResult<Response> {
     let share = get_share(&state, &token).await?;
     let Some(hash) = share.password_hash.clone() else {
-        return Ok(Json(SimpleResponse { ok: true }).into_response());
+        return Ok(Json(UnlockResponse {
+            ok: true,
+            csrf_token: None,
+        })
+        .into_response());
     };
-    let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
+    let expected_password_hash = hash.clone();
+    let expected_upload_policy_epoch = share.upload_policy_epoch;
+    let ip = proxy::client_limit_key(proxy::effective_client_ip(
+        peer.ip(),
+        &headers,
+        &state.config,
+    ));
     let key = format!("share:{}:{ip}", share.id);
     if !state.share_limiter.check_and_record_attempt(&key) {
         return Err(ApiError::new(
@@ -1705,9 +2069,7 @@ async fn unlock_share(
             "Ungültiges Passwort",
         ));
     }
-    let valid = tokio::task::spawn_blocking(move || auth::verify_password(&hash, &password))
-        .await
-        .map_err(ApiError::internal)?;
+    let valid = verify_password_admitted(&state, Some(hash), password).await?;
     if !valid {
         audit(
             &state,
@@ -1723,24 +2085,57 @@ async fn unlock_share(
             "Ungültiges Passwort",
         ));
     }
-    state.share_limiter.success(&key);
+    // Successful unlocks stay inside the fixed-window budget as well.
     let unlock_token = auth::random_token(32);
+    let unlock_csrf = auth::random_token(24);
     let share_id = share.id;
     let expires = Utc::now() + Duration::minutes(runtime_settings(&state).share_unlock_minutes);
     let token_for_db = unlock_token.clone();
-    database(state.db.clone(), move |db| {
-        db.create_unlock_session(&token_for_db, share_id, expires)
+    let csrf_for_db = unlock_csrf.clone();
+    let audit_object = share_id.to_string();
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let created = database(state.db.clone(), move |db| {
+        let created = db.create_unlock_session_for_verified_password(
+            &token_for_db,
+            share_id,
+            &expected_password_hash,
+            expected_upload_policy_epoch,
+            &csrf_for_db,
+            expires,
+        )?;
+        if created {
+            audit_sync(
+                &db,
+                "public",
+                "share_unlocked",
+                Some(&audit_object),
+                None,
+                audit_client_ip.as_deref(),
+            );
+        }
+        Ok(created)
     })
     .await?;
-    audit(
-        &state,
-        "public".into(),
-        "share_unlocked",
-        Some(share.id.to_string()),
-        None,
-    )
-    .await;
-    let mut response = Json(SimpleResponse { ok: true }).into_response();
+    if !created {
+        audit(
+            &state,
+            "public".into(),
+            "share_unlock_failed",
+            Some(share.id.to_string()),
+            None,
+        )
+        .await;
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_share_password",
+            "Ungültiges Passwort",
+        ));
+    }
+    let mut response = Json(UnlockResponse {
+        ok: true,
+        csrf_token: Some(unlock_csrf),
+    })
+    .into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&make_unlock_cookie(
@@ -2022,6 +2417,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn argon2_overload_is_identical_for_known_and_unknown_logins() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let hash = auth::hash_password("correct horse battery staple").unwrap();
+        state
+            .db
+            .create_admin("admin", &hash, &auth::new_totp_secret())
+            .unwrap();
+        let _capacity = state
+            .argon2_admission
+            .clone()
+            .acquire_many_owned(crate::MAX_CONCURRENT_ARGON2_OPERATIONS as u32)
+            .await
+            .unwrap();
+        let app = crate::web::router(state.clone());
+
+        let known = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/session/login",
+                r#"{"username":"admin","password":"wrong password"}"#,
+            ))
+            .await
+            .unwrap();
+        let unknown = app
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/session/login",
+                r#"{"username":"absent","password":"wrong password"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(known.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unknown.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_text(known).await, response_text(unknown).await);
+    }
+
     async fn api_login(state: &AppState, secret: &str) -> (String, String) {
         let app = crate::web::router(state.clone());
         let login = app
@@ -2034,20 +2470,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(login.status(), StatusCode::OK);
-        let session_cookie = cookie(&login);
+        let pre_mfa_cookie = cookie(&login);
         let login_body = response_text(login).await;
-        let csrf = json_string_value(&login_body, "csrf_token");
+        let pre_mfa_csrf = json_string_value(&login_body, "csrf_token");
+        let mfa_code = current_totp(secret);
+        let mut missing_csrf = json_request(
+            Method::POST,
+            "/api/v1/session/mfa",
+            &format!(r#"{{"code":"{mfa_code}"}}"#),
+        );
+        missing_csrf.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&pre_mfa_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(missing_csrf).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
         let mut mfa = json_request(
             Method::POST,
             "/api/v1/session/mfa",
-            &format!(r#"{{"code":"{}"}}"#, current_totp(secret)),
+            &format!(r#"{{"code":"{mfa_code}"}}"#),
         );
         mfa.headers_mut().insert(
             header::COOKIE,
-            HeaderValue::from_str(&session_cookie).unwrap(),
+            HeaderValue::from_str(&pre_mfa_cookie).unwrap(),
+        );
+        mfa.headers_mut().insert(
+            "x-csrf-token",
+            HeaderValue::from_str(&pre_mfa_csrf).unwrap(),
         );
         let mfa = app.oneshot(mfa).await.unwrap();
         assert_eq!(mfa.status(), StatusCode::OK);
+        let session_cookie = cookie(&mfa);
+        let mfa_body = response_text(mfa).await;
+        let csrf = json_string_value(&mfa_body, "csrf_token");
         (session_cookie, csrf)
     }
 
@@ -2093,9 +2550,9 @@ mod tests {
         let secret = auth::new_totp_secret();
         let hash = auth::hash_password("correct horse battery staple").unwrap();
         state.db.create_admin("admin", &hash, &secret).unwrap();
-        let app = crate::web::router(state);
+        let app = crate::web::router(state.clone());
 
-        let mut cookies = Vec::new();
+        let mut pending_sessions = Vec::new();
         for _ in 0..2 {
             let login = app
                 .clone()
@@ -2107,11 +2564,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(login.status(), StatusCode::OK);
-            cookies.push(cookie(&login));
+            let session_cookie = cookie(&login);
+            let login_body = response_text(login).await;
+            pending_sessions.push((session_cookie, json_string_value(&login_body, "csrf_token")));
         }
 
         let code = current_totp(&secret);
-        for (index, session_cookie) in cookies.into_iter().enumerate() {
+        for (index, (session_cookie, csrf)) in pending_sessions.into_iter().enumerate() {
             let mut request = json_request(
                 Method::POST,
                 "/api/v1/session/mfa",
@@ -2121,6 +2580,9 @@ mod tests {
                 header::COOKIE,
                 HeaderValue::from_str(&session_cookie).unwrap(),
             );
+            request
+                .headers_mut()
+                .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
             let response = app.clone().oneshot(request).await.unwrap();
             assert_eq!(
                 response.status(),
@@ -2145,6 +2607,32 @@ mod tests {
         state.db.create_admin("admin", &hash, &secret).unwrap();
         let (session_cookie, csrf) = api_login(&state, &secret).await;
         let app = crate::web::router(state.clone());
+
+        let _special_socket =
+            std::os::unix::net::UnixListener::bind(root.path().join("special-share-target.sock"))
+                .unwrap();
+        let mut special_target = json_request(
+            Method::POST,
+            "/api/v1/shares",
+            r#"{"path":"special-share-target.sock","permission":"download_only"}"#,
+        );
+        special_target.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        special_target
+            .headers_mut()
+            .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+        assert_eq!(
+            app.clone().oneshot(special_target).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state
+            .db
+            .list_shares()
+            .unwrap()
+            .iter()
+            .all(|share| share.relative_path != "special-share-target.sock"));
 
         let mut invalid_limit = json_request(
             Method::POST,
@@ -2583,18 +3071,90 @@ mod tests {
         let hash = auth::hash_password("correct horse battery staple").unwrap();
         state.db.create_admin("admin", &hash, &secret).unwrap();
         let (session_cookie, _) = api_login(&state, &secret).await;
-        let app = crate::web::router(state);
+        let app = crate::web::router(state.clone());
         let mut request = json_request(Method::GET, "/api/v1/files?path=&q=only-late-match", "");
         request.headers_mut().insert(
             header::COOKIE,
             HeaderValue::from_str(&session_cookie).unwrap(),
         );
-        let response = app.oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
         assert!(body.contains("only-late-match.txt"), "{body}");
         assert!(body.contains(r#""truncated":false"#));
         assert!(body.contains(r#""has_next":false"#));
+
+        let too_long = "x".repeat(MAX_SEARCH_QUERY_BYTES + 1);
+        let mut request = json_request(
+            Method::GET,
+            &format!("/api/v1/files?path=&q={too_long}"),
+            "",
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let all_searches = state
+            .search_admission
+            .clone()
+            .try_acquire_many_owned(crate::MAX_CONCURRENT_SEARCHES as u32)
+            .unwrap();
+        let mut request = json_request(Method::GET, "/api/v1/files?path=", "");
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let mut request = json_request(Method::GET, "/api/v1/files?path=&q=ordinary", "");
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(all_searches);
+
+        let peer = "127.0.0.1".parse().unwrap();
+        let peer_permits = (0..crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT)
+            .map(|_| {
+                crate::http_auth::try_acquire_client_activity(
+                    state.expensive_peer_admission.clone(),
+                    peer,
+                    crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
+                )
+                .unwrap()
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut request = json_request(Method::GET, "/api/v1/files?path=", "");
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let mut request = json_request(Method::GET, "/api/v1/files?path=&q=ordinary", "");
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&session_cookie).unwrap(),
+        );
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(peer_permits);
     }
 
     #[test]
@@ -2819,6 +3379,65 @@ mod tests {
                 .download_count,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn api_reports_active_upload_reservations_as_quota_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("uploads")).unwrap();
+        let state = test_state(root.path(), data.path());
+        let secret = auth::new_totp_secret();
+        let hash = auth::hash_password("correct horse battery staple").unwrap();
+        state.db.create_admin("admin", &hash, &secret).unwrap();
+        let (session_cookie, csrf) = api_login(&state, &secret).await;
+        let share_id = state
+            .db
+            .create_share_with_upload_limits(
+                "quota-conflict",
+                None,
+                "uploads",
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                Some(5),
+                Some(20),
+                Some(3),
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        for token in ["active-one", "active-two"] {
+            assert_eq!(
+                state.db.begin_upload_reservation(token, share_id).unwrap(),
+                crate::db::UploadReservationBeginOutcome::Reserved
+            );
+            assert_eq!(
+                state.db.extend_upload_reservation(token, 5).unwrap(),
+                crate::db::UploadReservationExtendOutcome::Extended
+            );
+        }
+        let app = crate::web::router(state.clone());
+        let mut update = json_request(
+            Method::PATCH,
+            &format!("/api/v1/shares/{share_id}"),
+            r#"{"upload_conflict_strategy":"overwrite_allowed","max_upload_total_size":5,"max_upload_files":1}"#,
+        );
+        authorize_mutation(&mut update, &session_cookie, &csrf);
+        let response = app.oneshot(update).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response_text(response)
+            .await
+            .contains(r#""code":"upload_quota_in_use""#));
+        let share = state.db.share_by_token("quota-conflict").unwrap().unwrap();
+        assert_eq!(
+            share.upload_conflict_strategy,
+            UploadConflictStrategy::Reject
+        );
+        assert_eq!(share.max_upload_total_size, Some(20));
+        assert_eq!(share.max_upload_files, Some(3));
     }
 
     #[tokio::test]

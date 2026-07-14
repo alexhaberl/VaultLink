@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
+/// Hard ceiling for an entire multipart request body. This protects the server from
+/// configurations that cannot be represented by the HTTP upload routes.
+pub const MAX_MULTIPART_BODY_SIZE: u64 = 128 * 1024 * 1024 * 1024;
+/// Maximum file payload. One MiB is reserved for multipart boundaries, filenames,
+/// and the bounded auxiliary form fields.
+pub const MAX_UPLOAD_SIZE: u64 = MAX_MULTIPART_BODY_SIZE - 1024 * 1024;
+pub const DEFAULT_INTERNAL_DIRECTORY_NAME: &str = ".vaultlink-internal";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -476,6 +484,11 @@ impl Config {
                 "max_upload_size must be positive".into(),
             ));
         }
+        if self.storage.max_upload_size > MAX_UPLOAD_SIZE {
+            return Err(ConfigError::Invalid(format!(
+                "max_upload_size must not exceed {MAX_UPLOAD_SIZE} bytes"
+            )));
+        }
         if self.storage.max_search_entries == 0
             || self.storage.max_search_results == 0
             || self.storage.max_preview_size == 0
@@ -559,14 +572,30 @@ fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(),
                 .into(),
         ));
     }
+    if !storage.require_mount {
+        let canonical_lock_domain = storage
+            .root_mount_path
+            .join(DEFAULT_INTERNAL_DIRECTORY_NAME);
+        if storage
+            .internal_directory
+            .as_ref()
+            .is_some_and(|internal| internal != &canonical_lock_domain)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "internal_directory must be omitted or use the canonical development lock domain {}",
+                canonical_lock_domain.display()
+            )));
+        }
+    }
     if let Some(internal) = &storage.internal_directory {
         if storage.require_mount && !internal.is_absolute() {
             return Err(ConfigError::Invalid(
                 "require_mount=true requires an absolute internal_directory".into(),
             ));
         }
-        if internal.starts_with(&storage.root_mount_path)
-            || storage.root_mount_path.starts_with(internal)
+        if storage.require_mount
+            && (internal.starts_with(&storage.root_mount_path)
+                || storage.root_mount_path.starts_with(internal))
         {
             return Err(ConfigError::Invalid(
                 "internal_directory must be a sibling outside the user-visible root_mount_path"
@@ -595,6 +624,21 @@ fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(),
                 .into(),
         )
     })?;
+    let canonical_lock_domain = storage
+        .root_mount_path
+        .parent()
+        .map(|parent| parent.join(DEFAULT_INTERNAL_DIRECTORY_NAME))
+        .ok_or_else(|| {
+            ConfigError::Invalid(
+                "root_mount_path needs a parent directory for the private lock domain".into(),
+            )
+        })?;
+    if internal_directory != canonical_lock_domain {
+        return Err(ConfigError::Invalid(format!(
+            "internal_directory must be the canonical private sibling {} so one storage root cannot use multiple lock domains",
+            canonical_lock_domain.display()
+        )));
+    }
     for (name, path) in [
         ("root_mount_path", storage.root_mount_path.as_path()),
         ("data_directory", storage.data_directory.as_path()),
@@ -888,6 +932,33 @@ mod tests {
     }
 
     #[test]
+    fn storage_root_has_only_one_configurable_lock_domain() {
+        let mut development = base();
+        development.storage.root_mount_path = "/srv/vaultlink-dev".into();
+        development.storage.data_directory = "/var/lib/vaultlink-dev".into();
+        development.storage.internal_directory =
+            Some("/srv/vaultlink-dev/.vaultlink-internal".into());
+        development.validate().unwrap();
+        development.storage.internal_directory = Some("/srv/another-private-dir".into());
+        assert!(development
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("canonical development lock domain"));
+
+        let mut production = base();
+        configure_local_mount_policy(&mut production);
+        production.validate().unwrap();
+        production.storage.internal_directory =
+            Some("/srv/vaultlink/.vaultlink-internal-alternate".into());
+        assert!(production
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("one storage root cannot use multiple lock domains"));
+    }
+
+    #[test]
     fn production_requires_an_explicit_fail_closed_mount_identity() {
         let mut config = base();
         config.server.mode = ServerMode::ReverseProxy;
@@ -1066,6 +1137,15 @@ mod tests {
     fn hsts_rejected_in_development() {
         let mut c = base();
         c.tls.hsts_enabled = true;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn upload_limit_must_fit_inside_the_multipart_ceiling() {
+        let mut c = base();
+        c.storage.max_upload_size = MAX_UPLOAD_SIZE;
+        assert!(c.validate().is_ok());
+        c.storage.max_upload_size = MAX_UPLOAD_SIZE + 1;
         assert!(c.validate().is_err());
     }
 

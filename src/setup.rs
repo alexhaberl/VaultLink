@@ -1,6 +1,7 @@
 use std::{
     io::Write,
     net::SocketAddr,
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -63,7 +64,6 @@ struct SetupForm {
     server_mode: String,
     listen_address: String,
     public_base_url: String,
-    production_mode: Option<String>,
     root_mount_path: String,
     data_directory: String,
     internal_directory: String,
@@ -82,7 +82,6 @@ struct SetupForm {
     pdf_preview_enabled: Option<String>,
     max_media_preview_size_mb: String,
     blocked_extensions: String,
-    secure_cookie: Option<String>,
     audit_client_ip_enabled: Option<String>,
     trusted_proxies: String,
     certificate_source: String,
@@ -443,7 +442,7 @@ async fn complete_setup(
                 .into_response()
         }
     };
-    match clear_initial_setup_pending(&config.storage.data_directory) {
+    match clear_initial_setup_pending_for_storage(&config.storage) {
         Ok(()) => {
             *completed = true;
             Html(page_without_locale_switcher(&setup_confirmed_body(
@@ -552,9 +551,17 @@ struct SetupResult {
     otpauth: String,
 }
 
+enum SetupStorageValidation {
+    Capabilities(storage_mount::ValidatedStorage),
+    #[cfg(test)]
+    TestBypass,
+}
+
 async fn build_and_store(config_path: &Path, form: SetupForm) -> Result<SetupResult, String> {
     build_and_store_with_mount_validator(config_path, form, |storage| {
-        storage_mount::validate(storage).map_err(|error| error.to_string())
+        storage_mount::validate_and_open(storage)
+            .map(SetupStorageValidation::Capabilities)
+            .map_err(|error| error.to_string())
     })
     .await
 }
@@ -565,7 +572,7 @@ async fn build_and_store_with_mount_validator<F>(
     validate_mount: F,
 ) -> Result<SetupResult, String>
 where
-    F: FnOnce(&Storage) -> Result<(), String>,
+    F: FnOnce(&Storage) -> Result<SetupStorageValidation, String>,
 {
     if form.admin_password != form.admin_password_confirm {
         return Err(i18n::text(i18n::current_locale(), i18n::PASSWORD_MISMATCH).into());
@@ -631,7 +638,7 @@ where
             mode,
             listen_address: form.listen_address,
             public_base_url: form.public_base_url,
-            production_mode: production_mode || form.production_mode.is_some(),
+            production_mode,
         },
         storage: Storage {
             root_mount_path: form.root_mount_path.into(),
@@ -683,7 +690,7 @@ where
             letsencrypt_staging: form.letsencrypt_staging.is_some(),
         },
         security: Security {
-            secure_cookie: production_mode || form.secure_cookie.is_some(),
+            secure_cookie: production_mode,
             audit_client_ip_enabled: form.audit_client_ip_enabled.is_some(),
             ..Default::default()
         },
@@ -701,9 +708,11 @@ where
             i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_CONFIGURATION)
         )
     })?;
-    if config.storage.require_mount {
-        validate_mount(&config.storage)?;
-    }
+    let validated_storage = if config.storage.require_mount {
+        Some(validate_mount(&config.storage)?)
+    } else {
+        None
+    };
     let serialized = toml::to_string_pretty(&config).map_err(|error| error.to_string())?;
     let recovering_existing_config = if config_path.exists() {
         let existing = Config::load(config_path).map_err(|error| {
@@ -729,12 +738,42 @@ where
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(&config.storage.data_directory).map_err(|error| error.to_string())?;
-    let database = Database::open(config.storage.data_directory.join("data.sqlite"))
-        .map_err(|error| error.to_string())?;
+    if !config.storage.require_mount {
+        std::fs::create_dir_all(&config.storage.data_directory)
+            .map_err(|error| error.to_string())?;
+    }
+    let validated_storage = match validated_storage {
+        Some(SetupStorageValidation::Capabilities(validated)) => {
+            validated
+                .verify_path_bindings(&config.storage)
+                .map_err(|error| error.to_string())?;
+            Some(validated)
+        }
+        #[cfg(test)]
+        Some(SetupStorageValidation::TestBypass) => None,
+        None => Some(
+            storage_mount::validate_and_open(&config.storage).map_err(|error| error.to_string())?,
+        ),
+    };
+    let data_directory = match validated_storage.as_ref() {
+        Some(validated) => validated.data_file().map_err(|error| error.to_string())?,
+        #[cfg(test)]
+        None => std::fs::File::open(&config.storage.data_directory)
+            .map_err(|error| error.to_string())?,
+        #[cfg(not(test))]
+        None => unreachable!("production setup validation always returns capabilities"),
+    };
+    let data_directory_path =
+        PathBuf::from(format!("/proc/self/fd/{}", data_directory.as_raw_fd()));
+    let database = Database::open_in_directory(
+        data_directory
+            .try_clone()
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     if database.admin_count().map_err(|error| error.to_string())? != 0 {
         if recovering_existing_config
-            && read_initial_setup_pending(&config.storage.data_directory)?.as_deref()
+            && read_initial_setup_pending(&data_directory_path)?.as_deref()
                 == Some(form.admin_username.as_str())
         {
             let admin = database
@@ -772,9 +811,7 @@ where
         write_config_atomic_new(config_path, &serialized).map_err(|error| error.to_string())?;
         true
     };
-    if let Err(error) =
-        ensure_initial_setup_pending(&config.storage.data_directory, &form.admin_username)
-    {
+    if let Err(error) = ensure_initial_setup_pending(&data_directory_path, &form.admin_username) {
         if wrote_config {
             let _ = std::fs::remove_file(config_path);
             let _ = sync_parent(config_path);
@@ -838,6 +875,17 @@ fn clear_initial_setup_pending(data_directory: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn clear_initial_setup_pending_for_storage(storage: &Storage) -> Result<(), String> {
+    let validated = storage_mount::validate_and_open(storage).map_err(|error| error.to_string())?;
+    validated
+        .verify_path_bindings(storage)
+        .map_err(|error| error.to_string())?;
+    let data_directory = validated.data_file().map_err(|error| error.to_string())?;
+    let data_directory_path =
+        PathBuf::from(format!("/proc/self/fd/{}", data_directory.as_raw_fd()));
+    clear_initial_setup_pending(&data_directory_path)
 }
 
 fn write_config_atomic_new(path: &Path, content: &str) -> std::io::Result<()> {
@@ -1253,7 +1301,6 @@ mod tests {
             server_mode: "development".into(),
             listen_address: "127.0.0.1:8080".into(),
             public_base_url: "http://localhost:8080".into(),
-            production_mode: None,
             root_mount_path: root.display().to_string(),
             data_directory: data.display().to_string(),
             internal_directory: String::new(),
@@ -1273,7 +1320,6 @@ mod tests {
             max_media_preview_size_mb: "1".into(),
             blocked_extensions: "exe".into(),
             audit_client_ip_enabled: None,
-            secure_cookie: None,
             trusted_proxies: "127.0.0.1".into(),
             certificate_source: "files".into(),
             tls_cert_file: "".into(),
@@ -1293,7 +1339,7 @@ mod tests {
         form.internal_directory = root
             .parent()
             .unwrap()
-            .join(".vaultlink-internal-test")
+            .join(".vaultlink-internal")
             .display()
             .to_string();
         form.require_mount = Some("on".into());
@@ -1336,6 +1382,8 @@ mod tests {
         assert!(html.contains("data-certificate-only=\"letsencrypt\""));
         assert!(!html.contains("Reverse Proxy aktiv"));
         assert!(!html.contains("Standalone TLS aktiv"));
+        assert!(!html.contains("name=\"production_mode\""));
+        assert!(!html.contains("name=\"secure_cookie\""));
         assert!(SETUP_JAVASCRIPT.contains("fallbackToRoot"));
         assert!(!SETUP_JAVASCRIPT.contains("`Ordner ${entry.name}`"));
         assert!(!html.contains("Max Upload Bytes"));
@@ -1649,10 +1697,12 @@ mod tests {
         let mut setup_form = form(root.path(), data.path());
         setup_form.preview_extensions.clear();
 
-        let error = build_and_store_with_mount_validator(&config_path, setup_form, |_| Ok(()))
-            .await
-            .err()
-            .expect("empty preview extensions must fail");
+        let error = build_and_store_with_mount_validator(&config_path, setup_form, |_| {
+            Ok(SetupStorageValidation::TestBypass)
+        })
+        .await
+        .err()
+        .expect("empty preview extensions must fail");
         assert!(error.contains("preview_extensions must not be empty"));
         assert!(!config_path.exists());
         assert!(!data.path().join("data.sqlite").exists());
@@ -1669,10 +1719,12 @@ mod tests {
         setup_form.admin_password = password.clone();
         setup_form.admin_password_confirm = password;
 
-        let error = build_and_store_with_mount_validator(&config_path, setup_form, |_| Ok(()))
-            .await
-            .err()
-            .expect("overlong admin passwords must fail");
+        let error = build_and_store_with_mount_validator(&config_path, setup_form, |_| {
+            Ok(SetupStorageValidation::TestBypass)
+        })
+        .await
+        .err()
+        .expect("overlong admin passwords must fail");
         assert!(error.contains("1024"));
         assert!(!config_path.exists());
         assert!(!data.path().join("data.sqlite").exists());
@@ -1841,14 +1893,14 @@ mod tests {
         form.server_mode = "standalone_tls".into();
         form.listen_address = "0.0.0.0:443".into();
         form.public_base_url = "https://files.example.test".into();
-        form.production_mode = Some("on".into());
         configure_production_mount_policy(&mut form, root.path());
-        form.secure_cookie = Some("on".into());
         form.certificate_source = "letsencrypt".into();
         form.letsencrypt_contact_email = "admin@example.test".into();
-        let result = build_and_store_with_mount_validator(&config_path, form, |_| Ok(()))
-            .await
-            .unwrap();
+        let result = build_and_store_with_mount_validator(&config_path, form, |_| {
+            Ok(SetupStorageValidation::TestBypass)
+        })
+        .await
+        .unwrap();
         assert!(!result.totp_secret.is_empty());
         let config = Config::load(&config_path).unwrap();
         assert_eq!(
@@ -1869,9 +1921,11 @@ mod tests {
         form.server_mode = "reverse_proxy".into();
         form.public_base_url = "https://files.example.test".into();
         configure_production_mount_policy(&mut form, root.path());
-        build_and_store_with_mount_validator(&config_path, form, |_| Ok(()))
-            .await
-            .unwrap();
+        build_and_store_with_mount_validator(&config_path, form, |_| {
+            Ok(SetupStorageValidation::TestBypass)
+        })
+        .await
+        .unwrap();
         let config = Config::load(&config_path).unwrap();
         assert!(config.server.production_mode);
         assert!(config.security.secure_cookie);
