@@ -5,7 +5,7 @@ DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
 FUZZ_MAX_TOTAL_TIME ?= 600
 FUZZ_JOBS ?= 4
 FUZZ_LOG_DIR ?= /tmp/vaultlink-fuzz-logs
-FUZZ_TARGETS := path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy file_mutation_policy
+FUZZ_TARGETS := path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy file_mutation_policy multipart_guard
 
 dev-setup: sample-data
 	@command -v cargo >/dev/null || (echo "Rust fehlt: https://rustup.rs installieren" && exit 1)

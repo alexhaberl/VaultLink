@@ -169,6 +169,10 @@ pub struct SecureRoot {
     next_delete_staging_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
     #[cfg(test)]
     next_delete_promotion_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_cleanup_start_errors: Arc<Mutex<Option<(io::ErrorKind, usize)>>>,
+    #[cfg(test)]
+    next_cleanup_batch_error: Arc<Mutex<Option<io::ErrorKind>>>,
 }
 
 /// A descriptor/path capability whose relative operations cannot resolve above this directory.
@@ -239,6 +243,8 @@ pub struct UploadFragmentCleanupBatch {
 pub struct UploadFragmentCleanup {
     directories: Vec<CleanupDirectory>,
     visited: HashSet<(u64, u64)>,
+    #[cfg(test)]
+    next_batch_error: Option<Arc<Mutex<Option<io::ErrorKind>>>>,
 }
 
 struct CleanupDirectory {
@@ -368,6 +374,15 @@ impl UploadFragmentCleanup {
                 io::ErrorKind::InvalidInput,
                 "upload fragment cleanup batch size must be positive",
             ));
+        }
+        #[cfg(test)]
+        if let Some(kind) = self.next_batch_error.as_ref().and_then(|error| {
+            error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        }) {
+            return Err(io::Error::new(kind, "injected cleanup batch failure"));
         }
         self.run_linux_batch(max_entries)
     }
@@ -835,6 +850,10 @@ impl SecureRoot {
             next_delete_staging_rename_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_delete_promotion_rename_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_cleanup_start_errors: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_cleanup_batch_error: Arc::new(Mutex::new(None)),
         };
         secure_root.recover_pending_deletions()?;
         Ok(secure_root)
@@ -917,20 +936,6 @@ impl SecureRoot {
     /// Opens exactly the configured file-share target without accepting a child path.
     pub fn bind_file(&self, relative: &str) -> io::Result<SecureFile> {
         self.root.open_file(relative)
-    }
-
-    /// Compatibility one-shot cleanup. Returns an error when the raw-entry budget
-    /// is exhausted before the scan completes; prefer the resumable API below.
-    pub fn cleanup_upload_fragments(&self, max_entries: usize) -> io::Result<usize> {
-        let mut cleanup = self.start_upload_fragment_cleanup()?;
-        let batch = cleanup.run_batch(max_entries)?;
-        if batch.complete {
-            Ok(batch.removed)
-        } else {
-            Err(io::Error::other(
-                "upload fragment cleanup entry limit exceeded",
-            ))
-        }
     }
 
     // Global operations remain available for authenticated admin access.
@@ -1259,6 +1264,38 @@ impl SecureRoot {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(kind);
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_cleanup_starts(&self, kind: io::ErrorKind, count: usize) {
+        assert!(count > 0, "cleanup failure count must be positive");
+        *self
+            .next_cleanup_start_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((kind, count));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_cleanup_batch(&self, kind: io::ErrorKind) {
+        *self
+            .next_cleanup_batch_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(kind);
+    }
+
+    #[cfg(test)]
+    fn injected_cleanup_start_error(&self) -> Option<io::Error> {
+        let mut failure = self
+            .next_cleanup_start_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (kind, remaining) = failure.as_mut()?;
+        let error = io::Error::new(*kind, "injected cleanup start failure");
+        *remaining -= 1;
+        if *remaining == 0 {
+            *failure = None;
+        }
+        Some(error)
+    }
+
     pub fn begin_upload(&self, directory: &str) -> io::Result<PendingUpload> {
         self.root.begin_upload(directory)
     }
@@ -1267,6 +1304,11 @@ impl SecureRoot {
     /// Uploads active in this process are registered and cannot be removed by it.
     pub fn start_upload_fragment_cleanup(&self) -> io::Result<UploadFragmentCleanup> {
         use std::os::unix::fs::MetadataExt;
+
+        #[cfg(test)]
+        if let Some(error) = self.injected_cleanup_start_error() {
+            return Err(error);
+        }
 
         let uploads = self.root.staging.as_ref().try_clone()?;
         let tombstones = self.tombstones.as_ref().try_clone()?;
@@ -1281,6 +1323,8 @@ impl SecureRoot {
                 (upload_identity.dev(), upload_identity.ino()),
                 (tombstone_identity.dev(), tombstone_identity.ino()),
             ]),
+            #[cfg(test)]
+            next_batch_error: Some(self.next_cleanup_batch_error.clone()),
         })
     }
 
@@ -1288,6 +1332,10 @@ impl SecureRoot {
         &self,
         tombstone_relative: &str,
     ) -> io::Result<UploadFragmentCleanup> {
+        #[cfg(test)]
+        if let Some(error) = self.injected_cleanup_start_error() {
+            return Err(error);
+        }
         let (parent_path, tombstone_name) = split_parent_name_private(tombstone_relative)?;
         if !parent_path.is_empty() {
             return Err(io::Error::new(
@@ -1316,6 +1364,8 @@ impl SecureRoot {
         Ok(UploadFragmentCleanup {
             directories: vec![cleanup],
             visited: HashSet::from([(metadata.dev(), metadata.ino())]),
+            #[cfg(test)]
+            next_batch_error: Some(self.next_cleanup_batch_error.clone()),
         })
     }
 }
@@ -1449,20 +1499,6 @@ impl SecureDirectory {
         )
     }
 
-    /// Compatibility one-shot cleanup. Returns an error when the raw-entry budget
-    /// is exhausted before the scan completes; prefer the resumable API below.
-    pub fn cleanup_upload_fragments(&self, max_entries: usize) -> io::Result<usize> {
-        let mut cleanup = self.start_upload_fragment_cleanup()?;
-        let batch = cleanup.run_batch(max_entries)?;
-        if batch.complete {
-            Ok(batch.removed)
-        } else {
-            Err(io::Error::other(
-                "upload fragment cleanup entry limit exceeded",
-            ))
-        }
-    }
-
     /// Starts a recursive cleanup cursor suitable for bounded background batches.
     /// Uploads active in this process are registered and cannot be removed by it.
     pub fn start_upload_fragment_cleanup(&self) -> io::Result<UploadFragmentCleanup> {
@@ -1524,6 +1560,8 @@ fn start_cleanup_from_directory(
     Ok(UploadFragmentCleanup {
         directories: vec![directory],
         visited: HashSet::from([(metadata.dev(), metadata.ino())]),
+        #[cfg(test)]
+        next_batch_error: None,
     })
 }
 
@@ -2212,7 +2250,10 @@ mod tests {
         let matching_directory = staging.join(upload_fragment_name());
         std::fs::create_dir(&matching_directory).unwrap();
 
-        assert_eq!(root.cleanup_upload_fragments(100).unwrap(), 1);
+        let mut cleanup = root.start_upload_fragment_cleanup().unwrap();
+        let batch = cleanup.run_batch(100).unwrap();
+        assert!(batch.complete);
+        assert_eq!(batch.removed, 1);
         assert!(!staging.join(first).exists());
         assert_eq!(std::fs::read(nested.join(second)).unwrap(), b"partial");
         assert_eq!(std::fs::read(staging.join("keep.part")).unwrap(), b"keep");
@@ -2233,7 +2274,10 @@ mod tests {
             .join(UPLOAD_STAGING_DIRECTORY_NAME);
         std::fs::write(staging.join(upload_fragment_name()), b"one").unwrap();
         std::fs::write(staging.join(upload_fragment_name()), b"two").unwrap();
-        assert!(root.cleanup_upload_fragments(1).is_err());
+        let mut cleanup = root.start_upload_fragment_cleanup().unwrap();
+        let batch = cleanup.run_batch(1).unwrap();
+        assert_eq!(batch.scanned, 1);
+        assert!(!batch.complete);
     }
 
     #[test]
@@ -2485,7 +2529,10 @@ mod tests {
         let manifest_path = recovery_path.with_file_name(deletion_manifest_name(&recovery_name));
         assert_eq!(std::fs::read(&recovery_path).unwrap(), b"original");
         assert!(manifest_path.is_file());
-        assert_eq!(root.cleanup_upload_fragments(100).unwrap(), 0);
+        let mut cleanup = root.start_upload_fragment_cleanup().unwrap();
+        let batch = cleanup.run_batch(100).unwrap();
+        assert!(batch.complete);
+        assert_eq!(batch.removed, 0);
         assert_eq!(std::fs::read(recovery_path).unwrap(), b"original");
         drop(root);
         let reopened = SecureRoot::open(directory.path()).unwrap();

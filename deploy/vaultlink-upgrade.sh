@@ -34,12 +34,16 @@ new_config=$2
 [ -f "$data" ] || { echo "VaultLink database is missing" >&2; exit 1; }
 [ -f "$config_path" ] || { echo "VaultLink configuration is missing: $config_path" >&2; exit 1; }
 
-for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock; do
+for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock od tr; do
     command -v "$required_command" >/dev/null || {
         echo "$required_command is required for a safe upgrade" >&2
         exit 1
     }
 done
+[ -r /dev/urandom ] || {
+    echo "/dev/urandom is required for safe share-alias migration" >&2
+    exit 1
+}
 
 exec 9>"$maintenance_lock"
 if ! flock -n 9; then
@@ -258,6 +262,11 @@ was_active=0
 stop_attempted=0
 backup_valid=0
 candidate_activated=0
+alias_rows=
+alias_sql=
+alias_mapping_temp=
+alias_mapping_path=
+alias_mapping_created=0
 old_readiness_url=
 old_readiness_connect_to=
 old_readiness_insecure=0
@@ -303,17 +312,131 @@ restore_verified_backup() {
     [ "$restore_failed" -eq 0 ]
 }
 
+migrate_short_share_aliases() {
+    shares_table_exists=$(sqlite3 "$data" \
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='shares'")
+    [ "$shares_table_exists" = 1 ] || return 0
+
+    alias_rows="$backup_dir/.share-alias-migration.rows.$$"
+    alias_sql="$backup_dir/.share-alias-migration.sql.$$"
+    alias_mapping_temp="$backup_dir/.share-alias-migration.tsv.$$"
+    alias_mapping_path="$backup_dir/share-alias-migration.tsv"
+    tab=$(printf '\t')
+
+    sqlite3 -batch -noheader -separator "$tab" "$data" \
+        "SELECT id, alias FROM shares
+         WHERE alias IS NOT NULL AND alias <> ''
+           AND length(CAST(alias AS BLOB)) < 12
+         ORDER BY id" >"$alias_rows"
+    chown root:root "$alias_rows"
+    chmod 0600 "$alias_rows"
+
+    if [ ! -s "$alias_rows" ]; then
+        rm -f "$alias_rows"
+        alias_rows=
+        return 0
+    fi
+
+    : >"$alias_sql"
+    : >"$alias_mapping_temp"
+    chown root:root "$alias_sql" "$alias_mapping_temp"
+    chmod 0600 "$alias_sql" "$alias_mapping_temp"
+    printf '%s\n' '.timeout 10000' '.bail on' 'BEGIN IMMEDIATE;' \
+        'CREATE TEMP TABLE alias_migration_guard(changed INTEGER NOT NULL CHECK(changed = 1));' \
+        >"$alias_sql"
+    printf 'share_id\told_alias\tnew_alias\n' >"$alias_mapping_temp"
+
+    while IFS="$tab" read -r alias_id old_alias; do
+        case "$alias_id" in
+            ''|*[!0-9]*)
+                echo "share alias migration found an invalid database row id" >&2
+                return 1
+                ;;
+        esac
+        case "$old_alias" in
+            ''|*[!A-Za-z0-9_-]*)
+                echo "share alias migration found an invalid legacy alias" >&2
+                return 1
+                ;;
+        esac
+        if [ "${#old_alias}" -ge 12 ]; then
+            echo "share alias migration found an inconsistent legacy alias" >&2
+            return 1
+        fi
+
+        # Twenty hexadecimal characters add 80 bits from the kernel CSPRNG.
+        # Keeping the old prefix makes the protected operator mapping auditable
+        # while bringing every migrated value safely inside the 12..32 policy.
+        suffix=$(LC_ALL=C od -An -N10 -tx1 /dev/urandom | tr -d ' \n')
+        case "$suffix" in
+            *[!0-9a-f]*)
+                echo "secure share alias generation failed" >&2
+                return 1
+                ;;
+        esac
+        if [ "${#suffix}" -ne 20 ]; then
+            echo "secure share alias generation failed" >&2
+            return 1
+        fi
+        new_alias=$old_alias$suffix
+        if [ "${#new_alias}" -lt 12 ] || [ "${#new_alias}" -gt 32 ]; then
+            echo "generated share alias is outside the supported length" >&2
+            return 1
+        fi
+
+        # Both aliases have been restricted to the URL-safe ASCII alphabet, so
+        # embedding them as SQL literals cannot introduce quoting or SQL syntax.
+        printf "UPDATE shares SET alias = '%s' WHERE id = %s AND alias = '%s';\n" \
+            "$new_alias" "$alias_id" "$old_alias" >>"$alias_sql"
+        printf '%s\n' 'INSERT INTO alias_migration_guard VALUES(changes());' \
+            'DELETE FROM alias_migration_guard;' >>"$alias_sql"
+        printf '%s\t%s\t%s\n' "$alias_id" "$old_alias" "$new_alias" \
+            >>"$alias_mapping_temp"
+    done <"$alias_rows"
+    printf '%s\n' 'COMMIT;' >>"$alias_sql"
+
+    if ! sqlite3 -batch "$data" <"$alias_sql"; then
+        echo "share alias migration failed; refusing to activate the candidate" >&2
+        return 1
+    fi
+    remaining_short_aliases=$(sqlite3 "$data" \
+        "SELECT count(*) FROM shares
+         WHERE alias IS NOT NULL AND alias <> ''
+           AND length(CAST(alias AS BLOB)) < 12")
+    if [ "$remaining_short_aliases" != 0 ]; then
+        echo "share alias migration left legacy aliases behind" >&2
+        return 1
+    fi
+
+    rm -f "$alias_rows" "$alias_sql"
+    alias_rows=
+    alias_sql=
+    mv -f "$alias_mapping_temp" "$alias_mapping_path"
+    alias_mapping_created=1
+    alias_mapping_temp=
+}
+
 on_failure() {
     status=$1
     trap - 0
     trap '' 1 2 15
     set +e
     restart_allowed=1
+    restore_completed=0
 
     rm -f "$staged_binary" "$staged_config" "$restore_binary" "$restore_config"
     if [ -n "$staged_data" ]; then
         rm -f "$staged_data"
         staged_data=
+    fi
+    if [ -n "$alias_rows" ]; then
+        rm -f "$alias_rows"
+    fi
+    if [ -n "$alias_sql" ]; then
+        rm -f "$alias_sql"
+    fi
+    if [ -n "$alias_mapping_temp" ]; then
+        rm -f "$alias_mapping_temp"
     fi
 
     if [ "$candidate_activated" -eq 1 ]; then
@@ -321,12 +444,24 @@ on_failure() {
         if ! systemctl stop "$service" >/dev/null 2>&1; then
             echo "CRITICAL: $service could not be stopped; recover manually from $backup_dir" >&2
             restart_allowed=0
-        elif [ "$backup_valid" -ne 1 ] || ! restore_verified_backup; then
+        elif [ "$backup_valid" -ne 1 ]; then
+            echo "CRITICAL: automatic restore failed; recover manually from $backup_dir" >&2
+            restart_allowed=0
+        elif restore_verified_backup; then
+            restore_completed=1
+        else
             echo "CRITICAL: automatic restore failed; recover manually from $backup_dir" >&2
             restart_allowed=0
         fi
     elif [ "$stop_attempted" -eq 1 ]; then
         echo "upgrade failed before activation; keeping the installed binary, configuration, and database" >&2
+    fi
+
+    # A completed database restore makes a published migration map stale. Keep
+    # it only when automatic restore failed and an operator may need it to
+    # inspect or manually recover the possibly migrated live database.
+    if [ "$restore_completed" -eq 1 ] && [ "$alias_mapping_created" -eq 1 ]; then
+        rm -f "$alias_mapping_path"
     fi
 
     if [ "$stop_attempted" -eq 1 ] && [ "$was_active" -eq 1 ] && [ "$restart_allowed" -eq 1 ]; then
@@ -385,9 +520,9 @@ readiness_connect_to=$(printf '%s\n' "$candidate_readiness_target" | sed -n '2p'
 readiness_insecure=$(printf '%s\n' "$candidate_readiness_target" | sed -n '3p')
 candidate_health_body='{"ok":true,"version":"'"$candidate_version"'"}'
 
-if [ "$old_version" = 0.4.0 ] && [ "$candidate_version" = 0.4.1 ] \
+if [ "$old_version" = 0.4.0 ] && [ "$candidate_version" != 0.4.0 ] \
     && [ "$was_active" -eq 1 ]; then
-    echo "the 0.4.0 to 0.4.1 storage migration requires vaultlink.service to be stopped before upgrade" >&2
+    echo "an upgrade from 0.4.0 requires vaultlink.service to be stopped before the storage migration" >&2
     exit 1
 fi
 
@@ -405,6 +540,7 @@ backup_valid=1
 # Each rename is atomic on its destination filesystem. The handled-failure trap
 # restores the complete verified triple if any later step fails.
 candidate_activated=1
+migrate_short_share_aliases
 mv -f "$staged_binary" "$live_binary"
 mv -f "$staged_config" "$config_path"
 

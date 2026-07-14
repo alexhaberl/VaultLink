@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 12;
 pub(crate) const MAX_SQLITE_UNSIGNED: u64 = i64::MAX as u64;
 
 pub const TRANSFER_SESSION_TTL_SECONDS: i64 = 15 * 60;
@@ -534,7 +534,70 @@ CREATE INDEX IF NOT EXISTS idx_admin_webauthn_credentials_admin
         )?;
         tx.pragma_update(None, "user_version", 10)?;
     }
+    if version < 11 {
+        tx.execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS admin_totp_replay(
+    admin_id INTEGER PRIMARY KEY REFERENCES admins(id) ON DELETE CASCADE,
+    last_step INTEGER NOT NULL CHECK(last_step >= 0)
+);
+"#,
+        )?;
+        tx.pragma_update(None, "user_version", 11)?;
+    }
+    if version < 12 {
+        let has_runtime_settings: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema
+                 WHERE type='table' AND name='runtime_settings'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_runtime_settings {
+            tx.execute(
+                "DELETE FROM runtime_settings
+                 WHERE key='share_password_max_bytes'
+                   AND EXISTS(
+                       SELECT 1 FROM runtime_settings
+                       WHERE key='share_password_max_length'
+                   )",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE runtime_settings
+                 SET key='share_password_max_length'
+                 WHERE key='share_password_max_bytes'",
+                [],
+            )?;
+        }
+        tx.pragma_update(None, "user_version", 12)?;
+    }
     tx.commit()
+}
+
+fn consume_admin_totp_step(
+    transaction: &Transaction<'_>,
+    admin_id: i64,
+    step: u64,
+) -> rusqlite::Result<bool> {
+    if step > i64::MAX as u64 {
+        return Ok(false);
+    }
+    let active = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM admins WHERE id=?1 AND active=1)",
+        [admin_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !active {
+        return Ok(false);
+    }
+    Ok(transaction.execute(
+        "INSERT INTO admin_totp_replay(admin_id,last_step) VALUES(?1,?2)
+         ON CONFLICT(admin_id) DO UPDATE SET last_step=excluded.last_step
+         WHERE excluded.last_step>admin_totp_replay.last_step",
+        params![admin_id, step as i64],
+    )? == 1)
 }
 
 fn transfer_deadlines() -> (String, String) {
@@ -860,6 +923,10 @@ impl Database {
                 "DELETE FROM admin_webauthn_credentials WHERE admin_id=?1",
                 [admin_id],
             )?;
+            transaction.execute(
+                "DELETE FROM admin_totp_replay WHERE admin_id=?1",
+                [admin_id],
+            )?;
         }
         revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = admin_id.to_string();
@@ -1044,8 +1111,14 @@ impl Database {
         &self,
         admin_id: i64,
         token: &str,
+        verified_totp_step: u64,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminMfaEnrollmentActivationOutcome> {
+        if verified_totp_step > i64::MAX as u64 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "verified_totp_step".into(),
+            ));
+        }
         let now = Utc::now().to_rfc3339();
         let enrollment_token_hash = token_hash(token);
         let mut connection = self.conn();
@@ -1071,6 +1144,11 @@ impl Database {
         transaction.execute(
             "UPDATE admins SET totp_secret=?2 WHERE id=?1",
             params![admin_id, totp_secret],
+        )?;
+        transaction.execute(
+            "INSERT INTO admin_totp_replay(admin_id,last_step) VALUES(?1,?2)
+             ON CONFLICT(admin_id) DO UPDATE SET last_step=excluded.last_step",
+            params![admin_id, verified_totp_step as i64],
         )?;
         revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = admin_id.to_string();
@@ -1124,6 +1202,7 @@ impl Database {
                 "DELETE FROM admin_webauthn_credentials WHERE admin_id=?1",
                 [id],
             )?;
+            transaction.execute("DELETE FROM admin_totp_replay WHERE admin_id=?1", [id])?;
             revoke_admin_auth_state(&transaction, id)?;
         }
         transaction.commit()?;
@@ -1327,6 +1406,55 @@ impl Database {
     pub fn session(&self, token: &str) -> rusqlite::Result<Option<Session>> {
         self.conn().query_row("SELECT a.id,a.username,s.csrf_token,s.mfa_verified FROM sessions s JOIN admins a ON a.id=s.admin_id WHERE s.token_hash=?1 AND s.expires_at>?2 AND a.active=1",params![token_hash(token),Utc::now().to_rfc3339()],|r|Ok(Session{admin_id:r.get(0)?,username:r.get(1)?,csrf_token:r.get(2)?,mfa_verified:r.get::<_,i64>(3)?!=0})).optional()
     }
+    /// Consumes a TOTP counter and verifies exactly the bound, unexpired session.
+    /// Both writes share an IMMEDIATE transaction so one code cannot unlock two sessions.
+    pub fn verify_mfa_with_totp_step(
+        &self,
+        token: &str,
+        admin_id: i64,
+        step: u64,
+    ) -> rusqlite::Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let session_token_hash = token_hash(token);
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let valid_session = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sessions
+                 JOIN admins ON admins.id=sessions.admin_id
+                 WHERE sessions.token_hash=?1 AND sessions.admin_id=?2
+                   AND sessions.expires_at>?3 AND sessions.mfa_verified=0
+                   AND admins.active=1
+             )",
+            params![session_token_hash, admin_id, now],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !valid_session || !consume_admin_totp_step(&transaction, admin_id, step)? {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE sessions SET mfa_verified=1
+             WHERE token_hash=?1 AND admin_id=?2 AND expires_at>?3 AND mfa_verified=0",
+            params![session_token_hash, admin_id, now],
+        )?;
+        if changed != 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Consumes one TOTP counter for a sensitive authenticated operation.
+    pub fn consume_admin_totp_step(&self, admin_id: i64, step: u64) -> rusqlite::Result<bool> {
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let consumed = consume_admin_totp_step(&transaction, admin_id, step)?;
+        transaction.commit()?;
+        Ok(consumed)
+    }
+
+    #[cfg(test)]
     pub fn verify_mfa(&self, token: &str) -> rusqlite::Result<bool> {
         Ok(self.conn().execute(
             "UPDATE sessions SET mfa_verified=1 WHERE token_hash=?1 AND expires_at>?2",
@@ -2339,6 +2467,48 @@ mod tests {
     }
 
     #[test]
+    fn totp_step_is_consumed_once_across_racing_sessions() {
+        let database = Database::open(":memory:").unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        for token in ["first-session", "second-session"] {
+            database
+                .create_session(token, 1, "csrf", Utc::now() + Duration::hours(1))
+                .unwrap();
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = ["first-session", "second-session"].map(|token| {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                database.verify_mfa_with_totp_step(token, 1, 42).unwrap()
+            })
+        });
+        barrier.wait();
+        let outcomes = workers.map(|worker| worker.join().unwrap());
+        assert_eq!(outcomes.into_iter().filter(|accepted| *accepted).count(), 1);
+        assert_eq!(
+            ["first-session", "second-session"]
+                .into_iter()
+                .filter(|token| database.session(token).unwrap().unwrap().mfa_verified)
+                .count(),
+            1
+        );
+
+        let pending_token = ["first-session", "second-session"]
+            .into_iter()
+            .find(|token| !database.session(token).unwrap().unwrap().mfa_verified)
+            .unwrap();
+        assert!(!database
+            .verify_mfa_with_totp_step(pending_token, 1, 42)
+            .unwrap());
+        assert!(database
+            .verify_mfa_with_totp_step(pending_token, 1, 43)
+            .unwrap());
+    }
+
+    #[test]
     fn verified_password_session_creation_rejects_a_stale_hash_without_a_zombie_session() {
         let database = Database::open(":memory:").unwrap();
         database
@@ -2544,7 +2714,7 @@ mod tests {
         assert!(database.session("session-token").unwrap().is_none());
         assert_eq!(
             database
-                .activate_admin_mfa_enrollment(1, "stale-enrollment", None)
+                .activate_admin_mfa_enrollment(1, "stale-enrollment", 42, None)
                 .unwrap(),
             AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired
         );
@@ -2552,6 +2722,8 @@ mod tests {
             database.admin("admin").unwrap().unwrap().totp_secret,
             "new-secret"
         );
+        assert!(database.consume_admin_totp_step(1, 42).unwrap());
+        assert!(!database.consume_admin_totp_step(1, 42).unwrap());
         let events = database.list_audit(Some("admin_recovered"), 10, 0).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].actor, "local_recovery");
@@ -2760,7 +2932,7 @@ mod tests {
 
         assert_eq!(
             database
-                .activate_admin_mfa_enrollment(1, "enrollment-token", Some("203.0.113.24"),)
+                .activate_admin_mfa_enrollment(1, "enrollment-token", 42, Some("203.0.113.24"),)
                 .unwrap(),
             AdminMfaEnrollmentActivationOutcome::Activated
         );
@@ -2769,13 +2941,15 @@ mod tests {
             "new-secret"
         );
         assert!(database.session("session-token").unwrap().is_none());
+        assert!(!database.consume_admin_totp_step(1, 42).unwrap());
+        assert!(database.consume_admin_totp_step(1, 43).unwrap());
         assert!(database
             .admin_mfa_enrollment(1, "enrollment-token")
             .unwrap()
             .is_none());
         assert_eq!(
             database
-                .activate_admin_mfa_enrollment(1, "enrollment-token", None)
+                .activate_admin_mfa_enrollment(1, "enrollment-token", 42, None)
                 .unwrap(),
             AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired
         );
@@ -2848,7 +3022,7 @@ mod tests {
             .is_none());
         assert_eq!(
             database
-                .activate_admin_mfa_enrollment(1, "injected-token", None)
+                .activate_admin_mfa_enrollment(1, "injected-token", 42, None)
                 .unwrap(),
             AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired
         );
@@ -3050,6 +3224,90 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             .unwrap();
         drop(connection);
         assert!(Database::open(path).is_err());
+    }
+
+    #[test]
+    fn migrates_legacy_password_max_runtime_key_to_the_canonical_name() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE runtime_settings(
+                     key TEXT PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );
+                 INSERT INTO runtime_settings VALUES('share_password_max_bytes','128');
+                 PRAGMA user_version=11;",
+            )
+            .unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row::<String, _, _>(
+                    "SELECT value FROM runtime_settings
+                     WHERE key='share_password_max_length'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "128"
+        );
+        assert_eq!(
+            connection
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM runtime_settings
+                     WHERE key='share_password_max_bytes'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn canonical_runtime_key_wins_if_both_password_max_names_exist() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE runtime_settings(
+                     key TEXT PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );
+                 INSERT INTO runtime_settings VALUES('share_password_max_bytes','128');
+                 INSERT INTO runtime_settings VALUES('share_password_max_length','256');
+                 PRAGMA user_version=11;",
+            )
+            .unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row::<String, _, _>(
+                    "SELECT value FROM runtime_settings
+                     WHERE key='share_password_max_length'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            "256"
+        );
+        assert_eq!(
+            connection
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM runtime_settings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

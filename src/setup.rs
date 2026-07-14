@@ -144,11 +144,7 @@ fn setup_router(state: SetupState) -> Router {
 async fn stylesheet_asset() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        format!(
-            "@layer vl-legacy, vl-reset, vl-tokens, vl-base, vl-components, vl-layouts, vl-utilities;\n@layer vl-legacy {{{}}}\n{}",
-            setup_css(),
-            ui::STYLESHEET
-        ),
+        ui::STYLESHEET,
     )
 }
 
@@ -240,7 +236,7 @@ async fn set_setup_locale(Form(form): Form<SetupLocaleForm>) -> Response {
         return (
             StatusCode::BAD_REQUEST,
             Html(page(
-                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="error.invalid_language"/></p></section>"#,
+                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="error.invalid_language"/></p></section>"#,
                 None,
             )),
         )
@@ -323,7 +319,7 @@ async fn setup_page(State(state): State<SetupState>, Query(query): Query<TokenQu
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
-                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
                 query.token.as_deref(),
             )),
         )
@@ -341,7 +337,7 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
-                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
                 Some(&form.token),
             )),
         )
@@ -352,7 +348,7 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
         return (
             StatusCode::CONFLICT,
             Html(page(
-                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.already_completed"/></p></section>"#,
+                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.already_completed"/></p></section>"#,
                 Some(state.token.as_str()),
             )),
         )
@@ -363,7 +359,7 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
             Ok(qr) => {
                 Html(page_without_locale_switcher(
                     &format!(
-                    r#"<section><h1><vl-i18n key="setup.completed"/></h1><p><vl-i18n key="setup.config_admin_created"/></p><p><vl-i18n key="setup.totp_recovery_help"/></p><div class="qr-card" aria-label="<vl-i18n key="setup.totp_qr_code"/>">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button><vl-i18n key="setup.secret_saved"/></button></form></section>"#,
+                    r#"<section class="vl-panel"><h1><vl-i18n key="setup.completed"/></h1><p><vl-i18n key="setup.config_admin_created"/></p><p><vl-i18n key="setup.totp_recovery_help"/></p><div class="vl-qr-card" aria-label="<vl-i18n key="setup.totp_qr_code"/>">{}</div><div class="vl-secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button class="vl-button"><vl-i18n key="setup.secret_saved"/></button></form></section>"#,
                     qr,
                     esc(&result.totp_secret),
                     esc(&result.otpauth),
@@ -376,7 +372,7 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(page(
                     &format!(
-                        r#"<section><h1><vl-i18n key="common.error"/></h1><p>{}</p></section>"#,
+                        r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p>{}</p></section>"#,
                         esc(&error)
                     ),
                     Some(state.token.as_str()),
@@ -403,7 +399,7 @@ async fn complete_setup(
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
-                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
                 Some(&form.token),
             )),
         )
@@ -422,7 +418,7 @@ async fn complete_setup(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(page(
                     &format!(
-                        r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
+                        r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
                         esc(&error.to_string())
                     ),
                     Some(state.token.as_str()),
@@ -438,7 +434,7 @@ async fn complete_setup(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(page(
                     &format!(
-                        r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
+                        r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
                         esc(&error.to_string())
                     ),
                     Some(state.token.as_str()),
@@ -461,7 +457,7 @@ async fn complete_setup(
             StatusCode::INTERNAL_SERVER_ERROR,
             Html(page(
                 &format!(
-                    r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.confirmation_failed"/> {}</p></section>"#,
+                    r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.confirmation_failed"/> {}</p></section>"#,
                     esc(&error)
                 ),
                 Some(state.token.as_str()),
@@ -478,7 +474,7 @@ fn setup_confirmed_body(config: &Config, token: &str, message: &str) -> String {
         ServerMode::StandaloneTls => "Standalone TLS",
     };
     format!(
-        r#"<section><h1><vl-i18n key="setup.confirmed"/></h1><p>{}</p><p><vl-i18n key="setup.configured_for_mode"/> <strong>{mode}</strong>.</p><form method="post" action="/start"><input type="hidden" name="token" value="{}"><button><vl-i18n key="setup.start_now"/></button></form><p class="muted"><vl-i18n key="setup.service_start_help"/></p></section>"#,
+        r#"<section class="vl-panel"><h1><vl-i18n key="setup.confirmed"/></h1><p>{}</p><p><vl-i18n key="setup.configured_for_mode"/> <strong>{mode}</strong>.</p><form method="post" action="/start"><input type="hidden" name="token" value="{}"><button class="vl-button"><vl-i18n key="setup.start_now"/></button></form><p class="vl-muted"><vl-i18n key="setup.service_start_help"/></p></section>"#,
         esc(message),
         esc(token),
     )
@@ -492,7 +488,7 @@ async fn start_server(
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
-                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
                 Some(&form.token),
             )),
         )
@@ -502,7 +498,7 @@ async fn start_server(
         return (
             StatusCode::CONFLICT,
             Html(page(
-                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.totp_confirm_first"/></p></section>"#,
+                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.totp_confirm_first"/></p></section>"#,
                 Some(state.token.as_str()),
             )),
         )
@@ -515,7 +511,7 @@ async fn start_server(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(page(
                     &format!(
-                        r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
+                        r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
                         esc(&error.to_string())
                     ),
                     Some(state.token.as_str()),
@@ -528,7 +524,7 @@ async fn start_server(
         return (
             StatusCode::CONFLICT,
             Html(page(
-                r#"<section><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.start_already_requested"/></p></section>"#,
+                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.start_already_requested"/></p></section>"#,
                 Some(state.token.as_str()),
             )),
         )
@@ -544,7 +540,7 @@ async fn start_server(
     });
     Html(page_without_locale_switcher(
         &format!(
-            r#"<section><h1><vl-i18n key="setup.starting"/></h1><p><vl-i18n key="setup.listener_transition"/></p><p><a class="button" href="{}"><vl-i18n key="setup.open_vaultlink"/></a></p><p class="muted"><vl-i18n key="setup.start_delay"/></p></section>"#,
+            r#"<section class="vl-panel"><h1><vl-i18n key="setup.starting"/></h1><p><vl-i18n key="setup.listener_transition"/></p><p><a class="vl-button" href="{}"><vl-i18n key="setup.open_vaultlink"/></a></p><p class="vl-muted"><vl-i18n key="setup.start_delay"/></p></section>"#,
             esc(&config.server.public_base_url),
         ),
     ))
@@ -574,16 +570,10 @@ where
     if form.admin_password != form.admin_password_confirm {
         return Err(i18n::text(i18n::current_locale(), i18n::PASSWORD_MISMATCH).into());
     }
-    if form.admin_password.chars().count() < 14 {
-        return Err(i18n::text(i18n::current_locale(), i18n::PASSWORD_MIN_14).into());
+    if !auth::valid_admin_password(&form.admin_password) {
+        return Err(i18n::text(i18n::current_locale(), i18n::PASSWORD_POLICY).into());
     }
-    if form.admin_username.len() < 3
-        || form.admin_username.len() > 64
-        || !form
-            .admin_username
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
+    if !auth::valid_admin_username(&form.admin_username) {
         return Err(i18n::text(i18n::current_locale(), i18n::USERNAME_POLICY).into());
     }
     let mode = match form.server_mode.as_str() {
@@ -988,37 +978,37 @@ fn setup_picker_file_allowed(path: &Path, file_kind: Option<&str>) -> bool {
 
 fn setup_form(token: &str, error: Option<&str>) -> String {
     let error = error
-        .map(|error| format!(r#"<p class="bad">{}</p>"#, esc(error)))
+        .map(|error| format!(r#"<p class="vl-danger-text">{}</p>"#, esc(error)))
         .unwrap_or_default();
     let token = esc(token);
     let max_text_preview_size_mb = MAX_TEXT_PREVIEW_SIZE / 1_000_000;
     format!(
         r#"
-<section class="hero">
-  <div><p class="eyebrow"><vl-i18n key="setup.title"/></p><h1><vl-i18n key="setup.initial_setup"/></h1><p class="muted"><vl-i18n key="setup.local_bootstrap"/></p></div>
-  <div class="side-panel"><strong><vl-i18n key="setup.security"/></strong><p class="muted"><vl-i18n key="setup.acme_proxy_help"/></p></div>
+<section class="vl-hero">
+  <div><p class="vl-eyebrow"><vl-i18n key="setup.title"/></p><h1><vl-i18n key="setup.initial_setup"/></h1><p class="vl-muted"><vl-i18n key="setup.local_bootstrap"/></p></div>
+  <div class="vl-side-panel"><strong><vl-i18n key="setup.security"/></strong><p class="vl-muted"><vl-i18n key="setup.acme_proxy_help"/></p></div>
 </section>
 {error}
-<form method="post" class="setup-form" data-setup-token="{token}">
+<form method="post" class="vl-stack" data-setup-token="{token}">
   <input type="hidden" name="token" value="{token}">
-  <section class="form-card"><h2><vl-i18n key="setup.server"/></h2><div class="form-grid">
+  <section class="vl-form-card"><h2><vl-i18n key="setup.server"/></h2><div class="vl-form-grid">
     <label><vl-i18n key="setup.mode"/><br><select name="server_mode" data-server-mode><option value="development">Development</option><option value="reverse_proxy">Reverse Proxy</option><option value="standalone_tls">Standalone TLS</option></select></label>
-    <label><vl-i18n key="setup.service_address"/><br><input name="listen_address" value="127.0.0.1:8080" required><small class="muted"><vl-i18n key="setup.service_address_help"/></small></label>
+    <label><vl-i18n key="setup.service_address"/><br><input name="listen_address" value="127.0.0.1:8080" required><small class="vl-muted"><vl-i18n key="setup.service_address_help"/></small></label>
     <label><vl-i18n key="setup.public_base_url"/><br><input name="public_base_url" value="http://localhost:8080" required></label>
     <label><vl-i18n key="setup.log_level"/><br><select name="log_level"><option value="error">error</option><option value="warn">warn</option><option value="info" selected>info</option><option value="debug">debug</option><option value="trace">trace</option></select></label>
   </div></section>
-  <section class="form-card"><h2><vl-i18n key="setup.storage"/></h2><div class="form-grid">
-    <label><vl-i18n key="setup.root_mount_path"/><br><div class="input-action"><input name="root_mount_path" value="/tmp/vaultlink-root" required><button class="secondary small" type="button" data-dir-picker="root_mount_path"><vl-i18n key="setup.browse"/></button></div></label>
-    <label><vl-i18n key="setup.data_directory"/><br><div class="input-action"><input name="data_directory" value="/tmp/vaultlink-data" required><button class="secondary small" type="button" data-dir-picker="data_directory"><vl-i18n key="setup.browse"/></button></div></label>
-    <label><vl-i18n key="setup.internal_directory"/><br><div class="input-action"><input name="internal_directory" data-mount-policy-field><button class="secondary small" type="button" data-dir-picker="internal_directory"><vl-i18n key="setup.browse"/></button></div></label>
+  <section class="vl-form-card"><h2><vl-i18n key="setup.storage"/></h2><div class="vl-form-grid">
+    <label><vl-i18n key="setup.root_mount_path"/><br><div class="vl-input-action"><input name="root_mount_path" value="/tmp/vaultlink-root" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="root_mount_path"><vl-i18n key="setup.browse"/></button></div></label>
+    <label><vl-i18n key="setup.data_directory"/><br><div class="vl-input-action"><input name="data_directory" value="/tmp/vaultlink-data" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="data_directory"><vl-i18n key="setup.browse"/></button></div></label>
+    <label><vl-i18n key="setup.internal_directory"/><br><div class="vl-input-action"><input name="internal_directory" data-mount-policy-field><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="internal_directory"><vl-i18n key="setup.browse"/></button></div></label>
     <label><vl-i18n key="setup.expected_filesystem_type"/><br><input name="expected_filesystem_type" placeholder="ext4 oder cifs" data-mount-policy-field></label>
     <label><vl-i18n key="setup.expected_mount_source"/><br><input name="expected_mount_source" placeholder="/dev/mapper/storage oder //server/share" data-mount-policy-field></label>
-    <label class="toggle-card"><input type="checkbox" name="require_mount" data-require-mount><span><vl-i18n key="setup.require_mount"/><small><vl-i18n key="setup.require_mount_help"/></small></span></label>
-    <label class="toggle-card"><input type="checkbox" name="external_writers" data-external-writers><span><vl-i18n key="setup.external_writers"/><small><vl-i18n key="setup.external_writers_help"/></small></span></label>
+    <label class="vl-toggle"><input type="checkbox" name="require_mount" data-require-mount><span><vl-i18n key="setup.require_mount"/><small><vl-i18n key="setup.require_mount_help"/></small></span></label>
+    <label class="vl-toggle"><input type="checkbox" name="external_writers" data-external-writers><span><vl-i18n key="setup.external_writers"/><small><vl-i18n key="setup.external_writers_help"/></small></span></label>
     <label><vl-i18n key="setup.max_upload_mb"/><br><input name="max_upload_size_mb" type="number" min="1" step="1" value="100" required></label>
     <label><vl-i18n key="setup.blocked_extensions"/><br><input name="blocked_extensions" value="exe,sh,php"></label>
   </div></section>
-  <section class="form-card"><h2><vl-i18n key="setup.zip_search_preview"/></h2><div class="form-grid">
+  <section class="vl-form-card"><h2><vl-i18n key="setup.zip_search_preview"/></h2><div class="vl-form-grid">
     <label><vl-i18n key="setup.zip_max_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="1" required></label>
     <label><vl-i18n key="setup.zip_max_files"/><br><input name="max_zip_files" type="number" min="0" value="10000" required></label>
     <label><vl-i18n key="setup.search_max_entries"/><br><input name="max_search_entries" type="number" min="1" value="50000" required></label>
@@ -1027,27 +1017,27 @@ fn setup_form(token: &str, error: Option<&str>) -> String {
     <label><vl-i18n key="setup.text_preview_extensions"/><br><input name="preview_extensions" value="txt,log,md,csv,json,toml,yaml,yml,ini,conf" required></label>
     <label><vl-i18n key="setup.media_preview_max_mb"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="100" required></label>
     <label><vl-i18n key="setup.image_preview_extensions"/><br><input name="image_preview_extensions" value="jpg,jpeg,png,gif,webp,bmp,avif"></label>
-    <label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" checked><span><vl-i18n key="setup.pdf_preview_enabled"/><small><vl-i18n key="setup.pdf_preview_help"/></small></span></label>
+    <label class="vl-toggle"><input type="checkbox" name="pdf_preview_enabled" checked><span><vl-i18n key="setup.pdf_preview_enabled"/><small><vl-i18n key="setup.pdf_preview_help"/></small></span></label>
   </div></section>
-  <section class="form-card" data-production-section><h2><vl-i18n key="setup.proxy_tls"/></h2><div class="form-grid">
+  <section class="vl-form-card" data-production-section><h2><vl-i18n key="setup.proxy_tls"/></h2><div class="vl-form-grid">
     <label data-mode-only="reverse_proxy"><vl-i18n key="setup.trusted_proxies"/><br><input name="trusted_proxies" value="127.0.0.1,::1"></label>
     <label data-mode-only="standalone_tls"><vl-i18n key="setup.certificate_source"/><br><select name="certificate_source" data-certificate-source><option value="files"><vl-i18n key="setup.pem_files"/></option><option value="letsencrypt"><vl-i18n key="setup.letsencrypt_auto"/></option></select></label>
-    <label data-certificate-only="files"><vl-i18n key="setup.tls_cert_file"/><br><div class="input-action"><input name="tls_cert_file"><button class="secondary small" type="button" data-file-picker="tls_cert_file"><vl-i18n key="setup.browse"/></button></div></label>
-    <label data-certificate-only="files"><vl-i18n key="setup.tls_key_file"/><br><div class="input-action"><input name="tls_key_file"><button class="secondary small" type="button" data-file-picker="tls_key_file"><vl-i18n key="setup.browse"/></button></div></label>
+    <label data-certificate-only="files"><vl-i18n key="setup.tls_cert_file"/><br><div class="vl-input-action"><input name="tls_cert_file"><button class="vl-button vl-button--secondary vl-button--small" type="button" data-file-picker="tls_cert_file"><vl-i18n key="setup.browse"/></button></div></label>
+    <label data-certificate-only="files"><vl-i18n key="setup.tls_key_file"/><br><div class="vl-input-action"><input name="tls_key_file"><button class="vl-button vl-button--secondary vl-button--small" type="button" data-file-picker="tls_key_file"><vl-i18n key="setup.browse"/></button></div></label>
     <label data-certificate-only="letsencrypt"><vl-i18n key="setup.letsencrypt_email"/><br><input name="letsencrypt_contact_email" placeholder="admin@example.com"></label>
-    <label data-certificate-only="letsencrypt"><vl-i18n key="setup.acme_cache_directory"/><br><div class="input-action"><input name="letsencrypt_cache_dir" value="acme" required><button class="secondary small" type="button" data-dir-picker="letsencrypt_cache_dir"><vl-i18n key="setup.browse"/></button></div></label>
-    <label class="toggle-card" data-certificate-only="letsencrypt"><input type="checkbox" name="letsencrypt_staging" checked><span><vl-i18n key="setup.letsencrypt_staging"/><small><vl-i18n key="setup.letsencrypt_staging_help"/></small></span></label>
-    <label class="toggle-card"><input type="checkbox" name="hsts_enabled"><span><vl-i18n key="setup.hsts_enabled"/><small><vl-i18n key="setup.hsts_help"/></small></span></label>
+    <label data-certificate-only="letsencrypt"><vl-i18n key="setup.acme_cache_directory"/><br><div class="vl-input-action"><input name="letsencrypt_cache_dir" value="acme" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="letsencrypt_cache_dir"><vl-i18n key="setup.browse"/></button></div></label>
+    <label class="vl-toggle" data-certificate-only="letsencrypt"><input type="checkbox" name="letsencrypt_staging" checked><span><vl-i18n key="setup.letsencrypt_staging"/><small><vl-i18n key="setup.letsencrypt_staging_help"/></small></span></label>
+    <label class="vl-toggle"><input type="checkbox" name="hsts_enabled"><span><vl-i18n key="setup.hsts_enabled"/><small><vl-i18n key="setup.hsts_help"/></small></span></label>
   </div></section>
-  <section class="form-card"><h2><vl-i18n key="setup.audit_privacy"/></h2><div class="form-grid"><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled"><span><vl-i18n key="setup.audit_ip"/><small><vl-i18n key="setup.audit_ip_help"/></small></span></label></div></section>
-  <section class="form-card"><h2><vl-i18n key="setup.first_admin"/></h2><div class="form-grid">
+  <section class="vl-form-card"><h2><vl-i18n key="setup.audit_privacy"/></h2><div class="vl-form-grid"><label class="vl-toggle"><input type="checkbox" name="audit_client_ip_enabled"><span><vl-i18n key="setup.audit_ip"/><small><vl-i18n key="setup.audit_ip_help"/></small></span></label></div></section>
+  <section class="vl-form-card"><h2><vl-i18n key="setup.first_admin"/></h2><div class="vl-form-grid">
     <label><vl-i18n key="auth.username"/><br><input name="admin_username" value="admin" minlength="3" maxlength="64" required></label>
-    <label><vl-i18n key="auth.password"/><br><input name="admin_password" type="password" minlength="14" required></label>
-    <label><vl-i18n key="account.confirm_password"/><br><input name="admin_password_confirm" type="password" minlength="14" required></label>
+    <label><vl-i18n key="auth.password"/><br><input name="admin_password" type="password" minlength="14" maxlength="1024" required></label>
+    <label><vl-i18n key="account.confirm_password"/><br><input name="admin_password_confirm" type="password" minlength="14" maxlength="1024" required></label>
   </div></section>
-  <p class="form-actions"><button><vl-i18n key="setup.write"/></button></p>
+  <p class="vl-form-actions"><button class="vl-button"><vl-i18n key="setup.write"/></button></p>
 </form>
-<dialog data-dir-dialog class="dir-dialog"><div class="dir-dialog-head"><strong data-picker-title><vl-i18n key="setup.choose_directory"/></strong><button class="secondary small" type="button" data-dir-close><vl-i18n key="common.close"/></button></div><p class="muted" data-dir-current>/</p><div class="button-group"><button class="secondary small" type="button" data-dir-up><vl-i18n key="files.up"/></button><button class="small" type="button" data-dir-use><vl-i18n key="setup.use_directory"/></button></div><p class="muted" data-picker-help><vl-i18n key="setup.server_directories_help"/></p><div class="dir-list" data-dir-list></div></dialog>
+<dialog data-dir-dialog class="vl-dir-dialog"><div class="vl-dir-dialog__head"><strong data-picker-title><vl-i18n key="setup.choose_directory"/></strong><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-close><vl-i18n key="common.close"/></button></div><p class="vl-muted" data-dir-current>/</p><div class="vl-button-group"><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-up><vl-i18n key="files.up"/></button><button class="vl-button vl-button--small" type="button" data-dir-use><vl-i18n key="setup.use_directory"/></button></div><p class="vl-muted" data-picker-help><vl-i18n key="setup.server_directories_help"/></p><div class="vl-dir-list" data-dir-list></div></dialog>
 "#
     )
 }
@@ -1076,9 +1066,6 @@ fn render_page(body: &str, locale_switcher: &str) -> String {
         locale_switcher,
         body
     )
-}
-fn setup_css() -> &'static str {
-    r#":root{--bg:#070d1b;--card:#121b31;--card2:#172542;--text:#f4f7ff;--soft:#d7e3fb;--muted:#9fb0d0;--accent:#5aa7ff;--line:#263653;--line2:#3b5076;--bad:#ff7b86;--good:#55d69a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top right,#221b57 0,#081020 34%,#050914 100%);color:var(--text);font:16px system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1220px;margin:auto;padding:2rem}.setup-shell{min-height:100vh}.public-brand{display:flex;align-items:center;gap:.8rem;margin:0 0 1.5rem;font-weight:900}.public-brand svg{width:48px;height:48px;border-radius:14px;box-shadow:0 12px 28px rgba(47,103,189,.25)}.public-brand small{display:block;color:var(--muted);font-weight:700}.hero,section{background:linear-gradient(180deg,rgba(23,37,66,.92),rgba(18,27,49,.92));border:1px solid rgba(90,167,255,.16);border-radius:22px;padding:1.35rem;margin:1rem 0;box-shadow:0 18px 60px rgba(0,0,0,.22)}.hero{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:1rem;align-items:center}.eyebrow{color:#9ed0ff;text-transform:uppercase;letter-spacing:.16em;font-weight:900;font-size:.78rem}.side-panel{padding:1rem;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.045)}h1{font-size:clamp(2rem,4vw,3.4rem);line-height:1;margin:.2rem 0 .7rem}h2{margin:0 0 .9rem;font-size:1.12rem;color:#dbeafe}.muted{color:var(--muted)}.bad{color:var(--bad);font-weight:800}.qr-card{display:inline-flex;margin:1rem 0;padding:1rem;border-radius:18px;background:#f8fbff;box-shadow:0 18px 42px rgba(0,0,0,.28)}.qr-card svg{display:block;width:220px;height:220px}.secret-block{display:grid;gap:.6rem;margin:1rem 0}.secret-block code{display:block;max-width:100%;overflow:auto;padding:.85rem;border-radius:12px;background:#081226;border:1px solid var(--line2);color:#dbeafe}.form-card{padding:1rem;border:1px solid rgba(90,167,255,.16);border-radius:18px;background:rgba(90,167,255,.045);margin:1rem 0}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:.9rem;align-items:end}label{display:block;color:var(--soft);font-weight:700}input,select,button{font:inherit;padding:.72rem .8rem;border-radius:12px;border:1px solid var(--line2);background:#0b1326;color:var(--text);max-width:100%}label input,label select{margin-top:.25rem;width:100%}input:focus,select:focus{outline:2px solid rgba(90,167,255,.35);border-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;cursor:pointer;padding:.78rem 1rem;border-radius:12px;background:linear-gradient(135deg,#2f67bd,#4e7de2);border:1px solid rgba(255,255,255,.1);color:white;box-shadow:0 10px 24px rgba(47,103,189,.22);font-weight:800;line-height:1.1;text-decoration:none;white-space:nowrap}.secondary{background:rgba(90,167,255,.12);border-color:rgba(90,167,255,.35);box-shadow:none;color:#dbeafe}.small{padding:.55rem .75rem;border-radius:10px;font-size:.92rem}.form-actions,.button-group{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center}.input-action{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.45rem;align-items:end}.toggle-card{display:flex;align-items:center;gap:.85rem;width:100%;min-width:260px;padding:.9rem 1rem;border:1px solid rgba(90,167,255,.22);border-radius:16px;background:rgba(90,167,255,.07);cursor:pointer}.toggle-card input{position:absolute;opacity:0;width:1px;height:1px}.toggle-card>input+span{position:relative;display:grid;gap:.15rem;padding-left:68px;color:var(--text)}.toggle-card>input+span::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);width:54px;height:30px;border-radius:999px;background:#1f2b45;border:1px solid var(--line2);box-shadow:inset 0 1px 4px rgba(0,0,0,.28)}.toggle-card>input+span::after{content:"";position:absolute;left:4px;top:50%;transform:translateY(-50%);width:22px;height:22px;border-radius:999px;background:#dbeafe;transition:transform .18s ease,background .18s ease}.toggle-card>input:checked+span::before{background:linear-gradient(135deg,#2f67bd,#4e7de2);border-color:rgba(255,255,255,.18)}.toggle-card>input:checked+span::after{transform:translate(24px,-50%);background:#fff}.toggle-card small{display:block;color:var(--muted);font-weight:600;line-height:1.35}.dir-dialog{width:min(720px,92vw);border:1px solid rgba(90,167,255,.22);border-radius:20px;background:#101a30;color:var(--text);box-shadow:0 30px 90px rgba(0,0,0,.55);padding:1rem}.dir-dialog::backdrop{background:rgba(0,0,0,.55)}.dir-dialog-head{display:flex;justify-content:space-between;gap:1rem;align-items:center}.dir-list{display:grid;gap:.45rem;max-height:420px;overflow:auto;margin-top:.9rem}.dir-entry{display:flex;justify-content:space-between;gap:.8rem;align-items:center;padding:.75rem .85rem;border:1px solid rgba(255,255,255,.08);border-radius:14px;background:rgba(255,255,255,.035);color:var(--text);text-align:left}.dir-entry:hover{filter:brightness(1.08)}@media(max-width:850px){main{padding:1rem}.hero{grid-template-columns:1fr}.input-action{grid-template-columns:1fr}.form-actions{display:block}}"#
 }
 
 const SETUP_JAVASCRIPT: &str = r#"
@@ -1141,7 +1128,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const response = await fetch(`/browse?token=${encodeURIComponent(token)}&path=${encodeURIComponent(requestedPath)}&mode=${pickerMode}&file_kind=${encodeURIComponent(pickerFileKind)}`);
     if (!response.ok) {
       if (fallbackToRoot && requestedPath !== '/') return load('/', false);
-      list.innerHTML = '<p class="bad"><vl-i18n key="setup.directory_unreadable"/></p>';
+      list.innerHTML = '<p class="vl-danger-text"><vl-i18n key="setup.directory_unreadable"/></p>';
       return;
     }
     const data = await response.json();
@@ -1154,7 +1141,7 @@ document.addEventListener('DOMContentLoaded', () => {
     for (const entry of data.entries) {
       const button = document.createElement('button');
       button.type = 'button';
-      button.className = 'dir-entry';
+      button.className = 'vl-dir-entry';
       button.dataset.entryType = entry.is_directory ? 'directory' : 'file';
       button.textContent = entry.name;
       button.addEventListener('click', () => {
@@ -1168,7 +1155,7 @@ document.addEventListener('DOMContentLoaded', () => {
       list.appendChild(button);
     }
     if (!data.entries.length) {
-      list.innerHTML = `<p class="muted">${pickerMode === 'file' ? '<vl-i18n key="setup.no_files_or_directories"/>' : '<vl-i18n key="setup.no_subdirectories"/>'}</p>`;
+      list.innerHTML = `<p class="vl-muted">${pickerMode === 'file' ? '<vl-i18n key="setup.no_files_or_directories"/>' : '<vl-i18n key="setup.no_subdirectories"/>'}</p>`;
     }
   }
 
@@ -1651,6 +1638,44 @@ mod tests {
         })
         .await;
         assert!(error.starts_with("Die Setup-Eingaben ergeben keine gültige"));
+    }
+
+    #[tokio::test]
+    async fn empty_preview_extensions_leave_no_setup_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let mut setup_form = form(root.path(), data.path());
+        setup_form.preview_extensions.clear();
+
+        let error = build_and_store_with_mount_validator(&config_path, setup_form, |_| Ok(()))
+            .await
+            .err()
+            .expect("empty preview extensions must fail");
+        assert!(error.contains("preview_extensions must not be empty"));
+        assert!(!config_path.exists());
+        assert!(!data.path().join("data.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn overlong_admin_password_cannot_be_persisted_by_setup() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let mut setup_form = form(root.path(), data.path());
+        let password = "x".repeat(auth::MAX_PASSWORD_BYTES + 1);
+        setup_form.admin_password = password.clone();
+        setup_form.admin_password_confirm = password;
+
+        let error = build_and_store_with_mount_validator(&config_path, setup_form, |_| Ok(()))
+            .await
+            .err()
+            .expect("overlong admin passwords must fail");
+        assert!(error.contains("1024"));
+        assert!(!config_path.exists());
+        assert!(!data.path().join("data.sqlite").exists());
     }
 
     #[test]

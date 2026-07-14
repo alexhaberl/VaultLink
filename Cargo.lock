@@ -2286,6 +2286,7 @@ dependencies = [
  "http-body-util",
  "percent-encoding",
  "pin-project-lite",
+ "tokio",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -2429,7 +2430,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vaultlink"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "argon2",
  "axum",
@@ -2440,6 +2441,8 @@ dependencies = [
  "futures-util",
  "hmac",
  "http",
+ "http-body",
+ "hyper-util",
  "mime_guess",
  "percent-encoding",
  "qrcode",
@@ -2471,8 +2474,11 @@ dependencies = [
 name = "vaultlink-fuzz"
 version = "0.0.0"
 dependencies = [
+ "axum",
+ "futures-util",
  "libfuzzer-sys",
  "tempfile",
+ "tokio",
  "vaultlink",
 ]
 

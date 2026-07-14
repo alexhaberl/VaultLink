@@ -1,16 +1,16 @@
-# v0.4.1 release checklist
+# v0.4.2 release checklist
 
-Stand: 2026-07-12 für die native Linux-amd64-/arm64-Freigabe von 0.4.1.
+Stand: 2026-07-14 für die native Linux-amd64-/arm64-Freigabe von 0.4.2.
 
 Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfolgt über einen eigenen Pull Request; ein Tag wird erst nach dem Merge auf `main`, bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
-## Feature-Scope für 0.4.1
+## Feature-Scope für 0.4.2
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
 - [x] „Mein Konto“ für eigene Passwortänderungen mit aktuellem Passwort sowie zweistufigen MFA-Wechsel; das alte Secret bleibt bis zum bestätigten neuen TOTP-Code aktiv.
 - [x] Lokaler `recover-admin`-Notfallpfad über SSH/Hostzugriff mit `--config` oder direktem `--database`, atomarem Credential-Wechsel, Session-/Pending-Widerruf und secret-freiem Audit.
 - [x] Deutsch/Englisch in Setup-, Auth-, Admin- und Public-Flows; Cookie vor `Accept-Language`, Englisch als Fallback, locale-gerechte Datums-/Zahlen-/JavaScript-Ausgabe.
-- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.4.1.
+- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.4.2.
 - [x] Admin-Dateiverwaltung zum Erstellen von Ordnern, No-Clobber-Umbenennen und permanenten rekursiven Löschen mit serverseitiger Bestätigung sowie clientseitigem Exact-Match-Gating.
 - [x] Begrenzte, neustartfähige Tombstone-Bereinigung mit global serialisierten Cleanup-Workern und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
 - [x] API und UI teilen Auth-, Session-, CSRF-, SecureFS-, SQLite-, Runtime-Settings- und Audit-Logik.
@@ -45,9 +45,9 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [x] ZeroSSL/acme.sh Renewal-Dokumentation und systemd-Beispiele.
 - [x] UI-/UX-Polish mit getrennten Auth/Public/Admin-Shells, Logo/Favicon, locale-gerechtem Date-Time-Picker, dezimalen MB/GB-Einheiten und konsistenten Buttons/Switches.
 - [x] Public Upload-Fehlerseiten für validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Größenlimits, fehlende Dateinamen und Speicherfehler.
-- [x] Fuzzing für Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, Upload-Validierung und API-Request-Policy.
+- [x] Fuzzing für Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, Upload-Validierung, API-Request-Policy, Dateimutationen und Multipart-Streaming.
 
-## Bewusste Nicht-Ziele für 0.4.1
+## Bewusste Nicht-Ziele für 0.4.2
 
 - DEB-Paket.
 - Öffentliches Repository.
@@ -63,14 +63,14 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [x] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` auf amd64 und arm64
 - [ ] `cargo test --locked --all-targets` auf amd64 und arm64
-  - Das verbindliche 0.4.1-Gate sind native Linux-Läufe für amd64 und arm64; frühere Windows-Läufe gelten nicht als Freigabenachweis.
+  - Das verbindliche 0.4.2-Gate sind native Linux-Läufe für amd64 und arm64; frühere Windows-Läufe gelten nicht als Freigabenachweis.
   - Enthalten: Account-Passwort/MFA, Recovery-Races, DE/EN-Hauptrouten und Setup, API Login/MFA/Session/CSRF, Secret-Redaction, Setup-Recovery, UTF-8, SecureFS, Preview, Transfers, ZIP, Multipart, Body-Limits, Upload-Atomizität und Migrationen.
 - [ ] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
-  - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy` und `api_request_policy` kompiliert.
+  - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy`, `api_request_policy`, `file_mutation_policy` und `multipart_guard` kompiliert.
 - [ ] `cargo build --release --locked` auf amd64 und arm64
 - [ ] `cargo audit --deny warnings` für das gemeinsame Workspace-Lockfile auf dem finalen Stand wiederholen.
 - [ ] `make policy-check` beziehungsweise das Shell-Skript in einer Umgebung mit `sh` wiederholen.
-- [ ] `make docker-smoke` auf dem finalen 0.4.1-Stand nativ auf amd64 und arm64 wiederholen.
+- [ ] `make docker-smoke` auf dem finalen 0.4.2-Stand nativ auf amd64 und arm64 wiederholen.
 
 ## Historische Beobachtung vor dem 0.3.2-Upgrade
 
@@ -108,14 +108,15 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
   - Upload-Overwrite-Policy,
   - Upload-Validierungslogik,
   - API-Request-Policy,
-  - Admin-Dateimutations- und Share-Teilbaumpolicy.
-  - Der Workflow läuft zusätzlich wöchentlich als einzelner Self-hosted-Job, der alle acht Targets mit vier Workern in zwei Gruppen und einem 60-Minuten-Timeout ausführt; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
+  - Admin-Dateimutations- und Share-Teilbaumpolicy,
+  - Multipart-Streaming-Guard inklusive Chunk-Grenzen, EOF, Header- und Preamble-Limits.
+  - Der Workflow läuft zusätzlich wöchentlich als einzelner Self-hosted-Job, der alle neun Targets mit vier Workern in drei Gruppen und einem 60-Minuten-Timeout ausführt; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
 - [ ] Dabei das gemeinsame Workspace-`Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.
 - [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `[self-hosted, Linux, ARM64, vaultlink]` grün; beide verwenden den zu `rust-toolchain.toml` passenden, digest-gepinnten Debian-13-/Rust-OCI-Index. Architekturunabhängige Release-Jobs laufen auf arm64.
 - [ ] Offline erzeugten Minisign-Public-Key als `release/minisign.pub` committen und `MINISIGN_SECRET_KEY` sowie `MINISIGN_PASSWORD` als GitHub-Actions-Secrets provisionieren; ohne alle drei Werte muss der Tag-Publish absichtlich fehlschlagen.
-- [ ] Ein autorisierter Maintainer pusht den annotierten `v0.4.1`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, Main-Ancestry-Prüfung und der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
+- [ ] Ein autorisierter Maintainer pusht den annotierten `v0.4.2`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, Main-Ancestry-Prüfung und der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
 - [ ] Artefakte prüfen:
   - versionierte amd64- und arm64-Archive,
   - eigenständige, architekturspezifische Binaries,
@@ -174,6 +175,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
   - Security Header,
   - Secure/SameSite/HttpOnly Cookies,
   - Login, MFA, Logout,
+  - Registrierung, Anmeldung und geschütztes Entfernen mit zwei realen FIDO2-Sicherheitsschlüsseln,
   - Admins,
   - Settings,
   - Audit,
@@ -210,7 +212,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [ ] `make policy-check` grün; alle Dependabot-Pin-Updates gegen die jeweiligen Upstream-Repositories geprüft.
 - [ ] Staging- und Public-Gates grün.
 - [ ] 72h-Soak bestanden.
-- [ ] Annotierten Tag `v0.4.1` erstellen.
+- [ ] Annotierten Tag `v0.4.2` erstellen.
 - [ ] Tag-Commit ist nachweislich in `origin/main` enthalten; Release-Environment/Secrets sind für den Tag freigegeben.
 - [ ] Offline erzeugtes `release/minisign.pub` ist vor dem Tag committed und die beiden Minisign-Secrets sind provisioniert.
 - [ ] Tag-Release-Workflow prüfen:

@@ -2,7 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Rust-Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Unterstützte Hostplattformen sind Linux x86_64 und aarch64; Windows-Hostsupport ist ab 0.4.1 entfernt. Windows-, macOS- und Linux-Clients bleiben über einen externen Standard-SMB-Server interoperabel.
 
-Status: `0.4.1`-Kandidat für ein privates Debian-13-amd64-/arm64-Release. Native amd64- und arm64-Gates laufen ausschließlich auf den dedizierten Self-hosted-Runnern; architekturunabhängige Jobs nutzen den arm64-Runner. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
+Status: `0.4.2`-Kandidat für ein privates Debian-13-amd64-/arm64-Release. Native amd64- und arm64-Gates laufen ausschließlich auf den dedizierten Self-hosted-Runnern; architekturunabhängige Jobs nutzen den arm64-Runner. Ein Tag wird erst nach den Gates in [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) gesetzt.
 
 GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
 
@@ -31,25 +31,31 @@ VaultLink/
 │   ├── api.rs              session-basierte JSON-API unter /api/v1
 │   ├── auth.rs             Argon2id, TOTP, Rate Limit
 │   ├── db.rs               Schema, Sessions, Shares, Audit
+│   ├── file_ops.rs         transaktionale Rename-/Delete-Operationen
 │   ├── http_auth.rs        gemeinsame Session-, Cookie-, CSRF- und Audit-Helfer
+│   ├── i18n.rs             serverseitige DE-/EN-Lokalisierung
+│   ├── multipart_guard.rs  Streaming-Grenzen für Multipart-Header
 │   ├── path_security.rs    Pfadvalidierung
 │   ├── secure_fs.rs        openat2/renameat2 und atomare Uploads
+│   ├── storage_mount.rs    Mount- und SMB-Vertrauensgrenze
 │   ├── range.rs            einzelner HTTP-Byte-Range-Parser
 │   ├── proxy.rs            vertrauenswürdige Proxy-Header
 │   ├── runtime.rs          SQLite-Overrides für Policy-Settings
 │   ├── setup.rs            lokales Bootstrap-Setup-UI
+│   ├── ui.rs               gemeinsame Styles, Icons und UI-Bausteine
+│   ├── webauthn.rs         WebAuthn-Ceremony-State und Credentials
 │   └── web.rs              Routen, HTML, Upload/Download/ZIP/Preview
 ├── config/                 Beispielkonfigurationen
 ├── deploy/                 systemd, Caddy, ACME-Hook
 ├── docs/                   Upgrade, Rollback, Release-Gates
-├── fuzz/                   Pfad-, Range-, Dateinamen-, Preview-, Upload- und API-Policy-Fuzzing
+├── fuzz/                   Pfad-, Range-, Multipart-, Preview-, Upload- und API-Policy-Fuzzing
 ├── Makefile
 └── Cargo.toml
 ```
 
 ## 3. Daten- und Persistenzmodell
 
-SQLite ist bewusst gewählt: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `runtime_settings`, `audit`.
+SQLite ist bewusst gewählt: eindeutige Aliase, parallele Sessions, atomare Downloadlimits und crash-feste Transaktionen sind Kernanforderungen. WAL ist aktiv. Tabellen: `admins`, `sessions`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `runtime_settings`, `audit`, `transfer_monthly_counts`, `transfer_statistics`, `admin_mfa_enrollments`, `admin_webauthn_credentials` und `admin_totp_replay`.
 
 `shares.max_upload_size` ist optional; `NULL` nutzt das globale Runtime-Limit. Migrationen laufen transaktional über `PRAGMA user_version`; unbekannte neuere Schemas verweigern den Start. Die Datenbank liegt standardmäßig in `/var/lib/vaultlink/data.sqlite` und muss `vaultlink:vaultlink 0600` gehören.
 
@@ -120,7 +126,7 @@ Für den auditierten Co-Writer-Modus gelten:
 - Externe Writer gelten als vertrauenswürdige Publisher des sichtbaren Inhalts. Sie können Dateien verändern oder ersetzen, die ein bestehender VaultLink-Link ausliefert. Diese direkten SMB-Aktionen umgehen VaultLink-Audit, Share-Limits und Web-Policy und müssen deshalb am SMB-Server selbst auditiert werden.
 - VaultLinks Linux-Mount erzwingt Transportverschlüsselung per SMB `seal`. Zusätzlich muss der externe SMB-Server SMB 3.1.1 Signing und Encryption für **jede** direkte Windows-, macOS- und Linux-Co-Writer-Session verpflichtend machen; VaultLink kann diese separaten Sessions nicht erzwingen. Verschlüsselung ruhender Daten ist Aufgabe des SMB-Servers. Transparenter Zugriff mit Standard-SMB-Clients ist nicht mit einer ausschließlich von VaultLink kontrollierten clientseitigen Inhaltsverschlüsselung vereinbar.
 
-Andere Netzwerkdateisysteme mit externen Schreibern sind in 0.4.1 nicht freigegeben. Ein erkanntes Remote-Dateisystem ohne explizite Mount-Policy wird beim Start abgewiesen. Production verlangt die Policy unabhängig vom gerade erkannten Dateisystem, sodass auch ein ausgefallener CIFS-Mount mit lokal sichtbarem Fallback-Verzeichnis fail-closed bleibt.
+Andere Netzwerkdateisysteme mit externen Schreibern sind in 0.4.2 nicht freigegeben. Ein erkanntes Remote-Dateisystem ohne explizite Mount-Policy wird beim Start abgewiesen. Production verlangt die Policy unabhängig vom gerade erkannten Dateisystem, sodass auch ein ausgefallener CIFS-Mount mit lokal sichtbarem Fallback-Verzeichnis fail-closed bleibt.
 
 Runtime-editierbar über `/admin/settings`: `public_base_url`, globales Uploadlimit, blockierte Endungen, Share-Passwortpolitik, Unlock-Dauer, ZIP-/Search-/Text-/Media-Preview-Limits, Text-/Bild-Preview-Endungen und PDF-Preview-Status. Servermodus, Bind-Adresse, TLS-Pfade, Trusted Proxies, Root-Mount, Data-Dir und ACME-Modus bleiben file-/restart-basiert.
 
@@ -159,7 +165,7 @@ ZIP-Downloads werden durchgehend im ZIP64-Format erzeugt. `max_zip_size` begrenz
 
 `max_downloads` begrenzt abgeschlossene Inhaltsübertragungen (Download, ZIP und gezählte Vorschau), nicht den Aufruf der öffentlichen Metadaten-/Landingpage oder Uploads. `HEAD` liefert nur dann Metadaten, wenn derselbe logische `GET` mit der aktuellen Transfer-Session beginnen dürfte, verbraucht selbst aber keine Quote.
 
-Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.4.1` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
+Zusätzlich gibt es eine session-basierte JSON-API unter `/api/v1`. Sie nutzt dieselben sicheren Cookies, MFA-Sessions, CSRF-Regeln, SecureFS-Zugriffe, SQLite-Operationen und Audit-Events wie die HTML-UI. In `0.4.2` gibt es bewusst keine API-Tokens; mutierende Admin-API-Routen verlangen den Header `X-CSRF-Token`.
 
 Bei passwortgeschützten öffentlichen Shares liefert die Metadatenroute vor dem Unlock ausschließlich `{"locked":true}`. Clients müssen nach erfolgreichem Unlock mit dem gesetzten API-Cookie erneut abfragen; Pfad, Berechtigung und Transferzähler werden vorher nicht offengelegt.
 

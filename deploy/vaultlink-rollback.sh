@@ -371,6 +371,12 @@ current_readiness_connect_to=$(printf '%s\n' "$current_readiness_target" | sed -
 current_readiness_insecure=$(printf '%s\n' "$current_readiness_target" | sed -n '3p')
 current_health_body='{"ok":true,"version":"'"$current_version"'"}'
 
+if [ "$requested_version" = 0.4.0 ] && [ "$current_version" != 0.4.0 ] \
+    && [ "$was_active" -eq 1 ]; then
+    echo "a rollback to 0.4.0 requires vaultlink.service to be stopped and the legacy storage layout to be restored first" >&2
+    exit 1
+fi
+
 stop_attempted=1
 systemctl stop "$service"
 

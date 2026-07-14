@@ -26,6 +26,8 @@ use config::Config;
 use db::Database;
 use runtime::RuntimeSettings;
 
+pub const MAX_IN_FLIGHT_RESPONSES: usize = 256;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -39,6 +41,8 @@ pub struct AppState {
     pub security_settings_mutation: Arc<tokio::sync::Mutex<()>>,
     pub storage_mutation: Arc<tokio::sync::Mutex<()>>,
     pub storage_cleanup: Arc<tokio::sync::Mutex<()>>,
+    pub upload_admission: Arc<tokio::sync::Semaphore>,
+    pub response_admission: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub upload_directory_sync_failure: Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>,
 }
@@ -92,6 +96,8 @@ impl AppState {
             security_settings_mutation: Arc::new(tokio::sync::Mutex::new(())),
             storage_mutation: Arc::new(tokio::sync::Mutex::new(())),
             storage_cleanup: Arc::new(tokio::sync::Mutex::new(())),
+            upload_admission: Arc::new(tokio::sync::Semaphore::new(32)),
+            response_admission: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_RESPONSES)),
             #[cfg(test)]
             upload_directory_sync_failure: Arc::new(std::sync::Mutex::new(None)),
         })

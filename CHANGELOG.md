@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.2 — 2026-07-14
+
+- Prevented TOTP replay across concurrent sessions with an atomic per-admin counter claim (schema 11).
+- Unified admin password validation across setup, CLI, UI and API, including the 1024-byte login boundary.
+- Added HTTP header/body idle limits, bounded concurrent uploads, safer WebAuthn reauthentication, and hard share-password input limits.
+- Hardened 0.4.0 storage migration and rollback gates for newer direct upgrade paths, and removed obsolete UI/SecureFS compatibility symbols.
+- Rejected non-startable empty preview-extension configurations and fixed expiry-offset and growing-text-preview edge cases.
+- Added WebAuthn ceremony-state invariants, injected deletion-cleanup retry tests, and production multipart-stream fuzzing.
+- Capped accepted HTTP connections and in-flight response bodies, added systemd FD/task ceilings, rotated short share aliases during upgrades and retired their lookup path, removed the legacy CSS delivery path, and replaced the placeholder PNG with a real 32×32 favicon.
+- Removed the deprecated `share_password_max_bytes` parser alias; schema 12 atomically renames the persisted runtime key while candidate TOML files must use `share_password_max_length`.
+
 ## 0.4.1 — 2026-07-12
 
 - Added native Linux aarch64 support with dedicated Self-hosted amd64 and arm64 runners; architecture-independent Actions jobs run on arm64 and no workflow uses GitHub-hosted compute.

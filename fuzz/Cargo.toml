@@ -8,8 +8,11 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+axum = "0.8"
+futures-util = "0.3"
 libfuzzer-sys = "0.4"
 tempfile = "3.27"
+tokio = { version = "1", features = ["rt"] }
 vaultlink = { path = ".." }
 
 [[bin]]
@@ -64,6 +67,13 @@ bench = false
 [[bin]]
 name = "file_mutation_policy"
 path = "fuzz_targets/file_mutation_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multipart_guard"
+path = "fuzz_targets/multipart_guard.rs"
 test = false
 doc = false
 bench = false
