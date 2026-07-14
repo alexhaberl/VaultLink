@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::Path};
+use std::net::SocketAddr;
 
 use axum::{
     body::Body,
@@ -29,7 +29,9 @@ use crate::{
         share_is_unlocked, try_acquire_client_activity, verify_password_admitted,
         with_audit_client_ip, MissingSession, UnlockCookieScope,
     },
-    path_security, proxy,
+    path_security,
+    policy::{self, ShareAvailability},
+    proxy,
     runtime::RuntimeSettings,
     AppState,
 };
@@ -2167,21 +2169,19 @@ async fn get_share(state: &AppState, token: &str) -> ApiResult<Share> {
 }
 
 fn usable(share: &Share) -> ApiResult<()> {
-    if !share.active {
-        return Err(ApiError::new(
+    match policy::share_availability(share, Utc::now()) {
+        ShareAvailability::Available => Ok(()),
+        ShareAvailability::Inactive => Err(ApiError::new(
             StatusCode::GONE,
             "share_inactive",
             "Freigabe ist deaktiviert",
-        ));
-    }
-    if share.expires_at.is_some_and(|expires| expires < Utc::now()) {
-        return Err(ApiError::new(
+        )),
+        ShareAvailability::Expired => Err(ApiError::new(
             StatusCode::GONE,
             "share_expired",
             "Freigabe ist abgelaufen",
-        ));
+        )),
     }
-    Ok(())
 }
 
 fn validate_rel(value: &str) -> ApiResult<String> {
@@ -2198,11 +2198,11 @@ fn validate_alias(value: &str) -> ApiResult<String> {
 }
 
 fn validate_share_password(settings: &RuntimeSettings, password: &str) -> ApiResult<()> {
-    let chars = password.chars().count();
-    if chars < settings.share_password_min_length || chars > settings.share_password_max_length {
+    let validation = policy::validate_share_password(settings, password);
+    if validation == policy::SharePasswordValidation::InvalidCharacterLength {
         return Err(ApiError::bad_request("Ungültiges Freigabepasswort"));
     }
-    if password.len() > auth::MAX_PASSWORD_BYTES {
+    if validation == policy::SharePasswordValidation::TooManyBytes {
         return Err(ApiError::bad_request("Freigabepasswort ist zu lang"));
     }
     Ok(())
@@ -2225,20 +2225,7 @@ fn validate_admin_password(password: &str) -> ApiResult<()> {
 }
 
 fn preview_allowed(path: &str, settings: &RuntimeSettings) -> bool {
-    let extension = Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    settings
-        .preview_extensions
-        .iter()
-        .any(|value| value == &extension)
-        || (settings.pdf_preview_enabled && extension == "pdf")
-        || settings
-            .image_preview_extensions
-            .iter()
-            .any(|value| value == &extension)
+    policy::preview_metadata_allowed(path, settings)
 }
 
 #[cfg(test)]

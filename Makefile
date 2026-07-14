@@ -1,4 +1,4 @@
-.PHONY: dev-setup sample-data test security-test fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-smoke docker-setup-smoke docker-api-smoke docker-upgrade-safety-test
+.PHONY: dev-setup sample-data test security-test fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-upgrade-safety-test
 
 CONFIG ?= config/development.toml
 DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
@@ -54,7 +54,11 @@ docker-smoke-build:
 	@docker version >/dev/null 2>&1 || (echo "Docker fehlt oder WSL-Integration ist nicht aktiv" && exit 1)
 	docker build -f deploy/docker/Dockerfile.setup-smoke -t $(DOCKER_SMOKE_IMAGE) .
 
+docker-test: docker-smoke-build
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) cargo test --locked --all-targets
+
 docker-smoke: docker-smoke-build
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) cargo test --locked --all-targets
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE)
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/api-smoke.sh
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh

@@ -10,6 +10,7 @@ pub mod http_auth;
 pub mod i18n;
 pub mod multipart_guard;
 pub mod path_security;
+pub mod policy;
 pub mod proxy;
 pub mod range;
 pub mod runtime;

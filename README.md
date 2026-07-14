@@ -241,7 +241,7 @@ proxy_buffering off;
 
 ### Standalone TLS mit PEM-Dateien
 
-`certificate_source = "files"` liest `cert_file` und `key_file`. Mit `reload_on_cert_change = true` lädt `systemctl reload vaultlink` die PEM-Dateien per SIGHUP neu. Fehlerhafte neue PEMs lassen die alte TLS-Konfiguration aktiv.
+`certificate_source = "files"` liest `cert_file` und `key_file`. Der private Key muss Modus `0400`, `0440`, `0600` oder `0640` haben. Damit bleibt insbesondere `root:vaultlink` mit reinem Gruppen-Leserecht unterstützt; weitere Mitglieder dieser dedizierten Gruppe gehören zur administrativen Vertrauensgrenze. Gruppen-Schreib-/Ausführrechte, alle Rechte für Other sowie Setuid/Setgid/Sticky werden abgewiesen. Mit `reload_on_cert_change = true` lädt `systemctl reload vaultlink` die PEM-Dateien per SIGHUP neu. Fehlerhafte neue PEMs lassen die alte TLS-Konfiguration aktiv.
 
 Für Port 443 ohne Root:
 

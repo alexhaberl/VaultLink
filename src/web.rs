@@ -67,7 +67,9 @@ use crate::{
         UnlockCookieScope,
     },
     i18n::{self, Locale, MessageKey},
-    path_security, proxy,
+    path_security,
+    policy::{self, PreviewKind, ShareAvailability},
+    proxy,
     range::parse_byte_range,
     runtime,
     runtime::RuntimeSettings,
@@ -841,7 +843,6 @@ document.addEventListener('submit',e=>{e.target.querySelectorAll('[data-tz-offse
 const MB: u64 = 1_000_000;
 const GB: u64 = 1_000_000_000;
 const STORAGE_RESERVE_BYTES: u64 = 64 * MB;
-const SHARE_PASSWORD_HARD_MAX_BYTES: usize = 1024;
 
 async fn logo_svg() -> impl IntoResponse {
     (
@@ -3619,11 +3620,7 @@ fn add_upload_bytes(total: u64, chunk: usize, maximum: u64) -> Option<u64> {
 }
 
 fn validate_share_password(settings: &RuntimeSettings, password: &str) -> Result<()> {
-    let chars = password.chars().count();
-    if chars < settings.share_password_min_length
-        || chars > settings.share_password_max_length
-        || password.len() > SHARE_PASSWORD_HARD_MAX_BYTES
-    {
+    if !policy::valid_share_password(settings, password) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
             "Freigabepasswort entspricht nicht der Richtlinie",
@@ -3705,55 +3702,12 @@ fn public_breadcrumbs(token: &str, path: &str) -> String {
     breadcrumbs(path, &format!("/v/{token}"))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreviewKind {
-    Text,
-    Image(&'static str),
-    Pdf,
-}
-
-impl PreviewKind {
-    fn content_type(self) -> &'static str {
-        match self {
-            Self::Text => "text/plain; charset=utf-8",
-            Self::Image(content_type) => content_type,
-            Self::Pdf => "application/pdf",
-        }
-    }
-
-    fn is_media(self) -> bool {
-        matches!(self, Self::Image(_) | Self::Pdf)
-    }
-}
-
 fn preview_kind(path: &str, settings: &RuntimeSettings) -> Option<PreviewKind> {
-    let extension = Path::new(path)
-        .extension()
-        .and_then(|value| value.to_str())?
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
-    if settings
-        .preview_extensions
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(&extension))
-    {
-        return Some(PreviewKind::Text);
-    }
-    if settings.pdf_preview_enabled && extension == "pdf" {
-        return Some(PreviewKind::Pdf);
-    }
-    if settings
-        .image_preview_extensions
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(&extension))
-    {
-        return image_content_type(&extension).map(PreviewKind::Image);
-    }
-    None
+    policy::preview_kind(path, settings)
 }
 
 fn preview_allowed(path: &str, settings: &RuntimeSettings) -> bool {
-    preview_kind(path, settings).is_some()
+    policy::preview_allowed(path, settings)
 }
 
 fn public_preview_error(error: io::Error) -> AppError {
@@ -3768,18 +3722,6 @@ fn public_preview_error(error: io::Error) -> AppError {
             AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar")
         }
         _ => AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"),
-    }
-}
-
-fn image_content_type(extension: &str) -> Option<&'static str> {
-    match extension {
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "png" => Some("image/png"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "bmp" => Some("image/bmp"),
-        "avif" => Some("image/avif"),
-        _ => None,
     }
 }
 
@@ -6895,13 +6837,12 @@ async fn audit_page(
 }
 
 fn usable(sh: &Share) -> Result<()> {
-    if !sh.active || sh.expires_at.is_some_and(|e| e <= Utc::now()) {
-        Err(AppError(
+    match policy::share_availability(sh, Utc::now()) {
+        ShareAvailability::Available => Ok(()),
+        ShareAvailability::Inactive | ShareAvailability::Expired => Err(AppError(
             StatusCode::GONE,
             "Dieser Link ist nicht mehr aktiv",
-        ))
-    } else {
-        Ok(())
+        )),
     }
 }
 async fn get_share(state: &AppState, token: &str) -> Result<Share> {
