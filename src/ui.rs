@@ -1074,9 +1074,6 @@ pub const STYLESHEET: &str = r#"
 }
 "#;
 
-/// Compatibility-friendly name for consumers serving the shared application CSS.
-pub const APP_CSS: &str = STYLESHEET;
-
 /// Progressive enhancement for single-request upload forms.
 ///
 /// The server-rendered form deliberately remains a single-file fallback. This

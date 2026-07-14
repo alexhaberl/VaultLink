@@ -92,7 +92,7 @@ impl RuntimeSettings {
             "share_password_min_length" => {
                 self.share_password_min_length = parse_usize(key, value)?;
             }
-            "share_password_max_length" | "share_password_max_bytes" => {
+            "share_password_max_length" => {
                 self.share_password_max_length = parse_usize(key, value)?;
             }
             "share_unlock_minutes" => {
@@ -460,6 +460,18 @@ mod tests {
         assert!(settings
             .apply_many([("max_upload_size", "999"), ("max_zip_files", "invalid")])
             .is_err());
+        assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn legacy_password_max_runtime_key_is_rejected_without_mutation() {
+        let mut settings = RuntimeSettings::from_config(&config());
+        let original = settings.clone();
+
+        let error = settings
+            .apply("share_password_max_bytes", "128")
+            .unwrap_err();
+        assert!(error.contains("unknown runtime setting"));
         assert_eq!(settings, original);
     }
 

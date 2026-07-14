@@ -207,7 +207,7 @@ for pattern in /config.toml .env '.env.*' '*.sqlite*'; do
     fi
 done
 
-for target in path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy file_mutation_policy; do
+for target in path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy file_mutation_policy multipart_guard; do
     if ! grep -E -q "(^|[[:space:]])${target}([[:space:]]|$)" Makefile; then
         report "Makefile fuzz target list is missing $target"
     fi
@@ -229,11 +229,18 @@ if ! grep -F -q 'run: make fuzz-parallel' .github/workflows/fuzz.yml; then
 fi
 
 if ! grep -E -q '^[[:space:]]+FUZZ_JOBS:[[:space:]]+4$' .github/workflows/fuzz.yml; then
-    report "fuzz workflow must run all eight targets across four workers"
+    report "fuzz workflow must run all nine targets across four workers"
 fi
 
 if ! grep -E -q '^[[:space:]]+timeout-minutes:[[:space:]]+60$' .github/workflows/fuzz.yml; then
-    report "fuzz workflow must allow one hour for instrumented builds and two target waves"
+    report "fuzz workflow must allow one hour for instrumented builds and three target waves"
+fi
+
+if ! grep -F -x -q 'LimitNOFILE=4096' deploy/vaultlink.service; then
+    report "vaultlink.service must retain its explicit file-descriptor ceiling"
+fi
+if ! grep -F -x -q 'TasksMax=512' deploy/vaultlink.service; then
+    report "vaultlink.service must retain its explicit task ceiling"
 fi
 
 if ! grep -E -q '^[[:space:]]+cancel-in-progress:[[:space:]]+true$' .github/workflows/fuzz.yml; then

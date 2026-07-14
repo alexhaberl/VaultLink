@@ -1,12 +1,150 @@
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    future::Future,
+    io,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
+
+use axum_server::accept::Accept;
+use hyper_util::rt::TokioTimer;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 use vaultlink::{
     auth,
     config::{self, CertificateSource, Config, ServerMode},
     db::{AdminRecoveryOutcome, Database, InitialAdminOutcome},
     storage_mount, web, AppState,
 };
+
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ACTIVE_CONNECTIONS: usize = 256;
+
+#[derive(Clone)]
+struct ConnectionLimitAcceptor<A> {
+    inner: A,
+    permits: Arc<Semaphore>,
+}
+
+impl<A> ConnectionLimitAcceptor<A> {
+    fn new(inner: A) -> Self {
+        Self {
+            inner,
+            permits: Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS)),
+        }
+    }
+}
+
+struct ConnectionLimitedIo<I> {
+    inner: I,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for ConnectionLimitedIo<I> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buffer)
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, buffers)
+    }
+}
+
+impl<I, S, A> Accept<I, S> for ConnectionLimitAcceptor<A>
+where
+    A: Accept<I, S>,
+    A::Future: Send + 'static,
+    A::Stream: Send + 'static,
+    A::Service: Send + 'static,
+{
+    type Stream = ConnectionLimitedIo<A::Stream>;
+    type Service = A::Service;
+    type Future =
+        Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send + 'static>>;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "global HTTP connection limit reached",
+                    ))
+                });
+            }
+        };
+        let future = self.inner.accept(stream, service);
+        Box::pin(async move {
+            let (inner, service) = future.await?;
+            Ok((
+                ConnectionLimitedIo {
+                    inner,
+                    _permit: permit,
+                },
+                service,
+            ))
+        })
+    }
+}
+
+fn harden_http_server<Addr: axum_server::Address, Acceptor>(
+    server: &mut axum_server::Server<Addr, Acceptor>,
+) {
+    server
+        .http_builder()
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT))
+        .max_headers(64)
+        .max_buf_size(64 * 1024);
+    server
+        .http_builder()
+        .http2()
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(Some(64))
+        .keep_alive_interval(Some(HTTP2_KEEP_ALIVE_INTERVAL))
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,7 +204,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 install_sighup_handler_for_files(&config, tls.clone());
                 let handle = axum_server::Handle::new();
                 install_server_shutdown(handle.clone());
-                axum_server::bind_rustls(addr, tls)
+                let mut server =
+                    axum_server::bind_rustls(addr, tls).map(ConnectionLimitAcceptor::new);
+                harden_http_server(&mut server);
+                server
                     .handle(handle)
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
@@ -104,8 +245,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let handle = axum_server::Handle::new();
                 install_server_shutdown(handle.clone());
-                axum_server::bind(addr)
+                let mut server = axum_server::bind(addr)
                     .acceptor(acceptor)
+                    .map(ConnectionLimitAcceptor::new);
+                harden_http_server(&mut server);
+                server
                     .handle(handle)
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
@@ -115,7 +259,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             install_noop_sighup_handler("no reloadable TLS configuration in this mode");
             let handle = axum_server::Handle::new();
             install_server_shutdown(handle.clone());
-            axum_server::bind(addr)
+            let mut server = axum_server::bind(addr).map(ConnectionLimitAcceptor::new);
+            harden_http_server(&mut server);
+            server
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
@@ -389,12 +535,7 @@ fn recover_admin(options: &RecoverAdminOptions) -> Result<(), Box<dyn std::error
 }
 
 fn validate_admin_username(username: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if username.len() < 3
-        || username.len() > 64
-        || !username.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '_' || character == '-'
-        })
-    {
+    if !auth::valid_admin_username(username) {
         return Err("username must contain 3-64 safe ASCII characters".into());
     }
     Ok(())
@@ -411,8 +552,8 @@ fn prompt_new_admin_password() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn validate_admin_password(password: &str) -> Result<(), &'static str> {
-    if password.chars().count() < 14 {
-        return Err("password must contain at least 14 characters");
+    if !auth::valid_admin_password(password) {
+        return Err("password must contain at least 14 characters and at most 1024 bytes");
     }
     Ok(())
 }
@@ -782,5 +923,29 @@ mod tests {
     fn admin_password_minimum_counts_characters_instead_of_bytes() {
         assert!(validate_admin_password("äääääääääääää").is_err());
         assert!(validate_admin_password("ääääääääääääää").is_ok());
+        assert!(validate_admin_password(&"x".repeat(auth::MAX_PASSWORD_BYTES)).is_ok());
+        assert!(validate_admin_password(&"x".repeat(auth::MAX_PASSWORD_BYTES + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn connection_limiter_rejects_excess_connections_and_releases_on_drop() {
+        let limiter = ConnectionLimitAcceptor {
+            inner: axum_server::accept::DefaultAcceptor::new(),
+            permits: Arc::new(Semaphore::new(1)),
+        };
+        let (_first_client, first_server) = tokio::io::duplex(64);
+        let (held_connection, ()) = limiter.accept(first_server, ()).await.unwrap();
+
+        let (_second_client, second_server) = tokio::io::duplex(64);
+        let error = limiter
+            .accept(second_server, ())
+            .await
+            .err()
+            .expect("the second connection must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+
+        drop(held_connection);
+        let (_third_client, third_server) = tokio::io::duplex(64);
+        assert!(limiter.accept(third_server, ()).await.is_ok());
     }
 }

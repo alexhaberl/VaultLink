@@ -258,7 +258,7 @@ async fn login(
             "Zu viele Anmeldeversuche",
         ));
     }
-    if form.password.len() > 1_024 {
+    if form.password.len() > auth::MAX_PASSWORD_BYTES {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_credentials",
@@ -352,8 +352,21 @@ async fn mfa(
     let admin = database(state.db.clone(), move |db| db.admin(&username))
         .await?
         .ok_or_else(|| ApiError::internal(()))?;
-    if !auth::verify_totp_now(&admin.totp_secret, &form.code) {
+    let Some(totp_step) = auth::matching_totp_step_now(&admin.totp_secret, &form.code) else {
         audit(&state, session_data.username, "mfa_failed", None, None).await;
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_mfa",
+            "Ungültiger MFA-Code",
+        ));
+    };
+    let admin_id = session_data.admin_id;
+    let accepted = database(state.db.clone(), move |db| {
+        db.verify_mfa_with_totp_step(&token, admin_id, totp_step)
+    })
+    .await?;
+    if !accepted {
+        audit(&state, session_data.username, "mfa_replayed", None, None).await;
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_mfa",
@@ -361,7 +374,6 @@ async fn mfa(
         ));
     }
     state.limiter.success(&key);
-    database(state.db.clone(), move |db| db.verify_mfa(&token)).await?;
     audit(
         &state,
         session_data.username.clone(),
@@ -1665,6 +1677,9 @@ async fn unlock_share(
     Json(request): Json<UnlockRequest>,
 ) -> ApiResult<Response> {
     let share = get_share(&state, &token).await?;
+    let Some(hash) = share.password_hash.clone() else {
+        return Ok(Json(SimpleResponse { ok: true }).into_response());
+    };
     let ip = proxy::effective_client_ip(peer.ip(), &headers, &state.config);
     let key = format!("share:{}:{ip}", share.id);
     if !state.share_limiter.check_and_record_attempt(&key) {
@@ -1674,10 +1689,22 @@ async fn unlock_share(
             "Zu viele Passwortversuche",
         ));
     }
-    let Some(hash) = share.password_hash.clone() else {
-        return Ok(Json(SimpleResponse { ok: true }).into_response());
-    };
     let password = request.password;
+    if password.len() > auth::MAX_PASSWORD_BYTES {
+        audit(
+            &state,
+            "public".into(),
+            "share_unlock_failed",
+            Some(share.id.to_string()),
+            None,
+        )
+        .await;
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_share_password",
+            "Ungültiges Passwort",
+        ));
+    }
     let valid = tokio::task::spawn_blocking(move || auth::verify_password(&hash, &password))
         .await
         .map_err(ApiError::internal)?;
@@ -1770,7 +1797,7 @@ fn validate_rel(value: &str) -> ApiResult<String> {
 
 fn validate_alias(value: &str) -> ApiResult<String> {
     let value = value.trim();
-    path_security::validate_new_share_alias(value)
+    path_security::validate_share_alias(value)
         .map(str::to_string)
         .map_err(|_| ApiError::bad_request("Ungültiger Alias"))
 }
@@ -1780,7 +1807,7 @@ fn validate_share_password(settings: &RuntimeSettings, password: &str) -> ApiRes
     if chars < settings.share_password_min_length || chars > settings.share_password_max_length {
         return Err(ApiError::bad_request("Ungültiges Freigabepasswort"));
     }
-    if password.len() > 1024 {
+    if password.len() > auth::MAX_PASSWORD_BYTES {
         return Err(ApiError::bad_request("Freigabepasswort ist zu lang"));
     }
     Ok(())
@@ -1795,7 +1822,7 @@ fn validate_admin_username(username: &str) -> ApiResult<()> {
 }
 
 fn validate_admin_password(password: &str) -> ApiResult<()> {
-    if password.chars().count() >= 14 && password.len() <= 1024 {
+    if auth::valid_admin_password(password) {
         Ok(())
     } else {
         Err(ApiError::bad_request("Ungültiges Admin-Passwort"))
@@ -2056,6 +2083,54 @@ mod tests {
         let body = response_text(response).await;
         assert!(body.contains(r#""code":"forbidden""#));
         assert!(body.contains("CSRF"));
+    }
+
+    #[tokio::test]
+    async fn api_rejects_reusing_one_totp_code_for_two_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let secret = auth::new_totp_secret();
+        let hash = auth::hash_password("correct horse battery staple").unwrap();
+        state.db.create_admin("admin", &hash, &secret).unwrap();
+        let app = crate::web::router(state);
+
+        let mut cookies = Vec::new();
+        for _ in 0..2 {
+            let login = app
+                .clone()
+                .oneshot(json_request(
+                    Method::POST,
+                    "/api/v1/session/login",
+                    r#"{"username":"admin","password":"correct horse battery staple"}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(login.status(), StatusCode::OK);
+            cookies.push(cookie(&login));
+        }
+
+        let code = current_totp(&secret);
+        for (index, session_cookie) in cookies.into_iter().enumerate() {
+            let mut request = json_request(
+                Method::POST,
+                "/api/v1/session/mfa",
+                &format!(r#"{{"code":"{code}"}}"#),
+            );
+            request.headers_mut().insert(
+                header::COOKIE,
+                HeaderValue::from_str(&session_cookie).unwrap(),
+            );
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                if index == 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            );
+        }
     }
 
     #[tokio::test]

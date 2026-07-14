@@ -36,14 +36,20 @@ independent. Each job verifies `uname -m` and the Rust host triple before
 compiling. Superseded pull-request runs are cancelled automatically.
 
 The weekly and manually dispatched fuzz campaign runs on the self-hosted arm64
-runner. It runs all eight targets for ten minutes each across four workers
+runner. It runs all nine targets for ten minutes each across four workers
 (`FUZZ_JOBS=4`), matching the runner's four vCPUs.
 The workflow has a 60-minute timeout so a cold instrumented Nightly build and
-both target waves have sufficient headroom. Security auditing,
+all three target waves have sufficient headroom. Security auditing,
 release-environment resolution, combined
 artifact verification, signing, publishing, and release dry runs also use the
 arm64 runner because they do not require an amd64 host. The amd64 runner is
 reserved for the native amd64 CI and release-build matrix entries.
+
+The Rust WebAuthn tests cover server-side challenge replacement, account and
+session binding, expiry, single-use state, and invalid finish responses. They do
+not emulate a hardware authenticator or browser ceremony with a private key;
+end-to-end device interoperability therefore remains a release smoke test with
+a real FIDO2 security key.
 
 Release builds use the same digest-pinned Debian 13/Rust OCI index selected by
 `rust-toolchain.toml` on
@@ -56,10 +62,10 @@ immutable workflow artifacts, verifies `SHA256SUMS-amd64` and
 Release asset names identify version, Debian baseline, and architecture, for
 example:
 
-- `VaultLink-0.4.1-debian13-amd64.tar.gz`
-- `VaultLink-0.4.1-debian13-arm64.tar.gz`
-- `vaultlink-0.4.1-debian13-ARCH`
-- `vaultlink-0.4.1-debian13-ARCH.cdx.json`
+- `VaultLink-0.4.2-debian13-amd64.tar.gz`
+- `VaultLink-0.4.2-debian13-arm64.tar.gz`
+- `vaultlink-0.4.2-debian13-ARCH`
+- `vaultlink-0.4.2-debian13-ARCH.cdx.json`
 - `SHA256SUMS-ARCH`
 
 Archives, standalone binaries, and checksum manifests receive separate

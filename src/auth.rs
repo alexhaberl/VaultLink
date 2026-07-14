@@ -17,6 +17,9 @@ const MAX_LIMITER_KEYS: usize = 10_000;
 const OVERFLOW_BUCKETS: usize = 256;
 const GLOBAL_CLEANUP_INTERVAL: u64 = 64;
 
+pub const ADMIN_PASSWORD_MIN_CHARACTERS: usize = 14;
+pub const MAX_PASSWORD_BYTES: usize = 1_024;
+
 fn fill_random(bytes: &mut [u8]) {
     SysRng
         .try_fill_bytes(bytes)
@@ -32,6 +35,9 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
         .map(|h| h.to_string())
 }
 pub fn verify_password(hash: &str, password: &str) -> bool {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return false;
+    }
     PasswordHash::new(hash)
         .ok()
         .and_then(|h| {
@@ -49,6 +55,11 @@ pub fn valid_admin_username(username: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+pub fn valid_admin_password(password: &str) -> bool {
+    password.chars().count() >= ADMIN_PASSWORD_MIN_CHARACTERS
+        && password.len() <= MAX_PASSWORD_BYTES
+}
+
 pub fn random_token(bytes: usize) -> String {
     let mut b = vec![0u8; bytes];
     fill_random(&mut b);
@@ -59,19 +70,26 @@ pub fn new_totp_secret() -> String {
     fill_random(&mut b);
     BASE32_NOPAD.encode(&b)
 }
-pub fn verify_totp(secret: &str, code: &str, now: u64) -> bool {
+pub fn matching_totp_step(secret: &str, code: &str, now: u64) -> Option<u64> {
     if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
+        return None;
     }
     let wanted = code.as_bytes();
-    (-1i64..=1).any(|offset| {
-        let step = (now / 30) as i64 + offset;
-        if step < 0 {
-            return false;
-        }
-        totp_code(secret, step as u64)
-            .is_some_and(|candidate| candidate.as_bytes().ct_eq(wanted).into())
+    let current_step = now / 30;
+    [
+        current_step.checked_add(1),
+        Some(current_step),
+        current_step.checked_sub(1),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|step| {
+        totp_code(secret, *step).is_some_and(|candidate| candidate.as_bytes().ct_eq(wanted).into())
     })
+}
+
+pub fn verify_totp(secret: &str, code: &str, now: u64) -> bool {
+    matching_totp_step(secret, code, now).is_some()
 }
 
 pub(crate) fn totp_code(secret: &str, step: u64) -> Option<String> {
@@ -88,8 +106,8 @@ pub(crate) fn totp_code(secret: &str, step: u64) -> Option<String> {
         | u32::from(out[offset + 3]);
     Some(format!("{:06}", number % 1_000_000))
 }
-pub fn verify_totp_now(secret: &str, code: &str) -> bool {
-    verify_totp(
+pub fn matching_totp_step_now(secret: &str, code: &str) -> Option<u64> {
+    matching_totp_step(
         secret,
         code,
         SystemTime::now()
@@ -317,6 +335,22 @@ mod tests {
         assert!(verify_password(&first, "correct horse battery staple"));
         assert!(verify_password(&second, "correct horse battery staple"));
         assert!(!verify_password(&first, "wrong"));
+        assert!(!verify_password(
+            &first,
+            &"x".repeat(MAX_PASSWORD_BYTES + 1)
+        ));
+    }
+
+    #[test]
+    fn admin_password_policy_has_consistent_character_and_byte_boundaries() {
+        assert!(!valid_admin_password(
+            &"ä".repeat(ADMIN_PASSWORD_MIN_CHARACTERS - 1)
+        ));
+        assert!(valid_admin_password(
+            &"ä".repeat(ADMIN_PASSWORD_MIN_CHARACTERS)
+        ));
+        assert!(valid_admin_password(&"x".repeat(MAX_PASSWORD_BYTES)));
+        assert!(!valid_admin_password(&"x".repeat(MAX_PASSWORD_BYTES + 1)));
     }
 
     #[test]
@@ -338,11 +372,10 @@ mod tests {
     }
     #[test]
     fn rfc_totp() {
-        assert!(verify_totp(
-            "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
-            "287082",
-            59
-        ));
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        assert!(verify_totp(secret, "287082", 59));
+        assert_eq!(matching_totp_step(secret, "287082", 59), Some(1));
+        assert_eq!(matching_totp_step(secret, "not-a-code", 59), None);
     }
     #[test]
     fn limiter_blocks() {

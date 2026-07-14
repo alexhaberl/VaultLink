@@ -93,9 +93,8 @@ pub fn safe_admin_filename(name: &str) -> Result<&str, PathError> {
     Ok(name)
 }
 
-/// Validates aliases at creation time. Lookup intentionally does not call this
-/// function so existing short aliases remain resolvable during migration.
-pub fn validate_new_share_alias(alias: &str) -> Result<&str, PathError> {
+/// Validates the canonical share-alias policy for both creation and lookup.
+pub fn validate_share_alias(alias: &str) -> Result<&str, PathError> {
     if !(SHARE_ALIAS_MIN_LENGTH..=SHARE_ALIAS_MAX_LENGTH).contains(&alias.len())
         || !alias
             .bytes()
@@ -177,7 +176,7 @@ mod tests {
             "alias_123456",
             "abcdefghijklmnopqrstuvwxzy123456",
         ] {
-            assert_eq!(validate_new_share_alias(valid), Ok(valid));
+            assert_eq!(validate_share_alias(valid), Ok(valid));
         }
         for invalid in [
             "short-alias",
@@ -186,7 +185,7 @@ mod tests {
             "alias.with.dot",
             "ümlaut-alias1",
         ] {
-            assert!(validate_new_share_alias(invalid).is_err(), "{invalid}");
+            assert!(validate_share_alias(invalid).is_err(), "{invalid}");
         }
     }
 }

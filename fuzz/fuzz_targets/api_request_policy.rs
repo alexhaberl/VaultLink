@@ -22,13 +22,6 @@ fn strategy_from_byte(value: u8) -> UploadConflictStrategy {
     }
 }
 
-fn alias_is_api_safe(alias: &str) -> bool {
-    (3..=32).contains(&alias.len())
-        && alias
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
 fn password_policy_accepts(password: &str, min: usize, max: usize) -> bool {
     let chars = password.chars().count();
     chars >= min && chars <= max && password.len() <= 1024
@@ -85,7 +78,11 @@ fuzz_target!(|input: (
             .any(|component| matches!(component, std::path::Component::ParentDir)));
     }
 
-    if alias_is_api_safe(&alias) {
+    if path_security::validate_share_alias(&alias).is_ok() {
+        assert!(
+            (path_security::SHARE_ALIAS_MIN_LENGTH..=path_security::SHARE_ALIAS_MAX_LENGTH)
+                .contains(&alias.len())
+        );
         assert!(!alias.contains('/'));
         assert!(!alias.contains('\\'));
         assert!(!alias.contains('\0'));

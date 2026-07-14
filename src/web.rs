@@ -7,13 +7,13 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc, OnceLock, RwLock,
     },
     task::{Context, Poll},
 };
 
 use axum::{
-    body::{Body, Bytes},
+    body::{Body, Bytes, HttpBody},
     extract::{
         ConnectInfo, DefaultBodyLimit, Form, Json, MatchedPath, Multipart, OriginalUri,
         Path as AxPath, Query, Request, State,
@@ -27,13 +27,18 @@ use axum::{
 use base64::Engine as _;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use futures_util::{Stream, StreamExt};
+use http_body::{Frame, SizeHint};
 use qrcode::{render::svg, QrCode};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::OwnedSemaphorePermit,
+};
 use tokio_util::io::ReaderStream;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    timeout::RequestBodyTimeoutLayer,
     trace::TraceLayer,
 };
 
@@ -68,6 +73,32 @@ const DEFAULT_REQUEST_BODY_LIMIT: usize = 1024 * 1024;
 const MAX_UPLOAD_PATH_FIELD_BYTES: usize = 4 * 1024;
 const MAX_UPLOAD_OPTION_FIELD_BYTES: usize = 16;
 const MAX_UPLOAD_MULTIPART_FIELDS: usize = 4;
+const REQUEST_BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct ResponseAdmissionBody {
+    inner: Body,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl HttpBody for ResponseAdmissionBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 #[derive(Debug)]
 pub struct AppError(StatusCode, &'static str);
@@ -82,7 +113,7 @@ impl IntoResponse for AppError {
             Html(plain_page(
                 "Fehler",
                 &format!(
-                    r#"<section><h1><vl-i18n key="common.error"/></h1><p>{}</p></section>"#,
+                    r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p>{}</p></section>"#,
                     esc(&message)
                 ),
             )),
@@ -168,7 +199,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/admin/shares/{id}/password", post(set_share_password))
         .route("/admin/shares/{id}/delete", post(delete_share))
-        .route("/admin/admins", get(admins_page_v3).post(create_admin_ui))
+        .route("/admin/admins", get(admins_page).post(create_admin_ui))
         .route("/admin/admins/{id}/deactivate", post(deactivate_admin))
         .route("/admin/admins/{id}/activate", post(activate_admin))
         .route("/admin/admins/{id}/password", post(reset_admin_password))
@@ -208,6 +239,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/favicon-32.png", get(favicon_png))
         .route("/favicon.ico", get(favicon_png))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT))
+        .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_IDLE_TIMEOUT))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::new(
             header::HeaderName::from_static("x-request-id"),
@@ -238,7 +270,41 @@ pub fn router(state: AppState) -> Router {
             security_headers,
         ))
         .layer(middleware::from_fn(locale_context))
+        .layer(middleware::from_fn_with_state(
+            state.response_admission.clone(),
+            response_admission,
+        ))
         .with_state(state)
+}
+
+async fn response_admission(
+    State(admission): State<Arc<tokio::sync::Semaphore>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let permit = match admission.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Zu viele gleichzeitige Anfragen",
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+    };
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(ResponseAdmissionBody {
+            inner: body,
+            _permit: permit,
+        }),
+    )
 }
 
 async fn locale_context(req: Request, next: Next) -> Response {
@@ -351,29 +417,11 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
-fn app_css() -> &'static str {
-    r#"
-:root{--bg:#070b16;--bg2:#0b1224;--panel:#111a2e;--panel2:#151f36;--line:#263553;--line2:#334565;--text:#f3f7ff;--muted:#9fb0d0;--soft:#c8d6f4;--accent:#5aa7ff;--accent2:#7c5cff;--good:#55d69a;--bad:#ff7b86;--shadow:0 22px 70px rgba(0,0,0,.36)}
-*{box-sizing:border-box}html{min-height:100%}body{margin:0;min-height:100vh;background:radial-gradient(circle at 15% -10%,rgba(90,167,255,.22),transparent 30rem),radial-gradient(circle at 85% 5%,rgba(124,92,255,.18),transparent 28rem),linear-gradient(135deg,var(--bg),var(--bg2) 60%,#080d1b);color:var(--text);font:16px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.app-shell{display:grid;grid-template-columns:260px minmax(0,1fr);min-height:100vh}.public-shell{min-height:100vh;padding:clamp(1rem,3vw,2.5rem);display:grid;align-items:start}.public-shell main{width:min(1120px,100%);margin:4vh auto 0}.sidebar{position:sticky;top:0;height:100vh;padding:1.25rem;border-right:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,rgba(14,22,40,.96),rgba(8,12,24,.92));backdrop-filter:blur(18px)}.brand,.public-brand{display:flex;align-items:center;gap:.75rem;margin-bottom:1.5rem;font-weight:800;letter-spacing:.01em}.brand img,.public-brand img{width:48px;height:48px;border-radius:15px;box-shadow:0 12px 30px rgba(90,167,255,.18)}.brand small,.public-brand small{display:block;color:var(--muted);font-weight:600}.nav-group{display:grid;gap:.35rem}.nav-link{display:flex;align-items:center;gap:.65rem;padding:.75rem .85rem;border-radius:12px;color:var(--soft);border:1px solid transparent}.nav-link:hover{text-decoration:none;background:rgba(90,167,255,.10);border-color:rgba(90,167,255,.18)}.sidebar-foot{position:absolute;left:1.25rem;right:1.25rem;bottom:1.25rem;padding:1rem;border:1px solid rgba(85,214,154,.18);border-radius:16px;background:rgba(85,214,154,.07);color:var(--muted);font-size:.9rem;overflow-wrap:anywhere}.content{min-width:0;padding:1.5rem 1.75rem 2.5rem}.topbar{display:flex;justify-content:space-between;align-items:center;gap:1rem;margin:0 auto 1.25rem;max-width:1500px}.topbar-title p{margin:0;color:var(--muted);font-size:.9rem}.topbar-title h1{margin:.15rem 0 0;font-size:clamp(1.45rem,2vw,2.1rem)}.topbar-actions{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center}.topbar-actions form{margin:0}main{max-width:1500px;margin:0 auto}
-section,.panel{background:linear-gradient(180deg,rgba(21,31,54,.96),rgba(15,23,42,.96));border:1px solid rgba(255,255,255,.08);box-shadow:var(--shadow);padding:1.25rem;border-radius:22px;margin:1rem 0;overflow:auto}.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;background:linear-gradient(135deg,rgba(90,167,255,.16),rgba(124,92,255,.10)),linear-gradient(180deg,rgba(26,39,66,.98),rgba(17,26,46,.98))}.hero h1,.panel h1,section h1{margin:.15rem 0 .65rem;font-size:clamp(1.8rem,3vw,3rem);line-height:1.08}.eyebrow{margin:0;color:#91c7ff;text-transform:uppercase;letter-spacing:.12em;font-size:.78rem;font-weight:800}.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.8rem;margin:1rem 0}.stat-card{padding:1rem;border:1px solid rgba(255,255,255,.08);border-radius:18px;background:rgba(255,255,255,.045)}.stat-card strong{display:block;font-size:1.45rem}.stat-card span{color:var(--muted);font-size:.9rem}
-input,select,button,textarea{font:inherit;padding:.72rem .8rem;border-radius:12px;border:1px solid var(--line2);background:#0b1326;color:var(--text);max-width:100%}input:focus,select:focus,textarea:focus{outline:2px solid rgba(90,167,255,.35);border-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;cursor:pointer;padding:.78rem 1rem;border-radius:12px;background:linear-gradient(135deg,#2f67bd,#4e7de2);border:1px solid rgba(255,255,255,.1);color:white;box-shadow:0 10px 24px rgba(47,103,189,.22);font-weight:750;line-height:1.1;text-decoration:none;white-space:nowrap}button:hover,.button:hover{text-decoration:none;filter:brightness(1.08)}button:disabled{cursor:not-allowed;opacity:.5;filter:none}.button.secondary,button.secondary{background:rgba(90,167,255,.12);border-color:rgba(90,167,255,.35);box-shadow:none;color:#dbeafe}.button.danger,button.danger{background:rgba(255,123,134,.16);border-color:rgba(255,123,134,.34);box-shadow:none;color:#ffd6db}.button.small,button.small{padding:.55rem .75rem;border-radius:10px;font-size:.92rem}label{display:block;margin:.7rem 0;color:var(--soft);font-weight:650}label input,label select,label textarea{margin-top:.25rem;width:100%}.datetime-picker{position:relative;display:flex;gap:.45rem;align-items:center}.datetime-picker input{margin-top:.25rem}.datetime-picker .calendar-button{margin-top:.25rem;padding:.72rem .8rem}.datetime-popover{position:absolute;z-index:20;top:calc(100% + .45rem);left:0;min-width:min(360px,90vw);padding:.9rem;border:1px solid rgba(90,167,255,.28);border-radius:16px;background:linear-gradient(180deg,#121d34,#0c1428);box-shadow:0 24px 60px rgba(0,0,0,.48)}.datetime-popover[hidden]{display:none}.datetime-popover .picker-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.65rem}.datetime-popover label{margin:0}.datetime-popover .picker-actions{display:flex;gap:.5rem;justify-content:flex-end;margin-top:.8rem}table{width:100%;border-collapse:separate;border-spacing:0 .35rem}th{padding:.65rem .8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;font-size:.78rem;text-align:left}td{padding:.85rem .8rem;border-top:1px solid rgba(255,255,255,.07);border-bottom:1px solid rgba(255,255,255,.07);background:rgba(11,19,38,.55);vertical-align:top}td:first-child{border-left:1px solid rgba(255,255,255,.07);border-radius:14px 0 0 14px}td:last-child{border-right:1px solid rgba(255,255,255,.07);border-radius:0 14px 14px 0}.row{display:flex;gap:.8rem;flex-wrap:wrap;align-items:end}.row label{min-width:220px;flex:1}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.8rem;align-items:end}.form-grid label{margin:0}.form-actions{display:flex;gap:.55rem;align-items:end}.muted{color:var(--muted)}.bad{color:var(--bad)}.good{color:var(--good)}.notice{padding:.85rem 1rem;border-radius:14px;background:rgba(85,214,154,.09);border:1px solid rgba(85,214,154,.2);color:#c8f8df}code,pre{overflow-wrap:anywhere}code{padding:.15rem .35rem;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(0,0,0,.18);color:#dbe9ff}pre{white-space:pre-wrap;background:#0b1326;border:1px solid var(--line);border-radius:16px;padding:1rem}.crumbs,.actions,.button-group,.preview-actions{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center}.crumbs{padding:.75rem .9rem;border-radius:14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07)}.actions form,.button-group form{display:inline-flex;gap:.45rem;flex-wrap:wrap;margin:0}.pill{display:inline-flex;align-items:center;gap:.35rem;padding:.25rem .55rem;border-radius:999px;border:1px solid rgba(90,167,255,.22);color:#cfe5ff;background:rgba(90,167,255,.10)}.split{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:1rem;align-items:start}.side-panel{padding:1rem;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.045)}.form-card,.share-card{padding:1rem;border:1px solid rgba(90,167,255,.16);border-radius:18px;background:rgba(90,167,255,.045);margin:.9rem 0}.form-card h2,.share-card h2{margin:0 0 .75rem;font-size:1rem;color:#cfe5ff}.share-card{display:grid;gap:.9rem}.share-main{display:grid;grid-template-columns:minmax(220px,1.3fr) minmax(150px,.6fr) minmax(150px,.7fr) minmax(120px,.45fr) minmax(280px,1fr);gap:1rem;align-items:start}.share-actions,.password-actions{display:flex;gap:.55rem;flex-wrap:wrap;align-items:center}.password-actions{padding-top:.75rem;margin-top:.75rem;border-top:1px solid rgba(255,255,255,.08)}.password-actions input{min-width:180px;flex:1}.overwrite-panel{padding:.85rem;border:1px solid rgba(255,255,255,.08);border-radius:16px;background:rgba(255,255,255,.035)}img{border-radius:16px}iframe{background:#0b1326}
-.actions a,.preview-actions a,td:last-child>a,section>p>a[href="/admin"],section>p>a[href^="/admin?"],section>p>a[href^="/v/"]{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;padding:.55rem .75rem;border-radius:10px;background:rgba(90,167,255,.12);border:1px solid rgba(90,167,255,.35);color:#dbeafe;text-decoration:none;font-weight:750;line-height:1.1}.actions a:hover,.preview-actions a:hover,td:last-child>a:hover,section>p>a:hover{text-decoration:none;filter:brightness(1.08)}.row>button{align-self:end;margin-bottom:.7rem}
-.qr-card{display:inline-block;margin:.9rem 0;padding:1rem;border-radius:18px;background:#f8fbff;color:#081226;border:1px solid rgba(90,167,255,.28);box-shadow:0 18px 44px rgba(0,0,0,.20)}.qr-card svg{display:block;width:220px;height:220px;border-radius:10px}.secret-block{display:grid;gap:.45rem;max-width:860px}.secret-block code{display:block;padding:.55rem .7rem}
-.admin-columns{display:grid;grid-template-columns:1fr;gap:1rem;align-items:start}.admin-column{padding:1rem;border:1px solid rgba(90,167,255,.16);border-radius:18px;background:rgba(90,167,255,.045)}.admin-column summary{cursor:pointer;font-size:1.1rem;font-weight:800;color:#dbeafe;margin-bottom:.7rem}.admin-column summary::marker{color:var(--accent)}.admin-column table{margin-top:.6rem}.admin-actions{display:grid;gap:.65rem;min-width:520px}.admin-actions .button-group{gap:.5rem}.admin-reset-form{display:grid;grid-template-columns:minmax(180px,1fr) minmax(180px,1fr) auto;gap:.55rem;align-items:end;padding-top:.65rem;border-top:1px solid rgba(255,255,255,.08)}.admin-reset-form label{margin:0}.admin-reset-form input{width:100%}
-.toggle-card{display:flex;align-items:center;gap:.85rem;width:100%;min-width:260px;padding:.9rem 1rem;border:1px solid rgba(90,167,255,.22);border-radius:16px;background:rgba(90,167,255,.07);cursor:pointer}.toggle-card input{position:absolute;opacity:0;width:1px;height:1px}.toggle-card .switch-ui{flex:0 0 auto;width:54px;height:30px;border-radius:999px;background:#1f2b45;border:1px solid var(--line2);position:relative;box-shadow:inset 0 1px 4px rgba(0,0,0,.28)}.toggle-card .switch-ui::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:999px;background:#dbeafe;transition:transform .18s ease,background .18s ease}.toggle-card input:checked+.switch-ui{background:linear-gradient(135deg,#2f67bd,#4e7de2);border-color:rgba(255,255,255,.18)}.toggle-card input:checked+.switch-ui::after{transform:translateX(24px);background:#fff}.toggle-card .switch-copy{display:grid;gap:.15rem;color:var(--text)}.toggle-card small{display:block;color:var(--muted);font-weight:600;line-height:1.35}.toggle-card:focus-within{outline:2px solid rgba(90,167,255,.35)}.toggle-card>input+span{position:relative;display:grid;gap:.15rem;padding-left:68px;color:var(--text)}.toggle-card>input+span::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);width:54px;height:30px;border-radius:999px;background:#1f2b45;border:1px solid var(--line2);box-shadow:inset 0 1px 4px rgba(0,0,0,.28)}.toggle-card>input+span::after{content:"";position:absolute;left:4px;top:50%;transform:translateY(-50%);width:22px;height:22px;border-radius:999px;background:#dbeafe;transition:transform .18s ease,background .18s ease}.toggle-card>input:checked+span::before{background:linear-gradient(135deg,#2f67bd,#4e7de2);border-color:rgba(255,255,255,.18)}.toggle-card>input:checked+span::after{transform:translate(24px,-50%);background:#fff}
-@media(max-width:980px){.app-shell{display:block}.sidebar{position:relative;height:auto;border-right:0;border-bottom:1px solid rgba(255,255,255,.08)}.sidebar-foot{display:none}.nav-group{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}.content{padding:1rem}.split,.admin-columns{grid-template-columns:1fr}}@media(max-width:650px){th:nth-child(3),td:nth-child(3){display:none}.topbar{display:block}.hero{display:block}}
-"#
-}
 
 async fn stylesheet_asset() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        format!(
-            "@layer vl-legacy, vl-reset, vl-tokens, vl-base, vl-components, vl-layouts, vl-utilities;\n@layer vl-legacy {{{}}}\n{}",
-            app_css(),
-            crate::ui::APP_CSS
-        ),
+        crate::ui::STYLESHEET,
     )
 }
 
@@ -430,15 +478,17 @@ async fn favicon_svg() -> impl IntoResponse {
 }
 
 async fn favicon_png() -> impl IntoResponse {
-    static PNG_1X1: &[u8] = &[
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
-        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 96, 248, 207, 192, 0,
-        0, 4, 0, 1, 255, 166, 44, 203, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-    ];
-    ([(header::CONTENT_TYPE, "image/png")], PNG_1X1)
+    const PNG_32X32_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAJYSURBVFhH7ZZPaBNBFMZzFDwUBD0IYr0IIi2Ih4ho6ElysFAotUUsPQiBBrzUglcppIdSaSG99FKKgoEWhGLpQbGEFkXBEggihKTaokhJMNA/YG5Pvl1edjJvs5ndLHrJ4UeYtzPvffO9mc1GTp25TP+TiB7413QEBBbQ1X2Tekdm6c7UJ+sXY32OCb4FXLz1kGKT63Q/QwLE8Vxf44WRAN7twMJPUdQNzDN1xVOA125NaeVKUwHXRtMiWTsgn14jsIAnG0SZnEPqnZyjE4qAiXWivd9Ex38kiM9tycKhCXj6lqh8JAvrpN/L4qEI+HrgFNks2W1A/NEa0WqeqHpiP8MvnApVwEzWKf6mIJMD2G/NqRF9+C6ftyVg7YsjYPyVTM4UK81b4VsAXiS8GLvmxGMrduzuswLdfvy6DsZoC7cCcJsCCTh7JV5fjKvGSdEOxFC0O5aogzHiarvgHOe4EH0gangKAP3zu9Zi2M5JcROwMzcHuFixbM/F1cR4cLEichsJUM+B6sJ+tbG/Ojs/7HkQgvGN5EuR20iA2gaQLclW6OAK8jn4uG/HmtnfUgDgNgC0gpOjFforGMXZfhbpZb+RAPU2gOefnQJsMyxn25n8L3t+NLEscvoSAPDVo4pQz4Mb29/s6wr3Tp/rEfl8C8CHBaxUReAVjGuGnaMdAO8L/kMaWjq0zpCeS8dIADh//R4Nv6g1iPDiUl9S5HDDWAC4OpgShdxo1XcVXwIADmUzJxDHc32NF74FAPQ2Pp1rKI6xSc91AglgsFscNr+7VmlLQBh0BPwFr0PNxBrwyt4AAAAASUVORK5CYII=";
+    static PNG_32X32: OnceLock<Vec<u8>> = OnceLock::new();
+    let png = PNG_32X32.get_or_init(|| {
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG_32X32_BASE64)
+            .expect("embedded 32x32 favicon must be valid base64")
+    });
+    ([(header::CONTENT_TYPE, "image/png")], png.as_slice())
 }
 
-const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="VaultLink"><defs><linearGradient id="g" x1="9" y1="7" x2="55" y2="59" gradientUnits="userSpaceOnUse"><stop stop-color="#5aa7ff"/><stop offset="1" stop-color="#7c5cff"/></linearGradient><filter id="s" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="6" stdDeviation="5" flood-color="#193b8f" flood-opacity=".35"/></filter></defs><rect width="64" height="64" rx="18" fill="#081226"/><path filter="url(#s)" d="M32 7 51 15v15c0 13-7.8 22.8-19 27-11.2-4.2-19-14-19-27V15L32 7Z" fill="url(#g)"/><path d="M24.4 36.7a7.5 7.5 0 0 1 0-10.6l4.1-4.1a7.5 7.5 0 0 1 10.6 0 2.8 2.8 0 0 1-4 4 1.9 1.9 0 0 0-2.7 0l-4.1 4.1a1.9 1.9 0 0 0 2.7 2.7 2.8 2.8 0 0 1 4 4 7.5 7.5 0 0 1-10.6-.1Z" fill="#f3f7ff"/><path d="M28.8 42a2.8 2.8 0 0 1 0-4 1.9 1.9 0 0 0 2.7 0l4.1-4.1a1.9 1.9 0 0 0-2.7-2.7 2.8 2.8 0 1 1-4-4 7.5 7.5 0 0 1 10.6 10.7L35.4 42a7.5 7.5 0 0 1-10.6 0Z" fill="#dbeafe" opacity=".95"/><path d="M27 32h10" stroke="#081226" stroke-width="4.2" stroke-linecap="round" opacity=".45"/></svg>"##;
+const LOGO_SVG: &str = crate::ui::LOGO_SVG;
 
 #[derive(Deserialize)]
 struct LocaleForm {
@@ -649,8 +699,6 @@ fn admin_page_with_locale_switcher(
     ]
     .join("");
     let body = i18n::render_markers(locale, body);
-    let body = body.replacen("<h1>", "<h2>", usize::MAX);
-    let body = body.replacen("</h1>", "</h2>", usize::MAX);
     let system_panel = i18n::render_markers(locale, &system_panel(state));
     let locale_switcher = if show_locale_switcher {
         locale_switcher()
@@ -1258,7 +1306,7 @@ fn public_upload_error(
         Html(plain_page(
             "Fehler",
             &format!(
-            r#"<section><h1><vl-i18n key="common.error"/></h1><p>{}</p><p><a class="button secondary" href="{}"><vl-i18n key="share.back"/></a></p></section>"#,
+            r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p>{}</p><p><a class="vl-button vl-button--secondary" href="{}"><vl-i18n key="share.back"/></a></p></section>"#,
                 esc(&message),
                 esc(&back)
             ),
@@ -1303,7 +1351,7 @@ fn internal<T>(_: T) -> AppError {
 async fn login_page() -> Html<String> {
     Html(plain_page(
         "Login",
-        r#"<section><h1><vl-i18n key="auth.admin_login"/></h1><form method="post"><label><vl-i18n key="auth.username"/><br><input name="username" autocomplete="username" required></label><label><vl-i18n key="auth.password"/><br><input name="password" type="password" autocomplete="current-password" required></label><button><vl-i18n key="auth.sign_in"/></button></form></section>"#,
+        r#"<section class="vl-panel vl-auth-card"><h1><vl-i18n key="auth.admin_login"/></h1><form method="post" class="vl-stack"><label class="vl-field"><vl-i18n key="auth.username"/><input name="username" autocomplete="username" required></label><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" maxlength="1024" autocomplete="current-password" required></label><button class="vl-button"><vl-i18n key="auth.sign_in"/></button></form></section>"#,
     ))
 }
 #[derive(Deserialize)]
@@ -1335,7 +1383,7 @@ async fn login(
             "Zu viele Anmeldeversuche",
         ));
     }
-    if form.password.len() > 1_024 {
+    if form.password.len() > auth::MAX_PASSWORD_BYTES {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
     let username = form.username.clone();
@@ -1403,7 +1451,7 @@ async fn mfa_page(State(state): State<AppState>, headers: HeaderMap) -> Result<H
     Ok(Html(plain_page(
         "MFA",
         &format!(
-            r#"<section><h1><vl-i18n key="auth.second_factor"/></h1><form method="post"><label><vl-i18n key="auth.six_digit_totp"/><br><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button><vl-i18n key="auth.verify"/></button></form>{security_key_button}</section>"#
+            r#"<section class="vl-panel vl-auth-card"><h1><vl-i18n key="auth.second_factor"/></h1><form method="post" class="vl-stack"><label class="vl-field"><vl-i18n key="auth.six_digit_totp"/><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button"><vl-i18n key="auth.verify"/></button></form>{security_key_button}</section>"#
         ),
     )))
 }
@@ -1428,12 +1476,20 @@ async fn mfa(
     let admin = database(state.db.clone(), move |db| db.admin(&username))
         .await?
         .ok_or_else(|| internal(()))?;
-    if !auth::verify_totp_now(&admin.totp_secret, &form.code) {
+    let Some(totp_step) = auth::matching_totp_step_now(&admin.totp_secret, &form.code) else {
         audit(&state, s.username, "mfa_failed", None, None).await;
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
+    };
+    let admin_id = s.admin_id;
+    let accepted = database(state.db.clone(), move |db| {
+        db.verify_mfa_with_totp_step(&token, admin_id, totp_step)
+    })
+    .await?;
+    if !accepted {
+        audit(&state, s.username, "mfa_replayed", None, None).await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
     }
     state.limiter.success(&key);
-    database(state.db.clone(), move |db| db.verify_mfa(&token)).await?;
     audit(&state, s.username, "login_success", None, None).await;
     Ok(Redirect::to("/admin"))
 }
@@ -1677,7 +1733,7 @@ async fn delete_file_confirmation(
     {
         (
             format!(
-                r#"<div class="form-card"><p class="bad"><strong><vl-i18n key="common.warning"/></strong> <vl-i18n key="files.folder_not_empty"/></p><label><vl-i18n key="files.confirm_folder_name"/> <code>{}</code> <vl-i18n key="files.enter"/><input name="confirm_name" autocomplete="off" data-confirm-input autofocus required></label></div>"#,
+                r#"<div class="vl-form-card"><p class="vl-danger-text"><strong><vl-i18n key="common.warning"/></strong> <vl-i18n key="files.folder_not_empty"/></p><label class="vl-field"><vl-i18n key="files.confirm_folder_name"/> <code>{}</code> <vl-i18n key="files.enter"/><input name="confirm_name" autocomplete="off" data-confirm-input autofocus required></label></div>"#,
                 esc(&inspection.name)
             ),
             format!(
@@ -1690,7 +1746,7 @@ async fn delete_file_confirmation(
         (String::new(), String::new(), "")
     };
     let body = format!(
-        r#"<section><h1>{}</h1><p><code>/{}</code></p><p class="bad"><vl-i18n key="files.delete_irreversible"/></p><p><vl-i18n key="files.affected_shares"/> <strong>{}</strong></p><form method="post" action="/admin/files/delete"{form_attributes}><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}">{}<div class="actions"><button class="danger"{button_attributes}><vl-i18n key="files.permanent_delete"/></button><a class="button secondary" href="/admin?path={}"><vl-i18n key="common.cancel"/></a></div></form></section>"#,
+        r#"<section class="vl-panel vl-confirm-card"><h2>{}</h2><p><code>/{}</code></p><p class="vl-danger-text"><vl-i18n key="files.delete_irreversible"/></p><p><vl-i18n key="files.affected_shares"/> <strong>{}</strong></p><form method="post" action="/admin/files/delete" class="vl-stack"{form_attributes}><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}">{}<div class="vl-inline-actions"><button class="vl-button vl-button--danger"{button_attributes}><vl-i18n key="files.permanent_delete"/></button><a class="vl-button vl-button--secondary" href="/admin?path={}"><vl-i18n key="common.cancel"/></a></div></form></section>"#,
         esc(&heading),
         esc(&inspection.path),
         inspection.affected_shares,
@@ -1833,6 +1889,16 @@ async fn process_admin_upload(
     mut multipart: Multipart,
 ) -> Result<AdminUploadSuccess> {
     let (_, admin) = session(state, headers, true, MissingSession::RedirectToLogin).await?;
+    let _upload_permit = state
+        .upload_admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Zu viele gleichzeitige Uploads",
+            )
+        })?;
     let settings = runtime_settings(state);
     if headers
         .get(header::CONTENT_LENGTH)
@@ -2243,8 +2309,7 @@ async fn admin_browser(
             );
         }
         if truncated {
-            rows +=
-                r#"<tr><td colspan="5" class="muted"><vl-i18n key="files.scan_limit"/></td></tr>"#;
+            rows += r#"<tr><td colspan="5" class="vl-muted"><vl-i18n key="files.scan_limit"/></td></tr>"#;
         }
     }
     let encoded_path = encoded(&rel);
@@ -2380,7 +2445,7 @@ async fn admin_preview(
             preview_too_large_body(&rel, size, "Datei ist größer als das Preview-Limit.", None)
         }
         PreviewContent::Text(text) => format!(
-            r#"<section><p class="preview-actions"><a href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
+            r#"<section class="vl-panel"><p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
             encoded(parent_path(&rel).as_deref().unwrap_or("")),
             esc(&rel),
             esc(&text)
@@ -2432,7 +2497,7 @@ fn admin_media_preview_body(path: &str, kind: PreviewKind, size: u64) -> String 
     let raw = format!("/admin/preview/raw?path={}", encoded(path));
     let viewer = media_viewer(kind, &raw);
     format!(
-        r#"<section><p class="preview-actions"><a href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a></p><p><code>/{}</code> <span class="muted">{}</span></p>{}</section>"#,
+        r#"<section class="vl-panel"><p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a></p><p><code>/{}</code> <span class="vl-muted">{}</span></p>{}</section>"#,
         encoded(parent_path(path).as_deref().unwrap_or("")),
         esc(path),
         human(size),
@@ -2476,7 +2541,7 @@ fn preview_too_large_body(
         ""
     };
     format!(
-        r#"<section>{}<p class="preview-actions">{}</p><p><code>/{}</code></p><p class="muted">{} <vl-i18n key="files.size_label"/>: {}.</p></section>"#,
+        r#"<section class="vl-panel">{}<p class="vl-inline-actions">{}</p><p><code>/{}</code></p><p class="vl-muted">{} <vl-i18n key="files.size_label"/>: {}.</p></section>"#,
         heading,
         back,
         esc(path),
@@ -2550,8 +2615,13 @@ fn parse_expiry(
             .unwrap_or("0")
             .trim()
             .parse::<i64>()
-            .unwrap_or(0);
-        let utc_naive = naive + Duration::minutes(offset);
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"))?;
+        if !(-1_440..=1_440).contains(&offset) {
+            return Err(AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"));
+        }
+        let utc_naive = naive
+            .checked_add_signed(Duration::minutes(offset))
+            .ok_or(AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"))?;
         return Ok(Some(DateTime::<Utc>::from_naive_utc_and_offset(
             utc_naive, Utc,
         )));
@@ -2628,7 +2698,9 @@ fn parent_path(path: &str) -> Option<String> {
 
 fn breadcrumbs(path: &str, base_url: &str) -> String {
     let clean = path.trim_matches('/');
-    let mut html = String::from(r#"<p class="crumbs"><a href=""#);
+    let mut html = String::from(
+        r#"<p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href=""#,
+    );
     html.push_str(base_url);
     html.push_str(r#"">/</a>"#);
     if clean.is_empty() {
@@ -2640,7 +2712,7 @@ fn breadcrumbs(path: &str, base_url: &str) -> String {
         current = join_display(&current, part);
         html.push_str(" / ");
         html.push_str(&format!(
-            r#"<a href="{}?path={}">{}</a>"#,
+            r#"<a class="vl-button vl-button--secondary" href="{}?path={}">{}</a>"#,
             base_url,
             encoded(&current),
             esc(part)
@@ -3419,6 +3491,11 @@ fn read_preview_opened(
         )
     })?;
     file.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > settings.max_preview_size {
+        return Ok(PreviewContent::TooLarge {
+            size: metadata.len().max(bytes.len() as u64),
+        });
+    }
     if bytes.contains(&0) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -3895,7 +3972,7 @@ async fn share_create_page(
         path_security::SHARE_ALIAS_MAX_LENGTH
     );
     let body = format!(
-        r#"<div class="vl-create-layout"><form method="post" action="/admin/shares" class="vl-panel vl-stack" data-share-create><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><section class="vl-target-card"><div><span class="vl-eyebrow"><vl-i18n key="share.selected_target"/></span><strong>/{}</strong><small class="vl-muted">{}</small></div><a class="vl-button vl-button--ghost" href="/admin"><vl-i18n key="share.change_target"/></a></section><section class="vl-form-section"><h2><vl-i18n key="share.step_permission"/></h2>{permission_fields}</section><section class="vl-form-section"><h2><vl-i18n key="share.step_link"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.short_alias"/><input name="alias" pattern="{alias_pattern}" data-share-alias><small><vl-i18n key="share.alias_help"/></small></label>{}<label class="vl-field"><vl-i18n key="share.max_transfers"/><input name="max_downloads" type="number" min="1"><small><vl-i18n key="share.empty_unlimited"/></small></label></div></section><section class="vl-form-section"><h2><vl-i18n key="share.step_protection"/></h2><label class="vl-switch"><input type="checkbox" data-password-toggle><span><vl-i18n key="share.password_protection"/><small><vl-i18n key="share.password_enable"/></small></span></label><div class="vl-form-grid" data-password-fields><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="{}" maxlength="{}" autocomplete="new-password"></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" autocomplete="new-password"></label></div></section>{upload_rules}<button class="vl-button vl-button--primary" type="submit"><vl-i18n key="share.create_secure"/></button></form><aside class="vl-panel vl-review-card" data-share-review><h2><vl-i18n key="share.review"/></h2><dl class="vl-review-list"><div><dt><vl-i18n key="common.target"/></dt><dd>/{}</dd></div><div><dt><vl-i18n key="share.permission"/></dt><dd data-review-permission><vl-i18n key="share.download_only"/></dd></div><div><dt><vl-i18n key="auth.password"/></dt><dd data-review-password><vl-i18n key="share.no_password"/></dd></div><div><dt><vl-i18n key="share.limit"/></dt><dd data-review-limit><vl-i18n key="common.unlimited"/></dd></div></dl><div class="vl-field"><span><vl-i18n key="share.url_preview"/></span><code data-review-url>{}</code></div><p class="vl-muted"><vl-i18n key="share.audit_help"/></p></aside></div>"#,
+        r#"<div class="vl-create-layout"><form method="post" action="/admin/shares" class="vl-panel vl-stack" data-share-create><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><section class="vl-target-card"><div><span class="vl-eyebrow"><vl-i18n key="share.selected_target"/></span><strong>/{}</strong><small class="vl-muted">{}</small></div><a class="vl-button vl-button--ghost" href="/admin"><vl-i18n key="share.change_target"/></a></section><section class="vl-form-section"><h2><vl-i18n key="share.step_permission"/></h2>{permission_fields}</section><section class="vl-form-section"><h2><vl-i18n key="share.step_link"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.short_alias"/><input name="alias" pattern="{alias_pattern}" data-share-alias><small><vl-i18n key="share.alias_help"/></small></label>{}<label class="vl-field"><vl-i18n key="share.max_transfers"/><input name="max_downloads" type="number" min="1"><small><vl-i18n key="share.empty_unlimited"/></small></label></div></section><section class="vl-form-section"><h2><vl-i18n key="share.step_protection"/></h2><label class="vl-switch"><input type="checkbox" name="password_enabled" value="1" data-password-toggle><span><vl-i18n key="share.password_protection"/><small><vl-i18n key="share.password_enable"/></small></span></label><div class="vl-form-grid" data-password-fields><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="{}" maxlength="{}" autocomplete="new-password"></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" autocomplete="new-password"></label></div></section>{upload_rules}<button class="vl-button vl-button--primary" type="submit"><vl-i18n key="share.create_secure"/></button></form><aside class="vl-panel vl-review-card" data-share-review><h2><vl-i18n key="share.review"/></h2><dl class="vl-review-list"><div><dt><vl-i18n key="common.target"/></dt><dd>/{}</dd></div><div><dt><vl-i18n key="share.permission"/></dt><dd data-review-permission><vl-i18n key="share.download_only"/></dd></div><div><dt><vl-i18n key="auth.password"/></dt><dd data-review-password><vl-i18n key="share.no_password"/></dd></div><div><dt><vl-i18n key="share.limit"/></dt><dd data-review-limit><vl-i18n key="common.unlimited"/></dd></div></dl><div class="vl-field"><span><vl-i18n key="share.url_preview"/></span><code data-review-url>{}</code></div><p class="vl-muted"><vl-i18n key="share.audit_help"/></p></aside></div>"#,
         esc(&session_data.csrf_token),
         esc(&relative_path),
         esc(&relative_path),
@@ -3912,11 +3989,6 @@ async fn share_create_page(
         settings.share_password_max_length,
         esc(&relative_path),
         esc(&url_preview),
-    );
-    let body = body.replacen(
-        r#"type="checkbox" data-password-toggle"#,
-        r#"type="checkbox" name="password_enabled" value="1" data-password-toggle"#,
-        1,
     );
     Ok(Html(admin_page(
         &state,
@@ -3965,12 +4037,12 @@ async fn create_share(
     if target_metadata.is_file() && permission.can_upload() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Uploads sind im MVP nur für Ordnerlinks erlaubt",
+            "Uploads sind nur für Ordnerlinks erlaubt",
         ));
     }
     let alias = f.alias.filter(|value| !value.is_empty());
     if let Some(alias) = alias.as_deref() {
-        path_security::validate_new_share_alias(alias)
+        path_security::validate_share_alias(alias)
             .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Alias"))?;
     }
     let exp = parse_expiry(
@@ -4292,6 +4364,13 @@ async fn start_security_key_registration(
 ) -> Result<Json<webauthn_rs::prelude::CreationChallengeResponse>> {
     let (token, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &body.csrf)?;
+    let limiter_key = format!("security-key-register:{}", session.admin_id);
+    if !state.limiter.check_and_record_attempt(&limiter_key) {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele Passwortversuche",
+        ));
+    }
     let label = body.label.trim();
     if label.is_empty() || label.chars().count() > 80 {
         return Err(AppError(
@@ -4305,14 +4384,34 @@ async fn start_security_key_registration(
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
     let password_hash = admin.password_hash;
     let current_password = body.current_password;
+    if current_password.len() > auth::MAX_PASSWORD_BYTES {
+        audit(
+            &state,
+            session.username,
+            "security_key_reauth_failed",
+            None,
+            None,
+        )
+        .await;
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
     let password_valid = tokio::task::spawn_blocking(move || {
         auth::verify_password(&password_hash, &current_password)
     })
     .await
     .map_err(internal)?;
     if !password_valid {
+        audit(
+            &state,
+            session.username,
+            "security_key_reauth_failed",
+            None,
+            None,
+        )
+        .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
+    state.limiter.success(&limiter_key);
     let admin_id = session.admin_id;
     let rows = database(state.db.clone(), move |db| {
         db.admin_webauthn_credentials(admin_id)
@@ -4410,19 +4509,58 @@ async fn delete_security_key(
 ) -> Result<Redirect> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
+    let limiter_key = format!("security-key-delete:{}", session.admin_id);
+    if !state.limiter.check_and_record_attempt(&limiter_key) {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele Passwortversuche",
+        ));
+    }
     let username = session.username.clone();
     let admin = database(state.db.clone(), move |db| db.admin(&username))
         .await?
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
     let password_hash = admin.password_hash;
     let password = form.current_password;
+    if password.len() > auth::MAX_PASSWORD_BYTES {
+        audit(
+            &state,
+            session.username,
+            "security_key_reauth_failed",
+            Some(id.to_string()),
+            None,
+        )
+        .await;
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
     let password_valid =
         tokio::task::spawn_blocking(move || auth::verify_password(&password_hash, &password))
             .await
             .map_err(internal)?;
-    if !password_valid || !auth::verify_totp_now(&admin.totp_secret, &form.current_code) {
+    let totp_step = password_valid
+        .then(|| auth::matching_totp_step_now(&admin.totp_secret, &form.current_code))
+        .flatten();
+    let totp_valid = if let Some(totp_step) = totp_step {
+        let admin_id = session.admin_id;
+        database(state.db.clone(), move |db| {
+            db.consume_admin_totp_step(admin_id, totp_step)
+        })
+        .await?
+    } else {
+        false
+    };
+    if !password_valid || !totp_valid {
+        audit(
+            &state,
+            session.username,
+            "security_key_reauth_failed",
+            Some(id.to_string()),
+            None,
+        )
+        .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
+    state.limiter.success(&limiter_key);
     let admin_id = session.admin_id;
     let deleted = database(state.db.clone(), move |db| {
         db.delete_admin_webauthn_credential(id, admin_id)
@@ -4458,7 +4596,7 @@ async fn account_page(State(state): State<AppState>, headers: HeaderMap) -> Resu
         security_keys
             .iter()
             .map(|key| format!(
-                r#"<article class="vl-share-row"><div><strong>{}</strong><small class="vl-muted">{}</small></div><form method="post" action="/admin/account/security-keys/{}/delete" class="vl-stack"><input type="hidden" name="csrf" value="{}"><input name="current_password" type="password" autocomplete="current-password" placeholder="Passwort" required><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" placeholder="TOTP" required><button class="vl-button vl-button--danger"><vl-i18n key="common.delete"/></button></form></article>"#,
+                r#"<article class="vl-share-row"><div><strong>{}</strong><small class="vl-muted">{}</small></div><form method="post" action="/admin/account/security-keys/{}/delete" class="vl-stack"><input type="hidden" name="csrf" value="{}"><input name="current_password" type="password" maxlength="1024" autocomplete="current-password" placeholder="Passwort" required><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" placeholder="TOTP" required><button class="vl-button vl-button--danger"><vl-i18n key="common.delete"/></button></form></article>"#,
                 esc(&key.label),
                 esc(&key.created_at),
                 key.id,
@@ -4467,7 +4605,7 @@ async fn account_page(State(state): State<AppState>, headers: HeaderMap) -> Resu
             .collect::<String>()
     };
     let body = format!(
-        r#"<div class="vl-create-layout"><section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.current_user"/></p><h2>{username}</h2></div><form method="post" action="/admin/account/password" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><h2><vl-i18n key="account.change_password"/></h2><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.new_password"/><input name="new_password" type="password" minlength="14" autocomplete="new-password" required><small><vl-i18n key="error.password_min"/></small></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" minlength="14" autocomplete="new-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.change_password"/></button></form></section><aside class="vl-panel vl-stack"><h2><vl-i18n key="account.change_mfa"/></h2><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><form method="post" action="/admin/account/mfa/start" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.current_mfa_code"/><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button" type="submit"><vl-i18n key="common.continue"/></button></form></aside></div><section class="vl-panel vl-stack"><h2><vl-i18n key="account.security_keys"/></h2><p class="vl-muted"><vl-i18n key="account.security_keys_help"/></p>{security_key_rows}<form class="vl-stack" data-security-key-register data-csrf="{csrf}"><label class="vl-field"><vl-i18n key="account.security_key_label"/><input name="label" maxlength="80" required></label><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" autocomplete="current-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.security_key_add"/></button><p class="vl-muted" data-security-key-status></p></form></section>"#,
+        r#"<div class="vl-create-layout"><section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.current_user"/></p><h2>{username}</h2></div><form method="post" action="/admin/account/password" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><h2><vl-i18n key="account.change_password"/></h2><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" maxlength="1024" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.new_password"/><input name="new_password" type="password" minlength="14" maxlength="1024" autocomplete="new-password" required><small><vl-i18n key="error.password_policy"/></small></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" minlength="14" maxlength="1024" autocomplete="new-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.change_password"/></button></form></section><aside class="vl-panel vl-stack"><h2><vl-i18n key="account.change_mfa"/></h2><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><form method="post" action="/admin/account/mfa/start" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" maxlength="1024" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.current_mfa_code"/><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button" type="submit"><vl-i18n key="common.continue"/></button></form></aside></div><section class="vl-panel vl-stack"><h2><vl-i18n key="account.security_keys"/></h2><p class="vl-muted"><vl-i18n key="account.security_keys_help"/></p>{security_key_rows}<form class="vl-stack" data-security-key-register data-csrf="{csrf}"><label class="vl-field"><vl-i18n key="account.security_key_label"/><input name="label" maxlength="80" required></label><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" maxlength="1024" autocomplete="current-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.security_key_add"/></button><p class="vl-muted" data-security-key-status></p></form></section>"#,
         username = esc(&session.username),
         csrf = esc(&session.csrf_token),
         security_key_rows = security_key_rows,
@@ -4511,6 +4649,9 @@ async fn change_account_password(
     let expected_hash = admin.password_hash.clone();
     let verification_hash = expected_hash.clone();
     let current_password = form.current_password;
+    if current_password.len() > auth::MAX_PASSWORD_BYTES {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
     let current_password_valid = tokio::task::spawn_blocking(move || {
         auth::verify_password(&verification_hash, &current_password)
     })
@@ -4527,10 +4668,10 @@ async fn change_account_password(
             "Passwörter stimmen nicht überein",
         ));
     }
-    if form.new_password.chars().count() < 14 {
+    if !auth::valid_admin_password(&form.new_password) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Passwort muss mindestens 14 Zeichen enthalten",
+            "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
         ));
     }
     let new_password = form.new_password;
@@ -4596,12 +4737,26 @@ async fn start_account_mfa(
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
     let verification_hash = admin.password_hash;
     let current_password = form.current_password;
+    if current_password.len() > auth::MAX_PASSWORD_BYTES {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
     let current_password_valid = tokio::task::spawn_blocking(move || {
         auth::verify_password(&verification_hash, &current_password)
     })
     .await
     .map_err(internal)?;
-    let current_mfa_valid = auth::verify_totp_now(&admin.totp_secret, &form.current_code);
+    let totp_step = current_password_valid
+        .then(|| auth::matching_totp_step_now(&admin.totp_secret, &form.current_code))
+        .flatten();
+    let current_mfa_valid = if let Some(totp_step) = totp_step {
+        let admin_id = session.admin_id;
+        database(state.db.clone(), move |db| {
+            db.consume_admin_totp_step(admin_id, totp_step)
+        })
+        .await?
+    } else {
+        false
+    };
     if !current_password_valid || !current_mfa_valid {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
@@ -4629,7 +4784,7 @@ async fn start_account_mfa(
     let otpauth = otpauth_url(&session.username, &new_secret);
     let qr = qr_svg(&otpauth)?;
     let body = format!(
-        r#"<section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.change_mfa"/></p><h2><vl-i18n key="account.mfa_enrollment_flow"/></h2></div><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><div class="qr-card" aria-label="TOTP QR-Code">{qr}</div><div class="secret-block"><code>{secret}</code><code>{otpauth}</code></div><p class="vl-muted"><vl-i18n key="public.valid_until"/>: {expires_at}</p><form method="post" action="/admin/account/mfa/confirm" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="enrollment_token" value="{token}"><label class="vl-field"><vl-i18n key="account.new_mfa_test_code"/><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><div class="vl-inline-actions"><button class="vl-button" type="submit"><vl-i18n key="common.confirm"/></button><a class="vl-button vl-button--secondary" href="/admin/account"><vl-i18n key="common.cancel"/></a></div></form></section>"#,
+        r#"<section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.change_mfa"/></p><h2><vl-i18n key="account.mfa_enrollment_flow"/></h2></div><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><div class="vl-qr-card" aria-label="TOTP QR-Code">{qr}</div><div class="vl-secret-block"><code>{secret}</code><code>{otpauth}</code></div><p class="vl-muted"><vl-i18n key="public.valid_until"/>: {expires_at}</p><form method="post" action="/admin/account/mfa/confirm" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="enrollment_token" value="{token}"><label class="vl-field"><vl-i18n key="account.new_mfa_test_code"/><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><div class="vl-inline-actions"><button class="vl-button" type="submit"><vl-i18n key="common.confirm"/></button><a class="vl-button vl-button--secondary" href="/admin/account"><vl-i18n key="common.cancel"/></a></div></form></section>"#,
         qr = qr,
         secret = esc(&new_secret),
         otpauth = esc(&otpauth),
@@ -4683,10 +4838,9 @@ async fn confirm_account_mfa(
         StatusCode::CONFLICT,
         "Kontoänderung fehlgeschlagen.",
     ))?;
-    if !auth::verify_totp_now(&enrollment.totp_secret, &form.code) {
+    let Some(totp_step) = auth::matching_totp_step_now(&enrollment.totp_secret, &form.code) else {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
-    }
-    state.limiter.success(&limiter_key);
+    };
     let activation_token = form.enrollment_token;
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
@@ -4694,14 +4848,22 @@ async fn confirm_account_mfa(
         .flatten()
         .map(|ip| ip.to_string());
     let outcome = database(state.db.clone(), move |db| {
-        db.activate_admin_mfa_enrollment(admin_id, &activation_token, audit_client_ip.as_deref())
+        db.activate_admin_mfa_enrollment(
+            admin_id,
+            &activation_token,
+            totp_step,
+            audit_client_ip.as_deref(),
+        )
     })
     .await?;
     match outcome {
-        AdminMfaEnrollmentActivationOutcome::Activated => Ok(redirect_with_cookie(
-            "/login",
-            clear_session_cookie(&state),
-        )?),
+        AdminMfaEnrollmentActivationOutcome::Activated => {
+            state.limiter.success(&limiter_key);
+            Ok(redirect_with_cookie(
+                "/login",
+                clear_session_cookie(&state),
+            )?)
+        }
         AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired => Err(AppError(
             StatusCode::CONFLICT,
             "Kontoänderung fehlgeschlagen.",
@@ -4709,15 +4871,7 @@ async fn confirm_account_mfa(
     }
 }
 
-fn valid_username(username: &str) -> bool {
-    username.len() >= 3
-        && username.len() <= 64
-        && username
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-async fn admins_page_v3(
+async fn admins_page(
     State(state): State<AppState>,
     Query(query): Query<AdminNoticeQuery>,
     headers: HeaderMap,
@@ -4728,24 +4882,24 @@ async fn admins_page_v3(
     let mut inactive_rows = String::new();
     for admin in admins {
         let action = if admin.id == session.admin_id {
-            r#"<div class="admin-actions"><span class="pill"><vl-i18n key="admins.current"/></span></div>"#
+            r#"<div class="vl-stack"><span class="vl-badge vl-badge--accent"><vl-i18n key="admins.current"/></span></div>"#
                 .to_string()
         } else {
             let status_action = if admin.active {
                 format!(
-                    r#"<form method="post" action="/admin/admins/{}/deactivate"><input type="hidden" name="csrf" value="{}"><button class="secondary"><vl-i18n key="admins.deactivate"/></button></form>"#,
+                    r#"<form method="post" action="/admin/admins/{}/deactivate"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--secondary"><vl-i18n key="admins.deactivate"/></button></form>"#,
                     admin.id,
                     esc(&session.csrf_token)
                 )
             } else {
                 format!(
-                    r#"<form method="post" action="/admin/admins/{}/activate"><input type="hidden" name="csrf" value="{}"><button><vl-i18n key="admins.activate"/></button></form>"#,
+                    r#"<form method="post" action="/admin/admins/{}/activate"><input type="hidden" name="csrf" value="{}"><button class="vl-button"><vl-i18n key="admins.activate"/></button></form>"#,
                     admin.id,
                     esc(&session.csrf_token)
                 )
             };
             format!(
-                r#"<div class="admin-actions"><div class="button-group">{}<form method="post" action="/admin/admins/{}/totp"><input type="hidden" name="csrf" value="{}"><button class="secondary"><vl-i18n key="admins.reset_mfa"/></button></form></div><form method="post" action="/admin/admins/{}/password" class="admin-reset-form"><input type="hidden" name="csrf" value="{}"><label><vl-i18n key="account.new_password"/><input name="password" type="password" minlength="14" required></label><label><vl-i18n key="common.confirm"/><input name="password_confirm" type="password" minlength="14" required></label><button><vl-i18n key="admins.set_password"/></button></form></div>"#,
+                r#"<div class="vl-stack"><div class="vl-button-group">{}<form method="post" action="/admin/admins/{}/totp"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--secondary"><vl-i18n key="admins.reset_mfa"/></button></form></div><form method="post" action="/admin/admins/{}/password" class="vl-form-grid"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="account.new_password"/><input name="password" type="password" minlength="14" maxlength="1024" required></label><label class="vl-field"><vl-i18n key="common.confirm"/><input name="password_confirm" type="password" minlength="14" maxlength="1024" required></label><button class="vl-button"><vl-i18n key="admins.set_password"/></button></form></div>"#,
                 status_action,
                 admin.id,
                 esc(&session.csrf_token),
@@ -4754,7 +4908,7 @@ async fn admins_page_v3(
             )
         };
         let row = format!(
-            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+            r#"<tr><td data-label="ID">{}</td><td data-label="<vl-i18n key="auth.username"/>">{}</td><td data-label="<vl-i18n key="common.created"/>">{}</td><td data-label="<vl-i18n key="common.action"/>">{}</td></tr>"#,
             admin.id,
             esc(&admin.username),
             esc(&format_audit_time(&admin.created_at)),
@@ -4768,20 +4922,22 @@ async fn admins_page_v3(
     }
     if active_rows.is_empty() {
         active_rows.push_str(
-            r#"<tr><td colspan="4" class="muted"><vl-i18n key="admins.no_active"/></td></tr>"#,
+            r#"<tr><td colspan="4" class="vl-muted"><vl-i18n key="admins.no_active"/></td></tr>"#,
         );
     }
     if inactive_rows.is_empty() {
         inactive_rows.push_str(
-            r#"<tr><td colspan="4" class="muted"><vl-i18n key="admins.no_inactive"/></td></tr>"#,
+            r#"<tr><td colspan="4" class="vl-muted"><vl-i18n key="admins.no_inactive"/></td></tr>"#,
         );
     }
     let notice = match query.notice.as_deref() {
-        Some("password_reset") => r#"<p class="notice"><vl-i18n key="admins.password_set"/></p>"#,
+        Some("password_reset") => {
+            r#"<p class="vl-notice vl-notice--success"><vl-i18n key="admins.password_set"/></p>"#
+        }
         _ => "",
     };
     let body = format!(
-        r#"<section><h1><vl-i18n key="nav.admins"/></h1>{notice}<div class="admin-columns"><details class="admin-column" open><summary><vl-i18n key="admins.active"/></summary><table><tr><th>ID</th><th><vl-i18n key="auth.username"/></th><th><vl-i18n key="common.created"/></th><th><vl-i18n key="common.action"/></th></tr>{active_rows}</table></details><details class="admin-column" open><summary><vl-i18n key="admins.inactive"/></summary><table><tr><th>ID</th><th><vl-i18n key="auth.username"/></th><th><vl-i18n key="common.created"/></th><th><vl-i18n key="common.action"/></th></tr>{inactive_rows}</table></details></div></section><section><h2><vl-i18n key="admins.create"/></h2><form method="post" class="vl-admin-create-form"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="auth.username"/><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="14" required></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" required></label><button class="vl-button"><vl-i18n key="common.create"/></button></form></section>"#,
+        r#"<section class="vl-panel"><h2><vl-i18n key="nav.admins"/></h2>{notice}<div class="vl-stack"><details class="vl-form-card" open><summary><vl-i18n key="admins.active"/></summary><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th>ID</th><th><vl-i18n key="auth.username"/></th><th><vl-i18n key="common.created"/></th><th><vl-i18n key="common.action"/></th></tr></thead><tbody>{active_rows}</tbody></table></div></details><details class="vl-form-card" open><summary><vl-i18n key="admins.inactive"/></summary><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th>ID</th><th><vl-i18n key="auth.username"/></th><th><vl-i18n key="common.created"/></th><th><vl-i18n key="common.action"/></th></tr></thead><tbody>{inactive_rows}</tbody></table></div></details></div></section><section class="vl-panel"><h2><vl-i18n key="admins.create"/></h2><form method="post" class="vl-admin-create-form"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="auth.username"/><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="14" maxlength="1024" required></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" minlength="14" maxlength="1024" required></label><button class="vl-button"><vl-i18n key="common.create"/></button></form></section>"#,
         esc(&session.csrf_token)
     );
     Ok(Html(admin_page(
@@ -4820,7 +4976,7 @@ async fn create_admin_ui(
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
-    if !valid_username(&form.username) {
+    if !auth::valid_admin_username(&form.username) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
             "Benutzername muss 3-64 sichere ASCII-Zeichen enthalten",
@@ -4832,10 +4988,10 @@ async fn create_admin_ui(
             "Passwörter stimmen nicht überein",
         ));
     }
-    if form.password.chars().count() < 14 {
+    if !auth::valid_admin_password(&form.password) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Passwort muss mindestens 14 Zeichen enthalten",
+            "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
         ));
     }
     let username = form.username.clone();
@@ -4863,7 +5019,7 @@ async fn create_admin_ui(
     let otpauth = otpauth_url(&username, &secret);
     let qr = qr_svg(&otpauth)?;
     let body = format!(
-        r#"<section><h1><vl-i18n key="title.admin_created"/></h1><p><vl-i18n key="admins.secret_once"/></p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
+        r#"<section class="vl-panel"><h2><vl-i18n key="title.admin_created"/></h2><p><vl-i18n key="admins.secret_once"/></p><p><strong>{}</strong></p><div class="vl-qr-card" aria-label="TOTP QR-Code">{}</div><div class="vl-secret-block"><code>{}</code><code>{}</code></div><p><a class="vl-button vl-button--secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
         esc(&username),
         qr,
         esc(&secret),
@@ -4898,10 +5054,10 @@ async fn reset_admin_password(
             "Passwörter stimmen nicht überein",
         ));
     }
-    if form.password.chars().count() < 14 {
+    if !auth::valid_admin_password(&form.password) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Passwort muss mindestens 14 Zeichen enthalten",
+            "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
         ));
     }
     let password = form.password;
@@ -4959,7 +5115,7 @@ async fn reset_admin_totp(
     let otpauth = otpauth_url(&username, &secret);
     let qr = qr_svg(&otpauth)?;
     let body = format!(
-        r#"<section><h1><vl-i18n key="title.mfa_reset"/></h1><p><vl-i18n key="admins.new_secret_once"/></p><p><strong>{}</strong></p><div class="qr-card" aria-label="TOTP QR-Code">{}</div><div class="secret-block"><code>{}</code><code>{}</code></div><p><a class="button secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
+        r#"<section class="vl-panel"><h2><vl-i18n key="title.mfa_reset"/></h2><p><vl-i18n key="admins.new_secret_once"/></p><p><strong>{}</strong></p><div class="vl-qr-card" aria-label="TOTP QR-Code">{}</div><div class="vl-secret-block"><code>{}</code><code>{}</code></div><p><a class="vl-button vl-button--secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
         esc(&username),
         qr,
         esc(&secret),
@@ -5079,7 +5235,7 @@ fn settings_form(
         String::new()
     } else {
         format!(
-            r#"<p class="muted">{}</p>"#,
+            r#"<p class="vl-muted">{}</p>"#,
             esc(&i18n::text_from_german(i18n::current_locale(), message))
         )
     };
@@ -5092,7 +5248,7 @@ fn settings_form(
         String::new()
     };
     format!(
-        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="row"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label><vl-i18n key="settings.upload_limit"/><br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.blocked"/><br><input name="blocked_extensions" value="{}"></label><label><vl-i18n key="settings.password_min"/><br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.password_max"/><br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.unlock_minutes"/><br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.zip_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="{}" required></label><label><vl-i18n key="settings.zip_files"/><br><input name="max_zip_files" type="number" min="0" value="{}" required></label><label><vl-i18n key="settings.search_entries"/><br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_results"/><br><input name="max_search_results" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.text_preview"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.text_extensions"/><br><input name="preview_extensions" value="{}" required></label><label><vl-i18n key="settings.media_preview"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.image_extensions"/><br><input name="image_preview_extensions" value="{}"></label><label class="toggle-card"><input type="checkbox" name="pdf_preview_enabled" {}><span><vl-i18n key="settings.pdf_active"/><small><vl-i18n key="settings.pdf_help"/></small></span></label><label class="toggle-card"><input type="checkbox" name="audit_client_ip_enabled" {}><span><vl-i18n key="settings.audit_ip"/><small><vl-i18n key="settings.audit_ip_help"/></small></span></label><button><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
+        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="vl-form-grid"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" required></label><label><vl-i18n key="settings.upload_limit"/><br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.blocked"/><br><input name="blocked_extensions" value="{}"></label><label><vl-i18n key="settings.password_min"/><br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.password_max"/><br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.unlock_minutes"/><br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.zip_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="{}" required></label><label><vl-i18n key="settings.zip_files"/><br><input name="max_zip_files" type="number" min="0" value="{}" required></label><label><vl-i18n key="settings.search_entries"/><br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_results"/><br><input name="max_search_results" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.text_preview"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.text_extensions"/><br><input name="preview_extensions" value="{}" required></label><label><vl-i18n key="settings.media_preview"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.image_extensions"/><br><input name="image_preview_extensions" value="{}"></label><label class="vl-toggle"><input type="checkbox" name="pdf_preview_enabled" {}><span><vl-i18n key="settings.pdf_active"/><small><vl-i18n key="settings.pdf_help"/></small></span></label><label class="vl-toggle"><input type="checkbox" name="audit_client_ip_enabled" {}><span><vl-i18n key="settings.audit_ip"/><small><vl-i18n key="settings.audit_ip_help"/></small></span></label><button class="vl-button"><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
         esc(&session.csrf_token),
         esc(&settings.public_base_url),
         display_limit_unit_floor(settings.max_upload_size, GB),
@@ -5435,6 +5591,17 @@ async fn unlock_share(
         ));
     }
     let password = form.password;
+    if password.len() > auth::MAX_PASSWORD_BYTES {
+        audit(
+            &state,
+            "public".into(),
+            "share_unlock_failed",
+            Some(share.id.to_string()),
+            None,
+        )
+        .await;
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiges Passwort"));
+    }
     let valid =
         tokio::task::spawn_blocking(move || auth::verify_password(&password_hash, &password))
             .await
@@ -5816,17 +5983,22 @@ fn add_public_preview_actions(
     let download = download_link
         .map(|link| {
             format!(
-                r#"<a href="{}"><vl-i18n key="common.download"/></a>"#,
+                r#"<a class="vl-button vl-button--secondary" href="{}"><vl-i18n key="common.download"/></a>"#,
                 esc(link)
             )
         })
         .unwrap_or_default();
-    let action = format!(
-        r#"<h1><vl-i18n key="files.preview"/></h1><p class="preview-actions"><a href="{}"><vl-i18n key="share.back"/></a>{}</p>"#,
+    const PREFIX: &str = r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1>"#;
+    let content = body
+        .strip_prefix(PREFIX)
+        .and_then(|body| body.strip_suffix("</section>"))
+        .unwrap_or(&body);
+    format!(
+        r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href="{}"><vl-i18n key="share.back"/></a>{}</p>{}</section>"#,
         esc(back_link),
-        download
-    );
-    body.replacen(r#"<h1><vl-i18n key="files.preview"/></h1>"#, &action, 1)
+        download,
+        content
+    )
 }
 
 pub(crate) async fn public_preview(
@@ -5907,7 +6079,7 @@ pub(crate) async fn public_preview(
             Some(&download_link),
         ),
         PreviewContent::Text(text) => format!(
-            r#"<section><h1><vl-i18n key="files.preview"/></h1><pre>{}</pre></section>"#,
+            r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><pre>{}</pre></section>"#,
             esc(&text)
         ),
         PreviewContent::Media { kind, size } => {
@@ -5938,7 +6110,7 @@ pub(crate) async fn public_preview(
             };
             let viewer = media_viewer(kind, &raw_url);
             format!(
-                r#"<section><h1><vl-i18n key="files.preview"/></h1><p class="muted">{} - <vl-i18n key="files.raw_token"/></p>{}</section>"#,
+                r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><p class="vl-muted">{} - <vl-i18n key="files.raw_token"/></p>{}</section>"#,
                 human(size),
                 viewer
             )
@@ -6388,6 +6560,16 @@ pub(crate) async fn upload(
     if !sh.is_directory || !sh.permission.can_upload() {
         return Err(AppError(StatusCode::FORBIDDEN, "Upload nicht erlaubt"));
     }
+    let _upload_permit = state
+        .upload_admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Zu viele gleichzeitige Uploads",
+            )
+        })?;
     let share_scope = state
         .secure_root
         .bind_directory(&sh.relative_path)
@@ -6872,11 +7054,7 @@ async fn short_redirect(
             "Zu viele Alias-Anfragen",
         ));
     }
-    if alias.len() > 32
-        || !alias
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
+    if path_security::validate_share_alias(&alias).is_err() {
         return Err(AppError(StatusCode::NOT_FOUND, "Alias nicht gefunden"));
     }
     let sh = database(state.db.clone(), move |db| db.share_by_alias(&alias))
@@ -7171,6 +7349,47 @@ mod tests {
             estimate_zip_archive_size(&[overflowing_file]),
             Err(ZipBuildError::Limit("zip archive size overflow"))
         ));
+    }
+
+    #[tokio::test]
+    async fn response_admission_holds_a_slot_until_the_body_is_dropped() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let app =
+            Router::new()
+                .route("/", get(|| async { "ok" }))
+                .layer(middleware::from_fn_with_state(
+                    admission.clone(),
+                    response_admission,
+                ));
+
+        let first = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(admission.available_permits(), 0);
+
+        let saturated = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            saturated.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+
+        drop(first);
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(
+            app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -7703,6 +7922,28 @@ mod tests {
                 .to_rfc3339(),
             "2026-07-07T18:32:00+00:00"
         );
+        assert!(parse_expiry(Some("2026-07-07T20:32"), Some("invalid")).is_err());
+        assert!(parse_expiry(Some("2026-07-07T20:32"), Some("1441")).is_err());
+    }
+
+    #[test]
+    fn text_preview_detects_growth_after_the_initial_metadata_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_path = directory.path().join("metadata.txt");
+        let content_path = directory.path().join("content.txt");
+        std::fs::write(&metadata_path, b"ok").unwrap();
+        std::fs::write(&content_path, b"12345").unwrap();
+        let metadata = std::fs::metadata(metadata_path).unwrap();
+        let file = std::fs::File::open(content_path).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut settings = runtime_settings(&test_state(root.path(), data.path()));
+        settings.max_preview_size = 4;
+
+        match read_preview_opened(file, metadata, "content.txt", &settings).unwrap() {
+            PreviewContent::TooLarge { size } => assert_eq!(size, 5),
+            _ => panic!("grown preview must be rejected as too large"),
+        }
     }
 
     #[tokio::test]
@@ -7711,7 +7952,13 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let state = test_state(root.path(), data.path());
         let html = i18n::scope(Locale::De, "/admin".into(), async {
-            admin_page(&state, PageId::Files, "<section></section>", true, "csrf")
+            admin_page(
+                &state,
+                PageId::Files,
+                r#"<section class="vl-panel"></section>"#,
+                true,
+                "csrf",
+            )
         })
         .await;
         assert!(html.contains("<title>Dateien · VaultLink</title>"));
@@ -8050,14 +8297,30 @@ mod tests {
 
     #[test]
     fn custom_datetime_picker_replaces_native_browser_picker() {
-        let css = app_css();
+        let css = crate::ui::STYLESHEET;
         let picker = i18n::render_markers(Locale::De, &expiry_picker_html());
-        assert!(css.contains(".datetime-popover"));
+        assert!(css.contains(".vl-datetime-popover"));
         assert!(!css.contains(r#"datetime-local"]::-webkit-calendar-picker-indicator"#));
         assert!(picker.contains("data-datetime-picker"));
         assert!(picker.contains(r#"name="expires_local""#));
         assert!(picker.contains("TT.MM.JJJJ HH:MM"));
         assert!(!picker.contains(r#"type="datetime-local""#));
+    }
+
+    #[tokio::test]
+    async fn png_favicon_is_an_actual_32_by_32_image() {
+        let response = favicon_png().await.into_response();
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("image/png"))
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&bytes[12..16], b"IHDR");
+        assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 32);
+        assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 32);
     }
 
     #[tokio::test]
@@ -8078,15 +8341,24 @@ mod tests {
     }
 
     #[test]
-    fn removed_setup_form_and_browser_rewrite_stay_removed() {
+    fn removed_compatibility_symbols_and_html_rewrites_stay_removed() {
         assert!(!include_str!("setup.rs").contains(concat!("setup_form_", "legacy")));
         assert!(!include_str!("web.rs").contains(concat!("body.", "replace(")));
+        assert!(!include_str!("web.rs").contains(concat!("body.", "replacen(")));
+        assert!(!include_str!("ui.rs").contains(concat!("APP_", "CSS")));
+        assert!(!include_str!("web.rs").contains(concat!("app_", "css()")));
+        assert!(!include_str!("setup.rs").contains(concat!("setup_", "css()")));
+        assert!(!include_str!("web.rs").contains(concat!("vl-", "legacy")));
+        assert!(!include_str!("setup.rs").contains(concat!("vl-", "legacy")));
+        assert!(!include_str!("web.rs").contains(concat!("admins_page_", "v3")));
+        assert!(!include_str!("secure_fs.rs").contains(concat!("cleanup_upload_", "fragments")));
+        assert!(!include_str!("web.rs").contains(concat!("const LOGO_", "SVG: &str = r##")));
     }
 
     #[test]
     fn public_preview_actions_are_rendered_above_content() {
         let body =
-            r#"<section><h1><vl-i18n key="files.preview"/></h1><pre>long text</pre></section>"#
+            r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><pre>long text</pre></section>"#
                 .to_string();
         let html = i18n::render_markers(
             Locale::De,
@@ -8437,15 +8709,11 @@ mod tests {
                 &UploadConflictStrategy::Reject,
             )
             .unwrap();
-        let legacy_alias = app
+        let retired_alias = app
             .oneshot(request(Method::GET, "/s/old", ""))
             .await
             .unwrap();
-        assert_eq!(legacy_alias.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            legacy_alias.headers().get(header::LOCATION).unwrap(),
-            "/v/legacy-token"
-        );
+        assert_eq!(retired_alias.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -9236,7 +9504,8 @@ mod tests {
         assert!(created_admin_page.contains("<svg"));
         assert!(created_admin_page.contains("otpauth://totp/VaultLink:ops"));
         assert!(!created_admin_page.contains(r#"action="/locale""#));
-        assert!(created_admin_page.contains(r#"class="button secondary" href="/admin/admins""#));
+        assert!(created_admin_page
+            .contains(r#"class="vl-button vl-button--secondary" href="/admin/admins""#));
         assert!(state.db.admin("ops").unwrap().is_some());
 
         let mut deactivate = request(
@@ -9287,8 +9556,8 @@ mod tests {
         assert!(!admin_list_html.contains("Eigene Passwort- und MFA-Änderungen"));
         assert_eq!(admin_list_html.matches("Passwort setzen").count(), 2);
         assert!(
-            admin_list_html.find("<td>1</td>").unwrap()
-                < admin_list_html.find("<td>3</td>").unwrap()
+            admin_list_html.find(r#"data-label="ID">1</td>"#).unwrap()
+                < admin_list_html.find(r#"data-label="ID">3</td>"#).unwrap()
         );
         assert!(
             admin_list_html.find("Aktive Admins").unwrap()

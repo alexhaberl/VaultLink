@@ -185,11 +185,7 @@ pub struct Security {
     pub secure_cookie: bool,
     #[serde(default = "default_share_password_min")]
     pub share_password_min_length: usize,
-    #[serde(
-        default = "default_share_password_max",
-        rename = "share_password_max_length",
-        alias = "share_password_max_bytes"
-    )]
+    #[serde(default = "default_share_password_max")]
     pub share_password_max_length: usize,
     #[serde(default = "default_share_unlock_minutes")]
     pub share_unlock_minutes: i64,
@@ -495,6 +491,11 @@ impl Config {
             )));
         }
         validate_mount_policy(&self.storage, self.server.production_mode)?;
+        if self.storage.preview_extensions.is_empty() {
+            return Err(ConfigError::Invalid(
+                "preview_extensions must not be empty".into(),
+            ));
+        }
         validate_extensions("preview_extensions", &self.storage.preview_extensions)?;
         validate_extensions(
             "image_preview_extensions",
@@ -841,6 +842,14 @@ mod tests {
     }
 
     #[test]
+    fn text_preview_extensions_must_not_be_empty() {
+        let mut config = base();
+        config.storage.preview_extensions.clear();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("preview_extensions must not be empty"));
+    }
+
+    #[test]
     fn legacy_storage_configuration_defaults_to_no_mount_requirement() {
         let serialized = toml::to_string(&base()).unwrap();
         let legacy = serialized
@@ -993,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn password_max_length_uses_character_name_and_accepts_legacy_key() {
+    fn password_max_length_uses_only_the_canonical_key() {
         let serialized = toml::to_string(&base()).unwrap();
         assert!(serialized.contains("share_password_max_length = 256"));
         assert!(!serialized.contains("share_password_max_bytes"));
@@ -1002,9 +1011,8 @@ mod tests {
             "share_password_max_length = 256",
             "share_password_max_bytes = 256",
         );
-        let parsed: Config = toml::from_str(&legacy).unwrap();
-        assert_eq!(parsed.security.share_password_max_length, 256);
-        parsed.validate().unwrap();
+        let error = toml::from_str::<Config>(&legacy).unwrap_err().to_string();
+        assert!(error.contains("unknown field `share_password_max_bytes`"));
     }
 
     #[test]

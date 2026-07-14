@@ -9,6 +9,10 @@ use crate::{
 };
 
 const CLEANUP_BATCH_ENTRIES: usize = 4096;
+#[cfg(not(test))]
+const CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub enum FileOperationError {
@@ -270,13 +274,13 @@ fn spawn_deletion_cleanup(
                 Ok(Err(error)) => {
                     tracing::warn!(%error, %tombstone_path, "could not start deletion cleanup");
                     drop(cleanup_guard);
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
                     continue;
                 }
                 Err(error) => {
                     tracing::warn!(%error, %tombstone_path, "deletion cleanup task failed to start");
                     drop(cleanup_guard);
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
                     continue;
                 }
             };
@@ -284,7 +288,7 @@ fn spawn_deletion_cleanup(
                 return;
             }
             drop(cleanup_guard);
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
         }
     });
 }
@@ -317,5 +321,141 @@ async fn run_cleanup(mut cleanup: UploadFragmentCleanup, tombstone_path: &str) -
             return failures == 0;
         }
         tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use crate::{
+        config::{Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage, Tls},
+        db::{Permission, UploadConflictStrategy},
+    };
+
+    use super::*;
+
+    fn test_state(root: &Path, data: &Path) -> AppState {
+        AppState::new(Config {
+            server: Server {
+                mode: ServerMode::Development,
+                listen_address: "127.0.0.1:8080".into(),
+                public_base_url: "http://localhost:8080".into(),
+                production_mode: false,
+            },
+            storage: Storage {
+                root_mount_path: root.into(),
+                data_directory: data.into(),
+                internal_directory: None,
+                require_mount: false,
+                external_writers: false,
+                expected_filesystem_type: None,
+                expected_mount_source: None,
+                max_upload_size: 1_000_000,
+                max_zip_size: 1_000_000,
+                max_zip_files: 100,
+                max_search_entries: 1_000,
+                max_search_results: 100,
+                max_preview_size: 100_000,
+                preview_extensions: vec!["txt".into()],
+                image_preview_extensions: vec!["png".into()],
+                pdf_preview_enabled: true,
+                max_media_preview_size: 1_000_000,
+                blocked_extensions: vec!["exe".into()],
+            },
+            reverse_proxy: ReverseProxy::default(),
+            tls: Tls::default(),
+            security: Security::default(),
+            logging: Logging::default(),
+        })
+        .unwrap()
+    }
+
+    fn tombstone_paths(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(
+            root.join(crate::path_security::INTERNAL_STORAGE_DIRECTORY_NAME)
+                .join("tombstones"),
+        )
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| crate::secure_fs::is_deletion_tombstone_name(&entry.file_name()))
+        .map(|entry| entry.path())
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn delete_reports_pending_and_retries_cleanup_start_and_batch_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("tree")).unwrap();
+        std::fs::write(root.path().join("tree/child.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "tree-token",
+                None,
+                "tree",
+                true,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+
+        // Hold the worker until the synchronous result and durable tombstone can
+        // be asserted. Two start errors cover both the targeted cleanup and its
+        // broad cleanup fallback; the following attempt fails in run_batch.
+        let cleanup_guard = state.storage_cleanup.lock().await;
+        state
+            .secure_root
+            .fail_next_cleanup_starts(io::ErrorKind::Other, 2);
+        state
+            .secure_root
+            .fail_next_cleanup_batch(io::ErrorKind::Other);
+
+        let result = delete(&state, "tree", Some("tree")).await.unwrap();
+        assert!(result.cleanup_pending);
+        assert_eq!(result.deactivated_shares, 1);
+        assert!(!root.path().join("tree").exists());
+        assert_eq!(tombstone_paths(root.path()).len(), 1);
+        assert!(
+            !state
+                .db
+                .share_by_token("tree-token")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+
+        drop(cleanup_guard);
+        for _ in 0..200 {
+            if tombstone_paths(root.path()).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            tombstone_paths(root.path()).is_empty(),
+            "cleanup did not recover after injected start and batch failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_regular_file_finishes_without_pending_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("single.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+
+        let result = delete(&state, "single.txt", None).await.unwrap();
+        assert!(!result.cleanup_pending);
+        assert!(tombstone_paths(root.path()).is_empty());
+        assert!(!root.path().join("single.txt").exists());
     }
 }

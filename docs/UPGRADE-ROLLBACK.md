@@ -22,15 +22,16 @@ expected_mount_source = "//fileserver.example/vaultlink"
 
 Verify the visible-tree migration and server ACLs with the VaultLink account and with every co-writer account before starting the candidate. The candidate requires an explicit mount identity in every production mode, rejects an unmounted local fallback, and rejects SQLite/WAL on a network filesystem. Do not replace `/etc/vaultlink/config.toml` manually: it must remain the old live configuration until the upgrade script activates the new Binary/Config pair with the service stopped.
 
-For rollback to 0.4.0, stop VaultLink and every SMB writer first. Reverse the server-side layout from the snapshot, restore the previous export/ACL boundary and verify it before invoking the rollback script. Do not point 0.4.0 at the new Co-Writer layout: its old in-tree staging model is not safe for this mode. The rollback backup contains the matching 0.4.0 Binary/Config/SQLite triple, but it cannot reverse an external SMB-server migration.
+For rollback to 0.4.0, stop VaultLink and every SMB writer first. Reverse the server-side layout from the snapshot, restore the previous export/ACL boundary and verify it before invoking the rollback script. The script refuses this rollback while `vaultlink.service` is active, but it cannot inspect or reverse the external SMB-server migration. Do not point 0.4.0 at the new Co-Writer layout: its old in-tree staging model is not safe for this mode. The rollback backup contains the matching 0.4.0 Binary/Config/SQLite triple.
 
 ## Upgrade
 
 1. Map `x86_64` to the `amd64` release and `aarch64`/`arm64` to the `arm64` release. Download the matching archive, standalone binary, SBOM, `SHA256SUMS-ARCH`, and their available `.minisig` files. Reject all other host architectures.
 2. Extract it outside `/opt/vaultlink`.
-3. Keep the current live configuration untouched and run `sudo deploy/vaultlink-upgrade.sh /path/to/new/vaultlink /path/to/new-config.toml`. For the 0.4.0-to-0.4.1 migration the script verifies that `vaultlink.service` was already stopped; it refuses to perform this external-storage migration from an active service.
-4. The script requires an existing executable, configuration, and database plus `curl`, `flock`, `runuser`, `sqlite3`, and GNU `timeout`. A shared non-blocking maintenance lock excludes concurrent upgrades and rollbacks. Before downtime it stages both Binary/Config pairs on their destination filesystems, validates each pair as the unprivileged `vaultlink` account and derives separate old/new readiness targets. It stops VaultLink, creates and verifies a consistent SQLite backup, publishes a complete old `vaultlink`/`config.toml`/`data.sqlite` backup set below the root-only `/var/lib/vaultlink-backups/` (`0700`, files `0700/0600/0600`), then activates the staged candidate Binary and Config with per-file atomic renames before starting the service.
-5. After the local gate succeeds, verify the exact public HTTP status and candidate health body from an external vantage with the separate check below. Then check `systemctl status vaultlink`, the journal, login/MFA, one protected share, upload, full download, and range download through the public URL.
+3. Keep the current live configuration untouched and run `sudo deploy/vaultlink-upgrade.sh /path/to/new/vaultlink /path/to/new-config.toml`. For every upgrade from 0.4.0 to a newer candidate, the script verifies that `vaultlink.service` was already stopped; it refuses to perform this external-storage migration from an active service.
+4. The script requires an existing executable, configuration, and database plus `curl`, `flock`, `runuser`, `sqlite3`, GNU `timeout`, `od`, `tr`, and a readable `/dev/urandom`. A shared non-blocking maintenance lock excludes concurrent upgrades and rollbacks. Before downtime it stages both Binary/Config pairs on their destination filesystems, validates each pair as the unprivileged `vaultlink` account and derives separate old/new readiness targets. It stops VaultLink, creates and verifies a consistent SQLite backup, publishes a complete old `vaultlink`/`config.toml`/`data.sqlite` backup set below the root-only `/var/lib/vaultlink-backups/` (`0700`, files `0700/0600/0600`), then activates the staged candidate Binary and Config with per-file atomic renames before starting the service.
+5. While the service is stopped and after that backup is durable, the script atomically replaces every non-empty share alias shorter than 12 ASCII bytes. It retains the old alias as a prefix and adds 20 lowercase hexadecimal characters (80 bits from `/dev/urandom`), keeping the result within the supported 12-to-32-character URL-safe policy. A malformed legacy value, changed row, or `UNIQUE` collision aborts the transaction and restores the verified backup. The candidate rejects 1-to-11-character alias lookups after this rotation, so bypassing the upgrade script would leave historical short links unavailable. If aliases were changed successfully, the root-only backup directory contains `share-alias-migration.tsv` (`root:root`, `0600`) with `share_id`, `old_alias`, and `new_alias`. This file contains working share locators: never copy it to tickets, chat, shell history, or unprotected logs. Securely distribute replacement links to their intended recipients, then delete the mapping when the old links are no longer needed.
+6. After the local gate succeeds, verify the exact public HTTP status and candidate health body from an external vantage with the separate check below. Then check `systemctl status vaultlink`, the journal, login/MFA, one protected share, upload, full download, and range download through the public URL.
 
 Use a previously pinned copy of `release/minisign.pub`; a public key obtained
 only from the same unverified download is not a trust anchor. From the directory
@@ -38,7 +39,7 @@ containing all four architecture-specific release inputs, verify before
 extraction:
 
 ```sh
-version=0.4.1
+version=0.4.2
 case "$(uname -m)" in
     x86_64) arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
@@ -54,7 +55,7 @@ sha256sum -c "$checksums"
 ```
 
 ```sh
-expected_version=0.4.1
+expected_version=0.4.2
 response=$(curl --disable --silent --show-error --noproxy '*' --proto '=https' \
     --connect-timeout 5 --max-time 15 --header 'Accept: application/json' \
     --output - --write-out '\n%{http_code}' \
@@ -65,13 +66,21 @@ test "$response" = "$expected"
 
 Schema migrations run in one SQLite transaction. A database with a schema newer than the binary supports is rejected at startup.
 
-If staging or Binary/Config pairing fails, the service is never stopped and the live configuration is unchanged. If backup or integrity validation fails after the stop, the incomplete backup is removed and a previously active service is restarted with the unchanged installation. If activation, startup, local readiness, or the post-start database check fails, the script restores the verified old Binary/Config/SQLite triple and checks it against the old readiness target. A `CRITICAL` message means automatic recovery itself failed and the reported backup path must be used manually.
+### Configuration compatibility sunset
+
+Candidate configurations must use `share_password_max_length`; the deprecated TOML name `share_password_max_bytes` is rejected before downtime. Schema 12 renames the same legacy key in `runtime_settings` automatically. If both persisted names exist, the canonical value wins.
+
+The omission defaults for `storage.internal_directory`, `storage.require_mount`, and `storage.external_writers` remain available only to development configurations throughout the 0.4.x line. They are scheduled for removal in 0.5.0. Before that release, every development configuration must be rewritten with explicit values. Production configurations already require an explicit mount identity and fail closed.
+
+Removing those storage defaults safely requires a breaking-format preflight in the 0.5.0 upgrade tooling: validate an explicit candidate configuration with the candidate binary before downtime, refuse to infer an internal directory or mount policy from the filesystem, retain the old configuration in the verified rollback triple, and add upgrade/rollback tests for missing, false, and fully explicit policies. This is intentionally not an in-place automatic rewrite because choosing the wrong storage boundary can expose staging data to co-writers.
+
+If staging or Binary/Config pairing fails, the service is never stopped and the live configuration is unchanged. If backup or integrity validation fails after the stop, the incomplete backup is removed and a previously active service is restarted with the unchanged installation. If alias migration, activation, startup, local readiness, or the post-start database check fails, the script restores the verified old Binary/Config/SQLite triple and checks it against the old readiness target. A successful automatic restore removes any now-stale alias mapping. If automatic restore itself fails, the protected mapping is retained because it may be required to inspect or recover a partially activated installation. A `CRITICAL` message means automatic recovery itself failed and the reported backup path must be used manually.
 
 The three live files reside on different filesystems and cannot be committed by one POSIX rename. The service is stopped and every replacement is pre-staged and renamed atomically on its own filesystem, which handles normal command errors and trapped signals. It does not claim power-loss or `SIGKILL` atomicity between those renames. After an interrupted host-level activation, keep the service and SMB writers stopped and restore one complete verified backup triple before continuing.
 
 ### Local readiness gate
 
-The automatic rollback decision uses only a direct request to the local VaultLink listener. It retries for up to 30 attempts within an overall 60-second budget, with a one-second interval, a two-second connect timeout, and a three-second total timeout per request. Responses are capped at 4 KiB. Success requires HTTP 200 and the candidate's exact compact response, for example `{"ok":true,"version":"0.4.1"}`. A delayed listener is retried; HTTP 500, malformed JSON, a wrong version, oversized responses, and transport timeouts fail the gate.
+The automatic rollback decision uses only a direct request to the local VaultLink listener. It retries for up to 30 attempts within an overall 60-second budget, with a one-second interval, a two-second connect timeout, and a three-second total timeout per request. Responses are capped at 4 KiB. Success requires HTTP 200 and the candidate's exact compact response, for example `{"ok":true,"version":"0.4.2"}`. A delayed listener is retried; HTTP 500, malformed JSON, a wrong version, oversized responses, and transport timeouts fail the gate.
 
 In reverse-proxy mode the request goes directly to local HTTP. In standalone-TLS mode curl keeps the public hostname for the TLS SNI value but uses `--connect-to` to reach the local listener, `--noproxy '*'` to bypass proxy environment variables, and `--insecure` for this local application gate only. Public DNS, proxy routing, certificate trust, and certificate expiry therefore cannot trigger a database rollback.
 
@@ -81,7 +90,7 @@ The retry values can be overridden for controlled tests with `VAULTLINK_READINES
 
 Run `sudo deploy/vaultlink-rollback.sh /var/lib/vaultlink-backups/TIMESTAMP`. The requested Binary/Config pair and SQLite database are verified and pre-staged before downtime under the shared maintenance lock. After stopping VaultLink, the script first creates a complete verified `rollback-pre-TIMESTAMP` emergency triple of the current state, restores the requested Binary, Config and database, removes stale WAL sidecars, starts VaultLink, and verifies systemd, exact local health JSON and SQLite integrity. It prints the emergency-backup path on success. If rollback activation fails, the complete emergency triple is restored automatically; a failed recovery stop or incomplete restore remains fail-closed and is never restarted.
 
-Retain backups until the soak gate has passed. Backups contain the full configuration plus password hashes, TOTP secrets, sessions, share tokens and audit data and must be protected like the live database.
+Retain backups until the soak gate has passed. Backups contain the full configuration plus password hashes, TOTP secrets, sessions, share tokens, audit data, and potentially the old-to-new share-alias mapping; they must be protected like the live database.
 
 Every `.vaultlink-internal/tombstones/*.pending` entry has a durable sibling `*.pending.manifest` containing the original relative path as a JSON string. VaultLink normally restores an uncommitted pending delete with a no-clobber rename during startup and removes the manifest only after both directory renames are durable. If a co-writer reused the visible name, both objects and the manifest are retained and the journal reports `private recovery entry was preserved` with the full path.
 

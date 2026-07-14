@@ -605,6 +605,7 @@ catalog! {
     TARGET_FOLDER_UNAVAILABLE, "error.target_folder", "Zielordner nicht verfügbar", "Target folder unavailable";
     UPLOAD_ABORTED, "error.upload_aborted", "Upload abgebrochen", "Upload aborted";
     UPLOAD_TOO_LARGE, "error.upload_large", "Upload ist zu groß", "Upload is too large";
+    UPLOAD_BUSY, "error.upload_busy", "Zu viele gleichzeitige Uploads", "Too many concurrent uploads";
     INSUFFICIENT_STORAGE, "error.storage", "Nicht genug freier Speicher", "Not enough free storage";
     INVALID_UPLOAD, "error.invalid_upload", "Ungültiger Upload", "Invalid upload";
     TOO_MANY_MULTIPART_FIELDS, "error.multipart_fields", "Zu viele Multipart-Felder", "Too many multipart fields";
@@ -616,7 +617,7 @@ catalog! {
     CSRF_PROOF_MISSING, "error.csrf_proof_missing", "CSRF-Nachweis fehlt", "CSRF proof missing";
     INVALID_EXPIRY, "error.invalid_expiry", "Ungültiges Ablaufdatum", "Invalid expiration date";
     INVALID_PERMISSION, "error.invalid_permission", "Ungültige Berechtigung", "Invalid permission";
-    UPLOAD_FOLDER_MVP, "error.upload_folder_mvp", "Uploads sind im MVP nur für Ordnerlinks erlaubt", "Uploads are available for folder links only";
+    ERROR_UPLOAD_LINK_FOLDER_ONLY, "error.upload_link_folder_only", "Uploads sind nur für Ordnerlinks erlaubt", "Uploads are available for folder links only";
     INVALID_ALIAS, "error.invalid_alias", "Ungültiger Alias", "Invalid alias";
     EXPIRY_PAST, "error.expiry_past", "Ablaufdatum liegt in der Vergangenheit", "Expiration date is in the past";
     PASSWORD_REQUIRED, "error.password_required", "Passwort und Bestätigung sind für den Passwortschutz verpflichtend", "Password and confirmation are required for password protection";
@@ -627,7 +628,7 @@ catalog! {
     UPLOAD_LIMIT_MIN, "error.upload_min", "Uploadlimit muss mindestens 1 Byte sein", "Upload limit must be at least 1 byte";
     TOKEN_ALIAS_EXISTS, "error.token_alias", "Token oder Alias bereits vorhanden", "Token or alias already exists";
     USERNAME_POLICY, "error.username_policy", "Benutzername muss 3-64 sichere ASCII-Zeichen enthalten", "Username must contain 3-64 safe ASCII characters";
-    PASSWORD_MIN_14, "error.password_min", "Passwort muss mindestens 14 Zeichen enthalten", "Password must contain at least 14 characters";
+    PASSWORD_POLICY, "error.password_policy", "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten", "Password must contain at least 14 characters and at most 1024 bytes";
     USERNAME_EXISTS, "error.username_exists", "Benutzername existiert bereits", "Username already exists";
     ADMIN_NOT_FOUND, "error.admin_not_found", "Admin nicht gefunden", "Admin not found";
     LAST_ADMIN, "error.last_admin", "Letzter aktiver Admin kann nicht stillgelegt werden", "The final active admin cannot be deactivated";
