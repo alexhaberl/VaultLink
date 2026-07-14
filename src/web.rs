@@ -9464,17 +9464,18 @@ mod tests {
         );
         transfer_request.abort();
         let _ = transfer_request.await;
-        for _ in 0..100 {
-            if state
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state
                 .db
                 .active_transfer_reservations(transfer_share)
                 .unwrap()
-                == 0
+                != 0
             {
-                break;
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("cancelled transfer reservation should be released");
         assert_eq!(
             state
                 .db
@@ -9505,12 +9506,13 @@ mod tests {
         );
         upload_request.abort();
         let _ = upload_request.await;
-        for _ in 0..100 {
-            if state.db.active_upload_reservations(upload_share).unwrap() == 0 {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.db.active_upload_reservations(upload_share).unwrap() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("cancelled upload reservation should be released");
         assert_eq!(
             state.db.active_upload_reservations(upload_share).unwrap(),
             0
