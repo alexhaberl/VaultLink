@@ -1,0 +1,28 @@
+# Stable WebAuthn/passkey dependencies still span the pre-1.0 and current utility
+# stacks. Re-evaluate when webauthn-rs has a newer stable release (not -dev/-rc).
+base64
+getrandom
+rand
+rand_core
+
+# Argon2/password hashing and WebAuthn currently pull compatible, but distinct,
+# digest generations. Re-evaluate after stable argon2 and webauthn-rs upgrades.
+block-buffer
+cpufeatures
+crypto-common
+digest
+
+# Stable dependency branches currently use both thiserror major versions. Remove
+# these entries as soon as all direct parents have converged on one major.
+thiserror
+thiserror-impl
+
+# The ACME/TLS dependency graph still spans two webpki-roots generations.
+# Re-evaluate after the next stable rustls-acme/rustls upgrade.
+webpki-roots
+
+# `--target all` intentionally exposes platform support generations that are not
+# compiled together on one host. Re-evaluate after their parent crates converge.
+hashbrown
+r-efi
+windows-sys

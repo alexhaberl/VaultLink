@@ -1,5 +1,6 @@
 use super::{
-    token_hash, Database, Permission, Share, ShareControlsUpdateOutcome, UploadConflictStrategy,
+    insert_required_audits, token_hash, trace_required_audits, AuditContext, Database, Permission,
+    RequiredAuditEvent, Share, ShareControlsUpdateOutcome, UploadConflictStrategy,
     DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE, MAX_SQLITE_UNSIGNED,
 };
 use chrono::{DateTime, Utc};
@@ -89,6 +90,79 @@ impl Database {
         password_hash: Option<&str>,
         upload_conflict_strategy: &UploadConflictStrategy,
     ) -> rusqlite::Result<i64> {
+        self.create_share_with_upload_limits_internal(
+            token,
+            alias,
+            path,
+            is_dir,
+            permission,
+            expires,
+            max,
+            upload_max,
+            upload_total,
+            upload_files,
+            admin,
+            password_hash,
+            upload_conflict_strategy,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_share_with_upload_limits_and_audit(
+        &self,
+        token: &str,
+        alias: Option<&str>,
+        path: &str,
+        is_dir: bool,
+        permission: &Permission,
+        expires: Option<DateTime<Utc>>,
+        max: Option<u64>,
+        upload_max: Option<u64>,
+        upload_total: Option<u64>,
+        upload_files: Option<u64>,
+        admin: i64,
+        password_hash: Option<&str>,
+        upload_conflict_strategy: &UploadConflictStrategy,
+        audit_context: &AuditContext,
+        audit_detail: Option<String>,
+    ) -> rusqlite::Result<i64> {
+        self.create_share_with_upload_limits_internal(
+            token,
+            alias,
+            path,
+            is_dir,
+            permission,
+            expires,
+            max,
+            upload_max,
+            upload_total,
+            upload_files,
+            admin,
+            password_hash,
+            upload_conflict_strategy,
+            Some((audit_context, audit_detail)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_share_with_upload_limits_internal(
+        &self,
+        token: &str,
+        alias: Option<&str>,
+        path: &str,
+        is_dir: bool,
+        permission: &Permission,
+        expires: Option<DateTime<Utc>>,
+        max: Option<u64>,
+        upload_max: Option<u64>,
+        upload_total: Option<u64>,
+        upload_files: Option<u64>,
+        admin: i64,
+        password_hash: Option<&str>,
+        upload_conflict_strategy: &UploadConflictStrategy,
+        required_audit: Option<(&AuditContext, Option<String>)>,
+    ) -> rusqlite::Result<i64> {
         let expects_upload_limits = is_dir && permission.can_upload();
         if expects_upload_limits != (upload_total.is_some() && upload_files.is_some())
             || upload_total.is_some_and(|value| value == 0 || value > MAX_SQLITE_UNSIGNED)
@@ -99,8 +173,9 @@ impl Database {
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let c = self.conn();
-        c.execute(
+        let mut connection = self.conn();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO shares(
                  token_hash,token,alias,relative_path,is_directory,permission,expires_at,
                  max_downloads,max_upload_size,created_by,created_at,password_hash,
@@ -124,7 +199,26 @@ impl Database {
                 upload_files,
             ],
         )?;
-        Ok(c.last_insert_rowid())
+        let id = transaction.last_insert_rowid();
+        let audit_events = required_audit.as_ref().map(|(_, detail)| {
+            vec![RequiredAuditEvent::new(
+                "share_created",
+                Some(id.to_string()),
+                detail.clone(),
+            )]
+        });
+        if let (Some((context, _)), Some(events)) =
+            (required_audit.as_ref(), audit_events.as_deref())
+        {
+            insert_required_audits(&transaction, context, events)?;
+        }
+        transaction.commit()?;
+        if let (Some((context, _)), Some(events)) =
+            (required_audit.as_ref(), audit_events.as_deref())
+        {
+            trace_required_audits(context, events);
+        }
+        Ok(id)
     }
     fn map_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
         let exp: Option<String> = r.get(6)?;
@@ -201,6 +295,32 @@ impl Database {
         new_path: &str,
         is_directory: bool,
     ) -> rusqlite::Result<usize> {
+        self.rename_share_paths_internal(old_path, new_path, is_directory, None)
+    }
+
+    pub fn rename_share_paths_and_audit(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        is_directory: bool,
+        context: &AuditContext,
+        recovery: bool,
+    ) -> rusqlite::Result<usize> {
+        self.rename_share_paths_internal(
+            old_path,
+            new_path,
+            is_directory,
+            Some((context, recovery)),
+        )
+    }
+
+    fn rename_share_paths_internal(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        is_directory: bool,
+        required_audit: Option<(&AuditContext, bool)>,
+    ) -> rusqlite::Result<usize> {
         let mut connection = self.conn();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updates = {
@@ -226,13 +346,53 @@ impl Database {
                 params![id, path],
             )?;
         }
+        let audit_events = required_audit.map(|(_, recovery)| {
+            [RequiredAuditEvent::new(
+                "path_renamed",
+                Some(new_path.to_string()),
+                Some(format!(
+                    "old_path={old_path};updated_shares={};recovery={recovery}",
+                    updates.len()
+                )),
+            )]
+        });
+        if let (Some((context, _)), Some(events)) = (required_audit, audit_events.as_ref()) {
+            insert_required_audits(&transaction, context, events)?;
+        }
         transaction.commit()?;
+        if let (Some((context, _)), Some(events)) = (required_audit, audit_events.as_ref()) {
+            trace_required_audits(context, events);
+        }
         Ok(updates.len())
     }
     pub fn deactivate_shares_for_path(
         &self,
         path: &str,
         is_directory: bool,
+    ) -> rusqlite::Result<usize> {
+        self.deactivate_shares_for_path_internal(path, is_directory, None)
+    }
+
+    pub fn deactivate_shares_for_path_and_audit(
+        &self,
+        path: &str,
+        is_directory: bool,
+        context: &AuditContext,
+        recovery: bool,
+        cleanup_pending: bool,
+    ) -> rusqlite::Result<usize> {
+        self.deactivate_shares_for_path_internal(
+            path,
+            is_directory,
+            Some((context, recovery, cleanup_pending)),
+        )
+    }
+
+    fn deactivate_shares_for_path_internal(
+        &self,
+        path: &str,
+        is_directory: bool,
+        required_audit: Option<(&AuditContext, bool, bool)>,
     ) -> rusqlite::Result<usize> {
         let mut connection = self.conn();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -259,7 +419,29 @@ impl Database {
                 [id],
             )?;
         }
+        let audit_events = required_audit.map(|(_, recovery, cleanup_pending)| {
+            [RequiredAuditEvent::new(
+                "path_deleted",
+                Some(path.to_string()),
+                Some(format!(
+                    "kind={};deactivated_shares={};cleanup={};recovery={recovery}",
+                    if is_directory { "directory" } else { "file" },
+                    ids.len(),
+                    if cleanup_pending {
+                        "pending"
+                    } else {
+                        "complete"
+                    },
+                )),
+            )]
+        });
+        if let (Some((context, _, _)), Some(events)) = (required_audit, audit_events.as_ref()) {
+            insert_required_audits(&transaction, context, events)?;
+        }
         transaction.commit()?;
+        if let (Some((context, _, _)), Some(events)) = (required_audit, audit_events.as_ref()) {
+            trace_required_audits(context, events);
+        }
         Ok(ids.len())
     }
     pub fn set_share_active(&self, id: i64, active: bool) -> rusqlite::Result<bool> {
@@ -272,12 +454,65 @@ impl Database {
             params![id, active as i64],
         )? == 1)
     }
+
+    pub fn set_share_active_and_audit(
+        &self,
+        id: i64,
+        active: bool,
+        context: &AuditContext,
+        action: &'static str,
+    ) -> rusqlite::Result<bool> {
+        self.required_transaction(context, |transaction| {
+            let changed = transaction.execute(
+                "UPDATE shares
+                 SET upload_policy_epoch=upload_policy_epoch+
+                         CASE WHEN active<>?2 THEN 1 ELSE 0 END,
+                     active=?2
+                 WHERE id=?1",
+                params![id, active as i64],
+            )? == 1;
+            let events = changed
+                .then(|| RequiredAuditEvent::new(action, Some(id.to_string()), None))
+                .into_iter()
+                .collect();
+            Ok((changed, events))
+        })
+    }
     pub fn update_share_controls(
         &self,
         id: i64,
         active: Option<bool>,
         strategy: Option<&UploadConflictStrategy>,
         upload_limits: Option<(u64, u64)>,
+    ) -> rusqlite::Result<ShareControlsUpdateOutcome> {
+        self.update_share_controls_internal(id, active, strategy, upload_limits, None)
+    }
+
+    pub fn update_share_controls_and_audit(
+        &self,
+        id: i64,
+        active: Option<bool>,
+        strategy: Option<&UploadConflictStrategy>,
+        upload_limits: Option<(u64, u64)>,
+        context: &AuditContext,
+        events: &[RequiredAuditEvent],
+    ) -> rusqlite::Result<ShareControlsUpdateOutcome> {
+        self.update_share_controls_internal(
+            id,
+            active,
+            strategy,
+            upload_limits,
+            Some((context, events)),
+        )
+    }
+
+    fn update_share_controls_internal(
+        &self,
+        id: i64,
+        active: Option<bool>,
+        strategy: Option<&UploadConflictStrategy>,
+        upload_limits: Option<(u64, u64)>,
+        required_audit: Option<(&AuditContext, &[RequiredAuditEvent])>,
     ) -> rusqlite::Result<ShareControlsUpdateOutcome> {
         let mut connection = self.conn();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -368,7 +603,13 @@ impl Database {
                 upload_limits.map(|value| value.1),
             ],
         )?;
+        if let Some((context, events)) = required_audit {
+            insert_required_audits(&transaction, context, events)?;
+        }
         transaction.commit()?;
+        if let Some((context, events)) = required_audit {
+            trace_required_audits(context, events);
+        }
         Ok(ShareControlsUpdateOutcome::Updated)
     }
 
@@ -377,6 +618,21 @@ impl Database {
             .conn()
             .execute("DELETE FROM shares WHERE id=?1", [id])?
             == 1)
+    }
+
+    pub fn delete_share_and_audit(
+        &self,
+        id: i64,
+        context: &AuditContext,
+    ) -> rusqlite::Result<bool> {
+        self.required_transaction(context, |transaction| {
+            let deleted = transaction.execute("DELETE FROM shares WHERE id=?1", [id])? == 1;
+            let events = deleted
+                .then(|| RequiredAuditEvent::new("share_deleted", Some(id.to_string()), None))
+                .into_iter()
+                .collect();
+            Ok((deleted, events))
+        })
     }
 
     pub fn set_share_password(&self, id: i64, hash: Option<&str>) -> rusqlite::Result<bool> {
@@ -392,5 +648,29 @@ impl Database {
         transaction.execute("DELETE FROM public_unlock_sessions WHERE share_id=?1", [id])?;
         transaction.commit()?;
         Ok(changed)
+    }
+
+    pub fn set_share_password_and_audit(
+        &self,
+        id: i64,
+        hash: Option<&str>,
+        context: &AuditContext,
+        action: &'static str,
+    ) -> rusqlite::Result<bool> {
+        self.required_transaction(context, |transaction| {
+            let changed = transaction.execute(
+                "UPDATE shares
+                 SET upload_policy_epoch=upload_policy_epoch+1,
+                     password_hash=?2
+                 WHERE id=?1",
+                params![id, hash],
+            )? == 1;
+            transaction.execute("DELETE FROM public_unlock_sessions WHERE share_id=?1", [id])?;
+            let events = changed
+                .then(|| RequiredAuditEvent::new(action, Some(id.to_string()), None))
+                .into_iter()
+                .collect();
+            Ok((changed, events))
+        })
     }
 }

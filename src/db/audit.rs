@@ -1,4 +1,7 @@
-use super::{AuditClientIpDeletionOutcome, AuditEvent, Database, MAX_AUDIT_ROWS};
+use super::{
+    insert_required_audits, trace_required_audits, AuditClientIpDeletionOutcome, AuditContext,
+    AuditEvent, Database, RequiredAuditEvent, MAX_AUDIT_ROWS,
+};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -113,6 +116,22 @@ impl Database {
         &self,
         fallback_logging_enabled: bool,
     ) -> rusqlite::Result<AuditClientIpDeletionOutcome> {
+        self.delete_audit_client_ips_if_disabled_internal(fallback_logging_enabled, None)
+    }
+
+    pub fn delete_audit_client_ips_if_disabled_and_audit(
+        &self,
+        fallback_logging_enabled: bool,
+        context: &AuditContext,
+    ) -> rusqlite::Result<AuditClientIpDeletionOutcome> {
+        self.delete_audit_client_ips_if_disabled_internal(fallback_logging_enabled, Some(context))
+    }
+
+    fn delete_audit_client_ips_if_disabled_internal(
+        &self,
+        fallback_logging_enabled: bool,
+        required_audit: Option<&AuditContext>,
+    ) -> rusqlite::Result<AuditClientIpDeletionOutcome> {
         let mut connection = self.conn();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if persisted_audit_client_ip_enabled(&transaction, fallback_logging_enabled)? {
@@ -122,7 +141,18 @@ impl Database {
             "UPDATE audit SET client_ip=NULL WHERE client_ip IS NOT NULL",
             [],
         )?;
+        let audit_events = [RequiredAuditEvent::new(
+            "audit_client_ips_deleted",
+            None,
+            Some(format!("deleted={deleted}")),
+        )];
+        if let Some(context) = required_audit {
+            insert_required_audits(&transaction, context, &audit_events)?;
+        }
         transaction.commit()?;
+        if let Some(context) = required_audit {
+            trace_required_audits(context, &audit_events);
+        }
         Ok(AuditClientIpDeletionOutcome::Deleted(deleted))
     }
 

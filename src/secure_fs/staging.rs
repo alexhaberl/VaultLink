@@ -4,17 +4,17 @@ use std::{ffi::OsStr, io};
 
 use crate::path_security;
 
-use super::recovery::{
-    entry_identity_state, entry_matches_identity, remove_file_operation, remove_pending_manifest,
-    replace_delete_operation_phase, replace_file_operation, rollback_pending_delete,
-    write_file_operation, write_pending_manifest,
+use super::identity::{entry_identity_state, entry_matches_identity};
+use super::journal::{
+    remove_file_operation, remove_pending_manifest, replace_delete_operation_phase,
+    replace_file_operation, rollback_pending_delete, write_file_operation, write_pending_manifest,
 };
+use super::private_entries::{active_upload_fragment_guard, unregister_upload_fragment};
 use super::{
-    active_upload_fragment_guard, deletion_pending_name, deletion_tombstone_name,
-    directory_scan_from_file, join_relative, linux, split_parent_name, unregister_upload_fragment,
-    DeleteCommitOutcome, DurableDeletePhase, DurableFileOperation, DurableRenamePhase,
-    EntryIdentityState, EntryKind, EntryStatus, PendingDeleteCommit, SecureRoot, StagedDelete,
-    StagedRename,
+    deletion_pending_name, deletion_tombstone_name, directory_scan_from_file, join_relative, linux,
+    split_parent_name, DeleteCommitOutcome, DurableDeletePhase, DurableFileOperation,
+    DurableRenamePhase, EntryIdentityState, EntryKind, EntryStatus, PendingDeleteCommit,
+    SecureRoot, StagedDelete, StagedRename,
 };
 
 impl SecureRoot {

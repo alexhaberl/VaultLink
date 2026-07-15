@@ -1,5 +1,6 @@
 use super::{
-    token_hash, Database, Permission, TransferAvailabilityOutcome, TransferLeaseBeginOutcome,
+    insert_required_audits, token_hash, trace_required_audits, AuditContext, Database, Permission,
+    RequiredAuditEvent, TransferAvailabilityOutcome, TransferLeaseBeginOutcome,
     TransferLeaseCancelOutcome, TransferLeaseCompleteOutcome, TransferLeaseHeartbeatOutcome,
     TransferMonthlyCounts, UploadReservationBeginOutcome, UploadReservationCommitOutcome,
     UploadReservationExtendOutcome, MAX_SQLITE_UNSIGNED, TRANSFER_LEASE_MAX_LIFETIME_SECONDS,
@@ -55,6 +56,15 @@ fn increment_transfer_monthly_count(
         params![month, action],
     )?;
     Ok(())
+}
+
+fn required_transfer_audit_action(action: &str) -> rusqlite::Result<&'static str> {
+    match action {
+        "download" => Ok("download"),
+        "zip_download" => Ok("zip_download"),
+        "preview" => Ok("preview"),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 fn cleanup_transfer_state(transaction: &Transaction<'_>, now: &str) -> rusqlite::Result<()> {
@@ -330,6 +340,24 @@ impl Database {
         token: &str,
         uploaded_bytes: u64,
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
+        self.commit_upload_reservation_internal(token, uploaded_bytes, None)
+    }
+
+    pub fn commit_upload_reservation_and_audit(
+        &self,
+        token: &str,
+        uploaded_bytes: u64,
+        context: &AuditContext,
+    ) -> rusqlite::Result<UploadReservationCommitOutcome> {
+        self.commit_upload_reservation_internal(token, uploaded_bytes, Some(context))
+    }
+
+    fn commit_upload_reservation_internal(
+        &self,
+        token: &str,
+        uploaded_bytes: u64,
+        required_audit: Option<&AuditContext>,
+    ) -> rusqlite::Result<UploadReservationCommitOutcome> {
         let reservation_hash = token_hash(token);
         let now_text = Utc::now().to_rfc3339();
         let mut connection = self.conn();
@@ -390,7 +418,18 @@ impl Database {
             "DELETE FROM public_upload_reservations WHERE token_hash=?1",
             [reservation_hash],
         )?;
+        let audit_events = [RequiredAuditEvent::new(
+            "upload_quota_committed",
+            Some(share_id.to_string()),
+            Some(format!("bytes={uploaded_bytes};files=1")),
+        )];
+        if let Some(context) = required_audit {
+            insert_required_audits(&transaction, context, &audit_events)?;
+        }
         transaction.commit()?;
+        if let Some(context) = required_audit {
+            trace_required_audits(context, &audit_events);
+        }
         Ok(UploadReservationCommitOutcome::Committed)
     }
 
@@ -557,6 +596,26 @@ impl Database {
         &self,
         lease_token: &str,
     ) -> rusqlite::Result<TransferLeaseCompleteOutcome> {
+        self.complete_transfer_lease_internal(lease_token, None)
+    }
+
+    pub fn complete_transfer_lease_and_audit(
+        &self,
+        lease_token: &str,
+        context: &AuditContext,
+        // Retained for HTTP-call-site compatibility. Audit authority comes from
+        // the grant loaded below, never from these caller-provided hints.
+        _caller_action: &'static str,
+        _caller_share_id: i64,
+    ) -> rusqlite::Result<TransferLeaseCompleteOutcome> {
+        self.complete_transfer_lease_internal(lease_token, Some(context))
+    }
+
+    fn complete_transfer_lease_internal(
+        &self,
+        lease_token: &str,
+        required_audit: Option<&AuditContext>,
+    ) -> rusqlite::Result<TransferLeaseCompleteOutcome> {
         let (now, expires) = transfer_deadlines();
         let lease_token_hash = token_hash(lease_token);
         let mut connection = self.conn();
@@ -610,7 +669,23 @@ impl Database {
             "DELETE FROM public_transfer_leases WHERE token_hash=?1",
             [lease_token_hash],
         )?;
+        let audit_events = match (outcome, required_audit) {
+            (TransferLeaseCompleteOutcome::Counted, Some(_)) => {
+                vec![RequiredAuditEvent::new(
+                    required_transfer_audit_action(&action)?,
+                    Some(share_id.to_string()),
+                    Some("completed transfer session".into()),
+                )]
+            }
+            _ => Vec::new(),
+        };
+        if let Some(context) = required_audit {
+            insert_required_audits(&transaction, context, &audit_events)?;
+        }
         transaction.commit()?;
+        if let Some(context) = required_audit {
+            trace_required_audits(context, &audit_events);
+        }
         Ok(outcome)
     }
 
@@ -658,6 +733,22 @@ impl Database {
     pub fn heartbeat_transfer_lease(
         &self,
         lease_token: &str,
+    ) -> rusqlite::Result<TransferLeaseHeartbeatOutcome> {
+        self.heartbeat_transfer_lease_internal(lease_token, None)
+    }
+
+    pub fn heartbeat_transfer_lease_and_audit(
+        &self,
+        lease_token: &str,
+        context: &AuditContext,
+    ) -> rusqlite::Result<TransferLeaseHeartbeatOutcome> {
+        self.heartbeat_transfer_lease_internal(lease_token, Some(context))
+    }
+
+    fn heartbeat_transfer_lease_internal(
+        &self,
+        lease_token: &str,
+        required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<TransferLeaseHeartbeatOutcome> {
         let now_datetime = Utc::now();
         let now = now_datetime.to_rfc3339();
@@ -738,7 +829,23 @@ impl Database {
                 [lease_token_hash],
             )?;
             cleanup_transfer_state(&transaction, &now)?;
+            let audit_events = match (outcome, required_audit) {
+                (TransferLeaseHeartbeatOutcome::CappedAndCounted, Some(_)) => {
+                    vec![RequiredAuditEvent::new(
+                        required_transfer_audit_action(&action)?,
+                        Some(share_id.to_string()),
+                        Some("capped transfer session".into()),
+                    )]
+                }
+                _ => Vec::new(),
+            };
+            if let Some(context) = required_audit {
+                insert_required_audits(&transaction, context, &audit_events)?;
+            }
             transaction.commit()?;
+            if let Some(context) = required_audit {
+                trace_required_audits(context, &audit_events);
+            }
             return Ok(outcome);
         }
         if lease_expires_at <= now_datetime {

@@ -2,10 +2,10 @@ use std::{ffi::OsString, fs::File, io, path::Path, sync::Arc};
 
 use crate::path_security;
 
+use super::private_entries::is_upload_fragment_name;
 use super::{
-    is_deletion_tombstone_name, is_upload_fragment_name, split_parent_name, validated,
-    DirectoryScan, DirectoryScanBatch, DirectoryScanItem, Entry, EntryKind, EntryStatus,
-    SecureDirectory, SecureFile, SecureRoot,
+    is_deletion_tombstone_name, split_parent_name, validated, DirectoryScan, DirectoryScanBatch,
+    DirectoryScanItem, Entry, EntryKind, EntryStatus, SecureDirectory, SecureFile, SecureRoot,
 };
 
 impl DirectoryScanItem {

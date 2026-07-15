@@ -28,6 +28,10 @@ For rollback from 0.4.1+ to any pre-0.4.1 version, stop VaultLink and every SMB 
 
 ## Upgrade
 
+Before upgrading an externally bound reverse-proxy deployment, update the candidate configuration for the fail-closed peer boundary. `reverse_proxy.trusted_proxies` is now both the direct TCP-peer allowlist and the forwarded-header trust list. Include the real proxy address and the local readiness peer explicitly: `127.0.0.1` for `0.0.0.0`, `::1` for `[::]`, or the concrete local listen address. Keep `allow_non_loopback = true`. A candidate that omits its readiness peer is rejected during preflight, and an unlisted direct client is rejected before HTTP. Install the matching `deploy/vaultlink-external-proxy-network.conf` drop-in with the same proxy address.
+
+The candidate also makes security audit persistence fail closed. Database-only mutations return `503 audit_unavailable` when their shared SQLite transaction cannot insert the audit row. A filesystem mutation that is already visible returns `202 audit_durability_uncertain` (or a browser warning) and must not be retried by clients. Rename/delete recovery retains the existing journal format and records its eventual completion as actor `system` without a client IP. No SQLite schema migration is required for this change.
+
 1. Map `x86_64` to the `amd64` release and `aarch64`/`arm64` to the `arm64` release. Download the matching archive, standalone binary, SBOM, `SHA256SUMS-ARCH`, and their available `.minisig` files. Reject all other host architectures.
 2. Extract it outside `/opt/vaultlink`.
 3. Keep the current live configuration untouched and run `sudo deploy/vaultlink-upgrade.sh /path/to/new/vaultlink /path/to/new-config.toml`. For every upgrade across the pre-0.4.1/0.4.1+ storage-layout boundary, the script verifies that `vaultlink.service` was already stopped; it refuses to perform this external-storage migration from an active service. The upgrade entry point rejects every semantic version downgrade and directs operators to the rollback script; the rollback entry point likewise rejects semantic roll-forwards and directs operators to the upgrade script.

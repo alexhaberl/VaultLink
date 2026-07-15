@@ -2467,6 +2467,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webauthn-rs",
+ "zeroize",
 ]
 
 [[package]]

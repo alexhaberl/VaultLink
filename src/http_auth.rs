@@ -10,13 +10,16 @@ use std::{
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::{
-    db::{Database, Session, Share},
+    auth,
+    db::{AuditContext, Database, Session, Share},
     runtime::RuntimeSettings,
     AppState,
 };
 
 pub const SESSION_COOKIE: &str = "vaultlink_session";
 pub const SECURE_SESSION_COOKIE: &str = "__Host-vaultlink_session";
+pub(crate) const AUDIT_UNAVAILABLE_MESSAGE: &str =
+    "Sicherheitsprotokoll vorübergehend nicht verfügbar";
 const TRANSFER_COOKIE_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 
 tokio::task_local! {
@@ -43,22 +46,6 @@ pub fn enabled_audit_client_ip(state: &AppState) -> Option<String> {
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string())
-}
-
-/// Synchronous audit companion for mutations already running in a blocking
-/// database task. Calling this before that task returns guarantees the audit is
-/// attempted even if its HTTP request or the async runtime is shutting down.
-pub fn audit_sync(
-    database: &Database,
-    actor: &str,
-    action: &'static str,
-    object: Option<&str>,
-    detail: Option<&str>,
-    client_ip: Option<&str>,
-) {
-    if let Err(error) = database.audit_with_client_ip(actor, action, object, detail, client_ip) {
-        tracing::error!(?error, action, "could not persist audit event");
-    }
 }
 
 pub fn current_client_limit_key() -> IpAddr {
@@ -114,6 +101,14 @@ pub struct HttpAuthError {
     pub status: StatusCode,
     pub message: &'static str,
     pub redirect: Option<&'static str>,
+    pub kind: HttpAuthErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpAuthErrorKind {
+    Request,
+    AuditUnavailable,
+    CapacityUnavailable,
 }
 
 impl HttpAuthError {
@@ -122,6 +117,20 @@ impl HttpAuthError {
             status,
             message,
             redirect: None,
+            kind: HttpAuthErrorKind::Request,
+        }
+    }
+
+    pub(crate) fn with_kind(
+        status: StatusCode,
+        message: &'static str,
+        kind: HttpAuthErrorKind,
+    ) -> Self {
+        Self {
+            status,
+            message,
+            redirect: None,
+            kind,
         }
     }
 
@@ -130,6 +139,7 @@ impl HttpAuthError {
             status: StatusCode::SEE_OTHER,
             message: location,
             redirect: Some(location),
+            kind: HttpAuthErrorKind::Request,
         }
     }
 }
@@ -141,13 +151,17 @@ pub fn internal<T>(_: T) -> HttpAuthError {
 }
 
 fn argon2_busy<T>(_: T) -> HttpAuthError {
-    HttpAuthError::status(
+    HttpAuthError::with_kind(
         StatusCode::SERVICE_UNAVAILABLE,
         "Passwortverarbeitung vorübergehend ausgelastet",
+        HttpAuthErrorKind::CapacityUnavailable,
     )
 }
 
-pub async fn hash_password_admitted(state: &AppState, password: String) -> Result<String> {
+pub(crate) async fn hash_password_admitted(
+    state: &AppState,
+    password: crate::sensitive::SecretString,
+) -> Result<String> {
     let permit = state
         .argon2_admission
         .clone()
@@ -157,17 +171,17 @@ pub async fn hash_password_admitted(state: &AppState, password: String) -> Resul
         // Keep the owned permit in the blocking task so cancelling the request
         // cannot release capacity while Argon2 is still consuming CPU and RAM.
         let _permit = permit;
-        crate::auth::hash_password(&password)
+        crate::auth::hash_secret_password(password)
     })
     .await
     .map_err(internal)?
     .map_err(internal)
 }
 
-pub async fn verify_password_admitted(
+pub(crate) async fn verify_password_admitted(
     state: &AppState,
     password_hash: Option<String>,
-    password: String,
+    password: crate::sensitive::SecretString,
 ) -> Result<bool> {
     let permit = state
         .argon2_admission
@@ -179,15 +193,36 @@ pub async fn verify_password_admitted(
         // overload response and both paths consume one admitted Argon2 job.
         let _permit = permit;
         match password_hash {
-            Some(hash) => crate::auth::verify_password(&hash, &password),
+            Some(hash) => crate::auth::verify_secret_password(hash, password),
             None => {
-                let _ = crate::auth::hash_password(&password);
+                let _ = crate::auth::hash_secret_password(password);
                 false
             }
         }
     })
     .await
     .map_err(internal)
+}
+
+pub(crate) async fn password_login_admitted(
+    state: &AppState,
+    command: crate::services::auth::PasswordLoginCommand,
+) -> Result<crate::services::auth::PasswordLoginOutcome> {
+    let permit = state
+        .argon2_admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(argon2_busy)?;
+    let service = crate::services::auth::AuthService::new(state.db.clone());
+    tokio::task::spawn_blocking(move || {
+        // The complete service operation owns the admitted Argon2 job. Unknown
+        // and known accounts therefore share capacity and overload behavior.
+        let _permit = permit;
+        service.login_with_password(command)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(required_database_error)
 }
 
 pub async fn database<T, F>(database: Database, operation: F) -> Result<T>
@@ -201,7 +236,36 @@ where
         .map_err(internal)
 }
 
-pub async fn audit(
+pub async fn required_database<T, F>(database: Database, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Database) -> rusqlite::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(database))
+        .await
+        .map_err(internal)?
+        .map_err(required_database_error)
+}
+
+fn required_database_error(error: rusqlite::Error) -> HttpAuthError {
+    if crate::db::is_audit_unavailable(&error) {
+        tracing::error!(
+            error = %error,
+            "required audit transaction rolled back"
+        );
+        HttpAuthError::with_kind(
+            StatusCode::SERVICE_UNAVAILABLE,
+            AUDIT_UNAVAILABLE_MESSAGE,
+            HttpAuthErrorKind::AuditUnavailable,
+        )
+    } else {
+        internal(error)
+    }
+}
+
+/// Persists a non-transactional observation. Successful security mutations
+/// must use a required audit transaction instead.
+pub async fn audit_observation(
     state: &AppState,
     actor: String,
     action: &'static str,
@@ -279,7 +343,8 @@ pub async fn commit_runtime_settings(
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
-    database(state.db.clone(), move |database| {
+    let audit_context = AuditContext::new(audit_actor, audit_client_ip);
+    required_database(state.db.clone(), move |database| {
         // A cancelled request drops only the JoinHandle; the blocking database
         // operation keeps this owned guard until the runtime/WebAuthn snapshot
         // and SQLite commit have advanced together.
@@ -288,15 +353,12 @@ pub async fn commit_runtime_settings(
         // therefore see the old snapshot until SQLite has committed the replacement.
         let mut current = runtime.write().expect("runtime settings lock poisoned");
         let pairs = next.pairs();
-        database.replace_runtime_settings(&pairs, admin_id)?;
-        audit_sync(
-            &database,
-            &audit_actor,
-            "settings_updated",
-            None,
-            Some(&audit_detail),
-            audit_client_ip.as_deref(),
-        );
+        database.replace_runtime_settings_and_audit(
+            &pairs,
+            admin_id,
+            &audit_context,
+            audit_detail,
+        )?;
         *current = next;
         if let Some(replacement) = replacement_webauthn {
             *webauthn.write().expect("WebAuthn service lock poisoned") = replacement;
@@ -371,7 +433,7 @@ pub async fn session(
 }
 
 pub fn csrf(session: &Session, value: &str) -> Result<()> {
-    if session.csrf_token.as_bytes() != value.as_bytes() {
+    if !auth::constant_time_eq(&session.csrf_token, value) {
         return Err(HttpAuthError::status(
             StatusCode::FORBIDDEN,
             "Ungültiges CSRF-Token",
@@ -574,18 +636,14 @@ mod tests {
         let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
 
         let request = tokio::spawn(async move {
-            database(operation_database, move |database| {
+            required_database(operation_database, move |database| {
                 let _ = started_sender.send(());
                 release_receiver.recv().unwrap();
-                assert!(database.reset_admin_password(1, "new-hash")?);
-                audit_sync(
-                    &database,
-                    "admin",
-                    "admin_password_reset",
-                    Some("1"),
-                    None,
-                    None,
-                );
+                assert!(database.reset_admin_password_and_audit(
+                    1,
+                    "new-hash",
+                    &AuditContext::new("admin", None),
+                )?);
                 let _ = finished_sender.send(());
                 Ok(())
             })

@@ -511,6 +511,8 @@ catalog! {
     PREVIEW_NOT_ALLOWED, "error.preview_not_allowed", "Vorschau nicht erlaubt", "Preview not allowed";
     FILE_PATH_MISSING, "error.file_path_missing", "Dateipfad fehlt", "File path missing";
 
+    AUDIT_DURABILITY_UNCERTAIN, "files.audit_durability_uncertain", "Die Dateioperation wurde ausgefuehrt, aber ihre Audit-Dauerhaftigkeit ist unklar. Nicht erneut ausfuehren; die Wiederherstellung schliesst sie sicher ab.", "The file operation completed, but its audit durability is uncertain. Do not retry it; recovery will finish it safely.";
+
     CURRENT_ADMIN, "admins.current", "Aktueller Admin", "Current admin";
     ACTIVE_ADMINS, "admins.active", "Aktive Admins", "Active admins";
     INACTIVE_ADMINS, "admins.inactive", "Stillgelegte Admins", "Inactive admins";

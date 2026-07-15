@@ -1,4 +1,6 @@
-use super::Database;
+use super::{
+    insert_required_audits, trace_required_audits, AuditContext, Database, RequiredAuditEvent,
+};
 use chrono::Utc;
 use rusqlite::{params, TransactionBehavior};
 
@@ -16,6 +18,25 @@ impl Database {
         settings: &[(&str, String)],
         admin: i64,
     ) -> rusqlite::Result<()> {
+        self.replace_runtime_settings_internal(settings, admin, None)
+    }
+
+    pub fn replace_runtime_settings_and_audit(
+        &self,
+        settings: &[(&str, String)],
+        admin: i64,
+        context: &AuditContext,
+        audit_detail: String,
+    ) -> rusqlite::Result<()> {
+        self.replace_runtime_settings_internal(settings, admin, Some((context, audit_detail)))
+    }
+
+    fn replace_runtime_settings_internal(
+        &self,
+        settings: &[(&str, String)],
+        admin: i64,
+        required_audit: Option<(&AuditContext, String)>,
+    ) -> rusqlite::Result<()> {
         let mut connection = self.conn();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM runtime_settings", [])?;
@@ -29,6 +50,22 @@ impl Database {
                 statement.execute(params![*key, value.as_str(), admin, updated_at])?;
             }
         }
-        transaction.commit()
+        let audit_events = required_audit.as_ref().map(|(_, detail)| {
+            [RequiredAuditEvent::new(
+                "settings_updated",
+                None,
+                Some(detail.clone()),
+            )]
+        });
+        if let (Some((context, _)), Some(events)) = (required_audit.as_ref(), audit_events.as_ref())
+        {
+            insert_required_audits(&transaction, context, events)?;
+        }
+        transaction.commit()?;
+        if let (Some((context, _)), Some(events)) = (required_audit.as_ref(), audit_events.as_ref())
+        {
+            trace_required_audits(context, events);
+        }
+        Ok(())
     }
 }

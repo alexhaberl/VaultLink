@@ -8,6 +8,12 @@ GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sh
 
 ## 1. Sicherheitskonzept
 
+Erfolgreiche sicherheitsrelevante SQLite-Mutationen und ihre Auditzeilen teilen eine `IMMEDIATE`-Transaktion. Ein Auditfehler rollt die Mutation zurueck; die JSON-API antwortet mit `503 audit_unavailable`. Abgelehnte Logins und andere reine Beobachtungen bleiben Best Effort, weil keine Fachmutation zurueckzurollen ist.
+
+Ist eine Dateioperation bereits im Dateisystem sichtbar, wird ein nachfolgender Auditfehler nicht als fehlgeschlagene Operation ausgegeben. API- und Queue-Clients erhalten `202` plus `audit_durability_uncertain`; Browser zeigen eine Warnung. Clients duerfen diese Antwort nicht automatisch wiederholen. Rename/Delete bleiben im unveraenderten SecureFS-Journal und werden einmalig als Actor `system` ohne Client-IP abgeschlossen.
+
+Anwendungseigene Passwort-, TOTP- und Share-Secret-Puffer verwenden einen zeroisierenden Wrapper ohne allgemeines `Clone`, `Display` oder `Serialize`. Unvermeidbare Kopien sind explizit benannt. Framework-, Serde-, SQLite-, Formatierungs- und Response-Puffer koennen dadurch nicht vollstaendig garantiert bereinigt werden; die Massnahme reduziert Lebensdauer und vermeidbare Kopien.
+
 - Dateizugriffe sind Linux descriptor-relativ. `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` bindet Adminzugriffe an den Storage-Root und öffentliche Zugriffe zusätzlich an eine pro Freigabe verengte Directory-/File-Capability. Im Co-Writer-Modus kommt `RESOLVE_NO_SYMLINKS` hinzu, damit externe Writer keinen gespeicherten Share-Pfad umbiegen können. Ein Kernel ohne die benötigten APIs wird mit verständlichem Startfehler abgewiesen.
 - Relative Nutzpfade werden nach genau einer HTTP-Dekodierung geprüft und verbieten absolute Pfade, `..`, Backslashes und NUL. Uploadnamen folgen zusätzlich einer plattformübergreifenden Policy, damit Windows-Prefixe und reservierte Namen nie aus dem Zielordner aufgelöst werden.
 - Uploads werden als zufällige `0600`-Temporärdateien im geschützten internen Upload-Staging geschrieben, geflusht und per `fsync` gesichert. Die Veröffentlichung in den sichtbaren Baum erfolgt atomar mit `renameat2(RENAME_NOREPLACE)`. Bei `external_writers = true` ist Überschreiben in UI, API und Uploadpfad ausnahmslos deaktiviert.
@@ -15,7 +21,7 @@ GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sh
 - Adminpasswörter verwenden Argon2id. Nach dem Passwort ist TOTP oder ein registrierter WebAuthn/FIDO2-Sicherheitsschlüssel (zum Beispiel YubiKey) erforderlich. Sessions sind zufällige serverseitige Bearer-Tokens, deren Hash in SQLite liegt.
 - Cookies sind `HttpOnly`, `SameSite=Strict` und in Production `Secure`.
 - Mutierende Adminaktionen verlangen CSRF. Login und Share-Unlock sind rate-limitiert.
-- Forwarded-Header werden nur im Reverse-Proxy-Modus und nur von `trusted_proxies` akzeptiert.
+- Im Reverse-Proxy-Modus ist `trusted_proxies` eine exakte TCP-Peer-Allowlist; nur für diese Peers werden zusätzlich Forwarded-Header ausgewertet.
 - Security Header: CSP, `X-Content-Type-Options: nosniff`, Frame-Schutz, Referrer-Policy, Permissions-Policy und HSTS nur bei HTTPS.
 - Audit liegt in SQLite und wird strukturiert an journald gespiegelt. Passwörter, TOTP-Secrets, Sessiontokens und Share-Tokens werden nicht geloggt.
 
@@ -28,15 +34,20 @@ VaultLink/
 ├── src/
 │   ├── main.rs             CLI, Serverstart, TLS/ACME
 │   ├── config.rs           TOML und Startvalidierung
-│   ├── api.rs              session-basierte JSON-API unter /api/v1
+│   ├── api.rs              stabile JSON-API-Fassade und Router unter /api/v1
+│   ├── api/                Auth-, Files-, Shares-, Admin-, Settings- und Public-Handler
 │   ├── auth.rs             Argon2id, TOTP, Rate Limit
-│   ├── db.rs               Schema, Sessions, Shares, Audit
+│   ├── db.rs               DB-Fassade, gemeinsame Typen und Transaktionskern
+│   ├── db/                 fachliche Auth-, Share-, Transfer-, Settings- und Audit-Operationen
 │   ├── file_ops.rs         transaktionale Rename-/Delete-Operationen
 │   ├── http_auth.rs        gemeinsame Session-, Cookie-, CSRF- und Audit-Helfer
 │   ├── i18n.rs             serverseitige DE-/EN-Lokalisierung
 │   ├── multipart_guard.rs  Streaming-Grenzen für Multipart-Header
 │   ├── path_security.rs    Pfadvalidierung
-│   ├── secure_fs.rs        openat2/renameat2 und atomare Uploads
+│   ├── secure_fs.rs        Secure-FS-Fassade für openat2/renameat2
+│   ├── secure_fs/          Capability-, Identity-, Journal-, Upload- und Recovery-Bausteine
+│   ├── sensitive.rs        zeroisierende SecretString-Abstraktion
+│   ├── services/           transportneutrale Auth-, Share-, Admin- und File-Services
 │   ├── storage_mount.rs    Mount- und SMB-Vertrauensgrenze
 │   ├── range.rs            einzelner HTTP-Byte-Range-Parser
 │   ├── proxy.rs            vertrauenswürdige Proxy-Header
@@ -44,7 +55,8 @@ VaultLink/
 │   ├── setup.rs            lokales Bootstrap-Setup-UI
 │   ├── ui.rs               gemeinsame Styles, Icons und UI-Bausteine
 │   ├── webauthn.rs         WebAuthn-Ceremony-State und Credentials
-│   └── web.rs              Routen, HTML, Upload/Download/ZIP/Preview
+│   ├── web.rs              stabile HTML-Fassade, Router und API-Re-Exports
+│   └── web/                Middleware, Rendering, Browsing, Transfer, Upload und Fachbereiche
 ├── config/                 Beispielkonfigurationen
 ├── deploy/                 systemd, Caddy, Upgrade/Rollback
 ├── docs/                   Upgrade, Rollback, Release-Gates
@@ -231,7 +243,23 @@ Preview:
 
 ### Reverse Proxy (empfohlen)
 
-VaultLink lauscht lokal, z. B. auf `127.0.0.1:8080`; Caddy oder Nginx terminiert HTTPS. Forwarded-Header werden nur aus `trusted_proxies` akzeptiert. Für Nginx/Nginx Proxy Manager bei großen Uploads:
+VaultLink lauscht lokal, z. B. auf `127.0.0.1:8080`; Caddy oder Nginx terminiert HTTPS. `trusted_proxies` ist zugleich die exakte Allowlist der direkten TCP-Peers und die Vertrauensgrenze für Forwarded-Header. Nicht gelistete Peers werden bereits vor der HTTP-Verarbeitung abgewiesen. IPv4-mapped-IPv6-Peers werden vor dem exakten Vergleich auf ihre IPv4-Adresse kanonisiert.
+
+Bei einem externen Proxy muss der nicht lokale Bind zusätzlich mit `allow_non_loopback = true` freigeschaltet werden. Die tatsächliche Proxy-IP und der Peer der lokalen Readiness-Prüfung müssen beide explizit eingetragen sein. Für einen IPv4-Wildcard-Listener ist das `127.0.0.1`, für einen IPv6-Wildcard-Listener `::1`; bei einer konkreten Bind-Adresse ist es diese lokale Adresse. Beispiel:
+
+```toml
+[server]
+mode = "reverse_proxy"
+listen_address = "0.0.0.0:8080"
+
+[reverse_proxy]
+enabled = true
+allow_non_loopback = true
+trusted_proxies = ["192.0.2.10", "127.0.0.1"]
+trust_x_forwarded_headers = true
+```
+
+`192.0.2.10` ist durch die reale Proxy-IP zu ersetzen. Das passende systemd-Netzwerk-Drop-in ist [deploy/vaultlink-external-proxy-network.conf](deploy/vaultlink-external-proxy-network.conf). Für Nginx/Nginx Proxy Manager bei großen Uploads:
 
 ```nginx
 client_max_body_size 1g;

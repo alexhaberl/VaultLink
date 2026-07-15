@@ -1,4 +1,28 @@
-use super::*;
+use std::net::SocketAddr;
+
+use axum::{
+    extract::{ConnectInfo, Form, Json, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Response},
+};
+use chrono::{Duration, Utc};
+use serde::Deserialize;
+
+use super::{decode_security_keys, esc, internal, plain_page, AppError, CsrfForm, Result};
+use crate::{
+    auth,
+    db::AuditContext,
+    http_auth::{
+        audit_observation, clear_session_cookie, csrf, database, enabled_audit_client_ip,
+        make_session_cookie, password_login_admitted, redirect_with_cookie, required_database,
+        session, MissingSession,
+    },
+    proxy,
+    services::auth::{
+        AuthService, PasswordLoginCommand, PasswordLoginOutcome, TotpLoginCommand, TotpLoginOutcome,
+    },
+    AppState,
+};
 
 pub(super) async fn login_page() -> Html<String> {
     Html(plain_page(
@@ -10,7 +34,7 @@ pub(super) async fn login_page() -> Html<String> {
 #[derive(Deserialize)]
 pub(super) struct LoginForm {
     username: String,
-    password: String,
+    password: crate::sensitive::SecretString,
 }
 
 pub(super) async fn login(
@@ -41,52 +65,27 @@ pub(super) async fn login(
             "Zu viele Anmeldeversuche",
         ));
     }
-    if form.password.len() > auth::MAX_PASSWORD_BYTES {
+    if form.password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    let username = form.username.clone();
-    let admin = database(state.db.clone(), move |db| db.admin(&username)).await?;
-    let expected_password_hash = admin.as_ref().map(|admin| admin.password_hash.clone());
-    let verification_hash = expected_password_hash.clone();
-    let password = form.password;
-    let valid = verify_password_admitted(&state, verification_hash, password).await?;
-    if !valid {
-        audit(&state, form.username, "login_failed", None, None).await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
-    }
-    let a = admin.unwrap();
+    let attempted_username = form.username.clone();
     let token = auth::random_token(32);
     let csrf = auth::random_token(24);
-    let session_token = token.clone();
-    let session_csrf = csrf.clone();
     let expires = Utc::now() + Duration::hours(state.config.security.session_hours);
-    let admin_id = a.id;
-    let audit_actor = a.username;
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    let expected_password_hash = expected_password_hash.expect("valid password requires a hash");
-    let outcome = database(state.db.clone(), move |db| {
-        let outcome = db.create_session_for_verified_password(
-            &session_token,
-            admin_id,
-            &expected_password_hash,
-            &session_csrf,
-            expires,
-        )?;
-        if outcome == PasswordSessionCreationOutcome::Created {
-            audit_sync(
-                &db,
-                &audit_actor,
-                "password_verified",
-                None,
-                None,
-                audit_client_ip.as_deref(),
-            );
-        }
-        Ok(outcome)
-    })
+    let outcome = password_login_admitted(
+        &state,
+        PasswordLoginCommand {
+            username: form.username,
+            password: form.password,
+            session_token: token.clone(),
+            csrf_token: csrf,
+            expires_at: expires,
+            audit_client_ip: enabled_audit_client_ip(&state),
+        },
+    )
     .await?;
-    if outcome != PasswordSessionCreationOutcome::Created {
-        audit(&state, form.username, "login_failed", None, None).await;
+    if outcome == PasswordLoginOutcome::InvalidCredentials {
+        audit_observation(&state, attempted_username, "login_failed", None, None).await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
     // Successful password verifications remain in the fixed window as well. This
@@ -130,7 +129,7 @@ pub(super) async fn mfa_page(
 #[derive(Deserialize)]
 pub(super) struct MfaForm {
     csrf: String,
-    code: String,
+    code: crate::sensitive::SecretString,
 }
 
 pub(super) async fn mfa(
@@ -147,45 +146,31 @@ pub(super) async fn mfa(
             "Zu viele MFA-Versuche",
         ));
     }
-    let username = s.username.clone();
-    let admin = database(state.db.clone(), move |db| db.admin(&username))
-        .await?
-        .ok_or_else(|| internal(()))?;
-    let Some(totp_step) = auth::matching_totp_step_now(&admin.totp_secret, &form.code) else {
-        audit(&state, s.username, "mfa_failed", None, None).await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
-    };
-    let admin_id = s.admin_id;
     let new_token = auth::random_token(32);
     let new_csrf = auth::random_token(24);
-    let rotated_token = new_token.clone();
-    let rotated_csrf = new_csrf.clone();
-    let audit_actor = s.username.clone();
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    let accepted = database(state.db.clone(), move |db| {
-        let accepted = db.verify_mfa_with_totp_step(
-            &token,
-            &rotated_token,
-            &rotated_csrf,
-            admin_id,
-            totp_step,
-        )?;
-        if accepted {
-            audit_sync(
-                &db,
-                &audit_actor,
-                "login_success",
-                None,
-                None,
-                audit_client_ip.as_deref(),
-            );
-        }
-        Ok(accepted)
+    let command = TotpLoginCommand {
+        username: s.username.clone(),
+        admin_id: s.admin_id,
+        current_session_token: token,
+        code: form.code,
+        rotated_session_token: new_token.clone(),
+        rotated_csrf_token: new_csrf,
+        audit_client_ip: enabled_audit_client_ip(&state),
+    };
+    let outcome = required_database(state.db.clone(), move |db| {
+        AuthService::new(db).login_with_totp(command)
     })
     .await?;
-    if !accepted {
-        audit(&state, s.username, "mfa_replayed", None, None).await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
+    match outcome {
+        TotpLoginOutcome::Created => {}
+        TotpLoginOutcome::InvalidCode => {
+            audit_observation(&state, s.username, "mfa_failed", None, None).await;
+            return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
+        }
+        TotpLoginOutcome::ReplayedOrStale => {
+            audit_observation(&state, s.username, "mfa_replayed", None, None).await;
+            return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
+        }
     }
     state.limiter.success(&key);
     Ok(redirect_with_cookie(
@@ -292,10 +277,10 @@ pub(super) async fn finish_security_key_authentication(
     let new_csrf = auth::random_token(24);
     let rotated_token = new_token.clone();
     let rotated_csrf = new_csrf.clone();
-    let audit_actor = session.username.clone();
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    let completed = database(state.db.clone(), move |db| {
-        let completed = db.complete_webauthn_mfa(
+    let audit_context =
+        AuditContext::new(session.username.clone(), enabled_audit_client_ip(&state));
+    let completed = required_database(state.db.clone(), move |db| {
+        db.complete_webauthn_mfa_and_audit(
             &token,
             &rotated_token,
             &rotated_csrf,
@@ -303,18 +288,8 @@ pub(super) async fn finish_security_key_authentication(
             admin_id,
             &expected_credential_json,
             &credential_json,
-        )?;
-        if completed {
-            audit_sync(
-                &db,
-                &audit_actor,
-                "login_success_webauthn",
-                None,
-                None,
-                audit_client_ip.as_deref(),
-            );
-        }
-        Ok(completed)
+            &audit_context,
+        )
     })
     .await?;
     if !completed {
@@ -339,19 +314,10 @@ pub(super) async fn logout(
 ) -> Result<Response> {
     let (token, s) = session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     csrf(&s, &form.csrf)?;
-    let audit_actor = s.username;
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    database(state.db.clone(), move |db| {
-        db.delete_session(&token)?;
-        audit_sync(
-            &db,
-            &audit_actor,
-            "logout",
-            None,
-            None,
-            audit_client_ip.as_deref(),
-        );
-        Ok(())
+    let actor = s.username;
+    let client_ip = enabled_audit_client_ip(&state);
+    required_database(state.db.clone(), move |db| {
+        AuthService::new(db).logout(&token, actor, client_ip)
     })
     .await?;
     Ok(redirect_with_cookie(

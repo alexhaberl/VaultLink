@@ -13,12 +13,22 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+use crate::sensitive::SecretString;
+
 const MAX_LIMITER_KEYS: usize = 10_000;
 const OVERFLOW_BUCKETS: usize = 256;
 const GLOBAL_CLEANUP_INTERVAL: u64 = 64;
 
 pub const ADMIN_PASSWORD_MIN_CHARACTERS: usize = 14;
 pub const MAX_PASSWORD_BYTES: usize = 1_024;
+
+/// Compares authentication tokens without leaking the first differing byte.
+///
+/// Token length is not secret, so differently sized values can be rejected
+/// before invoking the constant-time primitive.
+pub fn constant_time_eq(expected: &str, supplied: &str) -> bool {
+    expected.len() == supplied.len() && bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
+}
 
 fn fill_random(bytes: &mut [u8]) {
     SysRng
@@ -34,6 +44,15 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
 }
+
+/// Hashes an owned password on a worker thread without requiring the caller to
+/// retain a second application-owned plaintext allocation.
+pub(crate) fn hash_secret_password(
+    password: SecretString,
+) -> Result<String, argon2::password_hash::Error> {
+    hash_password(password.expose_secret())
+}
+
 pub fn verify_password(hash: &str, password: &str) -> bool {
     if password.len() > MAX_PASSWORD_BYTES {
         return false;
@@ -46,6 +65,12 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
                 .ok()
         })
         .is_some()
+}
+
+/// Verifies owned task inputs and zeroes the plaintext password when the task
+/// finishes. Password hashes are not treated as secrets.
+pub(crate) fn verify_secret_password(hash: String, password: SecretString) -> bool {
+    verify_password(&hash, password.expose_secret())
 }
 
 pub fn valid_admin_username(username: &str) -> bool {
@@ -70,6 +95,10 @@ pub fn new_totp_secret() -> String {
     fill_random(&mut b);
     BASE32_NOPAD.encode(&b)
 }
+
+pub(crate) fn new_totp_secret_value() -> SecretString {
+    SecretString::from(new_totp_secret())
+}
 pub fn matching_totp_step(secret: &str, code: &str, now: u64) -> Option<u64> {
     if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -84,7 +113,9 @@ pub fn matching_totp_step(secret: &str, code: &str, now: u64) -> Option<u64> {
     .into_iter()
     .flatten()
     .find(|step| {
-        totp_code(secret, *step).is_some_and(|candidate| candidate.as_bytes().ct_eq(wanted).into())
+        totp_code(secret, *step)
+            .map(SecretString::from)
+            .is_some_and(|candidate| candidate.expose_secret().as_bytes().ct_eq(wanted).into())
     })
 }
 
@@ -329,6 +360,14 @@ impl LoginLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_token_comparison_handles_equal_different_and_mismatched_lengths() {
+        assert!(constant_time_eq("same-token", "same-token"));
+        assert!(!constant_time_eq("same-token", "same-taken"));
+        assert!(!constant_time_eq("same-token", "short"));
+    }
+
     #[test]
     fn password_round_trip() {
         let first = hash_password("correct horse battery staple").unwrap();
