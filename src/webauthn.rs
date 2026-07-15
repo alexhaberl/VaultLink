@@ -5,6 +5,7 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use webauthn_rs::{
     prelude::{
         CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
@@ -22,11 +23,27 @@ fn session_key(session_token: &str) -> String {
     data_encoding::HEXLOWER.encode(digest.as_ref())
 }
 
-fn make_room<T>(pending: &mut HashMap<String, T>) {
-    if pending.len() >= MAX_PENDING_CEREMONIES {
-        if let Some(key) = pending.keys().next().cloned() {
-            pending.remove(&key);
-        }
+fn ensure_pending_capacity<T>(
+    pending: &HashMap<String, T>,
+    key: &str,
+) -> Result<(), WebAuthnServiceError> {
+    if !pending.contains_key(key) && pending.len() >= MAX_PENDING_CEREMONIES {
+        return Err(WebAuthnServiceError::CapacityExceeded);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum WebAuthnServiceError {
+    #[error("pending WebAuthn ceremony capacity exhausted")]
+    CapacityExceeded,
+    #[error("{0}")]
+    Ceremony(String),
+}
+
+impl WebAuthnServiceError {
+    fn ceremony(error: impl ToString) -> Self {
+        Self::Ceremony(error.to_string())
     }
 }
 
@@ -54,16 +71,16 @@ struct WebAuthnInner {
 }
 
 impl WebAuthnService {
-    pub fn from_public_base_url(public_base_url: &str) -> Result<Self, String> {
-        let origin = url::Url::parse(public_base_url).map_err(|error| error.to_string())?;
-        let rp_id = origin
-            .host_str()
-            .ok_or_else(|| "WebAuthn origin must contain a host".to_string())?;
+    pub fn from_public_base_url(public_base_url: &str) -> Result<Self, WebAuthnServiceError> {
+        let origin = url::Url::parse(public_base_url).map_err(WebAuthnServiceError::ceremony)?;
+        let rp_id = origin.host_str().ok_or_else(|| {
+            WebAuthnServiceError::Ceremony("WebAuthn origin must contain a host".into())
+        })?;
         let engine = WebauthnBuilder::new(rp_id, &origin)
-            .map_err(|error| error.to_string())?
+            .map_err(WebAuthnServiceError::ceremony)?
             .rp_name("VaultLink")
             .build()
-            .map_err(|error| error.to_string())?;
+            .map_err(WebAuthnServiceError::ceremony)?;
         Ok(Self {
             inner: Arc::new(WebAuthnInner {
                 engine,
@@ -84,7 +101,7 @@ impl WebAuthnService {
         admin_id: i64,
         username: &str,
         existing: &[SecurityKey],
-    ) -> Result<CreationChallengeResponse, String> {
+    ) -> Result<CreationChallengeResponse, WebAuthnServiceError> {
         let excluded = existing.iter().map(|key| key.cred_id().clone()).collect();
         let (challenge, state) = self
             .inner
@@ -97,16 +114,17 @@ impl WebAuthnService {
                 None,
                 None,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(WebAuthnServiceError::ceremony)?;
         let mut pending = self
             .inner
             .registrations
             .lock()
-            .map_err(|_| "lock poisoned")?;
+            .map_err(WebAuthnServiceError::ceremony)?;
         pending.retain(|_, value| value.created.elapsed() < CEREMONY_TTL);
-        make_room(&mut pending);
+        let key = session_key(session_token);
+        ensure_pending_capacity(&pending, &key)?;
         pending.insert(
-            session_key(session_token),
+            key,
             PendingRegistration {
                 admin_id,
                 created: Instant::now(),
@@ -121,21 +139,27 @@ impl WebAuthnService {
         session_token: &str,
         admin_id: i64,
         credential: &RegisterPublicKeyCredential,
-    ) -> Result<SecurityKey, String> {
+    ) -> Result<SecurityKey, WebAuthnServiceError> {
         let pending = self
             .inner
             .registrations
             .lock()
-            .map_err(|_| "lock poisoned")?
+            .map_err(WebAuthnServiceError::ceremony)?
             .remove(&session_key(session_token))
-            .ok_or_else(|| "registration challenge missing or already used".to_string())?;
+            .ok_or_else(|| {
+                WebAuthnServiceError::Ceremony(
+                    "registration challenge missing or already used".into(),
+                )
+            })?;
         if pending.admin_id != admin_id || pending.created.elapsed() >= CEREMONY_TTL {
-            return Err("registration challenge expired or belongs to another account".into());
+            return Err(WebAuthnServiceError::Ceremony(
+                "registration challenge expired or belongs to another account".into(),
+            ));
         }
         self.inner
             .engine
             .finish_securitykey_registration(credential, &pending.state)
-            .map_err(|error| error.to_string())
+            .map_err(WebAuthnServiceError::ceremony)
     }
 
     pub fn start_authentication(
@@ -143,21 +167,22 @@ impl WebAuthnService {
         session_token: &str,
         admin_id: i64,
         credentials: &[SecurityKey],
-    ) -> Result<RequestChallengeResponse, String> {
+    ) -> Result<RequestChallengeResponse, WebAuthnServiceError> {
         let (challenge, state) = self
             .inner
             .engine
             .start_securitykey_authentication(credentials)
-            .map_err(|error| error.to_string())?;
+            .map_err(WebAuthnServiceError::ceremony)?;
         let mut pending = self
             .inner
             .authentications
             .lock()
-            .map_err(|_| "lock poisoned")?;
+            .map_err(WebAuthnServiceError::ceremony)?;
         pending.retain(|_, value| value.created.elapsed() < CEREMONY_TTL);
-        make_room(&mut pending);
+        let key = session_key(session_token);
+        ensure_pending_capacity(&pending, &key)?;
         pending.insert(
-            session_key(session_token),
+            key,
             PendingAuthentication {
                 admin_id,
                 created: Instant::now(),
@@ -173,26 +198,34 @@ impl WebAuthnService {
         admin_id: i64,
         credential: &PublicKeyCredential,
         credentials: &mut [SecurityKey],
-    ) -> Result<usize, String> {
+    ) -> Result<usize, WebAuthnServiceError> {
         let pending = self
             .inner
             .authentications
             .lock()
-            .map_err(|_| "lock poisoned")?
+            .map_err(WebAuthnServiceError::ceremony)?
             .remove(&session_key(session_token))
-            .ok_or_else(|| "authentication challenge missing or already used".to_string())?;
+            .ok_or_else(|| {
+                WebAuthnServiceError::Ceremony(
+                    "authentication challenge missing or already used".into(),
+                )
+            })?;
         if pending.admin_id != admin_id || pending.created.elapsed() >= CEREMONY_TTL {
-            return Err("authentication challenge expired or belongs to another account".into());
+            return Err(WebAuthnServiceError::Ceremony(
+                "authentication challenge expired or belongs to another account".into(),
+            ));
         }
         let result = self
             .inner
             .engine
             .finish_securitykey_authentication(credential, &pending.state)
-            .map_err(|error| error.to_string())?;
+            .map_err(WebAuthnServiceError::ceremony)?;
         credentials
             .iter_mut()
             .position(|key| key.update_credential(&result).is_some())
-            .ok_or_else(|| "authenticated credential is not registered".to_string())
+            .ok_or_else(|| {
+                WebAuthnServiceError::Ceremony("authenticated credential is not registered".into())
+            })
     }
 }
 
@@ -275,6 +308,22 @@ mod tests {
     }
 
     #[test]
+    fn capacity_rejects_only_new_sessions_without_evicting_existing_state() {
+        let pending = (0..MAX_PENDING_CEREMONIES)
+            .map(|index| (format!("session-{index}"), ()))
+            .collect::<HashMap<_, _>>();
+        let keys = pending.keys().cloned().collect::<Vec<_>>();
+
+        assert!(matches!(
+            ensure_pending_capacity(&pending, "new-session"),
+            Err(WebAuthnServiceError::CapacityExceeded)
+        ));
+        assert!(ensure_pending_capacity(&pending, "session-0").is_ok());
+        assert_eq!(pending.len(), MAX_PENDING_CEREMONIES);
+        assert!(keys.iter().all(|key| pending.contains_key(key)));
+    }
+
+    #[test]
     fn registration_start_replaces_a_challenge_for_the_same_session() {
         let service = service();
         let first = service
@@ -302,17 +351,21 @@ mod tests {
         let wrong_session = service
             .finish_registration("other-session", 7, &invalid)
             .unwrap_err();
-        assert!(wrong_session.contains("missing or already used"));
+        assert!(wrong_session
+            .to_string()
+            .contains("missing or already used"));
         assert_eq!(service.inner.registrations.lock().unwrap().len(), 1);
 
         let wrong_admin = service
             .finish_registration("correct-session", 8, &invalid)
             .unwrap_err();
-        assert!(wrong_admin.contains("belongs to another account"));
+        assert!(wrong_admin
+            .to_string()
+            .contains("belongs to another account"));
         let replay = service
             .finish_registration("correct-session", 7, &invalid)
             .unwrap_err();
-        assert!(replay.contains("missing or already used"));
+        assert!(replay.to_string().contains("missing or already used"));
     }
 
     #[test]
@@ -334,10 +387,12 @@ mod tests {
         assert!(service
             .finish_registration("expired", 7, &invalid)
             .unwrap_err()
+            .to_string()
             .contains("expired"));
         assert!(service
             .finish_registration("expired", 7, &invalid)
             .unwrap_err()
+            .to_string()
             .contains("missing or already used"));
 
         service
@@ -349,7 +404,56 @@ mod tests {
         assert!(service
             .finish_registration("invalid-finish", 7, &invalid)
             .unwrap_err()
+            .to_string()
             .contains("missing or already used"));
+    }
+
+    #[test]
+    fn registration_start_prunes_expired_state_before_capacity_check() {
+        let service = service();
+        service
+            .start_registration("expired", 7, "admin", &[])
+            .unwrap();
+        service
+            .inner
+            .registrations
+            .lock()
+            .unwrap()
+            .get_mut(&session_key("expired"))
+            .unwrap()
+            .created = Instant::now() - CEREMONY_TTL - Duration::from_secs(1);
+
+        service
+            .start_registration("fresh", 7, "admin", &[])
+            .unwrap();
+        let pending = service.inner.registrations.lock().unwrap();
+        assert!(!pending.contains_key(&session_key("expired")));
+        assert!(pending.contains_key(&session_key("fresh")));
+    }
+
+    #[test]
+    fn registration_and_authentication_have_independent_capacities() {
+        let service = service();
+        for index in 0..MAX_PENDING_CEREMONIES {
+            service
+                .start_registration(&format!("registration-{index}"), 7, "admin", &[])
+                .unwrap();
+        }
+        assert!(matches!(
+            service.start_registration("registration-overflow", 7, "admin", &[]),
+            Err(WebAuthnServiceError::CapacityExceeded)
+        ));
+
+        let key = test_security_key();
+        service
+            .start_authentication("authentication", 7, std::slice::from_ref(&key))
+            .unwrap();
+
+        assert_eq!(
+            service.inner.registrations.lock().unwrap().len(),
+            MAX_PENDING_CEREMONIES
+        );
+        assert_eq!(service.inner.authentications.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -373,16 +477,19 @@ mod tests {
         assert!(service
             .finish_authentication("wrong-session", 7, &invalid, &mut credentials)
             .unwrap_err()
+            .to_string()
             .contains("missing or already used"));
         assert_eq!(service.inner.authentications.lock().unwrap().len(), 1);
 
         assert!(service
             .finish_authentication("session", 8, &invalid, &mut credentials)
             .unwrap_err()
+            .to_string()
             .contains("belongs to another account"));
         assert!(service
             .finish_authentication("session", 7, &invalid, &mut credentials)
             .unwrap_err()
+            .to_string()
             .contains("missing or already used"));
 
         service
@@ -394,6 +501,7 @@ mod tests {
         assert!(service
             .finish_authentication("invalid-finish", 7, &invalid, &mut credentials)
             .unwrap_err()
+            .to_string()
             .contains("missing or already used"));
     }
 
@@ -417,10 +525,36 @@ mod tests {
         assert!(service
             .finish_authentication("expired", 7, &invalid, &mut credentials)
             .unwrap_err()
+            .to_string()
             .contains("expired"));
         assert!(service
             .finish_authentication("expired", 7, &invalid, &mut credentials)
             .unwrap_err()
+            .to_string()
             .contains("missing or already used"));
+    }
+
+    #[test]
+    fn authentication_start_prunes_expired_state_before_capacity_check() {
+        let service = service();
+        let key = test_security_key();
+        service
+            .start_authentication("expired", 7, std::slice::from_ref(&key))
+            .unwrap();
+        service
+            .inner
+            .authentications
+            .lock()
+            .unwrap()
+            .get_mut(&session_key("expired"))
+            .unwrap()
+            .created = Instant::now() - CEREMONY_TTL - Duration::from_secs(1);
+
+        service
+            .start_authentication("fresh", 7, std::slice::from_ref(&key))
+            .unwrap();
+        let pending = service.inner.authentications.lock().unwrap();
+        assert!(!pending.contains_key(&session_key("expired")));
+        assert!(pending.contains_key(&session_key("fresh")));
     }
 }

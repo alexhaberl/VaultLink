@@ -1,0 +1,1 @@
+{% for item in shell.navigation %}<a href="{{ item.href }}"{% if item.active %} aria-current="page"{% endif %}>{{ item.icon_html|safe }}<span>{{ item.label }}</span></a>{% endfor %}

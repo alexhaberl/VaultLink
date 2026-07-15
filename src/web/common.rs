@@ -1,11 +1,18 @@
 use std::{collections::VecDeque, io};
 
-use axum::http::StatusCode;
+use axum::{
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use qrcode::{render::svg, QrCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::{esc, AppError, Result, GB, MB};
+use super::{
+    rendering::{esc, GB, MB},
+    AppError, Result,
+};
 use crate::{
     i18n::{self, Locale},
     policy::{self, PreviewKind},
@@ -13,7 +20,61 @@ use crate::{
     runtime::RuntimeSettings,
     secure_fs::{DirectoryScan, Entry, SecureDirectory, SecureFile, SecureRoot},
     sensitive::SecretString,
+    webauthn::WebAuthnServiceError,
 };
+
+pub(super) fn webauthn_start_response<T: Serialize>(
+    result: std::result::Result<T, WebAuthnServiceError>,
+) -> Result<Response> {
+    match result {
+        Ok(challenge) => Ok(Json(challenge).into_response()),
+        Err(WebAuthnServiceError::CapacityExceeded) => {
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "WebAuthn ist vorübergehend ausgelastet",
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+            Ok(response)
+        }
+        Err(WebAuthnServiceError::Ceremony(_)) => Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Sicherheitsschlüssel konnte nicht gestartet werden",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod webauthn_response_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_exhaustion_returns_retryable_service_unavailable() {
+        let response = webauthn_start_response::<serde_json::Value>(Err(
+            WebAuthnServiceError::CapacityExceeded,
+        ))
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("60"))
+        );
+    }
+
+    #[test]
+    fn ceremony_errors_keep_the_existing_bad_request_contract() {
+        let error = webauthn_start_response::<serde_json::Value>(Err(
+            WebAuthnServiceError::Ceremony("invalid challenge".into()),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(!error.1.is_empty());
+    }
+}
 
 pub(super) fn format_audit_time(value: &str) -> String {
     DateTime::parse_from_rfc3339(value)

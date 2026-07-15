@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use askama::Template;
 use axum::{
     extract::{ConnectInfo, Form, Json, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -8,7 +9,11 @@ use axum::{
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 
-use super::{decode_security_keys, esc, internal, plain_page, AppError, CsrfForm, Result};
+use super::{
+    common::{decode_security_keys, internal, webauthn_start_response, CsrfForm},
+    templates::public_page,
+    AppError, Result,
+};
 use crate::{
     auth,
     db::AuditContext,
@@ -24,11 +29,19 @@ use crate::{
     AppState,
 };
 
-pub(super) async fn login_page() -> Html<String> {
-    Html(plain_page(
-        "Login",
-        r#"<section class="vl-panel vl-auth-card"><h1><vl-i18n key="auth.admin_login"/></h1><form method="post" class="vl-stack"><label class="vl-field"><vl-i18n key="auth.username"/><input name="username" autocomplete="username" required></label><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" maxlength="1024" autocomplete="current-password" required></label><button class="vl-button"><vl-i18n key="auth.sign_in"/></button></form></section>"#,
-    ))
+#[derive(Template)]
+#[template(path = "web/auth/login.html")]
+struct LoginTemplate;
+
+#[derive(Template)]
+#[template(path = "web/auth/mfa.html")]
+struct MfaTemplate<'a> {
+    csrf: &'a str,
+    security_key_enabled: bool,
+}
+
+pub(super) async fn login_page() -> Result<Html<String>> {
+    Ok(Html(public_page("Login", &LoginTemplate)?))
 }
 
 #[derive(Deserialize)]
@@ -109,21 +122,13 @@ pub(super) async fn mfa_page(
             .map(|credentials| credentials.len())
     })
     .await?;
-    let security_key_button = if security_key_count >= 2 {
-        format!(
-            r#"<hr><button type="button" data-security-key-login data-csrf="{}"><vl-i18n key="auth.security_key_use"/></button><p class="vl-muted" data-security-key-status></p>"#,
-            esc(&current_session.csrf_token)
-        )
-    } else {
-        String::new()
-    };
-    Ok(Html(plain_page(
+    Ok(Html(public_page(
         "MFA",
-        &format!(
-            r#"<section class="vl-panel vl-auth-card"><h1><vl-i18n key="auth.second_factor"/></h1><form method="post" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="auth.six_digit_totp"/><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button"><vl-i18n key="auth.verify"/></button></form>{security_key_button}</section>"#,
-            esc(&current_session.csrf_token)
-        ),
-    )))
+        &MfaTemplate {
+            csrf: &current_session.csrf_token,
+            security_key_enabled: security_key_count >= 2,
+        },
+    )?))
 }
 
 #[derive(Deserialize)]
@@ -183,7 +188,7 @@ pub(super) async fn start_security_key_authentication(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CsrfForm>,
-) -> Result<Json<webauthn_rs::prelude::RequestChallengeResponse>> {
+) -> Result<Response> {
     let (token, session) =
         session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     if session.mfa_verified {
@@ -217,15 +222,7 @@ pub(super) async fn start_security_key_authentication(
         .read()
         .expect("WebAuthn service lock poisoned")
         .clone();
-    let challenge = webauthn
-        .start_authentication(&token, admin_id, &keys)
-        .map_err(|_| {
-            AppError(
-                StatusCode::BAD_REQUEST,
-                "Sicherheitsschlüssel konnte nicht gestartet werden",
-            )
-        })?;
-    Ok(Json(challenge))
+    webauthn_start_response(webauthn.start_authentication(&token, admin_id, &keys))
 }
 
 #[derive(Deserialize)]

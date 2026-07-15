@@ -1,3 +1,4 @@
+use askama::Template;
 use axum::{
     extract::{Form, Path as AxPath, Query, State},
     http::{HeaderMap, StatusCode},
@@ -11,15 +12,54 @@ use crate::{
         csrf, database, enabled_audit_client_ip, hash_password_admitted, required_database,
         session, MissingSession,
     },
+    i18n,
     sensitive::SecretString,
     services::admin::{AdminActivationResult, AdminService, AdminServiceError, CreateAdminCommand},
     AppState,
 };
 
 use super::{
-    admin_page, admin_page_without_locale_switcher, esc, format_audit_time, otpauth_url, qr_svg,
-    AppError, CsrfForm, PageId, Result,
+    common::{format_audit_time, otpauth_url, qr_svg, CsrfForm},
+    rendering::PageId,
+    templates::admin_page as render_admin_page,
+    AppError, Result,
 };
+
+struct AdminRow {
+    id: i64,
+    username: String,
+    created_at: String,
+    active: bool,
+    current: bool,
+}
+
+struct AdminGroup {
+    label_key: &'static str,
+    empty_key: &'static str,
+    rows: Vec<AdminRow>,
+}
+
+#[derive(Template)]
+#[template(path = "web/admin/admins.html")]
+struct AdminsTemplate<'a> {
+    groups: Vec<AdminGroup>,
+    csrf: &'a str,
+    password_reset: bool,
+    username_label: &'static str,
+    created_label: &'static str,
+    action_label: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "web/admin/totp_secret.html")]
+struct TotpSecretTemplate<'a> {
+    title_key: &'static str,
+    help_key: &'static str,
+    username: &'a str,
+    qr: &'a str,
+    secret: &'a str,
+    otpauth: &'a str,
+}
 
 pub(super) async fn admins_page(
     State(state): State<AppState>,
@@ -28,75 +68,50 @@ pub(super) async fn admins_page(
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let admins = database(state.db.clone(), |db| db.list_admins()).await?;
-    let mut active_rows = String::new();
-    let mut inactive_rows = String::new();
+    let mut active_rows = Vec::new();
+    let mut inactive_rows = Vec::new();
     for admin in admins {
-        let action = if admin.id == session.admin_id {
-            r#"<div class="vl-stack"><span class="vl-badge vl-badge--accent"><vl-i18n key="admins.current"/></span></div>"#
-                .to_string()
-        } else {
-            let status_action = if admin.active {
-                format!(
-                    r#"<form method="post" action="/admin/admins/{}/deactivate"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--secondary"><vl-i18n key="admins.deactivate"/></button></form>"#,
-                    admin.id,
-                    esc(&session.csrf_token)
-                )
-            } else {
-                format!(
-                    r#"<form method="post" action="/admin/admins/{}/activate"><input type="hidden" name="csrf" value="{}"><button class="vl-button"><vl-i18n key="admins.activate"/></button></form>"#,
-                    admin.id,
-                    esc(&session.csrf_token)
-                )
-            };
-            format!(
-                r#"<div class="vl-stack"><div class="vl-button-group">{}<form method="post" action="/admin/admins/{}/totp"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--secondary"><vl-i18n key="admins.reset_mfa"/></button></form></div><form method="post" action="/admin/admins/{}/password" class="vl-form-grid"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="account.new_password"/><input name="password" type="password" minlength="14" maxlength="1024" required></label><label class="vl-field"><vl-i18n key="common.confirm"/><input name="password_confirm" type="password" minlength="14" maxlength="1024" required></label><button class="vl-button"><vl-i18n key="admins.set_password"/></button></form></div>"#,
-                status_action,
-                admin.id,
-                esc(&session.csrf_token),
-                admin.id,
-                esc(&session.csrf_token)
-            )
+        let active = admin.active;
+        let row = AdminRow {
+            id: admin.id,
+            username: admin.username,
+            created_at: format_audit_time(&admin.created_at),
+            active,
+            current: admin.id == session.admin_id,
         };
-        let row = format!(
-            r#"<tr><td data-label="ID">{}</td><td data-label="<vl-i18n key="auth.username"/>">{}</td><td data-label="<vl-i18n key="common.created"/>">{}</td><td data-label="<vl-i18n key="common.action"/>">{}</td></tr>"#,
-            admin.id,
-            esc(&admin.username),
-            esc(&format_audit_time(&admin.created_at)),
-            action
-        );
-        if admin.active {
-            active_rows.push_str(&row);
+        if active {
+            active_rows.push(row);
         } else {
-            inactive_rows.push_str(&row);
+            inactive_rows.push(row);
         }
     }
-    if active_rows.is_empty() {
-        active_rows.push_str(
-            r#"<tr><td colspan="4" class="vl-muted"><vl-i18n key="admins.no_active"/></td></tr>"#,
-        );
-    }
-    if inactive_rows.is_empty() {
-        inactive_rows.push_str(
-            r#"<tr><td colspan="4" class="vl-muted"><vl-i18n key="admins.no_inactive"/></td></tr>"#,
-        );
-    }
-    let notice = match query.notice.as_deref() {
-        Some("password_reset") => {
-            r#"<p class="vl-notice vl-notice--success"><vl-i18n key="admins.password_set"/></p>"#
-        }
-        _ => "",
+    let body = AdminsTemplate {
+        groups: vec![
+            AdminGroup {
+                label_key: "admins.active",
+                empty_key: "admins.no_active",
+                rows: active_rows,
+            },
+            AdminGroup {
+                label_key: "admins.inactive",
+                empty_key: "admins.no_inactive",
+                rows: inactive_rows,
+            },
+        ],
+        csrf: &session.csrf_token,
+        password_reset: query.notice.as_deref() == Some("password_reset"),
+        username_label: i18n::text(i18n::current_locale(), i18n::USERNAME),
+        created_label: i18n::text(i18n::current_locale(), i18n::CREATED),
+        action_label: i18n::text(i18n::current_locale(), i18n::ACTION),
     };
-    let body = format!(
-        r#"<section class="vl-panel"><h2><vl-i18n key="nav.admins"/></h2>{notice}<div class="vl-stack"><details class="vl-form-card" open><summary><vl-i18n key="admins.active"/></summary><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th>ID</th><th><vl-i18n key="auth.username"/></th><th><vl-i18n key="common.created"/></th><th><vl-i18n key="common.action"/></th></tr></thead><tbody>{active_rows}</tbody></table></div></details><details class="vl-form-card" open><summary><vl-i18n key="admins.inactive"/></summary><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th>ID</th><th><vl-i18n key="auth.username"/></th><th><vl-i18n key="common.created"/></th><th><vl-i18n key="common.action"/></th></tr></thead><tbody>{inactive_rows}</tbody></table></div></details></div></section><section class="vl-panel"><h2><vl-i18n key="admins.create"/></h2><form method="post" class="vl-admin-create-form"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="auth.username"/><input name="username" pattern="[A-Za-z0-9_-]{{3,64}}" required></label><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="14" maxlength="1024" required></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" minlength="14" maxlength="1024" required></label><button class="vl-button"><vl-i18n key="common.create"/></button></form></section>"#,
-        esc(&session.csrf_token)
-    );
-    Ok(Html(admin_page(
+    Ok(Html(render_admin_page(
         &state,
         PageId::Admins,
         &body,
         false,
         &session.csrf_token,
-    )))
+        true,
+    )?))
 }
 
 #[derive(Deserialize)]
@@ -159,20 +174,22 @@ pub(super) async fn create_admin_ui(
     let response_secret = created.totp_secret;
     let otpauth = otpauth_url(&username, response_secret.expose_secret());
     let qr = qr_svg(otpauth.expose_secret())?;
-    let body = format!(
-        r#"<section class="vl-panel"><h2><vl-i18n key="title.admin_created"/></h2><p><vl-i18n key="admins.secret_once"/></p><p><strong>{}</strong></p><div class="vl-qr-card" aria-label="TOTP QR-Code">{}</div><div class="vl-secret-block"><code>{}</code><code>{}</code></div><p><a class="vl-button vl-button--secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
-        esc(&username),
-        qr,
-        esc(response_secret.expose_secret()),
-        esc(otpauth.expose_secret())
-    );
-    Ok(Html(admin_page_without_locale_switcher(
+    let body = TotpSecretTemplate {
+        title_key: "title.admin_created",
+        help_key: "admins.secret_once",
+        username: &username,
+        qr: &qr,
+        secret: response_secret.expose_secret(),
+        otpauth: otpauth.expose_secret(),
+    };
+    Ok(Html(render_admin_page(
         &state,
         PageId::AdminCreated,
         &body,
         false,
         &session.csrf_token,
-    )))
+        false,
+    )?))
 }
 
 pub(super) async fn reset_admin_password(
@@ -234,20 +251,22 @@ pub(super) async fn reset_admin_totp(
     let response_secret = reset.totp_secret;
     let otpauth = otpauth_url(&username, response_secret.expose_secret());
     let qr = qr_svg(otpauth.expose_secret())?;
-    let body = format!(
-        r#"<section class="vl-panel"><h2><vl-i18n key="title.mfa_reset"/></h2><p><vl-i18n key="admins.new_secret_once"/></p><p><strong>{}</strong></p><div class="vl-qr-card" aria-label="TOTP QR-Code">{}</div><div class="vl-secret-block"><code>{}</code><code>{}</code></div><p><a class="vl-button vl-button--secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
-        esc(&username),
-        qr,
-        esc(response_secret.expose_secret()),
-        esc(otpauth.expose_secret())
-    );
-    Ok(Html(admin_page_without_locale_switcher(
+    let body = TotpSecretTemplate {
+        title_key: "title.mfa_reset",
+        help_key: "admins.new_secret_once",
+        username: &username,
+        qr: &qr,
+        secret: response_secret.expose_secret(),
+        otpauth: otpauth.expose_secret(),
+    };
+    Ok(Html(render_admin_page(
         &state,
         PageId::MfaReset,
         &body,
         false,
         &session.csrf_token,
-    )))
+        false,
+    )?))
 }
 
 pub(super) async fn deactivate_admin(

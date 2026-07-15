@@ -14,9 +14,8 @@ use axum::{
 use base64::Engine as _;
 use serde::Deserialize;
 
-use super::{human, internal, AppError, Result};
+use super::{common::internal, AppError, Result};
 use crate::{
-    http_auth::runtime_settings,
     i18n::{self, Locale, MessageKey},
     AppState,
 };
@@ -171,40 +170,9 @@ pub(super) async fn set_locale(
     Ok(response)
 }
 
-pub(super) fn locale_switcher() -> String {
-    let locale = i18n::current_locale();
-    let label = i18n::text(locale, i18n::LANGUAGE);
-    let return_to = i18n::current_return_to();
-    format!(
-        r#"<form class="vl-locale-switch" method="post" action="/locale" aria-label="{}"><input type="hidden" name="return_to" value="{}"><button class="vl-locale-switch__option" name="locale" value="de" type="submit"{}>DE</button><span aria-hidden="true">/</span><button class="vl-locale-switch__option" name="locale" value="en" type="submit"{}>EN</button></form>"#,
-        esc(label),
-        esc(&return_to),
-        if locale == Locale::De {
-            r#" aria-current="true""#
-        } else {
-            ""
-        },
-        if locale == Locale::En {
-            r#" aria-current="true""#
-        } else {
-            ""
-        },
-    )
-}
-
 pub(super) fn plain_page(title: &str, body: &str) -> String {
-    let locale = i18n::current_locale();
-    let title = i18n::text_from_german(locale, title);
-    let body = i18n::render_markers(locale, body);
-    format!(
-        r##"<!doctype html><html lang="{}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/app.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">{}</a><div class="vl-public-shell"><header class="vl-public-header">{}{}</header><main id="main-content" class="vl-public-main">{}</main></div></body></html>"##,
-        locale.code(),
-        esc(&title),
-        i18n::text(locale, i18n::SKIP_TO_CONTENT),
-        crate::ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
-        locale_switcher(),
-        body
-    )
+    super::templates::public_page_html(title, body)
+        .expect("the public page template writes only to an in-memory string")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,7 +200,7 @@ pub(super) enum PageId {
 }
 
 impl PageId {
-    const fn title(self) -> MessageKey {
+    pub(super) const fn title(self) -> MessageKey {
         match self {
             Self::Account => i18n::ACCOUNT,
             Self::Files => i18n::NAV_FILES,
@@ -248,7 +216,7 @@ impl PageId {
         }
     }
 
-    const fn nav(self) -> Option<NavSection> {
+    pub(super) const fn nav(self) -> Option<NavSection> {
         match self {
             Self::Account => None,
             Self::Files | Self::Preview | Self::DeleteConfirm => Some(NavSection::Files),
@@ -270,16 +238,6 @@ pub(super) fn admin_page(
     admin_page_with_locale_switcher(state, page, body, show_create_link, csrf_token, true)
 }
 
-pub(super) fn admin_page_without_locale_switcher(
-    state: &AppState,
-    page: PageId,
-    body: &str,
-    show_create_link: bool,
-    csrf_token: &str,
-) -> String {
-    admin_page_with_locale_switcher(state, page, body, show_create_link, csrf_token, false)
-}
-
 pub(super) fn admin_page_with_locale_switcher(
     state: &AppState,
     page: PageId,
@@ -288,97 +246,15 @@ pub(super) fn admin_page_with_locale_switcher(
     csrf_token: &str,
     show_locale_switcher: bool,
 ) -> String {
-    let locale = i18n::current_locale();
-    let title = i18n::text(locale, page.title());
-    let create_link = if show_create_link {
-        format!(
-            r#"<a class="vl-button" href="/admin/shares/new">{} {}</a>"#,
-            crate::ui::icon(crate::ui::Icon::Link),
-            i18n::text(locale, i18n::CREATE_LINK),
-        )
-    } else {
-        String::new()
-    };
-    let active = page.nav();
-    let nav = [
-        crate::ui::nav_link(
-            "/admin",
-            i18n::text(locale, i18n::NAV_FILES),
-            crate::ui::Icon::Folder,
-            active == Some(NavSection::Files),
-        ),
-        crate::ui::nav_link(
-            "/admin/shares",
-            i18n::text(locale, i18n::NAV_LINKS),
-            crate::ui::Icon::Link,
-            active == Some(NavSection::Links),
-        ),
-        crate::ui::nav_link(
-            "/admin/admins",
-            i18n::text(locale, i18n::NAV_ADMINS),
-            crate::ui::Icon::Users,
-            active == Some(NavSection::Admins),
-        ),
-        crate::ui::nav_link(
-            "/admin/settings",
-            i18n::text(locale, i18n::NAV_SETTINGS),
-            crate::ui::Icon::Settings,
-            active == Some(NavSection::Settings),
-        ),
-        crate::ui::nav_link(
-            "/admin/audit",
-            i18n::text(locale, i18n::NAV_AUDIT),
-            crate::ui::Icon::Audit,
-            active == Some(NavSection::Audit),
-        ),
-    ]
-    .join("");
-    let body = i18n::render_markers(locale, body);
-    let system_panel = i18n::render_markers(locale, &system_panel(state));
-    let locale_switcher = if show_locale_switcher {
-        locale_switcher()
-    } else {
-        String::new()
-    };
-    format!(
-        r##"<!doctype html><html lang="{}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · VaultLink</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml"><link rel="alternate icon" href="/assets/favicon-32.png" type="image/png"><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/app.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">{}</a><div class="vl-app-shell"><aside class="vl-sidebar">{}<nav class="vl-nav" aria-label="{}">{}</nav><div class="vl-system-card"><strong><span aria-hidden="true">●</span> {}</strong><span>{}</span></div></aside><div class="vl-content"><header class="vl-topbar"><div><p class="vl-eyebrow">{}</p><h1>{}</h1></div><div class="vl-topbar-actions">{}{}<a class="vl-button vl-button--ghost" href="/admin/account">{} {}</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--secondary">{} {}</button></form></div></header><main id="main-content" class="vl-main">{}</main></div></div></body></html>"##,
-        locale.code(),
-        esc(title),
-        i18n::text(locale, i18n::SKIP_TO_CONTENT),
-        crate::ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
-        i18n::text(locale, i18n::MAIN_NAVIGATION),
-        nav,
-        i18n::text(locale, i18n::VAULTLINK_AVAILABLE),
-        system_panel,
-        i18n::text(locale, i18n::VAULTLINK_ADMIN),
-        esc(title),
-        create_link,
-        locale_switcher,
-        crate::ui::icon(crate::ui::Icon::User),
-        i18n::text(locale, i18n::ACCOUNT_LINK),
-        esc(csrf_token),
-        crate::ui::icon(crate::ui::Icon::Logout),
-        i18n::text(locale, i18n::LOG_OUT),
-        body
+    super::templates::admin_page_html(
+        state,
+        page,
+        body,
+        show_create_link,
+        csrf_token,
+        show_locale_switcher,
     )
-}
-
-pub(super) fn system_panel(state: &AppState) -> String {
-    let disk = disk_stats(state.secure_root.display_root())
-        .map(|d| {
-            format!(
-                r#"<vl-i18n key="audit.storage"/>: {} <vl-i18n key="common.free"/> / {}"#,
-                human(d.free),
-                human(d.total)
-            )
-        })
-        .unwrap_or_else(|| r#"<vl-i18n key="audit.storage"/>: n/a"#.to_string());
-    format!(
-        "{}<br>URL: {}<br><vl-i18n key=\"audit.server_mode\"/>: {:?}",
-        disk,
-        esc(&runtime_settings(state).public_base_url),
-        state.config.server.mode
-    )
+    .expect("the admin page template writes only to an in-memory string")
 }
 
 pub(super) struct DiskStats {

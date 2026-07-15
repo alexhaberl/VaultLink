@@ -14,7 +14,8 @@ use axum::{
 use futures_util::Stream;
 
 use super::{
-    encoded, esc, escaped_html_len, internal, plain_page, push_html_escaped, storage_full_error,
+    common::{encoded, internal},
+    rendering::{esc, escaped_html_len, plain_page, push_html_escaped, storage_full_error},
     AppError, Result, BUFFERED_RESPONSE_CHUNK_BYTES, MAX_RENDERED_TEXT_PREVIEW_BYTES,
     TEXT_PREVIEW_STREAM_MARKER,
 };
@@ -729,6 +730,11 @@ impl Stream for EscapedTextPageStream {
     }
 }
 
+/// Inserts a text preview into the single marker emitted by an Askama shell.
+///
+/// This is the one deliberate exception to Askama's normal value rendering:
+/// preview text can be large, so it is HTML-escaped incrementally under the
+/// rendered-output cap instead of first allocating a second escaped string.
 pub(super) fn escaped_text_page_stream(
     page_template: String,
     text: String,
