@@ -712,10 +712,10 @@ fn validate_tls_files(tls: &Tls) -> Result<(), ConfigError> {
         }
     }
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(&tls.key_file)?.permissions().mode();
-    if mode & 0o007 != 0 {
+    let mode = fs::metadata(&tls.key_file)?.permissions().mode() & 0o7777;
+    if !matches!(mode, 0o400 | 0o440 | 0o600 | 0o640) {
         return Err(ConfigError::Invalid(
-            "TLS private key must not be accessible to other users".into(),
+            "TLS private key mode must be 0400, 0440, 0600, or 0640".into(),
         ));
     }
     Ok(())
@@ -1161,6 +1161,34 @@ mod tests {
         c.tls.cert_file = "missing-cert.pem".into();
         c.tls.key_file = "missing-key.pem".into();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn standalone_tls_accepts_only_documented_private_key_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("certificate.pem");
+        let private_key = directory.path().join("private-key.pem");
+        std::fs::write(&certificate, "certificate").unwrap();
+        std::fs::write(&private_key, "private key").unwrap();
+        let tls = Tls {
+            cert_file: certificate,
+            key_file: private_key.clone(),
+            ..Tls::default()
+        };
+
+        for mode in [0o400, 0o440, 0o600, 0o640] {
+            std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(validate_tls_files(&tls).is_ok(), "rejected mode {mode:04o}");
+        }
+        for mode in [0o660, 0o620, 0o644, 0o700, 0o4640, 0o2640, 0o1640] {
+            std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                validate_tls_files(&tls).is_err(),
+                "accepted mode {mode:04o}"
+            );
+        }
     }
 
     #[test]

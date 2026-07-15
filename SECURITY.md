@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-`0.4.2` is currently a private release candidate for Linux x86_64 and aarch64. No published version is supported until the signed artifacts, native release gates, and annotated tag in the release checklist are complete. Security fixes are prepared on the latest private candidate; Windows hosts are not supported.
+`0.4.3` is currently a private release candidate for Linux x86_64 and aarch64. No published version is supported until the signed artifacts, native release gates, and annotated tag in the release checklist are complete. Security fixes are prepared on the latest private candidate; Windows hosts are not supported.
 
 ## Build and release security
 
