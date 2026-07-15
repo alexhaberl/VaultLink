@@ -1,0 +1,3904 @@
+use super::*;
+
+#[test]
+fn required_audit_failure_rolls_back_admin_share_session_and_settings_mutations() {
+    let db = Database::open(":memory:").unwrap();
+    db.create_admin("admin", "old-hash", "secret").unwrap();
+    db.create_admin("inactive", "inactive-hash", "inactive-secret")
+        .unwrap();
+    db.create_admin("other-active", "other-hash", "other-secret")
+        .unwrap();
+    assert_eq!(
+        db.deactivate_admin(2).unwrap(),
+        AdminDeactivationOutcome::Deactivated
+    );
+    db.replace_runtime_settings(&[("public_base_url", "https://old.invalid".into())], 1)
+        .unwrap();
+    let share_id = db
+        .create_share(
+            "existing-share",
+            None,
+            "file.txt",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            Some("old-share-hash"),
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_required_audit
+                 BEFORE INSERT ON audit
+                 BEGIN
+                     SELECT RAISE(FAIL, 'injected audit failure');
+                 END;",
+        )
+        .unwrap();
+    let context = AuditContext::new("admin", Some("192.0.2.1".into()));
+
+    let create_admin_error = db
+        .create_admin_and_audit("rolled-back-admin", "hash", "secret", &context)
+        .unwrap_err();
+    assert!(is_audit_unavailable(&create_admin_error));
+    assert_eq!(db.admin_count().unwrap(), 3);
+
+    let activate_error = db.activate_admin_and_audit(2, &context).unwrap_err();
+    assert!(is_audit_unavailable(&activate_error));
+    assert_eq!(
+        db.conn()
+            .query_row::<i64, _, _>("SELECT active FROM admins WHERE id=2", [], |row| row.get(0))
+            .unwrap(),
+        0
+    );
+
+    let deactivate_error = db.deactivate_admin_and_audit(3, &context).unwrap_err();
+    assert!(is_audit_unavailable(&deactivate_error));
+    assert_eq!(
+        db.conn()
+            .query_row::<i64, _, _>("SELECT active FROM admins WHERE id=3", [], |row| row.get(0))
+            .unwrap(),
+        1
+    );
+
+    let admin_error = db
+        .reset_admin_password_and_audit(1, "new-hash", &context)
+        .unwrap_err();
+    assert!(is_audit_unavailable(&admin_error));
+    assert_eq!(
+        db.admin("admin").unwrap().unwrap().password_hash,
+        "old-hash"
+    );
+
+    let totp_error = db
+        .reset_admin_totp_and_audit(1, "new-secret", &context)
+        .unwrap_err();
+    assert!(is_audit_unavailable(&totp_error));
+    assert_eq!(
+        db.admin("admin")
+            .unwrap()
+            .unwrap()
+            .totp_secret
+            .expose_secret(),
+        "secret"
+    );
+
+    let share_error = db
+        .set_share_active_and_audit(share_id, false, &context, "share_deactivated")
+        .unwrap_err();
+    assert!(is_audit_unavailable(&share_error));
+    assert!(db.share_by_token("existing-share").unwrap().unwrap().active);
+
+    let control_events = [RequiredAuditEvent::new(
+        "share_controls_updated",
+        Some(share_id.to_string()),
+        None,
+    )];
+    let controls_error = db
+        .update_share_controls_and_audit(
+            share_id,
+            Some(false),
+            Some(&UploadConflictStrategy::OverwriteAllowed),
+            None,
+            &context,
+            &control_events,
+        )
+        .unwrap_err();
+    assert!(is_audit_unavailable(&controls_error));
+    let unchanged_share = db.share_by_token("existing-share").unwrap().unwrap();
+    assert!(unchanged_share.active);
+    assert_eq!(
+        unchanged_share.upload_conflict_strategy,
+        UploadConflictStrategy::Reject
+    );
+
+    let password_error = db
+        .set_share_password_and_audit(
+            share_id,
+            Some("new-share-hash"),
+            &context,
+            "share_password_changed",
+        )
+        .unwrap_err();
+    assert!(is_audit_unavailable(&password_error));
+    assert_eq!(
+        db.share_by_token("existing-share")
+            .unwrap()
+            .unwrap()
+            .password_hash
+            .as_deref(),
+        Some("old-share-hash")
+    );
+
+    let share = db.share_by_token("existing-share").unwrap().unwrap();
+    let unlock_error = db
+        .create_unlock_session_for_verified_password_and_audit(
+            "rolled-back-unlock",
+            share_id,
+            share.password_hash.as_deref().unwrap(),
+            share.upload_policy_epoch,
+            "csrf",
+            Utc::now() + Duration::hours(1),
+            &context,
+        )
+        .unwrap_err();
+    assert!(is_audit_unavailable(&unlock_error));
+    assert!(!db.unlock_session("rolled-back-unlock", share_id).unwrap());
+
+    let delete_error = db.delete_share_and_audit(share_id, &context).unwrap_err();
+    assert!(is_audit_unavailable(&delete_error));
+    assert!(db.share_by_token("existing-share").unwrap().is_some());
+
+    let create_error = db
+        .create_share_with_upload_limits_and_audit(
+            "rolled-back-share",
+            None,
+            "other.txt",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+            &context,
+            None,
+        )
+        .unwrap_err();
+    assert!(is_audit_unavailable(&create_error));
+    assert!(db.share_by_token("rolled-back-share").unwrap().is_none());
+
+    let session_error = db
+        .create_session_for_verified_password_and_audit(
+            "rolled-back-session",
+            1,
+            "old-hash",
+            "csrf",
+            Utc::now() + chrono::Duration::hours(1),
+            &context,
+        )
+        .unwrap_err();
+    assert!(is_audit_unavailable(&session_error));
+    assert!(db.session("rolled-back-session").unwrap().is_none());
+
+    let settings_error = db
+        .replace_runtime_settings_and_audit(
+            &[("public_base_url", "https://new.invalid".into())],
+            1,
+            &context,
+            "changed=true".into(),
+        )
+        .unwrap_err();
+    assert!(is_audit_unavailable(&settings_error));
+    assert_eq!(
+        db.runtime_settings().unwrap(),
+        vec![("public_base_url".into(), "https://old.invalid".into())]
+    );
+    assert_eq!(db.count_audit(None).unwrap(), 0);
+}
+
+#[test]
+fn token_hash_keeps_lowercase_sha256_encoding() {
+    assert_eq!(
+        token_hash("test"),
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    );
+}
+
+#[test]
+fn fallible_unsigned_sqlite_values_reject_out_of_range_data() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute("CREATE TABLE numbers(value INTEGER NOT NULL)", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO numbers(value) VALUES(?1)",
+            [MAX_SQLITE_UNSIGNED],
+        )
+        .unwrap();
+    let maximum: u64 = connection
+        .query_row("SELECT value FROM numbers", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(maximum, MAX_SQLITE_UNSIGNED);
+    assert!(connection
+        .execute(
+            "INSERT INTO numbers(value) VALUES(?1)",
+            [MAX_SQLITE_UNSIGNED + 1]
+        )
+        .is_err());
+
+    connection.execute("DELETE FROM numbers", []).unwrap();
+    connection
+        .execute("INSERT INTO numbers(value) VALUES(-1)", [])
+        .unwrap();
+    assert!(connection
+        .query_row("SELECT value FROM numbers", [], |row| row.get::<_, u64>(0))
+        .is_err());
+}
+
+#[test]
+fn persistent_database_is_regular_private_and_not_linked() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("data.sqlite");
+    std::fs::write(&path, []).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let database = Database::open(&path).unwrap();
+    drop(database);
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    assert!(metadata.file_type().is_file());
+    assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+    assert_eq!(metadata.nlink(), 1);
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+
+    let hard_link = directory.path().join("data-hard-link.sqlite");
+    std::fs::hard_link(&path, &hard_link).unwrap();
+    assert!(Database::open(&path).is_err());
+
+    let symlink = directory.path().join("data-symlink.sqlite");
+    std::os::unix::fs::symlink(&path, &symlink).unwrap();
+    assert!(Database::open(&symlink).is_err());
+    assert!(Database::open(directory.path()).is_err());
+}
+
+#[test]
+fn database_open_stays_bound_to_the_validated_directory_capability() {
+    let parent = tempfile::tempdir().unwrap();
+    let configured = parent.path().join("data");
+    let displaced = parent.path().join("data-validated");
+    std::fs::create_dir(&configured).unwrap();
+    std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let capability = File::open(&configured).unwrap();
+
+    std::fs::rename(&configured, &displaced).unwrap();
+    std::fs::create_dir(&configured).unwrap();
+
+    let database = Database::open_in_directory(capability).unwrap();
+    assert_eq!(database.admin_count().unwrap(), 0);
+    drop(database);
+
+    assert!(displaced.join("data.sqlite").is_file());
+    assert!(!configured.join("data.sqlite").exists());
+}
+
+#[test]
+fn file_mutations_update_only_exact_share_subtrees() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let mut ids = Vec::new();
+    for (index, path) in ["foo", "foo/child.txt", "foobar", "other"]
+        .into_iter()
+        .enumerate()
+    {
+        ids.push(
+            database
+                .create_share(
+                    &format!("token-{index}"),
+                    None,
+                    path,
+                    path == "foo",
+                    &Permission::DownloadOnly,
+                    None,
+                    None,
+                    None,
+                    1,
+                    None,
+                    &UploadConflictStrategy::Reject,
+                )
+                .unwrap(),
+        );
+    }
+    database.set_share_active(ids[1], false).unwrap();
+    assert_eq!(
+        database.rename_share_paths("foo", "renamed", true).unwrap(),
+        2
+    );
+    let shares = database.list_shares().unwrap();
+    assert!(shares.iter().any(|share| share.relative_path == "renamed"));
+    assert!(shares
+        .iter()
+        .any(|share| share.relative_path == "renamed/child.txt" && !share.active));
+    assert!(shares.iter().any(|share| share.relative_path == "foobar"));
+    assert_eq!(
+        database
+            .count_active_shares_for_path("renamed", true)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        database
+            .deactivate_shares_for_path("renamed", true)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        database
+            .count_active_shares_for_path("renamed", true)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn download_limit_is_atomic() {
+    let d = Database::open(":memory:").unwrap();
+    d.create_admin("a", "h", "s").unwrap();
+    let id = d
+        .create_share(
+            "token",
+            None,
+            "x",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    assert!(d.count_download(id).unwrap());
+    assert!(!d.count_download(id).unwrap());
+}
+#[test]
+fn alias_unique() {
+    let d = Database::open(":memory:").unwrap();
+    d.create_admin("a", "h", "s").unwrap();
+    d.create_share(
+        "a",
+        Some("alias"),
+        "x",
+        false,
+        &Permission::DownloadOnly,
+        None,
+        None,
+        None,
+        1,
+        None,
+        &UploadConflictStrategy::Reject,
+    )
+    .unwrap();
+    assert!(d
+        .create_share(
+            "b",
+            Some("alias"),
+            "y",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .is_err());
+}
+
+#[test]
+fn session_mfa_and_logout_lifecycle() {
+    let d = Database::open(":memory:").unwrap();
+    d.create_admin("admin", "hash", "secret").unwrap();
+    d.create_session(
+        "session-token",
+        1,
+        "csrf",
+        Utc::now() + chrono::Duration::hours(1),
+    )
+    .unwrap();
+    let session = d.session("session-token").unwrap().unwrap();
+    assert!(!session.mfa_verified);
+    assert_eq!(session.csrf_token, "csrf");
+    assert!(d.verify_mfa("session-token").unwrap());
+    assert!(d.session("session-token").unwrap().unwrap().mfa_verified);
+    d.delete_session("session-token").unwrap();
+    assert!(d.session("session-token").unwrap().is_none());
+}
+
+#[test]
+fn totp_step_is_consumed_once_across_racing_sessions() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    for token in ["first-session", "second-session"] {
+        database
+            .create_session(token, 1, "csrf", Utc::now() + Duration::hours(1))
+            .unwrap();
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let workers = ["first-session", "second-session"].map(|token| {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let rotated = format!("{token}-rotated");
+            let accepted = database
+                .verify_mfa_with_totp_step(token, &rotated, "rotated-csrf", 1, 42)
+                .unwrap();
+            (token, rotated, accepted)
+        })
+    });
+    barrier.wait();
+    let outcomes = workers.map(|worker| worker.join().unwrap());
+    assert_eq!(
+        outcomes.iter().filter(|(_, _, accepted)| *accepted).count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(
+                |(_, rotated, _)| database.session(rotated).unwrap().is_some_and(|session| {
+                    session.mfa_verified && session.csrf_token == "rotated-csrf"
+                })
+            )
+            .count(),
+        1
+    );
+    assert!(outcomes
+        .iter()
+        .all(|(old, _, accepted)| { !accepted || database.session(old).unwrap().is_none() }));
+
+    let pending_token = outcomes
+        .iter()
+        .find(|(_, _, accepted)| !accepted)
+        .map(|(old, _, _)| *old)
+        .unwrap();
+    assert!(!database
+        .verify_mfa_with_totp_step(pending_token, "retry-1", "csrf-1", 1, 42)
+        .unwrap());
+    assert!(database
+        .verify_mfa_with_totp_step(pending_token, "retry-2", "csrf-2", 1, 43)
+        .unwrap());
+    assert!(database.session(pending_token).unwrap().is_none());
+    assert_eq!(
+        database.session("retry-2").unwrap().unwrap().csrf_token,
+        "csrf-2"
+    );
+}
+
+#[test]
+fn verified_password_session_creation_rejects_a_stale_hash_without_a_zombie_session() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "verified-hash", "secret")
+        .unwrap();
+    database.reset_admin_password(1, "rotated-hash").unwrap();
+
+    assert_eq!(
+        database
+            .create_session_for_verified_password(
+                "stale-session",
+                1,
+                "verified-hash",
+                "csrf",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap(),
+        PasswordSessionCreationOutcome::StalePassword
+    );
+    assert!(database.session("stale-session").unwrap().is_none());
+    assert_eq!(
+        database
+            .conn()
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM sessions WHERE token_hash=?1",
+                [token_hash("stale-session")],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn verified_password_session_creation_rejects_an_inactive_admin_without_a_zombie_session() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("disabled", "verified-hash", "secret")
+        .unwrap();
+    database
+        .create_admin("survivor", "other-hash", "other-secret")
+        .unwrap();
+    assert_eq!(
+        database.deactivate_admin(1).unwrap(),
+        AdminDeactivationOutcome::Deactivated
+    );
+
+    assert_eq!(
+        database
+            .create_session_for_verified_password(
+                "inactive-session",
+                1,
+                "verified-hash",
+                "csrf",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap(),
+        PasswordSessionCreationOutcome::AdminInactive
+    );
+    assert!(database.session("inactive-session").unwrap().is_none());
+    assert_eq!(
+        database
+            .conn()
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM sessions WHERE token_hash=?1",
+                [token_hash("inactive-session")],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn verified_password_session_creation_accepts_the_current_active_hash() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "verified-hash", "secret")
+        .unwrap();
+
+    assert_eq!(
+        database
+            .create_session_for_verified_password(
+                "current-session",
+                1,
+                "verified-hash",
+                "csrf",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap(),
+        PasswordSessionCreationOutcome::Created
+    );
+    assert!(database.session("current-session").unwrap().is_some());
+}
+
+#[test]
+fn audit_client_ips_are_optional_listed_and_purgeable_without_deleting_events() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .audit("admin", "settings_updated", None, None)
+        .unwrap();
+    database
+        .audit_with_client_ip(
+            "public",
+            "share_unlock_failed",
+            Some("7"),
+            Some("rate limited"),
+            Some("203.0.113.24"),
+        )
+        .unwrap();
+
+    assert_eq!(database.count_audit_client_ips().unwrap(), 1);
+    assert_eq!(database.count_audit(None).unwrap(), 2);
+    assert_eq!(database.count_audit(Some("settings_updated")).unwrap(), 1);
+    assert_eq!(database.count_audit(Some("missing_action")).unwrap(), 0);
+    let events = database.list_audit(None, 10, 0).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].client_ip.as_deref(), Some("203.0.113.24"));
+    assert!(events[1].client_ip.is_none());
+
+    assert_eq!(
+        database.delete_audit_client_ips_if_disabled(false).unwrap(),
+        AuditClientIpDeletionOutcome::Deleted(1)
+    );
+    assert_eq!(database.count_audit_client_ips().unwrap(), 0);
+    assert_eq!(
+        database.delete_audit_client_ips_if_disabled(false).unwrap(),
+        AuditClientIpDeletionOutcome::Deleted(0)
+    );
+    let events = database.list_audit(None, 10, 0).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| event.client_ip.is_none()));
+}
+
+#[test]
+fn audited_client_ip_purge_rolls_back_when_required_audit_fails() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .audit_with_client_ip("public", "existing_event", None, None, Some("203.0.113.24"))
+        .unwrap();
+    assert_eq!(database.count_audit_client_ips().unwrap(), 1);
+    database
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_audit_ip_purge_audit
+                 BEFORE INSERT ON audit
+                 WHEN NEW.action='audit_client_ips_deleted'
+                 BEGIN SELECT RAISE(FAIL, 'injected audit failure'); END;",
+        )
+        .unwrap();
+    let context = AuditContext::new("admin", None);
+
+    let error = database
+        .delete_audit_client_ips_if_disabled_and_audit(false, &context)
+        .unwrap_err();
+    assert!(is_audit_unavailable(&error));
+    assert_eq!(database.count_audit_client_ips().unwrap(), 1);
+    assert_eq!(
+        database
+            .count_audit(Some("audit_client_ips_deleted"))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn audit_ip_writes_and_purge_follow_the_persisted_privacy_setting() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    database
+        .replace_runtime_settings(&[("audit_client_ip_enabled", "true".to_string())], 1)
+        .unwrap();
+    database
+        .audit_with_client_ip("public", "before_disable", None, None, Some("203.0.113.40"))
+        .unwrap();
+
+    // The committed setting wins over a stale in-memory fallback.
+    assert_eq!(
+        database.delete_audit_client_ips_if_disabled(false).unwrap(),
+        AuditClientIpDeletionOutcome::LoggingEnabled
+    );
+
+    database
+        .replace_runtime_settings(&[("audit_client_ip_enabled", "false".to_string())], 1)
+        .unwrap();
+    // Model a delayed request that captured the IP while logging was still
+    // enabled but reaches SQLite only after the disabling commit.
+    database
+        .audit_with_client_ip(
+            "public",
+            "delayed_after_disable",
+            None,
+            None,
+            Some("203.0.113.41"),
+        )
+        .unwrap();
+    let delayed = database
+        .list_audit(Some("delayed_after_disable"), 1, 0)
+        .unwrap();
+    assert_eq!(delayed.len(), 1);
+    assert!(delayed[0].client_ip.is_none());
+    assert_eq!(database.count_audit_client_ips().unwrap(), 1);
+
+    assert_eq!(
+        database.delete_audit_client_ips_if_disabled(true).unwrap(),
+        AuditClientIpDeletionOutcome::Deleted(1)
+    );
+    assert_eq!(database.count_audit_client_ips().unwrap(), 0);
+
+    database
+        .replace_runtime_settings(&[("audit_client_ip_enabled", "true".to_string())], 1)
+        .unwrap();
+    assert_eq!(
+        database.delete_audit_client_ips_if_disabled(false).unwrap(),
+        AuditClientIpDeletionOutcome::LoggingEnabled
+    );
+}
+
+#[test]
+fn audit_retention_keeps_only_the_newest_rows() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    {
+        let mut connection = database.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        for index in 0..6 {
+            transaction
+                .execute(
+                    "INSERT INTO audit(
+                             occurred_at,actor,action,object_id,detail,client_ip
+                         ) VALUES(?1,'test',?2,NULL,NULL,NULL)",
+                    params![Utc::now().to_rfc3339(), format!("event-{index}")],
+                )
+                .unwrap();
+            enforce_audit_retention(&transaction, 3).unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+
+    let actions: Vec<String> = {
+        let connection = database.conn();
+        let mut statement = connection
+            .prepare("SELECT action FROM audit ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(
+        actions,
+        vec![
+            "event-3".to_string(),
+            "event-4".to_string(),
+            "event-5".to_string()
+        ]
+    );
+}
+
+#[test]
+fn initial_admin_creation_is_atomic() {
+    let database = Database::open(":memory:").unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for username in ["first", "second"] {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            database
+                .create_initial_admin_and_audit(
+                    username,
+                    "hash",
+                    "secret",
+                    &AuditContext::new("setup", None),
+                )
+                .unwrap()
+        }));
+    }
+    barrier.wait();
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == InitialAdminOutcome::Created)
+            .count(),
+        1
+    );
+    assert_eq!(database.admin_count().unwrap(), 1);
+    assert_eq!(
+        database.count_audit(Some("initial_admin_created")).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn initial_admin_creation_refuses_an_initialized_database() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("existing", "existing-hash", "existing-secret")
+        .unwrap();
+
+    assert_eq!(
+        database
+            .create_initial_admin("second", "second-hash", "second-secret")
+            .unwrap(),
+        InitialAdminOutcome::AlreadyInitialized
+    );
+    assert_eq!(database.admin_count().unwrap(), 1);
+    assert!(database.admin("second").unwrap().is_none());
+}
+
+#[test]
+fn audited_initial_admin_creation_rolls_back_when_audit_fails() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_initial_admin_audit
+                 BEFORE INSERT ON audit
+                 WHEN NEW.action='initial_admin_created'
+                 BEGIN SELECT RAISE(FAIL, 'injected audit failure'); END;",
+        )
+        .unwrap();
+    let context = AuditContext::new("setup", None);
+
+    let error = database
+        .create_initial_admin_and_audit("admin", "hash", "secret", &context)
+        .unwrap_err();
+    assert!(is_audit_unavailable(&error));
+    assert_eq!(database.admin_count().unwrap(), 0);
+    assert_eq!(
+        database.count_audit(Some("initial_admin_created")).unwrap(),
+        0
+    );
+
+    database
+        .conn()
+        .execute_batch("DROP TRIGGER fail_initial_admin_audit")
+        .unwrap();
+    assert_eq!(
+        database
+            .create_initial_admin_and_audit("admin", "hash", "secret", &context)
+            .unwrap(),
+        InitialAdminOutcome::Created
+    );
+    let events = database
+        .list_audit(Some("initial_admin_created"), 10, 0)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor, "setup");
+    assert!(events[0].client_ip.is_none());
+}
+
+#[test]
+fn combined_admin_recovery_is_atomic_and_revokes_sessions() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "old-hash", "old-secret")
+        .unwrap();
+    database
+        .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    database
+        .start_admin_mfa_enrollment(1, "stale-enrollment", "stale-pending-secret")
+        .unwrap();
+
+    let outcome = database
+        .recover_admin("ADMIN", Some("new-hash"), Some("new-secret"))
+        .unwrap();
+    assert_eq!(
+        outcome,
+        AdminRecoveryOutcome::Recovered {
+            admin_id: 1,
+            username: "admin".into(),
+            active: true,
+        }
+    );
+    let admin = database.admin("admin").unwrap().unwrap();
+    assert_eq!(admin.password_hash, "new-hash");
+    assert_eq!(admin.totp_secret.expose_secret(), "new-secret");
+    assert!(database.session("session-token").unwrap().is_none());
+    assert_eq!(
+        database
+            .activate_admin_mfa_enrollment(1, "stale-enrollment", 42, None)
+            .unwrap(),
+        AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired
+    );
+    assert_eq!(
+        database
+            .admin("admin")
+            .unwrap()
+            .unwrap()
+            .totp_secret
+            .expose_secret(),
+        "new-secret"
+    );
+    assert!(database.consume_admin_totp_step(1, 42).unwrap());
+    assert!(!database.consume_admin_totp_step(1, 42).unwrap());
+    let events = database.list_audit(Some("admin_recovered"), 10, 0).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor, "local_recovery");
+    assert_eq!(
+        events[0].detail.as_deref(),
+        Some("reset_password=true;reset_mfa=true")
+    );
+    assert!(events[0].client_ip.is_none());
+    let serialized_event = format!("{events:?}");
+    assert!(!serialized_event.contains("new-hash"));
+    assert!(!serialized_event.contains("new-secret"));
+}
+
+#[test]
+fn combined_admin_recovery_rolls_back_all_changes_when_audit_fails() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "old-hash", "old-secret")
+        .unwrap();
+    database
+        .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    database
+        .start_admin_mfa_enrollment(1, "pending-token", "pending-secret")
+        .unwrap();
+    database
+        .conn()
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_admin_recovery_audit
+                 BEFORE INSERT ON audit
+                 WHEN NEW.action='admin_recovered'
+                 BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+        )
+        .unwrap();
+
+    assert!(database
+        .recover_admin("admin", Some("new-hash"), Some("new-secret"))
+        .is_err());
+    let admin = database.admin("admin").unwrap().unwrap();
+    assert_eq!(admin.password_hash, "old-hash");
+    assert_eq!(admin.totp_secret.expose_secret(), "old-secret");
+    assert!(database.session("session-token").unwrap().is_some());
+    assert!(database
+        .admin_mfa_enrollment(1, "pending-token")
+        .unwrap()
+        .is_some());
+    assert_eq!(database.count_audit(Some("admin_recovered")).unwrap(), 0);
+}
+
+#[test]
+fn admin_recovery_returns_not_found_without_side_effects() {
+    let database = Database::open(":memory:").unwrap();
+
+    assert_eq!(
+        database
+            .recover_admin("missing", Some("new-hash"), None)
+            .unwrap(),
+        AdminRecoveryOutcome::NotFound
+    );
+    assert_eq!(database.admin_count().unwrap(), 0);
+    assert_eq!(database.count_audit(Some("admin_recovered")).unwrap(), 0);
+}
+
+#[test]
+fn password_change_compare_and_swap_allows_only_one_racing_update() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "old-hash", "secret")
+        .unwrap();
+    database
+        .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for new_hash in ["first-hash", "second-hash"] {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            database
+                .change_admin_password_cas(1, "old-hash", new_hash, Some("198.51.100.10"))
+                .unwrap()
+        }));
+    }
+    barrier.wait();
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AdminPasswordChangeOutcome::Changed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AdminPasswordChangeOutcome::StalePassword)
+            .count(),
+        1
+    );
+    let admin = database.admin("admin").unwrap().unwrap();
+    assert!(matches!(
+        admin.password_hash.as_str(),
+        "first-hash" | "second-hash"
+    ));
+    assert!(database.session("session-token").unwrap().is_none());
+    assert_eq!(
+        database
+            .count_audit(Some("account_password_changed"))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        database
+            .list_audit(Some("account_password_changed"), 10, 0)
+            .unwrap()[0]
+            .client_ip
+            .as_deref(),
+        Some("198.51.100.10")
+    );
+}
+
+#[test]
+fn audited_mfa_enrollment_start_consumes_totp_and_records_required_audit() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "hash", "old-secret")
+        .unwrap();
+    let context = AuditContext::new("admin", Some("198.51.100.20".into()));
+
+    let outcome = database
+        .start_admin_mfa_enrollment_and_audit(1, "enrollment-token", "new-secret", 42, &context)
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        AuditedAdminMfaEnrollmentStartOutcome::Started { .. }
+    ));
+    assert!(!database.consume_admin_totp_step(1, 42).unwrap());
+    assert_eq!(
+        database
+            .admin_mfa_enrollment(1, "enrollment-token")
+            .unwrap()
+            .unwrap()
+            .totp_secret
+            .expose_secret(),
+        "new-secret"
+    );
+    let events = database
+        .list_audit(Some("account_mfa_enrollment_started"), 10, 0)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor, "admin");
+    assert_eq!(events[0].object_id.as_deref(), Some("1"));
+    assert_eq!(events[0].client_ip.as_deref(), Some("198.51.100.20"));
+    assert!(!format!("{events:?}").contains("new-secret"));
+}
+
+#[test]
+fn audited_mfa_enrollment_start_rolls_back_step_and_pending_secret_on_audit_failure() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "hash", "old-secret")
+        .unwrap();
+    database
+        .start_admin_mfa_enrollment(1, "old-token", "old-pending-secret")
+        .unwrap();
+    database
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_mfa_enrollment_start_audit
+                 BEFORE INSERT ON audit
+                 WHEN NEW.action='account_mfa_enrollment_started'
+                 BEGIN SELECT RAISE(FAIL, 'injected audit failure'); END;",
+        )
+        .unwrap();
+    let context = AuditContext::new("admin", None);
+
+    let error = database
+        .start_admin_mfa_enrollment_and_audit(1, "new-token", "new-pending-secret", 43, &context)
+        .unwrap_err();
+    assert!(is_audit_unavailable(&error));
+    assert!(database
+        .admin_mfa_enrollment(1, "old-token")
+        .unwrap()
+        .is_some());
+    assert!(database
+        .admin_mfa_enrollment(1, "new-token")
+        .unwrap()
+        .is_none());
+    assert!(database.consume_admin_totp_step(1, 43).unwrap());
+    assert_eq!(
+        database
+            .count_audit(Some("account_mfa_enrollment_started"))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn pending_mfa_enrollment_has_a_ttl_and_replaces_the_previous_token() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+
+    let first = database
+        .start_admin_mfa_enrollment(1, "first-token", "first-secret")
+        .unwrap();
+    let AdminMfaEnrollmentStartOutcome::Started { expires_at } = first else {
+        panic!("known administrator must start an enrollment");
+    };
+    let expires_at = DateTime::parse_from_rfc3339(&expires_at).unwrap();
+    let remaining = expires_at.signed_duration_since(Utc::now());
+    assert!(remaining <= Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS));
+    assert!(remaining > Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS - 5));
+    assert_eq!(
+        database
+            .admin_mfa_enrollment(1, "first-token")
+            .unwrap()
+            .unwrap()
+            .totp_secret
+            .expose_secret(),
+        "first-secret"
+    );
+
+    database
+        .start_admin_mfa_enrollment(1, "second-token", "second-secret")
+        .unwrap();
+    assert!(database
+        .admin_mfa_enrollment(1, "first-token")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        database
+            .admin_mfa_enrollment(1, "second-token")
+            .unwrap()
+            .unwrap()
+            .totp_secret
+            .expose_secret(),
+        "second-secret"
+    );
+    let stored_token_hash = database
+        .conn()
+        .query_row::<String, _, _>(
+            "SELECT token_hash FROM admin_mfa_enrollments WHERE admin_id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_token_hash, token_hash("second-token"));
+    assert_ne!(stored_token_hash, "second-token");
+
+    database
+        .conn()
+        .execute(
+            "UPDATE admin_mfa_enrollments SET expires_at=?1 WHERE admin_id=1",
+            [Utc::now()
+                .checked_sub_signed(Duration::seconds(1))
+                .unwrap()
+                .to_rfc3339()],
+        )
+        .unwrap();
+    assert_eq!(database.cleanup_expired_admin_mfa_enrollments().unwrap(), 1);
+    assert!(database
+        .admin_mfa_enrollment(1, "second-token")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn pending_mfa_activation_is_single_use_and_revokes_sessions() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "hash", "old-secret")
+        .unwrap();
+    database
+        .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    database
+        .start_admin_mfa_enrollment(1, "enrollment-token", "new-secret")
+        .unwrap();
+
+    assert_eq!(
+        database
+            .activate_admin_mfa_enrollment(1, "enrollment-token", 42, Some("203.0.113.24"),)
+            .unwrap(),
+        AdminMfaEnrollmentActivationOutcome::Activated
+    );
+    assert_eq!(
+        database
+            .admin("admin")
+            .unwrap()
+            .unwrap()
+            .totp_secret
+            .expose_secret(),
+        "new-secret"
+    );
+    assert!(database.session("session-token").unwrap().is_none());
+    assert!(!database.consume_admin_totp_step(1, 42).unwrap());
+    assert!(database.consume_admin_totp_step(1, 43).unwrap());
+    assert!(database
+        .admin_mfa_enrollment(1, "enrollment-token")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        database
+            .activate_admin_mfa_enrollment(1, "enrollment-token", 42, None)
+            .unwrap(),
+        AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired
+    );
+    let events = database
+        .list_audit(Some("account_mfa_changed"), 10, 0)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].detail.is_none());
+    assert_eq!(events[0].client_ip.as_deref(), Some("203.0.113.24"));
+    assert!(!format!("{events:?}").contains("new-secret"));
+}
+
+#[test]
+fn deactivation_removes_pending_mfa_and_blocks_inactive_account_operations() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("one", "one-hash", "one-secret")
+        .unwrap();
+    database
+        .create_admin("two", "two-hash", "two-secret")
+        .unwrap();
+    database
+        .start_admin_mfa_enrollment(1, "pending-token", "pending-secret")
+        .unwrap();
+
+    assert_eq!(
+        database.deactivate_admin(1).unwrap(),
+        AdminDeactivationOutcome::Deactivated
+    );
+    assert_eq!(
+        database
+            .conn()
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM admin_mfa_enrollments WHERE admin_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database
+            .start_admin_mfa_enrollment(1, "new-token", "new-secret")
+            .unwrap(),
+        AdminMfaEnrollmentStartOutcome::AdminInactive
+    );
+    assert_eq!(
+        database
+            .change_admin_password_cas(1, "one-hash", "new-hash", None)
+            .unwrap(),
+        AdminPasswordChangeOutcome::Inactive
+    );
+
+    database
+        .conn()
+        .execute(
+            "INSERT INTO admin_mfa_enrollments(
+                    admin_id,token_hash,totp_secret,created_at,expires_at
+                 ) VALUES(1,?1,'injected-secret',?2,?3)",
+            params![
+                token_hash("injected-token"),
+                Utc::now().to_rfc3339(),
+                (Utc::now() + Duration::minutes(5)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+    assert!(database
+        .admin_mfa_enrollment(1, "injected-token")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        database
+            .activate_admin_mfa_enrollment(1, "injected-token", 42, None)
+            .unwrap(),
+        AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired
+    );
+    let inactive = database
+        .conn()
+        .query_row::<(String, String), _, _>(
+            "SELECT password_hash,totp_secret FROM admins WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(inactive, ("one-hash".into(), "one-secret".into()));
+}
+
+#[test]
+fn concurrent_admin_deactivation_preserves_one_active_admin() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("one", "hash", "secret").unwrap();
+    database.create_admin("two", "hash", "secret").unwrap();
+    database
+        .create_session("one-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    database
+        .create_session("two-session", 2, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let first = {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            database.deactivate_admin(2).unwrap()
+        })
+    };
+    let second = {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            database.deactivate_admin(1).unwrap()
+        })
+    };
+    barrier.wait();
+    let outcomes = [first.join().unwrap(), second.join().unwrap()];
+    assert!(outcomes.contains(&AdminDeactivationOutcome::Deactivated));
+    assert!(outcomes.contains(&AdminDeactivationOutcome::LastActive));
+    assert_eq!(database.active_admin_count().unwrap(), 1);
+    assert_eq!(
+        database
+            .conn()
+            .query_row::<i64, _, _>("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn runtime_settings_replacement_rolls_back_as_one_snapshot() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let original = [
+        ("max_upload_size", "10".to_string()),
+        ("max_zip_size", "20".to_string()),
+    ];
+    database.replace_runtime_settings(&original, 1).unwrap();
+    database
+        .conn()
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_runtime_replace
+                 BEFORE INSERT ON runtime_settings
+                 WHEN NEW.key='max_zip_size'
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+    let replacement = [
+        ("max_upload_size", "100".to_string()),
+        ("max_zip_size", "200".to_string()),
+    ];
+    assert!(database.replace_runtime_settings(&replacement, 1).is_err());
+    assert_eq!(
+        database.runtime_settings().unwrap(),
+        vec![
+            ("max_upload_size".to_string(), "10".to_string()),
+            ("max_zip_size".to_string(), "20".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn disabled_and_deleted_links_change_state() {
+    let d = Database::open(":memory:").unwrap();
+    d.create_admin("admin", "hash", "secret").unwrap();
+    let id = d
+        .create_share(
+            "token",
+            None,
+            "file",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    assert!(d.set_share_active(id, false).unwrap());
+    assert!(!d.set_share_active(id + 1, false).unwrap());
+    assert!(!d.share_by_token("token").unwrap().unwrap().active);
+    assert!(d.delete_share(id).unwrap());
+    assert!(!d.delete_share(id).unwrap());
+    assert!(d.share_by_token("token").unwrap().is_none());
+}
+
+#[test]
+fn malformed_share_expiry_fails_individual_and_list_queries() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    for (token, path) in [("valid", "valid.txt"), ("corrupt", "corrupt.txt")] {
+        database
+            .create_share(
+                token,
+                None,
+                path,
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+    }
+    database
+        .conn()
+        .execute(
+            "UPDATE shares SET expires_at='not-a-timestamp' WHERE token_hash=?1",
+            [token_hash("corrupt")],
+        )
+        .unwrap();
+
+    assert!(database.share_by_token("corrupt").is_err());
+    assert!(database.list_shares().is_err());
+}
+
+#[test]
+fn migrates_unversioned_installation_without_losing_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old_schema.sqlite");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(r#"
+CREATE TABLE admins(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, totp_secret TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE sessions(token_hash TEXT PRIMARY KEY, admin_id INTEGER NOT NULL REFERENCES admins(id), csrf_token TEXT NOT NULL, mfa_verified INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL);
+CREATE TABLE shares(id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, token TEXT NOT NULL, alias TEXT UNIQUE, relative_path TEXT NOT NULL, is_directory INTEGER NOT NULL, permission TEXT NOT NULL, expires_at TEXT, max_downloads INTEGER, download_count INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_by INTEGER NOT NULL REFERENCES admins(id), created_at TEXT NOT NULL);
+CREATE TABLE audit(id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object_id TEXT, detail TEXT);
+INSERT INTO admins VALUES(1,'admin','hash','secret','2026-01-01T00:00:00Z');
+INSERT INTO sessions VALUES('session-hash',1,'csrf',1,'2099-01-01T00:00:00Z');
+INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','download_only');
+"#).unwrap();
+        connection.execute("INSERT INTO shares VALUES(1,?1,'share-token','alias','folder',1,'download_only',NULL,7,3,1,1,'2026-01-01T00:00:00Z')", [token_hash("share-token")]).unwrap();
+    }
+    let database = Database::open(&path).unwrap();
+    assert_eq!(
+        database
+            .conn()
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    let share = database.share_by_token("share-token").unwrap().unwrap();
+    assert_eq!(share.download_count, 3);
+    assert_eq!(share.max_downloads, Some(7));
+    assert_eq!(share.created_at, "2026-01-01T00:00:00Z");
+    assert!(share.password_hash.is_none());
+    assert_eq!(
+        share.upload_conflict_strategy,
+        UploadConflictStrategy::Reject
+    );
+    assert_eq!(
+        database
+            .conn()
+            .query_row::<i64, _, _>("SELECT COUNT(*) FROM audit", [], |row| row.get(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn rejects_unknown_newer_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("future.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        .unwrap();
+    drop(connection);
+    assert!(Database::open(path).is_err());
+}
+
+#[test]
+fn migrates_legacy_password_max_runtime_key_to_the_canonical_name() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE runtime_settings(
+                     key TEXT PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );
+                 INSERT INTO runtime_settings VALUES('share_password_max_bytes','128');
+                 PRAGMA user_version=11;",
+        )
+        .unwrap();
+
+    migrate(&mut connection).unwrap();
+
+    assert_eq!(
+        connection
+            .query_row::<String, _, _>(
+                "SELECT value FROM runtime_settings
+                     WHERE key='share_password_max_length'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        "128"
+    );
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM runtime_settings
+                     WHERE key='share_password_max_bytes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn canonical_runtime_key_wins_if_both_password_max_names_exist() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE runtime_settings(
+                     key TEXT PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );
+                 INSERT INTO runtime_settings VALUES('share_password_max_bytes','128');
+                 INSERT INTO runtime_settings VALUES('share_password_max_length','256');
+                 PRAGMA user_version=11;",
+        )
+        .unwrap();
+
+    migrate(&mut connection).unwrap();
+
+    assert_eq!(
+        connection
+            .query_row::<String, _, _>(
+                "SELECT value FROM runtime_settings
+                     WHERE key='share_password_max_length'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        "256"
+    );
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("SELECT COUNT(*) FROM runtime_settings", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn migrates_v6_database_to_transfer_grants_without_losing_shares() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("v6.sqlite");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+                .execute_batch(
+                    "CREATE TABLE shares(id INTEGER PRIMARY KEY, marker TEXT NOT NULL);
+                     CREATE TABLE audit(id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object_id TEXT, detail TEXT);
+                     INSERT INTO shares VALUES(7, 'preserved');
+                     PRAGMA user_version=6;",
+                )
+                .unwrap();
+    }
+    let database = Database::open(&path).unwrap();
+    let connection = database.conn();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    assert_eq!(
+        connection
+            .query_row::<String, _, _>("SELECT marker FROM shares WHERE id=7", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        "preserved"
+    );
+    assert_eq!(
+            connection
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name IN ('public_transfer_grants','public_transfer_leases')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            2
+        );
+}
+
+#[test]
+fn migrates_v7_audit_and_initializes_persistent_transfer_statistics() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("v7.sqlite");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE audit(
+                        id INTEGER PRIMARY KEY,
+                        occurred_at TEXT NOT NULL,
+                        actor TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        object_id TEXT,
+                        detail TEXT
+                     );
+                     INSERT INTO audit VALUES(
+                        1,'2026-01-01T00:00:00Z','admin','share_created','1','download_only'
+                     );
+                     PRAGMA user_version=7;",
+            )
+            .unwrap();
+    }
+
+    let database = Database::open(&path).unwrap();
+    assert_eq!(
+        database
+            .conn()
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    let event = database.list_audit(None, 10, 0).unwrap().remove(0);
+    assert_eq!(event.action, "share_created");
+    assert!(event.client_ip.is_none());
+    let started_at = database.transfer_statistics_started_at().unwrap();
+    DateTime::parse_from_rfc3339(&started_at).unwrap();
+    assert_eq!(
+            database
+                .conn()
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name IN ('transfer_monthly_counts','transfer_statistics')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            2
+        );
+    assert!(database
+            .conn()
+            .execute(
+                "INSERT INTO transfer_monthly_counts(month,action,count) VALUES('2026-13','download',1)",
+                [],
+            )
+            .is_err());
+    assert!(database
+        .conn()
+        .execute(
+            "INSERT INTO transfer_monthly_counts(month,action,count) VALUES('2026-07','upload',1)",
+            [],
+        )
+        .is_err());
+    drop(database);
+
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened.transfer_statistics_started_at().unwrap(),
+        started_at
+    );
+}
+
+#[test]
+fn unlock_sessions_are_hashed_and_cascade_with_share() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "folder",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            Some("password-hash"),
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let original_share = database.share_by_token("share").unwrap().unwrap();
+    assert!(database
+        .create_unlock_session_for_verified_password(
+            "unlock-secret",
+            share_id,
+            original_share.password_hash.as_deref().unwrap(),
+            original_share.upload_policy_epoch,
+            "unlock-csrf",
+            Utc::now() + chrono::Duration::minutes(60),
+        )
+        .unwrap());
+    assert!(database.unlock_session("unlock-secret", share_id).unwrap());
+    assert_eq!(
+        database
+            .unlock_session_csrf("unlock-secret", share_id)
+            .unwrap()
+            .as_deref(),
+        Some("unlock-csrf")
+    );
+    let stored: String = database
+        .conn()
+        .query_row("SELECT token_hash FROM public_unlock_sessions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_ne!(stored, "unlock-secret");
+    database
+        .set_share_password(share_id, Some("new-password-hash"))
+        .unwrap();
+    assert!(!database.unlock_session("unlock-secret", share_id).unwrap());
+    assert!(!database
+        .create_unlock_session_for_verified_password(
+            "stale-unlock-secret",
+            share_id,
+            original_share.password_hash.as_deref().unwrap(),
+            original_share.upload_policy_epoch,
+            "stale-unlock-csrf",
+            Utc::now() + chrono::Duration::minutes(60),
+        )
+        .unwrap());
+    assert!(!database
+        .unlock_session("stale-unlock-secret", share_id)
+        .unwrap());
+    let updated_share = database.share_by_token("share").unwrap().unwrap();
+    assert!(updated_share.upload_policy_epoch > original_share.upload_policy_epoch);
+    assert!(database
+        .create_unlock_session_for_verified_password(
+            "new-unlock-secret",
+            share_id,
+            updated_share.password_hash.as_deref().unwrap(),
+            updated_share.upload_policy_epoch,
+            "new-unlock-csrf",
+            Utc::now() + chrono::Duration::minutes(60),
+        )
+        .unwrap());
+    database
+        .set_share_password(share_id, updated_share.password_hash.as_deref())
+        .unwrap();
+    assert!(!database
+        .unlock_session("new-unlock-secret", share_id)
+        .unwrap());
+    assert!(!database
+        .create_unlock_session_for_verified_password(
+            "same-hash-stale-secret",
+            share_id,
+            updated_share.password_hash.as_deref().unwrap(),
+            updated_share.upload_policy_epoch,
+            "same-hash-stale-csrf",
+            Utc::now() + chrono::Duration::minutes(60),
+        )
+        .unwrap());
+    database.delete_share(share_id).unwrap();
+    assert_eq!(
+        database
+            .conn()
+            .query_row::<i64, _, _>("SELECT COUNT(*) FROM public_unlock_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn migrates_v12_upload_shares_with_finite_quotas_and_read_only_unlocks() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("v12.sqlite");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+                .execute_batch(
+                    "CREATE TABLE admins(
+                         id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE,
+                         password_hash TEXT NOT NULL,totp_secret TEXT NOT NULL,
+                         created_at TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1
+                     );
+                     CREATE TABLE shares(
+                         id INTEGER PRIMARY KEY,token_hash TEXT NOT NULL UNIQUE,token TEXT NOT NULL,
+                         alias TEXT UNIQUE,relative_path TEXT NOT NULL,is_directory INTEGER NOT NULL,
+                         permission TEXT NOT NULL,expires_at TEXT,max_downloads INTEGER,
+                         max_upload_size INTEGER,download_count INTEGER NOT NULL DEFAULT 0,
+                         active INTEGER NOT NULL DEFAULT 1,created_by INTEGER NOT NULL,
+                         created_at TEXT NOT NULL,password_hash TEXT,
+                         upload_conflict_strategy TEXT NOT NULL DEFAULT 'reject'
+                     );
+                     CREATE TABLE public_unlock_sessions(
+                         token_hash TEXT PRIMARY KEY,share_id INTEGER NOT NULL,
+                         expires_at TEXT NOT NULL
+                     );
+                     INSERT INTO admins VALUES(1,'admin','hash','secret','now',1);
+                     INSERT INTO shares VALUES(
+                         1,'hash','token',NULL,'folder',1,'upload_only',NULL,NULL,
+                         150000000000,0,1,1,'now','password-hash','reject'
+                     );
+                     INSERT INTO public_unlock_sessions VALUES(
+                         'legacy-hash',1,'2999-01-01T00:00:00Z'
+                     );
+                     PRAGMA user_version=12;",
+                )
+                .unwrap();
+    }
+    let database = Database::open(&path).unwrap();
+    let share = database.list_shares().unwrap().remove(0);
+    assert_eq!(share.max_upload_total_size, Some(150_000_000_000));
+    assert_eq!(
+        share.max_upload_files,
+        Some(DEFAULT_SHARE_UPLOAD_FILE_COUNT)
+    );
+    let migrated_unlocks: u64 = database
+        .conn()
+        .query_row("SELECT COUNT(*) FROM public_unlock_sessions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(migrated_unlocks, 0);
+    assert!(database
+        .unlock_session_csrf("unavailable-plaintext-token", 1)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn migrates_v13_preview_sessions_with_bounded_lookup_index() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE public_preview_sessions(
+                     token_hash TEXT PRIMARY KEY,
+                     share_id INTEGER NOT NULL,
+                     relative_path TEXT NOT NULL,
+                     expires_at TEXT NOT NULL
+                 );
+                 PRAGMA user_version=13;",
+        )
+        .unwrap();
+
+    migrate(&mut connection).unwrap();
+
+    let index_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                     WHERE type='index' AND name='idx_preview_share_path_owner'
+                 )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(index_exists);
+    let owner_column_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('public_preview_sessions')
+                     WHERE name='owner_key_hash' AND \"notnull\"=1
+                 )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(owner_column_exists);
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn migrates_v14_upload_reservations_with_policy_epoch_fail_closed() {
+    let mut connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE shares(id INTEGER PRIMARY KEY);
+                 CREATE TABLE public_upload_reservations(
+                     token_hash TEXT PRIMARY KEY,
+                     share_id INTEGER NOT NULL,
+                     reserved_bytes INTEGER NOT NULL,
+                     created_at TEXT NOT NULL,
+                     expires_at TEXT NOT NULL
+                 );
+                 INSERT INTO shares VALUES(1);
+                 INSERT INTO public_upload_reservations
+                     VALUES('legacy-reservation',1,42,'now','later');
+                 PRAGMA user_version=14;",
+        )
+        .unwrap();
+
+    migrate(&mut connection).unwrap();
+
+    for table in ["shares", "public_upload_reservations"] {
+        let epoch_column_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                         SELECT 1 FROM pragma_table_info(?1)
+                         WHERE name='upload_policy_epoch' AND \"notnull\"=1
+                     )",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(epoch_column_exists, "missing epoch column on {table}");
+    }
+    let legacy_reservations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM public_upload_reservations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_reservations, 0);
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn upload_quota_reservations_are_atomic_cumulative_and_cancellable() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share_with_upload_limits(
+            "upload-share",
+            None,
+            "folder",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            Some(6),
+            Some(10),
+            Some(2),
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    assert_eq!(
+        database.begin_upload_reservation("one", share_id).unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert_eq!(
+        database.begin_upload_reservation("two", share_id).unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert_eq!(
+        database
+            .begin_upload_reservation("three", share_id)
+            .unwrap(),
+        UploadReservationBeginOutcome::FileQuotaReached
+    );
+    assert_eq!(
+        database.extend_upload_reservation("one", 6).unwrap(),
+        UploadReservationExtendOutcome::Extended
+    );
+    assert_eq!(
+        database.extend_upload_reservation("two", 5).unwrap(),
+        UploadReservationExtendOutcome::ByteQuotaReached
+    );
+    assert!(database.cancel_upload_reservation("two").unwrap());
+    assert_eq!(
+        database.commit_upload_reservation("one", 6).unwrap(),
+        UploadReservationCommitOutcome::Committed
+    );
+
+    assert_eq!(
+        database
+            .begin_upload_reservation("three", share_id)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert_eq!(
+        database.extend_upload_reservation("three", 4).unwrap(),
+        UploadReservationExtendOutcome::Extended
+    );
+    assert_eq!(
+        database.commit_upload_reservation("three", 4).unwrap(),
+        UploadReservationCommitOutcome::Committed
+    );
+    let share = database.share_by_token("upload-share").unwrap().unwrap();
+    assert_eq!((share.uploaded_bytes, share.uploaded_files), (10, 2));
+    assert_eq!(
+        database.begin_upload_reservation("four", share_id).unwrap(),
+        UploadReservationBeginOutcome::ByteQuotaReached
+    );
+    assert_eq!(
+        database.commit_upload_reservation("missing", 0).unwrap(),
+        UploadReservationCommitOutcome::NotFound
+    );
+}
+
+#[test]
+fn upload_quota_commit_rolls_back_usage_and_reservation_when_audit_fails() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share_with_upload_limits(
+            "upload-share",
+            None,
+            "folder",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            Some(10),
+            Some(100),
+            Some(2),
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .begin_upload_reservation("reservation", share_id)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert_eq!(
+        database
+            .extend_upload_reservation("reservation", 7)
+            .unwrap(),
+        UploadReservationExtendOutcome::Extended
+    );
+    database
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_upload_quota_audit
+                 BEFORE INSERT ON audit
+                 WHEN NEW.action='upload_quota_committed'
+                 BEGIN SELECT RAISE(FAIL, 'injected audit failure'); END;",
+        )
+        .unwrap();
+    let context = AuditContext::new("public", None);
+
+    let error = database
+        .commit_upload_reservation_and_audit("reservation", 7, &context)
+        .unwrap_err();
+    assert!(is_audit_unavailable(&error));
+    let usage_rows: u64 = database
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM public_upload_usage WHERE share_id=?1",
+            [share_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(usage_rows, 0);
+    assert_eq!(database.active_upload_reservations(share_id).unwrap(), 1);
+
+    database
+        .conn()
+        .execute_batch("DROP TRIGGER fail_upload_quota_audit")
+        .unwrap();
+    assert_eq!(
+        database
+            .commit_upload_reservation_and_audit("reservation", 7, &context)
+            .unwrap(),
+        UploadReservationCommitOutcome::Committed
+    );
+    let share = database.share_by_token("upload-share").unwrap().unwrap();
+    assert_eq!((share.uploaded_bytes, share.uploaded_files), (7, 1));
+    assert_eq!(
+        database
+            .count_audit(Some("upload_quota_committed"))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn upload_reservations_are_revoked_when_share_authority_changes() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let revocations = [
+        "UPDATE shares SET active=0 WHERE id=?1",
+        "UPDATE shares SET expires_at='2000-01-01T00:00:00Z' WHERE id=?1",
+        "UPDATE shares SET is_directory=0 WHERE id=?1",
+        "UPDATE shares SET permission='download_only' WHERE id=?1",
+    ];
+
+    for (index, revocation) in revocations.into_iter().enumerate() {
+        let share_token = format!("revoked-share-{index}");
+        let extend_token = format!("extend-{index}");
+        let commit_token = format!("commit-{index}");
+        let share_id = database
+            .create_share_with_upload_limits(
+                &share_token,
+                None,
+                &format!("folder-{index}"),
+                true,
+                &Permission::UploadOnly,
+                None,
+                None,
+                Some(100),
+                Some(1_000),
+                Some(10),
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .begin_upload_reservation(&extend_token, share_id)
+                .unwrap(),
+            UploadReservationBeginOutcome::Reserved
+        );
+        assert_eq!(
+            database
+                .begin_upload_reservation(&commit_token, share_id)
+                .unwrap(),
+            UploadReservationBeginOutcome::Reserved
+        );
+        database.conn().execute(revocation, [share_id]).unwrap();
+
+        assert_eq!(
+            database
+                .extend_upload_reservation(&extend_token, 1)
+                .unwrap(),
+            UploadReservationExtendOutcome::ShareUnavailable
+        );
+        assert_eq!(
+            database
+                .commit_upload_reservation(&commit_token, 0)
+                .unwrap(),
+            UploadReservationCommitOutcome::ShareUnavailable
+        );
+        assert_eq!(database.active_upload_reservations(share_id).unwrap(), 0);
+        assert!(!database.cancel_upload_reservation(&extend_token).unwrap());
+        assert!(!database.cancel_upload_reservation(&commit_token).unwrap());
+        let usage: u64 = database
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM public_upload_usage WHERE share_id=?1",
+                [share_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage, 0);
+    }
+
+    let read_write_share = database
+        .create_share_with_upload_limits(
+            "read-write-share",
+            None,
+            "read-write-folder",
+            true,
+            &Permission::DownloadUpload,
+            None,
+            None,
+            Some(100),
+            Some(1_000),
+            Some(2),
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .begin_upload_reservation("read-write-upload", read_write_share)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert_eq!(
+        database
+            .extend_upload_reservation("read-write-upload", 1)
+            .unwrap(),
+        UploadReservationExtendOutcome::Extended
+    );
+    assert_eq!(
+        database
+            .commit_upload_reservation("read-write-upload", 1)
+            .unwrap(),
+        UploadReservationCommitOutcome::Committed
+    );
+}
+
+#[test]
+fn upload_reservation_policy_epoch_rejects_reactivation_and_policy_rotation() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share_with_upload_limits(
+            "epoch-share",
+            None,
+            "folder",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            Some(100),
+            Some(1_000),
+            Some(10),
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+
+    assert_eq!(
+        database
+            .begin_upload_reservation("before-reactivation", share_id)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert!(database.set_share_active(share_id, false).unwrap());
+    assert!(database.set_share_active(share_id, true).unwrap());
+    assert_eq!(database.active_upload_reservations(share_id).unwrap(), 0);
+    assert_eq!(
+        database
+            .extend_upload_reservation("before-reactivation", 1)
+            .unwrap(),
+        UploadReservationExtendOutcome::ShareUnavailable
+    );
+
+    assert_eq!(
+        database
+            .begin_upload_reservation("before-password", share_id)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert!(database
+        .set_share_password(share_id, Some("rotated-password-hash"))
+        .unwrap());
+    assert_eq!(
+        database
+            .commit_upload_reservation("before-password", 0)
+            .unwrap(),
+        UploadReservationCommitOutcome::ShareUnavailable
+    );
+
+    assert_eq!(
+        database
+            .begin_upload_reservation("before-strategy", share_id)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert_eq!(
+        database
+            .update_share_controls(
+                share_id,
+                None,
+                Some(&UploadConflictStrategy::OverwriteAllowed),
+                None,
+            )
+            .unwrap(),
+        ShareControlsUpdateOutcome::Updated
+    );
+    assert_eq!(
+        database
+            .extend_upload_reservation("before-strategy", 1)
+            .unwrap(),
+        UploadReservationExtendOutcome::ShareUnavailable
+    );
+
+    assert_eq!(
+        database
+            .begin_upload_reservation("before-quota", share_id)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert_eq!(
+        database
+            .update_share_controls(share_id, None, None, Some((2_000, 20)))
+            .unwrap(),
+        ShareControlsUpdateOutcome::Updated
+    );
+    assert_eq!(
+        database
+            .commit_upload_reservation("before-quota", 0)
+            .unwrap(),
+        UploadReservationCommitOutcome::ShareUnavailable
+    );
+
+    assert_eq!(
+        database
+            .begin_upload_reservation("current-policy", share_id)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert_eq!(
+        database
+            .extend_upload_reservation("current-policy", 1)
+            .unwrap(),
+        UploadReservationExtendOutcome::Extended
+    );
+    assert_eq!(
+        database
+            .commit_upload_reservation("current-policy", 1)
+            .unwrap(),
+        UploadReservationCommitOutcome::Committed
+    );
+}
+
+#[test]
+fn stale_upload_quota_update_does_not_partially_change_strategy() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share_with_upload_limits(
+            "atomic-share",
+            None,
+            "folder",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            Some(5),
+            Some(20),
+            Some(3),
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    // These reservations represent concurrent uploads started after the UI
+    // read its share snapshot but before it submitted strategy plus limits.
+    for token in ["upload-one", "upload-two"] {
+        database.begin_upload_reservation(token, share_id).unwrap();
+        database.extend_upload_reservation(token, 5).unwrap();
+    }
+
+    assert_eq!(
+        database
+            .update_share_controls(
+                share_id,
+                None,
+                Some(&UploadConflictStrategy::OverwriteAllowed),
+                Some((5, 1)),
+            )
+            .unwrap(),
+        ShareControlsUpdateOutcome::QuotaConflict
+    );
+    let share = database.share_by_token("atomic-share").unwrap().unwrap();
+    assert_eq!(
+        share.upload_conflict_strategy,
+        UploadConflictStrategy::Reject
+    );
+    assert_eq!(share.max_upload_total_size, Some(20));
+    assert_eq!(share.max_upload_files, Some(3));
+
+    assert!(database.cancel_upload_reservation("upload-two").unwrap());
+    assert_eq!(
+        database
+            .update_share_controls(
+                share_id,
+                None,
+                Some(&UploadConflictStrategy::OverwriteAllowed),
+                Some((5, 1)),
+            )
+            .unwrap(),
+        ShareControlsUpdateOutcome::Updated
+    );
+    let share = database.share_by_token("atomic-share").unwrap().unwrap();
+    assert_eq!(
+        share.upload_conflict_strategy,
+        UploadConflictStrategy::OverwriteAllowed
+    );
+    assert_eq!(share.max_upload_total_size, Some(5));
+    assert_eq!(share.max_upload_files, Some(1));
+
+    database
+        .conn()
+        .execute(
+            "UPDATE public_upload_reservations SET expires_at=?2 WHERE token_hash=?1",
+            params![
+                token_hash("upload-one"),
+                (Utc::now() - Duration::seconds(1)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .update_share_controls(share_id, None, None, Some((1, 1)))
+            .unwrap(),
+        ShareControlsUpdateOutcome::Updated
+    );
+    let share = database.share_by_token("atomic-share").unwrap().unwrap();
+    assert_eq!(share.max_upload_total_size, Some(1));
+    assert_eq!(share.max_upload_files, Some(1));
+}
+
+#[test]
+fn invalid_atomic_share_insert_leaves_no_row() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    assert!(database
+        .create_share_with_upload_limits(
+            "invalid-share",
+            None,
+            "folder",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            Some(10),
+            Some(9),
+            Some(2),
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .is_err());
+    assert!(database.share_by_token("invalid-share").unwrap().is_none());
+}
+
+#[test]
+fn preview_sessions_are_hashed_share_and_path_bound() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "folder",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    database
+        .create_preview_session(
+            "preview-secret",
+            "preview-owner",
+            share_id,
+            "folder/image.png",
+            Utc::now() + chrono::Duration::minutes(5),
+        )
+        .unwrap();
+    assert!(database
+        .preview_session("preview-secret", share_id, "folder/image.png")
+        .unwrap());
+    assert!(!database
+        .preview_session("preview-secret", share_id, "folder/other.png")
+        .unwrap());
+    assert!(!database
+        .preview_session("wrong", share_id, "folder/image.png")
+        .unwrap());
+    let stored: String = database
+        .conn()
+        .query_row(
+            "SELECT token_hash FROM public_preview_sessions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(stored, "preview-secret");
+}
+
+#[test]
+fn preview_sessions_are_expiry_cleaned_and_bounded_per_share_path() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "bounded-preview-share",
+            None,
+            "folder",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let path = "folder/image.png";
+    for index in 0..MAX_ACTIVE_PREVIEW_SESSIONS_PER_RESOURCE {
+        database
+            .create_preview_session(
+                &format!("owner-b-preview-{index}"),
+                "owner-b",
+                share_id,
+                path,
+                Utc::now() + Duration::minutes(30 + index),
+            )
+            .unwrap();
+    }
+    for index in 0..10 {
+        database
+            .create_preview_session(
+                &format!("preview-{index}"),
+                "owner-a",
+                share_id,
+                path,
+                Utc::now() + Duration::minutes(10 + index),
+            )
+            .unwrap();
+    }
+
+    let active: u64 = database
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM public_preview_sessions
+                 WHERE share_id=?1 AND relative_path=?2
+                   AND owner_key_hash=?3 AND expires_at>?4",
+            params![
+                share_id,
+                path,
+                token_hash("owner-a"),
+                Utc::now().to_rfc3339()
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, MAX_ACTIVE_PREVIEW_SESSIONS_PER_RESOURCE as u64);
+    assert!(!database
+        .preview_session("preview-0", share_id, path)
+        .unwrap());
+    assert!(!database
+        .preview_session("preview-1", share_id, path)
+        .unwrap());
+    assert!(database
+        .preview_session("preview-9", share_id, path)
+        .unwrap());
+    for index in 0..MAX_ACTIVE_PREVIEW_SESSIONS_PER_RESOURCE {
+        assert!(database
+            .preview_session(&format!("owner-b-preview-{index}"), share_id, path)
+            .unwrap());
+    }
+
+    database
+        .conn()
+        .execute(
+            "INSERT INTO public_preview_sessions(
+                     token_hash,share_id,relative_path,expires_at
+                 ) VALUES(?1,?2,?3,?4)",
+            params![
+                token_hash("expired-preview"),
+                share_id,
+                "folder/expired.png",
+                (Utc::now() - Duration::minutes(1)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+    database
+        .create_preview_session(
+            "other-path",
+            "owner-a",
+            share_id,
+            "folder/other.png",
+            Utc::now() + Duration::minutes(5),
+        )
+        .unwrap();
+    let expired: u64 = database
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM public_preview_sessions WHERE expires_at<=?1",
+            [Utc::now().to_rfc3339()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(expired, 0);
+    let index_exists: bool = database
+        .conn()
+        .query_row(
+            "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                     WHERE type='index' AND name='idx_preview_share_path_owner'
+                 )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(index_exists);
+}
+
+#[test]
+fn preview_sessions_are_bounded_per_owner_and_share_without_cross_owner_eviction() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "owner-bounded-preview-share",
+            None,
+            "folder",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let expires = Utc::now() + Duration::hours(1);
+    assert_eq!(
+        database
+            .create_preview_session(
+                "foreign-preview",
+                "owner-b",
+                share_id,
+                "folder/foreign.png",
+                expires,
+            )
+            .unwrap(),
+        PreviewSessionCreateOutcome::Created
+    );
+    for index in 0..56 {
+        assert_eq!(
+            database
+                .create_preview_session(
+                    &format!("owner-a-path-{index}"),
+                    "owner-a",
+                    share_id,
+                    &format!("folder/path-{index}.png"),
+                    expires,
+                )
+                .unwrap(),
+            PreviewSessionCreateOutcome::Created
+        );
+    }
+    for index in 0..MAX_ACTIVE_PREVIEW_SESSIONS_PER_RESOURCE {
+        assert_eq!(
+            database
+                .create_preview_session(
+                    &format!("owner-a-bucket-{index}"),
+                    "owner-a",
+                    share_id,
+                    "folder/bucket.png",
+                    expires + Duration::minutes(index),
+                )
+                .unwrap(),
+            PreviewSessionCreateOutcome::Created
+        );
+    }
+
+    assert_eq!(
+        database
+            .create_preview_session(
+                "owner-a-over-capacity",
+                "owner-a",
+                share_id,
+                "folder/new-path.png",
+                expires,
+            )
+            .unwrap(),
+        PreviewSessionCreateOutcome::OwnerCapacityReached
+    );
+    assert!(database
+        .preview_session("foreign-preview", share_id, "folder/foreign.png")
+        .unwrap());
+    assert_eq!(
+        database
+            .create_preview_session(
+                "owner-a-bucket-replacement",
+                "owner-a",
+                share_id,
+                "folder/bucket.png",
+                expires + Duration::hours(2),
+            )
+            .unwrap(),
+        PreviewSessionCreateOutcome::Created
+    );
+    assert!(!database
+        .preview_session("owner-a-bucket-0", share_id, "folder/bucket.png")
+        .unwrap());
+    let owner_rows: i64 = database
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM public_preview_sessions
+                 WHERE share_id=?1 AND owner_key_hash=?2",
+            params![share_id, token_hash("owner-a")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner_rows, MAX_ACTIVE_PREVIEW_SESSIONS_PER_OWNER_SHARE);
+}
+
+#[test]
+fn preview_sessions_enforce_per_share_capacity_without_cross_share_eviction() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let create_share = |token: &str, path: &str| {
+        database
+            .create_share(
+                token,
+                None,
+                path,
+                true,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap()
+    };
+    let full_share_id = create_share("full-preview-share", "full-folder");
+    let isolated_share_id = create_share("isolated-preview-share", "isolated-folder");
+    let expires = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    {
+        let mut connection = database.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO public_preview_sessions(
+                             token_hash,share_id,relative_path,expires_at,owner_key_hash
+                         ) VALUES(?1,?2,'full-folder/image.png',?3,?4)",
+                )
+                .unwrap();
+            for index in 0..MAX_ACTIVE_PREVIEW_SESSIONS_PER_SHARE {
+                insert
+                    .execute(params![
+                        format!("share-cap-token-{index}"),
+                        full_share_id,
+                        expires,
+                        format!("share-cap-owner-{index}")
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+    }
+
+    assert_eq!(
+        database
+            .create_preview_session(
+                "share-over-capacity",
+                "new-owner",
+                full_share_id,
+                "full-folder/new.png",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap(),
+        PreviewSessionCreateOutcome::ShareCapacityReached
+    );
+    let retained_full_share_row: bool = database
+        .conn()
+        .query_row(
+            "SELECT EXISTS(
+                     SELECT 1 FROM public_preview_sessions
+                     WHERE token_hash='share-cap-token-0'
+                 )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(retained_full_share_row);
+    assert_eq!(
+        database
+            .create_preview_session(
+                "isolated-share-preview",
+                "new-owner",
+                isolated_share_id,
+                "isolated-folder/image.png",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap(),
+        PreviewSessionCreateOutcome::Created
+    );
+    let full_share_rows: i64 = database
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM public_preview_sessions WHERE share_id=?1",
+            [full_share_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(full_share_rows, MAX_ACTIVE_PREVIEW_SESSIONS_PER_SHARE);
+    assert!(database
+        .preview_session(
+            "isolated-share-preview",
+            isolated_share_id,
+            "isolated-folder/image.png"
+        )
+        .unwrap());
+}
+
+#[test]
+fn preview_sessions_enforce_global_capacity_after_expiry_purge() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let target_share_id = database
+        .create_share(
+            "globally-bounded-preview-share",
+            None,
+            "folder",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let source_share_ids: Vec<i64> = (0..20)
+        .map(|index| {
+            database
+                .create_share(
+                    &format!("global-preview-source-{index}"),
+                    None,
+                    &format!("source-folder-{index}"),
+                    true,
+                    &Permission::DownloadOnly,
+                    None,
+                    None,
+                    None,
+                    1,
+                    None,
+                    &UploadConflictStrategy::Reject,
+                )
+                .unwrap()
+        })
+        .collect();
+    let expires = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    {
+        let mut connection = database.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO public_preview_sessions(
+                             token_hash,share_id,relative_path,expires_at,owner_key_hash
+                         ) VALUES(?1,?2,'folder/image.png',?3,?4)",
+                )
+                .unwrap();
+            for index in 0..MAX_ACTIVE_PREVIEW_SESSIONS_GLOBAL {
+                let source_share_id = source_share_ids[index as usize % source_share_ids.len()];
+                insert
+                    .execute(params![
+                        format!("global-token-{index}"),
+                        source_share_id,
+                        expires,
+                        format!("global-owner-{index}")
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+    }
+
+    assert_eq!(
+        database
+            .create_preview_session(
+                "global-over-capacity",
+                "new-owner",
+                target_share_id,
+                "folder/new.png",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap(),
+        PreviewSessionCreateOutcome::GlobalCapacityReached
+    );
+    let retained_foreign_row: bool = database
+        .conn()
+        .query_row(
+            "SELECT EXISTS(
+                     SELECT 1 FROM public_preview_sessions
+                     WHERE token_hash='global-token-0'
+                 )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(retained_foreign_row);
+
+    let expired = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+    let updated = database
+        .conn()
+        .execute(
+            "UPDATE public_preview_sessions SET expires_at=?2 WHERE token_hash=?1",
+            params!["global-token-0", expired],
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+    let now = Utc::now().to_rfc3339();
+    let expired_rows: i64 = database
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM public_preview_sessions WHERE expires_at<=?1",
+            [&now],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(expired_rows, 1, "expired={expired};now={now}");
+    assert_eq!(
+        database
+            .create_preview_session(
+                "global-after-expiry",
+                "new-owner",
+                target_share_id,
+                "folder/new.png",
+                Utc::now() + Duration::hours(1),
+            )
+            .unwrap(),
+        PreviewSessionCreateOutcome::Created
+    );
+    let global_rows: i64 = database
+        .conn()
+        .query_row("SELECT COUNT(*) FROM public_preview_sessions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(global_rows, MAX_ACTIVE_PREVIEW_SESSIONS_GLOBAL);
+}
+
+#[test]
+fn transfer_grant_reserves_and_counts_once_across_request_leases() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "file.bin",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+
+    assert_eq!(
+        database.current_transfer_monthly_counts().unwrap().total(),
+        0
+    );
+
+    assert_eq!(
+        database
+            .check_transfer_availability("client", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferAvailabilityOutcome::Available
+    );
+
+    assert_eq!(
+        database
+            .begin_transfer_lease("client", "lease-one", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferLeaseBeginOutcome::NewLease
+    );
+    assert_eq!(
+        database
+            .begin_transfer_lease("client", "lease-two", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferLeaseBeginOutcome::NewLease
+    );
+    assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        database
+            .check_transfer_availability("client", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferAvailabilityOutcome::Available
+    );
+    assert_eq!(
+        database
+            .check_transfer_availability("other", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferAvailabilityOutcome::LimitReached
+    );
+    assert_eq!(
+        database
+            .begin_transfer_lease("other", "blocked", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferLeaseBeginOutcome::LimitReached
+    );
+    assert_eq!(
+        database.complete_transfer_lease("lease-one").unwrap(),
+        TransferLeaseCompleteOutcome::Counted
+    );
+    assert_eq!(
+        database
+            .share_by_token("share")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        1
+    );
+    assert_eq!(
+        database.current_transfer_monthly_counts().unwrap().download,
+        1
+    );
+    assert_eq!(
+        database.complete_transfer_lease("lease-two").unwrap(),
+        TransferLeaseCompleteOutcome::AlreadyCounted
+    );
+    assert_eq!(
+        database.current_transfer_monthly_counts().unwrap().download,
+        1
+    );
+    assert_eq!(
+        database
+            .check_transfer_availability("client", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferAvailabilityOutcome::AlreadyCounted
+    );
+    assert_eq!(
+        database
+            .check_transfer_availability("other", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferAvailabilityOutcome::LimitReached
+    );
+    assert_eq!(
+        database
+            .share_by_token("share")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        1
+    );
+    let counted_expiry: String = database
+        .conn()
+        .query_row(
+            "SELECT expires_at FROM public_transfer_grants WHERE share_id=?1",
+            [share_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .begin_transfer_lease("client", "resume", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferLeaseBeginOutcome::AlreadyCounted
+    );
+    let resumed_expiry: String = database
+        .conn()
+        .query_row(
+            "SELECT expires_at FROM public_transfer_grants WHERE share_id=?1",
+            [share_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(resumed_expiry, counted_expiry);
+    assert_eq!(
+        database.complete_transfer_lease("resume").unwrap(),
+        TransferLeaseCompleteOutcome::AlreadyCounted
+    );
+    assert_eq!(
+        database.current_transfer_monthly_counts().unwrap().download,
+        1
+    );
+    assert_eq!(
+        database
+            .begin_transfer_lease("client", "new-resource", share_id, "other.bin", "download")
+            .unwrap(),
+        TransferLeaseBeginOutcome::LimitReached
+    );
+}
+
+#[test]
+fn transfer_required_audit_uses_grant_values_and_rolls_back_on_failure() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "file.bin",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .begin_transfer_lease("client", "lease", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferLeaseBeginOutcome::NewLease
+    );
+    database
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_transfer_audit
+                 BEFORE INSERT ON audit
+                 WHEN NEW.action='download'
+                 BEGIN SELECT RAISE(FAIL, 'injected audit failure'); END;",
+        )
+        .unwrap();
+    let context = AuditContext::new("public", Some("192.0.2.44".into()));
+
+    let error = database
+        .complete_transfer_lease_and_audit(
+            "lease",
+            &context,
+            "caller_supplied_wrong_action",
+            share_id + 999,
+        )
+        .unwrap_err();
+    assert!(is_audit_unavailable(&error));
+    assert_eq!(
+        database
+            .share_by_token("share")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        0
+    );
+    assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 1);
+
+    database
+        .conn()
+        .execute_batch("DROP TRIGGER fail_transfer_audit")
+        .unwrap();
+    assert_eq!(
+        database
+            .complete_transfer_lease_and_audit(
+                "lease",
+                &context,
+                "caller_supplied_wrong_action",
+                share_id + 999,
+            )
+            .unwrap(),
+        TransferLeaseCompleteOutcome::Counted
+    );
+    let events = database.list_audit(Some("download"), 10, 0).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].object_id.as_deref(),
+        Some(share_id.to_string().as_str())
+    );
+    assert_eq!(events[0].actor, "public");
+}
+
+#[test]
+fn completed_transfers_increment_each_supported_monthly_action() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "folder",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+
+    for (index, action) in ["download", "zip_download", "preview"]
+        .into_iter()
+        .enumerate()
+    {
+        let session = format!("client-{index}");
+        let lease = format!("lease-{index}");
+        let resource = format!("resource-{index}");
+        assert_eq!(
+            database
+                .begin_transfer_lease(&session, &lease, share_id, &resource, action)
+                .unwrap(),
+            TransferLeaseBeginOutcome::NewLease
+        );
+        assert_eq!(
+            database.complete_transfer_lease(&lease).unwrap(),
+            TransferLeaseCompleteOutcome::Counted
+        );
+    }
+
+    let counts = database.current_transfer_monthly_counts().unwrap();
+    assert_eq!(counts.month, current_utc_month());
+    assert_eq!(counts.download, 1);
+    assert_eq!(counts.zip_download, 1);
+    assert_eq!(counts.preview, 1);
+    assert_eq!(counts.total(), 3);
+    assert_eq!(
+        database.transfer_monthly_counts("2000-01").unwrap().total(),
+        0
+    );
+    assert!(database.transfer_monthly_counts("2026-00").is_err());
+    assert!(database.transfer_monthly_counts("2026-1").is_err());
+}
+
+#[test]
+fn monthly_count_failure_rolls_back_the_counted_transfer() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "file.bin",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .begin_transfer_lease("client", "lease", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferLeaseBeginOutcome::NewLease
+    );
+    database
+        .conn()
+        .execute("DROP TABLE transfer_monthly_counts", [])
+        .unwrap();
+
+    assert!(database.complete_transfer_lease("lease").is_err());
+    assert_eq!(
+        database
+            .share_by_token("share")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        0
+    );
+    let counted: i64 = database
+        .conn()
+        .query_row(
+            "SELECT counted FROM public_transfer_grants WHERE share_id=?1",
+            [share_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(counted, 0);
+}
+
+#[test]
+fn transfer_cancel_releases_only_the_final_pending_lease() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "file.bin",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    database
+        .begin_transfer_lease("client", "one", share_id, "file.bin", "download")
+        .unwrap();
+    database
+        .begin_transfer_lease("client", "two", share_id, "file.bin", "download")
+        .unwrap();
+    assert_eq!(
+        database.cancel_transfer_lease("one").unwrap(),
+        TransferLeaseCancelOutcome::Cancelled
+    );
+    assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        database.cancel_transfer_lease("two").unwrap(),
+        TransferLeaseCancelOutcome::Cancelled
+    );
+    assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 0);
+    assert_eq!(
+        database
+            .begin_transfer_lease("other", "replacement", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferLeaseBeginOutcome::NewLease
+    );
+    assert_eq!(
+        database.current_transfer_monthly_counts().unwrap().total(),
+        0
+    );
+}
+
+#[test]
+fn concurrent_transfer_grants_cannot_overbook_the_limit() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "folder",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for (client, lease, resource) in [
+        ("client-a", "lease-a", "folder/a"),
+        ("client-b", "lease-b", "folder/b"),
+    ] {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            database
+                .begin_transfer_lease(client, lease, share_id, resource, "download")
+                .unwrap()
+        }));
+    }
+    barrier.wait();
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == TransferLeaseBeginOutcome::NewLease)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == TransferLeaseBeginOutcome::LimitReached)
+            .count(),
+        1
+    );
+    assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 1);
+}
+
+#[test]
+fn transfer_heartbeat_and_expiry_are_enforced() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "file.bin",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    database
+        .begin_transfer_lease("client", "lease", share_id, "file.bin", "download")
+        .unwrap();
+    assert_eq!(
+        database.heartbeat_transfer_lease("lease").unwrap(),
+        TransferLeaseHeartbeatOutcome::Extended
+    );
+    database
+        .conn()
+        .execute(
+            "UPDATE public_transfer_leases SET expires_at='2000-01-01T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        database.heartbeat_transfer_lease("lease").unwrap(),
+        TransferLeaseHeartbeatOutcome::NotFound
+    );
+    assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 0);
+}
+
+#[test]
+fn transfer_heartbeat_cannot_extend_lease_past_absolute_lifetime() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "share",
+            None,
+            "file.bin",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    database
+        .begin_transfer_lease("client", "lease", share_id, "file.bin", "download")
+        .unwrap();
+    let older_than_absolute_limit =
+        Utc::now() - Duration::seconds(TRANSFER_LEASE_MAX_LIFETIME_SECONDS + 1);
+    {
+        let connection = database.conn();
+        connection
+            .execute(
+                "UPDATE public_transfer_leases
+                     SET created_at=?1,expires_at='2000-01-01T00:00:00Z'",
+                [older_than_absolute_limit.to_rfc3339()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE public_transfer_grants SET expires_at='2099-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        database.heartbeat_transfer_lease("lease").unwrap(),
+        TransferLeaseHeartbeatOutcome::CappedAndCounted
+    );
+    assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 0);
+    assert_eq!(
+        database
+            .share_by_token("share")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        1
+    );
+    assert_eq!(
+        database.complete_transfer_lease("lease").unwrap(),
+        TransferLeaseCompleteOutcome::NotFound
+    );
+    assert_eq!(
+        database
+            .begin_transfer_lease("other", "other-lease", share_id, "file.bin", "download")
+            .unwrap(),
+        TransferLeaseBeginOutcome::LimitReached
+    );
+}
+
+#[test]
+fn capped_transfer_heartbeat_rolls_back_with_required_audit_and_derives_grant_event() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share(
+            "heartbeat-audit-share",
+            None,
+            "archive.zip",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    database
+        .begin_transfer_lease(
+            "client",
+            "heartbeat-audit-lease",
+            share_id,
+            "archive.zip",
+            "zip_download",
+        )
+        .unwrap();
+    let older_than_absolute_limit =
+        Utc::now() - Duration::seconds(TRANSFER_LEASE_MAX_LIFETIME_SECONDS + 1);
+    database
+        .conn()
+        .execute_batch(&format!(
+            "UPDATE public_transfer_leases
+                 SET created_at='{}',expires_at='2099-01-01T00:00:00Z';
+             UPDATE public_transfer_grants SET expires_at='2099-01-01T00:00:00Z';
+             CREATE TRIGGER fail_capped_transfer_audit
+             BEFORE INSERT ON audit
+             BEGIN SELECT RAISE(FAIL, 'injected capped transfer audit failure'); END;",
+            older_than_absolute_limit.to_rfc3339()
+        ))
+        .unwrap();
+    let context = AuditContext::new("public", Some("198.51.100.25".into()));
+
+    let error = database
+        .heartbeat_transfer_lease_and_audit("heartbeat-audit-lease", &context)
+        .unwrap_err();
+    assert!(is_audit_unavailable(&error));
+    assert_eq!(
+        database
+            .share_by_token("heartbeat-audit-share")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        0
+    );
+    assert_eq!(database.active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        database
+            .current_transfer_monthly_counts()
+            .unwrap()
+            .zip_download,
+        0
+    );
+    assert_eq!(database.count_audit(None).unwrap(), 0);
+
+    database
+        .conn()
+        .execute_batch("DROP TRIGGER fail_capped_transfer_audit")
+        .unwrap();
+    assert_eq!(
+        database
+            .heartbeat_transfer_lease_and_audit("heartbeat-audit-lease", &context)
+            .unwrap(),
+        TransferLeaseHeartbeatOutcome::CappedAndCounted
+    );
+    let event = database
+        .list_audit(Some("zip_download"), 1, 0)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let share_id = share_id.to_string();
+    assert_eq!(event.actor, "public");
+    assert_eq!(event.object_id.as_deref(), Some(share_id.as_str()));
+    assert_eq!(event.detail.as_deref(), Some("capped transfer session"));
+    assert_eq!(event.client_ip.as_deref(), Some("198.51.100.25"));
+}
+
+#[test]
+fn webauthn_credentials_are_scoped_unique_and_mutable() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    database.create_admin("other", "hash", "secret").unwrap();
+
+    let id = database
+        .add_admin_webauthn_credential(1, "Primary YubiKey", "credential-a", "{\"v\":1}")
+        .unwrap();
+    let rows = database.admin_webauthn_credentials(1).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].label, "Primary YubiKey");
+    assert!(rows[0].last_used_at.is_none());
+    assert!(database.admin_webauthn_credentials(2).unwrap().is_empty());
+    assert!(database
+        .add_admin_webauthn_credential(1, "", "credential-empty-label", "{}")
+        .is_err());
+    assert!(database
+        .add_admin_webauthn_credential(1, &"x".repeat(81), "credential-long-label", "{}")
+        .is_err());
+
+    assert!(database
+        .add_admin_webauthn_credential(2, "Duplicate", "credential-a", "{}")
+        .is_err());
+    assert!(!database
+        .update_admin_webauthn_credential(id, 2, "{\"v\":2}")
+        .unwrap());
+    assert!(database
+        .update_admin_webauthn_credential(id, 1, "{\"v\":2}")
+        .unwrap());
+    let rows = database.admin_webauthn_credentials(1).unwrap();
+    assert_eq!(rows[0].credential_json, "{\"v\":2}");
+    assert!(rows[0].last_used_at.is_some());
+
+    assert!(!database.delete_admin_webauthn_credential(id, 2).unwrap());
+    assert!(database.delete_admin_webauthn_credential(id, 1).unwrap());
+    assert!(database.admin_webauthn_credentials(1).unwrap().is_empty());
+
+    let first = database
+        .add_admin_webauthn_credential(1, "Primary", "credential-c", "{}")
+        .unwrap();
+    database
+        .add_admin_webauthn_credential(1, "Backup", "credential-d", "{}")
+        .unwrap();
+    assert!(!database.delete_admin_webauthn_credential(first, 1).unwrap());
+    database
+        .add_admin_webauthn_credential(1, "Replacement", "credential-e", "{}")
+        .unwrap();
+    assert!(database.delete_admin_webauthn_credential(first, 1).unwrap());
+    assert_eq!(database.admin_webauthn_credentials(1).unwrap().len(), 2);
+
+    database
+        .add_admin_webauthn_credential(2, "Backup", "credential-b", "{}")
+        .unwrap();
+    database
+        .conn()
+        .execute("DELETE FROM admins WHERE id=2", [])
+        .unwrap();
+    assert!(database.admin_webauthn_credentials(2).unwrap().is_empty());
+}
+
+#[test]
+fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    database
+        .create_session(
+            "authorized-session",
+            1,
+            "csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(database.verify_mfa("authorized-session").unwrap());
+    let first = database
+        .add_admin_webauthn_credential(1, "First", "credential-a", "{}")
+        .unwrap();
+    let second = database
+        .add_admin_webauthn_credential(1, "Second", "credential-b", "{}")
+        .unwrap();
+    let third = database
+        .add_admin_webauthn_credential(1, "Third", "credential-c", "{}")
+        .unwrap();
+    let delete = |credential_id, step, client_ip| {
+        database.delete_admin_webauthn_credential_with_totp(
+            "authorized-session",
+            credential_id,
+            1,
+            "hash",
+            "secret",
+            step,
+            client_ip,
+        )
+    };
+
+    assert_eq!(
+        delete(first, 42, Some("203.0.113.40")).unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::Deleted
+    );
+    let audit = database
+        .list_audit(Some("webauthn_credential_deleted"), 10, 0)
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+    let first_object = first.to_string();
+    assert_eq!(audit[0].object_id.as_deref(), Some(first_object.as_str()));
+    assert_eq!(audit[0].client_ip.as_deref(), Some("203.0.113.40"));
+
+    assert_eq!(
+        delete(second, 42, None).unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::TotpRejected
+    );
+    assert_eq!(
+        delete(second, 43, None).unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::NotDeleted
+    );
+    database
+        .add_admin_webauthn_credential(1, "Fourth", "credential-d", "{}")
+        .unwrap();
+
+    assert_eq!(
+        delete(second, 43, None).unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::Deleted
+    );
+    database
+        .add_admin_webauthn_credential(1, "Fifth", "credential-e", "{}")
+        .unwrap();
+
+    database
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_webauthn_delete_audit
+                 BEFORE INSERT ON audit
+                 WHEN NEW.action='webauthn_credential_deleted'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced audit failure');
+                 END;",
+        )
+        .unwrap();
+    assert!(delete(third, 44, None).is_err());
+    assert_eq!(database.admin_webauthn_credentials(1).unwrap().len(), 3);
+    database
+        .conn()
+        .execute_batch("DROP TRIGGER fail_webauthn_delete_audit")
+        .unwrap();
+
+    assert_eq!(
+        delete(third, 44, None).unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::Deleted
+    );
+    assert_eq!(
+        database
+            .count_audit(Some("webauthn_credential_deleted"))
+            .unwrap(),
+        3
+    );
+}
+
+#[test]
+fn security_mutation_webauthn_deletion_rejects_stale_credentials_and_session() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "original-hash", "original-secret")
+        .unwrap();
+    database
+        .create_session("stale-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    assert!(database.verify_mfa("stale-session").unwrap());
+    let first = database
+        .add_admin_webauthn_credential(1, "First", "credential-a", "{}")
+        .unwrap();
+    database
+        .add_admin_webauthn_credential(1, "Second", "credential-b", "{}")
+        .unwrap();
+    database
+        .add_admin_webauthn_credential(1, "Third", "credential-c", "{}")
+        .unwrap();
+
+    assert_eq!(
+        database
+            .delete_admin_webauthn_credential_with_totp(
+                "stale-session",
+                first,
+                1,
+                "wrong-hash",
+                "original-secret",
+                42,
+                None,
+            )
+            .unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected
+    );
+    assert_eq!(
+        database
+            .delete_admin_webauthn_credential_with_totp(
+                "stale-session",
+                first,
+                1,
+                "original-hash",
+                "wrong-secret",
+                42,
+                None,
+            )
+            .unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected
+    );
+
+    assert!(database
+        .reset_admin_password(1, "replacement-hash")
+        .unwrap());
+    assert_eq!(
+        database
+            .delete_admin_webauthn_credential_with_totp(
+                "stale-session",
+                first,
+                1,
+                "original-hash",
+                "original-secret",
+                42,
+                None,
+            )
+            .unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected
+    );
+    assert_eq!(database.admin_webauthn_credentials(1).unwrap().len(), 3);
+    assert_eq!(
+        database
+            .count_audit(Some("webauthn_credential_deleted"))
+            .unwrap(),
+        0
+    );
+
+    database
+        .create_session(
+            "replacement-session",
+            1,
+            "csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(database.verify_mfa("replacement-session").unwrap());
+    assert_eq!(
+        database
+            .delete_admin_webauthn_credential_with_totp(
+                "replacement-session",
+                first,
+                1,
+                "replacement-hash",
+                "original-secret",
+                42,
+                None,
+            )
+            .unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::Deleted
+    );
+}
+
+#[test]
+fn webauthn_registration_cannot_restore_keys_after_mfa_reset() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let expires = Utc::now() + chrono::Duration::hours(1);
+
+    database
+        .create_session("authorized-session", 1, "csrf", expires)
+        .unwrap();
+    assert!(database.verify_mfa("authorized-session").unwrap());
+    assert!(matches!(
+        database
+            .add_admin_webauthn_credential_for_session(
+                "authorized-session",
+                1,
+                "Primary",
+                "credential-a",
+                "{}",
+                Some("203.0.113.24"),
+            )
+            .unwrap(),
+        AdminWebauthnCredentialRegistrationOutcome::Registered(_)
+    ));
+    assert_eq!(
+        database
+            .count_audit(Some("webauthn_credential_added"))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        database
+            .list_audit(Some("webauthn_credential_added"), 1, 0)
+            .unwrap()[0]
+            .client_ip
+            .as_deref(),
+        Some("203.0.113.24")
+    );
+
+    database
+        .create_session("stale-session", 1, "csrf", expires)
+        .unwrap();
+    assert!(database.verify_mfa("stale-session").unwrap());
+    assert_eq!(
+        database.reset_admin_totp(1, "replacement-secret").unwrap(),
+        Some("admin".to_string())
+    );
+    assert!(database.admin_webauthn_credentials(1).unwrap().is_empty());
+
+    assert_eq!(
+        database
+            .add_admin_webauthn_credential_for_session(
+                "stale-session",
+                1,
+                "Stale",
+                "credential-stale",
+                "{}",
+                None,
+            )
+            .unwrap(),
+        AdminWebauthnCredentialRegistrationOutcome::SessionUnavailable
+    );
+    assert!(database.admin_webauthn_credentials(1).unwrap().is_empty());
+    assert_eq!(
+        database
+            .count_audit(Some("webauthn_credential_added"))
+            .unwrap(),
+        1
+    );
+
+    database
+        .create_session("pre-mfa-session", 1, "csrf", expires)
+        .unwrap();
+    assert_eq!(
+        database
+            .add_admin_webauthn_credential_for_session(
+                "pre-mfa-session",
+                1,
+                "Pre MFA",
+                "credential-pre-mfa",
+                "{}",
+                None,
+            )
+            .unwrap(),
+        AdminWebauthnCredentialRegistrationOutcome::SessionUnavailable
+    );
+}

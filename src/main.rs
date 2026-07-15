@@ -22,9 +22,10 @@ use tokio::{
 use vaultlink::{
     auth,
     config::{self, CertificateSource, Config, ServerMode},
-    db::{AdminRecoveryOutcome, Database, InitialAdminOutcome},
+    db::{AdminRecoveryOutcome, AuditContext, Database, InitialAdminOutcome},
     storage_mount, web, AppState,
 };
+use zeroize::Zeroizing;
 
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ACTIVE_CONNECTIONS: usize = 256;
@@ -38,13 +39,13 @@ struct ConnectionLimitAcceptor<A> {
     inner: A,
     permits: Arc<Semaphore>,
     peer_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
-    trusted_proxy_peers: Arc<HashSet<IpAddr>>,
+    trusted_proxy_peers: Option<Arc<HashSet<IpAddr>>>,
     max_connections_per_peer: usize,
     accept_timeout: Duration,
 }
 
 impl<A> ConnectionLimitAcceptor<A> {
-    fn new(inner: A, trusted_proxy_peers: Arc<HashSet<IpAddr>>) -> Self {
+    fn new(inner: A, trusted_proxy_peers: Option<Arc<HashSet<IpAddr>>>) -> Self {
         Self {
             inner,
             permits: Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS)),
@@ -218,10 +219,23 @@ where
             Ok(address) => address.ip(),
             Err(error) => return Box::pin(async move { Err(error) }),
         };
+        let canonical_peer = vaultlink::proxy::canonical_peer_ip(raw_peer);
+        if self
+            .trusted_proxy_peers
+            .as_ref()
+            .is_some_and(|trusted| !trusted.contains(&canonical_peer))
+        {
+            return Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "TCP peer is not in reverse_proxy.trusted_proxies",
+                ))
+            });
+        }
         let peer = vaultlink::proxy::client_limit_key(raw_peer);
         let max_connections_per_peer = peer_connection_limit(
             raw_peer,
-            &self.trusted_proxy_peers,
+            self.trusted_proxy_peers.as_deref(),
             self.max_connections_per_peer,
         );
         let permit = match self.permits.clone().try_acquire_owned() {
@@ -289,10 +303,12 @@ where
 
 fn peer_connection_limit(
     raw_peer: IpAddr,
-    trusted_proxy_peers: &HashSet<IpAddr>,
+    trusted_proxy_peers: Option<&HashSet<IpAddr>>,
     untrusted_limit: usize,
 ) -> usize {
-    if trusted_proxy_peers.contains(&raw_peer) {
+    if trusted_proxy_peers
+        .is_some_and(|trusted| trusted.contains(&vaultlink::proxy::canonical_peer_ip(raw_peer)))
+    {
         // All connections from a trusted reverse proxy commonly arrive from one
         // raw socket peer. Give only that explicitly configured peer the global
         // budget; direct clients keep the smaller per-peer abuse boundary.
@@ -366,16 +382,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone();
     start_upload_fragment_cleanup(&state);
     let addr: std::net::SocketAddr = config.server.listen_address.parse()?;
-    let trusted_proxy_peers = Arc::new(if config.server.mode == ServerMode::ReverseProxy {
-        config
-            .reverse_proxy
-            .trusted_proxies
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>()
+    let trusted_proxy_peers = if config.server.mode == ServerMode::ReverseProxy {
+        Some(Arc::new(
+            config
+                .reverse_proxy
+                .trusted_proxies
+                .iter()
+                .copied()
+                .map(vaultlink::proxy::canonical_peer_ip)
+                .collect::<HashSet<_>>(),
+        ))
     } else {
-        HashSet::new()
-    });
+        None
+    };
     let app = web::router(state);
     tracing::info!(%addr,mode=?config.server.mode,"VaultLink starting");
     match config.server.mode {
@@ -668,12 +687,21 @@ fn init_admin(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error
         );
     }
     let password = prompt_new_admin_password()?;
-    let secret = auth::new_totp_secret();
-    let hash = auth::hash_password(&password)
+    let secret = Zeroizing::new(auth::new_totp_secret());
+    let hash = auth::hash_password(password.as_str())
         .map_err(|error| std::io::Error::other(format!("password hashing failed: {error}")))?;
-    match database.create_initial_admin(username, &hash, &secret)? {
+    drop(password);
+    match database.create_initial_admin_and_audit(
+        username,
+        &hash,
+        secret.as_str(),
+        &AuditContext::new("local_init", None),
+    )? {
         InitialAdminOutcome::Created => {
-            println!("Administrator created. One-time credential output follows; save it now:\nSecret: {secret}\notpauth://totp/VaultLink:{username}?secret={secret}&issuer=VaultLink");
+            println!(
+                "Administrator created. One-time credential output follows; save it now:\nSecret: {0}\notpauth://totp/VaultLink:{username}?secret={0}&issuer=VaultLink",
+                secret.as_str()
+            );
             Ok(())
         }
         InitialAdminOutcome::AlreadyInitialized => Err(
@@ -696,17 +724,19 @@ fn recover_admin(options: &RecoverAdminOptions) -> Result<(), Box<dyn std::error
     let password_hash =
         if options.reset_password {
             let password = prompt_new_admin_password()?;
-            Some(auth::hash_password(&password).map_err(|error| {
+            Some(auth::hash_password(password.as_str()).map_err(|error| {
                 std::io::Error::other(format!("password hashing failed: {error}"))
             })?)
         } else {
             None
         };
-    let totp_secret = options.reset_mfa.then(auth::new_totp_secret);
+    let totp_secret = options
+        .reset_mfa
+        .then(|| Zeroizing::new(auth::new_totp_secret()));
     match database.recover_admin(
         &options.username,
         password_hash.as_deref(),
-        totp_secret.as_deref(),
+        totp_secret.as_ref().map(|secret| secret.as_str()),
     )? {
         AdminRecoveryOutcome::NotFound => {
             Err(format!("administrator not found: {}", options.username).into())
@@ -723,7 +753,10 @@ fn recover_admin(options: &RecoverAdminOptions) -> Result<(), Box<dyn std::error
                 println!("Warning: this administrator remains inactive.");
             }
             if let Some(secret) = totp_secret {
-                println!("One-time credential output follows; save it now:\nSecret: {secret}\notpauth://totp/VaultLink:{username}?secret={secret}&issuer=VaultLink");
+                println!(
+                    "One-time credential output follows; save it now:\nSecret: {0}\notpauth://totp/VaultLink:{username}?secret={0}&issuer=VaultLink",
+                    secret.as_str()
+                );
             }
             Ok(())
         }
@@ -737,11 +770,11 @@ fn validate_admin_username(username: &str) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn prompt_new_admin_password() -> Result<String, Box<dyn std::error::Error>> {
-    let password = rpassword::prompt_password("New admin password: ")?;
-    validate_admin_password(&password)?;
-    let confirmation = rpassword::prompt_password("Confirm password: ")?;
-    if password != confirmation {
+fn prompt_new_admin_password() -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    let password = Zeroizing::new(rpassword::prompt_password("New admin password: ")?);
+    validate_admin_password(password.as_str())?;
+    let confirmation = Zeroizing::new(rpassword::prompt_password("Confirm password: ")?);
+    if password.as_str() != confirmation.as_str() {
         return Err("passwords do not match".into());
     }
     Ok(password)
@@ -1164,7 +1197,7 @@ mod tests {
             inner: axum_server::accept::DefaultAcceptor::new(),
             permits: Arc::new(Semaphore::new(1)),
             peer_connections: Arc::new(Mutex::new(HashMap::new())),
-            trusted_proxy_peers: Arc::new(HashSet::new()),
+            trusted_proxy_peers: None,
             max_connections_per_peer: 2,
             accept_timeout: CONNECTION_ACCEPT_TIMEOUT,
         };
@@ -1190,7 +1223,7 @@ mod tests {
             inner: axum_server::accept::DefaultAcceptor::new(),
             permits: Arc::new(Semaphore::new(2)),
             peer_connections: Arc::new(Mutex::new(HashMap::new())),
-            trusted_proxy_peers: Arc::new(HashSet::new()),
+            trusted_proxy_peers: None,
             max_connections_per_peer: 1,
             accept_timeout: CONNECTION_ACCEPT_TIMEOUT,
         };
@@ -1216,7 +1249,7 @@ mod tests {
             inner: PendingAcceptor,
             permits: Arc::new(Semaphore::new(1)),
             peer_connections: Arc::new(Mutex::new(HashMap::new())),
-            trusted_proxy_peers: Arc::new(HashSet::new()),
+            trusted_proxy_peers: None,
             max_connections_per_peer: 1,
             accept_timeout: Duration::from_millis(20),
         };
@@ -1229,6 +1262,43 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(limiter.permits.available_permits(), 1);
         assert!(limiter.peer_connections.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_acceptor_accepts_only_an_explicit_tcp_peer() {
+        let loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let trusted_limiter = ConnectionLimitAcceptor {
+            inner: axum_server::accept::DefaultAcceptor::new(),
+            permits: Arc::new(Semaphore::new(2)),
+            peer_connections: Arc::new(Mutex::new(HashMap::new())),
+            trusted_proxy_peers: Some(Arc::new(HashSet::from([loopback]))),
+            max_connections_per_peer: 1,
+            accept_timeout: CONNECTION_ACCEPT_TIMEOUT,
+        };
+        let (_trusted_client, trusted_server) = tcp_pair().await;
+        assert!(trusted_limiter.accept(trusted_server, ()).await.is_ok());
+
+        let untrusted_limiter = ConnectionLimitAcceptor {
+            inner: axum_server::accept::DefaultAcceptor::new(),
+            permits: Arc::new(Semaphore::new(2)),
+            peer_connections: Arc::new(Mutex::new(HashMap::new())),
+            trusted_proxy_peers: Some(Arc::new(HashSet::from(["192.0.2.10".parse().unwrap()]))),
+            max_connections_per_peer: 1,
+            accept_timeout: CONNECTION_ACCEPT_TIMEOUT,
+        };
+        let (_direct_client, direct_server) = tcp_pair().await;
+        let error = untrusted_limiter
+            .accept(direct_server, ())
+            .await
+            .err()
+            .expect("an unlisted direct peer must be rejected before HTTP");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(untrusted_limiter.permits.available_permits(), 2);
+        assert!(untrusted_limiter
+            .peer_connections
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1250,7 +1320,7 @@ mod tests {
         assert_eq!(
             peer_connection_limit(
                 trusted_peer,
-                &trusted_proxy_peers,
+                Some(&trusted_proxy_peers),
                 MAX_ACTIVE_CONNECTIONS_PER_PEER,
             ),
             MAX_ACTIVE_CONNECTIONS
@@ -1258,7 +1328,7 @@ mod tests {
         assert_eq!(
             peer_connection_limit(
                 "192.0.2.11".parse().unwrap(),
-                &trusted_proxy_peers,
+                Some(&trusted_proxy_peers),
                 MAX_ACTIVE_CONNECTIONS_PER_PEER,
             ),
             MAX_ACTIVE_CONNECTIONS_PER_PEER
@@ -1266,10 +1336,10 @@ mod tests {
         assert_eq!(
             peer_connection_limit(
                 "::ffff:192.0.2.10".parse().unwrap(),
-                &trusted_proxy_peers,
+                Some(&trusted_proxy_peers),
                 MAX_ACTIVE_CONNECTIONS_PER_PEER,
             ),
-            MAX_ACTIVE_CONNECTIONS_PER_PEER
+            MAX_ACTIVE_CONNECTIONS
         );
     }
 

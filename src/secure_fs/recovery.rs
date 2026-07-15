@@ -8,15 +8,21 @@ use std::{
     sync::Arc,
 };
 
+use super::identity::{entry_exists, entry_identity_state, entry_matches_identity};
+use super::journal::{
+    read_file_operation, read_pending_manifest, remove_file_operation, remove_pending_manifest,
+    replace_delete_operation_phase, replace_file_operation,
+};
+use super::private_entries::{
+    active_upload_fragment_guard, is_upload_fragment_name, unregister_upload_fragment,
+};
 use super::{
-    active_upload_fragment_guard, cleanup_segment_name, deletion_manifest_name,
-    deletion_pending_from_manifest_name, file_operation_name, is_deletion_pending_name,
-    is_deletion_tombstone_name, is_file_operation_name, is_file_operation_temporary_name,
-    is_upload_fragment_name, linux, split_parent_name, split_parent_name_private,
-    unregister_upload_fragment, CleanupDirectory, CleanupPolicy, DurableDeletePhase,
-    DurableFileOperation, DurableRenamePhase, EntryIdentityState, EntryKind, FileOperationRecovery,
-    FileOperationWriteError, PendingFileOperation, SecureDirectory, SecureRoot,
-    UploadFragmentCleanup, UploadFragmentCleanupBatch, MAX_CLEANUP_DIRECTORY_STACK,
+    cleanup_segment_name, deletion_manifest_name, deletion_pending_from_manifest_name,
+    is_deletion_pending_name, is_deletion_tombstone_name, is_file_operation_name,
+    is_file_operation_temporary_name, linux, split_parent_name, split_parent_name_private,
+    CleanupDirectory, CleanupPolicy, DurableDeletePhase, DurableFileOperation, DurableRenamePhase,
+    EntryIdentityState, EntryKind, FileOperationRecovery, PendingFileOperation, SecureDirectory,
+    SecureRoot, UploadFragmentCleanup, UploadFragmentCleanupBatch, MAX_CLEANUP_DIRECTORY_STACK,
     MAX_CLEANUP_VISITED_DIRECTORIES,
 };
 
@@ -210,166 +216,6 @@ impl UploadFragmentCleanup {
     }
 }
 
-pub(super) fn write_pending_manifest(
-    staging: &File,
-    pending_name: &str,
-    original_path: &str,
-) -> io::Result<String> {
-    use std::io::Write;
-
-    let manifest_name = deletion_manifest_name(pending_name);
-    let mut manifest = linux::openat2(
-        staging,
-        &manifest_name,
-        linux::O_WRONLY | linux::O_CREAT | linux::O_EXCL,
-    )?;
-    let result = (|| {
-        serde_json::to_writer(&mut manifest, original_path).map_err(io::Error::other)?;
-        manifest.write_all(b"\n")?;
-        manifest.sync_all()?;
-        staging.sync_all()
-    })();
-    if result.is_err() {
-        drop(manifest);
-        let _ = linux::unlink(staging, &manifest_name);
-        let _ = staging.sync_all();
-    }
-    result.map(|()| manifest_name)
-}
-
-pub(super) fn write_file_operation(
-    staging: &File,
-    operation: &DurableFileOperation,
-) -> Result<String, FileOperationWriteError> {
-    use std::io::Write;
-
-    for _ in 0..16 {
-        let operation_name = file_operation_name();
-        let temporary_name = format!("{operation_name}.pending");
-        let mut manifest = match linux::openat2(
-            staging,
-            &temporary_name,
-            linux::O_WRONLY | linux::O_CREAT | linux::O_EXCL,
-        ) {
-            Ok(manifest) => manifest,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(FileOperationWriteError::before_publish(error)),
-        };
-        let mut published = false;
-        let result = (|| {
-            serde_json::to_writer(&mut manifest, operation).map_err(io::Error::other)?;
-            manifest.write_all(b"\n")?;
-            manifest.sync_all()?;
-            linux::rename_noreplace(staging, &temporary_name, &operation_name)?;
-            published = true;
-            staging.sync_all()
-        })();
-        if let Err(error) = result {
-            if !published {
-                drop(manifest);
-                let _ = linux::unlink(staging, &temporary_name);
-                let _ = staging.sync_all();
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    continue;
-                }
-            }
-            return Err(FileOperationWriteError {
-                error,
-                published_name: published.then_some(operation_name),
-            });
-        }
-        return Ok(operation_name);
-    }
-    Err(FileOperationWriteError::before_publish(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate durable file-operation journal",
-    )))
-}
-
-pub(super) fn replace_file_operation(
-    staging: &File,
-    operation_name: &str,
-    operation: &DurableFileOperation,
-) -> io::Result<()> {
-    use std::io::Write;
-
-    if !is_file_operation_name(OsStr::new(operation_name)) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid file-operation journal name",
-        ));
-    }
-    let temporary_name = format!("{operation_name}.pending");
-    let mut manifest = linux::openat2(
-        staging,
-        &temporary_name,
-        linux::O_WRONLY | linux::O_CREAT | linux::O_EXCL,
-    )?;
-    let mut published = false;
-    let result = (|| {
-        serde_json::to_writer(&mut manifest, operation).map_err(io::Error::other)?;
-        manifest.write_all(b"\n")?;
-        manifest.sync_all()?;
-        linux::rename_replace_between(staging, &temporary_name, staging, operation_name)?;
-        published = true;
-        staging.sync_all()
-    })();
-    if result.is_err() && !published {
-        drop(manifest);
-        let _ = linux::unlink(staging, &temporary_name);
-        let _ = staging.sync_all();
-    }
-    result
-}
-
-pub(super) fn replace_delete_operation_phase(
-    staging: &File,
-    operation_name: &str,
-    phase: DurableDeletePhase,
-) -> io::Result<()> {
-    let mut operation = read_file_operation(staging, operation_name)?;
-    match &mut operation {
-        DurableFileOperation::Delete {
-            phase: current_phase,
-            ..
-        } => *current_phase = phase,
-        DurableFileOperation::Rename { .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "delete transaction references a rename journal",
-            ));
-        }
-    }
-    replace_file_operation(staging, operation_name, &operation)
-}
-
-fn read_file_operation(staging: &File, operation_name: &str) -> io::Result<DurableFileOperation> {
-    use std::io::Read;
-
-    const MAX_OPERATION_BYTES: u64 = 64 * 1024;
-    let mut manifest =
-        linux::openat2(staging, operation_name, linux::O_RDONLY | linux::O_NOFOLLOW)?;
-    let metadata = manifest.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_OPERATION_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file-operation journal is not a small regular file",
-        ));
-    }
-    let mut content = Vec::with_capacity(metadata.len() as usize);
-    manifest
-        .by_ref()
-        .take(MAX_OPERATION_BYTES + 1)
-        .read_to_end(&mut content)?;
-    if content.len() as u64 > MAX_OPERATION_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file-operation journal exceeds its size limit",
-        ));
-    }
-    serde_json::from_slice(&content).map_err(io::Error::other)
-}
-
 fn deletion_tombstone_has_durable_intent(
     staging: &File,
     tombstone_name: &OsStr,
@@ -411,134 +257,6 @@ fn deletion_tombstone_has_durable_intent(
         }
     }
     Ok(false)
-}
-
-pub(super) fn remove_file_operation(staging: &File, operation_name: &str) -> io::Result<()> {
-    match linux::unlink(staging, operation_name) {
-        Ok(()) => staging.sync_all(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn read_pending_manifest(staging: &File, manifest_name: &str) -> io::Result<String> {
-    use std::io::Read;
-
-    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-    let mut manifest = linux::openat2(staging, manifest_name, linux::O_RDONLY | linux::O_NOFOLLOW)?;
-    let metadata = manifest.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "deletion recovery manifest is not a small regular file",
-        ));
-    }
-    let mut content = Vec::with_capacity(metadata.len() as usize);
-    manifest
-        .by_ref()
-        .take(MAX_MANIFEST_BYTES + 1)
-        .read_to_end(&mut content)?;
-    if content.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "deletion recovery manifest exceeds its size limit",
-        ));
-    }
-    serde_json::from_slice(&content).map_err(io::Error::other)
-}
-
-pub(super) fn remove_pending_manifest(staging: &File, manifest_name: &str) -> io::Result<()> {
-    match linux::unlink(staging, manifest_name) {
-        Ok(()) => staging.sync_all(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-pub(super) fn entry_identity_state(
-    directory: &File,
-    name: &str,
-    expected: (u64, u64),
-    expected_kind: EntryKind,
-) -> io::Result<EntryIdentityState> {
-    use std::os::unix::fs::MetadataExt;
-
-    let entry = match linux::openat2(directory, name, linux::O_PATH | linux::O_NOFOLLOW) {
-        Ok(entry) => entry,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(EntryIdentityState::Missing);
-        }
-        Err(error) => return Err(error),
-    };
-    let metadata = entry.metadata()?;
-    let matches = (metadata.dev(), metadata.ino()) == expected
-        && match expected_kind {
-            EntryKind::File => metadata.is_file(),
-            EntryKind::Directory => metadata.is_dir(),
-        };
-    Ok(if matches {
-        EntryIdentityState::Expected
-    } else {
-        EntryIdentityState::Replaced
-    })
-}
-
-pub(super) fn entry_matches_identity(
-    directory: &File,
-    name: &str,
-    expected: (u64, u64),
-    expected_kind: EntryKind,
-) -> bool {
-    entry_identity_state(directory, name, expected, expected_kind)
-        .is_ok_and(|state| state == EntryIdentityState::Expected)
-}
-
-fn entry_exists(directory: &File, name: &str) -> io::Result<bool> {
-    match linux::openat2(directory, name, linux::O_PATH | linux::O_NOFOLLOW) {
-        Ok(_) => Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-pub(super) fn rollback_pending_delete(
-    staging: &File,
-    pending_name: &str,
-    manifest_name: &str,
-    parent: &File,
-    original_name: &str,
-    original_path: &str,
-) -> io::Result<()> {
-    match linux::rename_noreplace_between(staging, pending_name, parent, original_name) {
-        Ok(()) => {
-            // Cross-directory rename durability requires the restored visible
-            // destination to be synced before the private source directory.
-            parent.sync_all()?;
-            staging.sync_all()?;
-            remove_pending_manifest(staging, manifest_name)
-        }
-        Err(error) => {
-            tracing::error!(
-                %error,
-                recovery_entry = %pending_name,
-                original = %original_path,
-                "could not roll back pending deletion; private recovery entry was preserved"
-            );
-            Err(error)
-        }
-    }
 }
 
 fn validate_file_operation(operation: &DurableFileOperation) -> io::Result<()> {

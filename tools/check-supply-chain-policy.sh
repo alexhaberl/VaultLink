@@ -12,6 +12,10 @@ if ! sh tools/check-deployment-assets.sh; then
     report "deployment samples and legacy-component policy failed"
 fi
 
+if ! sh tools/check-cargo-duplicates.sh; then
+    report "Cargo duplicate dependency policy failed"
+fi
+
 uses_lines=$(grep -R -n -E '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]+' .github/workflows || true)
 bad_uses=$(printf '%s\n' "$uses_lines" | grep -E -v 'uses:[[:space:]]+\./|@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)
 if [ -n "$bad_uses" ]; then
@@ -21,6 +25,18 @@ fi
 
 if ! grep -E -q '^FROM[[:space:]]+[^[:space:]]+@sha256:[0-9a-f]{64}$' deploy/docker/Dockerfile.setup-smoke; then
     report "Docker smoke base image must be pinned by digest"
+fi
+
+smoke_dockerfile=deploy/docker/Dockerfile.setup-smoke
+if ! grep -E -q '^COPY Cargo\.toml Cargo\.lock rust-toolchain\.toml Makefile \.dockerignore \./$' "$smoke_dockerfile" \
+    || ! grep -F -x -q 'COPY .github ./.github' "$smoke_dockerfile" \
+    || ! grep -F -x -q 'COPY deploy ./deploy' "$smoke_dockerfile" \
+    || ! grep -F -x -q 'COPY tools ./tools' "$smoke_dockerfile"; then
+    report "Docker smoke build must include policy, workflow, tool, and deployment assets"
+fi
+if ! grep -F -q 'shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh' "$smoke_dockerfile" \
+    || ! grep -F -q 'sh tools/check-supply-chain-policy.sh' "$smoke_dockerfile"; then
+    report "Docker smoke build must run shell and supply-chain policy gates"
 fi
 
 literal_dollar='$'
@@ -250,6 +266,9 @@ fi
 
 if ! grep -F -x -q 'LimitNOFILE=4096' deploy/vaultlink.service; then
     report "vaultlink.service must retain its explicit file-descriptor ceiling"
+fi
+if ! grep -F -x -q 'LimitCORE=0' deploy/vaultlink.service; then
+    report "vaultlink.service must disable core dumps"
 fi
 if ! grep -F -x -q 'TasksMax=512' deploy/vaultlink.service; then
     report "vaultlink.service must retain its explicit task ceiling"

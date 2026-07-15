@@ -26,9 +26,11 @@ use crate::{
         CertificateSource, Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage,
         Tls, MAX_TEXT_PREVIEW_SIZE,
     },
-    db::{Database, InitialAdminOutcome},
+    db::{AuditContext, Database, InitialAdminOutcome},
     i18n::{self, Locale},
-    runtime, storage_mount, ui,
+    runtime,
+    sensitive::SecretString,
+    storage_mount, ui,
 };
 
 #[derive(Clone)]
@@ -93,8 +95,8 @@ struct SetupForm {
     hsts_enabled: Option<String>,
     log_level: String,
     admin_username: String,
-    admin_password: String,
-    admin_password_confirm: String,
+    admin_password: SecretString,
+    admin_password_confirm: SecretString,
 }
 
 pub async fn run(
@@ -314,7 +316,11 @@ fn setup_access_instructions(listen: SocketAddr, token: &str) -> String {
 }
 
 async fn setup_page(State(state): State<SetupState>, Query(query): Query<TokenQuery>) -> Response {
-    if query.token.as_deref() != Some(state.token.as_str()) {
+    if !query
+        .token
+        .as_deref()
+        .is_some_and(|token| auth::constant_time_eq(state.token.as_str(), token))
+    {
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
@@ -332,7 +338,7 @@ async fn setup_page(State(state): State<SetupState>, Query(query): Query<TokenQu
 }
 
 async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupForm>) -> Response {
-    if form.token != *state.token {
+    if !auth::constant_time_eq(state.token.as_str(), &form.token) {
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
@@ -354,14 +360,14 @@ async fn submit_setup(State(state): State<SetupState>, Form(form): Form<SetupFor
             .into_response();
     }
     match build_and_store(&state.config_path, form).await {
-        Ok(result) => match qr_svg(&result.otpauth) {
+        Ok(result) => match qr_svg(result.otpauth.expose_secret()) {
             Ok(qr) => {
                 Html(page_without_locale_switcher(
                     &format!(
                     r#"<section class="vl-panel"><h1><vl-i18n key="setup.completed"/></h1><p><vl-i18n key="setup.config_admin_created"/></p><p><vl-i18n key="setup.totp_recovery_help"/></p><div class="vl-qr-card" aria-label="<vl-i18n key="setup.totp_qr_code"/>">{}</div><div class="vl-secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><input type="hidden" name="token" value="{}"><button class="vl-button"><vl-i18n key="setup.secret_saved"/></button></form></section>"#,
                     qr,
-                    esc(&result.totp_secret),
-                    esc(&result.otpauth),
+                    esc(result.totp_secret.expose_secret()),
+                    esc(result.otpauth.expose_secret()),
                     esc(&state.token)
                 ),
                 ))
@@ -394,7 +400,7 @@ async fn complete_setup(
     State(state): State<SetupState>,
     Form(form): Form<CompleteSetupForm>,
 ) -> Response {
-    if form.token != *state.token {
+    if !auth::constant_time_eq(state.token.as_str(), &form.token) {
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
@@ -483,7 +489,7 @@ async fn start_server(
     State(state): State<SetupState>,
     Form(form): Form<CompleteSetupForm>,
 ) -> Response {
-    if form.token != *state.token {
+    if !auth::constant_time_eq(state.token.as_str(), &form.token) {
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
@@ -547,8 +553,15 @@ async fn start_server(
 }
 
 struct SetupResult {
-    totp_secret: String,
-    otpauth: String,
+    totp_secret: SecretString,
+    otpauth: SecretString,
+}
+
+fn one_time_otpauth(username: &str, secret: &SecretString) -> SecretString {
+    SecretString::new(format!(
+        "otpauth://totp/VaultLink:{username}?secret={}&issuer=VaultLink",
+        secret.expose_secret()
+    ))
 }
 
 enum SetupStorageValidation {
@@ -574,12 +587,18 @@ async fn build_and_store_with_mount_validator<F>(
 where
     F: FnOnce(&Storage) -> Result<SetupStorageValidation, String>,
 {
-    if form.admin_password != form.admin_password_confirm {
+    if !form
+        .admin_password
+        .matches_confirmation(&form.admin_password_confirm)
+    {
         return Err(i18n::text(i18n::current_locale(), i18n::PASSWORD_MISMATCH).into());
     }
-    if !auth::valid_admin_password(&form.admin_password) {
+    if !auth::valid_admin_password(form.admin_password.expose_secret()) {
         return Err(i18n::text(i18n::current_locale(), i18n::PASSWORD_POLICY).into());
     }
+    // Confirmation is needed only for the comparison above. Drop it before
+    // parsing configuration and performing storage I/O.
+    drop(form.admin_password_confirm);
     if !auth::valid_admin_username(&form.admin_username) {
         return Err(i18n::text(i18n::current_locale(), i18n::USERNAME_POLICY).into());
     }
@@ -731,10 +750,10 @@ where
     } else {
         false
     };
-    let totp_secret = auth::new_totp_secret();
-    let submitted_password = form.admin_password.clone();
+    let submitted_password =
+        recovering_existing_config.then(|| form.admin_password.duplicate_for_verification());
     let password = form.admin_password;
-    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&password))
+    let hash = tokio::task::spawn_blocking(move || auth::hash_secret_password(password))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
@@ -782,9 +801,11 @@ where
                 .ok_or_else(|| {
                     i18n::text(i18n::current_locale(), i18n::SETUP_RECOVERY_UNAVAILABLE).to_string()
                 })?;
-            let password_hash = admin.password_hash.clone();
+            let password_hash = admin.password_hash;
+            let submitted_password = submitted_password
+                .expect("recovering an existing setup retains one verification copy");
             let password_valid = tokio::task::spawn_blocking(move || {
-                auth::verify_password(&password_hash, &submitted_password)
+                auth::verify_secret_password(password_hash, submitted_password)
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -794,10 +815,7 @@ where
                 );
             }
             let totp_secret = admin.totp_secret;
-            let otpauth = format!(
-                "otpauth://totp/VaultLink:{}?secret={}&issuer=VaultLink",
-                form.admin_username, totp_secret
-            );
+            let otpauth = one_time_otpauth(&form.admin_username, &totp_secret);
             return Ok(SetupResult {
                 totp_secret,
                 otpauth,
@@ -805,6 +823,7 @@ where
         }
         return Err(i18n::text(i18n::current_locale(), i18n::SETUP_INITIAL_ADMIN_EXISTS).into());
     }
+    let totp_secret = auth::new_totp_secret_value();
     let wrote_config = if recovering_existing_config {
         false
     } else {
@@ -818,7 +837,12 @@ where
         }
         return Err(error);
     }
-    match database.create_initial_admin(&form.admin_username, &hash, &totp_secret) {
+    match database.create_initial_admin_and_audit(
+        &form.admin_username,
+        &hash,
+        totp_secret.expose_secret(),
+        &AuditContext::new("setup", None),
+    ) {
         Ok(InitialAdminOutcome::Created) => {}
         Ok(InitialAdminOutcome::AlreadyInitialized) => {
             return Err(
@@ -833,12 +857,11 @@ where
             return Err(error.to_string());
         }
     }
-    let otpauth = format!(
-        "otpauth://totp/VaultLink:{}?secret={}&issuer=VaultLink",
-        form.admin_username, totp_secret
-    );
+    let response_totp_secret = totp_secret.duplicate_for_one_time_response();
+    drop(totp_secret);
+    let otpauth = one_time_otpauth(&form.admin_username, &response_totp_secret);
     Ok(SetupResult {
-        totp_secret,
+        totp_secret: response_totp_secret,
         otpauth,
     })
 }
@@ -963,7 +986,11 @@ async fn setup_browse(
     State(state): State<SetupState>,
     Query(query): Query<BrowseQuery>,
 ) -> Response {
-    if query.token.as_deref() != Some(state.token.as_str()) {
+    if !query
+        .token
+        .as_deref()
+        .is_some_and(|token| auth::constant_time_eq(state.token.as_str(), token))
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let requested = query.path.unwrap_or_else(|| "/".to_string());
@@ -1097,7 +1124,9 @@ fn page(body: &str, token: Option<&str>) -> String {
 // Transitional setup responses may contain a one-time TOTP secret or the only
 // button that moves the listener into server mode. They deliberately omit the
 // locale form because those responses are produced by POST and cannot be
-// replayed safely after a locale redirect.
+// replayed safely after a locale redirect. The application-owned SecretString
+// is zeroed after rendering, but the framework and network response buffers
+// cannot be reliably zeroized.
 fn page_without_locale_switcher(body: &str) -> String {
     render_page(body, "")
 }
@@ -1716,8 +1745,8 @@ mod tests {
         let config_path = config_dir.path().join("config.toml");
         let mut setup_form = form(root.path(), data.path());
         let password = "x".repeat(auth::MAX_PASSWORD_BYTES + 1);
-        setup_form.admin_password = password.clone();
-        setup_form.admin_password_confirm = password;
+        setup_form.admin_password = password.clone().into();
+        setup_form.admin_password_confirm = password.into();
 
         let error = build_and_store_with_mount_validator(&config_path, setup_form, |_| {
             Ok(SetupStorageValidation::TestBypass)
@@ -1823,7 +1852,7 @@ mod tests {
         let result = build_and_store(&config_path, form(root.path(), data.path()))
             .await
             .unwrap();
-        assert!(!result.totp_secret.is_empty());
+        assert!(!result.totp_secret.expose_secret().is_empty());
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.storage.max_preview_size, 1_000_000);
         let confirmed = i18n::render_markers(
@@ -1901,7 +1930,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(!result.totp_secret.is_empty());
+        assert!(!result.totp_secret.expose_secret().is_empty());
         let config = Config::load(&config_path).unwrap();
         assert_eq!(
             config.tls.certificate_source,
@@ -2032,7 +2061,10 @@ mod tests {
         let recovered = build_and_store(&config_path, form(root.path(), data.path()))
             .await
             .unwrap();
-        assert_eq!(recovered.totp_secret, first.totp_secret);
+        assert_eq!(
+            recovered.totp_secret.expose_secret(),
+            first.totp_secret.expose_secret()
+        );
 
         clear_initial_setup_pending(data.path()).unwrap();
         assert!(!initial_setup_pending_path(data.path()).exists());

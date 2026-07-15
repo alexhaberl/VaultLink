@@ -16,6 +16,7 @@ RestartSec=5s
 TimeoutStopSec=30s
 UMask=0077
 LimitNOFILE=4096
+LimitCORE=0
 TasksMax=512
 NoNewPrivileges=true
 PrivateTmp=true

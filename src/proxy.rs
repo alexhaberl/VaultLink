@@ -2,31 +2,53 @@ use crate::config::{Config, ServerMode};
 use http::HeaderMap;
 use std::net::{IpAddr, Ipv6Addr};
 
+/// Canonicalizes a TCP peer without widening the configured trust boundary.
+///
+/// Dual-stack listeners can report an IPv4 peer as an IPv4-mapped IPv6
+/// address. Treat that representation as the corresponding IPv4 address, but
+/// keep every native IPv6 address exact.
+pub fn canonical_peer_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        address => address,
+    }
+}
+
+/// Returns whether a TCP peer is explicitly present in the proxy allowlist.
+pub fn is_trusted_proxy_peer(peer: IpAddr, trusted_proxies: &[IpAddr]) -> bool {
+    let peer = canonical_peer_ip(peer);
+    trusted_proxies
+        .iter()
+        .copied()
+        .map(canonical_peer_ip)
+        .any(|trusted| trusted == peer)
+}
+
 /// Returns the stable key used by abuse and concurrency limits.
 ///
 /// IPv6 clients commonly rotate privacy addresses within one delegated prefix,
 /// so exact-address keys are trivially bypassed. Group native IPv6 by /64 while
 /// preserving IPv4 (including IPv4-mapped IPv6) as an individual address.
 pub fn client_limit_key(address: IpAddr) -> IpAddr {
-    match address {
+    match canonical_peer_ip(address) {
         IpAddr::V6(address) => {
-            if let Some(mapped) = address.to_ipv4_mapped() {
-                IpAddr::V4(mapped)
-            } else {
-                let mut segments = address.segments();
-                segments[4..].fill(0);
-                IpAddr::V6(Ipv6Addr::from(segments))
-            }
+            let mut segments = address.segments();
+            segments[4..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(segments))
         }
         address => address,
     }
 }
 
 pub fn effective_client_ip(peer: IpAddr, headers: &HeaderMap, config: &Config) -> IpAddr {
+    let peer = canonical_peer_ip(peer);
     if config.server.mode != ServerMode::ReverseProxy
         || !config.reverse_proxy.enabled
         || !config.reverse_proxy.trust_x_forwarded_headers
-        || !config.reverse_proxy.trusted_proxies.contains(&peer)
+        || !is_trusted_proxy_peer(peer, &config.reverse_proxy.trusted_proxies)
     {
         return peer;
     }
@@ -41,13 +63,13 @@ pub fn effective_client_ip(peer: IpAddr, headers: &HeaderMap, config: &Config) -
 
     let mut current = peer;
     for candidate in forwarded.into_iter().rev() {
-        if !config.reverse_proxy.trusted_proxies.contains(&current) {
+        if !is_trusted_proxy_peer(current, &config.reverse_proxy.trusted_proxies) {
             break;
         }
         let Ok(candidate) = candidate.parse() else {
             return peer;
         };
-        current = candidate;
+        current = canonical_peer_ip(candidate);
     }
     current
 }
@@ -190,6 +212,31 @@ mod tests {
         assert_eq!(
             client_limit_key("::ffff:192.0.2.7".parse().unwrap()),
             "192.0.2.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn proxy_peer_comparison_canonicalizes_mapped_ipv4_but_keeps_ipv6_exact() {
+        let trusted = vec!["192.0.2.7".parse().unwrap(), "2001:db8::1".parse().unwrap()];
+        assert!(is_trusted_proxy_peer(
+            "::ffff:192.0.2.7".parse().unwrap(),
+            &trusted
+        ));
+        assert!(!is_trusted_proxy_peer(
+            "2001:db8::2".parse().unwrap(),
+            &trusted
+        ));
+    }
+
+    #[test]
+    fn forwarded_headers_accept_a_canonical_mapped_proxy_peer() {
+        let mut c = cfg();
+        c.server.mode = ServerMode::ReverseProxy;
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert_eq!(
+            effective_client_ip("::ffff:127.0.0.1".parse().unwrap(), &h, &c),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
         );
     }
 }

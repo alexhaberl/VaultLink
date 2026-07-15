@@ -13,8 +13,12 @@ pub mod path_security;
 pub mod policy;
 pub mod proxy;
 pub mod range;
+#[cfg(test)]
+mod route_inventory_tests;
 pub mod runtime;
 pub mod secure_fs;
+pub(crate) mod sensitive;
+pub(crate) mod services;
 pub mod setup;
 pub mod storage_mount;
 pub mod ui;

@@ -17,14 +17,20 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile .dockerignore ./
+COPY .github ./.github
 COPY src ./src
 COPY config ./config
 COPY fuzz/Cargo.toml ./fuzz/Cargo.toml
 COPY fuzz/fuzz_targets ./fuzz/fuzz_targets
-COPY deploy/docker ./deploy/docker
-COPY --chmod=0755 deploy/vaultlink-upgrade.sh deploy/vaultlink-rollback.sh ./deploy/
-COPY --chmod=0644 deploy/vaultlink.service ./deploy/
+COPY deploy ./deploy
+COPY tools ./tools
+
+RUN chmod 0644 deploy/Caddyfile deploy/*.conf deploy/*.example \
+        deploy/vaultlink.service tools/*.txt \
+    && chmod 0755 deploy/*.sh deploy/docker/*.sh tools/*.sh \
+    && shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh \
+    && sh tools/check-supply-chain-policy.sh
 
 RUN test ! -e /work/config.toml \
     && test ! -e /work/.env \

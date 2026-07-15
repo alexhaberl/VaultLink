@@ -10,23 +10,26 @@ use serde::Deserialize;
 
 use crate::{
     auth,
-    db::{Permission, Share},
+    db::{AuditContext, Permission, Share},
     file_ops,
     http_auth::{
-        audit, audit_sync, current_client_limit_key, database, enabled_audit_client_ip,
-        make_unlock_cookie, redirect_with_cookie, runtime_settings, share_is_unlocked,
-        share_unlock_csrf, try_acquire_client_activity, verify_password_admitted,
-        UnlockCookieScope,
+        audit_observation, current_client_limit_key, database, enabled_audit_client_ip,
+        make_unlock_cookie, redirect_with_cookie, required_database, runtime_settings,
+        share_is_unlocked, share_unlock_csrf, try_acquire_client_activity,
+        verify_password_admitted, UnlockCookieScope,
     },
     i18n, path_security,
     policy::{self, ShareAvailability},
-    proxy, AppState,
+    proxy,
+    sensitive::SecretString,
+    AppState,
 };
 
 use super::{
     encoded, esc, format_file_time, format_public_date, human, internal, list_directory_page,
     parent_path, plain_page, preview_allowed, public_breadcrumbs, search_tree,
-    share_permission_label, AppError, BrowseQuery, Result, MAX_SEARCH_QUERY_BYTES,
+    share_permission_label, storage_recovery_app_error, AppError, BrowseQuery, Result,
+    MAX_SEARCH_QUERY_BYTES,
 };
 
 pub(super) fn usable(sh: &Share) -> Result<()> {
@@ -55,12 +58,7 @@ pub(super) async fn get_storage_share(
     let guard = state.storage_mutation.clone().lock_owned().await;
     let guard = file_ops::recover_pending_file_operations_with_guard(state, guard)
         .await
-        .map_err(|_| {
-            AppError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Speicherzustand wird wiederhergestellt",
-            )
-        })?;
+        .map_err(storage_recovery_app_error)?;
     let share = get_share(state, token).await?;
     if share.id != expected_id {
         return Err(AppError(
@@ -73,7 +71,7 @@ pub(super) async fn get_storage_share(
 
 #[derive(Deserialize)]
 pub(super) struct UnlockForm {
-    password: String,
+    password: SecretString,
 }
 
 pub(super) async fn unlock_share(
@@ -102,8 +100,8 @@ pub(super) async fn unlock_share(
         ));
     }
     let password = form.password;
-    if password.len() > auth::MAX_PASSWORD_BYTES {
-        audit(
+    if password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
+        audit_observation(
             &state,
             "public".into(),
             "share_unlock_failed",
@@ -115,7 +113,7 @@ pub(super) async fn unlock_share(
     }
     let valid = verify_password_admitted(&state, Some(password_hash), password).await?;
     if !valid {
-        audit(
+        audit_observation(
             &state,
             "public".into(),
             "share_unlock_failed",
@@ -133,32 +131,21 @@ pub(super) async fn unlock_share(
     let stored_unlock_csrf = unlock_csrf.clone();
     let share_id = share.id;
     let expires = Utc::now() + Duration::minutes(runtime_settings(&state).share_unlock_minutes);
-    let audit_object = share_id.to_string();
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    let created = database(state.db.clone(), move |db| {
-        let created = db.create_unlock_session_for_verified_password(
+    let audit_context = AuditContext::new("public", enabled_audit_client_ip(&state));
+    let created = required_database(state.db.clone(), move |db| {
+        db.create_unlock_session_for_verified_password_and_audit(
             &stored_unlock_token,
             share_id,
             &expected_password_hash,
             expected_upload_policy_epoch,
             &stored_unlock_csrf,
             expires,
-        )?;
-        if created {
-            audit_sync(
-                &db,
-                "public",
-                "share_unlock_success",
-                Some(&audit_object),
-                None,
-                audit_client_ip.as_deref(),
-            );
-        }
-        Ok(created)
+            &audit_context,
+        )
     })
     .await?;
     if !created {
-        audit(
+        audit_observation(
             &state,
             "public".into(),
             "share_unlock_failed",
@@ -267,6 +254,9 @@ pub(super) async fn public_page(
             "uncertain" => i18n::text(i18n::current_locale(), i18n::UPLOAD_STORAGE_UNCONFIRMED),
             "replaced_uncertain" => {
                 i18n::text(i18n::current_locale(), i18n::REPLACE_STORAGE_UNCONFIRMED)
+            }
+            "audit_uncertain" => {
+                i18n::text(i18n::current_locale(), i18n::AUDIT_DURABILITY_UNCERTAIN)
             }
             _ => "",
         };

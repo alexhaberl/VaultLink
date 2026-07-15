@@ -6,12 +6,13 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
-    auth,
-    db::AdminDeactivationOutcome,
+    db::{AdminDeactivationOutcome, AuditContext},
     http_auth::{
-        audit_sync, csrf, database, enabled_audit_client_ip, hash_password_admitted, session,
-        MissingSession,
+        csrf, database, enabled_audit_client_ip, hash_password_admitted, required_database,
+        session, MissingSession,
     },
+    sensitive::SecretString,
+    services::admin::{AdminActivationResult, AdminService, AdminServiceError, CreateAdminCommand},
     AppState,
 };
 
@@ -102,15 +103,15 @@ pub(super) async fn admins_page(
 pub(super) struct CreateAdminUiForm {
     csrf: String,
     username: String,
-    password: String,
-    password_confirm: String,
+    password: SecretString,
+    password_confirm: SecretString,
 }
 
 #[derive(Deserialize)]
 pub(super) struct ResetAdminPasswordForm {
     csrf: String,
-    password: String,
-    password_confirm: String,
+    password: SecretString,
+    password_confirm: SecretString,
 }
 
 #[derive(Deserialize, Default)]
@@ -125,53 +126,45 @@ pub(super) async fn create_admin_ui(
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
-    if !auth::valid_admin_username(&form.username) {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Benutzername muss 3-64 sichere ASCII-Zeichen enthalten",
-        ));
-    }
-    if form.password != form.password_confirm {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Passwörter stimmen nicht überein",
-        ));
-    }
-    if !auth::valid_admin_password(&form.password) {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
-        ));
-    }
-    let username = form.username.clone();
-    let secret = auth::new_totp_secret();
-    let hash = hash_password_admitted(&state, form.password).await?;
-    let created_username = username.clone();
-    let created_secret = secret.clone();
-    let audit_actor = session.username;
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    database(state.db.clone(), move |db| {
-        db.create_admin(&created_username, &hash, &created_secret)?;
-        audit_sync(
-            &db,
-            &audit_actor,
-            "admin_created",
-            Some(&created_username),
-            None,
-            audit_client_ip.as_deref(),
-        );
-        Ok(())
+    let service = AdminService::new(state.db.clone());
+    let validated = service
+        .prepare_create(CreateAdminCommand {
+            username: form.username,
+            password: form.password,
+            confirmation: Some(form.password_confirm),
+        })
+        .map_err(admin_validation_error)?;
+    let (prepared, password) = validated.into_hash_input();
+    let hash = hash_password_admitted(&state, password).await?;
+    let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
+    let create_result = required_database(state.db.clone(), move |_| {
+        service
+            .create(prepared, hash, &audit_context)
+            .map_err(admin_database_error)
     })
-    .await
-    .map_err(|_| AppError(StatusCode::CONFLICT, "Benutzername existiert bereits"))?;
-    let otpauth = otpauth_url(&username, &secret);
-    let qr = qr_svg(&otpauth)?;
+    .await;
+    let created = match create_result {
+        Ok(created) => created,
+        Err(error) if error.status == StatusCode::SERVICE_UNAVAILABLE => {
+            return Err(error.into());
+        }
+        Err(_) => {
+            return Err(AppError(
+                StatusCode::CONFLICT,
+                "Benutzername existiert bereits",
+            ));
+        }
+    };
+    let username = created.summary.username;
+    let response_secret = created.totp_secret;
+    let otpauth = otpauth_url(&username, response_secret.expose_secret());
+    let qr = qr_svg(otpauth.expose_secret())?;
     let body = format!(
         r#"<section class="vl-panel"><h2><vl-i18n key="title.admin_created"/></h2><p><vl-i18n key="admins.secret_once"/></p><p><strong>{}</strong></p><div class="vl-qr-card" aria-label="TOTP QR-Code">{}</div><div class="vl-secret-block"><code>{}</code><code>{}</code></div><p><a class="vl-button vl-button--secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
         esc(&username),
         qr,
-        esc(&secret),
-        esc(&otpauth)
+        esc(response_secret.expose_secret()),
+        esc(otpauth.expose_secret())
     );
     Ok(Html(admin_page_without_locale_switcher(
         &state,
@@ -196,35 +189,16 @@ pub(super) async fn reset_admin_password(
             "Eigenes Passwort kann hier nicht zurückgesetzt werden",
         ));
     }
-    if form.password != form.password_confirm {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Passwörter stimmen nicht überein",
-        ));
-    }
-    if !auth::valid_admin_password(&form.password) {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
-        ));
-    }
-    let hash = hash_password_admitted(&state, form.password).await?;
-    let audit_actor = session.username;
-    let audit_object = id.to_string();
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    let changed = database(state.db.clone(), move |db| {
-        let changed = db.reset_admin_password(id, &hash)?;
-        if changed {
-            audit_sync(
-                &db,
-                &audit_actor,
-                "admin_password_reset",
-                Some(&audit_object),
-                None,
-                audit_client_ip.as_deref(),
-            );
-        }
-        Ok(changed)
+    let service = AdminService::new(state.db.clone());
+    let password = service
+        .prepare_password(form.password, Some(form.password_confirm))
+        .map_err(admin_validation_error)?;
+    let hash = hash_password_admitted(&state, password).await?;
+    let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
+    let changed = required_database(state.db.clone(), move |_| {
+        service
+            .reset_password(id, &hash, &audit_context)
+            .map_err(admin_database_error)
     })
     .await?;
     if !changed {
@@ -247,35 +221,25 @@ pub(super) async fn reset_admin_totp(
             "Eigene MFA kann hier nicht zurückgesetzt werden",
         ));
     }
-    let secret = auth::new_totp_secret();
-    let reset_secret = secret.clone();
-    let audit_actor = session.username;
-    let audit_object = id.to_string();
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    let username = database(state.db.clone(), move |db| {
-        let username = db.reset_admin_totp(id, &reset_secret)?;
-        if username.is_some() {
-            audit_sync(
-                &db,
-                &audit_actor,
-                "admin_totp_reset",
-                Some(&audit_object),
-                None,
-                audit_client_ip.as_deref(),
-            );
-        }
-        Ok(username)
+    let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
+    let service = AdminService::new(state.db.clone());
+    let reset = required_database(state.db.clone(), move |_| {
+        service
+            .reset_totp(id, &audit_context)
+            .map_err(admin_database_error)
     })
     .await?
     .ok_or(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"))?;
-    let otpauth = otpauth_url(&username, &secret);
-    let qr = qr_svg(&otpauth)?;
+    let username = reset.username;
+    let response_secret = reset.totp_secret;
+    let otpauth = otpauth_url(&username, response_secret.expose_secret());
+    let qr = qr_svg(otpauth.expose_secret())?;
     let body = format!(
         r#"<section class="vl-panel"><h2><vl-i18n key="title.mfa_reset"/></h2><p><vl-i18n key="admins.new_secret_once"/></p><p><strong>{}</strong></p><div class="vl-qr-card" aria-label="TOTP QR-Code">{}</div><div class="vl-secret-block"><code>{}</code><code>{}</code></div><p><a class="vl-button vl-button--secondary" href="/admin/admins"><vl-i18n key="admins.to_list"/></a></p></section>"#,
         esc(&username),
         qr,
-        esc(&secret),
-        esc(&otpauth)
+        esc(response_secret.expose_secret()),
+        esc(otpauth.expose_secret())
     );
     Ok(Html(admin_page_without_locale_switcher(
         &state,
@@ -300,38 +264,31 @@ pub(super) async fn deactivate_admin(
             "Eigener Admin kann nicht stillgelegt werden",
         ));
     }
-    let audit_actor = session.username;
-    let audit_object = id.to_string();
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    let outcome = database(state.db.clone(), move |db| {
-        let outcome = db.deactivate_admin(id)?;
-        if matches!(
-            outcome,
-            AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive
-        ) {
-            audit_sync(
-                &db,
-                &audit_actor,
-                "admin_deactivated",
-                Some(&audit_object),
-                None,
-                audit_client_ip.as_deref(),
-            );
-        }
-        Ok(outcome)
+    let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
+    let service = AdminService::new(state.db.clone());
+    let outcome = required_database(state.db.clone(), move |_| {
+        service
+            .set_active(id, false, &audit_context)
+            .map_err(admin_database_error)
     })
     .await?;
     match outcome {
-        AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive => {}
-        AdminDeactivationOutcome::LastActive => {
-            return Err(AppError(
-                StatusCode::BAD_REQUEST,
-                "Letzter aktiver Admin kann nicht stillgelegt werden",
-            ));
-        }
-        AdminDeactivationOutcome::NotFound => {
+        AdminActivationResult::Deactivation(outcome) => match outcome {
+            AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive => {}
+            AdminDeactivationOutcome::LastActive => {
+                return Err(AppError(
+                    StatusCode::BAD_REQUEST,
+                    "Letzter aktiver Admin kann nicht stillgelegt werden",
+                ));
+            }
+            AdminDeactivationOutcome::NotFound => {
+                return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
+            }
+        },
+        AdminActivationResult::NotFound => {
             return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
         }
+        AdminActivationResult::Changed => {}
     }
     Ok(Redirect::to("/admin/admins"))
 }
@@ -344,26 +301,41 @@ pub(super) async fn activate_admin(
 ) -> Result<Redirect> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
-    let audit_actor = session.username;
-    let audit_object = id.to_string();
-    let audit_client_ip = enabled_audit_client_ip(&state);
-    let changed = database(state.db.clone(), move |db| {
-        let changed = db.activate_admin(id)?;
-        if changed {
-            audit_sync(
-                &db,
-                &audit_actor,
-                "admin_activated",
-                Some(&audit_object),
-                None,
-                audit_client_ip.as_deref(),
-            );
-        }
-        Ok(changed)
+    let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
+    let service = AdminService::new(state.db.clone());
+    let outcome = required_database(state.db.clone(), move |_| {
+        service
+            .set_active(id, true, &audit_context)
+            .map_err(admin_database_error)
     })
     .await?;
-    if !changed {
+    if outcome == AdminActivationResult::NotFound {
         return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
     }
     Ok(Redirect::to("/admin/admins"))
+}
+
+fn admin_validation_error(error: AdminServiceError) -> AppError {
+    match error {
+        AdminServiceError::InvalidUsername => AppError(
+            StatusCode::BAD_REQUEST,
+            "Benutzername muss 3-64 sichere ASCII-Zeichen enthalten",
+        ),
+        AdminServiceError::InvalidPassword => AppError(
+            StatusCode::BAD_REQUEST,
+            "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
+        ),
+        AdminServiceError::PasswordConfirmationMismatch => {
+            AppError(StatusCode::BAD_REQUEST, "Passwörter stimmen nicht überein")
+        }
+        AdminServiceError::Database(_) => {
+            AppError(StatusCode::INTERNAL_SERVER_ERROR, "Datenbankfehler")
+        }
+    }
+}
+
+fn admin_database_error(error: AdminServiceError) -> rusqlite::Error {
+    error
+        .into_database_error()
+        .unwrap_or(rusqlite::Error::InvalidQuery)
 }

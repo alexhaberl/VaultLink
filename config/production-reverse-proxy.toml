@@ -45,6 +45,11 @@ audit_client_ip_enabled = false
 [reverse_proxy]
 enabled = true
 allow_non_loopback = false
+# This is both the exact TCP-peer allowlist and the trust boundary for
+# forwarded headers. The local listener/readiness peers are listed explicitly.
+# For an external proxy with listen_address = "0.0.0.0:8080", use for example:
+# allow_non_loopback = true
+# trusted_proxies = ["192.0.2.10", "127.0.0.1"]
 trusted_proxies = ["127.0.0.1", "::1"]
 trust_x_forwarded_headers = true
 

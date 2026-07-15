@@ -2,18 +2,23 @@
 //! so a path cannot escape the configured root between validation and use.
 
 mod capability;
+mod identity;
+mod journal;
+mod private_entries;
 mod recovery;
 mod staging;
 mod upload;
 
 use capability::{directory_scan_from_file, linux};
-use recovery::entry_matches_identity;
 #[cfg(test)]
-use recovery::{
-    rebase_cleanup_directory, replace_delete_operation_phase, replace_file_operation,
-    start_cleanup_from_directory, write_file_operation,
-};
-pub use upload::{is_upload_fragment_name, upload_fragment_name, PendingUpload, PublishOutcome};
+use journal::{replace_delete_operation_phase, replace_file_operation, write_file_operation};
+use private_entries::ActiveUploadFragmentKey;
+#[cfg(test)]
+use private_entries::{active_upload_fragment_guard, unregister_upload_fragment};
+pub use private_entries::{is_upload_fragment_name, upload_fragment_name};
+#[cfg(test)]
+use recovery::{rebase_cleanup_directory, start_cleanup_from_directory};
+pub use upload::{PendingUpload, PublishOutcome};
 
 use std::{
     collections::HashSet,
@@ -22,11 +27,12 @@ use std::{
     io,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
     time::SystemTime,
 };
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -54,27 +60,8 @@ const MAX_CLEANUP_DIRECTORY_STACK: usize = 32;
 // a cleanup cursor intentionally survives across many batches.
 const MAX_CLEANUP_VISITED_DIRECTORIES: usize = 16_384;
 
-type ActiveUploadFragmentKey = String;
-
 #[cfg(test)]
 type TestOnceHook = Box<dyn FnOnce() + Send + 'static>;
-
-static ACTIVE_UPLOAD_FRAGMENTS: OnceLock<Mutex<HashSet<ActiveUploadFragmentKey>>> = OnceLock::new();
-
-fn active_upload_fragments() -> &'static Mutex<HashSet<ActiveUploadFragmentKey>> {
-    ACTIVE_UPLOAD_FRAGMENTS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn active_upload_fragment_guard() -> std::sync::MutexGuard<'static, HashSet<ActiveUploadFragmentKey>>
-{
-    active_upload_fragments()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn unregister_upload_fragment(key: &str) {
-    active_upload_fragment_guard().remove(key);
-}
 
 pub fn deletion_tombstone_name() -> String {
     format!(

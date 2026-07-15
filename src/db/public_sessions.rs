@@ -1,5 +1,6 @@
 use super::{
-    token_hash, Database, PreviewSessionCreateOutcome, MAX_ACTIVE_PREVIEW_SESSIONS_GLOBAL,
+    insert_required_audits, token_hash, trace_required_audits, AuditContext, Database,
+    PreviewSessionCreateOutcome, RequiredAuditEvent, MAX_ACTIVE_PREVIEW_SESSIONS_GLOBAL,
     MAX_ACTIVE_PREVIEW_SESSIONS_PER_OWNER_SHARE, MAX_ACTIVE_PREVIEW_SESSIONS_PER_RESOURCE,
     MAX_ACTIVE_PREVIEW_SESSIONS_PER_SHARE,
 };
@@ -19,6 +20,50 @@ impl Database {
         expected_upload_policy_epoch: i64,
         csrf_token: &str,
         expires: DateTime<Utc>,
+    ) -> rusqlite::Result<bool> {
+        self.create_unlock_session_for_verified_password_internal(
+            token,
+            share_id,
+            expected_password_hash,
+            expected_upload_policy_epoch,
+            csrf_token,
+            expires,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_unlock_session_for_verified_password_and_audit(
+        &self,
+        token: &str,
+        share_id: i64,
+        expected_password_hash: &str,
+        expected_upload_policy_epoch: i64,
+        csrf_token: &str,
+        expires: DateTime<Utc>,
+        context: &AuditContext,
+    ) -> rusqlite::Result<bool> {
+        self.create_unlock_session_for_verified_password_internal(
+            token,
+            share_id,
+            expected_password_hash,
+            expected_upload_policy_epoch,
+            csrf_token,
+            expires,
+            Some(context),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_unlock_session_for_verified_password_internal(
+        &self,
+        token: &str,
+        share_id: i64,
+        expected_password_hash: &str,
+        expected_upload_policy_epoch: i64,
+        csrf_token: &str,
+        expires: DateTime<Utc>,
+        required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<bool> {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.conn();
@@ -46,7 +91,17 @@ impl Database {
                 now,
             ],
         )? == 1;
+        let audit_events = created
+            .then(|| RequiredAuditEvent::new("share_unlocked", Some(share_id.to_string()), None))
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(context) = required_audit {
+            insert_required_audits(&transaction, context, &audit_events)?;
+        }
         transaction.commit()?;
+        if let Some(context) = required_audit {
+            trace_required_audits(context, &audit_events);
+        }
         Ok(created)
     }
     pub fn unlock_session(&self, token: &str, share_id: i64) -> rusqlite::Result<bool> {

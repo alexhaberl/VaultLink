@@ -273,6 +273,14 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+fn local_readiness_peer_ip(listen_ip: IpAddr) -> IpAddr {
+    match listen_ip {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    }
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let value = fs::read_to_string(path)?;
@@ -285,11 +293,7 @@ impl Config {
         let listen: SocketAddr = self.server.listen_address.parse().map_err(|_| {
             ConfigError::Invalid("listen_address must be an IP socket address".into())
         })?;
-        let local_ip = match listen.ip() {
-            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-            ip => ip,
-        };
+        let local_ip = local_readiness_peer_ip(listen.ip());
         let local = SocketAddr::new(local_ip, listen.port());
 
         if self.server.mode != ServerMode::StandaloneTls {
@@ -403,11 +407,22 @@ impl Config {
                         .reverse_proxy
                         .trusted_proxies
                         .iter()
+                        .copied()
+                        .map(crate::proxy::canonical_peer_ip)
                         .any(|proxy| !proxy.is_loopback())
                 {
                     return Err(ConfigError::Invalid(
                         "non-loopback binding requires a non-loopback trusted proxy".into(),
                     ));
+                }
+                let readiness_peer = local_readiness_peer_ip(listen.ip());
+                if !crate::proxy::is_trusted_proxy_peer(
+                    readiness_peer,
+                    &self.reverse_proxy.trusted_proxies,
+                ) {
+                    return Err(ConfigError::Invalid(format!(
+                        "reverse_proxy trusted_proxies must include the local readiness peer {readiness_peer}"
+                    )));
                 }
                 if self.tls.enabled {
                     return Err(ConfigError::Invalid(
@@ -1131,7 +1146,30 @@ mod tests {
         c.reverse_proxy.trusted_proxies = vec!["192.0.2.10".parse().unwrap()];
         assert!(c.validate().is_err());
         c.reverse_proxy.allow_non_loopback = true;
+        let error = c.validate().unwrap_err().to_string();
+        assert!(error.contains("local readiness peer 127.0.0.1"));
+        c.reverse_proxy
+            .trusted_proxies
+            .push("127.0.0.1".parse().unwrap());
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn reverse_proxy_readiness_accepts_mapped_ipv4_allowlist_entry() {
+        let mut c = base();
+        c.server.mode = ServerMode::ReverseProxy;
+        c.server.production_mode = true;
+        configure_local_mount_policy(&mut c);
+        c.server.listen_address = "0.0.0.0:8080".into();
+        c.server.public_base_url = "https://vaultlink.example".into();
+        c.security.secure_cookie = true;
+        c.reverse_proxy.enabled = true;
+        c.reverse_proxy.allow_non_loopback = true;
+        c.reverse_proxy.trusted_proxies = vec![
+            "192.0.2.10".parse().unwrap(),
+            "::ffff:127.0.0.1".parse().unwrap(),
+        ];
+        c.validate().unwrap();
     }
     #[test]
     fn hsts_rejected_in_development() {
@@ -1280,7 +1318,8 @@ mod tests {
         c.security.secure_cookie = true;
         c.reverse_proxy.enabled = true;
         c.reverse_proxy.allow_non_loopback = true;
-        c.reverse_proxy.trusted_proxies = vec!["192.0.2.10".parse().unwrap()];
+        c.reverse_proxy.trusted_proxies =
+            vec!["192.0.2.10".parse().unwrap(), "127.0.0.1".parse().unwrap()];
         assert!(c.validate().is_ok());
 
         assert_eq!(

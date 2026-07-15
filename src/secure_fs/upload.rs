@@ -1,40 +1,13 @@
-use std::{ffi::OsStr, fs::File, io, sync::Arc};
+use std::{fs::File, io, sync::Arc};
 
 use crate::path_security;
 
-use super::{
-    active_upload_fragment_guard, entry_matches_identity, linux, unregister_upload_fragment,
-    validated, ActiveUploadFragmentKey, EntryKind, SecureDirectory, SecureRoot,
+use super::identity::entry_matches_identity;
+use super::private_entries::{
+    active_upload_fragment_guard, unregister_upload_fragment, upload_fragment_name,
+    ActiveUploadFragmentKey,
 };
-
-const UPLOAD_FRAGMENT_PREFIX: &str = ".vaultlink-";
-const UPLOAD_FRAGMENT_SUFFIX: &str = ".part";
-const UPLOAD_FRAGMENT_TOKEN_LENGTH: usize = 24;
-
-/// Generates the private filename used while an upload is incomplete.
-pub fn upload_fragment_name() -> String {
-    format!(
-        "{UPLOAD_FRAGMENT_PREFIX}{}{UPLOAD_FRAGMENT_SUFFIX}",
-        crate::auth::random_token(18)
-    )
-}
-
-/// Matches only filenames in VaultLink's private upload-fragment namespace.
-pub fn is_upload_fragment_name(name: &OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(token) = name
-        .strip_prefix(UPLOAD_FRAGMENT_PREFIX)
-        .and_then(|name| name.strip_suffix(UPLOAD_FRAGMENT_SUFFIX))
-    else {
-        return false;
-    };
-    token.len() == UPLOAD_FRAGMENT_TOKEN_LENGTH
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
+use super::{linux, validated, EntryKind, SecureDirectory, SecureRoot};
 
 #[derive(Debug)]
 pub enum PublishOutcome {
