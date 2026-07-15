@@ -26,10 +26,13 @@ use crate::{
 };
 
 use super::{
-    encoded, esc, format_file_time, format_public_date, human, internal, list_directory_page,
-    parent_path, plain_page, preview_allowed, public_breadcrumbs, search_tree,
-    share_permission_label, storage_recovery_app_error, AppError, BrowseQuery, Result,
-    MAX_SEARCH_QUERY_BYTES,
+    common::{
+        encoded, format_file_time, format_public_date, human, internal, list_directory_page,
+        parent_path, preview_allowed, public_breadcrumbs, search_tree, BrowseQuery,
+    },
+    rendering::{esc, plain_page},
+    shares::share_permission_label,
+    storage_recovery_app_error, AppError, Result, MAX_SEARCH_QUERY_BYTES,
 };
 
 pub(super) fn usable(sh: &Share) -> Result<()> {
@@ -500,7 +503,7 @@ pub(super) async fn public_page(
         };
         let panel_tag = if split_layout { "aside" } else { "section" };
         body += &format!(
-            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_choose"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label>{}<div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit>{} <vl-i18n key="upload.securely"/></button><p class="vl-muted"><vl-i18n key="share.no_replace_help"/></p></form></{panel_tag}>"#,
+            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_choose"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label>{}<div class="vl-upload-queue" data-upload-list role="status" aria-live="polite"></div><button class="vl-button" data-upload-submit>{} <vl-i18n key="upload.securely"/></button><p class="vl-muted"><vl-i18n key="share.no_replace_help"/></p></form></{panel_tag}>"#,
             if sh.permission == Permission::UploadOnly {
                 i18n::text(i18n::current_locale(), i18n::UPLOAD_FILE)
             } else {

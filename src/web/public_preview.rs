@@ -1,5 +1,6 @@
 use std::io;
 
+use askama::Template;
 use axum::{
     body::Body,
     extract::{OriginalUri, Path as AxPath, Query, State},
@@ -10,14 +11,31 @@ use chrono::{Duration, Utc};
 use futures_util::StreamExt;
 
 use super::{
-    begin_public_transfer, complete_transfer_without_body, encoded, esc, escaped_html_len,
-    escaped_text_page_stream, get_share, get_storage_share, human, internal, media_viewer,
-    parent_path, plain_page, preview_kind, preview_too_large_body, public_preview_error,
-    public_share_route, raw_preview_response, raw_preview_secure_file_response, read_preview,
-    read_preview_secure_file, set_transfer_cookie, transfer_body, AppError, BrowseQuery,
-    PermitBody, PreviewContent, PreviewRawQuery, Result, MAX_RENDERED_TEXT_PREVIEW_BYTES,
-    TEXT_PREVIEW_RENDER_UNIT_BYTES, TEXT_PREVIEW_STREAM_MARKER,
+    admission::PermitBody,
+    common::{
+        encoded, human, internal, parent_path, preview_kind, public_preview_error, BrowseQuery,
+    },
+    files::{media_viewer, preview_too_large_body},
+    preview_zip::{
+        raw_preview_response, raw_preview_secure_file_response, read_preview,
+        read_preview_secure_file, PreviewContent,
+    },
+    public::{get_share, get_storage_share},
+    rendering::{esc, escaped_html_len, plain_page},
+    shares::PreviewRawQuery,
+    transfer_runtime::{
+        begin_public_transfer, complete_transfer_without_body, escaped_text_page_stream,
+        public_share_route, set_transfer_cookie, transfer_body,
+    },
+    AppError, Result, MAX_RENDERED_TEXT_PREVIEW_BYTES, TEXT_PREVIEW_RENDER_UNIT_BYTES,
 };
+
+#[derive(Template)]
+#[template(path = "web/public/text_preview.html")]
+struct PublicTextPreviewTemplate<'a> {
+    back_link: &'a str,
+    download_link: &'a str,
+}
 use crate::{
     auth,
     db::PreviewSessionCreateOutcome,
@@ -223,16 +241,12 @@ pub(crate) async fn public_preview(
             unreachable!("oversized previews return before response rendering")
         }
         PreviewContent::Text(text) => {
-            let body = format!(
-                r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><pre>{}</pre></section>"#,
-                TEXT_PREVIEW_STREAM_MARKER
-            );
-            let body = add_public_preview_actions(
-                body,
-                &public_back_link(&public_route, &share_rel, sh.is_directory),
-                Some(&download_link),
-            );
-            let page = plain_page("Vorschau", &body);
+            let back_link = public_back_link(&public_route, &share_rel, sh.is_directory);
+            let body = PublicTextPreviewTemplate {
+                back_link: &back_link,
+                download_link: &download_link,
+            };
+            let page = super::templates::public_page("Vorschau", &body)?;
             let (stream, page_length) = escaped_text_page_stream(page, text).map_err(internal)?;
             let transfer = text_transfer
                 .take()

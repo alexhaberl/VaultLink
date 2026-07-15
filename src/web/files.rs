@@ -1,3 +1,4 @@
+use askama::Template;
 use axum::{
     body::Body,
     extract::{Form, Json, Multipart, Query, State},
@@ -9,16 +10,34 @@ use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
 use super::{
-    add_upload_bytes, admin_page, breadcrumbs, disk_stats, encoded, esc, escaped_html_len,
-    escaped_text_page_stream, extension_is_blocked, format_file_time, human, internal,
-    join_display, limited_multipart_text, list_directory_page, parent_path, preview_allowed,
-    preview_kind, raw_preview_response, read_preview, search_tree, share_is_available,
-    storage_has_room, storage_recovery_app_error, text_preview_render_permits, upload_io_error,
-    upload_queue_error_response, AppError, BrowseQuery, PageId, PendingUploadFileError, PermitBody,
-    PreviewContent, Result, ShareQuery, UploadChunkReservation, UploadQueueSuccess,
-    MAX_RENDERED_TEXT_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES, MAX_UPLOAD_OPTION_FIELD_BYTES,
-    MAX_UPLOAD_PATH_FIELD_BYTES, TEXT_PREVIEW_STREAM_MARKER,
+    admission::PermitBody,
+    common::{
+        add_upload_bytes, breadcrumbs, encoded, extension_is_blocked, format_file_time, human,
+        internal, join_display, list_directory_page, parent_path, preview_allowed, preview_kind,
+        search_tree, BrowseQuery,
+    },
+    preview_zip::{raw_preview_response, read_preview, PreviewContent},
+    public_preview::text_preview_render_permits,
+    rendering::{
+        admin_page, disk_stats, esc, escaped_html_len, storage_has_room, PageId,
+        UploadChunkReservation,
+    },
+    shares::{share_is_available, ShareQuery},
+    storage_recovery_app_error,
+    transfer_runtime::{
+        escaped_text_page_stream, limited_multipart_text, upload_io_error, PendingUploadFileError,
+    },
+    upload::{upload_queue_error_response, UploadQueueSuccess},
+    AppError, Result, MAX_RENDERED_TEXT_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES,
+    MAX_UPLOAD_OPTION_FIELD_BYTES, MAX_UPLOAD_PATH_FIELD_BYTES,
 };
+
+#[derive(Template)]
+#[template(path = "web/files/text_preview.html")]
+struct AdminTextPreviewTemplate<'a> {
+    parent_path: &'a str,
+    relative_path: &'a str,
+}
 use crate::{
     db::AuditContext,
     file_ops,
@@ -914,7 +933,7 @@ pub(super) async fn admin_browser(
         r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_conflict"/><small><vl-i18n key="share.after_conflict"/></small></span></label>"#
     };
     let upload_form = format!(
-        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} <vl-i18n key="upload.files"/></summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><div class="vl-panel-head"><div><strong><vl-i18n key="upload.admin"/></strong><p class="vl-muted"><vl-i18n key="upload.sequential"/></p></div><button class="vl-button vl-button--ghost vl-button--small" type="button" data-details-close><vl-i18n key="common.close"/></button></div>{}<label class="vl-upload-dropzone" data-upload-dropzone><strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_add"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list aria-live="polite"></div><button class="vl-button" data-upload-submit><vl-i18n key="upload.start"/></button></form></details>"#,
+        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} <vl-i18n key="upload.files"/></summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><div class="vl-panel-head"><div><strong><vl-i18n key="upload.admin"/></strong><p class="vl-muted"><vl-i18n key="upload.sequential"/></p></div><button class="vl-button vl-button--ghost vl-button--small" type="button" data-details-close><vl-i18n key="common.close"/></button></div>{}<label class="vl-upload-dropzone" data-upload-dropzone><strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_add"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list role="status" aria-live="polite"></div><button class="vl-button" data-upload-submit><vl-i18n key="upload.start"/></button></form></details>"#,
         crate::ui::icon(crate::ui::Icon::Upload),
         esc(&rel),
         esc(&s.csrf_token),
@@ -1010,13 +1029,19 @@ pub(super) async fn admin_preview(
     .await;
     match content {
         PreviewContent::Text(text) => {
-            let body = format!(
-                r#"<section class="vl-panel"><p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href="/admin?path={}"><vl-i18n key="files.back_to_folder"/></a></p><p><code>/{}</code></p><pre>{}</pre></section>"#,
-                encoded(parent_path(&rel).as_deref().unwrap_or("")),
-                esc(&rel),
-                TEXT_PREVIEW_STREAM_MARKER
-            );
-            let page = admin_page(&state, PageId::Preview, &body, false, &session.csrf_token);
+            let parent = encoded(parent_path(&rel).as_deref().unwrap_or(""));
+            let body = AdminTextPreviewTemplate {
+                parent_path: &parent,
+                relative_path: &rel,
+            };
+            let page = super::templates::admin_page(
+                &state,
+                PageId::Preview,
+                &body,
+                false,
+                &session.csrf_token,
+                true,
+            )?;
             let (stream, page_length) = escaped_text_page_stream(page, text).map_err(internal)?;
             let mut response = Response::new(Body::new(PermitBody {
                 inner: Body::from_stream(stream),

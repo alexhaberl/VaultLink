@@ -1,3 +1,4 @@
+use askama::Template;
 use axum::{
     extract::{Form, Json, Path as AxPath, State},
     http::{HeaderMap, StatusCode},
@@ -7,9 +8,12 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+use super::common::webauthn_start_response;
 use super::{
-    admin_page, admin_page_without_locale_switcher, decode_security_keys, esc, format_utc_minute,
-    internal, otpauth_url, qr_svg, AppError, PageId, Result,
+    common::{decode_security_keys, format_utc_minute, internal, otpauth_url, qr_svg},
+    rendering::PageId,
+    templates::admin_page as render_admin_page,
+    AppError, Result,
 };
 use crate::{
     auth,
@@ -27,6 +31,31 @@ use crate::{
     AppState,
 };
 
+struct SecurityKeyView {
+    id: i64,
+    label: String,
+    created_at: String,
+}
+
+#[derive(Template)]
+#[template(path = "web/account/account.html")]
+struct AccountTemplate<'a> {
+    username: &'a str,
+    csrf: &'a str,
+    security_keys: Vec<SecurityKeyView>,
+}
+
+#[derive(Template)]
+#[template(path = "web/account/mfa_enrollment.html")]
+struct MfaEnrollmentTemplate<'a> {
+    qr: &'a str,
+    secret: &'a str,
+    otpauth: &'a str,
+    expires_at: &'a str,
+    csrf: &'a str,
+    enrollment_token: &'a str,
+}
+
 #[derive(Deserialize)]
 pub(super) struct SecurityKeyRegistrationStart {
     csrf: String,
@@ -38,7 +67,7 @@ pub(super) async fn start_security_key_registration(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<SecurityKeyRegistrationStart>,
-) -> Result<Json<webauthn_rs::prelude::CreationChallengeResponse>> {
+) -> Result<Response> {
     let (token, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &body.csrf)?;
     let limiter_key = format!("security-key-register:{}", session.admin_id);
@@ -97,15 +126,12 @@ pub(super) async fn start_security_key_registration(
         .read()
         .expect("WebAuthn service lock poisoned")
         .clone();
-    let challenge = webauthn
-        .start_registration(&token, admin_id, &session.username, &existing)
-        .map_err(|_| {
-            AppError(
-                StatusCode::BAD_REQUEST,
-                "Sicherheitsschlüssel konnte nicht gestartet werden",
-            )
-        })?;
-    Ok(Json(challenge))
+    webauthn_start_response(webauthn.start_registration(
+        &token,
+        admin_id,
+        &session.username,
+        &existing,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -287,33 +313,26 @@ pub(super) async fn account_page(
         db.admin_webauthn_credentials(admin_id)
     })
     .await?;
-    let security_key_rows = if security_keys.is_empty() {
-        r#"<p class="vl-muted"><vl-i18n key="account.security_keys_empty"/></p>"#.to_string()
-    } else {
-        security_keys
-            .iter()
-            .map(|key| format!(
-                r#"<article class="vl-share-row"><div><strong>{}</strong><small class="vl-muted">{}</small></div><form method="post" action="/admin/account/security-keys/{}/delete" class="vl-stack"><input type="hidden" name="csrf" value="{}"><input name="current_password" type="password" maxlength="1024" autocomplete="current-password" placeholder="Passwort" required><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" placeholder="TOTP" required><button class="vl-button vl-button--danger"><vl-i18n key="common.delete"/></button></form></article>"#,
-                esc(&key.label),
-                esc(&key.created_at),
-                key.id,
-                esc(&session.csrf_token),
-            ))
-            .collect::<String>()
+    let body = AccountTemplate {
+        username: &session.username,
+        csrf: &session.csrf_token,
+        security_keys: security_keys
+            .into_iter()
+            .map(|key| SecurityKeyView {
+                id: key.id,
+                label: key.label,
+                created_at: key.created_at,
+            })
+            .collect(),
     };
-    let body = format!(
-        r#"<div class="vl-create-layout"><section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.current_user"/></p><h2>{username}</h2></div><form method="post" action="/admin/account/password" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><h2><vl-i18n key="account.change_password"/></h2><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" maxlength="1024" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.new_password"/><input name="new_password" type="password" minlength="14" maxlength="1024" autocomplete="new-password" required><small><vl-i18n key="error.password_policy"/></small></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" minlength="14" maxlength="1024" autocomplete="new-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.change_password"/></button></form></section><aside class="vl-panel vl-stack"><h2><vl-i18n key="account.change_mfa"/></h2><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><form method="post" action="/admin/account/mfa/start" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" maxlength="1024" autocomplete="current-password" required></label><label class="vl-field"><vl-i18n key="account.current_mfa_code"/><input name="current_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button class="vl-button" type="submit"><vl-i18n key="common.continue"/></button></form></aside></div><section class="vl-panel vl-stack"><h2><vl-i18n key="account.security_keys"/></h2><p class="vl-muted"><vl-i18n key="account.security_keys_help"/></p>{security_key_rows}<form class="vl-stack" data-security-key-register data-csrf="{csrf}"><label class="vl-field"><vl-i18n key="account.security_key_label"/><input name="label" maxlength="80" required></label><label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" maxlength="1024" autocomplete="current-password" required></label><button class="vl-button" type="submit"><vl-i18n key="account.security_key_add"/></button><p class="vl-muted" data-security-key-status></p></form></section>"#,
-        username = esc(&session.username),
-        csrf = esc(&session.csrf_token),
-        security_key_rows = security_key_rows,
-    );
-    Ok(Html(admin_page(
+    Ok(Html(render_admin_page(
         &state,
         PageId::Account,
         &body,
         false,
         &session.csrf_token,
-    )))
+        true,
+    )?))
 }
 
 #[derive(Deserialize)]
@@ -481,22 +500,22 @@ pub(super) async fn start_account_mfa(
         .unwrap_or(expires_at);
     let otpauth = otpauth_url(&session.username, response_secret.expose_secret());
     let qr = qr_svg(otpauth.expose_secret())?;
-    let body = format!(
-        r#"<section class="vl-panel vl-stack"><div><p class="vl-eyebrow"><vl-i18n key="account.change_mfa"/></p><h2><vl-i18n key="account.mfa_enrollment_flow"/></h2></div><p class="vl-muted"><vl-i18n key="account.old_mfa_valid"/></p><div class="vl-qr-card" aria-label="TOTP QR-Code">{qr}</div><div class="vl-secret-block"><code>{secret}</code><code>{otpauth}</code></div><p class="vl-muted"><vl-i18n key="public.valid_until"/>: {expires_at}</p><form method="post" action="/admin/account/mfa/confirm" class="vl-stack"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="enrollment_token" value="{token}"><label class="vl-field"><vl-i18n key="account.new_mfa_test_code"/><input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><div class="vl-inline-actions"><button class="vl-button" type="submit"><vl-i18n key="common.confirm"/></button><a class="vl-button vl-button--secondary" href="/admin/account"><vl-i18n key="common.cancel"/></a></div></form></section>"#,
-        qr = qr,
-        secret = esc(response_secret.expose_secret()),
-        otpauth = esc(otpauth.expose_secret()),
-        expires_at = esc(&expires_at),
-        csrf = esc(&session.csrf_token),
-        token = esc(&enrollment_token),
-    );
-    Ok(Html(admin_page_without_locale_switcher(
+    let body = MfaEnrollmentTemplate {
+        qr: &qr,
+        secret: response_secret.expose_secret(),
+        otpauth: otpauth.expose_secret(),
+        expires_at: &expires_at,
+        csrf: &session.csrf_token,
+        enrollment_token: &enrollment_token,
+    };
+    Ok(Html(render_admin_page(
         &state,
         PageId::Account,
         &body,
         false,
         &session.csrf_token,
-    )))
+        false,
+    )?))
 }
 
 #[derive(Deserialize)]

@@ -20,6 +20,7 @@ WORKDIR /work
 COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile .dockerignore ./
 COPY .github ./.github
 COPY src ./src
+COPY templates ./templates
 COPY config ./config
 COPY fuzz/Cargo.toml ./fuzz/Cargo.toml
 COPY fuzz/fuzz_targets ./fuzz/fuzz_targets

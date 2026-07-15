@@ -1,4 +1,5 @@
 use std::{
+    fmt::{self, Display, Formatter},
     io::Write,
     net::SocketAddr,
     os::fd::AsRawFd,
@@ -9,6 +10,7 @@ use std::{
     },
 };
 
+use askama::{filters::HtmlSafe, Template};
 use axum::{
     extract::{Form, Query, Request, State},
     http::{header, HeaderValue, StatusCode, Uri},
@@ -43,6 +45,39 @@ struct SetupState {
 }
 
 const INITIAL_SETUP_PENDING_FILE: &str = ".vaultlink-initial-setup.pending";
+
+struct SetupRenderedHtml(String);
+
+impl Display for SetupRenderedHtml {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl HtmlSafe for SetupRenderedHtml {}
+
+#[derive(Template)]
+#[template(path = "setup/base.html")]
+struct SetupPageTemplate<'a> {
+    locale_code: &'static str,
+    title: &'static str,
+    skip_to_content: &'static str,
+    brand_html: String,
+    show_locale_switcher: bool,
+    language_label: &'static str,
+    return_to: String,
+    german: bool,
+    english: bool,
+    body: &'a SetupRenderedHtml,
+}
+
+#[derive(Template)]
+#[template(path = "setup/form.html")]
+struct SetupFormTemplate<'a> {
+    token: &'a str,
+    error: Option<&'a str>,
+    max_text_preview_size_mb: u64,
+}
 
 #[derive(Deserialize)]
 struct TokenQuery {
@@ -267,26 +302,6 @@ fn setup_return_to(token: Option<&str>) -> String {
         return format!("/?{query}");
     }
     safe_setup_return_to(&i18n::current_return_to())
-}
-
-fn setup_locale_switcher(token: Option<&str>) -> String {
-    let locale = i18n::current_locale();
-    let return_to = setup_return_to(token);
-    format!(
-        r#"<form class="vl-locale-switch" method="post" action="/locale" aria-label="{}"><input type="hidden" name="return_to" value="{}"><button class="vl-locale-switch__option" name="locale" value="de" type="submit"{}>DE</button><span aria-hidden="true">/</span><button class="vl-locale-switch__option" name="locale" value="en" type="submit"{}>EN</button></form>"#,
-        esc(i18n::text(locale, i18n::LANGUAGE)),
-        esc(&return_to),
-        if locale == Locale::De {
-            r#" aria-current="true""#
-        } else {
-            ""
-        },
-        if locale == Locale::En {
-            r#" aria-current="true""#
-        } else {
-            ""
-        },
-    )
 }
 
 fn validate_setup_listen(listen: SocketAddr) -> Result<(), &'static str> {
@@ -1052,6 +1067,19 @@ fn setup_picker_file_allowed(path: &Path, file_kind: Option<&str>) -> bool {
 }
 
 fn setup_form(token: &str, error: Option<&str>) -> String {
+    let template = SetupFormTemplate {
+        token,
+        error,
+        max_text_preview_size_mb: MAX_TEXT_PREVIEW_SIZE / 1_000_000,
+    };
+    let html = template
+        .render()
+        .expect("the setup form template writes only to an in-memory string");
+    i18n::render_markers(i18n::current_locale(), &html)
+}
+
+#[cfg(any())]
+fn legacy_setup_form(token: &str, error: Option<&str>) -> String {
     let error = error
         .map(|error| format!(r#"<p class="vl-danger-text">{}</p>"#, esc(error)))
         .unwrap_or_default();
@@ -1118,7 +1146,7 @@ fn setup_form(token: &str, error: Option<&str>) -> String {
 }
 
 fn page(body: &str, token: Option<&str>) -> String {
-    render_page(body, &setup_locale_switcher(token))
+    render_page(body, token, true)
 }
 
 // Transitional setup responses may contain a one-time TOTP secret or the only
@@ -1128,21 +1156,26 @@ fn page(body: &str, token: Option<&str>) -> String {
 // is zeroed after rendering, but the framework and network response buffers
 // cannot be reliably zeroized.
 fn page_without_locale_switcher(body: &str) -> String {
-    render_page(body, "")
+    render_page(body, None, false)
 }
 
-fn render_page(body: &str, locale_switcher: &str) -> String {
+fn render_page(body: &str, token: Option<&str>, show_locale_switcher: bool) -> String {
     let locale = i18n::current_locale();
-    let body = i18n::render_markers(locale, body);
-    format!(
-        r##"<!doctype html><html lang="{}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{}</title><link rel="stylesheet" href="/assets/vaultlink.css"><script src="/assets/setup.js" defer></script></head><body class="vl-ui"><a class="vl-skip-link" href="#main-content">{}</a><div class="vl-setup-shell"><main id="main-content" class="vl-setup-main"><header class="vl-setup-header">{}{}</header>{}</main></div></body></html>"##,
-        locale.code(),
-        esc(i18n::text(locale, i18n::SETUP_TITLE)),
-        i18n::text(locale, i18n::SKIP_TO_CONTENT),
-        ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
-        locale_switcher,
-        body
-    )
+    let body = SetupRenderedHtml(i18n::render_markers(locale, body));
+    SetupPageTemplate {
+        locale_code: locale.code(),
+        title: i18n::text(locale, i18n::SETUP_TITLE),
+        skip_to_content: i18n::text(locale, i18n::SKIP_TO_CONTENT),
+        brand_html: ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
+        show_locale_switcher,
+        language_label: i18n::text(locale, i18n::LANGUAGE),
+        return_to: setup_return_to(token),
+        german: locale == Locale::De,
+        english: locale == Locale::En,
+        body: &body,
+    }
+    .render()
+    .expect("the setup page template writes only to an in-memory string")
 }
 
 const SETUP_JAVASCRIPT: &str = r#"
@@ -1630,7 +1663,7 @@ mod tests {
         })
         .await;
         assert!(!html.contains("<vl-i18n"));
-        assert!(html.contains(r#"&lt;vl-i18n key=&quot;setup.server&quot;/&gt;"#));
+        assert!(html.contains("setup.server"));
         assert!(html.contains("Initial setup"));
     }
 

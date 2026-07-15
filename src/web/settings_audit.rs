@@ -6,8 +6,9 @@ use axum::{
 use serde::Deserialize;
 
 use super::{
-    admin_page, display_limit_unit_floor, esc, format_audit_time, parse_unit_to_bytes, AppError,
-    PageId, Result, GB, MB,
+    common::{display_limit_unit_floor, format_audit_time, parse_unit_to_bytes},
+    rendering::{admin_page, esc, PageId, GB, MB},
+    AppError, Result,
 };
 use crate::{
     config::MAX_TEXT_PREVIEW_SIZE,

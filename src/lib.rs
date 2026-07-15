@@ -21,6 +21,8 @@ pub(crate) mod sensitive;
 pub(crate) mod services;
 pub mod setup;
 pub mod storage_mount;
+#[cfg(test)]
+mod template_policy_tests;
 pub mod ui;
 pub mod web;
 pub mod webauthn;

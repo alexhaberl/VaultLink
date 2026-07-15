@@ -24,8 +24,9 @@ use crate::{
 };
 
 use super::{
-    disk_stats, internal, join_display, preview_kind, storage_full_error, AppError,
-    DirectoryAccess, Result,
+    common::{internal, join_display, preview_kind, DirectoryAccess},
+    rendering::{disk_stats, storage_full_error},
+    AppError, Result,
 };
 
 const ZIP_CHUNK_SIZE: usize = 64 * 1024;
