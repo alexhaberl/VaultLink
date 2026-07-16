@@ -444,7 +444,7 @@ cargo run -- init-admin --config config/development.toml --username admin
 make run
 ```
 
-`make sample-data` erzeugt `dev/mount` und `dev/data`. Wenn Docker verfügbar ist, baut `make docker-smoke` einmalig das digest-gepinnte Debian-13/Rust-Testimage und führt ohne externes Containernetzwerk Setup-, API-, Load-Fixture-, Soak-Evidence- sowie isolierte Upgrade-/Rollback-Fehlertests aus. Die einzelnen Smoke-Ziele bleiben separat verfügbar. `make policy-check` prüft die Supply-Chain-Vorgaben des Projekts.
+`make sample-data` erzeugt `dev/mount` und `dev/data`. Wenn Docker verfügbar ist, baut `make docker-smoke` einmalig das digest-gepinnte Debian-13/Rust-Testimage und führt ohne externes Containernetzwerk Setup-, API-, Load-Fixture-, Soak-Evidence- sowie isolierte Upgrade-/Rollback-Fehlertests aus. Die einzelnen Smoke-Ziele bleiben separat verfügbar. Der [Container-Setup-Entrypoint](docs/CONTAINER-SETUP.md) hält den VaultLink-Listener auf Loopback und veröffentlicht einen getrennten Proxy-Port ohne Setup/Serve-Portkollision. `make policy-check` prüft die Supply-Chain-Vorgaben des Projekts.
 
 ## Troubleshooting
 
