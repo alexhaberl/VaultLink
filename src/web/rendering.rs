@@ -1,9 +1,6 @@
 use std::{
     path::Path,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        OnceLock,
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use axum::{
@@ -11,7 +8,6 @@ use axum::{
     http::{header, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
 };
-use base64::Engine as _;
 use serde::Deserialize;
 
 use super::{common::internal, AppError, Result};
@@ -118,14 +114,10 @@ pub(super) async fn favicon_svg() -> impl IntoResponse {
 }
 
 pub(super) async fn favicon_png() -> impl IntoResponse {
-    const PNG_32X32_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAJYSURBVFhH7ZZPaBNBFMZzFDwUBD0IYr0IIi2Ih4ho6ElysFAotUUsPQiBBrzUglcppIdSaSG99FKKgoEWhGLpQbGEFkXBEggihKTaokhJMNA/YG5Pvl1edjJvs5ndLHrJ4UeYtzPvffO9mc1GTp25TP+TiB7413QEBBbQ1X2Tekdm6c7UJ+sXY32OCb4FXLz1kGKT63Q/QwLE8Vxf44WRAN7twMJPUdQNzDN1xVOA125NaeVKUwHXRtMiWTsgn14jsIAnG0SZnEPqnZyjE4qAiXWivd9Ex38kiM9tycKhCXj6lqh8JAvrpN/L4qEI+HrgFNks2W1A/NEa0WqeqHpiP8MvnApVwEzWKf6mIJMD2G/NqRF9+C6ftyVg7YsjYPyVTM4UK81b4VsAXiS8GLvmxGMrduzuswLdfvy6DsZoC7cCcJsCCTh7JV5fjKvGSdEOxFC0O5aogzHiarvgHOe4EH0gangKAP3zu9Zi2M5JcROwMzcHuFixbM/F1cR4cLEichsJUM+B6sJ+tbG/Ojs/7HkQgvGN5EuR20iA2gaQLclW6OAK8jn4uG/HmtnfUgDgNgC0gpOjFforGMXZfhbpZb+RAPU2gOefnQJsMyxn25n8L3t+NLEscvoSAPDVo4pQz4Mb29/s6wr3Tp/rEfl8C8CHBaxUReAVjGuGnaMdAO8L/kMaWjq0zpCeS8dIADh//R4Nv6g1iPDiUl9S5HDDWAC4OpgShdxo1XcVXwIADmUzJxDHc32NF74FAPQ2Pp1rKI6xSc91AglgsFscNr+7VmlLQBh0BPwFr0PNxBrwyt4AAAAASUVORK5CYII=";
-    static PNG_32X32: OnceLock<Vec<u8>> = OnceLock::new();
-    let png = PNG_32X32.get_or_init(|| {
-        base64::engine::general_purpose::STANDARD
-            .decode(PNG_32X32_BASE64)
-            .expect("embedded 32x32 favicon must be valid base64")
-    });
-    ([(header::CONTENT_TYPE, "image/png")], png.as_slice())
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        crate::ui::FAVICON_PNG,
+    )
 }
 
 pub(super) const LOGO_SVG: &str = crate::ui::LOGO_SVG;
