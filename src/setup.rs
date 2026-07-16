@@ -174,6 +174,9 @@ fn setup_router(state: SetupState) -> Router {
         .route("/mounts", get(setup_mounts))
         .route("/assets/vaultlink.css", get(stylesheet_asset))
         .route("/assets/setup.js", get(setup_javascript_asset))
+        .route("/assets/favicon.svg", get(setup_favicon_svg))
+        .route("/assets/favicon-32.png", get(setup_favicon_png))
+        .route("/favicon.ico", get(setup_favicon_png))
         .layer(middleware::from_fn(setup_security_headers))
         .layer(middleware::from_fn(setup_locale_context))
         .with_state(state)
@@ -184,6 +187,17 @@ async fn stylesheet_asset() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         ui::STYLESHEET,
     )
+}
+
+async fn setup_favicon_svg() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        ui::LOGO_SVG,
+    )
+}
+
+async fn setup_favicon_png() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], ui::FAVICON_PNG)
 }
 
 async fn setup_javascript_asset() -> impl IntoResponse {
@@ -1686,6 +1700,8 @@ mod tests {
         })
         .await;
         assert!(html.contains("VaultLink<small>Secure file sharing</small>"));
+        assert!(html.contains(r#"href="/assets/favicon.svg""#));
+        assert!(html.contains(r#"href="/assets/favicon-32.png""#));
         assert!(html.contains(r#"<html lang="de">"#));
         assert!(html.contains("Ersteinrichtung"));
         assert!(
@@ -1965,6 +1981,33 @@ mod tests {
         assert!(german.contains("Verzeichnis kann nicht gelesen werden."));
         assert!(german.contains("Datei auswählen"));
         assert!(!german.contains("<vl-i18n"));
+    }
+
+    #[tokio::test]
+    async fn setup_serves_the_shared_logo_favicons() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let app = setup_router(test_setup_state(config_dir.path().join("config.toml")));
+
+        let svg = app
+            .clone()
+            .oneshot(request(Method::GET, "/assets/favicon.svg", ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            svg.headers()[header::CONTENT_TYPE],
+            "image/svg+xml; charset=utf-8"
+        );
+        assert_eq!(response_text(svg).await, ui::LOGO_SVG);
+
+        let png = app
+            .oneshot(request(Method::GET, "/assets/favicon-32.png", ""))
+            .await
+            .unwrap();
+        assert_eq!(png.headers()[header::CONTENT_TYPE], "image/png");
+        let bytes = axum::body::to_bytes(png.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), ui::FAVICON_PNG);
     }
 
     #[tokio::test]

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="VaultLink">
+  <defs>
+    <linearGradient id="vl-file-front" x1="8" y1="6" x2="38" y2="54" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2f8cff"/>
+      <stop offset="1" stop-color="#159dff"/>
+    </linearGradient>
+    <linearGradient id="vl-file-back" x1="32" y1="20" x2="57" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6f5cf6"/>
+      <stop offset="1" stop-color="#5b52f2"/>
+    </linearGradient>
+    <linearGradient id="vl-file-fold" x1="38" y1="6" x2="48" y2="17" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#37a2ff"/>
+      <stop offset="1" stop-color="#168cff"/>
+    </linearGradient>
+  </defs>
+  <path d="M10 5h25v46H10a5 5 0 0 1-5-5V10a5 5 0 0 1 5-5Z" fill="url(#vl-file-front)"/>
+  <path d="M33 20h13l12 12v21a6 6 0 0 1-6 6H33V20Z" fill="url(#vl-file-back)"/>
+  <path d="M38 6.2 48.8 17H41a3 3 0 0 1-3-3V6.2Z" fill="url(#vl-file-fold)"/>
+  <path d="M32 18.5c4 2.6 7.7 4.2 12 5.2v4.7c0 6.9-4.6 12.2-12 15.4-7.4-3.2-12-8.5-12-15.4v-4.7c4.3-1 8-2.6 12-5.2Z" fill="#081226"/>
+</svg>

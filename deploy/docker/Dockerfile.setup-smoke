@@ -17,6 +17,7 @@ COPY README.md SECURITY.md CHANGELOG.md ./
 COPY .github ./.github
 COPY src ./src
 COPY templates ./templates
+COPY assets ./assets
 COPY config ./config
 COPY docs ./docs
 COPY fuzz/Cargo.toml ./fuzz/Cargo.toml

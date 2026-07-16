@@ -1485,8 +1485,9 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
 })();
 "#;
 
-/// Standalone VaultLink shield/link mark.
-pub const LOGO_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="VaultLink"><defs><linearGradient id="vl-logo-g" x1="9" y1="7" x2="55" y2="59" gradientUnits="userSpaceOnUse"><stop stop-color="#5aa7ff"/><stop offset="1" stop-color="#7c5cff"/></linearGradient><filter id="vl-logo-s" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="6" stdDeviation="5" flood-color="#193b8f" flood-opacity=".35"/></filter></defs><rect width="64" height="64" rx="18" fill="#081226"/><path filter="url(#vl-logo-s)" d="M32 7 51 15v15c0 13-7.8 22.8-19 27-11.2-4.2-19-14-19-27V15L32 7Z" fill="url(#vl-logo-g)"/><path d="M24.4 36.7a7.5 7.5 0 0 1 0-10.6l4.1-4.1a7.5 7.5 0 0 1 10.6 0 2.8 2.8 0 0 1-4 4 1.9 1.9 0 0 0-2.7 0l-4.1 4.1a1.9 1.9 0 0 0 2.7 2.7 2.8 2.8 0 0 1 4 4 7.5 7.5 0 0 1-10.6-.1Z" fill="#f3f7ff"/><path d="M28.8 42a2.8 2.8 0 0 1 0-4 1.9 1.9 0 0 0 2.7 0l4.1-4.1a1.9 1.9 0 0 0-2.7-2.7 2.8 2.8 0 1 1-4-4 7.5 7.5 0 0 1 10.6 10.7L35.4 42a7.5 7.5 0 0 1-10.6 0Z" fill="#dbeafe" opacity=".95"/><path d="M27 32h10" stroke="#081226" stroke-width="4.2" stroke-linecap="round" opacity=".45"/></svg>"##;
+/// Standalone VaultLink file/shield mark shared by every rendered surface.
+pub const LOGO_SVG: &str = include_str!("../assets/branding/vaultlink-logo.svg");
+pub const FAVICON_PNG: &[u8] = include_bytes!("../assets/branding/favicon-32.png");
 
 /// Icons available to server-rendered UI helpers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1667,6 +1668,15 @@ mod tests {
         assert!(nav.contains(r#"aria-current="page""#));
         assert!(nav.contains("&quot;bad&quot;"));
         assert!(nav.contains("&lt;Dateien&gt;"));
+    }
+
+    #[test]
+    fn shared_brand_assets_use_the_background_free_file_shield() {
+        assert!(LOGO_SVG.contains("vl-file-front"));
+        assert!(LOGO_SVG.contains("vl-file-back"));
+        assert!(LOGO_SVG.contains(r##"fill="#081226""##));
+        assert!(!LOGO_SVG.contains("<rect"));
+        assert_eq!(&FAVICON_PNG[..8], b"\x89PNG\r\n\x1a\n");
     }
 
     #[test]

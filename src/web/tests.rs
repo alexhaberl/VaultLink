@@ -4300,6 +4300,8 @@ async fn admin_ui_creates_admin_and_updates_runtime_settings() {
     assert!(!login_page.contains("Link erstellen"));
     assert!(login_page.contains("vl-brand"));
     assert!(login_page.contains("<svg"));
+    assert!(login_page.contains("vl-file-front"));
+    assert!(!login_page.contains("vl-logo-g"));
 
     let mut create_admin = request(
             Method::POST,
