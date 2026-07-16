@@ -45,7 +45,7 @@ containing all four architecture-specific release inputs, verify before
 extraction:
 
 ```sh
-version=0.4.3
+version=0.5.0
 case "$(uname -m)" in
     x86_64) arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
@@ -61,7 +61,7 @@ sha256sum -c "$checksums"
 ```
 
 ```sh
-expected_version=0.4.3
+expected_version=0.5.0
 response=$(curl --disable --silent --show-error --noproxy '*' --proto '=https' \
     --connect-timeout 5 --max-time 15 --header 'Accept: application/json' \
     --output - --write-out '\n%{http_code}' \
@@ -76,9 +76,9 @@ Schema migrations run in one SQLite transaction. A database with a schema newer 
 
 Candidate configurations must use `share_password_max_length`; the deprecated TOML name `share_password_max_bytes` is rejected before downtime. Schema 12 renames the same legacy key in `runtime_settings` automatically. If both persisted names exist, the canonical value wins.
 
-The omission defaults for `storage.internal_directory`, `storage.require_mount`, and `storage.external_writers` remain available only to development configurations throughout the 0.4.x line. They are scheduled for removal in 0.5.0. Before that release, every development configuration must be rewritten with explicit values. Production configurations already require an explicit mount identity and fail closed.
+VaultLink 0.5.0 removes the omission defaults for `storage.internal_directory`, `storage.require_mount`, and `storage.external_writers`. Every candidate configuration, including development, must contain all three fields. For development, set `internal_directory` explicitly to `<root_mount_path>/.vaultlink-internal`, normally with `require_mount = false` and `external_writers = false`.
 
-Removing those storage defaults safely requires a breaking-format preflight in the 0.5.0 upgrade tooling: validate an explicit candidate configuration with the candidate binary before downtime, refuse to infer an internal directory or mount policy from the filesystem, retain the old configuration in the verified rollback triple, and add upgrade/rollback tests for missing, false, and fully explicit policies. This is intentionally not an in-place automatic rewrite because choosing the wrong storage boundary can expose staging data to co-writers.
+The upgrade script validates the candidate binary/configuration pair as `vaultlink` before downtime and rejects a missing or inconsistent storage boundary. It never infers the internal directory or mount policy from the filesystem and never rewrites the live configuration. The old explicit configuration remains part of the verified rollback triple. This fail-closed preflight is intentional because choosing the wrong storage boundary can expose staging data to co-writers.
 
 If staging or Binary/Config pairing fails, the service is never stopped and the live configuration is unchanged. If backup or integrity validation fails after the stop, the incomplete backup is removed and a previously active service is restarted with the unchanged installation. If alias migration, activation, startup, local readiness, or the post-start database check fails, the script restores the verified old Binary/Config/SQLite triple and checks it against the old readiness target. A successful automatic restore removes any now-stale alias mapping. If automatic restore itself fails, the protected mapping is retained because it may be required to inspect or recover a partially activated installation. A `CRITICAL` message means automatic recovery itself failed and the reported backup path must be used manually.
 
@@ -86,7 +86,7 @@ The three live files reside on different filesystems and cannot be committed by 
 
 ### Local readiness gate
 
-The automatic rollback decision uses only a direct request to the local VaultLink listener. It retries for up to 30 attempts within an overall 60-second budget, with a one-second interval, a two-second connect timeout, and a three-second total timeout per request. Responses are capped at 4 KiB. Success requires HTTP 200 and the candidate's exact compact response, for example `{"ok":true,"version":"0.4.3"}`. A delayed listener is retried; HTTP 500, malformed JSON, a wrong version, oversized responses, and transport timeouts fail the gate.
+The automatic rollback decision uses only a direct request to the local VaultLink listener. It retries for up to 30 attempts within an overall 60-second budget, with a one-second interval, a two-second connect timeout, and a three-second total timeout per request. Responses are capped at 4 KiB. Success requires HTTP 200 and the candidate's exact compact response, for example `{"ok":true,"version":"0.5.0"}`. A delayed listener is retried; HTTP 500, malformed JSON, a wrong version, oversized responses, and transport timeouts fail the gate.
 
 In reverse-proxy mode the request goes directly to local HTTP. In standalone-TLS mode curl keeps the public hostname for the TLS SNI value but uses `--connect-to` to reach the local listener, `--noproxy '*'` to bypass proxy environment variables, and `--insecure` for this local application gate only. Public DNS, proxy routing, certificate trust, and certificate expiry therefore cannot trigger a database rollback.
 

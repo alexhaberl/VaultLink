@@ -187,12 +187,8 @@ pub(super) async fn list_audit(
     session(&state, &headers, true, MissingSession::Unauthorized).await?;
     let page = query.page.unwrap_or(0).min(1_000_000);
     let action = query.action.filter(|value| !value.trim().is_empty());
-    let runtime = state.runtime.clone();
+    let client_ip_enabled = runtime_settings(&state).audit_client_ip_enabled;
     let (client_ip_enabled, events) = database(state.db.clone(), move |db| {
-        let client_ip_enabled = runtime
-            .read()
-            .map(|settings| settings.audit_client_ip_enabled)
-            .unwrap_or(false);
         let events = db.list_audit(action.as_deref(), 101, page * 100)?;
         Ok((client_ip_enabled, events))
     })

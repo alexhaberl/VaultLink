@@ -89,7 +89,9 @@ mod tests {
             storage: Storage {
                 root_mount_path: PathBuf::from("."),
                 data_directory: PathBuf::from("."),
-                internal_directory: None,
+                internal_directory: Some(
+                    PathBuf::from(".").join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME),
+                ),
                 require_mount: false,
                 external_writers: false,
                 expected_filesystem_type: None,

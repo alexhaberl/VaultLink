@@ -1,0 +1,40 @@
+[Unit]
+Description=VaultLink 72-hour soak for commit %i
+Requires=vaultlink.service
+After=vaultlink.service network-online.target
+ConditionPathExists=/var/lib/vaultlink-soak/%i/unit.env
+
+[Service]
+Type=exec
+User=root
+Group=github-runner
+EnvironmentFile=/etc/vaultlink/soak.env
+EnvironmentFile=/var/lib/vaultlink-soak/%i/unit.env
+ExecStart=/usr/local/libexec/vaultlink/soak-monitor.sh
+TimeoutStartSec=infinity
+Restart=no
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateIPC=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/vaultlink-soak
+ReadOnlyPaths=/etc/vaultlink /var/lib/vaultlink /opt/vaultlink
+
+[Install]
+WantedBy=multi-user.target

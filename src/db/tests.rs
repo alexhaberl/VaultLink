@@ -1,6 +1,125 @@
 use super::*;
 
 #[test]
+fn live_mfa_session_operation_linearizes_with_session_revocation() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    database
+        .create_session("live-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    assert!(database.verify_mfa("live-session").unwrap());
+
+    let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let publishing_database = database.clone();
+    let publisher = std::thread::spawn(move || {
+        publishing_database
+            .with_live_mfa_session("live-session", 1, || {
+                entered_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                "published"
+            })
+            .unwrap()
+    });
+    entered_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+
+    let (revocation_started_sender, revocation_started_receiver) = std::sync::mpsc::channel();
+    let (revoked_sender, revoked_receiver) = std::sync::mpsc::channel();
+    let revoking_database = database.clone();
+    let revoker = std::thread::spawn(move || {
+        revocation_started_sender.send(()).unwrap();
+        revoking_database.delete_session("live-session").unwrap();
+        revoked_sender.send(()).unwrap();
+    });
+    revocation_started_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    assert!(revoked_receiver
+        .recv_timeout(std::time::Duration::from_millis(25))
+        .is_err());
+
+    release_sender.send(()).unwrap();
+    assert_eq!(publisher.join().unwrap(), Some("published"));
+    revoked_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    revoker.join().unwrap();
+
+    let ran_after_revocation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marker = ran_after_revocation.clone();
+    assert_eq!(
+        database
+            .with_live_mfa_session("live-session", 1, || {
+                marker.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .unwrap(),
+        None
+    );
+    assert!(!ran_after_revocation.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn poisoned_database_lock_rolls_back_before_reuse() {
+    let db = Database::open(":memory:").unwrap();
+    db.create_admin("admin", "old-hash", "secret").unwrap();
+    let poisoned = db.clone();
+    let panic = std::panic::catch_unwind(move || {
+        let connection = poisoned.0.connection.lock().unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        connection
+            .execute(
+                "UPDATE admins SET password_hash='uncommitted' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        panic!("inject database lock poisoning");
+    });
+    assert!(panic.is_err());
+    assert!(db.0.connection.is_poisoned());
+
+    assert_eq!(
+        db.admin("admin").unwrap().unwrap().password_hash,
+        "old-hash"
+    );
+    assert!(!db.0.connection.is_poisoned());
+}
+
+#[test]
+fn failed_poison_rollback_is_fail_closed_and_retried() {
+    let db = Database::open(":memory:").unwrap();
+    db.create_admin("admin", "old-hash", "secret").unwrap();
+    let poisoned = db.clone();
+    let panic = std::panic::catch_unwind(move || {
+        let connection = poisoned.0.connection.lock().unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        connection
+            .execute(
+                "UPDATE admins SET password_hash='uncommitted' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        panic!("inject database lock poisoning");
+    });
+    assert!(panic.is_err());
+    db.0.fail_next_poison_rollback
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let error = db
+        .admin("admin")
+        .expect_err("failed normalization must not expose the connection");
+    assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
+    assert!(db.0.connection.is_poisoned());
+
+    assert_eq!(
+        db.admin("admin").unwrap().unwrap().password_hash,
+        "old-hash"
+    );
+    assert!(!db.0.connection.is_poisoned());
+}
+
+#[test]
 fn required_audit_failure_rolls_back_admin_share_session_and_settings_mutations() {
     let db = Database::open(":memory:").unwrap();
     db.create_admin("admin", "old-hash", "secret").unwrap();

@@ -61,11 +61,12 @@ pub struct Server {
 pub struct Storage {
     pub root_mount_path: PathBuf,
     pub data_directory: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        deserialize_with = "deserialize_required_internal_directory",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub internal_directory: Option<PathBuf>,
-    #[serde(default)]
     pub require_mount: bool,
-    #[serde(default)]
     pub external_writers: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_filesystem_type: Option<String>,
@@ -93,6 +94,15 @@ pub struct Storage {
     pub max_media_preview_size: u64,
     #[serde(default)]
     pub blocked_extensions: Vec<String>,
+}
+
+fn deserialize_required_internal_directory<'de, D>(
+    deserializer: D,
+) -> Result<Option<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    PathBuf::deserialize(deserializer).map(Some)
 }
 
 fn default_upload_size() -> u64 {
@@ -575,6 +585,12 @@ impl Config {
 }
 
 fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(), ConfigError> {
+    let internal_directory = storage.internal_directory.as_deref().ok_or_else(|| {
+        ConfigError::Invalid(
+            "storage.internal_directory must be configured explicitly; VaultLink 0.5.0 no longer infers a private storage boundary"
+                .into(),
+        )
+    })?;
     if production_mode && !storage.require_mount {
         return Err(ConfigError::Invalid(
             "production_mode=true requires require_mount=true and an explicit fail-closed mount identity"
@@ -591,32 +607,25 @@ fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(),
         let canonical_lock_domain = storage
             .root_mount_path
             .join(DEFAULT_INTERNAL_DIRECTORY_NAME);
-        if storage
-            .internal_directory
-            .as_ref()
-            .is_some_and(|internal| internal != &canonical_lock_domain)
-        {
+        if internal_directory != canonical_lock_domain {
             return Err(ConfigError::Invalid(format!(
-                "internal_directory must be omitted or use the canonical development lock domain {}",
+                "internal_directory must explicitly use the canonical development lock domain {}",
                 canonical_lock_domain.display()
             )));
         }
     }
-    if let Some(internal) = &storage.internal_directory {
-        if storage.require_mount && !internal.is_absolute() {
-            return Err(ConfigError::Invalid(
-                "require_mount=true requires an absolute internal_directory".into(),
-            ));
-        }
-        if storage.require_mount
-            && (internal.starts_with(&storage.root_mount_path)
-                || storage.root_mount_path.starts_with(internal))
-        {
-            return Err(ConfigError::Invalid(
-                "internal_directory must be a sibling outside the user-visible root_mount_path"
-                    .into(),
-            ));
-        }
+    if storage.require_mount && !internal_directory.is_absolute() {
+        return Err(ConfigError::Invalid(
+            "require_mount=true requires an absolute internal_directory".into(),
+        ));
+    }
+    if storage.require_mount
+        && (internal_directory.starts_with(&storage.root_mount_path)
+            || storage.root_mount_path.starts_with(internal_directory))
+    {
+        return Err(ConfigError::Invalid(
+            "internal_directory must be a sibling outside the user-visible root_mount_path".into(),
+        ));
     }
     if !storage.require_mount {
         if storage.expected_filesystem_type.is_some() || storage.expected_mount_source.is_some() {
@@ -633,12 +642,6 @@ fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(),
             "require_mount=true requires absolute root_mount_path and data_directory paths".into(),
         ));
     }
-    let internal_directory = storage.internal_directory.as_deref().ok_or_else(|| {
-        ConfigError::Invalid(
-            "require_mount=true requires a pre-provisioned internal_directory outside root_mount_path"
-                .into(),
-        )
-    })?;
     let canonical_lock_domain = storage
         .root_mount_path
         .parent()
@@ -849,7 +852,7 @@ mod tests {
             storage: Storage {
                 root_mount_path: ".".into(),
                 data_directory: ".".into(),
-                internal_directory: None,
+                internal_directory: Some(PathBuf::from(".").join(DEFAULT_INTERNAL_DIRECTORY_NAME)),
                 require_mount: false,
                 external_writers: false,
                 expected_filesystem_type: None,
@@ -909,24 +912,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_storage_configuration_defaults_to_no_mount_requirement() {
+    fn storage_boundary_fields_are_required_in_0_5_0() {
         let serialized = toml::to_string(&base()).unwrap();
-        let legacy = serialized
-            .lines()
-            .filter(|line| {
-                !line.starts_with("require_mount =")
-                    && !line.starts_with("external_writers =")
-                    && !line.starts_with("expected_filesystem_type =")
-                    && !line.starts_with("expected_mount_source =")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let parsed: Config = toml::from_str(&legacy).unwrap();
-        assert!(!parsed.storage.require_mount);
-        assert!(!parsed.storage.external_writers);
-        assert_eq!(parsed.storage.expected_filesystem_type, None);
-        assert_eq!(parsed.storage.expected_mount_source, None);
-        parsed.validate().unwrap();
+        for required in ["internal_directory", "require_mount", "external_writers"] {
+            let without_required = serialized
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{required} =")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let error = toml::from_str::<Config>(&without_required)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(required),
+                "missing {required} produced: {error}"
+            );
+        }
+
+        let mut in_memory = base();
+        in_memory.storage.internal_directory = None;
+        let error = in_memory.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.internal_directory must be configured explicitly"));
     }
 
     #[test]

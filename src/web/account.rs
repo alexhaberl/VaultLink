@@ -121,11 +121,7 @@ pub(super) async fn start_security_key_registration(
     })
     .await?;
     let existing = decode_security_keys(&rows)?;
-    let webauthn = state
-        .webauthn
-        .read()
-        .expect("WebAuthn service lock poisoned")
-        .clone();
+    let webauthn = crate::http_auth::webauthn_service(&state)?;
     webauthn_start_response(webauthn.start_registration(
         &token,
         admin_id,
@@ -156,11 +152,7 @@ pub(super) async fn finish_security_key_registration(
         ));
     }
     let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
-    let webauthn = state
-        .webauthn
-        .read()
-        .expect("WebAuthn service lock poisoned")
-        .clone();
+    let webauthn = crate::http_auth::webauthn_service(&state)?;
     let key = webauthn
         .finish_registration(&token, session.admin_id, &body.credential)
         .map_err(|_| {

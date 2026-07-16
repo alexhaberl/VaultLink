@@ -61,18 +61,36 @@ struct ConnectionPermit {
     _global: OwnedSemaphorePermit,
     peer_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
     peer: IpAddr,
+    maximum: usize,
 }
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
-        let Ok(mut peers) = self.peer_connections.lock() else {
-            return;
-        };
+        let mut peers = connection_counts(&self.peer_connections, self.maximum);
         if let Some(count) = peers.get_mut(&self.peer) {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 peers.remove(&self.peer);
             }
+        }
+    }
+}
+
+fn connection_counts(
+    counts: &Mutex<HashMap<IpAddr, usize>>,
+    maximum: usize,
+) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
+    match counts.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!("recovering poisoned connection limiter mutex");
+            let mut guard = poisoned.into_inner();
+            guard.retain(|_, count| {
+                *count = (*count).min(maximum);
+                *count > 0
+            });
+            counts.clear_poison();
+            guard
         }
     }
 }
@@ -250,14 +268,7 @@ where
             }
         };
         {
-            let mut peers = match self.peer_connections.lock() {
-                Ok(peers) => peers,
-                Err(_) => {
-                    return Box::pin(async {
-                        Err(io::Error::other("connection limiter lock poisoned"))
-                    });
-                }
-            };
+            let mut peers = connection_counts(&self.peer_connections, max_connections_per_peer);
             let count = peers.entry(peer).or_default();
             if *count >= max_connections_per_peer {
                 return Box::pin(async {
@@ -273,6 +284,7 @@ where
             _global: permit,
             peer_connections: self.peer_connections.clone(),
             peer,
+            maximum: max_connections_per_peer,
         };
         let future = self.inner.accept(stream, service);
         let accept_timeout = self.accept_timeout;
@@ -374,13 +386,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let state = AppState::new(config.clone())?;
     vaultlink::file_ops::recover_pending_file_operations(&state).await?;
-    let effective_public_base_url = state
-        .runtime
-        .read()
-        .map_err(|_| io::Error::other("runtime settings lock poisoned"))?
-        .public_base_url
-        .clone();
-    start_upload_fragment_cleanup(&state);
+    let effective_public_base_url = vaultlink::http_auth::runtime_settings(&state).public_base_url;
+    let cleanup_coordinator = state.storage_cleanup.clone();
+    let cleanup_worker = cleanup_coordinator.start_worker(state.secure_root.clone())?;
     let addr: std::net::SocketAddr = config.server.listen_address.parse()?;
     let trusted_proxy_peers = if config.server.mode == ServerMode::ReverseProxy {
         Some(Arc::new(
@@ -397,65 +405,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = web::router(state);
     tracing::info!(%addr,mode=?config.server.mode,"VaultLink starting");
-    match config.server.mode {
-        ServerMode::StandaloneTls => match config.tls.certificate_source {
-            CertificateSource::Files => {
-                let tls =
-                    load_http1_rustls_config(&config.tls.cert_file, &config.tls.key_file).await?;
-                install_sighup_handler_for_files(&config, tls.clone());
-                let handle = axum_server::Handle::new();
-                install_server_shutdown(handle.clone());
-                // HTTP/2 can retain an already-buffered DATA frame without polling
-                // the response Body again when peer flow-control is zero. That
-                // bypasses Body deadlines and can pin ZIP/memory permits forever.
-                // HTTP/1.1 plus the socket write-idle timeout gives every response
-                // an independently enforceable progress boundary.
-                let mut server = axum_server::bind_rustls(addr, tls)
-                    .map(|acceptor| {
-                        ConnectionLimitAcceptor::new(acceptor, trusted_proxy_peers.clone())
-                    })
-                    .http1_only();
-                harden_http_server(&mut server);
-                server
-                    .handle(handle)
-                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                    .await?;
-            }
-            CertificateSource::LetsEncrypt => {
-                install_noop_sighup_handler("ACME manages certificate renewal internally");
-                let public_url = url::Url::parse(&effective_public_base_url)?;
-                let domain = public_url
-                    .host_str()
-                    .ok_or("public_base_url must contain a DNS host")?
-                    .to_string();
-                let cache_dir = config::letsencrypt_cache_dir(&config.storage, &config.tls)?;
-                std::fs::create_dir_all(&cache_dir)?;
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700))?;
-                let contact = format!("mailto:{}", config.tls.letsencrypt_contact_email);
-                let mut acme_state = rustls_acme::AcmeConfig::new([domain.clone()])
-                    .contact_push(contact)
-                    .cache(rustls_acme::caches::DirCache::new(cache_dir))
-                    .directory_lets_encrypt(!config.tls.letsencrypt_staging)
-                    .state();
-                let acceptor = acme_state.axum_acceptor(acme_state.default_rustls_config());
-                tokio::spawn(async move {
-                    while let Some(event) = acme_state.next().await {
-                        match event {
-                            Ok(event) => tracing::info!(?event, "ACME event"),
-                            Err(error) => tracing::error!(?error, "ACME error"),
+    let server_result = async {
+        match config.server.mode {
+            ServerMode::StandaloneTls => match config.tls.certificate_source {
+                CertificateSource::Files => {
+                    let tls = load_http1_rustls_config(&config.tls.cert_file, &config.tls.key_file)
+                        .await?;
+                    install_sighup_handler_for_files(&config, tls.clone());
+                    let handle = axum_server::Handle::new();
+                    install_server_shutdown(handle.clone(), cleanup_coordinator.clone());
+                    // HTTP/2 can retain an already-buffered DATA frame without polling
+                    // the response Body again when peer flow-control is zero. That
+                    // bypasses Body deadlines and can pin ZIP/memory permits forever.
+                    // HTTP/1.1 plus the socket write-idle timeout gives every response
+                    // an independently enforceable progress boundary.
+                    let mut server = axum_server::bind_rustls(addr, tls)
+                        .map(|acceptor| {
+                            ConnectionLimitAcceptor::new(acceptor, trusted_proxy_peers.clone())
+                        })
+                        .http1_only();
+                    harden_http_server(&mut server);
+                    server
+                        .handle(handle)
+                        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                        .await?;
+                }
+                CertificateSource::LetsEncrypt => {
+                    install_noop_sighup_handler("ACME manages certificate renewal internally");
+                    let public_url = url::Url::parse(&effective_public_base_url)?;
+                    let domain = public_url
+                        .host_str()
+                        .ok_or("public_base_url must contain a DNS host")?
+                        .to_string();
+                    let cache_dir = config::letsencrypt_cache_dir(&config.storage, &config.tls)?;
+                    std::fs::create_dir_all(&cache_dir)?;
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700))?;
+                    let contact = format!("mailto:{}", config.tls.letsencrypt_contact_email);
+                    let mut acme_state = rustls_acme::AcmeConfig::new([domain.clone()])
+                        .contact_push(contact)
+                        .cache(rustls_acme::caches::DirCache::new(cache_dir))
+                        .directory_lets_encrypt(!config.tls.letsencrypt_staging)
+                        .state();
+                    let acceptor = acme_state.axum_acceptor(acme_state.default_rustls_config());
+                    tokio::spawn(async move {
+                        while let Some(event) = acme_state.next().await {
+                            match event {
+                                Ok(event) => tracing::info!(?event, "ACME event"),
+                                Err(error) => tracing::error!(?error, "ACME error"),
+                            }
                         }
-                    }
-                });
-                tracing::info!(
-                    %domain,
-                    staging = config.tls.letsencrypt_staging,
-                    "Standalone TLS uses Let's Encrypt ACME tls-alpn-01"
-                );
+                    });
+                    tracing::info!(
+                        %domain,
+                        staging = config.tls.letsencrypt_staging,
+                        "Standalone TLS uses Let's Encrypt ACME tls-alpn-01"
+                    );
+                    let handle = axum_server::Handle::new();
+                    install_server_shutdown(handle.clone(), cleanup_coordinator.clone());
+                    let mut server = axum_server::bind(addr)
+                        .acceptor(acceptor)
+                        .map(|acceptor| {
+                            ConnectionLimitAcceptor::new(acceptor, trusted_proxy_peers.clone())
+                        })
+                        .http1_only();
+                    harden_http_server(&mut server);
+                    server
+                        .handle(handle)
+                        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                        .await?;
+                }
+            },
+            _ => {
+                install_noop_sighup_handler("no reloadable TLS configuration in this mode");
                 let handle = axum_server::Handle::new();
-                install_server_shutdown(handle.clone());
+                install_server_shutdown(handle.clone(), cleanup_coordinator.clone());
                 let mut server = axum_server::bind(addr)
-                    .acceptor(acceptor)
                     .map(|acceptor| {
                         ConnectionLimitAcceptor::new(acceptor, trusted_proxy_peers.clone())
                     })
@@ -466,22 +491,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
             }
-        },
-        _ => {
-            install_noop_sighup_handler("no reloadable TLS configuration in this mode");
-            let handle = axum_server::Handle::new();
-            install_server_shutdown(handle.clone());
-            let mut server = axum_server::bind(addr)
-                .map(|acceptor| ConnectionLimitAcceptor::new(acceptor, trusted_proxy_peers.clone()))
-                .http1_only();
-            harden_http_server(&mut server);
-            server
-                .handle(handle)
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await?;
         }
+        Ok::<(), Box<dyn std::error::Error>>(())
     }
-    Ok(())
+    .await;
+    cleanup_worker.shutdown().await?;
+    server_result
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -787,87 +802,14 @@ fn validate_admin_password(password: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn start_upload_fragment_cleanup(state: &AppState) {
-    const CLEANUP_BATCH_ENTRIES: usize = 4096;
-    const CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(30);
-
-    let secure_root = state.secure_root.clone();
-    let cleanup_lock = state.storage_cleanup.clone();
-    tokio::spawn(async move {
-        loop {
-            let cleanup_guard = cleanup_lock.clone().lock_owned().await;
-            let start_root = secure_root.clone();
-            let (mut cleanup_guard, mut cleanup) = match tokio::task::spawn_blocking(move || {
-                let cleanup = start_root.start_upload_fragment_cleanup();
-                (cleanup_guard, cleanup)
-            })
-            .await
-            {
-                Ok((cleanup_guard, Ok(cleanup))) => (cleanup_guard, cleanup),
-                Ok((_cleanup_guard, Err(error))) => {
-                    tracing::warn!(%error, "could not start stale upload fragment cleanup; retrying");
-                    tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "stale upload fragment cleanup start task failed; retrying");
-                    tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
-                    continue;
-                }
-            };
-            let mut scanned = 0usize;
-            let mut removed = 0usize;
-            let mut failed = 0usize;
-            let retry = loop {
-                let result = tokio::task::spawn_blocking(move || {
-                    let batch = cleanup.run_batch(CLEANUP_BATCH_ENTRIES);
-                    (cleanup, cleanup_guard, batch)
-                })
-                .await;
-                let (next_cleanup, next_guard, batch) = match result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        tracing::warn!(%error, "stale upload fragment cleanup task failed; retrying");
-                        break true;
-                    }
-                };
-                cleanup = next_cleanup;
-                cleanup_guard = next_guard;
-                let batch = match batch {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not continue stale upload fragment cleanup; retrying");
-                        break true;
-                    }
-                };
-                scanned = scanned.saturating_add(batch.scanned);
-                removed = removed.saturating_add(batch.removed);
-                failed = failed.saturating_add(batch.failed);
-                if batch.complete {
-                    if removed > 0 || failed > 0 {
-                        tracing::info!(
-                            scanned,
-                            removed,
-                            failed,
-                            "stale upload fragment cleanup completed"
-                        );
-                    }
-                    break failed > 0;
-                }
-                tokio::task::yield_now().await;
-            };
-            if !retry {
-                return;
-            }
-            tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
-        }
-    });
-}
-
-fn install_server_shutdown(handle: axum_server::Handle<std::net::SocketAddr>) {
+fn install_server_shutdown(
+    handle: axum_server::Handle<std::net::SocketAddr>,
+    cleanup: vaultlink::storage_cleanup::StorageCleanupCoordinator,
+) {
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!("shutdown signal received; draining active connections");
+        cleanup.request_shutdown();
         handle.graceful_shutdown(Some(std::time::Duration::from_secs(25)));
     });
 }
@@ -950,6 +892,28 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_limiter_recovers_after_lock_poisoning() {
+        let peer = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let zero_peer = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let counts = Arc::new(Mutex::new(HashMap::from([
+            (peer, usize::MAX),
+            (zero_peer, 0usize),
+        ])));
+        let poisoned = counts.clone();
+        assert!(std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("inject connection limiter poisoning");
+        })
+        .is_err());
+
+        let recovered = connection_counts(&counts, 8);
+        assert_eq!(recovered.get(&peer), Some(&8));
+        assert!(!recovered.contains_key(&zero_peer));
+        drop(recovered);
+        assert!(!counts.is_poisoned());
+    }
 
     #[derive(Clone)]
     struct PendingAcceptor;
@@ -1357,6 +1321,7 @@ mod tests {
                 _global: global,
                 peer_connections,
                 peer,
+                maximum: 1,
             },
             write_timeout: None,
             write_idle_timeout: Duration::from_millis(20),

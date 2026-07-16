@@ -8,13 +8,53 @@ minisign -G -p minisign.pub -s vaultlink-release.key
 
 Commit the public key as `release/minisign.pub`. Store the complete private key only in the GitHub Actions secret `MINISIGN_SECRET_KEY`; store its password in `MINISIGN_PASSWORD`. Never place the private key in the repository, VM, release artifact, or logs. The release workflow intentionally fails when the public key or either secret is absent.
 
-The current private GitHub Free repository does not rely on an Actions Environment as an approval boundary. Only an authorized maintainer may push the annotated release tag after every checklist gate is complete. The workflow independently requires the tag version to match Cargo metadata, verifies that the tagged commit is contained in `origin/main`, rebuilds/tests that commit on both native architectures, and grants `contents: write` only to the tag-only publish job. Branch dry-runs remain read-only.
+The current private GitHub Free repository does not rely on an Actions Environment as an approval boundary. Only an authorized maintainer may push the annotated release tag after every checklist gate is complete. The workflow independently requires the tag version to match Cargo metadata, verifies that the tagged commit equals the current `origin/main`, rebuilds/tests that commit on both native architectures, and grants `contents: write` only to the tag-only publish job. Branch dry-runs remain read-only.
 
 ## Supply-chain pin maintenance
 
-Release and test workflows pin external actions to full commit SHAs and container images to manifest digests. Keep the adjacent version comments when reviewing Dependabot updates, verify that each SHA belongs to the named upstream repository, and run `make policy-check` plus the release dry-run before merging a pin refresh. Cargo-installed release tools require exact `--version` values.
+Release and test workflows pin external actions to full commit SHAs and container images to manifest digests. Keep the adjacent version comments when reviewing Dependabot updates, verify that each SHA belongs to the named upstream repository, and run `make policy-check` plus the release dry-run before merging a pin refresh. Release-time jobs install neither APT packages nor Cargo tools.
 
-The current release container starts from an immutable Debian-13/Rust image, but APT packages are installed from Debian's signed live repositories. Do not describe builds as bit-for-bit reproducible until the repository is moved to a dated, maintained Debian snapshot.
+The required `VAULTLINK_RELEASE_BUILDER_IMAGE` is a multi-architecture,
+digest-pinned image built only from `deploy/docker/Dockerfile.release-builder`
+and the immutable Debian snapshot in `deploy/docker/debian-snapshot.sources`.
+The builder Dockerfile deliberately copies no application source, workflow, or
+`release-builder-image.lock`, so its digest can safely be pinned by the same
+source commit. Its direct and transitive package
+closure is exact-versioned in `debian-packages.lock`; the image build compares
+the base-image dpkg manifest before and after installation and rejects every
+changed package absent from that lock. Cargo audit/SBOM tools are baked into the
+builder at pinned versions. Reproducibility jobs generate and normalize an
+independent SBOM for each clean build, then require both the binary and complete
+final release archive to have identical SHA-256 values. A tag build must match
+those exact binary and archive hashes for its architecture.
+
+`deploy/docker/release-builder-image.lock` is the reviewed source of truth. It
+is intentionally `UNPROVISIONED` until a maintainer performs an explicit
+dependency refresh. Build and push the builder as one linux/amd64+linux/arm64
+manifest with Buildx, record the resulting full
+`ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>` reference in the
+lock, and set the repository variable `VAULTLINK_RELEASE_BUILDER_IMAGE` to that
+exact same string. Release and reproducibility environment resolvers compare
+the two before any job container starts and require `packages: read` plus GHCR
+credentials. An unset marker, mismatch, mutable tag, different repository, or
+unavailable private image is an intentional external release blocker.
+
+The refresh is performed from a reviewed clean tree; the temporary tag is not
+used by any release job:
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f deploy/docker/Dockerfile.release-builder \
+  -t ghcr.io/alexhaberl/vaultlink-release-builder:dependency-refresh --push .
+docker buildx imagetools inspect \
+  ghcr.io/alexhaberl/vaultlink-release-builder:dependency-refresh
+```
+
+Copy the reported manifest digest—not either platform-child digest—into the
+checked-in full reference and the repository variable, then rerun both native
+reproducibility jobs. For a private package, explicitly grant this repository's
+Actions token read access to the GHCR package. Updating the temporary tag later
+cannot affect the pinned jobs.
 
 ## Multi-architecture assets
 

@@ -1,6 +1,6 @@
 [package]
 name = "vaultlink"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 description = "Secure file sharing for an existing Linux mountpoint"
@@ -8,6 +8,12 @@ description = "Secure file sharing for an existing Linux mountpoint"
 [workspace]
 members = ["fuzz"]
 resolver = "2"
+
+[features]
+default = []
+# Internal facade used by the out-of-tree cargo-fuzz package. This is not a
+# supported application API.
+fuzzing = []
 
 [dependencies]
 argon2 = "0.5"

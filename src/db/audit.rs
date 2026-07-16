@@ -94,7 +94,7 @@ impl Database {
         detail: Option<&str>,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<()> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_audit_event(&transaction, actor, action, object, detail, client_ip)?;
         transaction.commit()?;
@@ -105,7 +105,7 @@ impl Database {
     }
 
     pub fn count_audit_client_ips(&self) -> rusqlite::Result<u64> {
-        self.conn().query_row(
+        self.try_conn()?.query_row(
             "SELECT COUNT(*) FROM audit WHERE client_ip IS NOT NULL",
             [],
             |row| row.get(0),
@@ -132,7 +132,7 @@ impl Database {
         fallback_logging_enabled: bool,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<AuditClientIpDeletionOutcome> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if persisted_audit_client_ip_enabled(&transaction, fallback_logging_enabled)? {
             return Ok(AuditClientIpDeletionOutcome::LoggingEnabled);
@@ -162,7 +162,7 @@ impl Database {
         limit: usize,
         offset: usize,
     ) -> rusqlite::Result<Vec<AuditEvent>> {
-        let connection = self.conn();
+        let connection = self.try_conn()?;
         if let Some(action) = action {
             let mut statement = connection.prepare(
                 "SELECT occurred_at,actor,action,object_id,detail,client_ip FROM audit WHERE action=?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
@@ -201,7 +201,7 @@ impl Database {
     }
 
     pub fn count_audit(&self, action: Option<&str>) -> rusqlite::Result<usize> {
-        let connection = self.conn();
+        let connection = self.try_conn()?;
         let count: i64 = if let Some(action) = action {
             connection.query_row(
                 "SELECT COUNT(*) FROM audit WHERE action=?1",

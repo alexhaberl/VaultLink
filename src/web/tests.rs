@@ -1,9 +1,20 @@
 use super::{
-    admission::*, auth_ui::*, common::*, preview_zip::*, public::*, public_preview::*,
-    rendering::*, router, settings_audit::*, storage_recovery_app_error, transfer_runtime::*,
-    upload::*, AppError, BUFFERED_RESPONSE_CHUNK_BYTES, DEFAULT_REQUEST_BODY_LIMIT,
-    ERROR_CODE_HEADER, MAX_RENDERED_TEXT_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES,
-    MAX_UPLOAD_PATH_FIELD_BYTES, TEXT_PREVIEW_STREAM_MARKER,
+    admission::*,
+    auth_ui::*,
+    common::*,
+    preview_zip::*,
+    public::*,
+    public_preview::*,
+    rendering::*,
+    router,
+    settings_audit::*,
+    storage_recovery_app_error,
+    transfer::{install_zip_blocking_test_hook, ZipBlockingTestHook, ZipBlockingTestPhase},
+    transfer_runtime::*,
+    upload::*,
+    AppError, BUFFERED_RESPONSE_CHUNK_BYTES, DEFAULT_REQUEST_BODY_LIMIT, ERROR_CODE_HEADER,
+    MAX_RENDERED_TEXT_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES, MAX_UPLOAD_PATH_FIELD_BYTES,
+    TEXT_PREVIEW_STREAM_MARKER,
 };
 use crate::config::{Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage, Tls};
 use crate::{
@@ -11,7 +22,8 @@ use crate::{
     config::MAX_TEXT_PREVIEW_SIZE,
     db::{
         Permission, Session, Share, TransferLeaseBeginOutcome, UploadConflictStrategy,
-        UploadReservationBeginOutcome,
+        UploadReservationBeginOutcome, UploadReservationCommitOutcome,
+        UploadReservationExtendOutcome,
     },
     http_auth::{csrf, runtime_settings, try_acquire_client_activity},
     i18n::{self, Locale},
@@ -52,7 +64,7 @@ fn test_state_with_limit(root: &Path, data: &Path, max_upload_size: u64) -> AppS
         storage: Storage {
             root_mount_path: root.into(),
             data_directory: data.into(),
-            internal_directory: None,
+            internal_directory: Some(root.join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)),
             require_mount: false,
             external_writers: false,
             expected_filesystem_type: None,
@@ -408,7 +420,6 @@ async fn public_transfer_deadline_stops_a_stream_that_never_yields() {
     let mut stream = TransferBodyStream {
         inner: Box::pin(futures_util::stream::pending()),
         database: state.db,
-        runtime: state.runtime,
         lease_token: None,
         client_ip: None,
         action: "download",
@@ -554,6 +565,122 @@ async fn request_cancellation_releases_unclaimed_transfer_and_upload_begins() {
     );
 }
 
+#[tokio::test]
+async fn consuming_lease_and_quota_guards_finish_their_durable_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let transfer_share = state
+        .db
+        .create_share(
+            "consuming-transfer",
+            None,
+            "file.txt",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let upload_share = state
+        .db
+        .create_share_with_upload_limits(
+            "consuming-upload",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            Some(10),
+            Some(100),
+            Some(10),
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+
+    assert_eq!(
+        state
+            .db
+            .begin_transfer_lease(
+                "consuming-session",
+                "consuming-lease",
+                transfer_share,
+                "file.txt",
+                "download",
+            )
+            .unwrap(),
+        TransferLeaseBeginOutcome::NewLease
+    );
+    PublicTransferLease::new(
+        state.db.clone(),
+        "consuming-lease".into(),
+        String::new(),
+        None,
+        None,
+    )
+    .cancel()
+    .await;
+    assert_eq!(
+        state
+            .db
+            .active_transfer_reservations(transfer_share)
+            .unwrap(),
+        0
+    );
+
+    assert_eq!(
+        state
+            .db
+            .begin_upload_reservation("consuming-cancel", upload_share)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    UploadQuotaReservation::new(state.db.clone(), "consuming-cancel".into())
+        .cancel()
+        .await
+        .unwrap();
+    assert_eq!(
+        state.db.active_upload_reservations(upload_share).unwrap(),
+        0
+    );
+
+    assert_eq!(
+        state
+            .db
+            .begin_upload_reservation("consuming-commit", upload_share)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    let committed = UploadQuotaReservation::new(state.db.clone(), "consuming-commit".into());
+    assert_eq!(
+        state
+            .db
+            .extend_upload_reservation("consuming-commit", 1)
+            .unwrap(),
+        UploadReservationExtendOutcome::Extended
+    );
+    assert_eq!(
+        state
+            .db
+            .commit_upload_reservation("consuming-commit", 1)
+            .unwrap(),
+        UploadReservationCommitOutcome::Committed
+    );
+    committed.committed();
+    assert_eq!(
+        state.db.active_upload_reservations(upload_share).unwrap(),
+        0
+    );
+}
+
 #[test]
 fn reservation_drop_schedules_blocking_cleanup_before_immediate_runtime_shutdown() {
     let root = tempfile::tempdir().unwrap();
@@ -618,13 +745,13 @@ fn reservation_drop_schedules_blocking_cleanup_before_immediate_runtime_shutdown
                 .unwrap(),
             UploadReservationBeginOutcome::Reserved
         );
-        let _transfer = PublicTransferLease {
-            lease_token: Some("shutdown-lease".into()),
-            cookie: String::new(),
-            heartbeat_stop: None,
-            database: database.clone(),
-            client_ip: None,
-        };
+        let _transfer = PublicTransferLease::new(
+            database.clone(),
+            "shutdown-lease".into(),
+            String::new(),
+            None,
+            None,
+        );
         let _upload =
             UploadQuotaReservation::new(database.clone(), "shutdown-upload-reservation".into());
     });
@@ -677,13 +804,13 @@ async fn unknown_length_transfer_counts_before_its_first_payload_chunk_is_yielde
             .unwrap(),
         TransferLeaseBeginOutcome::NewLease
     );
-    let transfer = PublicTransferLease {
-        lease_token: Some("direct-lease".into()),
-        cookie: String::new(),
-        heartbeat_stop: None,
-        database: state.db.clone(),
-        client_ip: None,
-    };
+    let transfer = PublicTransferLease::new(
+        state.db.clone(),
+        "direct-lease".into(),
+        String::new(),
+        None,
+        None,
+    );
     let source = futures_util::stream::iter([
         Ok::<_, io::Error>(Bytes::from_static(b"first")),
         Ok(Bytes::from_static(b"second")),
@@ -702,6 +829,51 @@ async fn unknown_length_transfer_counts_before_its_first_payload_chunk_is_yielde
         1
     );
     assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn public_transfer_completion_uses_the_validated_audit_ip_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("snapshot.txt"), b"snapshot").unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_share(
+            "snapshot-transfer",
+            None,
+            "snapshot.txt",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    state.runtime.write().unwrap().audit_client_ip_enabled = true;
+    let response = router(state.clone())
+        .oneshot(request(Method::GET, "/v/snapshot-transfer/download", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let runtime = state.runtime.clone();
+    assert!(std::thread::spawn(move || {
+        let _guard = runtime.write().unwrap();
+        panic!("poison runtime after transfer lease begin");
+    })
+    .join()
+    .is_err());
+    assert!(state.runtime.is_poisoned());
+
+    assert_eq!(response_text(response).await, "snapshot");
+    let events = state.db.list_audit(Some("download"), 10, 0).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].client_ip.as_deref(), Some("127.0.0.1"));
 }
 
 #[tokio::test]
@@ -733,13 +905,13 @@ async fn known_length_transfer_counts_before_n_minus_one_bytes_are_yielded() {
             .unwrap(),
         TransferLeaseBeginOutcome::NewLease
     );
-    let transfer = PublicTransferLease {
-        lease_token: Some("known-lease".into()),
-        cookie: String::new(),
-        heartbeat_stop: None,
-        database: state.db.clone(),
-        client_ip: None,
-    };
+    let transfer = PublicTransferLease::new(
+        state.db.clone(),
+        "known-lease".into(),
+        String::new(),
+        None,
+        None,
+    );
     let source = futures_util::stream::iter([
         Ok::<_, io::Error>(Bytes::from_static(b"abcde")),
         Ok(Bytes::from_static(b"f")),
@@ -1088,6 +1260,187 @@ fn multipart_request_with_options(
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
+    request
+}
+
+fn multipart_request_with_late_overwrite(uri: &str, name: &str, content: &[u8]) -> Request {
+    let boundary = "vaultlink-late-intent-boundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(content);
+    body.extend_from_slice(
+        format!(
+            "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite_existing\"\r\n\r\n1\r\n--{boundary}--\r\n"
+        )
+        .as_bytes(),
+    );
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+    ));
+    request
+}
+
+fn raw_multipart_request(uri: &str, boundary: &str, body: Vec<u8>) -> Request {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+    ));
+    request
+}
+
+const CONTROLLED_UPLOAD_BOUNDARY: &str = "vaultlink-controlled-upload-boundary";
+
+fn controlled_multipart_request(
+    uri: &str,
+    name: &str,
+    content: &[u8],
+    overwrite_requested: bool,
+) -> (
+    Request,
+    tokio::sync::mpsc::Sender<std::result::Result<Bytes, io::Error>>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|chunk| (chunk, receiver))
+    });
+    let mut prefix = Vec::new();
+    if overwrite_requested {
+        prefix.extend_from_slice(
+            format!(
+                "--{CONTROLLED_UPLOAD_BOUNDARY}\r\nContent-Disposition: form-data; name=\"overwrite_existing\"\r\n\r\n1\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    prefix.extend_from_slice(
+        format!(
+            "--{CONTROLLED_UPLOAD_BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    prefix.extend_from_slice(content);
+    sender.try_send(Ok(Bytes::from(prefix))).unwrap();
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={CONTROLLED_UPLOAD_BOUNDARY}"),
+        )
+        .body(Body::from_stream(stream))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+    ));
+    (request, sender)
+}
+
+async fn finish_controlled_multipart(
+    sender: tokio::sync::mpsc::Sender<std::result::Result<Bytes, io::Error>>,
+) {
+    sender
+        .send(Ok(Bytes::from(format!(
+            "\r\n--{CONTROLLED_UPLOAD_BOUNDARY}--\r\n"
+        ))))
+        .await
+        .unwrap();
+}
+
+async fn wait_for_upload_fragment(root: &Path) {
+    let staging = root.join(".vaultlink-internal").join("uploads");
+    for _ in 0..200 {
+        if std::fs::read_dir(&staging).is_ok_and(|mut entries| entries.next().is_some()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("upload did not reach staging");
+}
+
+fn upload_fragment_count(root: &Path) -> usize {
+    std::fs::read_dir(root.join(".vaultlink-internal").join("uploads"))
+        .map(|entries| entries.filter_map(std::result::Result::ok).count())
+        .unwrap_or_default()
+}
+
+async fn wait_for_public_upload_cleanup(state: &AppState, root: &Path, share_id: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if state.db.active_upload_reservations(share_id).unwrap() == 0
+                && upload_fragment_count(root) == 0
+                && state.upload_admission.available_permits() == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("public upload resources should be released");
+}
+
+fn api_share_strategy_request(
+    share_id: i64,
+    strategy: &str,
+    session_token: &str,
+    csrf_token: &str,
+) -> Request {
+    let mut request = Request::builder()
+        .method(Method::PATCH)
+        .uri(format!("/api/v1/shares/{share_id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, format!("vaultlink_session={session_token}"))
+        .header("x-csrf-token", csrf_token)
+        .body(Body::from(format!(
+            r#"{{"upload_conflict_strategy":"{strategy}"}}"#
+        )))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+    ));
+    request
+}
+
+fn html_share_strategy_request(
+    share_id: i64,
+    strategy: &str,
+    session_token: &str,
+    csrf_token: &str,
+) -> Request {
+    let mut request = request(
+        Method::POST,
+        &format!("/admin/shares/{share_id}/upload-conflict"),
+        &format!("csrf={csrf_token}&strategy={strategy}"),
+    );
+    request.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_str(&format!("vaultlink_session={session_token}")).unwrap(),
+    );
     request
 }
 
@@ -2066,6 +2419,75 @@ async fn webauthn_mfa_start_is_rate_limited_before_credential_work() {
     assert_eq!(
         app.oneshot(request()).await.unwrap().status(),
         StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn router_recovers_invalid_runtime_and_webauthn_snapshots_after_poisoning() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state
+        .db
+        .create_admin(
+            "admin",
+            &auth::hash_password("a sufficiently long password").unwrap(),
+            &auth::new_totp_secret(),
+        )
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "poison-recovery-session",
+            1,
+            "poison-recovery-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("poison-recovery-session").unwrap();
+
+    let runtime = state.runtime.clone();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut settings = runtime.write().unwrap();
+            settings.max_upload_size = 0;
+            panic!("inject invalid runtime snapshot poisoning");
+        }))
+        .is_err()
+    );
+    let webauthn = state.webauthn.clone();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _service = webauthn.write().unwrap();
+            panic!("inject WebAuthn snapshot poisoning");
+        }))
+        .is_err()
+    );
+
+    let app = router(state.clone());
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/admin/account/security-keys/register/start")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(
+            header::COOKIE,
+            "vaultlink_session=poison-recovery-session",
+        )
+        .body(Body::from(
+            r#"{"csrf":"poison-recovery-csrf","current_password":"a sufficiently long password","label":"Recovery key"}"#,
+        ))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!state.runtime.is_poisoned());
+    assert!(!state.webauthn.is_poisoned());
+    assert_eq!(
+        runtime_settings(&state).max_upload_size,
+        state.config.storage.max_upload_size
     );
 }
 
@@ -3795,6 +4217,90 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_upload_rechecks_the_exact_mfa_session_before_publish() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_admin("other-admin", "hash", "other-secret")
+        .unwrap();
+    for token in ["queue-session", "browser-session"] {
+        state
+            .db
+            .create_session(token, 1, "csrf-token", Utc::now() + Duration::hours(1))
+            .unwrap();
+        state.db.verify_mfa(token).unwrap();
+    }
+    let app = router(state.clone());
+
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut queued = admin_multipart_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "csrf-token",
+        "queue-revoked.txt",
+        b"must not publish",
+        false,
+    );
+    queued.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=queue-session"),
+    );
+    let queue_app = app.clone();
+    let queued = tokio::spawn(async move { queue_app.oneshot(queued).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+    state.db.delete_session("queue-session").unwrap();
+    drop(storage_guard);
+
+    let queued = queued.await.unwrap();
+    assert_eq!(queued.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_text(queued).await,
+        r#"{"error":"session_revoked"}"#
+    );
+    assert!(!root.path().join("uploads/queue-revoked.txt").exists());
+
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut browser = admin_multipart_request(
+        "/admin/files/upload",
+        "uploads",
+        "csrf-token",
+        "browser-revoked.txt",
+        b"must not publish",
+        false,
+    );
+    browser.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=browser-session"),
+    );
+    let browser_app = app.clone();
+    let browser = tokio::spawn(async move { browser_app.oneshot(browser).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+    state.db.deactivate_admin(1).unwrap();
+    drop(storage_guard);
+
+    let browser = browser.await.unwrap();
+    assert_eq!(browser.status(), StatusCode::SEE_OTHER);
+    assert_eq!(browser.headers().get(header::LOCATION).unwrap(), "/login");
+    assert!(browser
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
+    assert!(!root.path().join("uploads/browser-revoked.txt").exists());
+    assert!(state
+        .db
+        .list_audit(Some("admin_upload"), 10, 0)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn text_preview_reserves_transfer_and_render_capacity_before_reading() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -3959,6 +4465,530 @@ async fn text_preview_reserves_transfer_and_render_capacity_before_reading() {
     render_hook.release();
     assert_eq!(first_render.await.unwrap().status(), StatusCode::OK);
     drop(render_hook_guard);
+}
+
+fn active_expensive_peer_operations(state: &AppState) -> usize {
+    state
+        .expensive_peer_admission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .sum()
+}
+
+async fn wait_for_zip_hook(hook: &ZipBlockingTestHook) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while hook.entered.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ZIP blocking hook should be reached");
+}
+
+async fn wait_for_zip_resources_released(state: &AppState, share_id: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if state.zip_generation_admission.available_permits() == 1
+                && active_expensive_peer_operations(state) == 0
+                && state.db.active_transfer_reservations(share_id).unwrap() == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ZIP resources should be released by their single owner");
+
+    // A second cancellation callback must neither recreate a lease nor alter
+    // either admission counter after the owner has already been consumed.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(state.zip_generation_admission.available_permits(), 1);
+    assert_eq!(active_expensive_peer_operations(state), 0);
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_zip_plan_retains_permits_and_lease_until_blocking_work_finishes() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let share_path = "zip-plan-cancellation-docs";
+    std::fs::create_dir(root.path().join(share_path)).unwrap();
+    std::fs::write(root.path().join(share_path).join("note.txt"), b"note").unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.zip_generation_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "zip-plan-cancellation",
+            None,
+            share_path,
+            true,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let hook = Arc::new(ZipBlockingTestHook {
+        path: share_path.into(),
+        phase: ZipBlockingTestPhase::Plan,
+        panic_after_release: false,
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        released: std::sync::Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+    });
+    let hook_guard = install_zip_blocking_test_hook(hook.clone());
+    let app = router(state.clone());
+    let request = tokio::spawn(async move {
+        app.oneshot(request(
+            Method::GET,
+            "/v/zip-plan-cancellation/download.zip",
+            "",
+        ))
+        .await
+        .unwrap()
+    });
+    wait_for_zip_hook(&hook).await;
+
+    assert_eq!(state.zip_generation_admission.available_permits(), 0);
+    assert_eq!(active_expensive_peer_operations(&state), 1);
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 1);
+    request.abort();
+    let _ = request.await;
+    tokio::task::yield_now().await;
+    assert_eq!(state.zip_generation_admission.available_permits(), 0);
+    assert_eq!(active_expensive_peer_operations(&state), 1);
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 1);
+
+    hook.release();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if state.zip_generation_admission.available_permits() == 1
+                && active_expensive_peer_operations(&state) == 0
+                && state.db.active_transfer_reservations(share_id).unwrap() == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cancelled ZIP plan should release its single resource owner");
+    assert_eq!(
+        state
+            .db
+            .share_by_token("zip-plan-cancellation")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        0
+    );
+    drop(hook_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zip_blocking_join_error_releases_transfer_lease_and_admission_once() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let share_path = "zip-blocking-panic-docs";
+    std::fs::create_dir(root.path().join(share_path)).unwrap();
+    std::fs::write(root.path().join(share_path).join("note.txt"), b"note").unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.zip_generation_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "zip-blocking-panic",
+            None,
+            share_path,
+            true,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let hook = Arc::new(ZipBlockingTestHook {
+        path: share_path.into(),
+        phase: ZipBlockingTestPhase::Plan,
+        panic_after_release: true,
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        released: std::sync::Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+    });
+    let hook_guard = install_zip_blocking_test_hook(hook.clone());
+    let app = router(state.clone());
+    let request = tokio::spawn(async move {
+        app.oneshot(request(
+            Method::GET,
+            "/v/zip-blocking-panic/download.zip",
+            "",
+        ))
+        .await
+        .unwrap()
+    });
+    wait_for_zip_hook(&hook).await;
+    assert_eq!(state.zip_generation_admission.available_permits(), 0);
+    assert_eq!(active_expensive_peer_operations(&state), 1);
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 1);
+
+    hook.release();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+        .await
+        .expect("panicking ZIP task should join")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    wait_for_zip_resources_released(&state, share_id).await;
+    assert_eq!(
+        state
+            .db
+            .share_by_token("zip-blocking-panic")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        0
+    );
+    drop(hook_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_capacity_zip_materialization_error_releases_resources_once() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let share_path = "zip-materialization-error-docs";
+    let source_path = root.path().join(share_path).join("note.txt");
+    std::fs::create_dir(root.path().join(share_path)).unwrap();
+    std::fs::write(&source_path, b"note").unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.zip_generation_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "zip-materialization-error",
+            None,
+            share_path,
+            true,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let hook = Arc::new(ZipBlockingTestHook {
+        path: share_path.into(),
+        phase: ZipBlockingTestPhase::Materialize,
+        panic_after_release: false,
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        released: std::sync::Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+    });
+    let hook_guard = install_zip_blocking_test_hook(hook.clone());
+    let app = router(state.clone());
+    let request = tokio::spawn(async move {
+        app.oneshot(request(
+            Method::GET,
+            "/v/zip-materialization-error/download.zip",
+            "",
+        ))
+        .await
+        .unwrap()
+    });
+    wait_for_zip_hook(&hook).await;
+    assert_eq!(state.zip_generation_admission.available_permits(), 0);
+    assert_eq!(active_expensive_peer_operations(&state), 1);
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 1);
+
+    // Planning has completed, so removing the source here deterministically
+    // produces ZipBuildError::Source rather than the capacity fallback.
+    std::fs::remove_file(source_path).unwrap();
+    hook.release();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+        .await
+        .expect("failed ZIP materialization should return")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    wait_for_zip_resources_released(&state, share_id).await;
+    assert_eq!(
+        state
+            .db
+            .share_by_token("zip-materialization-error")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        0
+    );
+    drop(hook_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_zip_error_before_first_chunk_releases_resources_once() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let share_path = "zip-direct-error-docs";
+    let source_path = root.path().join(share_path).join("note.txt");
+    std::fs::create_dir(root.path().join(share_path)).unwrap();
+    std::fs::write(&source_path, b"note").unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.zip_generation_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "zip-direct-error",
+            None,
+            share_path,
+            true,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let hook = Arc::new(ZipBlockingTestHook {
+        path: share_path.into(),
+        phase: ZipBlockingTestPhase::Direct,
+        panic_after_release: false,
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        released: std::sync::Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+    });
+    let hook_guard = install_zip_blocking_test_hook(hook.clone());
+    let response = router(state.clone())
+        .oneshot(request(Method::GET, "/v/zip-direct-error/download.zip", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_zip_hook(&hook).await;
+    assert_eq!(state.zip_generation_admission.available_permits(), 0);
+    assert_eq!(active_expensive_peer_operations(&state), 1);
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 1);
+
+    std::fs::remove_file(source_path).unwrap();
+    let mut body = response.into_body().into_data_stream();
+    hook.release();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+        .await
+        .expect("direct ZIP producer should report its source error")
+        .expect("direct ZIP producer should emit an error item");
+    assert!(first.is_err(), "no payload may precede the producer error");
+    drop(body);
+
+    wait_for_zip_resources_released(&state, share_id).await;
+    assert_eq!(
+        state
+            .db
+            .share_by_token("zip-direct-error")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        0
+    );
+    drop(hook_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_zip_materialization_retains_capacity_until_blocking_work_finishes() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let share_path = "zip-cancellation-docs";
+    std::fs::create_dir(root.path().join(share_path)).unwrap();
+    std::fs::write(root.path().join(share_path).join("note.txt"), b"note").unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "zip-cancellation",
+            None,
+            share_path,
+            true,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let expected_temp_reservation = plan_zip(
+        &state.secure_root.bind_directory(share_path).unwrap(),
+        "",
+        &runtime_settings(&state),
+    )
+    .unwrap()
+    .estimated_archive_size;
+    let hook = Arc::new(ZipBlockingTestHook {
+        path: share_path.into(),
+        phase: ZipBlockingTestPhase::Materialize,
+        panic_after_release: false,
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        released: std::sync::Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+    });
+    let hook_guard = install_zip_blocking_test_hook(hook.clone());
+    let app = router(state.clone());
+    let request = tokio::spawn(async move {
+        app.oneshot(request(Method::GET, "/v/zip-cancellation/download.zip", ""))
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while hook.entered.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        state.zip_generation_admission.available_permits(),
+        crate::MAX_CONCURRENT_ZIP_GENERATIONS - 1
+    );
+    assert!(zip_temp_reserved_bytes_for_test() >= expected_temp_reservation);
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 1);
+
+    request.abort();
+    let _ = request.await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        state.zip_generation_admission.available_permits(),
+        crate::MAX_CONCURRENT_ZIP_GENERATIONS - 1,
+        "request cancellation released ZIP capacity around live blocking work"
+    );
+    assert!(
+        zip_temp_reserved_bytes_for_test() >= expected_temp_reservation,
+        "request cancellation released the temp budget around live materialization"
+    );
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 1);
+
+    hook.release();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if state.zip_generation_admission.available_permits()
+                == crate::MAX_CONCURRENT_ZIP_GENERATIONS
+                && state.db.active_transfer_reservations(share_id).unwrap() == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(hook_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_direct_zip_keeps_permits_in_the_blocking_producer() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let share_path = "zip-direct-cancellation-docs";
+    std::fs::create_dir(root.path().join(share_path)).unwrap();
+    std::fs::write(root.path().join(share_path).join("note.txt"), b"note").unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.zip_generation_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "zip-direct-cancellation",
+            None,
+            share_path,
+            true,
+            &Permission::DownloadOnly,
+            None,
+            Some(1),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let hook = Arc::new(ZipBlockingTestHook {
+        path: share_path.into(),
+        phase: ZipBlockingTestPhase::Direct,
+        panic_after_release: false,
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        released: std::sync::Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+    });
+    let hook_guard = install_zip_blocking_test_hook(hook.clone());
+    let response = router(state.clone())
+        .oneshot(request(
+            Method::GET,
+            "/v/zip-direct-cancellation/download.zip",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_zip_hook(&hook).await;
+    assert_eq!(state.zip_generation_admission.available_permits(), 0);
+    assert_eq!(active_expensive_peer_operations(&state), 1);
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 1);
+
+    drop(response);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.db.active_transfer_reservations(share_id).unwrap() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("dropping the direct ZIP body should cancel its lease once");
+    assert_eq!(state.zip_generation_admission.available_permits(), 0);
+    assert_eq!(active_expensive_peer_operations(&state), 1);
+    assert_eq!(
+        state
+            .db
+            .share_by_token("zip-direct-cancellation")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        0
+    );
+
+    hook.release();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if state.zip_generation_admission.available_permits() == 1
+                && active_expensive_peer_operations(&state) == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("direct ZIP permits should outlive the cancelled body but not the producer");
+    assert_eq!(state.db.active_transfer_reservations(share_id).unwrap(), 0);
+    assert_eq!(
+        state
+            .db
+            .share_by_token("zip-direct-cancellation")
+            .unwrap()
+            .unwrap()
+            .download_count,
+        0
+    );
+    drop(hook_guard);
 }
 
 #[tokio::test]
@@ -4557,6 +5587,643 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
 }
 
 #[tokio::test]
+async fn public_upload_rejects_missing_duplicate_late_and_unknown_fields_without_leaks() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "multipart-states",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let app = router(state.clone());
+    let boundary = "vaultlink-field-state-boundary";
+    let closing = format!("--{boundary}--\r\n");
+    let path = |value: &str| {
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n{value}\r\n")
+    };
+    let file = |name: &str, value: &str| {
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n{value}\r\n"
+        )
+    };
+    let unknown = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"surprise\"\r\n\r\nvalue\r\n"
+    );
+    let cases = [
+        (
+            "missing",
+            format!("{}{}", path("unused"), closing),
+            "Datei fehlt",
+        ),
+        (
+            "duplicate-path",
+            format!("{}{}{}", path("first"), path("second"), closing),
+            "Uploadpfad",
+        ),
+        (
+            "late-path",
+            format!("{}{}{}", file("late.txt", "one"), path("late"), closing),
+            "Uploadpfad",
+        ),
+        (
+            "multiple-files",
+            format!(
+                "{}{}{}",
+                file("first.txt", "one"),
+                file("second.txt", "two"),
+                closing
+            ),
+            "genau eine Datei",
+        ),
+        (
+            "unknown",
+            format!("{unknown}{closing}"),
+            "Unbekanntes Multipart-Feld",
+        ),
+    ];
+
+    for (case, body, expected_message) in cases {
+        let response = app
+            .clone()
+            .oneshot(raw_multipart_request(
+                "/v/multipart-states/upload",
+                boundary,
+                body.into_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "case {case}");
+        assert!(
+            response_text(response).await.contains(expected_message),
+            "case {case} did not report {expected_message}"
+        );
+        wait_for_public_upload_cleanup(&state, root.path(), share_id).await;
+        assert!(!root.path().join("uploads/late.txt").exists());
+        assert!(!root.path().join("uploads/first.txt").exists());
+        assert!(!root.path().join("uploads/second.txt").exists());
+    }
+    assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+    assert!(state
+        .db
+        .list_audit(Some("upload"), 10, 0)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn public_upload_binds_intent_after_the_complete_multipart_envelope() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    std::fs::write(root.path().join("uploads/existing.txt"), b"old").unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "late-intent",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::OverwriteAllowed,
+        )
+        .unwrap();
+    let response = router(state.clone())
+        .oneshot(multipart_request_with_late_overwrite(
+            "/v/late-intent/upload",
+            "existing.txt",
+            b"new",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-vaultlink-upload-outcome")
+            .unwrap(),
+        "replaced"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/existing.txt")).unwrap(),
+        b"new"
+    );
+    assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+    assert_eq!(
+        state
+            .db
+            .share_by_token("late-intent")
+            .unwrap()
+            .unwrap()
+            .uploaded_bytes,
+        3
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_upload_cancellation_during_staging_releases_the_typed_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "cancel-staging",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let hook = PublicUploadTestHook::blocking("cancel-staging", PublicUploadTestPhase::Staging);
+    let hook_guard = install_public_upload_test_hook(hook.clone());
+    let app = router(state.clone());
+    let request = tokio::spawn(async move {
+        app.oneshot(multipart_request(
+            "/v/cancel-staging/upload",
+            "cancelled.txt",
+            b"content",
+        ))
+        .await
+        .unwrap()
+    });
+    hook.wait_until_entered().await;
+
+    assert_eq!(state.upload_admission.available_permits(), 0);
+    assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 1);
+    assert_eq!(upload_fragment_count(root.path()), 1);
+    request.abort();
+    let _ = request.await;
+
+    wait_for_public_upload_cleanup(&state, root.path(), share_id).await;
+    assert!(!root.path().join("uploads/cancelled.txt").exists());
+    assert!(state
+        .db
+        .list_audit(Some("upload"), 10, 0)
+        .unwrap()
+        .is_empty());
+    drop(hook_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_upload_cancellation_after_finalizer_handoff_does_not_abort_publish() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "cancel-finalizer",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let hook = PublicUploadTestHook::blocking("cancel-finalizer", PublicUploadTestPhase::Finalizer);
+    let hook_guard = install_public_upload_test_hook(hook.clone());
+    let app = router(state.clone());
+    let request = tokio::spawn(async move {
+        app.oneshot(multipart_request(
+            "/v/cancel-finalizer/upload",
+            "published.txt",
+            b"content",
+        ))
+        .await
+        .unwrap()
+    });
+    hook.wait_until_entered().await;
+
+    request.abort();
+    let _ = request.await;
+    tokio::task::yield_now().await;
+    assert_eq!(state.upload_admission.available_permits(), 0);
+    assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 1);
+    assert_eq!(upload_fragment_count(root.path()), 1);
+
+    hook.release();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if state.upload_admission.available_permits() == 1
+                && state.db.active_upload_reservations(share_id).unwrap() == 0
+                && root.path().join("uploads/published.txt").exists()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("detached upload finalizer should publish and release ownership");
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/published.txt")).unwrap(),
+        b"content"
+    );
+    assert_eq!(state.db.list_audit(Some("upload"), 10, 0).unwrap().len(), 1);
+    drop(hook_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_upload_staging_io_failure_cleans_fragment_and_quota() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "staging-failure",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let hook = PublicUploadTestHook::failing(
+        "staging-failure",
+        PublicUploadTestPhase::StagingSync,
+        io::ErrorKind::Other,
+    );
+    let hook_guard = install_public_upload_test_hook(hook.clone());
+    let response = router(state.clone())
+        .oneshot(multipart_request(
+            "/v/staging-failure/upload",
+            "never.txt",
+            b"content",
+        ))
+        .await
+        .unwrap();
+    hook.wait_until_entered().await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    wait_for_public_upload_cleanup(&state, root.path(), share_id).await;
+    assert!(!root.path().join("uploads/never.txt").exists());
+    assert!(state
+        .db
+        .list_audit(Some("upload"), 10, 0)
+        .unwrap()
+        .is_empty());
+    drop(hook_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_upload_uses_the_policy_that_wins_before_finalization() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    std::fs::write(root.path().join("uploads/existing.txt"), b"old").unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "policy-session",
+            1,
+            "policy-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("policy-session").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "policy-first",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::OverwriteAllowed,
+        )
+        .unwrap();
+    let app = router(state.clone());
+    let (upload, sender) =
+        controlled_multipart_request("/v/policy-first/upload", "existing.txt", b"new", true);
+    let upload_app = app.clone();
+    let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+
+    let policy = app
+        .clone()
+        .oneshot(api_share_strategy_request(
+            share_id,
+            "reject",
+            "policy-session",
+            "policy-csrf",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(policy.status(), StatusCode::OK);
+    finish_controlled_multipart(sender).await;
+
+    let upload = upload.await.unwrap();
+    assert_eq!(upload.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/existing.txt")).unwrap(),
+        b"old"
+    );
+    assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+    let share = state.db.share_by_token("policy-first").unwrap().unwrap();
+    assert_eq!(
+        share.upload_conflict_strategy,
+        UploadConflictStrategy::Reject
+    );
+    assert_eq!(share.uploaded_bytes, 0);
+    assert_eq!(share.uploaded_files, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_upload_publish_wins_before_a_waiting_policy_change() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    std::fs::write(root.path().join("uploads/existing.txt"), b"old").unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "policy-session",
+            1,
+            "policy-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("policy-session").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "upload-first",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::OverwriteAllowed,
+        )
+        .unwrap();
+    let hook = PublicUploadTestHook::blocking("upload-first", PublicUploadTestPhase::StorageLocked);
+    let hook_guard = install_public_upload_test_hook(hook.clone());
+    let app = router(state.clone());
+    let (upload, sender) =
+        controlled_multipart_request("/v/upload-first/upload", "existing.txt", b"new", true);
+    let upload_app = app.clone();
+    let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+
+    finish_controlled_multipart(sender).await;
+    hook.wait_until_entered().await;
+    let policy_app = app.clone();
+    let policy = tokio::spawn(async move {
+        policy_app
+            .oneshot(api_share_strategy_request(
+                share_id,
+                "reject",
+                "policy-session",
+                "policy-csrf",
+            ))
+            .await
+            .unwrap()
+    });
+    tokio::task::yield_now().await;
+    assert!(!policy.is_finished());
+
+    hook.release();
+    let upload = upload.await.unwrap();
+    assert_eq!(upload.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/existing.txt")).unwrap(),
+        b"new"
+    );
+    let policy = policy.await.unwrap();
+    assert_eq!(policy.status(), StatusCode::OK);
+    assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+    let share = state.db.share_by_token("upload-first").unwrap().unwrap();
+    assert_eq!(
+        share.upload_conflict_strategy,
+        UploadConflictStrategy::Reject
+    );
+    assert_eq!(share.uploaded_bytes, 3);
+    assert_eq!(share.uploaded_files, 1);
+    drop(hook_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_upload_uses_the_html_policy_that_wins_before_finalization() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    std::fs::write(root.path().join("uploads/existing.txt"), b"old").unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "html-policy-session",
+            1,
+            "html-policy-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("html-policy-session").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "html-policy-first",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::OverwriteAllowed,
+        )
+        .unwrap();
+    let app = router(state.clone());
+    let (upload, sender) =
+        controlled_multipart_request("/v/html-policy-first/upload", "existing.txt", b"new", true);
+    let upload_app = app.clone();
+    let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+
+    let policy = app
+        .clone()
+        .oneshot(html_share_strategy_request(
+            share_id,
+            "reject",
+            "html-policy-session",
+            "html-policy-csrf",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(policy.status(), StatusCode::SEE_OTHER);
+    finish_controlled_multipart(sender).await;
+
+    let upload = upload.await.unwrap();
+    assert_eq!(upload.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/existing.txt")).unwrap(),
+        b"old"
+    );
+    assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+    let share = state
+        .db
+        .share_by_token("html-policy-first")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        share.upload_conflict_strategy,
+        UploadConflictStrategy::Reject
+    );
+    assert_eq!(share.uploaded_bytes, 0);
+    assert_eq!(share.uploaded_files, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_upload_publish_wins_before_a_waiting_html_policy_change() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    std::fs::write(root.path().join("uploads/existing.txt"), b"old").unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "html-upload-session",
+            1,
+            "html-upload-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("html-upload-session").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "html-upload-first",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::OverwriteAllowed,
+        )
+        .unwrap();
+    let hook =
+        PublicUploadTestHook::blocking("html-upload-first", PublicUploadTestPhase::StorageLocked);
+    let hook_guard = install_public_upload_test_hook(hook.clone());
+    let app = router(state.clone());
+    let (upload, sender) =
+        controlled_multipart_request("/v/html-upload-first/upload", "existing.txt", b"new", true);
+    let upload_app = app.clone();
+    let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+
+    finish_controlled_multipart(sender).await;
+    hook.wait_until_entered().await;
+    let policy_app = app.clone();
+    let policy = tokio::spawn(async move {
+        policy_app
+            .oneshot(html_share_strategy_request(
+                share_id,
+                "reject",
+                "html-upload-session",
+                "html-upload-csrf",
+            ))
+            .await
+            .unwrap()
+    });
+    tokio::task::yield_now().await;
+    assert!(!policy.is_finished());
+
+    hook.release();
+    let upload = upload.await.unwrap();
+    assert_eq!(upload.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/existing.txt")).unwrap(),
+        b"new"
+    );
+    let policy = policy.await.unwrap();
+    assert_eq!(policy.status(), StatusCode::SEE_OTHER);
+    assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+    let share = state
+        .db
+        .share_by_token("html-upload-first")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        share.upload_conflict_strategy,
+        UploadConflictStrategy::Reject
+    );
+    assert_eq!(share.uploaded_bytes, 3);
+    assert_eq!(share.uploaded_files, 1);
+    drop(hook_guard);
+}
+
+#[tokio::test]
 async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -4723,12 +6390,6 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
         app.clone().oneshot(conflict).await.unwrap().status(),
         StatusCode::CONFLICT
     );
-    for _ in 0..100 {
-        if state.db.active_upload_reservations(share_id).unwrap() == 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
     assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
 
     let mut over_quota = multipart_request("/v/protected-upload/upload", "too-large.txt", b"56");
@@ -4900,5 +6561,159 @@ async fn api_upload_route_can_stream_beyond_the_buffered_body_limit() {
             .unwrap()
             .len(),
         content.len() as u64
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    for name in ["password.txt", "mfa.txt", "expired.txt"] {
+        std::fs::write(root.path().join("uploads").join(name), b"original").unwrap();
+    }
+    let mut state = test_state(root.path(), data.path());
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state
+        .db
+        .create_admin("admin", "old-hash", "secret")
+        .unwrap();
+    let app = router(state.clone());
+
+    state
+        .db
+        .create_session(
+            "password-session",
+            1,
+            "csrf-token",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("password-session").unwrap();
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut upload = admin_multipart_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "csrf-token",
+        "password.txt",
+        b"must not replace",
+        true,
+    );
+    upload.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=password-session"),
+    );
+    let upload_app = app.clone();
+    let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+    assert!(matches!(
+        state
+            .db
+            .change_admin_password_cas(1, "old-hash", "new-hash", None)
+            .unwrap(),
+        crate::db::AdminPasswordChangeOutcome::Changed
+    ));
+    drop(storage_guard);
+    let response = upload.await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_text(response).await,
+        r#"{"error":"session_revoked"}"#
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/password.txt")).unwrap(),
+        b"original"
+    );
+    assert_eq!(state.upload_admission.available_permits(), 1);
+
+    state
+        .db
+        .create_session(
+            "mfa-session",
+            1,
+            "csrf-token",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("mfa-session").unwrap();
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut upload = admin_multipart_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "csrf-token",
+        "mfa.txt",
+        b"must not replace",
+        true,
+    );
+    upload.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=mfa-session"),
+    );
+    let upload_app = app.clone();
+    let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+    assert!(state
+        .db
+        .reset_admin_totp(1, &auth::new_totp_secret())
+        .unwrap()
+        .is_some());
+    drop(storage_guard);
+    let response = upload.await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_text(response).await,
+        r#"{"error":"session_revoked"}"#
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/mfa.txt")).unwrap(),
+        b"original"
+    );
+    assert_eq!(state.upload_admission.available_permits(), 1);
+
+    state
+        .db
+        .create_session(
+            "expiry-session",
+            1,
+            "csrf-token",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("expiry-session").unwrap();
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut upload = admin_multipart_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "csrf-token",
+        "expired.txt",
+        b"must not replace",
+        true,
+    );
+    upload.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=expiry-session"),
+    );
+    let upload_app = app.clone();
+    let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+    state.db.expire_session_for_test("expiry-session").unwrap();
+    drop(storage_guard);
+    let response = upload.await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_text(response).await,
+        r#"{"error":"session_revoked"}"#
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/expired.txt")).unwrap(),
+        b"original"
+    );
+
+    assert_eq!(state.upload_admission.available_permits(), 1);
+    assert!(state.upload_peer_admission.lock().unwrap().is_empty());
+    assert_eq!(state.db.count_audit(Some("admin_upload")).unwrap(), 0);
+    assert_eq!(
+        state.db.count_audit(Some("admin_upload_replaced")).unwrap(),
+        0
     );
 }

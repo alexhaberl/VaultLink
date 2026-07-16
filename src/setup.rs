@@ -1103,7 +1103,7 @@ fn legacy_setup_form(token: &str, error: Option<&str>) -> String {
   <section class="vl-form-card"><h2><vl-i18n key="setup.storage"/></h2><div class="vl-form-grid">
     <label><vl-i18n key="setup.root_mount_path"/><br><div class="vl-input-action"><input name="root_mount_path" value="/tmp/vaultlink-root" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="root_mount_path"><vl-i18n key="setup.browse"/></button></div></label>
     <label><vl-i18n key="setup.data_directory"/><br><div class="vl-input-action"><input name="data_directory" value="/tmp/vaultlink-data" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="data_directory"><vl-i18n key="setup.browse"/></button></div></label>
-    <label><vl-i18n key="setup.internal_directory"/><br><div class="vl-input-action"><input name="internal_directory" data-mount-policy-field><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="internal_directory"><vl-i18n key="setup.browse"/></button></div></label>
+    <label><vl-i18n key="setup.internal_directory"/><br><div class="vl-input-action"><input name="internal_directory" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="internal_directory"><vl-i18n key="setup.browse"/></button></div></label>
     <label><vl-i18n key="setup.expected_filesystem_type"/><br><input name="expected_filesystem_type" placeholder="ext4 oder cifs" data-mount-policy-field></label>
     <label><vl-i18n key="setup.expected_mount_source"/><br><input name="expected_mount_source" placeholder="/dev/mapper/storage oder //server/share" data-mount-policy-field></label>
     <label class="vl-toggle"><input type="checkbox" name="require_mount" data-require-mount><span><vl-i18n key="setup.require_mount"/><small><vl-i18n key="setup.require_mount_help"/></small></span></label>
@@ -1365,7 +1365,10 @@ mod tests {
             public_base_url: "http://localhost:8080".into(),
             root_mount_path: root.display().to_string(),
             data_directory: data.display().to_string(),
-            internal_directory: String::new(),
+            internal_directory: root
+                .join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)
+                .display()
+                .to_string(),
             require_mount: None,
             external_writers: None,
             expected_filesystem_type: String::new(),
@@ -1432,6 +1435,8 @@ mod tests {
         );
         assert!(html.contains("data-dir-picker=\"root_mount_path\""));
         assert!(html.contains("data-dir-picker=\"internal_directory\""));
+        assert!(html.contains(r#"<input name="internal_directory" required>"#));
+        assert!(!html.contains(r#"name="internal_directory" data-mount-policy-field"#));
         assert!(html.contains("data-require-mount"));
         assert!(html.contains("data-external-writers"));
         assert!(html.contains("data-file-picker=\"tls_cert_file\""));
@@ -1994,6 +1999,27 @@ mod tests {
         assert!(config.reverse_proxy.enabled);
         assert!(config.reverse_proxy.trust_x_forwarded_headers);
         assert!(!config.tls.enabled);
+    }
+
+    #[tokio::test]
+    async fn development_setup_rejects_blank_internal_directory_without_inference() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        let mut form = form(root.path(), data.path());
+        form.internal_directory.clear();
+
+        let error = match build_and_store(&config_path, form).await {
+            Ok(_) => panic!("development setup inferred a missing internal storage boundary"),
+            Err(error) => error,
+        };
+        assert!(error.contains("storage.internal_directory must be configured explicitly"));
+        assert!(!config_path.exists());
+        assert!(!root
+            .path()
+            .join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)
+            .exists());
     }
 
     #[tokio::test]

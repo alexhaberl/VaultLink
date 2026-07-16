@@ -169,7 +169,7 @@ impl Database {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let expires = (now + Duration::seconds(UPLOAD_RESERVATION_TTL_SECONDS)).to_rfc3339();
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM public_upload_reservations WHERE expires_at<=?1",
@@ -261,7 +261,7 @@ impl Database {
         let now_text = now.to_rfc3339();
         let expires = (now + Duration::seconds(UPLOAD_RESERVATION_TTL_SECONDS)).to_rfc3339();
         let reservation_hash = token_hash(token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM public_upload_reservations WHERE expires_at<=?1",
@@ -360,7 +360,7 @@ impl Database {
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
         let reservation_hash = token_hash(token);
         let now_text = Utc::now().to_rfc3339();
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM public_upload_reservations WHERE expires_at<=?1",
@@ -434,7 +434,7 @@ impl Database {
     }
 
     pub fn cancel_upload_reservation(&self, token: &str) -> rusqlite::Result<bool> {
-        Ok(self.conn().execute(
+        Ok(self.try_conn()?.execute(
             "DELETE FROM public_upload_reservations WHERE token_hash=?1",
             [token_hash(token)],
         )? == 1)
@@ -442,7 +442,7 @@ impl Database {
 
     #[cfg(test)]
     pub fn active_upload_reservations(&self, share_id: i64) -> rusqlite::Result<u64> {
-        self.conn().query_row(
+        self.try_conn()?.query_row(
             "SELECT COUNT(*)
              FROM public_upload_reservations reservations
              JOIN shares ON shares.id=reservations.share_id
@@ -454,7 +454,7 @@ impl Database {
     }
     pub fn count_download(&self, id: i64) -> rusqlite::Result<bool> {
         let now = Utc::now().to_rfc3339();
-        Ok(self.conn().execute(
+        Ok(self.try_conn()?.execute(
             "UPDATE shares
              SET download_count=download_count+1
              WHERE id=?1 AND active=1 AND (expires_at IS NULL OR expires_at>?2)
@@ -488,7 +488,7 @@ impl Database {
         let (now, expires) = transfer_deadlines();
         let session_token_hash = token_hash(session_token);
         let lease_token_hash = token_hash(lease_token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state(&transaction, &now)?;
         let access = transfer_access_state(
@@ -565,7 +565,7 @@ impl Database {
     ) -> rusqlite::Result<TransferAvailabilityOutcome> {
         let (now, _) = transfer_deadlines();
         let session_token_hash = token_hash(session_token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state(&transaction, &now)?;
         let outcome = match transfer_access_state(
@@ -618,7 +618,7 @@ impl Database {
     ) -> rusqlite::Result<TransferLeaseCompleteOutcome> {
         let (now, expires) = transfer_deadlines();
         let lease_token_hash = token_hash(lease_token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state(&transaction, &now)?;
         let lease = transaction
@@ -697,7 +697,7 @@ impl Database {
     ) -> rusqlite::Result<TransferLeaseCancelOutcome> {
         let (now, _) = transfer_deadlines();
         let lease_token_hash = token_hash(lease_token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state(&transaction, &now)?;
         let grant = transaction
@@ -754,7 +754,7 @@ impl Database {
         let now = now_datetime.to_rfc3339();
         let rolling_expiry = now_datetime + Duration::seconds(TRANSFER_SESSION_TTL_SECONDS);
         let lease_token_hash = token_hash(lease_token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let grant = transaction
             .query_row(
@@ -877,7 +877,7 @@ impl Database {
     /// Number of distinct, uncounted grants currently reserving a download slot.
     pub fn active_transfer_reservations(&self, share_id: i64) -> rusqlite::Result<u64> {
         let now = Utc::now().to_rfc3339();
-        self.conn().query_row(
+        self.try_conn()?.query_row(
             "SELECT COUNT(*) FROM public_transfer_grants grants
              WHERE grants.share_id=?1 AND grants.counted=0 AND grants.expires_at>?2
                AND EXISTS(
@@ -890,7 +890,7 @@ impl Database {
     }
 
     pub fn transfer_statistics_started_at(&self) -> rusqlite::Result<String> {
-        self.conn().query_row(
+        self.try_conn()?.query_row(
             "SELECT started_at FROM transfer_statistics WHERE singleton=1",
             [],
             |row| row.get(0),
@@ -902,7 +902,7 @@ impl Database {
                 "month must use UTC YYYY-MM".into(),
             ));
         }
-        let connection = self.conn();
+        let connection = self.try_conn()?;
         let mut statement = connection.prepare(
             "SELECT action,count FROM transfer_monthly_counts WHERE month=?1 ORDER BY action",
         )?;

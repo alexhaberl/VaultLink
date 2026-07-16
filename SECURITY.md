@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-`0.4.3` is currently a private release candidate for Linux x86_64 and aarch64. No published version is supported until the signed artifacts, native release gates, and annotated tag in the release checklist are complete. Security fixes are prepared on the latest private candidate; Windows hosts are not supported.
+Release line: `0.5.0` for Linux x86_64 and aarch64. Its hardening work passed through the internal, untagged 0.4.9 candidate. Only artifacts attached to the signed, annotated `v0.5.0` tag are supported; if that tag is absent, no published version is supported. Windows hosts are not supported.
 
 ## Build and release security
 
@@ -10,7 +10,7 @@
 - Rust toolchains and CI-installed Cargo tools use exact versions. `tools/check-supply-chain-policy.sh` rejects mutable workflow references, remote `curl | sh`, and missing Docker build-context exclusions.
 - Push and pull-request CI audits the shared workspace `Cargo.lock`, compiles every fuzz target, and runs setup, API, upgrade, and rollback Docker smokes without external runtime networking.
 - Local `.env`, root `config.toml`, and SQLite files are excluded from the Docker context; the smoke image copies only build inputs and deploy tests explicitly.
-- Debian APT packages still come from the signed live Debian repositories. The image digest fixes the starting filesystem, but bit-for-bit rebuilds require a separately maintained Debian snapshot and are not claimed yet.
+- Debian build packages come exclusively from the checked-in, timestamped Debian snapshot and an exact direct/transitive package lock. The weekly and manually dispatched native reproducibility gate compares two clean binary and archive builds per architecture before release.
 
 ## Reporting a vulnerability
 

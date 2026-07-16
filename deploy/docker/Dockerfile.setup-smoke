@@ -1,35 +1,36 @@
 # Keep this pin aligned with rust-toolchain.toml and the release workflow.
 FROM rust:1.97.0-trixie@sha256:8e117cab45b7e67c5d146456107cd0f8bf87df3a668e5cf142be6984cf900ca0
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        coreutils \
-        curl \
-        passwd \
-        python3 \
-        pkg-config \
-        build-essential \
-        shellcheck \
-        sqlite3 \
-        systemd \
-        util-linux \
-    && rm -rf /var/lib/apt/lists/*
+COPY deploy/docker/debian-snapshot.sources deploy/docker/debian-packages.lock /tmp/vaultlink-debian/
+COPY tools/install-pinned-debian-packages.sh /tmp/vaultlink-debian/install.sh
+RUN /bin/sh /tmp/vaultlink-debian/install.sh \
+        /tmp/vaultlink-debian/debian-snapshot.sources \
+        /tmp/vaultlink-debian/debian-packages.lock \
+    && rm -rf /tmp/vaultlink-debian
+
+RUN cargo install --locked cargo-cyclonedx --version 0.5.9 \
+    && cargo install --locked cargo-audit --version 0.22.2
 
 WORKDIR /work
 COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile .dockerignore ./
+COPY README.md SECURITY.md CHANGELOG.md ./
 COPY .github ./.github
 COPY src ./src
 COPY templates ./templates
 COPY config ./config
+COPY docs ./docs
 COPY fuzz/Cargo.toml ./fuzz/Cargo.toml
 COPY fuzz/fuzz_targets ./fuzz/fuzz_targets
 COPY deploy ./deploy
+COPY release ./release
 COPY tools ./tools
 
 RUN chmod 0644 deploy/Caddyfile deploy/*.conf deploy/*.example \
-        deploy/vaultlink.service tools/*.txt \
+        deploy/vaultlink.service deploy/docker/*.lock deploy/docker/*.sources tools/*.txt \
     && chmod 0755 deploy/*.sh deploy/docker/*.sh tools/*.sh \
+    && groupadd --system vaultlink \
+    && useradd --system --gid vaultlink --home-dir /nonexistent \
+        --no-create-home --shell /usr/sbin/nologin vaultlink \
     && shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh \
     && sh tools/check-supply-chain-policy.sh
 

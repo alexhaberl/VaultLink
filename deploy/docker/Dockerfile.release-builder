@@ -1,0 +1,15 @@
+# This image is deliberately independent of application source and the image lock.
+# Build and publish it for linux/amd64 and linux/arm64, then pin its manifest digest.
+FROM rust:1.97.0-trixie@sha256:8e117cab45b7e67c5d146456107cd0f8bf87df3a668e5cf142be6984cf900ca0
+
+COPY deploy/docker/debian-snapshot.sources deploy/docker/debian-packages.lock /tmp/vaultlink-debian/
+COPY tools/install-pinned-debian-packages.sh /tmp/vaultlink-debian/install.sh
+RUN /bin/sh /tmp/vaultlink-debian/install.sh \
+        /tmp/vaultlink-debian/debian-snapshot.sources \
+        /tmp/vaultlink-debian/debian-packages.lock \
+    && rm -rf /tmp/vaultlink-debian
+
+RUN cargo install --locked cargo-cyclonedx --version 0.5.9 \
+    && cargo install --locked cargo-audit --version 0.22.2
+
+WORKDIR /work

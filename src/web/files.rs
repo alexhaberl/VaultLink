@@ -6,7 +6,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
 };
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 use super::{
@@ -42,9 +42,9 @@ use crate::{
     db::AuditContext,
     file_ops,
     http_auth::{
-        audit_observation, csrf, current_audit_client_ip, current_client_limit_key, database,
-        enabled_audit_client_ip, runtime_settings, session, try_acquire_client_activity,
-        with_audit_client_ip, MissingSession,
+        audit_observation, clear_session_cookie, csrf, current_audit_client_ip,
+        current_client_limit_key, database, enabled_audit_client_ip, runtime_settings, session,
+        try_acquire_client_activity, with_audit_client_ip, MissingSession,
     },
     i18n::{self, Locale},
     path_security,
@@ -236,6 +236,13 @@ pub(super) struct AdminUploadSuccess {
     audit_durability_uncertain: bool,
 }
 
+const ADMIN_UPLOAD_SESSION_REVOKED: &str = "session_revoked";
+
+#[derive(Serialize)]
+struct AdminUploadSessionRevoked {
+    error: &'static str,
+}
+
 pub(super) async fn persist_required_file_audit(
     state: &AppState,
     context: AuditContext,
@@ -341,7 +348,9 @@ pub(super) async fn process_admin_upload(
     headers: &HeaderMap,
     mut multipart: Multipart,
 ) -> Result<AdminUploadSuccess> {
-    let (_, admin) = session(state, headers, true, MissingSession::RedirectToLogin).await?;
+    let (session_token, admin) =
+        session(state, headers, true, MissingSession::RedirectToLogin).await?;
+    let admin_id = admin.admin_id;
     let _upload_permit = state
         .upload_admission
         .clone()
@@ -532,18 +541,27 @@ pub(super) async fn process_admin_upload(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(internal(error)),
         };
-        let publish_result = tokio::task::spawn_blocking(move || {
-            // Publishing is not cancelled with the HTTP request. Retain the
-            // mutation lock in the blocking task until the namespace change ends.
+        let publish_result = database(state.db.clone(), move |database| {
+            // Publishing is not cancelled with the HTTP request. Retain the storage
+            // lock through the namespace change, and retain the database connection
+            // lock from the exact-session recheck through publication. Session
+            // revocation and this commit therefore have one deterministic order.
             let _storage_guard = storage_guard;
-            if overwrite_existing {
-                pending.publish_replace(&publish_name)
-            } else {
-                pending.publish(&publish_name)
-            }
+            database.with_live_mfa_session(&session_token, admin_id, || {
+                if overwrite_existing {
+                    pending.publish_replace(&publish_name)
+                } else {
+                    pending.publish(&publish_name)
+                }
+            })
         })
-        .await
-        .map_err(internal)?;
+        .await?;
+        let Some(publish_result) = publish_result else {
+            return Err(AppError(
+                StatusCode::UNAUTHORIZED,
+                ADMIN_UPLOAD_SESSION_REVOKED,
+            ));
+        };
         let publish_outcome = match publish_result {
             Ok(outcome) => outcome,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -601,7 +619,18 @@ pub(super) async fn admin_upload(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Response> {
-    let success = process_admin_upload(&state, &headers, multipart).await?;
+    let success = match process_admin_upload(&state, &headers, multipart).await {
+        Ok(success) => success,
+        Err(AppError(StatusCode::UNAUTHORIZED, ADMIN_UPLOAD_SESSION_REVOKED)) => {
+            let mut response = Redirect::to("/login").into_response();
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&clear_session_cookie(&state)).map_err(internal)?,
+            );
+            return Ok(response);
+        }
+        Err(error) => return Err(error),
+    };
     let mut response = Redirect::to(&browser_redirect(
         &success.directory,
         if success.audit_durability_uncertain {
@@ -652,6 +681,13 @@ pub(super) async fn admin_upload_queue(
             )
                 .into_response()
         }
+        Err(AppError(StatusCode::UNAUTHORIZED, ADMIN_UPLOAD_SESSION_REVOKED)) => (
+            StatusCode::UNAUTHORIZED,
+            Json(AdminUploadSessionRevoked {
+                error: ADMIN_UPLOAD_SESSION_REVOKED,
+            }),
+        )
+            .into_response(),
         Err(AppError(status, message)) => upload_queue_error_response(status, message),
     }
 }

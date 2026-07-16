@@ -1,0 +1,163 @@
+name: Reproducible release build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  contents: read
+  packages: read
+  statuses: write
+
+jobs:
+  release_environment:
+    name: Resolve pinned reproducibility environment
+    runs-on: [self-hosted, Linux, ARM64, vaultlink]
+    env:
+      RELEASE_BUILDER_IMAGE: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Validate pinned release image before matrix startup
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$RELEASE_BUILDER_IMAGE"
+          locked_image=$(sed -n '1p' deploy/docker/release-builder-image.lock)
+          test "$(wc -l <deploy/docker/release-builder-image.lock)" -eq 1
+          if [[ "$locked_image" == UNPROVISIONED ]]; then
+            echo "release builder is UNPROVISIONED; commit its real manifest digest in a dependency-refresh change" >&2
+            exit 1
+          fi
+          case "$locked_image" in
+            ghcr.io/alexhaberl/vaultlink-release-builder@sha256:*) ;;
+            *) echo "checked-in release builder is not the fixed digest-pinned GHCR image" >&2; exit 1 ;;
+          esac
+          test "$image" = "$locked_image"
+          digest=${image##*@sha256:}
+          printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$'
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+
+  compare:
+    name: Clean native comparison (${{ matrix.architecture }})
+    concurrency:
+      group: reproducibility-${{ github.ref }}-${{ matrix.architecture }}
+      cancel-in-progress: false
+    needs: release_environment
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runs_on: '["self-hosted", "Linux", "X64", "vaultlink"]'
+            expected_uname: x86_64
+          - architecture: arm64
+            runs_on: '["self-hosted", "Linux", "ARM64", "vaultlink"]'
+            expected_uname: aarch64
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 120
+    container:
+      image: ${{ needs.release_environment.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CARGO_TERM_COLOR: always
+      SOURCE_DATE_EPOCH: "0"
+      RELEASE_BUILDER_IMAGE: ${{ needs.release_environment.outputs.image }}
+    steps:
+      - name: Restore host workspace ownership before checkout
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Verify prebuilt release environment
+        run: sh tools/verify-release-builder.sh
+      - name: Verify native inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "${{ matrix.expected_uname }}"
+          test "$(rustc --version | awk '{print $2}')" = "$(sh tools/rust-toolchain-channel.sh)"
+          sh tools/check-supply-chain-policy.sh
+      - name: Build twice from empty target directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          rm -rf target/repro-first target/repro-second repro
+          mkdir -p repro
+
+          CARGO_TARGET_DIR=target/repro-first cargo build --locked --release
+          rm -f ./*.cdx.json
+          cargo cyclonedx --format json
+          first_raw_sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print)
+          test "$(printf '%s\n' "$first_raw_sbom" | grep -c .)" -eq 1
+          python3 tools/normalize-cyclonedx-sbom.py \
+            "$first_raw_sbom" repro/first-sbom.cdx.json
+          rm -f "$first_raw_sbom"
+          sh tools/assemble-release-archive.sh \
+            target/repro-first/release/vaultlink repro/first-sbom.cdx.json \
+            repro/first-dist "$version" '${{ matrix.architecture }}'
+
+          CARGO_TARGET_DIR=target/repro-second cargo build --locked --release
+          rm -f ./*.cdx.json
+          cargo cyclonedx --format json
+          second_raw_sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print)
+          test "$(printf '%s\n' "$second_raw_sbom" | grep -c .)" -eq 1
+          python3 tools/normalize-cyclonedx-sbom.py \
+            "$second_raw_sbom" repro/second-sbom.cdx.json
+          rm -f "$second_raw_sbom"
+          sh tools/assemble-release-archive.sh \
+            target/repro-second/release/vaultlink repro/second-sbom.cdx.json \
+            repro/second-dist "$version" '${{ matrix.architecture }}'
+
+          standalone="vaultlink-${version}-debian13-${{ matrix.architecture }}"
+          archive="VaultLink-${version}-debian13-${{ matrix.architecture }}.tar.gz"
+          cmp "repro/first-dist/$standalone" "repro/second-dist/$standalone"
+          cmp repro/first-sbom.cdx.json repro/second-sbom.cdx.json
+          cmp "repro/first-dist/$archive" "repro/second-dist/$archive"
+          sha256sum \
+            "repro/first-dist/$standalone" "repro/second-dist/$standalone" \
+            "repro/first-dist/$archive" "repro/second-dist/$archive" \
+            >"repro/SHA256SUMS-${{ matrix.architecture }}"
+          printf 'version=%s\ncommit=%s\nsource_date_epoch=%s\narchitecture=%s\nbuilder_image=%s\n' \
+            "$version" "$GITHUB_SHA" "$SOURCE_DATE_EPOCH" "${{ matrix.architecture }}" \
+            "$RELEASE_BUILDER_IMAGE" \
+            >"repro/manifest-${{ matrix.architecture }}.env"
+      - name: Upload comparison evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reproducibility-${{ github.sha }}-${{ matrix.architecture }}
+          path: |
+            repro/SHA256SUMS-${{ matrix.architecture }}
+            repro/manifest-${{ matrix.architecture }}.env
+          if-no-files-found: error
+          retention-days: 30
+      - name: Restore host workspace ownership
+        if: always()
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+      - name: Publish exact-commit reproducibility status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_RESULT: ${{ job.status }}
+        shell: bash
+        run: |
+          case "$JOB_RESULT" in
+            success) state=success; description='Two clean native builds matched' ;;
+            *) state=failure; description='Native reproducibility gate failed' ;;
+          esac
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context='vaultlink/reproducibility-${{ matrix.architecture }}' \
+            -f description="$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

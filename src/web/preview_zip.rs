@@ -79,12 +79,25 @@ impl ZipTempReservation {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn acquire_unchecked_for_test(estimated_bytes: u64) -> Self {
+        ZIP_TEMP_RESERVED.fetch_add(estimated_bytes, Ordering::AcqRel);
+        Self {
+            bytes: estimated_bytes,
+        }
+    }
 }
 
 impl Drop for ZipTempReservation {
     fn drop(&mut self) {
         ZIP_TEMP_RESERVED.fetch_sub(self.bytes, Ordering::AcqRel);
     }
+}
+
+#[cfg(test)]
+pub(super) fn zip_temp_reserved_bytes_for_test() -> u64 {
+    ZIP_TEMP_RESERVED.load(Ordering::Acquire)
 }
 
 #[derive(Debug)]
@@ -490,13 +503,33 @@ impl Write for ZipChannelWriter {
     }
 }
 
+#[cfg(test)]
 pub(super) fn direct_zip_stream<D: DirectoryAccess>(
     directory: D,
     plan: ZipPlan,
 ) -> impl Stream<Item = io::Result<Bytes>> + Send {
+    direct_zip_stream_with_resources(directory, plan, (), || {})
+}
+
+/// Keeps `resources` inside the producer itself. If the HTTP body is dropped,
+/// the receiver closes immediately, but admission resources are not released
+/// until the blocking writer observes that closure and actually terminates.
+pub(super) fn direct_zip_stream_with_resources<D, R, F>(
+    directory: D,
+    plan: ZipPlan,
+    resources: R,
+    on_start: F,
+) -> impl Stream<Item = io::Result<Bytes>> + Send
+where
+    D: DirectoryAccess,
+    R: Send + 'static,
+    F: FnOnce() + Send + 'static,
+{
     let (sender, receiver) = tokio::sync::mpsc::channel(ZIP_CHANNEL_CHUNKS);
     let error_sender = sender.clone();
     tokio::task::spawn_blocking(move || {
+        let _resources = resources;
+        on_start();
         if let Err(error) = write_zip_archive(&directory, &plan, ZipChannelWriter::new(sender)) {
             let _ = error_sender.blocking_send(Err(error.into_io()));
         }

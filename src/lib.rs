@@ -6,6 +6,9 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod file_ops;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod http_auth;
 pub mod i18n;
 pub mod multipart_guard;
@@ -20,6 +23,7 @@ pub mod secure_fs;
 pub(crate) mod sensitive;
 pub(crate) mod services;
 pub mod setup;
+pub mod storage_cleanup;
 pub mod storage_mount;
 #[cfg(test)]
 mod template_policy_tests;
@@ -69,7 +73,7 @@ pub struct AppState {
     pub webauthn: Arc<RwLock<webauthn::WebAuthnService>>,
     pub security_settings_mutation: Arc<tokio::sync::Mutex<()>>,
     pub storage_mutation: Arc<tokio::sync::Mutex<()>>,
-    pub storage_cleanup: Arc<tokio::sync::Mutex<()>>,
+    pub storage_cleanup: storage_cleanup::StorageCleanupCoordinator,
     pub upload_admission: Arc<tokio::sync::Semaphore>,
     pub response_admission: Arc<tokio::sync::Semaphore>,
     pub stream_admission: Arc<tokio::sync::Semaphore>,
@@ -182,7 +186,7 @@ impl AppState {
             webauthn: Arc::new(RwLock::new(webauthn)),
             security_settings_mutation: Arc::new(tokio::sync::Mutex::new(())),
             storage_mutation: Arc::new(tokio::sync::Mutex::new(())),
-            storage_cleanup: Arc::new(tokio::sync::Mutex::new(())),
+            storage_cleanup: storage_cleanup::StorageCleanupCoordinator::new(),
             upload_admission: Arc::new(tokio::sync::Semaphore::new(32)),
             response_admission: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_RESPONSES)),
             stream_admission: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_STREAMS)),
@@ -456,7 +460,7 @@ fn errno_error(error: rustix::io::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error.raw_os_error())
 }
 
-fn runtime_settings_from_persisted(
+pub(crate) fn runtime_settings_from_persisted(
     config: &Config,
     persisted: &[(String, String)],
 ) -> Result<RuntimeSettings, String> {
@@ -495,7 +499,7 @@ mod tests {
             storage: Storage {
                 root_mount_path: root.into(),
                 data_directory: data.into(),
-                internal_directory: None,
+                internal_directory: Some(root.join(DEFAULT_INTERNAL_DIRECTORY_NAME)),
                 require_mount: false,
                 external_writers: false,
                 expected_filesystem_type: None,

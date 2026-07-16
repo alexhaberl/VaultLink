@@ -8,10 +8,52 @@ use crate::{
         DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE, MAX_SQLITE_UNSIGNED,
     },
     path_security,
-    policy::{self, SharePasswordValidation},
+    policy::{self, SharePasswordValidation, ShareUploadPolicyError},
     runtime::RuntimeSettings,
     sensitive::SecretString,
+    AppState,
 };
+
+/// Serializes every administrator-controlled share-authority change with the
+/// public-upload policy checkpoint.  The guard is moved into the blocking DB
+/// task on commit, so cancelling the HTTP adapter cannot release the storage
+/// lock before the database mutation has reached a terminal result.
+pub(crate) struct ShareAuthorityMutation {
+    database: Database,
+    storage_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl ShareAuthorityMutation {
+    pub(crate) async fn acquire(state: &AppState) -> Self {
+        Self::from_guard(state, state.storage_mutation.clone().lock_owned().await)
+    }
+
+    pub(crate) fn from_guard(
+        state: &AppState,
+        storage_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Self {
+        Self {
+            database: state.db.clone(),
+            storage_guard,
+        }
+    }
+
+    pub(crate) async fn commit<T, F>(self, operation: F) -> crate::http_auth::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Database) -> rusqlite::Result<T> + Send + 'static,
+    {
+        let Self {
+            database,
+            storage_guard,
+        } = self;
+        crate::http_auth::required_database(database, move |database| {
+            let _storage_guard = storage_guard;
+            operation(database)
+        })
+        .await
+    }
+}
 
 /// The target kind established by the secure-filesystem adapter while it holds
 /// the storage mutation lock. Special files cannot be represented here.
@@ -200,7 +242,15 @@ impl ShareService {
 
         let is_directory = command.target.is_directory();
         let allows_upload = command.permission.can_upload();
-        if !is_directory && allows_upload {
+        if matches!(
+            policy::share_upload_conflict_strategy(
+                is_directory,
+                command.permission.clone(),
+                false,
+                false,
+            ),
+            Err(ShareUploadPolicyError::UploadPermissionRequiresDirectory)
+        ) {
             return Err(ShareServiceError::UploadPermissionRequiresDirectory);
         }
         if command
@@ -254,17 +304,23 @@ impl ShareService {
             None
         };
 
-        let upload_conflict_strategy = if command.overwrite_allowed {
-            if self.external_writers {
-                return Err(ShareServiceError::OverwriteDisabledForExternalWriters);
+        let upload_conflict_strategy = policy::share_upload_conflict_strategy(
+            is_directory,
+            command.permission.clone(),
+            command.overwrite_allowed,
+            self.external_writers,
+        )
+        .map_err(|error| match error {
+            ShareUploadPolicyError::UploadPermissionRequiresDirectory => {
+                ShareServiceError::UploadPermissionRequiresDirectory
             }
-            if !is_upload_directory {
-                return Err(ShareServiceError::OverwriteRequiresDirectoryUpload);
+            ShareUploadPolicyError::OverwriteRequiresDirectoryUpload => {
+                ShareServiceError::OverwriteRequiresDirectoryUpload
             }
-            UploadConflictStrategy::OverwriteAllowed
-        } else {
-            UploadConflictStrategy::Reject
-        };
+            ShareUploadPolicyError::OverwriteDisabledForExternalWriters => {
+                ShareServiceError::OverwriteDisabledForExternalWriters
+            }
+        })?;
 
         let password_to_hash = self.prepare_password(command.password)?;
         let password_protected = password_to_hash.is_some();

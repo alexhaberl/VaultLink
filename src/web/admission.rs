@@ -68,11 +68,6 @@ pub(super) struct PermitBody {
     pub(super) _permit: OwnedSemaphorePermit,
 }
 
-pub(super) struct PeerPermitBody {
-    pub(super) inner: Body,
-    pub(super) _permit: ClientActivityPermit,
-}
-
 pub(super) struct StreamAdmissionBody {
     pub(super) inner: Body,
     pub(super) _permit: OwnedSemaphorePermit,
@@ -193,26 +188,6 @@ impl HttpBody for StreamAdmissionBody {
 }
 
 impl HttpBody for PermitBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
-        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl HttpBody for PeerPermitBody {
     type Data = Bytes;
     type Error = axum::Error;
 

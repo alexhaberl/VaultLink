@@ -7,8 +7,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
+#[cfg(panic = "unwind")]
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::{
-    catch_panic::CatchPanicLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     timeout::RequestBodyTimeoutLayer,
     trace::TraceLayer,
@@ -118,7 +119,7 @@ impl From<crate::http_auth::HttpAuthError> for AppError {
 
 pub fn router(state: AppState) -> Router {
     let limit = HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize;
-    Router::new()
+    let router = Router::new()
         .nest("/api/v1", crate::api::router(state.clone()))
         .route("/", get(|| async { Redirect::to("/admin") }))
         .route("/login", get(auth_ui::login_page).post(auth_ui::login))
@@ -273,8 +274,10 @@ pub fn router(state: AppState) -> Router {
                     version = ?request.version()
                 )
             }),
-        )
-        .layer(CatchPanicLayer::new())
+        );
+    #[cfg(panic = "unwind")]
+    let router = router.layer(CatchPanicLayer::new());
+    router
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admission::audit_client_ip_context,

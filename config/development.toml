@@ -7,6 +7,7 @@ production_mode = false
 [storage]
 root_mount_path = "dev/mount"
 data_directory = "dev/data"
+internal_directory = "dev/mount/.vaultlink-internal"
 require_mount = false
 external_writers = false
 # Setup/UI units are decimal: 1 MB = 1,000,000 bytes; 1 GB = 1,000,000,000 bytes.

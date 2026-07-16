@@ -13,7 +13,7 @@ futures-util = "0.3"
 libfuzzer-sys = "0.4"
 tempfile = "3.27"
 tokio = { version = "1", features = ["rt"] }
-vaultlink = { path = ".." }
+vaultlink = { path = "..", features = ["fuzzing"] }
 
 [[bin]]
 name = "path_normalization"
@@ -51,15 +51,15 @@ doc = false
 bench = false
 
 [[bin]]
-name = "upload_validation_policy"
-path = "fuzz_targets/upload_validation_policy.rs"
+name = "upload_request_state"
+path = "fuzz_targets/upload_request_state.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "api_request_policy"
-path = "fuzz_targets/api_request_policy.rs"
+name = "share_request_policy"
+path = "fuzz_targets/share_request_policy.rs"
 test = false
 doc = false
 bench = false

@@ -173,7 +173,7 @@ impl Database {
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO shares(
@@ -260,13 +260,13 @@ impl Database {
         })
     }
     pub fn share_by_token(&self, token: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
+        self.try_conn()?.query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
     }
     pub fn share_by_alias(&self, alias: &str) -> rusqlite::Result<Option<Share>> {
-        self.conn().query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id WHERE alias=?1",[alias],Self::map_share).optional()
+        self.try_conn()?.query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id WHERE alias=?1",[alias],Self::map_share).optional()
     }
     pub fn list_shares(&self) -> rusqlite::Result<Vec<Share>> {
-        let c = self.conn();
+        let c = self.try_conn()?;
         let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id ORDER BY shares.id DESC")?;
         let shares = s
             .query_map([], Self::map_share)?
@@ -278,7 +278,7 @@ impl Database {
         path: &str,
         is_directory: bool,
     ) -> rusqlite::Result<usize> {
-        let connection = self.conn();
+        let connection = self.try_conn()?;
         let mut statement =
             connection.prepare("SELECT relative_path FROM shares WHERE active=1")?;
         let mut count = 0usize;
@@ -321,7 +321,7 @@ impl Database {
         is_directory: bool,
         required_audit: Option<(&AuditContext, bool)>,
     ) -> rusqlite::Result<usize> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updates = {
             let mut statement = transaction.prepare("SELECT id,relative_path FROM shares")?;
@@ -394,7 +394,7 @@ impl Database {
         is_directory: bool,
         required_audit: Option<(&AuditContext, bool, bool)>,
     ) -> rusqlite::Result<usize> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ids = {
             let mut statement =
@@ -445,7 +445,7 @@ impl Database {
         Ok(ids.len())
     }
     pub fn set_share_active(&self, id: i64, active: bool) -> rusqlite::Result<bool> {
-        Ok(self.conn().execute(
+        Ok(self.try_conn()?.execute(
             "UPDATE shares
              SET upload_policy_epoch=upload_policy_epoch+
                      CASE WHEN active<>?2 THEN 1 ELSE 0 END,
@@ -514,7 +514,7 @@ impl Database {
         upload_limits: Option<(u64, u64)>,
         required_audit: Option<(&AuditContext, &[RequiredAuditEvent])>,
     ) -> rusqlite::Result<ShareControlsUpdateOutcome> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now().to_rfc3339();
         transaction.execute(
@@ -615,7 +615,7 @@ impl Database {
 
     pub fn delete_share(&self, id: i64) -> rusqlite::Result<bool> {
         Ok(self
-            .conn()
+            .try_conn()?
             .execute("DELETE FROM shares WHERE id=?1", [id])?
             == 1)
     }
@@ -636,7 +636,7 @@ impl Database {
     }
 
     pub fn set_share_password(&self, id: i64, hash: Option<&str>) -> rusqlite::Result<bool> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
             "UPDATE shares

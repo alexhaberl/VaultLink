@@ -2,7 +2,168 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
-use crate::{auth, db::Share, runtime::RuntimeSettings};
+use crate::{
+    auth,
+    db::{Permission, Share, UploadConflictStrategy},
+    path_security, runtime,
+    runtime::RuntimeSettings,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShareUploadPolicyError {
+    UploadPermissionRequiresDirectory,
+    OverwriteRequiresDirectoryUpload,
+    OverwriteDisabledForExternalWriters,
+}
+
+/// Computes the upload policy used by both HTTP share adapters and the domain
+/// service. Keeping this decision in production code lets fuzzing exercise the
+/// same rule instead of a model that can drift from the handlers.
+pub fn share_upload_conflict_strategy(
+    is_directory: bool,
+    permission: Permission,
+    overwrite_requested: bool,
+    external_writers: bool,
+) -> Result<UploadConflictStrategy, ShareUploadPolicyError> {
+    if permission.can_upload() && !is_directory {
+        return Err(ShareUploadPolicyError::UploadPermissionRequiresDirectory);
+    }
+    if !overwrite_requested {
+        return Ok(UploadConflictStrategy::Reject);
+    }
+    if external_writers {
+        return Err(ShareUploadPolicyError::OverwriteDisabledForExternalWriters);
+    }
+    if !is_directory || !permission.can_upload() {
+        return Err(ShareUploadPolicyError::OverwriteRequiresDirectoryUpload);
+    }
+    Ok(UploadConflictStrategy::OverwriteAllowed)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UploadFormField {
+    Path,
+    Overwrite,
+    Csrf,
+    File,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UploadFormStateError {
+    TooManyFields,
+    DuplicateOrLatePath,
+    DuplicateOverwrite,
+    DuplicateOrLateCsrf,
+    MultipleFiles,
+    UnknownField,
+}
+
+/// Tracks only multipart structure. Field contents and I/O stay in the HTTP
+/// adapter, while ordering and cardinality have one production implementation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UploadFormState {
+    fields_seen: usize,
+    saw_path: bool,
+    saw_overwrite: bool,
+    saw_csrf: bool,
+    saw_file: bool,
+}
+
+impl UploadFormState {
+    pub fn observe(
+        &mut self,
+        field: UploadFormField,
+        maximum_fields: usize,
+    ) -> Result<(), UploadFormStateError> {
+        self.fields_seen = self.fields_seen.saturating_add(1);
+        if self.fields_seen > maximum_fields {
+            return Err(UploadFormStateError::TooManyFields);
+        }
+        match field {
+            UploadFormField::Path => {
+                if std::mem::replace(&mut self.saw_path, true) || self.saw_file {
+                    Err(UploadFormStateError::DuplicateOrLatePath)
+                } else {
+                    Ok(())
+                }
+            }
+            UploadFormField::Overwrite => {
+                if std::mem::replace(&mut self.saw_overwrite, true) {
+                    Err(UploadFormStateError::DuplicateOverwrite)
+                } else {
+                    Ok(())
+                }
+            }
+            UploadFormField::Csrf => {
+                if std::mem::replace(&mut self.saw_csrf, true) || self.saw_file {
+                    Err(UploadFormStateError::DuplicateOrLateCsrf)
+                } else {
+                    Ok(())
+                }
+            }
+            UploadFormField::File => {
+                if std::mem::replace(&mut self.saw_file, true) {
+                    Err(UploadFormStateError::MultipleFiles)
+                } else {
+                    Ok(())
+                }
+            }
+            UploadFormField::Unknown => Err(UploadFormStateError::UnknownField),
+        }
+    }
+
+    pub fn saw_file(&self) -> bool {
+        self.saw_file
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicUploadPolicyError {
+    ShareRejected,
+    InvalidPath,
+    InvalidFilename,
+    BlockedExtension,
+    TooLarge,
+}
+
+pub fn normalize_public_upload_subdir(
+    permission: Permission,
+    value: &str,
+) -> Result<String, PublicUploadPolicyError> {
+    if !permission.can_upload() {
+        return Err(PublicUploadPolicyError::ShareRejected);
+    }
+    if permission == Permission::UploadOnly {
+        return Ok(String::new());
+    }
+    path_security::validate_relative(value)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .map_err(|_| PublicUploadPolicyError::InvalidPath)
+}
+
+pub fn validate_public_upload_filename<'a>(
+    filename: &'a str,
+    blocked_extensions: &[String],
+) -> Result<&'a str, PublicUploadPolicyError> {
+    let filename = path_security::safe_admin_filename(filename)
+        .map_err(|_| PublicUploadPolicyError::InvalidFilename)?;
+    if runtime::extension_is_blocked(filename, blocked_extensions) {
+        return Err(PublicUploadPolicyError::BlockedExtension);
+    }
+    Ok(filename)
+}
+
+pub fn add_upload_bytes(
+    total: u64,
+    chunk: u64,
+    maximum: u64,
+) -> Result<u64, PublicUploadPolicyError> {
+    total
+        .checked_add(chunk)
+        .filter(|new_total| *new_total <= maximum)
+        .ok_or(PublicUploadPolicyError::TooLarge)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShareAvailability {
@@ -205,5 +366,90 @@ mod tests {
         let settings = runtime_settings();
         assert!(preview_metadata_allowed("scan.tiff", &settings));
         assert!(!preview_allowed("scan.tiff", &settings));
+    }
+
+    #[test]
+    fn share_upload_policy_is_the_single_overwrite_decision() {
+        assert_eq!(
+            share_upload_conflict_strategy(true, Permission::DownloadUpload, true, false),
+            Ok(UploadConflictStrategy::OverwriteAllowed)
+        );
+        assert_eq!(
+            share_upload_conflict_strategy(false, Permission::UploadOnly, false, false),
+            Err(ShareUploadPolicyError::UploadPermissionRequiresDirectory)
+        );
+        assert_eq!(
+            share_upload_conflict_strategy(true, Permission::UploadOnly, true, true),
+            Err(ShareUploadPolicyError::OverwriteDisabledForExternalWriters)
+        );
+    }
+
+    #[test]
+    fn upload_form_state_rejects_duplicate_and_late_security_fields() {
+        let mut state = UploadFormState::default();
+        state.observe(UploadFormField::Path, 4).unwrap();
+        state.observe(UploadFormField::File, 4).unwrap();
+        assert_eq!(
+            state.observe(UploadFormField::Csrf, 4),
+            Err(UploadFormStateError::DuplicateOrLateCsrf)
+        );
+
+        let mut duplicate = UploadFormState::default();
+        duplicate.observe(UploadFormField::Overwrite, 4).unwrap();
+        assert_eq!(
+            duplicate.observe(UploadFormField::Overwrite, 4),
+            Err(UploadFormStateError::DuplicateOverwrite)
+        );
+
+        let mut duplicate_path = UploadFormState::default();
+        duplicate_path.observe(UploadFormField::Path, 4).unwrap();
+        assert_eq!(
+            duplicate_path.observe(UploadFormField::Path, 4),
+            Err(UploadFormStateError::DuplicateOrLatePath)
+        );
+
+        let mut late_path = UploadFormState::default();
+        late_path.observe(UploadFormField::File, 4).unwrap();
+        assert_eq!(
+            late_path.observe(UploadFormField::Path, 4),
+            Err(UploadFormStateError::DuplicateOrLatePath)
+        );
+
+        let mut multiple_files = UploadFormState::default();
+        multiple_files.observe(UploadFormField::File, 4).unwrap();
+        assert_eq!(
+            multiple_files.observe(UploadFormField::File, 4),
+            Err(UploadFormStateError::MultipleFiles)
+        );
+
+        let mut unknown = UploadFormState::default();
+        assert_eq!(
+            unknown.observe(UploadFormField::Unknown, 4),
+            Err(UploadFormStateError::UnknownField)
+        );
+
+        let mut too_many = UploadFormState::default();
+        too_many.observe(UploadFormField::Overwrite, 1).unwrap();
+        assert_eq!(
+            too_many.observe(UploadFormField::Csrf, 1),
+            Err(UploadFormStateError::TooManyFields)
+        );
+    }
+
+    #[test]
+    fn public_upload_helpers_cover_path_name_and_size() {
+        assert_eq!(
+            normalize_public_upload_subdir(Permission::UploadOnly, "ignored/../path").unwrap(),
+            ""
+        );
+        assert_eq!(
+            validate_public_upload_filename("payload.exe", &["exe".into()]),
+            Err(PublicUploadPolicyError::BlockedExtension)
+        );
+        assert_eq!(add_upload_bytes(4, 6, 10), Ok(10));
+        assert_eq!(
+            add_upload_bytes(4, 7, 10),
+            Err(PublicUploadPolicyError::TooLarge)
+        );
     }
 }

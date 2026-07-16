@@ -24,15 +24,16 @@ use crate::{
     },
     file_ops,
     http_auth::{
-        csrf, current_audit_client_ip, database, hash_password_admitted, required_database,
-        runtime_settings, session, MissingSession,
+        csrf, current_audit_client_ip, database, hash_password_admitted, runtime_settings, session,
+        MissingSession,
     },
     i18n::{self},
     path_security,
     runtime::RuntimeSettings,
     sensitive::SecretString,
     services::share::{
-        CreateShareCommand, SharePasswordInput, ShareService, ShareServiceError, ShareTarget,
+        CreateShareCommand, ShareAuthorityMutation, SharePasswordInput, ShareService,
+        ShareServiceError, ShareTarget,
     },
     AppState,
 };
@@ -506,6 +507,7 @@ pub(super) async fn create_share(
     let storage_guard = file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
         .await
         .map_err(storage_recovery_app_error)?;
+    let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
     let secure_root = state.secure_root.clone();
     let metadata_path = rel.clone();
     let target_metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
@@ -593,23 +595,23 @@ pub(super) async fn create_share(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    required_database(state.db.clone(), move |_| {
-        // Keep target revalidation and the non-cancellable SQLite create
-        // serialized even when the client disconnects mid-request.
-        let _storage_guard = storage_guard;
-        service
-            .create(prepared, password_hash, &audit_context)
-            .map(drop)
-            .map_err(share_service_database_error)
-    })
-    .await
-    .map_err(|error| {
-        if error.status == StatusCode::SERVICE_UNAVAILABLE {
-            AppError::from(error)
-        } else {
-            AppError(StatusCode::CONFLICT, "Token oder Alias bereits vorhanden")
-        }
-    })?;
+    authority_mutation
+        .commit(move |_| {
+            // Keep target revalidation and the non-cancellable SQLite create
+            // serialized even when the client disconnects mid-request.
+            service
+                .create(prepared, password_hash, &audit_context)
+                .map(drop)
+                .map_err(share_service_database_error)
+        })
+        .await
+        .map_err(|error| {
+            if error.status == StatusCode::SERVICE_UNAVAILABLE {
+                AppError::from(error)
+            } else {
+                AppError(StatusCode::CONFLICT, "Token oder Alias bereits vorhanden")
+            }
+        })?;
     Ok(Redirect::to("/admin/shares"))
 }
 
@@ -683,6 +685,7 @@ pub(super) async fn toggle_share(
 ) -> Result<Redirect> {
     let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&s, &f.csrf)?;
+    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
     let sh = database(state.db.clone(), |db| db.list_shares())
         .await?
         .into_iter()
@@ -696,10 +699,11 @@ pub(super) async fn toggle_share(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let changed = required_database(state.db.clone(), move |db| {
-        db.set_share_active_and_audit(id, active, &audit_context, "share_toggled")
-    })
-    .await?;
+    let changed = authority_mutation
+        .commit(move |db| {
+            db.set_share_active_and_audit(id, active, &audit_context, "share_toggled")
+        })
+        .await?;
     if !changed {
         return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
     }
@@ -739,6 +743,7 @@ pub(super) async fn set_share_upload_conflict(
             "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
         ));
     }
+    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
     let share = database(state.db.clone(), |db| db.list_shares())
         .await?
         .into_iter()
@@ -813,17 +818,18 @@ pub(super) async fn set_share_upload_conflict(
             strategy.as_str()
         )),
     )];
-    let outcome = required_database(state.db.clone(), move |db| {
-        db.update_share_controls_and_audit(
-            id,
-            None,
-            Some(&stored_strategy),
-            Some((total_limit, file_limit)),
-            &audit_context,
-            &audit_events,
-        )
-    })
-    .await?;
+    let outcome = authority_mutation
+        .commit(move |db| {
+            db.update_share_controls_and_audit(
+                id,
+                None,
+                Some(&stored_strategy),
+                Some((total_limit, file_limit)),
+                &audit_context,
+                &audit_events,
+            )
+        })
+        .await?;
     match outcome {
         ShareControlsUpdateOutcome::Updated => {}
         ShareControlsUpdateOutcome::NotFound => {
@@ -896,10 +902,12 @@ pub(super) async fn set_share_password(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let changed = required_database(state.db.clone(), move |db| {
-        db.set_share_password_and_audit(id, password_hash.as_deref(), &audit_context, action)
-    })
-    .await?;
+    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let changed = authority_mutation
+        .commit(move |db| {
+            db.set_share_password_and_audit(id, password_hash.as_deref(), &audit_context, action)
+        })
+        .await?;
     if !changed {
         return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
     }
@@ -921,10 +929,10 @@ pub(super) async fn delete_share(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let deleted = required_database(state.db.clone(), move |db| {
-        db.delete_share_and_audit(id, &audit_context)
-    })
-    .await?;
+    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let deleted = authority_mutation
+        .commit(move |db| db.delete_share_and_audit(id, &audit_context))
+        .await?;
     if !deleted {
         return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
     }

@@ -21,7 +21,7 @@ fn test_state(root: &Path, data: &Path) -> AppState {
         storage: Storage {
             root_mount_path: root.into(),
             data_directory: data.into(),
-            internal_directory: None,
+            internal_directory: Some(root.join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)),
             require_mount: false,
             external_writers: false,
             expected_filesystem_type: None,
@@ -132,6 +132,23 @@ fn current_totp(secret: &str) -> String {
         .as_secs()
         / 30;
     auth::totp_code(secret, step).unwrap()
+}
+
+#[tokio::test]
+async fn health_reports_the_exact_package_version() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let app = crate::web::router(test_state(root.path(), data.path()));
+    let response = app
+        .oneshot(json_request(Method::GET, "/api/v1/health", ""))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_text(response).await,
+        format!(r#"{{"ok":true,"version":"{}"}}"#, env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[tokio::test]
@@ -1428,7 +1445,15 @@ async fn api_admin_file_mutations_update_shares_and_require_tree_confirmation() 
         .contains("confirmation_required"));
     assert!(root.path().join("tree").exists());
 
-    let cleanup_guard = state.storage_cleanup.lock().await;
+    let cleanup_guard = state
+        .storage_cleanup
+        .serialization_for_test()
+        .lock_owned()
+        .await;
+    let cleanup_worker = state
+        .storage_cleanup
+        .start_worker(state.secure_root.clone())
+        .unwrap();
     let mut confirmed = json_request(
         Method::DELETE,
         "/api/v1/files",
@@ -1468,6 +1493,7 @@ async fn api_admin_file_mutations_update_shares_and_require_tree_confirmation() 
             .unwrap()
             .active
     );
+    cleanup_worker.shutdown().await.unwrap();
 }
 
 fn authorize_mutation(request: &mut Request<Body>, session_cookie: &str, csrf: &str) {

@@ -62,7 +62,7 @@ impl Database {
         password_hash: &str,
         totp_secret: &str,
     ) -> rusqlite::Result<InitialAdminOutcome> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let initialized: bool =
             transaction.query_row("SELECT EXISTS(SELECT 1 FROM admins)", [], |row| row.get(0))?;
@@ -117,7 +117,7 @@ impl Database {
         password_hash: &str,
         totp_secret: &str,
     ) -> rusqlite::Result<()> {
-        self.conn().execute(
+        self.try_conn()?.execute(
             "INSERT INTO admins(username,password_hash,totp_secret,created_at,active) VALUES(?1,?2,?3,?4,1)",
             params![
                 username,
@@ -161,7 +161,7 @@ impl Database {
         })
     }
     pub fn admin(&self, username: &str) -> rusqlite::Result<Option<Admin>> {
-        self.conn()
+        self.try_conn()?
             .query_row(
                 "SELECT id,username,password_hash,totp_secret,active FROM admins WHERE username=?1 AND active=1",
                 [username],
@@ -178,17 +178,17 @@ impl Database {
             .optional()
     }
     pub fn admin_count(&self) -> rusqlite::Result<i64> {
-        self.conn()
+        self.try_conn()?
             .query_row("SELECT COUNT(*) FROM admins", [], |row| row.get(0))
     }
     pub fn active_admin_count(&self) -> rusqlite::Result<i64> {
-        self.conn()
+        self.try_conn()?
             .query_row("SELECT COUNT(*) FROM admins WHERE active=1", [], |row| {
                 row.get(0)
             })
     }
     pub fn list_admins(&self) -> rusqlite::Result<Vec<AdminSummary>> {
-        let c = self.conn();
+        let c = self.try_conn()?;
         let mut statement =
             c.prepare("SELECT id,username,created_at,active FROM admins ORDER BY id ASC")?;
         let admins = statement
@@ -205,7 +205,7 @@ impl Database {
     }
     pub fn activate_admin(&self, id: i64) -> rusqlite::Result<bool> {
         Ok(self
-            .conn()
+            .try_conn()?
             .execute("UPDATE admins SET active=1 WHERE id=?1", [id])?
             == 1)
     }
@@ -242,7 +242,7 @@ impl Database {
         id: i64,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<AdminDeactivationOutcome> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let active = transaction
             .query_row("SELECT active FROM admins WHERE id=?1", [id], |row| {
@@ -307,7 +307,7 @@ impl Database {
                 "password_hash or totp_secret".into(),
             ));
         }
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let admin = transaction
             .query_row(
@@ -384,7 +384,7 @@ impl Database {
         new_password_hash: &str,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminPasswordChangeOutcome> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let admin = transaction
             .query_row(
@@ -443,7 +443,7 @@ impl Database {
         let now_string = now.to_rfc3339();
         let expires_at = (now + Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS)).to_rfc3339();
         let enrollment_token_hash = token_hash(token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_admin_mfa_enrollments(&transaction, &now_string)?;
         let active = transaction
@@ -562,7 +562,7 @@ impl Database {
     ) -> rusqlite::Result<Option<PendingAdminMfaEnrollment>> {
         let now = Utc::now().to_rfc3339();
         let enrollment_token_hash = token_hash(token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_admin_mfa_enrollments(&transaction, &now)?;
         let enrollment = transaction
@@ -606,7 +606,7 @@ impl Database {
         }
         let now = Utc::now().to_rfc3339();
         let enrollment_token_hash = token_hash(token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_admin_mfa_enrollments(&transaction, &now)?;
         let enrollment = transaction
@@ -655,14 +655,14 @@ impl Database {
     }
 
     pub fn cleanup_expired_admin_mfa_enrollments(&self) -> rusqlite::Result<usize> {
-        self.conn().execute(
+        self.try_conn()?.execute(
             "DELETE FROM admin_mfa_enrollments WHERE expires_at<=?1",
             [Utc::now().to_rfc3339()],
         )
     }
 
     pub fn reset_admin_password(&self, id: i64, password_hash: &str) -> rusqlite::Result<bool> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE admins SET password_hash=?2 WHERE id=?1",
@@ -699,7 +699,7 @@ impl Database {
         })
     }
     pub fn reset_admin_totp(&self, id: i64, totp_secret: &str) -> rusqlite::Result<Option<String>> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let username = transaction
             .query_row("SELECT username FROM admins WHERE id=?1", [id], |row| {
@@ -758,7 +758,7 @@ impl Database {
         &self,
         admin_id: i64,
     ) -> rusqlite::Result<Vec<AdminWebauthnCredential>> {
-        let connection = self.conn();
+        let connection = self.try_conn()?;
         let mut statement = connection.prepare(
             "SELECT id,label,credential_id,credential_json,created_at,last_used_at
              FROM admin_webauthn_credentials WHERE admin_id=?1 ORDER BY id",
@@ -786,7 +786,7 @@ impl Database {
         credential_id: &str,
         credential_json: &str,
     ) -> rusqlite::Result<i64> {
-        let connection = self.conn();
+        let connection = self.try_conn()?;
         connection.execute(
             "INSERT INTO admin_webauthn_credentials(
                  admin_id,label,credential_id,credential_json,created_at
@@ -819,7 +819,7 @@ impl Database {
     ) -> rusqlite::Result<AdminWebauthnCredentialRegistrationOutcome> {
         let now = Utc::now().to_rfc3339();
         let session_token_hash = token_hash(session_token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let username = transaction
             .query_row(
@@ -866,7 +866,7 @@ impl Database {
         admin_id: i64,
         credential_json: &str,
     ) -> rusqlite::Result<bool> {
-        Ok(self.conn().execute(
+        Ok(self.try_conn()?.execute(
             "UPDATE admin_webauthn_credentials
              SET credential_json=?3,last_used_at=?4
              WHERE id=?1 AND admin_id=?2",
@@ -933,7 +933,7 @@ impl Database {
         updated_credential_json: &str,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<bool> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let credential_updated = transaction.execute(
             "UPDATE admin_webauthn_credentials
@@ -988,7 +988,7 @@ impl Database {
     }
 
     pub fn webauthn_credential_count(&self) -> rusqlite::Result<u64> {
-        self.conn().query_row(
+        self.try_conn()?.query_row(
             "SELECT COUNT(*) FROM admin_webauthn_credentials",
             [],
             |row| row.get(0),
@@ -1000,7 +1000,7 @@ impl Database {
         id: i64,
         admin_id: i64,
     ) -> rusqlite::Result<bool> {
-        Ok(self.conn().execute(
+        Ok(self.try_conn()?.execute(
             "DELETE FROM admin_webauthn_credentials
              WHERE id=?1 AND admin_id=?2
                AND (SELECT COUNT(*) FROM admin_webauthn_credentials WHERE admin_id=?2) <> 2",
@@ -1023,7 +1023,7 @@ impl Database {
         totp_step: u64,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminWebauthnCredentialDeletionOutcome> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let username = transaction
             .query_row(
@@ -1084,7 +1084,7 @@ impl Database {
         csrf: &str,
         expires: DateTime<Utc>,
     ) -> rusqlite::Result<()> {
-        let c = self.conn();
+        let c = self.try_conn()?;
         c.execute(
             "DELETE FROM sessions WHERE expires_at < ?1",
             [Utc::now().to_rfc3339()],
@@ -1146,7 +1146,7 @@ impl Database {
     ) -> rusqlite::Result<PasswordSessionCreationOutcome> {
         let now = Utc::now().to_rfc3339();
         let session_token_hash = token_hash(token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM sessions WHERE expires_at < ?1", [&now])?;
         let created = transaction.execute(
@@ -1196,8 +1196,56 @@ impl Database {
     }
 
     pub fn session(&self, token: &str) -> rusqlite::Result<Option<Session>> {
-        self.conn().query_row("SELECT a.id,a.username,s.csrf_token,s.mfa_verified FROM sessions s JOIN admins a ON a.id=s.admin_id WHERE s.token_hash=?1 AND s.expires_at>?2 AND a.active=1",params![token_hash(token),Utc::now().to_rfc3339()],|r|Ok(Session{admin_id:r.get(0)?,username:r.get(1)?,csrf_token:r.get(2)?,mfa_verified:r.get::<_,i64>(3)?!=0})).optional()
+        self.try_conn()?.query_row("SELECT a.id,a.username,s.csrf_token,s.mfa_verified FROM sessions s JOIN admins a ON a.id=s.admin_id WHERE s.token_hash=?1 AND s.expires_at>?2 AND a.active=1",params![token_hash(token),Utc::now().to_rfc3339()],|r|Ok(Session{admin_id:r.get(0)?,username:r.get(1)?,csrf_token:r.get(2)?,mfa_verified:r.get::<_,i64>(3)?!=0})).optional()
     }
+
+    #[cfg(test)]
+    pub(crate) fn expire_session_for_test(&self, token: &str) -> rusqlite::Result<()> {
+        self.try_conn()?.execute(
+            "UPDATE sessions SET expires_at=?2 WHERE token_hash=?1",
+            params![
+                token_hash(token),
+                (Utc::now() - Duration::seconds(1)).to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Runs `operation` only while the exact MFA session is still authorized.
+    ///
+    /// The database connection mutex remains held until `operation` returns. Callers
+    /// can therefore linearize a non-database security-sensitive commit with logout,
+    /// credential reset and administrator deactivation, all of which use the same
+    /// connection mutex.
+    pub fn with_live_mfa_session<T>(
+        &self,
+        token: &str,
+        admin_id: i64,
+        operation: impl FnOnce() -> T,
+    ) -> rusqlite::Result<Option<T>> {
+        let connection = self.try_conn()?;
+        let live = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM sessions
+                 JOIN admins ON admins.id=sessions.admin_id
+                 WHERE sessions.token_hash=?1
+                   AND sessions.admin_id=?2
+                   AND sessions.mfa_verified=1
+                   AND sessions.expires_at>?3
+                   AND admins.active=1
+             )",
+            params![token_hash(token), admin_id, Utc::now().to_rfc3339()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !live {
+            return Ok(None);
+        }
+        let outcome = operation();
+        drop(connection);
+        Ok(Some(outcome))
+    }
+
     /// Consumes a TOTP counter and verifies exactly the bound, unexpired session.
     /// Both writes share an IMMEDIATE transaction so one code cannot unlock two sessions.
     pub fn verify_mfa_with_totp_step(
@@ -1248,7 +1296,7 @@ impl Database {
     ) -> rusqlite::Result<bool> {
         let now = Utc::now().to_rfc3339();
         let session_token_hash = token_hash(old_token);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let valid_session = transaction.query_row(
             "SELECT EXISTS(
@@ -1293,7 +1341,7 @@ impl Database {
 
     /// Consumes one TOTP counter for a sensitive authenticated operation.
     pub fn consume_admin_totp_step(&self, admin_id: i64, step: u64) -> rusqlite::Result<bool> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let consumed = consume_admin_totp_step(&transaction, admin_id, step)?;
         transaction.commit()?;
@@ -1302,13 +1350,13 @@ impl Database {
 
     #[cfg(test)]
     pub fn verify_mfa(&self, token: &str) -> rusqlite::Result<bool> {
-        Ok(self.conn().execute(
+        Ok(self.try_conn()?.execute(
             "UPDATE sessions SET mfa_verified=1 WHERE token_hash=?1 AND expires_at>?2",
             params![token_hash(token), Utc::now().to_rfc3339()],
         )? == 1)
     }
     pub fn delete_session(&self, token: &str) -> rusqlite::Result<()> {
-        self.conn().execute(
+        self.try_conn()?.execute(
             "DELETE FROM sessions WHERE token_hash=?1",
             [token_hash(token)],
         )?;

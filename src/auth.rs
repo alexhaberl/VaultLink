@@ -154,6 +154,7 @@ pub struct LoginLimiter {
     max: usize,
     window: Duration,
     capacity: usize,
+    overflow_buckets: usize,
 }
 
 struct LimiterState {
@@ -191,11 +192,57 @@ impl LoginLimiter {
         capacity: usize,
         overflow_buckets: usize,
     ) -> Self {
+        let overflow_buckets = overflow_buckets.max(1);
         Self {
             inner: Arc::new(Mutex::new(LimiterState::new(overflow_buckets))),
             max,
             window,
             capacity: capacity.max(1),
+            overflow_buckets,
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, LimiterState> {
+        match self.inner.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned login limiter state");
+                let mut state = poisoned.into_inner();
+                let now = Instant::now();
+
+                if state.overflow.len() != self.overflow_buckets
+                    || state.entries.len() > self.capacity
+                {
+                    // A structurally damaged limiter must remain bounded and
+                    // fail closed until the current window expires. Saturating
+                    // every overflow bucket avoids accidentally granting a new
+                    // key after discarding an untrustworthy primary map.
+                    state.entries.clear();
+                    state.overflow = (0..self.overflow_buckets)
+                        .map(|_| {
+                            Some(AttemptHistory {
+                                attempts: vec![now; self.max],
+                            })
+                        })
+                        .collect();
+                } else {
+                    self.cleanup_expired(&mut state, now);
+                    for history in state.entries.values_mut() {
+                        if history.attempts.len() > self.max {
+                            let excess = history.attempts.len() - self.max;
+                            history.attempts.drain(..excess);
+                        }
+                    }
+                    for history in state.overflow.iter_mut().filter_map(Option::as_mut) {
+                        if history.attempts.len() > self.max {
+                            let excess = history.attempts.len() - self.max;
+                            history.attempts.drain(..excess);
+                        }
+                    }
+                }
+                self.inner.clear_poison();
+                state
+            }
         }
     }
 
@@ -231,7 +278,7 @@ impl LoginLimiter {
             .filter_map(|(index, key)| (!keys[..index].contains(&key)).then_some(key))
             .collect::<Vec<_>>();
 
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.state();
         let now = Instant::now();
         self.periodic_cleanup(&mut state, now);
 
@@ -320,7 +367,7 @@ impl LoginLimiter {
     /// not cleared here: a success for one key must not erase other keys'
     /// protection. Their attempts expire only with the configured window.
     pub fn success(&self, key: &str) {
-        self.inner.lock().unwrap().entries.remove(key);
+        self.state().entries.remove(key);
     }
 
     fn periodic_cleanup(&self, state: &mut LimiterState, now: Instant) {
@@ -452,6 +499,56 @@ mod tests {
             .filter(|admitted| *admitted)
             .count();
         assert_eq!(admitted, 3);
+    }
+
+    #[test]
+    fn limiter_recovers_after_lock_poisoning() {
+        let limiter = LoginLimiter::new(2, Duration::from_secs(60));
+        let poisoned = limiter.clone();
+        let panic = std::panic::catch_unwind(move || {
+            let _guard = poisoned.inner.lock().unwrap();
+            panic!("inject limiter lock poisoning");
+        });
+        assert!(panic.is_err());
+        assert!(limiter.inner.is_poisoned());
+
+        assert!(limiter.check_and_record_attempt("after-panic"));
+        assert!(!limiter.inner.is_poisoned());
+    }
+
+    #[test]
+    fn limiter_bounds_structurally_invalid_poisoned_state_fail_closed() {
+        let limiter = LoginLimiter::with_capacity_and_overflow(2, Duration::from_secs(60), 1, 2);
+        let poisoned = limiter.clone();
+        let panic = std::panic::catch_unwind(move || {
+            let mut state = poisoned.inner.lock().unwrap();
+            state.entries.insert(
+                "one".into(),
+                AttemptHistory {
+                    attempts: vec![Instant::now()],
+                },
+            );
+            state.entries.insert(
+                "two".into(),
+                AttemptHistory {
+                    attempts: vec![Instant::now()],
+                },
+            );
+            state.overflow.clear();
+            panic!("inject invalid limiter state");
+        });
+        assert!(panic.is_err());
+
+        assert!(!limiter.check_and_record_attempt("new-key"));
+        let state = limiter.inner.lock().unwrap();
+        assert!(state.entries.is_empty());
+        assert_eq!(state.overflow.len(), 2);
+        assert!(state
+            .overflow
+            .iter()
+            .flatten()
+            .all(|history| history.attempts.len() == 2));
+        assert!(!limiter.inner.is_poisoned());
     }
 
     #[test]

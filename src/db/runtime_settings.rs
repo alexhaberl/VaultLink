@@ -6,7 +6,7 @@ use rusqlite::{params, TransactionBehavior};
 
 impl Database {
     pub fn runtime_settings(&self) -> rusqlite::Result<Vec<(String, String)>> {
-        let c = self.conn();
+        let c = self.try_conn()?;
         let mut statement = c.prepare("SELECT key,value FROM runtime_settings ORDER BY key")?;
         let settings = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -37,7 +37,7 @@ impl Database {
         admin: i64,
         required_audit: Option<(&AuditContext, String)>,
     ) -> rusqlite::Result<()> {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM runtime_settings", [])?;
         let updated_at = Utc::now().to_rfc3339();

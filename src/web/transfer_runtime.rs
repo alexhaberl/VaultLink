@@ -2,7 +2,6 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::{Arc, RwLock},
     task::{Context, Poll},
 };
 
@@ -30,16 +29,16 @@ use crate::{
         runtime_settings, transfer_cookie, TransferCookieScope,
     },
     i18n::{self},
-    runtime::RuntimeSettings,
     AppState,
 };
 
 pub(super) struct PublicTransferLease {
-    pub(super) lease_token: Option<String>,
-    pub(super) cookie: String,
-    pub(super) heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
-    pub(super) database: Database,
-    pub(super) client_ip: Option<String>,
+    lease_token: String,
+    armed: bool,
+    cookie: String,
+    heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    database: Database,
+    client_ip: Option<String>,
 }
 
 pub(super) struct PendingReservationOwnership<T> {
@@ -60,6 +59,43 @@ impl<T: Copy> PendingReservationOwnership<T> {
 }
 
 impl PublicTransferLease {
+    pub(super) fn new(
+        database: Database,
+        lease_token: String,
+        cookie: String,
+        heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
+        client_ip: Option<String>,
+    ) -> Self {
+        Self {
+            lease_token,
+            armed: true,
+            cookie,
+            heartbeat_stop,
+            database,
+            client_ip,
+        }
+    }
+
+    pub(super) fn cookie(&self) -> &str {
+        &self.cookie
+    }
+
+    /// Explicitly consumes a lease that cannot be handed to a response body.
+    /// Drop remains the cancellation backstop for request cancellation.
+    pub(super) async fn cancel(mut self) {
+        self.heartbeat_stop.take();
+        let lease_token = self.lease_token.clone();
+        let cancellation_database = self.database.clone();
+        if database(cancellation_database, move |database| {
+            database.cancel_transfer_lease(&lease_token).map(|_| ())
+        })
+        .await
+        .is_ok()
+        {
+            self.armed = false;
+        }
+    }
+
     fn into_stream_parts(
         mut self,
     ) -> (
@@ -67,10 +103,8 @@ impl PublicTransferLease {
         Option<tokio::sync::oneshot::Sender<()>>,
         Option<String>,
     ) {
-        let lease_token = self
-            .lease_token
-            .take()
-            .expect("public transfer lease token");
+        let lease_token = std::mem::take(&mut self.lease_token);
+        self.armed = false;
         let heartbeat_stop = self.heartbeat_stop.take();
         let client_ip = self.client_ip.take();
         (lease_token, heartbeat_stop, client_ip)
@@ -80,15 +114,15 @@ impl PublicTransferLease {
 impl Drop for PublicTransferLease {
     fn drop(&mut self) {
         self.heartbeat_stop.take();
-        if let Some(lease_token) = self.lease_token.take() {
-            spawn_transfer_cancel(self.database.clone(), lease_token);
+        if self.armed {
+            self.armed = false;
+            spawn_transfer_cancel(self.database.clone(), std::mem::take(&mut self.lease_token));
         }
     }
 }
 
 pub(super) fn start_transfer_heartbeat(
     database: Database,
-    runtime: Arc<RwLock<RuntimeSettings>>,
     lease_token: String,
     action: &'static str,
     share_id: i64,
@@ -109,13 +143,7 @@ pub(super) fn start_transfer_heartbeat(
                 _ = ticker.tick() => {
                     let heartbeat_database = database.clone();
                     let heartbeat_token = lease_token.clone();
-                    let audit_ip = runtime
-                        .read()
-                        .ok()
-                        .is_some_and(|settings| settings.audit_client_ip_enabled)
-                        .then(|| client_ip.clone())
-                        .flatten();
-                    let audit_context = AuditContext::new("public", audit_ip);
+                    let audit_context = AuditContext::new("public", client_ip.clone());
                     match tokio::task::spawn_blocking(move || {
                         heartbeat_database.heartbeat_transfer_lease_and_audit(
                             &heartbeat_token,
@@ -202,25 +230,25 @@ pub(super) async fn begin_public_transfer(
     .await?;
     match pending_ownership.outcome() {
         TransferLeaseBeginOutcome::NewLease | TransferLeaseBeginOutcome::AlreadyCounted => {
-            let client_ip = runtime_settings(state)
-                .audit_client_ip_enabled
+            let audit_client_ip_enabled = runtime_settings(state).audit_client_ip_enabled;
+            let client_ip = audit_client_ip_enabled
                 .then(current_audit_client_ip)
                 .flatten()
                 .map(|ip| ip.to_string());
-            let lease = PublicTransferLease {
-                heartbeat_stop: start_transfer_heartbeat(
-                    state.db.clone(),
-                    state.runtime.clone(),
-                    lease_token.clone(),
-                    action,
-                    share.id,
-                    client_ip.clone(),
-                ),
-                lease_token: Some(lease_token),
-                cookie: make_transfer_cookie(state, share, &session_token, transfer_scope(uri)),
-                database: state.db.clone(),
+            let heartbeat_stop = start_transfer_heartbeat(
+                state.db.clone(),
+                lease_token.clone(),
+                action,
+                share.id,
+                client_ip.clone(),
+            );
+            let lease = PublicTransferLease::new(
+                state.db.clone(),
+                lease_token,
+                make_transfer_cookie(state, share, &session_token, transfer_scope(uri)),
+                heartbeat_stop,
                 client_ip,
-            };
+            );
             // Acknowledgement is deliberately last: until the RAII owner exists,
             // dropping this request makes the blocking worker cancel the lease.
             pending_ownership.claim();
@@ -310,19 +338,12 @@ pub(super) async fn check_public_transfer_availability(
 
 pub(super) fn transfer_complete_future(
     database: Database,
-    runtime: Arc<RwLock<RuntimeSettings>>,
     lease_token: String,
     action: &'static str,
     share_id: i64,
     client_ip: Option<String>,
 ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
     Box::pin(async move {
-        let client_ip = runtime
-            .read()
-            .ok()
-            .is_some_and(|settings| settings.audit_client_ip_enabled)
-            .then_some(client_ip)
-            .flatten();
         let result = tokio::task::spawn_blocking(move || {
             database.complete_transfer_lease_and_audit(
                 &lease_token,
@@ -362,7 +383,8 @@ pub(super) fn spawn_transfer_cancel(database: Database, lease_token: String) {
 
 pub(super) struct UploadQuotaReservation {
     pub(super) database: Database,
-    pub(super) token: Option<String>,
+    token: String,
+    armed: bool,
     pub(super) reserved_bytes: u64,
     pub(super) last_heartbeat: std::time::Instant,
 }
@@ -371,26 +393,48 @@ impl UploadQuotaReservation {
     pub(super) fn new(database: Database, token: String) -> Self {
         Self {
             database,
-            token: Some(token),
+            token,
+            armed: true,
             reserved_bytes: 0,
             last_heartbeat: std::time::Instant::now(),
         }
     }
 
     pub(super) fn token(&self) -> &str {
-        self.token.as_deref().expect("active upload reservation")
+        &self.token
     }
 
-    pub(super) fn committed(&mut self) {
-        self.token.take();
+    pub(super) fn committed(mut self) {
+        self.armed = false;
+    }
+
+    pub(super) fn database_finalized(mut self) {
+        self.armed = false;
+    }
+
+    /// Removes the durable reservation before an expected HTTP rejection is
+    /// returned. Keeping `self.token` armed until the blocking DB operation
+    /// succeeds preserves the Drop fallback if this future is cancelled or the
+    /// database is temporarily unavailable.
+    pub(super) async fn cancel(mut self) -> Result<()> {
+        let token = self.token.clone();
+        let database_handle = self.database.clone();
+        database(database_handle, move |database| {
+            database.cancel_upload_reservation(&token)
+        })
+        .await?;
+        self.armed = false;
+        Ok(())
     }
 }
 
 impl Drop for UploadQuotaReservation {
     fn drop(&mut self) {
-        let Some(token) = self.token.take() else {
+        if !self.armed {
             return;
-        };
+        }
+        self.armed = false;
+        let token = std::mem::take(&mut self.token);
         let database = self.database.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn_blocking(move || {
@@ -435,7 +479,6 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
 pub(super) struct TransferBodyStream {
     pub(super) inner: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
     pub(super) database: Database,
-    pub(super) runtime: Arc<RwLock<RuntimeSettings>>,
     pub(super) lease_token: Option<String>,
     pub(super) client_ip: Option<String>,
     pub(super) action: &'static str,
@@ -457,7 +500,6 @@ impl TransferBodyStream {
         };
         let future = transfer_complete_future(
             self.database.clone(),
-            self.runtime.clone(),
             token,
             self.action,
             self.share_id,
@@ -618,7 +660,6 @@ where
     Body::from_stream(TransferBodyStream {
         inner: Box::pin(stream),
         database: state.db.clone(),
-        runtime: state.runtime.clone(),
         lease_token: Some(lease_token),
         client_ip,
         action,
@@ -786,16 +827,9 @@ pub(super) async fn complete_transfer_without_body(
 ) -> Result<()> {
     let (lease_token, heartbeat_stop, client_ip) = transfer.into_stream_parts();
     drop(heartbeat_stop);
-    transfer_complete_future(
-        state.db.clone(),
-        state.runtime.clone(),
-        lease_token,
-        action,
-        share_id,
-        client_ip,
-    )
-    .await
-    .map_err(internal)
+    transfer_complete_future(state.db.clone(), lease_token, action, share_id, client_ip)
+        .await
+        .map_err(internal)
 }
 
 pub(super) fn set_transfer_cookie(response: &mut Response, cookie: &str) -> Result<()> {
