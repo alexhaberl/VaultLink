@@ -69,6 +69,9 @@ jobs:
             *) state=failure; description='The native 600-second fuzz gate failed' ;;
           esac
           curl --fail-with-body --silent --show-error \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-max-time 60 \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
