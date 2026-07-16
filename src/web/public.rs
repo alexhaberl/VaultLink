@@ -486,7 +486,7 @@ pub(super) async fn public_page(
             String::new()
         };
         let overwrite_checkbox = if sh.upload_conflict_strategy.can_overwrite()
-            && !state.config.storage.external_writers
+            && state.config.storage.replacements_allowed()
         {
             r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_existing_file"/><small><vl-i18n key="share.replace_concrete"/></small></span></label>"#
         } else {

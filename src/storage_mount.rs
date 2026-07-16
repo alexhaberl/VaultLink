@@ -29,6 +29,23 @@ struct MountInfo {
     super_options: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveMount {
+    pub mount_point: PathBuf,
+    pub filesystem_type: String,
+    pub source: String,
+    pub read_write: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetectedMount {
+    pub mount_point: PathBuf,
+    pub root_mount_path: PathBuf,
+    pub internal_directory: PathBuf,
+    pub filesystem_type: String,
+    pub source: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PathMountIdentity {
     mount_id: u64,
@@ -182,6 +199,93 @@ pub fn validate(storage: &Storage) -> Result<(), StorageMountError> {
     validate_and_open(storage).map(|_| ())
 }
 
+pub fn active_mount_at(path: &Path) -> Result<Option<ActiveMount>, StorageMountError> {
+    let mountinfo = fs::read(MOUNTINFO_PATH).map_err(|error| {
+        mount_error(format!(
+            "cannot read the Linux mount table from {MOUNTINFO_PATH}: {error}"
+        ))
+    })?;
+    active_mount_at_from(&mountinfo, path)
+}
+
+pub fn discover_supported_mounts() -> Result<Vec<DetectedMount>, StorageMountError> {
+    let mountinfo = fs::read(MOUNTINFO_PATH).map_err(|error| {
+        mount_error(format!(
+            "cannot read the Linux mount table from {MOUNTINFO_PATH}: {error}"
+        ))
+    })?;
+    let mut mounts = discover_supported_mounts_from(&mountinfo)?;
+    mounts.retain(|mount| mount_point_is_directory(&mount.mount_point));
+    Ok(mounts)
+}
+
+fn mount_point_is_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+}
+
+fn active_mount_at_from(
+    mountinfo: &[u8],
+    path: &Path,
+) -> Result<Option<ActiveMount>, StorageMountError> {
+    let mut matches = parse_mountinfo(mountinfo)?
+        .into_iter()
+        .filter(|mount| mount.mount_point == path);
+    let Some(mount) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(mount_error(format!(
+            "mount point {} occurs more than once in {MOUNTINFO_PATH}",
+            path.display()
+        )));
+    }
+    let source = mount.source.into_string().map_err(|_| {
+        mount_error(format!(
+            "mount source for {} is not valid UTF-8",
+            path.display()
+        ))
+    })?;
+    Ok(Some(ActiveMount {
+        mount_point: mount.mount_point,
+        filesystem_type: mount.filesystem_type,
+        source,
+        read_write: mount.read_write,
+    }))
+}
+
+fn discover_supported_mounts_from(
+    mountinfo: &[u8],
+) -> Result<Vec<DetectedMount>, StorageMountError> {
+    let mut detected = Vec::new();
+    for mount in parse_mountinfo(mountinfo)? {
+        let cifs = matches!(mount.filesystem_type.as_str(), "cifs" | "smb3");
+        let supported = cifs || is_local_sqlite_filesystem(&mount.filesystem_type);
+        if !supported || !mount.read_write || (cifs && validate_cifs_options(&mount).is_err()) {
+            continue;
+        }
+        let Ok(source) = mount.source.into_string() else {
+            continue;
+        };
+        let root_mount_path = mount.mount_point.join("shared");
+        let internal_directory = mount.mount_point.join(".vaultlink-internal");
+        detected.push(DetectedMount {
+            mount_point: mount.mount_point,
+            root_mount_path,
+            internal_directory,
+            filesystem_type: if cifs {
+                "cifs".to_string()
+            } else {
+                mount.filesystem_type
+            },
+            source,
+        });
+    }
+    detected.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+    detected.dedup_by(|left, right| left.mount_point == right.mount_point);
+    Ok(detected)
+}
+
 #[doc(hidden)]
 pub fn validate_and_open(storage: &Storage) -> Result<ValidatedStorage, StorageMountError> {
     if !storage.require_mount {
@@ -327,7 +431,7 @@ fn validate_identity(
         .expected_filesystem_type
         .as_deref()
         .ok_or_else(|| mount_error("expected_filesystem_type is missing"))?;
-    if mount.filesystem_type != expected_filesystem_type {
+    if !filesystem_types_match(&mount.filesystem_type, expected_filesystem_type) {
         return Err(mount_error(format!(
             "{} has filesystem type {:?}, expected {:?}",
             root_path.display(),
@@ -455,6 +559,10 @@ fn is_local_sqlite_filesystem(filesystem_type: &str) -> bool {
         filesystem_type,
         "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "f2fs" | "bcachefs" | "zfs"
     )
+}
+
+fn filesystem_types_match(actual: &str, expected: &str) -> bool {
+    actual == expected || (matches!(actual, "cifs" | "smb3") && matches!(expected, "cifs" | "smb3"))
 }
 
 fn is_remote_filesystem(filesystem_type: &str) -> bool {
@@ -720,6 +828,7 @@ mod tests {
             internal_directory: Some("/mnt/.vaultlink-internal".into()),
             require_mount: true,
             external_writers: true,
+            allow_external_writer_replace: false,
             expected_filesystem_type: Some("cifs".into()),
             expected_mount_source: Some("//nas.example/vault link".into()),
             max_upload_size: 1,
@@ -774,6 +883,72 @@ mod tests {
         storage.expected_filesystem_type = None;
         storage.expected_mount_source = None;
         storage
+    }
+
+    #[test]
+    fn discovers_supported_read_write_mounts_and_filters_weak_cifs() {
+        let detected = discover_supported_mounts_from(
+            b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - cifs //nas.example/vault rw,vers=3.1.1,cache=strict,sign,seal,serverino\n\
+              42 23 0:43 / /mnt/weak rw,nosuid,nodev,noexec - cifs //nas.example/weak rw,vers=3.0,cache=loose,noserverino\n\
+              43 23 0:44 / /mnt/read-only ro,nosuid,nodev,noexec - cifs //nas.example/readonly ro,vers=3.1.1,cache=strict,sign,seal,serverino\n\
+              44 23 8:2 / /mnt/local rw,nosuid,nodev,noexec - ext4 /dev/mapper/storage rw\n\
+              45 23 0:45 / /mnt/overlay rw,nosuid,nodev,noexec - overlay overlay rw\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detected,
+            vec![
+                DetectedMount {
+                    mount_point: "/mnt/local".into(),
+                    root_mount_path: "/mnt/local/shared".into(),
+                    internal_directory: "/mnt/local/.vaultlink-internal".into(),
+                    filesystem_type: "ext4".into(),
+                    source: "/dev/mapper/storage".into(),
+                },
+                DetectedMount {
+                    mount_point: "/mnt/storage".into(),
+                    root_mount_path: "/mnt/storage/shared".into(),
+                    internal_directory: "/mnt/storage/.vaultlink-internal".into(),
+                    filesystem_type: "cifs".into(),
+                    source: "//nas.example/vault".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn normalizes_smb3_mountinfo_to_the_cifs_policy_name() {
+        let detected = discover_supported_mounts_from(
+            b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - smb3 //nas.example/vault rw,vers=3.1.1,cache=strict,sign,seal,serverino\n",
+        )
+        .unwrap();
+        assert_eq!(detected[0].filesystem_type, "cifs");
+        assert!(filesystem_types_match("smb3", "cifs"));
+        assert!(filesystem_types_match("cifs", "smb3"));
+    }
+
+    #[test]
+    fn mount_point_filter_rejects_file_mount_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("hosts");
+        std::fs::write(&file, b"127.0.0.1 localhost\n").unwrap();
+        assert!(mount_point_is_directory(directory.path()));
+        assert!(!mount_point_is_directory(&file));
+    }
+
+    #[test]
+    fn active_mount_lookup_requires_one_exact_utf8_mount_point() {
+        let mountinfo = b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - cifs //nas.example/vault rw,vers=3.1.1,cache=strict,sign,seal,serverino\n\
+              23 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n";
+        let active = active_mount_at_from(mountinfo, Path::new("/mnt/storage"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.filesystem_type, "cifs");
+        assert_eq!(active.source, "//nas.example/vault");
+        assert!(active.read_write);
+        assert!(active_mount_at_from(mountinfo, Path::new("/mnt/missing"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

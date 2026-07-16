@@ -515,6 +515,7 @@ mod tests {
                 internal_directory: Some(root.join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)),
                 require_mount: false,
                 external_writers: false,
+                allow_external_writer_replace: false,
                 expected_filesystem_type: None,
                 expected_mount_source: None,
                 max_upload_size: 1_000_000,

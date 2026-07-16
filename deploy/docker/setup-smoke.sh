@@ -104,7 +104,7 @@ grep -q "root_mount_path" "$CONFIG_PATH"
 
 # Upgrade/rollback preflight must fail closed on every storage field that
 # became mandatory in 0.5.0, while the current setup process is still running.
-for required_storage_field in internal_directory require_mount external_writers; do
+for required_storage_field in internal_directory require_mount external_writers allow_external_writer_replace; do
     incomplete_config="$WORK_DIR/missing-$required_storage_field.toml"
     incomplete_log="$WORK_DIR/missing-$required_storage_field.log"
     sed "/^${required_storage_field}[[:space:]]*=/d" \

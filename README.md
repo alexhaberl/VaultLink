@@ -14,7 +14,7 @@ Anwendungseigene Passwort-, TOTP- und Share-Secret-Puffer verwenden einen zerois
 
 - Dateizugriffe sind Linux descriptor-relativ. `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` bindet Adminzugriffe an den Storage-Root und öffentliche Zugriffe zusätzlich an eine pro Freigabe verengte Directory-/File-Capability. Im Co-Writer-Modus kommt `RESOLVE_NO_SYMLINKS` hinzu, damit externe Writer keinen gespeicherten Share-Pfad umbiegen können. Ein Kernel ohne die benötigten APIs wird mit verständlichem Startfehler abgewiesen.
 - Relative Nutzpfade werden nach genau einer HTTP-Dekodierung geprüft und verbieten absolute Pfade, `..`, Backslashes und NUL. Uploadnamen folgen zusätzlich einer plattformübergreifenden Policy, damit Windows-Prefixe und reservierte Namen nie aus dem Zielordner aufgelöst werden.
-- Uploads werden als zufällige `0600`-Temporärdateien im geschützten internen Upload-Staging geschrieben, geflusht und per `fsync` gesichert. Die Veröffentlichung in den sichtbaren Baum erfolgt atomar mit `renameat2(RENAME_NOREPLACE)`. Bei `external_writers = true` ist Überschreiben in UI, API und Uploadpfad ausnahmslos deaktiviert.
+- Uploads werden als zufällige `0600`-Temporärdateien im geschützten internen Upload-Staging geschrieben, geflusht und per `fsync` gesichert. Die Veröffentlichung in den sichtbaren Baum erfolgt atomar mit `renameat2(RENAME_NOREPLACE)`. Bei `external_writers = true` bleibt Überschreiben in UI, API und Uploadpfad standardmäßig deaktiviert. Der separate Opt-in `allow_external_writer_replace = true` aktiviert bewusst Last-Writer-Wins; parallele neuere SMB-Änderungen können dadurch verloren gehen.
 - Abgebrochene Uploadfragmente und ausschließlich als committed markierte Lösch-Tombstones werden in fortsetzbaren Hintergrund-Batches entfernt. Uncommitted Pending-Löschungen und Rollback-Konflikte bleiben als Recovery-Einträge erhalten, statt beim Neustart Daten zu verlieren.
 - Adminpasswörter verwenden Argon2id. Nach dem Passwort ist TOTP oder ein registrierter WebAuthn/FIDO2-Sicherheitsschlüssel (zum Beispiel YubiKey) erforderlich. Sessions sind zufällige serverseitige Bearer-Tokens, deren Hash in SQLite liegt.
 - Cookies sind `HttpOnly`, `SameSite=Strict` und in Production `Secure`.
@@ -35,6 +35,7 @@ VaultLink/
 │   ├── api.rs              stabile JSON-API-Fassade und Router unter /api/v1
 │   ├── api/                Auth-, Files-, Shares-, Admin-, Settings- und Public-Handler
 │   ├── auth.rs             Argon2id, TOTP, Rate Limit
+│   ├── cifs_provision.rs   privilegierte, eng begrenzte CIFS/systemd-Provisionierung
 │   ├── db.rs               DB-Fassade, gemeinsame Typen und Transaktionskern
 │   ├── db/                 fachliche Auth-, Share-, Transfer-, Settings- und Audit-Operationen
 │   ├── file_ops.rs         transaktionale Rename-/Delete-Operationen
@@ -104,11 +105,12 @@ data_directory = "/var/lib/vaultlink"
 internal_directory = "/srv/vaultlink/.vaultlink-internal"
 require_mount = true
 external_writers = false
+allow_external_writer_replace = false
 expected_filesystem_type = "ext4"
 expected_mount_source = "/dev/mapper/vaultlink"
 ```
 
-`expected_mount_source` muss exakt dem Source-Feld der aktiven Zeile in `/proc/self/mountinfo` entsprechen; ein `UUID=`-Eintrag aus `/etc/fstab` ist nicht automatisch derselbe Wert. Für auditierten lokalen Storage sind ext2/3/4, XFS, Btrfs, F2FS, Bcachefs und ZFS zugelassen. Root, internes Verzeichnis und Data Directory gehören dem `vaultlink`-Dienstbenutzer und dürfen weder über Gruppen-/Other-Modusbits noch über die POSIX-ACL-Maske schreibbar sein; lokale Co-Writer sind bei `external_writers = false` nicht unterstützt. SQLite darf dabei auf demselben lokalen Mount liegen, aber niemals innerhalb des sichtbaren Baums. Bei CIFS/SMB muss SQLite zusätzlich auf einem getrennten lokalen Dateisystem liegen.
+`expected_mount_source` muss exakt dem Source-Feld der aktiven Zeile in `/proc/self/mountinfo` entsprechen; ein `UUID=`-Eintrag aus `/etc/fstab` ist nicht automatisch derselbe Wert. Die Quelle bleibt auch bei lokalem Storage Pflicht, wenn `require_mount = true` gilt: Nur so erkennt VaultLink einen ausgefallenen Mount statt auf ein gleichnamiges lokales Fallback-Verzeichnis zu schreiben. Für auditierten lokalen Storage sind ext2/3/4, XFS, Btrfs, F2FS, Bcachefs und ZFS zugelassen. Root, internes Verzeichnis und Data Directory gehören dem `vaultlink`-Dienstbenutzer und dürfen weder über Gruppen-/Other-Modusbits noch über die POSIX-ACL-Maske schreibbar sein; lokale Co-Writer sind bei `external_writers = false` nicht unterstützt. SQLite darf dabei auf demselben lokalen Mount liegen, aber niemals innerhalb des sichtbaren Baums. Bei CIFS/SMB muss SQLite zusätzlich auf einem getrennten lokalen Dateisystem liegen.
 
 `public_base_url` verwendet kanonische `http://`- beziehungsweise `https://`-Authority-Syntax ohne abschließenden Slash. Basispfade, Zugangsdaten, Query und Fragment sind nicht unterstützt.
 
@@ -131,13 +133,14 @@ Pro Storage-Root darf genau **eine** VaultLink-Serverinstanz aktiv sein. Die Loc
 
 Für den auditierten Co-Writer-Modus gelten:
 
-- `require_mount = true`, `external_writers = true`, `expected_filesystem_type = "cifs"` und die erwartete UNC-Quelle sind Pflicht.
+- `require_mount = true`, `external_writers = true`, `expected_filesystem_type = "cifs"` und die erwartete UNC-Quelle sind Pflicht. `allow_external_writer_replace = false` bleibt der sichere Standard.
 - Der Kernel muss `statx`-Mount-IDs unterstützen (Linux 5.8 oder neuer). Root und interner Geschwisterpfad müssen dieselbe geprüfte Mount-ID nutzen; nur so bleiben Cross-Directory-Renames atomar.
 - Client, Mount und SMB-Server müssen kohärente exklusive `flock`-/SMB-Byte-Range-Locks für `.vaultlink-instance.lock` durchsetzen. Schlägt die lokale Semantikprüfung fehl, startet VaultLink fail-closed; mehrere Hosts mit unabhängig gecachten oder getrennten Lockdateien sind keine unterstützte HA-Konfiguration.
 - VaultLink prüft `vers=3.1.1`, `seal`, `cache=strict`, `serverino`, `nosuid`, `nodev`, `noexec`, Read-write-Status und verbietet unter anderem `cache=loose`, `nostrictsync`, `noperm`, `noserverino` und `multiuser`.
 - Userpfade dürfen weder Symlinks noch verschachtelte Mounts/DFS-Submounts durchqueren.
 - `data_directory` und SQLite/WAL bleiben auf einem separaten, explizit unterstützten lokalen Dateisystem; CIFS/NFS für SQLite wird abgewiesen.
 - Externe Writer gelten als vertrauenswürdige Publisher des sichtbaren Inhalts. Sie können Dateien verändern oder ersetzen, die ein bestehender VaultLink-Link ausliefert. Diese direkten SMB-Aktionen umgehen VaultLink-Audit, Share-Limits und Web-Policy und müssen deshalb am SMB-Server selbst auditiert werden.
+- `allow_external_writer_replace = true` ist ein ausdrücklicher Last-Writer-Wins-Opt-in. Die Veröffentlichung bleibt ein atomarer Rename, kann aber eine neuere parallele Änderung eines SMB-Clients überschreiben, weil Standardclients VaultLinks Storage-Lock nicht verwenden. VaultLink kann diesen Datenverlust nicht zuverlässig erkennen oder verhindern.
 - VaultLinks Linux-Mount erzwingt Transportverschlüsselung per SMB `seal`. Zusätzlich muss der externe SMB-Server SMB 3.1.1 Signing und Encryption für **jede** direkte Windows-, macOS- und Linux-Co-Writer-Session verpflichtend machen; VaultLink kann diese separaten Sessions nicht erzwingen. Verschlüsselung ruhender Daten ist Aufgabe des SMB-Servers. Transparenter Zugriff mit Standard-SMB-Clients ist nicht mit einer ausschließlich von VaultLink kontrollierten clientseitigen Inhaltsverschlüsselung vereinbar.
 
 Andere Netzwerkdateisysteme mit externen Schreibern sind in 0.5.0 nicht freigegeben. Ein erkanntes Remote-Dateisystem ohne explizite Mount-Policy wird beim Start abgewiesen. Production verlangt die Policy unabhängig vom gerade erkannten Dateisystem, sodass auch ein ausgefallener CIFS-Mount mit lokal sichtbarem Fallback-Verzeichnis fail-closed bleibt.
@@ -320,7 +323,24 @@ sudo install -o root -g root -m 0644 deploy/vaultlink.service /etc/systemd/syste
 sudo systemctl daemon-reload
 ```
 
-`ReadWritePaths=/mnt/storage` in [deploy/vaultlink.service](deploy/vaultlink.service) an die geprüfte Mount-Basis anpassen. Für SMB außerdem [deploy/mnt-storage.mount.example](deploy/mnt-storage.mount.example) als `/etc/systemd/system/mnt-storage.mount` und [deploy/vaultlink-external-storage.conf](deploy/vaultlink-external-storage.conf) als systemd-Drop-in installieren. `What`, Credentials, UID/GID und UNC-Quelle müssen zur Konfiguration passen. Die Credential-Datei gehört `root:root` mit Modus `0600`.
+`ReadWritePaths=/mnt/storage` in [deploy/vaultlink.service](deploy/vaultlink.service) an die geprüfte Mount-Basis anpassen. Die folgenden Schritte können weiterhin manuell mit [deploy/mnt-storage.mount.example](deploy/mnt-storage.mount.example) und [deploy/vaultlink-external-storage.conf](deploy/vaultlink-external-storage.conf) ausgeführt werden. Für die Standardstruktur `/mnt/storage` steht zusätzlich der eng begrenzte Root-Befehl im nächsten Abschnitt bereit.
+
+### CIFS-Mount sicher provisionieren
+
+Vorher auf dem SMB-Server `shared/` und `.vaultlink-internal/{uploads,tombstones}` mit den oben beschriebenen Server-ACLs anlegen. Der Linux-Client kann diese ACL-Grenze nicht zuverlässig beweisen und legt die Verzeichnisse deshalb nicht ersatzweise mit nur lokalen Modusbits an.
+
+Danach als Root den Mount provisionieren; das Passwort wird ausschließlich interaktiv vom Terminal gelesen und ist kein CLI-Argument:
+
+```sh
+sudo /opt/vaultlink/vaultlink provision-cifs \
+  --source //fileserver.example/vaultlink \
+  --username vaultlink-service \
+  --domain EXAMPLE
+```
+
+Der Befehl ist absichtlich auf `/mnt/storage` begrenzt. Er erstellt ausschließlich neue Dateien und verweigert das Überschreiben vorhandener Credentials oder systemd-Units. Die Credential-Datei erhält `root:root 0600`; die Mount-Unit erzwingt `vers=3.1.1`, Signing, Verschlüsselung, `cache=strict`, `serverino`, `nosuid`, `nodev` und `noexec`. Bei Aktivierungs-, Identitäts-, Options- oder Layoutfehlern stoppt er die Unit und entfernt die von diesem Versuch neu angelegten Dateien.
+
+Nach erfolgreichem Mount erkennt das Browser-Setup aktive unterstützte lokale Mounts sowie sichere CIFS/SMB3-Mounts. Bei genau einem vollständig vorbereiteten Mount werden der sichtbare `shared`-Pfad, `.vaultlink-internal`, Dateisystemtyp und die intern geprüfte Mount-Quelle automatisch übernommen. Bei mehreren Mounts erscheint eine Auswahl; eine laufende Setup-Seite kann die Liste über „Mounts aktualisieren“ neu laden. Die Mount-Quelle wird absichtlich nicht als frei editierbares GUI-Feld angeboten.
 
 ### Erstkonfiguration im Browser über SSH-Tunnel
 

@@ -607,6 +607,7 @@ impl SecureRoot {
             internal_directory,
             require_preprovisioned_internal,
             forbid_user_symlinks,
+            !forbid_user_symlinks,
             None,
         )
     }
@@ -621,6 +622,7 @@ impl SecureRoot {
         internal_directory: Option<&Path>,
         require_preprovisioned_internal: bool,
         forbid_user_symlinks: bool,
+        allow_replace: bool,
         storage_instance_lock: Arc<crate::StorageInstanceLock>,
     ) -> io::Result<Self> {
         Self::open_configured_inner(
@@ -628,6 +630,7 @@ impl SecureRoot {
             internal_directory,
             require_preprovisioned_internal,
             forbid_user_symlinks,
+            allow_replace,
             Some(storage_instance_lock),
         )
     }
@@ -637,6 +640,7 @@ impl SecureRoot {
         internal_directory: Option<&Path>,
         require_preprovisioned_internal: bool,
         forbid_user_symlinks: bool,
+        allow_replace: bool,
         storage_instance_lock: Option<Arc<crate::StorageInstanceLock>>,
     ) -> io::Result<Self> {
         let locked_root = storage_instance_lock
@@ -755,7 +759,7 @@ impl SecureRoot {
                 directory,
                 staging: uploads,
                 forbid_symlinks: forbid_user_symlinks,
-                allow_replace: !forbid_user_symlinks,
+                allow_replace,
                 _storage_instance_lock: storage_instance_lock.clone(),
                 #[cfg(test)]
                 next_create_directory_sync_error: next_create_directory_sync_error.clone(),
@@ -2294,6 +2298,36 @@ mod tests {
         assert_eq!(
             std::fs::read(shared.join("existing.txt")).unwrap(),
             b"original"
+        );
+    }
+
+    #[test]
+    fn explicit_external_writer_replace_policy_enables_filesystem_replace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mount = tempfile::tempdir().unwrap();
+        let shared = mount.path().join("shared");
+        let internal = mount.path().join(INTERNAL_DIRECTORY_NAME);
+        let uploads = internal.join(UPLOAD_STAGING_DIRECTORY_NAME);
+        let tombstones = internal.join(TOMBSTONE_STAGING_DIRECTORY_NAME);
+        for path in [&shared, &internal, &uploads, &tombstones] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root =
+            SecureRoot::open_configured_inner(&shared, Some(&internal), true, true, true, None)
+                .unwrap();
+        std::fs::write(shared.join("existing.txt"), b"external").unwrap();
+        let mut upload = root.begin_upload("").unwrap();
+        let mut file = upload.take_file().unwrap();
+        file.write_all(b"vaultlink").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        upload.publish_replace("existing.txt").unwrap();
+        assert_eq!(
+            std::fs::read(shared.join("existing.txt")).unwrap(),
+            b"vaultlink"
         );
     }
 

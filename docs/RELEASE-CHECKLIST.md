@@ -21,7 +21,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [x] Optionaler Kurzlink-Alias.
 - [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`; HEAD prüft die verfügbare Quote ohne Reservierung oder Zählung, feste Transfer-Grants zählen erst vollständige Antworten und fassen Range-Resumes ohne Sliding-Expiry zusammen.
 - [x] Sichere Uploads mit temporärer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
-- [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink ohne Co-Writer; bei `external_writers=true` erzwingen UI, API und Publish-Pfad No-Replace.
+- [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink; bei `external_writers=true` erzwingen UI, API und Publish-Pfad standardmäßig No-Replace. Der separate Opt-in `allow_external_writer_replace=true` dokumentiert und testet bewusstes Last-Writer-Wins.
 - [x] Upload in navigierten Unterordnern für `download_upload`-Ordnerlinks.
 - [x] Upload-only-Freigaben listen keine Ordnerinhalte und erlauben keine Preview/Downloads.
 - [x] Inkrementeller ZIP-Download für Ordnerfreigaben mit durchgehendem ZIP64, Datei-, Scan- und Größenlimits, gecappten Quelldateien, Temp-Budget und backpressured Direct-Stream-Fallback.
@@ -36,6 +36,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [x] Pro-Share SecureFS-Capabilities verhindern Symlink-Wechsel in Sibling-Shares für Listing, Preview, Download, ZIP und Upload.
 - [x] Linux-only auf x86_64 und aarch64; Windows-Dateinamensinteroperabilität bleibt für Standard-SMB-Clients erhalten.
 - [x] Externer CIFS-Co-Writer-Modus mit geprüfter Mount-ID/-Quelle/-Optionen, pre-provisioniertem sibling staging, lokalem SQLite und crash-sicherem Pending-/Committed-Delete-Protokoll.
+- [x] Separater Root-Befehl für die nicht überschreibende `/mnt/storage`-CIFS-Provisionierung mit interaktiver Credential-Eingabe und Rollback; das unprivilegierte Browser-Setup erkennt sichere aktive SMB-Mounts und übernimmt Pfade, Typ und Quelle.
 - [x] Exklusiver, nicht blockierender Lifetime-Lock im gemeinsamen `internal_directory` wird vor Storage-Recovery/Cleanup erworben, auf wirksame Lock-Semantik geprüft und verhindert überlappende VaultLink-Server für dieselbe Journal-Domain.
 - [x] Jede Production-Konfiguration verlangt eine exakte fail-closed Mount-Identität; ein ausgefallener CIFS-Mount darf auch dann nicht auf das lokale Fallback-Verzeichnis starten, wenn dort gerade ext4 sichtbar ist. Auditiertes lokales Production-Storage darf SQLite außerhalb des sichtbaren Baums auf demselben lokalen Mount halten.
 - [x] Browser-Setup und `init-admin` prüfen Root/Internal/Data-Mount und kanonische Pfade vor Konfiguration, Datenbank oder Credential-Secrets; Symlink-Aliase in den sichtbaren Baum werden abgewiesen.

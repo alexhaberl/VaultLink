@@ -224,7 +224,7 @@ pub(super) async fn share_index_page(
             })
             .unwrap_or_default();
         let upload_settings = if share.is_directory && share.permission.can_upload() {
-            let overwrite_control = if state.config.storage.external_writers {
+            let overwrite_control = if !state.config.storage.replacements_allowed() {
                 String::new()
             } else {
                 let checked = if share.upload_conflict_strategy.can_overwrite() {
@@ -384,7 +384,7 @@ pub(super) async fn share_create_page(
     } else {
         r#"<input type="hidden" name="permission" value="download_only"><span class="vl-badge vl-badge--accent"><vl-i18n key="share.download_only"/></span><p class="vl-muted"><vl-i18n key="share.upload_folder_only"/></p>"#
     };
-    let overwrite_rule = if state.config.storage.external_writers {
+    let overwrite_rule = if !state.config.storage.replacements_allowed() {
         ""
     } else {
         r#"<label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1"><span><vl-i18n key="share.existing_replace"/><small><vl-i18n key="share.uploader_confirm"/></small></span></label>"#
@@ -469,7 +469,7 @@ pub(super) async fn create_share(
     let service = ShareService::new(
         state.db.clone(),
         settings.clone(),
-        state.config.storage.external_writers,
+        !state.config.storage.replacements_allowed(),
     );
     let rel = service
         .normalize_target_path(&f.path)
@@ -737,7 +737,7 @@ pub(super) async fn set_share_upload_conflict(
     } else {
         UploadConflictStrategy::Reject
     };
-    if strategy.can_overwrite() && state.config.storage.external_writers {
+    if strategy.can_overwrite() && !state.config.storage.replacements_allowed() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
             "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
@@ -873,7 +873,7 @@ pub(super) async fn set_share_password(
     let service = ShareService::new(
         state.db.clone(),
         settings.clone(),
-        state.config.storage.external_writers,
+        !state.config.storage.replacements_allowed(),
     );
     let password_hash = if remove {
         None

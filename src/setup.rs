@@ -106,6 +106,7 @@ struct SetupForm {
     internal_directory: String,
     require_mount: Option<String>,
     external_writers: Option<String>,
+    allow_external_writer_replace: Option<String>,
     expected_filesystem_type: String,
     expected_mount_source: String,
     max_upload_size_mb: String,
@@ -170,6 +171,7 @@ fn setup_router(state: SetupState) -> Router {
         .route("/complete", axum::routing::post(complete_setup))
         .route("/start", axum::routing::post(start_server))
         .route("/browse", get(setup_browse))
+        .route("/mounts", get(setup_mounts))
         .route("/assets/vaultlink.css", get(stylesheet_asset))
         .route("/assets/setup.js", get(setup_javascript_asset))
         .layer(middleware::from_fn(setup_security_headers))
@@ -629,6 +631,7 @@ where
     let reverse_proxy_mode = matches!(mode, ServerMode::ReverseProxy);
     let production_mode = !matches!(mode, ServerMode::Development);
     let external_writers = form.external_writers.is_some();
+    let allow_external_writer_replace = form.allow_external_writer_replace.is_some();
     let require_mount = production_mode || form.require_mount.is_some() || external_writers;
     let optional_mount_value = |value: String| {
         let value = value.trim().to_string();
@@ -680,6 +683,7 @@ where
             internal_directory,
             require_mount,
             external_writers,
+            allow_external_writer_replace,
             expected_filesystem_type,
             expected_mount_source,
             max_upload_size: parse_unit_to_bytes(
@@ -997,6 +1001,84 @@ struct BrowseResponse {
     entries: Vec<BrowseEntry>,
 }
 
+#[derive(Serialize)]
+struct DetectedMountResponse {
+    mount_point: String,
+    root_mount_path: String,
+    internal_directory: String,
+    expected_filesystem_type: String,
+    expected_mount_source: String,
+    ready: bool,
+}
+
+#[derive(Serialize)]
+struct MountDiscoveryResponse {
+    mounts: Vec<DetectedMountResponse>,
+    error: Option<String>,
+}
+
+async fn setup_mounts(
+    State(state): State<SetupState>,
+    Query(query): Query<TokenQuery>,
+) -> Response {
+    if !query
+        .token
+        .as_deref()
+        .is_some_and(|token| auth::constant_time_eq(state.token.as_str(), token))
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match storage_mount::discover_supported_mounts() {
+        Ok(mounts) => {
+            let mounts = mounts
+                .into_iter()
+                .filter_map(|mount| {
+                    let mount_point = mount.mount_point.to_str()?.to_string();
+                    let root_mount_path = mount.root_mount_path.to_str()?.to_string();
+                    let internal_directory = mount.internal_directory.to_str()?.to_string();
+                    let ready =
+                        mount_layout_ready(&mount.root_mount_path, &mount.internal_directory);
+                    Some(DetectedMountResponse {
+                        mount_point,
+                        root_mount_path,
+                        internal_directory,
+                        expected_filesystem_type: mount.filesystem_type,
+                        expected_mount_source: mount.source,
+                        ready,
+                    })
+                })
+                .collect();
+            Json(MountDiscoveryResponse {
+                mounts,
+                error: None,
+            })
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(MountDiscoveryResponse {
+                mounts: Vec::new(),
+                error: Some(error.to_string()),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn mount_layout_ready(root_mount_path: &Path, internal_directory: &Path) -> bool {
+    [
+        root_mount_path.to_path_buf(),
+        internal_directory.to_path_buf(),
+        internal_directory.join("uploads"),
+        internal_directory.join("tombstones"),
+    ]
+    .iter()
+    .all(|path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    })
+}
+
 async fn setup_browse(
     State(state): State<SetupState>,
     Query(query): Query<BrowseQuery>,
@@ -1102,21 +1184,21 @@ fn legacy_setup_form(token: &str, error: Option<&str>) -> String {
   </div></section>
   <section class="vl-form-card"><h2><vl-i18n key="setup.storage"/></h2><div class="vl-form-grid">
     <label><vl-i18n key="setup.root_mount_path"/><br><div class="vl-input-action"><input name="root_mount_path" value="/tmp/vaultlink-root" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="root_mount_path"><vl-i18n key="setup.browse"/></button></div></label>
-    <label><vl-i18n key="setup.data_directory"/><br><div class="vl-input-action"><input name="data_directory" value="/tmp/vaultlink-data" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="data_directory"><vl-i18n key="setup.browse"/></button></div></label>
+    <label><vl-i18n key="setup.data_directory"/><br><div class="vl-input-action"><input name="data_directory" value="/var/lib/vaultlink" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="data_directory"><vl-i18n key="setup.browse"/></button></div></label>
     <label><vl-i18n key="setup.internal_directory"/><br><div class="vl-input-action"><input name="internal_directory" required><button class="vl-button vl-button--secondary vl-button--small" type="button" data-dir-picker="internal_directory"><vl-i18n key="setup.browse"/></button></div></label>
     <label><vl-i18n key="setup.expected_filesystem_type"/><br><input name="expected_filesystem_type" placeholder="ext4 oder cifs" data-mount-policy-field></label>
     <label><vl-i18n key="setup.expected_mount_source"/><br><input name="expected_mount_source" placeholder="/dev/mapper/storage oder //server/share" data-mount-policy-field></label>
     <label class="vl-toggle"><input type="checkbox" name="require_mount" data-require-mount><span><vl-i18n key="setup.require_mount"/><small><vl-i18n key="setup.require_mount_help"/></small></span></label>
     <label class="vl-toggle"><input type="checkbox" name="external_writers" data-external-writers><span><vl-i18n key="setup.external_writers"/><small><vl-i18n key="setup.external_writers_help"/></small></span></label>
-    <label><vl-i18n key="setup.max_upload_mb"/><br><input name="max_upload_size_mb" type="number" min="1" step="1" value="100" required></label>
+    <label><vl-i18n key="setup.max_upload_mb"/><br><input name="max_upload_size_mb" type="number" min="1" step="1" value="50000" required></label>
     <label><vl-i18n key="setup.blocked_extensions"/><br><input name="blocked_extensions" value="exe,sh,php"></label>
   </div></section>
   <section class="vl-form-card"><h2><vl-i18n key="setup.zip_search_preview"/></h2><div class="vl-form-grid">
-    <label><vl-i18n key="setup.zip_max_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="1" required></label>
+    <label><vl-i18n key="setup.zip_max_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="20" required></label>
     <label><vl-i18n key="setup.zip_max_files"/><br><input name="max_zip_files" type="number" min="0" value="10000" required></label>
     <label><vl-i18n key="setup.search_max_entries"/><br><input name="max_search_entries" type="number" min="1" value="50000" required></label>
     <label><vl-i18n key="setup.search_max_results"/><br><input name="max_search_results" type="number" min="1" value="500" required></label>
-    <label><vl-i18n key="setup.text_preview_max_mb"/><br><input name="max_preview_size_mb" type="number" min="1" max="{max_text_preview_size_mb}" step="1" value="1" required></label>
+    <label><vl-i18n key="setup.text_preview_max_mb"/><br><input name="max_preview_size_mb" type="number" min="1" max="{max_text_preview_size_mb}" step="1" value="50" required></label>
     <label><vl-i18n key="setup.text_preview_extensions"/><br><input name="preview_extensions" value="txt,log,md,csv,json,toml,yaml,yml,ini,conf" required></label>
     <label><vl-i18n key="setup.media_preview_max_mb"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="100" required></label>
     <label><vl-i18n key="setup.image_preview_extensions"/><br><input name="image_preview_extensions" value="jpg,jpeg,png,gif,webp,bmp,avif"></label>
@@ -1187,9 +1269,19 @@ document.addEventListener('DOMContentLoaded', () => {
   const certificateSource = form.querySelector('[data-certificate-source]');
   const requireMount = form.querySelector('[data-require-mount]');
   const externalWriters = form.querySelector('[data-external-writers]');
+  const externalWritersField = form.querySelector('[data-external-writers-field]');
+  const externalWriterReplace = form.querySelector('[data-external-writer-replace]');
+  const externalWriterReplaceField = form.querySelector('[data-external-writer-replace-field]');
+  const token = form.dataset.setupToken;
   const syncConditionalFields = () => {
     const selectedMode = mode?.value || 'development';
     const selectedCertificate = certificateSource?.value || 'files';
+    const cifsStorage = form.elements.expected_filesystem_type.value === 'cifs';
+    externalWritersField.hidden = !cifsStorage;
+    if (!cifsStorage) externalWriters.checked = false;
+    const externalClientsEnabled = cifsStorage && externalWriters.checked;
+    externalWriterReplaceField.hidden = !externalClientsEnabled;
+    if (!externalClientsEnabled) externalWriterReplace.checked = false;
     const standalone = selectedMode === 'standalone_tls';
     const production = selectedMode !== 'development';
     if (production || externalWriters?.checked) requireMount.checked = true;
@@ -1219,11 +1311,142 @@ document.addEventListener('DOMContentLoaded', () => {
   certificateSource?.addEventListener('change', syncConditionalFields);
   requireMount?.addEventListener('change', syncConditionalFields);
   externalWriters?.addEventListener('change', syncConditionalFields);
+  externalWriterReplace?.addEventListener('change', syncConditionalFields);
+  form.elements.expected_filesystem_type?.addEventListener('change', syncConditionalFields);
   syncConditionalFields();
+
+  const detectedMountSelect = form.querySelector('[data-detected-mount]');
+  const refreshMountsButton = form.querySelector('[data-refresh-mounts]');
+  const detectedMountStatus = form.querySelector('[data-mount-status]');
+  let detectedMounts = new Map();
+  const applyDetectedMount = mount => {
+    form.elements.root_mount_path.value = mount.root_mount_path;
+    form.elements.internal_directory.value = mount.internal_directory;
+    form.elements.expected_filesystem_type.value = mount.expected_filesystem_type;
+    form.elements.expected_mount_source.value = mount.expected_mount_source;
+    requireMount.checked = true;
+    syncConditionalFields();
+    detectedMountStatus.textContent = '<vl-i18n key="setup.cifs_mount_applied"/>';
+  };
+  const canAutoApplyDetectedMount = () =>
+    form.elements.root_mount_path.value === '/tmp/vaultlink-root'
+    && form.elements.internal_directory.value === ''
+    && form.elements.expected_filesystem_type.value === ''
+    && form.elements.expected_mount_source.value === '';
+  async function refreshDetectedMounts(autoApply = false) {
+    refreshMountsButton.disabled = true;
+    try {
+      const previousMountPoint = detectedMountSelect.value;
+      const response = await fetch(`/mounts?token=${encodeURIComponent(token)}`);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || 'mount discovery failed');
+      detectedMounts = new Map(payload.mounts.map(mount => [mount.mount_point, mount]));
+      detectedMountSelect.replaceChildren();
+      const readyMounts = payload.mounts.filter(mount => mount.ready);
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = readyMounts.length
+        ? '<vl-i18n key="setup.choose_cifs_mount"/>'
+        : '<vl-i18n key="setup.no_cifs_mounts"/>';
+      detectedMountSelect.appendChild(placeholder);
+      for (const mount of payload.mounts) {
+        const option = document.createElement('option');
+        option.value = mount.mount_point;
+        option.disabled = !mount.ready;
+        option.textContent = `${mount.expected_mount_source} → ${mount.mount_point}${mount.ready ? '' : ' · <vl-i18n key="setup.cifs_layout_incomplete"/>'}`;
+        detectedMountSelect.appendChild(option);
+      }
+      detectedMountSelect.disabled = readyMounts.length === 0;
+      detectedMountStatus.textContent = readyMounts.length
+        ? '<vl-i18n key="setup.detected_cifs_mount_help"/>'
+        : '<vl-i18n key="setup.cifs_discovery_hint"/>';
+      const matchingMount = readyMounts.find(mount => mount.mount_point === previousMountPoint)
+        || readyMounts.find(mount =>
+          mount.root_mount_path === form.elements.root_mount_path.value
+          && mount.internal_directory === form.elements.internal_directory.value
+          && mount.expected_filesystem_type === form.elements.expected_filesystem_type.value
+          && mount.expected_mount_source === form.elements.expected_mount_source.value);
+      if (matchingMount) {
+        detectedMountSelect.value = matchingMount.mount_point;
+      } else if (autoApply && readyMounts.length === 1 && canAutoApplyDetectedMount()) {
+        detectedMountSelect.value = readyMounts[0].mount_point;
+        applyDetectedMount(readyMounts[0]);
+      }
+    } catch (_) {
+      detectedMounts = new Map();
+      detectedMountSelect.disabled = true;
+      detectedMountStatus.textContent = '<vl-i18n key="setup.cifs_discovery_failed"/>';
+    } finally {
+      refreshMountsButton.disabled = false;
+    }
+  }
+  detectedMountSelect?.addEventListener('change', () => {
+    const mount = detectedMounts.get(detectedMountSelect.value);
+    if (mount?.ready) applyDetectedMount(mount);
+  });
+  refreshMountsButton?.addEventListener('click', () => refreshDetectedMounts(false));
+  refreshDetectedMounts(true);
+
+  const infoTriggers = [...form.querySelectorAll('.vl-field-info')];
+  const positionInfoPopup = trigger => {
+    const tooltip = trigger.querySelector('.vl-field-tooltip');
+    if (!tooltip) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const margin = 16;
+    const halfWidth = tooltipRect.width / 2;
+    const left = Math.max(
+      margin + halfWidth,
+      Math.min(window.innerWidth - margin - halfWidth, triggerRect.left + triggerRect.width / 2),
+    );
+    let top = triggerRect.bottom + 8;
+    if (top + tooltipRect.height > window.innerHeight - margin
+      && triggerRect.top - tooltipRect.height - 8 >= margin) {
+      top = triggerRect.top - tooltipRect.height - 8;
+    }
+    tooltip.style.setProperty('--vl-tooltip-left', `${left}px`);
+    tooltip.style.setProperty('--vl-tooltip-top', `${top}px`);
+  };
+  const closeInfoPopups = except => {
+    for (const trigger of infoTriggers) {
+      if (trigger === except) continue;
+      trigger.classList.remove('is-open');
+      trigger.setAttribute('aria-expanded', 'false');
+    }
+  };
+  for (const trigger of infoTriggers) {
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.addEventListener('pointerenter', () => positionInfoPopup(trigger));
+    trigger.addEventListener('focus', () => positionInfoPopup(trigger));
+    trigger.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      positionInfoPopup(trigger);
+      const open = !trigger.classList.contains('is-open');
+      closeInfoPopups(trigger);
+      trigger.classList.toggle('is-open', open);
+      trigger.setAttribute('aria-expanded', String(open));
+      trigger.focus();
+    });
+    trigger.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        trigger.click();
+      } else if (event.key === 'Escape') {
+        trigger.classList.remove('is-open');
+        trigger.setAttribute('aria-expanded', 'false');
+        trigger.blur();
+      }
+    });
+    trigger.addEventListener('blur', () => {
+      trigger.classList.remove('is-open');
+      trigger.setAttribute('aria-expanded', 'false');
+    });
+  }
+  document.addEventListener('click', () => closeInfoPopups());
 
   const dialog = document.querySelector('[data-dir-dialog]');
   if (!dialog?.showModal) return;
-  const token = form.dataset.setupToken;
   const list = dialog.querySelector('[data-dir-list]');
   const current = dialog.querySelector('[data-dir-current]');
   const pickerTitle = dialog.querySelector('[data-picker-title]');
@@ -1371,6 +1594,7 @@ mod tests {
                 .to_string(),
             require_mount: None,
             external_writers: None,
+            allow_external_writer_replace: None,
             expected_filesystem_type: String::new(),
             expected_mount_source: String::new(),
             max_upload_size_mb: "1".into(),
@@ -1421,24 +1645,52 @@ mod tests {
         assert!(html.contains("VaultLink<small>Secure file sharing</small>"));
         assert!(html.contains(r#"<html lang="de">"#));
         assert!(html.contains("Ersteinrichtung"));
-        assert!(html.contains("name=\"max_upload_size_mb\""));
-        assert!(html.contains("name=\"max_zip_size_gb\""));
+        assert!(
+            html.contains("Lokaler Bootstrap für die initiale Konfiguration und den ersten Admin.")
+        );
+        assert!(!html.contains("Setup bindet ausschließlich an Loopback."));
+        assert!(html
+            .contains(r#"name="max_upload_size_mb" type="number" min="1" step="1" value="50000""#));
+        assert!(
+            html.contains(r#"name="max_zip_size_gb" type="number" min="0" step="1" value="20""#)
+        );
         assert!(html.contains(
-            r#"name="max_preview_size_mb" type="number" min="1" max="64" step="1" value="1""#
+            r#"name="max_preview_size_mb" type="number" min="1" max="64" step="1" value="50""#
         ));
+        assert!(html.contains("Max. Quelldaten pro ZIP in GB"));
+        assert!(!html.contains("Max. Quelldaten pro ZIP in GB (0 = kein separates Limit)"));
+        assert!(html.contains("Max. Dateien pro ZIP"));
+        assert!(!html.contains("Max. Dateien pro ZIP (0 = kein separates Limit)"));
         assert!(html.contains("name=\"max_media_preview_size_mb\""));
         assert!(html.contains("<select name=\"log_level\">"));
         assert!(html.contains("VaultLink-Dienstadresse nach dem Setup"));
-        assert!(html.contains("Die lokale Setup-Adresse bleibt davon unabhängig"));
+        assert!(html.contains("Hier lauscht der spätere VaultLink-Dienst."));
+        assert!(!html.contains("Die lokale Setup-Adresse bleibt davon unabhängig"));
         assert!(
             html.contains(r#"name="admin_username" value="admin" minlength="3" maxlength="64""#)
         );
         assert!(html.contains("data-dir-picker=\"root_mount_path\""));
         assert!(html.contains("data-dir-picker=\"internal_directory\""));
+        assert!(html.contains(r#"name="data_directory" value="/var/lib/vaultlink" required"#));
+        assert!(!html.contains(r#"name="data_directory" value="/tmp/vaultlink-data""#));
         assert!(html.contains(r#"<input name="internal_directory" required>"#));
         assert!(!html.contains(r#"name="internal_directory" data-mount-policy-field"#));
         assert!(html.contains("data-require-mount"));
         assert!(html.contains("data-external-writers"));
+        assert!(html.contains("data-external-writers-field"));
+        assert!(html.contains("Externe SMB-Clients"));
+        assert!(!html.contains("Externe SMB-Schreiber"));
+        assert!(html.contains("data-external-writer-replace-field"));
+        assert!(html.contains("Replace trotz externer SMB-Clients"));
+        assert!(html.contains("data-detected-mount"));
+        assert!(html.contains("data-refresh-mounts"));
+        assert!(html.contains(r#"<option value="zfs">zfs</option>"#));
+        assert!(html.contains(r#"<option value="cifs">cifs</option>"#));
+        assert!(!html.contains(r#"<option value="smb3">smb3</option>"#));
+        assert!(html.contains(
+            r#"<input type="hidden" name="expected_mount_source" data-mount-policy-field>"#
+        ));
+        assert!(!html.contains("Erwartete Mount-Quelle"));
         assert!(html.contains("data-file-picker=\"tls_cert_file\""));
         assert!(html.contains("data-file-picker=\"tls_key_file\""));
         assert!(html.contains("data-dir-dialog"));
@@ -1452,6 +1704,12 @@ mod tests {
         assert!(!html.contains("name=\"production_mode\""));
         assert!(!html.contains("name=\"secure_cookie\""));
         assert!(SETUP_JAVASCRIPT.contains("fallbackToRoot"));
+        assert!(SETUP_JAVASCRIPT.contains("/mounts?token="));
+        assert!(SETUP_JAVASCRIPT.contains("applyDetectedMount"));
+        assert!(SETUP_JAVASCRIPT.contains("previousMountPoint"));
+        assert!(SETUP_JAVASCRIPT.contains("externalWritersField.hidden = !cifsStorage"));
+        assert!(SETUP_JAVASCRIPT
+            .contains("externalWriterReplaceField.hidden = !externalClientsEnabled"));
         assert!(!SETUP_JAVASCRIPT.contains("`Ordner ${entry.name}`"));
         assert!(!html.contains("Max Upload Bytes"));
         assert!(!html.contains("Log Level<br><input"));
@@ -1879,6 +2137,52 @@ mod tests {
         assert!(!key_body.contains("server.crt"));
         assert!(!key_body.contains("setup-ui-proxy.py"));
         assert!(key_body.contains(r#""is_directory":false"#));
+    }
+
+    #[tokio::test]
+    async fn setup_mount_discovery_requires_token_and_returns_json() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let app = setup_router(test_setup_state(config_dir.path().join("config.toml")));
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/mounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mounts?token=token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&response_text(authorized).await).unwrap();
+        assert!(body["mounts"].is_array());
+        assert!(body["error"].is_null());
+    }
+
+    #[test]
+    fn mount_layout_readiness_requires_real_preprovisioned_directories() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("shared");
+        let internal = base.path().join(".vaultlink-internal");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&internal).unwrap();
+        std::fs::create_dir(internal.join("uploads")).unwrap();
+        assert!(!mount_layout_ready(&root, &internal));
+        std::fs::create_dir(internal.join("tombstones")).unwrap();
+        assert!(mount_layout_ready(&root, &internal));
     }
 
     #[tokio::test]

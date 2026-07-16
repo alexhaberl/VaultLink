@@ -1,4 +1,6 @@
-# Example: install as /etc/systemd/system/mnt-storage.mount, then adjust What,
+# Example for manual provisioning. Alternatively use the root-only
+# `vaultlink provision-cifs` command. Install as
+# /etc/systemd/system/mnt-storage.mount, then adjust What,
 # the root-only (0600) credential path, and the vaultlink uid/gid mapping.
 # The unit name must match Where=/mnt/storage.
 # Pre-provision .vaultlink-internal/{uploads,tombstones}. Server-side ACLs must

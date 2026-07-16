@@ -68,6 +68,7 @@ pub struct Storage {
     pub internal_directory: Option<PathBuf>,
     pub require_mount: bool,
     pub external_writers: bool,
+    pub allow_external_writer_replace: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_filesystem_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -584,6 +585,12 @@ impl Config {
     }
 }
 
+impl Storage {
+    pub fn replacements_allowed(&self) -> bool {
+        !self.external_writers || self.allow_external_writer_replace
+    }
+}
+
 fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(), ConfigError> {
     let internal_directory = storage.internal_directory.as_deref().ok_or_else(|| {
         ConfigError::Invalid(
@@ -601,6 +608,11 @@ fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(),
         return Err(ConfigError::Invalid(
             "external_writers=true requires require_mount=true and an explicit mount identity"
                 .into(),
+        ));
+    }
+    if storage.allow_external_writer_replace && !storage.external_writers {
+        return Err(ConfigError::Invalid(
+            "allow_external_writer_replace=true requires external_writers=true".into(),
         ));
     }
     if !storage.require_mount {
@@ -855,6 +867,7 @@ mod tests {
                 internal_directory: Some(PathBuf::from(".").join(DEFAULT_INTERNAL_DIRECTORY_NAME)),
                 require_mount: false,
                 external_writers: false,
+                allow_external_writer_replace: false,
                 expected_filesystem_type: None,
                 expected_mount_source: None,
                 max_upload_size: 10,
@@ -914,7 +927,12 @@ mod tests {
     #[test]
     fn storage_boundary_fields_are_required_in_0_5_0() {
         let serialized = toml::to_string(&base()).unwrap();
-        for required in ["internal_directory", "require_mount", "external_writers"] {
+        for required in [
+            "internal_directory",
+            "require_mount",
+            "external_writers",
+            "allow_external_writer_replace",
+        ] {
             let without_required = serialized
                 .lines()
                 .filter(|line| !line.starts_with(&format!("{required} =")))
@@ -950,6 +968,16 @@ mod tests {
         config.storage.internal_directory = Some("/mnt/.vaultlink-internal".into());
         config.storage.external_writers = true;
         config.validate().unwrap();
+        config.storage.allow_external_writer_replace = true;
+        config.validate().unwrap();
+
+        let mut invalid = base();
+        invalid.storage.allow_external_writer_replace = true;
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires external_writers=true"));
     }
 
     #[test]

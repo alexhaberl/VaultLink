@@ -125,7 +125,7 @@ pub(super) async fn create_share(
     let service = ShareService::new(
         state.db.clone(),
         settings.clone(),
-        state.config.storage.external_writers,
+        !state.config.storage.replacements_allowed(),
     );
     let rel = service
         .normalize_target_path(&request.path)
@@ -234,7 +234,7 @@ pub(super) async fn update_share(
         .as_ref()
         .is_some_and(|strategy| {
             strategy.can_overwrite()
-                && (state.config.storage.external_writers
+                && (!state.config.storage.replacements_allowed()
                     || !current_share.is_directory
                     || !current_share.permission.can_upload())
         })
@@ -429,7 +429,7 @@ pub(super) async fn set_share_password(
     let service = ShareService::new(
         state.db.clone(),
         runtime_settings(&state),
-        state.config.storage.external_writers,
+        !state.config.storage.replacements_allowed(),
     );
     let password = service
         .prepare_password(SharePasswordInput::Direct(request.password))

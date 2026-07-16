@@ -16,6 +16,7 @@ data_directory = "/var/lib/vaultlink"
 internal_directory = "/mnt/storage/.vaultlink-internal"
 require_mount = true
 external_writers = true
+allow_external_writer_replace = false
 expected_filesystem_type = "cifs"
 expected_mount_source = "//fileserver.example/vaultlink"
 ```
@@ -76,7 +77,7 @@ Schema migrations run in one SQLite transaction. A database with a schema newer 
 
 Candidate configurations must use `share_password_max_length`; the deprecated TOML name `share_password_max_bytes` is rejected before downtime. Schema 12 renames the same legacy key in `runtime_settings` automatically. If both persisted names exist, the canonical value wins.
 
-VaultLink 0.5.0 removes the omission defaults for `storage.internal_directory`, `storage.require_mount`, and `storage.external_writers`. Every candidate configuration, including development, must contain all three fields. For development, set `internal_directory` explicitly to `<root_mount_path>/.vaultlink-internal`, normally with `require_mount = false` and `external_writers = false`.
+VaultLink 0.5.0 removes the omission defaults for `storage.internal_directory`, `storage.require_mount`, `storage.external_writers`, and `storage.allow_external_writer_replace`. Every candidate configuration, including development, must contain all four fields. For development, set `internal_directory` explicitly to `<root_mount_path>/.vaultlink-internal`, normally with `require_mount = false`, `external_writers = false`, and `allow_external_writer_replace = false`.
 
 The upgrade script validates the candidate binary/configuration pair as `vaultlink` before downtime and rejects a missing or inconsistent storage boundary. It never infers the internal directory or mount policy from the filesystem and never rewrites the live configuration. The old explicit configuration remains part of the verified rollback triple. This fail-closed preflight is intentional because choosing the wrong storage boundary can expose staging data to co-writers.
 

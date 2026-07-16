@@ -14,6 +14,7 @@ internal_directory = "/mnt/storage/.vaultlink-internal"
 # or administrative rights on this private sibling or the share root.
 require_mount = true
 external_writers = true
+allow_external_writer_replace = false
 expected_filesystem_type = "cifs"
 expected_mount_source = "//fileserver.example/vaultlink"
 # Setup/UI units are decimal: 1 MB = 1,000,000 bytes; 1 GB = 1,000,000,000 bytes.

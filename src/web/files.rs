@@ -444,7 +444,7 @@ pub(super) async fn process_admin_upload(
                     .await
                     .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Uploadoption"))?;
                 overwrite_existing = value == "1";
-                if overwrite_existing && state.config.storage.external_writers {
+                if overwrite_existing && !state.config.storage.replacements_allowed() {
                     return Err(AppError(
                         StatusCode::BAD_REQUEST,
                         "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
@@ -963,7 +963,7 @@ pub(super) async fn admin_browser(
         esc(&s.csrf_token),
         esc(&rel),
     );
-    let overwrite_control = if state.config.storage.external_writers {
+    let overwrite_control = if !state.config.storage.replacements_allowed() {
         ""
     } else {
         r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_conflict"/><small><vl-i18n key="share.after_conflict"/></small></span></label>"#
