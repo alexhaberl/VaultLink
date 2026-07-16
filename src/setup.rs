@@ -1681,7 +1681,7 @@ mod tests {
         assert!(html.contains("Externe SMB-Clients"));
         assert!(!html.contains("Externe SMB-Schreiber"));
         assert!(html.contains("data-external-writer-replace-field"));
-        assert!(html.contains("Replace trotz externer SMB-Clients"));
+        assert!(html.contains("SMB-Replace erlauben"));
         assert!(html.contains("data-detected-mount"));
         assert!(html.contains("data-refresh-mounts"));
         assert!(html.contains(r#"<option value="zfs">zfs</option>"#));

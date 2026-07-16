@@ -235,7 +235,7 @@ catalog! {
     SETUP_REQUIRE_MOUNT_HELP, "setup.require_mount_help", "In Production immer aktiv. VaultLink startet nur mit exakt passender aktiver Mount-Identität.", "Always enabled in production. VaultLink starts only with the exact active mount identity.";
     SETUP_EXTERNAL_WRITERS, "setup.external_writers", "Externe SMB-Clients", "External SMB clients";
     SETUP_EXTERNAL_WRITERS_HELP, "setup.external_writers_help", "Aktivieren, wenn weitere SMB-Clients direkt auf dasselbe CIFS-Storage schreiben. Replace-Uploads bleiben standardmäßig deaktiviert.", "Enable when other SMB clients write directly to the same CIFS storage. Replacement uploads remain disabled by default.";
-    SETUP_EXTERNAL_WRITER_REPLACE, "setup.external_writer_replace", "Replace trotz externer SMB-Clients", "Replace with external SMB clients";
+    SETUP_EXTERNAL_WRITER_REPLACE, "setup.external_writer_replace", "SMB-Replace erlauben", "Allow SMB replacement";
     SETUP_EXTERNAL_WRITER_REPLACE_HELP, "setup.external_writer_replace_help", "Bewusster Last-Writer-Wins-Modus: VaultLink darf vorhandene Dateien atomar ersetzen. Parallele, neuere Änderungen externer SMB-Clients können dabei ohne weitere Rückfrage verloren gehen.", "Explicit last-writer-wins mode: VaultLink may atomically replace existing files. Newer concurrent changes from external SMB clients can be lost without another confirmation.";
     SETUP_MAX_UPLOAD_MB, "setup.max_upload_mb", "Max. Upload MB", "Max upload MB";
     SETUP_MAX_UPLOAD_MB_HELP, "setup.max_upload_mb_help", "Globales Größenlimit pro hochgeladener Datei in dezimalen Megabyte.", "Global size limit per uploaded file in decimal megabytes.";
