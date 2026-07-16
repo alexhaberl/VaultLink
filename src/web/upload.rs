@@ -375,7 +375,7 @@ struct PreparedPublicUpload {
 }
 
 enum PublicUploadCommit {
-    Committed(CommittedPublicUpload),
+    Committed(Box<CommittedPublicUpload>),
     ReservationExpired,
     ShareUnavailable,
 }
@@ -454,13 +454,15 @@ impl PreparedPublicUpload {
                     ..
                 } = self;
                 reservation.committed();
-                Ok(PublicUploadCommit::Committed(CommittedPublicUpload {
-                    pending,
-                    target,
-                    total,
-                    replace,
-                    replaced,
-                }))
+                Ok(PublicUploadCommit::Committed(Box::new(
+                    CommittedPublicUpload {
+                        pending,
+                        target,
+                        total,
+                        replace,
+                        replaced,
+                    },
+                )))
             }
             UploadReservationCommitOutcome::NotFound => {
                 let Self { reservation, .. } = self;
@@ -654,7 +656,7 @@ impl PublicUploadFinalizer {
             )
             .await?
         {
-            PublicUploadCommit::Committed(upload) => upload,
+            PublicUploadCommit::Committed(upload) => *upload,
             PublicUploadCommit::ReservationExpired => {
                 return Ok(public_upload_error(
                     &token,
