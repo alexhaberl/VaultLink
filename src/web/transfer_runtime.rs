@@ -448,11 +448,16 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
     database: Database,
     reservation_token: String,
     share_id: i64,
+    expected_upload_policy_epoch: i64,
 ) -> Result<PendingReservationOwnership<UploadReservationBeginOutcome>> {
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
-        let outcome = database.begin_upload_reservation(&reservation_token, share_id);
+        let outcome = database.begin_upload_reservation(
+            &reservation_token,
+            share_id,
+            expected_upload_policy_epoch,
+        );
         let reserved = matches!(outcome, Ok(UploadReservationBeginOutcome::Reserved));
         if outcome_sender.send(outcome).is_err() {
             if reserved {

@@ -44,6 +44,7 @@ use crate::{
 
 struct PublicUploadTarget {
     share_id: i64,
+    upload_policy_epoch: i64,
     share_scope: SecureDirectory,
     upload_subdir: String,
     file_name: String,
@@ -109,10 +110,12 @@ impl PublicUploadStaging {
     ) -> PublicUploadPhaseResult<Self> {
         let reservation_token = auth::random_token(32);
         let share_id = target.share_id;
+        let upload_policy_epoch = target.upload_policy_epoch;
         let pending_ownership = begin_upload_reservation_cancellation_safe(
             state.db.clone(),
             reservation_token.clone(),
             share_id,
+            upload_policy_epoch,
         )
         .await?;
         let reservation = match pending_ownership.outcome() {
@@ -947,6 +950,7 @@ impl PublicUploadFormPhase<'_> {
                     };
                     let target = PublicUploadTarget {
                         share_id: share.id,
+                        upload_policy_epoch: share.upload_policy_epoch,
                         share_scope: share_scope.clone(),
                         upload_subdir: upload_subdir.clone(),
                         file_name: name,

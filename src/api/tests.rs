@@ -1330,7 +1330,10 @@ async fn api_reports_active_upload_reservations_as_quota_conflict() {
         .unwrap();
     for token in ["active-one", "active-two"] {
         assert_eq!(
-            state.db.begin_upload_reservation(token, share_id).unwrap(),
+            state
+                .db
+                .begin_upload_reservation(token, share_id, 0)
+                .unwrap(),
             crate::db::UploadReservationBeginOutcome::Reserved
         );
         assert_eq!(
