@@ -777,6 +777,8 @@ where
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
     if !config.storage.require_mount {
+        std::fs::create_dir_all(&config.storage.root_mount_path)
+            .map_err(|error| error.to_string())?;
         std::fs::create_dir_all(&config.storage.data_directory)
             .map_err(|error| error.to_string())?;
     }
@@ -1268,23 +1270,48 @@ document.addEventListener('DOMContentLoaded', () => {
   const mode = form.querySelector('[data-server-mode]');
   const certificateSource = form.querySelector('[data-certificate-source]');
   const requireMount = form.querySelector('[data-require-mount]');
+  const rootMountPath = form.elements.root_mount_path;
+  const internalDirectory = form.elements.internal_directory;
+  const internalDirectoryPicker = form.querySelector('[data-dir-picker="internal_directory"]');
+  const expectedFilesystemType = form.elements.expected_filesystem_type;
+  const expectedMountSource = form.elements.expected_mount_source;
   const externalWriters = form.querySelector('[data-external-writers]');
   const externalWritersField = form.querySelector('[data-external-writers-field]');
   const externalWriterReplace = form.querySelector('[data-external-writer-replace]');
   const externalWriterReplaceField = form.querySelector('[data-external-writer-replace-field]');
   const token = form.dataset.setupToken;
+  const developmentInternalDirectory = () => {
+    const root = rootMountPath.value.replace(/\/+$/, '');
+    return root ? `${root}/.vaultlink-internal` : '/.vaultlink-internal';
+  };
+  let internalDirectoryIsAutomatic =
+    internalDirectory.value === developmentInternalDirectory();
+  const syncAutomaticInternalDirectory = () => {
+    if (internalDirectoryIsAutomatic) {
+      internalDirectory.value = developmentInternalDirectory();
+    }
+  };
   const syncConditionalFields = () => {
     const selectedMode = mode?.value || 'development';
     const selectedCertificate = certificateSource?.value || 'files';
-    const cifsStorage = form.elements.expected_filesystem_type.value === 'cifs';
+    const production = selectedMode !== 'development';
+    if (production || externalWriters?.checked) requireMount.checked = true;
+    if (!requireMount.checked) {
+      expectedFilesystemType.value = '';
+      expectedMountSource.value = '';
+      externalWriters.checked = false;
+      externalWriterReplace.checked = false;
+      syncAutomaticInternalDirectory();
+    }
+    internalDirectory.readOnly = !requireMount.checked;
+    internalDirectoryPicker.hidden = !requireMount.checked;
+    const cifsStorage = expectedFilesystemType.value === 'cifs';
     externalWritersField.hidden = !cifsStorage;
     if (!cifsStorage) externalWriters.checked = false;
     const externalClientsEnabled = cifsStorage && externalWriters.checked;
     externalWriterReplaceField.hidden = !externalClientsEnabled;
     if (!externalClientsEnabled) externalWriterReplace.checked = false;
     const standalone = selectedMode === 'standalone_tls';
-    const production = selectedMode !== 'development';
-    if (production || externalWriters?.checked) requireMount.checked = true;
     const mountPolicyRequired = production || requireMount?.checked || externalWriters?.checked;
     form.querySelectorAll('[data-mount-policy-field]').forEach(element => {
       element.required = mountPolicyRequired;
@@ -1309,10 +1336,21 @@ document.addEventListener('DOMContentLoaded', () => {
   };
   mode?.addEventListener('change', syncConditionalFields);
   certificateSource?.addEventListener('change', syncConditionalFields);
-  requireMount?.addEventListener('change', syncConditionalFields);
+  requireMount?.addEventListener('change', () => {
+    if (!requireMount.checked) {
+      externalWriters.checked = false;
+      externalWriterReplace.checked = false;
+      internalDirectoryIsAutomatic = true;
+    }
+    syncConditionalFields();
+  });
+  rootMountPath?.addEventListener('input', syncAutomaticInternalDirectory);
+  internalDirectory?.addEventListener('input', () => {
+    internalDirectoryIsAutomatic = false;
+  });
   externalWriters?.addEventListener('change', syncConditionalFields);
   externalWriterReplace?.addEventListener('change', syncConditionalFields);
-  form.elements.expected_filesystem_type?.addEventListener('change', syncConditionalFields);
+  form.addEventListener('submit', syncConditionalFields);
   syncConditionalFields();
 
   const detectedMountSelect = form.querySelector('[data-detected-mount]');
@@ -1320,10 +1358,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const detectedMountStatus = form.querySelector('[data-mount-status]');
   let detectedMounts = new Map();
   const applyDetectedMount = mount => {
-    form.elements.root_mount_path.value = mount.root_mount_path;
-    form.elements.internal_directory.value = mount.internal_directory;
-    form.elements.expected_filesystem_type.value = mount.expected_filesystem_type;
-    form.elements.expected_mount_source.value = mount.expected_mount_source;
+    rootMountPath.value = mount.root_mount_path;
+    internalDirectory.value = mount.internal_directory;
+    internalDirectoryIsAutomatic = true;
+    expectedFilesystemType.value = mount.expected_filesystem_type;
+    expectedMountSource.value = mount.expected_mount_source;
     requireMount.checked = true;
     syncConditionalFields();
     detectedMountStatus.textContent = '<vl-i18n key="setup.cifs_mount_applied"/>';
@@ -1520,7 +1559,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (event.currentTarget.dataset.parent) load(event.currentTarget.dataset.parent);
   });
   dialog.querySelector('[data-dir-use]').addEventListener('click', () => {
-    if (target) target.value = path;
+    if (target) {
+      target.value = path;
+      if (target === rootMountPath) syncAutomaticInternalDirectory();
+      if (target === internalDirectory) internalDirectoryIsAutomatic = false;
+    }
     dialog.close();
   });
 });
@@ -1686,9 +1729,10 @@ mod tests {
         assert!(html.contains("SMB-Replace erlauben"));
         assert!(html.contains("data-detected-mount"));
         assert!(html.contains("data-refresh-mounts"));
-        assert!(html.contains(r#"<option value="zfs">zfs</option>"#));
-        assert!(html.contains(r#"<option value="cifs">cifs</option>"#));
-        assert!(!html.contains(r#"<option value="smb3">smb3</option>"#));
+        assert!(html.contains(
+            r#"<input type="hidden" name="expected_filesystem_type" data-mount-policy-field>"#
+        ));
+        assert!(!html.contains(r#"<select name="expected_filesystem_type""#));
         assert!(html.contains(
             r#"<input type="hidden" name="expected_mount_source" data-mount-policy-field>"#
         ));
@@ -1710,6 +1754,10 @@ mod tests {
         assert!(SETUP_JAVASCRIPT.contains("applyDetectedMount"));
         assert!(SETUP_JAVASCRIPT
             .contains("internal_directory.value === '/tmp/vaultlink-root/.vaultlink-internal'"));
+        assert!(SETUP_JAVASCRIPT.contains("expectedFilesystemType.value = ''"));
+        assert!(SETUP_JAVASCRIPT.contains("expectedMountSource.value = ''"));
+        assert!(SETUP_JAVASCRIPT.contains("internalDirectory.readOnly = !requireMount.checked"));
+        assert!(SETUP_JAVASCRIPT.contains("form.addEventListener('submit', syncConditionalFields)"));
         assert!(SETUP_JAVASCRIPT.contains("previousMountPoint"));
         assert!(SETUP_JAVASCRIPT.contains("externalWritersField.hidden = !cifsStorage"));
         assert!(SETUP_JAVASCRIPT
@@ -2212,6 +2260,29 @@ mod tests {
         let database = Database::open(data.path().join("data.sqlite")).unwrap();
         assert_eq!(database.admin_count().unwrap(), 1);
         assert!(database.admin("admin").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn development_setup_creates_a_missing_local_root() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("new-storage-root");
+        let data = base.path().join("new-data-directory");
+        let config_path = base.path().join("config.toml");
+
+        build_and_store(&config_path, form(&root, &data))
+            .await
+            .unwrap();
+
+        assert!(root.is_dir());
+        assert!(data.join("data.sqlite").is_file());
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            config.storage.internal_directory.as_deref(),
+            Some(
+                root.join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)
+                    .as_path()
+            )
+        );
     }
 
     #[tokio::test]

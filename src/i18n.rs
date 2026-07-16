@@ -225,7 +225,7 @@ catalog! {
     SETUP_DATA_DIRECTORY, "setup.data_directory", "Datenverzeichnis", "Data directory";
     SETUP_DATA_DIRECTORY_HELP, "setup.data_directory_help", "Enthält SQLite-Datenbank und Laufzeitdaten; es muss außerhalb des sichtbaren Dateibaums liegen.", "Stores the SQLite database and runtime data; it must be outside the visible file tree.";
     SETUP_INTERNAL_DIRECTORY, "setup.internal_directory", "Privates internes Verzeichnis", "Private internal directory";
-    SETUP_INTERNAL_DIRECTORY_HELP, "setup.internal_directory_help", "Privater Bereich für Lockdatei, Upload-Staging und Lösch-Journal; Benutzer dürfen darauf nicht zugreifen.", "Private area for the lock file, upload staging, and deletion journal; users must not be able to access it.";
+    SETUP_INTERNAL_DIRECTORY_HELP, "setup.internal_directory_help", "Privater Bereich für Lockdatei, Upload-Staging und Lösch-Journal. Im Development legt VaultLink ihn automatisch unter dem Root-Pfad an; bei Production/CIFS muss er mit sicheren Rechten und Server-ACLs vorbereitet sein.", "Private area for the lock file, upload staging, and deletion journal. In development, VaultLink creates it automatically below the root path; production/CIFS requires secure permissions and server ACLs to be provisioned first.";
     SETUP_EXPECTED_FILESYSTEM_TYPE, "setup.expected_filesystem_type", "Erwarteter Dateisystemtyp", "Expected filesystem type";
     SETUP_SELECT_FILESYSTEM_TYPE, "setup.select_filesystem_type", "Dateisystem auswählen", "Select filesystem type";
     SETUP_EXPECTED_FILESYSTEM_TYPE_HELP, "setup.expected_filesystem_type_help", "Exakter Typ des aktiven Mounts aus /proc/self/mountinfo, zum Beispiel ext4 oder cifs.", "Exact type of the active mount from /proc/self/mountinfo, such as ext4 or cifs.";
