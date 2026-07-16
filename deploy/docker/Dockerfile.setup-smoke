@@ -26,12 +26,15 @@ COPY release ./release
 COPY tools ./tools
 
 RUN chmod 0644 deploy/Caddyfile deploy/*.conf deploy/*.example \
-        deploy/vaultlink.service deploy/docker/*.lock deploy/docker/*.sources tools/*.txt \
+        deploy/vaultlink.service deploy/docker/*.lock deploy/docker/*.py \
+        deploy/docker/*.sources tools/*.txt \
     && chmod 0755 deploy/*.sh deploy/docker/*.sh tools/*.sh \
     && groupadd --system vaultlink \
     && useradd --system --gid vaultlink --home-dir /nonexistent \
         --no-create-home --shell /usr/sbin/nologin vaultlink \
     && shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh \
+    && python3 -m py_compile deploy/docker/loopback-proxy.py \
+    && rm -rf deploy/docker/__pycache__ \
     && sh tools/check-supply-chain-policy.sh
 
 RUN test ! -e /work/config.toml \
@@ -45,5 +48,7 @@ RUN install -d /opt/vaultlink /var/lib/vaultlink \
     && rm -f /opt/vaultlink/vaultlink
 
 RUN cargo build --release --locked
+
+EXPOSE 8081/tcp
 
 CMD ["bash", "deploy/docker/setup-smoke.sh"]
