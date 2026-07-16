@@ -555,6 +555,10 @@ impl PublicUploadFinalizer {
         }
 
         let storage_guard = state.storage_mutation.clone().lock_owned().await;
+        #[cfg(test)]
+        upload_phase_test_checkpoint(&token, PublicUploadTestPhase::StorageLocked)
+            .await
+            .map_err(internal)?;
         let storage_guard =
             file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
                 .await
@@ -1015,6 +1019,7 @@ pub(super) enum PublicUploadTestPhase {
     Staging,
     StagingSync,
     Finalizer,
+    StorageLocked,
 }
 
 #[cfg(test)]

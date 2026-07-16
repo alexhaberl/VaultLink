@@ -1404,20 +1404,6 @@ async fn wait_for_public_upload_cleanup(state: &AppState, root: &Path, share_id:
     .expect("public upload resources should be released");
 }
 
-async fn wait_until_storage_locked(state: &AppState) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            match state.storage_mutation.try_lock() {
-                Ok(guard) => drop(guard),
-                Err(_) => return,
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("upload did not acquire the storage mutation lock");
-}
-
 fn api_share_strategy_request(
     share_id: i64,
     strategy: &str,
@@ -6032,6 +6018,8 @@ async fn public_upload_publish_wins_before_a_waiting_policy_change() {
             &UploadConflictStrategy::OverwriteAllowed,
         )
         .unwrap();
+    let hook = PublicUploadTestHook::blocking("upload-first", PublicUploadTestPhase::StorageLocked);
+    let hook_guard = install_public_upload_test_hook(hook.clone());
     let app = router(state.clone());
     let (upload, sender) =
         controlled_multipart_request("/v/upload-first/upload", "existing.txt", b"new", true);
@@ -6039,23 +6027,8 @@ async fn public_upload_publish_wins_before_a_waiting_policy_change() {
     let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
     wait_for_upload_fragment(root.path()).await;
 
-    let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
-    let (release_sender, release_receiver) = std::sync::mpsc::channel();
-    let blocking_db = state.db.clone();
-    let blocker = std::thread::spawn(move || {
-        blocking_db
-            .with_live_mfa_session("policy-session", 1, || {
-                entered_sender.send(()).unwrap();
-                release_receiver.recv().unwrap();
-            })
-            .unwrap()
-    });
-    entered_receiver
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
-
     finish_controlled_multipart(sender).await;
-    wait_until_storage_locked(&state).await;
+    hook.wait_until_entered().await;
     let policy_app = app.clone();
     let policy = tokio::spawn(async move {
         policy_app
@@ -6071,8 +6044,7 @@ async fn public_upload_publish_wins_before_a_waiting_policy_change() {
     tokio::task::yield_now().await;
     assert!(!policy.is_finished());
 
-    release_sender.send(()).unwrap();
-    assert_eq!(blocker.join().unwrap(), Some(()));
+    hook.release();
     let upload = upload.await.unwrap();
     assert_eq!(upload.status(), StatusCode::SEE_OTHER);
     assert_eq!(
@@ -6089,6 +6061,7 @@ async fn public_upload_publish_wins_before_a_waiting_policy_change() {
     );
     assert_eq!(share.uploaded_bytes, 3);
     assert_eq!(share.uploaded_files, 1);
+    drop(hook_guard);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6199,6 +6172,9 @@ async fn public_upload_publish_wins_before_a_waiting_html_policy_change() {
             &UploadConflictStrategy::OverwriteAllowed,
         )
         .unwrap();
+    let hook =
+        PublicUploadTestHook::blocking("html-upload-first", PublicUploadTestPhase::StorageLocked);
+    let hook_guard = install_public_upload_test_hook(hook.clone());
     let app = router(state.clone());
     let (upload, sender) =
         controlled_multipart_request("/v/html-upload-first/upload", "existing.txt", b"new", true);
@@ -6206,23 +6182,8 @@ async fn public_upload_publish_wins_before_a_waiting_html_policy_change() {
     let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
     wait_for_upload_fragment(root.path()).await;
 
-    let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
-    let (release_sender, release_receiver) = std::sync::mpsc::channel();
-    let blocking_db = state.db.clone();
-    let blocker = std::thread::spawn(move || {
-        blocking_db
-            .with_live_mfa_session("html-upload-session", 1, || {
-                entered_sender.send(()).unwrap();
-                release_receiver.recv().unwrap();
-            })
-            .unwrap()
-    });
-    entered_receiver
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
-
     finish_controlled_multipart(sender).await;
-    wait_until_storage_locked(&state).await;
+    hook.wait_until_entered().await;
     let policy_app = app.clone();
     let policy = tokio::spawn(async move {
         policy_app
@@ -6238,8 +6199,7 @@ async fn public_upload_publish_wins_before_a_waiting_html_policy_change() {
     tokio::task::yield_now().await;
     assert!(!policy.is_finished());
 
-    release_sender.send(()).unwrap();
-    assert_eq!(blocker.join().unwrap(), Some(()));
+    hook.release();
     let upload = upload.await.unwrap();
     assert_eq!(upload.status(), StatusCode::SEE_OTHER);
     assert_eq!(
@@ -6260,6 +6220,7 @@ async fn public_upload_publish_wins_before_a_waiting_html_policy_change() {
     );
     assert_eq!(share.uploaded_bytes, 3);
     assert_eq!(share.uploaded_files, 1);
+    drop(hook_guard);
 }
 
 #[tokio::test]
