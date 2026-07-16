@@ -5602,7 +5602,8 @@ async fn public_upload_rejects_missing_duplicate_late_and_unknown_fields_without
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("uploads")).unwrap();
-    let state = test_state(root.path(), data.path());
+    let mut state = test_state(root.path(), data.path());
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
     state.db.create_admin("admin", "hash", "secret").unwrap();
     let share_id = state
         .db
