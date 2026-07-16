@@ -271,10 +271,10 @@ for load_result in "$evidence"/load-*/result.env; do
     run_id=$(sed -n 's/^run_id=//p' "$load_result")
     [ "$(wc -l <"$load_dir/upload-results.csv")" -eq 10 ] \
         || { echo "load upload sample count mismatch" >&2; exit 1; }
-    awk -F, -v hash="$upload_hash" -v namespace="$namespace" -v run_id="$run_id" '
+    awk -F, -v hash="$upload_hash" -v soak_namespace="$namespace" -v run_id="$run_id" '
         $2 != sprintf("198.18.3.%d", $1 + 1) || $3 != 303 || $4 != "created" \
             || $5 != hash || $6 != 200 || $7 != hash \
-            || $8 != sprintf("load-%s-%s-%d.bin", namespace, run_id, $1) { exit 1 }
+            || $8 != sprintf("load-%s-%s-%d.bin", soak_namespace, run_id, $1) { exit 1 }
     ' \
         "$load_dir/upload-results.csv" \
         || { echo "upload status or payload hash mismatch" >&2; exit 1; }

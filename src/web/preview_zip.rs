@@ -503,6 +503,7 @@ impl Write for ZipChannelWriter {
     }
 }
 
+#[cfg(test)]
 pub(super) fn direct_zip_stream<D: DirectoryAccess>(
     directory: D,
     plan: ZipPlan,
