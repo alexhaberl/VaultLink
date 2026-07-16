@@ -130,10 +130,14 @@ fixture="$storage/vaultlink-load"
 grep -F -q 'execve("/usr/sbin/runuser"' "$trace" \
     || fail "trace did not cross the runuser boundary"
 assert_storage_mutations_unprivileged "$trace" "$storage"
-for required_mutation in 'mkdir(' 'fchmodat(' 'O_WRONLY|O_CREAT' 'renameat2('; do
-    grep -F -q "$required_mutation" "$trace" \
-        || fail "trace is missing required mutation $required_mutation"
-done
+grep -E -q '(mkdir|mkdirat)\(' "$trace" \
+    || fail "trace is missing a directory-creation mutation"
+grep -E -q '(chmod|fchmod|fchmodat|fchmodat2)\(' "$trace" \
+    || fail "trace is missing a mode mutation"
+grep -F -q 'O_WRONLY|O_CREAT' "$trace" \
+    || fail "trace is missing a write/create open mutation"
+grep -E -q '(rename|renameat|renameat2)\(' "$trace" \
+    || fail "trace is missing an atomic publish mutation"
 if grep -E -q '(execve\("[^\"]*/(chown|install)"|(^|[[:space:]])(chown|fchownat)\()' "$trace"; then
     fail "trace contains a forbidden ownership-changing mutation"
 fi
