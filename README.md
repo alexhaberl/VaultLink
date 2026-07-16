@@ -2,9 +2,7 @@
 
 VaultLink ist eine serverseitig gerenderte Rust-Webanwendung, die einen bereits gemounteten Linux-Ordner sicher über öffentliche Download- und Upload-Links freigibt. Unterstützte Hostplattformen sind Linux x86_64 und aarch64; Windows-Hostsupport ist ab 0.4.1 entfernt. Windows-, macOS- und Linux-Clients bleiben über einen externen Standard-SMB-Server interoperabel.
 
-Status: `0.5.0`-Release-Linie für private Debian-13-amd64-/arm64-Artefakte. Die Sicherheitskorrekturen wurden zuvor unter der internen, nie getaggten Candidate-Version 0.4.9 stabilisiert. Verfügbar und unterstützt sind ausschließlich Artefakte am signierten, annotierten `v0.5.0`-Tag; fehlt dieser Tag, ist die Release-Linie noch nicht veröffentlicht. Native amd64- und arm64-Gates laufen ausschließlich auf den dedizierten Self-hosted-Runnern; architekturunabhängige Jobs nutzen den arm64-Runner.
-
-GitHub-Projektbeschreibung: **VaultLink - secure, self-hosted file and folder sharing for an existing Linux mountpoint, built in Rust.**
+Geplanter Release: `0.5.0` für Debian 13 auf amd64 und arm64. Die Release-Linie ist erst veröffentlicht, sobald der signierte, annotierte Tag `v0.5.0` verfügbar ist. Details zum Umfang und zu den noch offenen Freigabeschritten stehen im [Changelog](CHANGELOG.md) und in der [Release-Checkliste](docs/RELEASE-CHECKLIST.md).
 
 ## 1. Sicherheitskonzept
 
@@ -309,14 +307,15 @@ Erst mit `letsencrypt_staging = true` und `hsts_enabled = false` testen. Staging
 
 ## 8. Debian-Deployment
 
+Für eine Installation das zur Hostarchitektur passende, signierte Debian-13-Release-Archiv verwenden und vor dem Entpacken Signaturen sowie Prüfsummen nach [docs/UPGRADE-ROLLBACK.md](docs/UPGRADE-ROLLBACK.md) verifizieren. Die folgenden Befehle werden im entpackten Archiv ausgeführt:
+
 ```sh
-sudo apt update && sudo apt install -y build-essential cifs-utils coreutils curl libssl-dev pkg-config sqlite3 util-linux
-cargo build --release --locked
+sudo apt update && sudo apt install -y cifs-utils coreutils curl sqlite3 util-linux
 
 sudo useradd --system --home /var/lib/vaultlink --shell /usr/sbin/nologin vaultlink
 sudo install -d -o root -g vaultlink -m 0750 /opt/vaultlink /etc/vaultlink /etc/vaultlink/tls
 sudo install -d -o vaultlink -g vaultlink -m 0750 /var/lib/vaultlink /var/log/vaultlink
-sudo install -o root -g root -m 0755 target/release/vaultlink /opt/vaultlink/vaultlink
+sudo install -o root -g root -m 0755 bin/vaultlink /opt/vaultlink/vaultlink
 sudo install -o root -g root -m 0644 deploy/vaultlink.service /etc/systemd/system/vaultlink.service
 sudo systemctl daemon-reload
 ```
@@ -414,7 +413,7 @@ Ein stillgelegter Admin bleibt auch nach der Credential-Wiederherstellung stillg
 
 Firewall: bei Reverse Proxy nur 80/443 für Caddy/Nginx öffnen und VaultLink auf Loopback lassen. Bei Standalone nur 443 öffnen.
 
-## 9. Linux-Entwicklung, optional in WSL
+## 9. Linux-Entwicklung
 
 ```sh
 sudo apt update && sudo apt install -y build-essential coreutils curl libssl-dev pkg-config sqlite3 util-linux
@@ -425,7 +424,7 @@ cargo run -- init-admin --config config/development.toml --username admin
 make run
 ```
 
-`make sample-data` erzeugt `dev/mount` und `dev/data`. WSL braucht kein systemd und kein TLS. Wenn Docker verfügbar ist, baut `make docker-smoke` einmalig das digest-gepinnte Debian-13/Rust-Testimage und führt ohne externes Containernetzwerk Setup-, API- sowie isolierte Upgrade-/Rollback-Fehlertests aus. `make docker-setup-smoke`, `make docker-api-smoke` und `make docker-upgrade-safety-test` bleiben als einzelne Ziele verfügbar. `make policy-check` verhindert mutable Action-/Image-Referenzen, ungepinnte Cargo-CI-Tools und fehlende Docker-Secret-Ausschlüsse.
+`make sample-data` erzeugt `dev/mount` und `dev/data`. Wenn Docker verfügbar ist, baut `make docker-smoke` einmalig das digest-gepinnte Debian-13/Rust-Testimage und führt ohne externes Containernetzwerk Setup-, API-, Load-Fixture-, Soak-Evidence- sowie isolierte Upgrade-/Rollback-Fehlertests aus. Die einzelnen Smoke-Ziele bleiben separat verfügbar. `make policy-check` prüft die Supply-Chain-Vorgaben des Projekts.
 
 ## Troubleshooting
 
