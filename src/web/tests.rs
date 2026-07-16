@@ -67,6 +67,7 @@ fn test_state_with_limit(root: &Path, data: &Path, max_upload_size: u64) -> AppS
             internal_directory: Some(root.join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)),
             require_mount: false,
             external_writers: false,
+            allow_external_writer_replace: false,
             expected_filesystem_type: None,
             expected_mount_source: None,
             max_upload_size,
@@ -6581,6 +6582,83 @@ async fn external_writers_disable_saved_public_overwrite_policy() {
     assert_eq!(
         std::fs::read(root.path().join("uploads/report.txt")).unwrap(),
         b"external"
+    );
+}
+
+#[tokio::test]
+async fn explicit_external_writer_replace_opt_in_enables_last_writer_wins() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    std::fs::write(root.path().join("uploads/report.txt"), b"external").unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "external-replace-admin-session",
+            1,
+            "external-replace-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state
+        .db
+        .verify_mfa("external-replace-admin-session")
+        .unwrap();
+    state
+        .db
+        .create_share(
+            "external-replace",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::OverwriteAllowed,
+        )
+        .unwrap();
+    let mut config = (*state.config).clone();
+    config.storage.external_writers = true;
+    config.storage.allow_external_writer_replace = true;
+    state.config = std::sync::Arc::new(config);
+    let app = router(state);
+
+    let page = response_text(
+        app.clone()
+            .oneshot(request(Method::GET, "/v/external-replace", ""))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(page.contains("overwrite_existing"));
+
+    let mut admin_request = request(Method::GET, "/admin/shares", "");
+    admin_request.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=external-replace-admin-session"),
+    );
+    let admin_page = response_text(app.clone().oneshot(admin_request).await.unwrap()).await;
+    assert!(admin_page.contains("overwrite_allowed"));
+
+    let response = app
+        .oneshot(multipart_request_with_options(
+            "/v/external-replace/upload",
+            "report.txt",
+            b"vaultlink",
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/report.txt")).unwrap(),
+        b"vaultlink"
     );
 }
 

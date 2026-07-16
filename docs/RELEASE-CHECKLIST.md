@@ -21,7 +21,7 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [x] Optionaler Kurzlink-Alias.
 - [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`; HEAD prüft die verfügbare Quote ohne Reservierung oder Zählung, feste Transfer-Grants zählen erst vollständige Antworten und fassen Range-Resumes ohne Sliding-Expiry zusammen.
 - [x] Sichere Uploads mit temporärer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
-- [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink ohne Co-Writer; bei `external_writers=true` erzwingen UI, API und Publish-Pfad No-Replace.
+- [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink; bei `external_writers=true` erzwingen UI, API und Publish-Pfad standardmäßig No-Replace. Der separate Opt-in `allow_external_writer_replace=true` dokumentiert und testet bewusstes Last-Writer-Wins.
 - [x] Upload in navigierten Unterordnern für `download_upload`-Ordnerlinks.
 - [x] Upload-only-Freigaben listen keine Ordnerinhalte und erlauben keine Preview/Downloads.
 - [x] Inkrementeller ZIP-Download für Ordnerfreigaben mit durchgehendem ZIP64, Datei-, Scan- und Größenlimits, gecappten Quelldateien, Temp-Budget und backpressured Direct-Stream-Fallback.
@@ -35,7 +35,8 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [x] Setup überschreibt keine bestehende Konfiguration; Config-ohne-Admin und committed Admin vor verlorener TOTP-Antwort sind wiederaufnehmbar.
 - [x] Pro-Share SecureFS-Capabilities verhindern Symlink-Wechsel in Sibling-Shares für Listing, Preview, Download, ZIP und Upload.
 - [x] Linux-only auf x86_64 und aarch64; Windows-Dateinamensinteroperabilität bleibt für Standard-SMB-Clients erhalten.
-- [x] Externer CIFS-Co-Writer-Modus mit geprüfter Mount-ID/-Quelle/-Optionen, pre-provisioniertem sibling staging, lokalem SQLite und crash-sicherem Pending-/Committed-Delete-Protokoll.
+- [x] Externer CIFS-Co-Writer-Modus mit geprüftem direkten Share-Root, reserviertem pre-provisioniertem `.vaultlink-internal`, Mount-ID/-Quelle/-Optionen, lokalem SQLite und crash-sicherem Pending-/Committed-Delete-Protokoll.
+- [x] Separater Root-Befehl für die nicht überschreibende `/mnt/storage`-CIFS-Provisionierung mit interaktiver Credential-Eingabe und Rollback; das unprivilegierte Browser-Setup erkennt sichere aktive SMB-Mounts und übernimmt Pfade, Typ und Quelle.
 - [x] Exklusiver, nicht blockierender Lifetime-Lock im gemeinsamen `internal_directory` wird vor Storage-Recovery/Cleanup erworben, auf wirksame Lock-Semantik geprüft und verhindert überlappende VaultLink-Server für dieselbe Journal-Domain.
 - [x] Jede Production-Konfiguration verlangt eine exakte fail-closed Mount-Identität; ein ausgefallener CIFS-Mount darf auch dann nicht auf das lokale Fallback-Verzeichnis starten, wenn dort gerade ext4 sichtbar ist. Auditiertes lokales Production-Storage darf SQLite außerhalb des sichtbaren Baums auf demselben lokalen Mount halten.
 - [x] Browser-Setup und `init-admin` prüfen Root/Internal/Data-Mount und kanonische Pfade vor Konfiguration, Datenbank oder Credential-Secrets; Symlink-Aliase in den sichtbaren Baum werden abgewiesen.
@@ -153,12 +154,12 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
   - exakten lokalen Health-/Versions-Smoke ausführen,
   - fehlgeschlagener Recovery-Stop oder unvollständiger Emergency-Restore bleibt gestoppt.
 - [ ] Reales SMB-3.1.1-Co-Writer-Gate auf einem externen Server:
-  - pre-0.4.1-Root unter vollständiger Writer-Quiesce inventarisieren; `shared`-/`.vaultlink-internal`-Alias- und alte Fragment/Tombstone-Kollisionen auflösen,
-  - alle sichtbaren Einträge einschließlich Dotfiles serverseitig metadata-/ACL-/xattr-erhaltend in das neue leere `shared/` verschieben und gegen Snapshot/Hashes verifizieren,
+  - pre-0.4.1-Share-Root unter vollständiger Writer-Quiesce inventarisieren; `.vaultlink-internal`-Alias- und alte Fragment/Tombstone-Kollisionen auflösen,
+  - alle sichtbaren Einträge einschließlich Dotfiles direkt im Share-Root gegen Snapshot/Hashes verifizieren,
   - separates VaultLink-SMB-Konto sowie normale Windows-, macOS- und Linux-Co-Writer-Konten verwenden,
   - SMB-Server/Share erzwingt SMB 3.1.1 Signing und Encryption; dies wird für die VaultLink-Mount-Session und jede direkte Windows-/macOS-/Linux-Session separat verifiziert,
-  - `shared/` ist für alle beabsichtigten Co-Writer les-/schreibbar,
-  - Co-Writer besitzen Modify nur innerhalb `shared/`, niemals administrative Rechte auf Share-Root/Mount-Basis,
+  - das Share-Root ist für alle beabsichtigten Co-Writer im benötigten Umfang les-/schreibbar,
+  - Co-Writer besitzen Modify für Benutzerdaten im Share-Root, niemals administrative Rechte oder Zugriff auf `.vaultlink-internal`,
   - `.vaultlink-internal/{uploads,tombstones}` ist vorab vorhanden und für Co-Writer weder lesbar noch schreib-, lösch- oder umbenennbar; Parent-`DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` sowie chmod/chown/setfacl-Äquivalente sind verweigert,
   - `/proc/self/mountinfo` zeigt `vers=3.1.1`, `seal`, `cache=strict`, `nosuid`, `nodev`, `noexec` und keine verbotenen Optionen,
   - SQLite liegt auf einem separaten lokalen Dateisystem,

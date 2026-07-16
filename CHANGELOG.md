@@ -9,8 +9,9 @@ This work was developed under the internal `0.4.9` hardening candidate. That can
 - Replaced unbounded tombstone retry tasks with one coalescing, lifecycle-managed cleanup coordinator.
 - Added poisoned-lock recovery for unwind builds while retaining fail-fast `panic=abort` release behavior.
 - Split public-upload and ZIP-transfer ownership into consuming prepared states and moved fuzz targets from copied models to the production request/share policy facade.
-- Made the development storage boundary explicit: `internal_directory`, `require_mount`, and `external_writers` are now mandatory configuration fields.
+- Made the development storage boundary explicit: `internal_directory`, `require_mount`, `external_writers`, and `allow_external_writer_replace` are now mandatory configuration fields.
 - Added immutable Debian package inputs, reproducibility checks, exact-commit soak evidence and version-consistency release policy.
+- Added a fixed-boundary, root-only CIFS provisioner plus token-protected setup discovery that can use the hardened SMB share root directly while reserving an unreachable in-tree `.vaultlink-internal`, without granting the browser setup process mount privileges, with an explicit last-writer-wins opt-in for Replace uploads alongside external SMB clients.
 
 ## 0.4.3 — 2026-07-14
 

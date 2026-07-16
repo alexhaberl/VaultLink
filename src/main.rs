@@ -359,6 +359,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
         return recover_admin(&options);
     }
+    if args.get(1).is_some_and(|value| value == "provision-cifs") {
+        let options = vaultlink::cifs_provision::CifsProvisionOptions::parse(&args)
+            .map_err(std::io::Error::other)?;
+        return vaultlink::cifs_provision::run(options).map_err(Into::into);
+    }
     let mode = command_mode(&args).map_err(std::io::Error::other)?;
     let config_path = arg(&args, "--config")
         .map(PathBuf::from)

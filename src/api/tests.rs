@@ -24,6 +24,7 @@ fn test_state(root: &Path, data: &Path) -> AppState {
             internal_directory: Some(root.join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)),
             require_mount: false,
             external_writers: false,
+            allow_external_writer_replace: false,
             expected_filesystem_type: None,
             expected_mount_source: None,
             max_upload_size: 1_000_000,
@@ -656,6 +657,40 @@ async fn external_writers_reject_api_overwrite_configuration() {
         StatusCode::BAD_REQUEST
     );
     assert!(!state.db.list_shares().unwrap()[0].active);
+}
+
+#[tokio::test]
+async fn external_writer_replace_opt_in_allows_api_overwrite_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    let mut state = test_state(root.path(), data.path());
+    let secret = auth::new_totp_secret();
+    let hash = auth::hash_password("correct horse battery staple").unwrap();
+    state.db.create_admin("admin", &hash, &secret).unwrap();
+    let (session_cookie, csrf) = api_login(&state, &secret).await;
+    let mut config = (*state.config).clone();
+    config.storage.external_writers = true;
+    config.storage.allow_external_writer_replace = true;
+    state.config = std::sync::Arc::new(config);
+    let app = crate::web::router(state.clone());
+
+    let mut create = json_request(
+        Method::POST,
+        "/api/v1/shares",
+        r#"{"path":"docs","permission":"download_upload","overwrite_allowed":true}"#,
+    );
+    create.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_str(&session_cookie).unwrap(),
+    );
+    create
+        .headers_mut()
+        .insert("x-csrf-token", HeaderValue::from_str(&csrf).unwrap());
+    assert_eq!(app.oneshot(create).await.unwrap().status(), StatusCode::OK);
+    assert!(state.db.list_shares().unwrap()[0]
+        .upload_conflict_strategy
+        .can_overwrite());
 }
 
 #[tokio::test]

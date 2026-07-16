@@ -3,6 +3,7 @@ compile_error!("VaultLink supports Linux only");
 
 pub mod api;
 pub mod auth;
+pub mod cifs_provision;
 pub mod config;
 pub mod db;
 pub mod file_ops;
@@ -149,7 +150,8 @@ impl AppState {
             &config.storage.root_mount_path,
             config.storage.internal_directory.as_deref(),
             config.storage.require_mount,
-            config.storage.external_writers,
+            config.storage.forbid_user_symlinks(),
+            config.storage.replacements_allowed(),
             storage_instance_lock.clone(),
         )
         .map_err(|error| {
@@ -502,6 +504,7 @@ mod tests {
                 internal_directory: Some(root.join(DEFAULT_INTERNAL_DIRECTORY_NAME)),
                 require_mount: false,
                 external_writers: false,
+                allow_external_writer_replace: false,
                 expected_filesystem_type: None,
                 expected_mount_source: None,
                 max_upload_size: 1_000_000,
@@ -739,7 +742,8 @@ mod tests {
             &storage.root_mount_path,
             storage.internal_directory.as_deref(),
             storage.require_mount,
-            storage.external_writers,
+            storage.forbid_user_symlinks(),
+            storage.replacements_allowed(),
             first_lock,
         ) {
             Ok(_) => panic!("SecureRoot accepted a replacement internal-directory namespace"),
@@ -772,7 +776,8 @@ mod tests {
             &storage.root_mount_path,
             storage.internal_directory.as_deref(),
             storage.require_mount,
-            storage.external_writers,
+            storage.forbid_user_symlinks(),
+            storage.replacements_allowed(),
             lock,
         ) {
             Ok(_) => panic!("SecureRoot accepted a replacement root namespace"),

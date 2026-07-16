@@ -607,6 +607,7 @@ impl SecureRoot {
             internal_directory,
             require_preprovisioned_internal,
             forbid_user_symlinks,
+            !forbid_user_symlinks,
             None,
         )
     }
@@ -621,6 +622,7 @@ impl SecureRoot {
         internal_directory: Option<&Path>,
         require_preprovisioned_internal: bool,
         forbid_user_symlinks: bool,
+        allow_replace: bool,
         storage_instance_lock: Arc<crate::StorageInstanceLock>,
     ) -> io::Result<Self> {
         Self::open_configured_inner(
@@ -628,6 +630,7 @@ impl SecureRoot {
             internal_directory,
             require_preprovisioned_internal,
             forbid_user_symlinks,
+            allow_replace,
             Some(storage_instance_lock),
         )
     }
@@ -637,6 +640,7 @@ impl SecureRoot {
         internal_directory: Option<&Path>,
         require_preprovisioned_internal: bool,
         forbid_user_symlinks: bool,
+        allow_replace: bool,
         storage_instance_lock: Option<Arc<crate::StorageInstanceLock>>,
     ) -> io::Result<Self> {
         let locked_root = storage_instance_lock
@@ -721,13 +725,18 @@ impl SecureRoot {
         };
         let internal = Arc::new(internal);
         let canonical_internal = internal_path.canonicalize()?;
+        let nested_reserved_internal = canonical_internal.parent() == Some(display_root.as_path())
+            && canonical_internal
+                .file_name()
+                .is_some_and(crate::path_security::is_internal_storage_name);
         if require_preprovisioned_internal
-            && (canonical_internal.starts_with(&display_root)
-                || display_root.starts_with(&canonical_internal))
+            && (display_root.starts_with(&canonical_internal)
+                || (canonical_internal.starts_with(&display_root)
+                    && !(forbid_user_symlinks && nested_reserved_internal)))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "external-writer internal storage must be outside the user-visible storage root",
+                "preprovisioned internal storage must be either outside the visible root or its direct reserved child with symlink traversal disabled",
             ));
         }
         if internal.metadata()?.dev() != directory.metadata()?.dev() {
@@ -755,7 +764,7 @@ impl SecureRoot {
                 directory,
                 staging: uploads,
                 forbid_symlinks: forbid_user_symlinks,
-                allow_replace: !forbid_user_symlinks,
+                allow_replace,
                 _storage_instance_lock: storage_instance_lock.clone(),
                 #[cfg(test)]
                 next_create_directory_sync_error: next_create_directory_sync_error.clone(),
@@ -2127,6 +2136,37 @@ mod tests {
     }
 
     #[test]
+    fn nested_reserved_internal_storage_is_filtered_and_unreachable() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let shared = tempfile::tempdir().unwrap();
+        let internal = shared.path().join(INTERNAL_DIRECTORY_NAME);
+        std::fs::create_dir(&internal).unwrap();
+        std::fs::create_dir(internal.join(UPLOAD_STAGING_DIRECTORY_NAME)).unwrap();
+        std::fs::create_dir(internal.join(TOMBSTONE_STAGING_DIRECTORY_NAME)).unwrap();
+        for path in [
+            internal.as_path(),
+            &internal.join(UPLOAD_STAGING_DIRECTORY_NAME),
+            &internal.join(TOMBSTONE_STAGING_DIRECTORY_NAME),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(shared.path().join("document.txt"), b"visible").unwrap();
+        symlink(
+            INTERNAL_DIRECTORY_NAME,
+            shared.path().join("internal-alias"),
+        )
+        .unwrap();
+
+        let root = SecureRoot::open_configured(shared.path(), Some(&internal), true, true).unwrap();
+        let entries = root.list("", 0, 100).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "document.txt");
+        assert!(root.metadata(INTERNAL_DIRECTORY_NAME).is_err());
+        assert!(root.bind_directory("internal-alias/uploads").is_err());
+    }
+
+    #[test]
     fn insecure_internal_directory_permissions_fail_closed() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2294,6 +2334,36 @@ mod tests {
         assert_eq!(
             std::fs::read(shared.join("existing.txt")).unwrap(),
             b"original"
+        );
+    }
+
+    #[test]
+    fn explicit_external_writer_replace_policy_enables_filesystem_replace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mount = tempfile::tempdir().unwrap();
+        let shared = mount.path().join("shared");
+        let internal = mount.path().join(INTERNAL_DIRECTORY_NAME);
+        let uploads = internal.join(UPLOAD_STAGING_DIRECTORY_NAME);
+        let tombstones = internal.join(TOMBSTONE_STAGING_DIRECTORY_NAME);
+        for path in [&shared, &internal, &uploads, &tombstones] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root =
+            SecureRoot::open_configured_inner(&shared, Some(&internal), true, true, true, None)
+                .unwrap();
+        std::fs::write(shared.join("existing.txt"), b"external").unwrap();
+        let mut upload = root.begin_upload("").unwrap();
+        let mut file = upload.take_file().unwrap();
+        file.write_all(b"vaultlink").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        upload.publish_replace("existing.txt").unwrap();
+        assert_eq!(
+            std::fs::read(shared.join("existing.txt")).unwrap(),
+            b"vaultlink"
         );
     }
 

@@ -10,6 +10,7 @@ data_directory = "dev/data"
 internal_directory = "dev/mount/.vaultlink-internal"
 require_mount = false
 external_writers = false
+allow_external_writer_replace = false
 # Setup/UI units are decimal: 1 MB = 1,000,000 bytes; 1 GB = 1,000,000,000 bytes.
 max_upload_size = 100000000
 max_zip_size = 1000000000

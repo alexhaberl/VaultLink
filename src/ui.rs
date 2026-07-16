@@ -353,7 +353,8 @@ pub const STYLESHEET: &str = r#"
   }
 
   .vl-field,
-  .vl-form-grid > label {
+  .vl-form-grid > label,
+  .vl-mount-discovery > label {
     display: grid;
     gap: var(--vl-space-1);
     margin: 0;
@@ -361,8 +362,72 @@ pub const STYLESHEET: &str = r#"
     font-weight: 700;
   }
 
+  .vl-field-label {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: var(--vl-space-2);
+  }
+
+  .vl-field-info {
+    position: relative;
+    display: inline-grid;
+    width: 1.25rem;
+    height: 1.25rem;
+    flex: 0 0 1.25rem;
+    place-items: center;
+    border: 1px solid rgba(139, 197, 255, 0.72);
+    border-radius: var(--vl-radius-pill);
+    background: rgba(90, 167, 255, 0.12);
+    color: #b9dcff;
+    cursor: help;
+    font-size: var(--vl-text-xs);
+    font-style: normal;
+    font-weight: 800;
+    line-height: 1;
+  }
+
+  .vl-field-info:focus-visible {
+    outline: 3px solid var(--vl-focus);
+    outline-offset: 3px;
+  }
+
+  .vl-field-tooltip {
+    position: fixed;
+    z-index: 60;
+    top: var(--vl-tooltip-top, 0);
+    left: var(--vl-tooltip-left, 0);
+    width: min(20rem, calc(100vw - 3rem));
+    padding: var(--vl-space-3) var(--vl-space-4);
+    border: 1px solid var(--vl-border-strong);
+    border-radius: var(--vl-radius-md);
+    background: #0d182d;
+    box-shadow: var(--vl-shadow-overlay);
+    color: var(--vl-text-soft);
+    font-size: var(--vl-text-sm);
+    font-weight: 500;
+    line-height: 1.4;
+    opacity: 0;
+    overflow-wrap: anywhere;
+    pointer-events: none;
+    text-align: left;
+    transform: translate(-50%, -0.25rem);
+    transition: opacity var(--vl-motion-fast) ease, transform var(--vl-motion-fast) ease,
+      visibility var(--vl-motion-fast) ease;
+    visibility: hidden;
+  }
+
+  .vl-field-info:hover .vl-field-tooltip,
+  .vl-field-info:focus .vl-field-tooltip,
+  .vl-field-info.is-open .vl-field-tooltip {
+    opacity: 1;
+    transform: translate(-50%, 0);
+    visibility: visible;
+  }
+
   .vl-field small,
-  .vl-form-grid > label small {
+  .vl-form-grid > label small,
+  .vl-mount-discovery > label small {
     color: var(--vl-text-muted);
     font-size: var(--vl-text-sm);
     font-weight: 500;
@@ -373,6 +438,20 @@ pub const STYLESHEET: &str = r#"
     grid-template-columns: minmax(0, 1fr) auto;
     gap: var(--vl-space-2);
     align-items: end;
+  }
+
+  .vl-mount-discovery {
+    display: grid;
+    grid-column: 1 / -1;
+    gap: var(--vl-space-2);
+    padding: var(--vl-space-4);
+    border: 1px solid rgba(90, 167, 255, 0.24);
+    border-radius: var(--vl-radius-lg);
+    background: rgba(90, 167, 255, 0.06);
+  }
+
+  .vl-mount-discovery > p {
+    margin: 0;
   }
 
   .vl-datetime-picker { position: relative; }
@@ -628,6 +707,11 @@ pub const STYLESHEET: &str = r#"
   }
 
   .vl-setup-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--vl-space-4);
     margin-bottom: var(--vl-space-6);
   }
 

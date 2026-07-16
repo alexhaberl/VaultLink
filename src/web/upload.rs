@@ -591,7 +591,7 @@ impl PublicUploadFinalizer {
         // Carry only the uploader's immutable intent across request streaming.
         // Replacement authority is derived from the current share policy while
         // the storage lock is held through quota commit and publication.
-        let allow_replace = !state.config.storage.external_writers
+        let allow_replace = state.config.storage.replacements_allowed()
             && current_share.upload_conflict_strategy.can_overwrite()
             && upload.overwrite_requested();
         let current_destination = match state
@@ -882,7 +882,7 @@ impl PublicUploadFormPhase<'_> {
                             )
                         })?;
                     overwrite_requested = value == "1";
-                    if overwrite_requested && state.config.storage.external_writers {
+                    if overwrite_requested && !state.config.storage.replacements_allowed() {
                         return Err(public_upload_rejection(
                             token,
                             &upload_subdir,
