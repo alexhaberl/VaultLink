@@ -1330,7 +1330,7 @@ document.addEventListener('DOMContentLoaded', () => {
   };
   const canAutoApplyDetectedMount = () =>
     form.elements.root_mount_path.value === '/tmp/vaultlink-root'
-    && form.elements.internal_directory.value === ''
+    && form.elements.internal_directory.value === '/tmp/vaultlink-root/.vaultlink-internal'
     && form.elements.expected_filesystem_type.value === ''
     && form.elements.expected_mount_source.value === '';
   async function refreshDetectedMounts(autoApply = false) {
@@ -1673,7 +1673,9 @@ mod tests {
         assert!(html.contains("data-dir-picker=\"internal_directory\""));
         assert!(html.contains(r#"name="data_directory" value="/var/lib/vaultlink" required"#));
         assert!(!html.contains(r#"name="data_directory" value="/tmp/vaultlink-data""#));
-        assert!(html.contains(r#"<input name="internal_directory" required>"#));
+        assert!(html.contains(
+            r#"<input name="internal_directory" value="/tmp/vaultlink-root/.vaultlink-internal" required>"#
+        ));
         assert!(!html.contains(r#"name="internal_directory" data-mount-policy-field"#));
         assert!(html.contains("data-require-mount"));
         assert!(html.contains("data-external-writers"));
@@ -1706,6 +1708,8 @@ mod tests {
         assert!(SETUP_JAVASCRIPT.contains("fallbackToRoot"));
         assert!(SETUP_JAVASCRIPT.contains("/mounts?token="));
         assert!(SETUP_JAVASCRIPT.contains("applyDetectedMount"));
+        assert!(SETUP_JAVASCRIPT
+            .contains("internal_directory.value === '/tmp/vaultlink-root/.vaultlink-internal'"));
         assert!(SETUP_JAVASCRIPT.contains("previousMountPoint"));
         assert!(SETUP_JAVASCRIPT.contains("externalWritersField.hidden = !cifsStorage"));
         assert!(SETUP_JAVASCRIPT
