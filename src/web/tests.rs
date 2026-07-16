@@ -1405,14 +1405,17 @@ async fn wait_for_public_upload_cleanup(state: &AppState, root: &Path, share_id:
 }
 
 async fn wait_until_storage_locked(state: &AppState) {
-    for _ in 0..200 {
-        match state.storage_mutation.try_lock() {
-            Ok(guard) => drop(guard),
-            Err(_) => return,
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match state.storage_mutation.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(_) => return,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    panic!("upload did not acquire the storage mutation lock");
+    })
+    .await
+    .expect("upload did not acquire the storage mutation lock");
 }
 
 fn api_share_strategy_request(

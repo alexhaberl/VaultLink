@@ -259,9 +259,9 @@ if [ "$exact_main_tag_gates" -ne 3 ] \
     || grep -F -q "$ancestor_tag_reference" .github/workflows/release.yml; then
     report "release tags must target the exact approved main candidate in build, verification, and publish jobs"
 fi
-if ! grep -F -q 'repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME' .github/workflows/release.yml \
-    || ! grep -F -q 'test "$remote_tag_object" = "$local_tag_object"' .github/workflows/release.yml \
-    || ! grep -F -q 'repos/$GITHUB_REPOSITORY/git/ref/heads/main' .github/workflows/release.yml; then
+if ! grep -F -q "repos/\$GITHUB_REPOSITORY/git/ref/tags/\$GITHUB_REF_NAME" .github/workflows/release.yml \
+    || ! grep -F -q "test \"\$remote_tag_object\" = \"\$local_tag_object\"" .github/workflows/release.yml \
+    || ! grep -F -q "repos/\$GITHUB_REPOSITORY/git/ref/heads/main" .github/workflows/release.yml; then
     report "release publish must revalidate the live remote tag object and main commit immediately before creation"
 fi
 

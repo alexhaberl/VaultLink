@@ -64,8 +64,10 @@ if [ ! -s "$active/result.env" ]; then
         [ "${#hash}" -eq 64 ] || { echo "unit hash is invalid" >&2; exit 1; }
     done
     case "$namespace" in *[!A-Za-z0-9._-]*|'') echo "unit namespace is invalid" >&2; exit 1 ;; esac
-    [ "$architecture" = amd64 ] && [ "$os_id" = debian ] && [ "$os_version_id" = 13 ] \
-        || { echo "unit platform is not Debian 13 amd64" >&2; exit 1; }
+    if [ "$architecture" != amd64 ] || [ "$os_id" != debian ] || [ "$os_version_id" != 13 ]; then
+        echo "unit platform is not Debian 13 amd64" >&2
+        exit 1
+    fi
     unit="vaultlink-soak@${commit}.service"
     load_state=$(systemctl show --property=LoadState --value "$unit" 2>/dev/null || true)
     if [ "$load_state" != loaded ]; then

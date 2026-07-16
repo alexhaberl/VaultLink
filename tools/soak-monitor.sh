@@ -65,14 +65,20 @@ case "$SOAK_START_EPOCH:$SOAK_DEADLINE_EPOCH" in
 esac
 [ $((SOAK_DEADLINE_EPOCH - SOAK_START_EPOCH)) -eq "$duration" ] \
     || { echo "persisted soak deadline does not match its duration" >&2; exit 64; }
-[ "$SOAK_ARCHITECTURE" = amd64 ] && [ "$(uname -m)" = x86_64 ] \
-    || { echo "soak requires native amd64/x86_64" >&2; exit 64; }
-[ "$SOAK_OS_ID" = debian ] && [ "$SOAK_OS_VERSION_ID" = 13 ] \
-    || { echo "soak unit platform must be Debian 13" >&2; exit 64; }
+if [ "$SOAK_ARCHITECTURE" != amd64 ] || [ "$(uname -m)" != x86_64 ]; then
+    echo "soak requires native amd64/x86_64" >&2
+    exit 64
+fi
+if [ "$SOAK_OS_ID" != debian ] || [ "$SOAK_OS_VERSION_ID" != 13 ]; then
+    echo "soak unit platform must be Debian 13" >&2
+    exit 64
+fi
 actual_os_id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')
 actual_os_version_id=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')
-[ "$actual_os_id" = "$SOAK_OS_ID" ] && [ "$actual_os_version_id" = "$SOAK_OS_VERSION_ID" ] \
-    || { echo "soak host platform changed or is not Debian 13" >&2; exit 64; }
+if [ "$actual_os_id" != "$SOAK_OS_ID" ] || [ "$actual_os_version_id" != "$SOAK_OS_VERSION_ID" ]; then
+    echo "soak host platform changed or is not Debian 13" >&2
+    exit 64
+fi
 
 for command in awk curl journalctl sha256sum sort sqlite3 systemctl; do
     command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 69; }
