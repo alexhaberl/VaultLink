@@ -2075,16 +2075,20 @@ fn upload_quota_reservations_are_atomic_cumulative_and_cancellable() {
         )
         .unwrap();
     assert_eq!(
-        database.begin_upload_reservation("one", share_id).unwrap(),
-        UploadReservationBeginOutcome::Reserved
-    );
-    assert_eq!(
-        database.begin_upload_reservation("two", share_id).unwrap(),
+        database
+            .begin_upload_reservation("one", share_id, 0)
+            .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
     assert_eq!(
         database
-            .begin_upload_reservation("three", share_id)
+            .begin_upload_reservation("two", share_id, 0)
+            .unwrap(),
+        UploadReservationBeginOutcome::Reserved
+    );
+    assert_eq!(
+        database
+            .begin_upload_reservation("three", share_id, 0)
             .unwrap(),
         UploadReservationBeginOutcome::FileQuotaReached
     );
@@ -2104,7 +2108,7 @@ fn upload_quota_reservations_are_atomic_cumulative_and_cancellable() {
 
     assert_eq!(
         database
-            .begin_upload_reservation("three", share_id)
+            .begin_upload_reservation("three", share_id, 0)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -2119,7 +2123,9 @@ fn upload_quota_reservations_are_atomic_cumulative_and_cancellable() {
     let share = database.share_by_token("upload-share").unwrap().unwrap();
     assert_eq!((share.uploaded_bytes, share.uploaded_files), (10, 2));
     assert_eq!(
-        database.begin_upload_reservation("four", share_id).unwrap(),
+        database
+            .begin_upload_reservation("four", share_id, 0)
+            .unwrap(),
         UploadReservationBeginOutcome::ByteQuotaReached
     );
     assert_eq!(
@@ -2151,7 +2157,7 @@ fn upload_quota_commit_rolls_back_usage_and_reservation_when_audit_fails() {
         .unwrap();
     assert_eq!(
         database
-            .begin_upload_reservation("reservation", share_id)
+            .begin_upload_reservation("reservation", share_id, 0)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -2241,13 +2247,13 @@ fn upload_reservations_are_revoked_when_share_authority_changes() {
             .unwrap();
         assert_eq!(
             database
-                .begin_upload_reservation(&extend_token, share_id)
+                .begin_upload_reservation(&extend_token, share_id, 0)
                 .unwrap(),
             UploadReservationBeginOutcome::Reserved
         );
         assert_eq!(
             database
-                .begin_upload_reservation(&commit_token, share_id)
+                .begin_upload_reservation(&commit_token, share_id, 0)
                 .unwrap(),
             UploadReservationBeginOutcome::Reserved
         );
@@ -2298,7 +2304,7 @@ fn upload_reservations_are_revoked_when_share_authority_changes() {
         .unwrap();
     assert_eq!(
         database
-            .begin_upload_reservation("read-write-upload", read_write_share)
+            .begin_upload_reservation("read-write-upload", read_write_share, 0)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -2340,7 +2346,7 @@ fn upload_reservation_policy_epoch_rejects_reactivation_and_policy_rotation() {
 
     assert_eq!(
         database
-            .begin_upload_reservation("before-reactivation", share_id)
+            .begin_upload_reservation("before-reactivation", share_id, 0)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -2353,10 +2359,21 @@ fn upload_reservation_policy_epoch_rejects_reactivation_and_policy_rotation() {
             .unwrap(),
         UploadReservationExtendOutcome::ShareUnavailable
     );
-
     assert_eq!(
         database
-            .begin_upload_reservation("before-password", share_id)
+            .begin_upload_reservation("stale-reactivation", share_id, 0)
+            .unwrap(),
+        UploadReservationBeginOutcome::ShareUnavailable
+    );
+
+    let before_password_epoch = database
+        .share_by_token("epoch-share")
+        .unwrap()
+        .unwrap()
+        .upload_policy_epoch;
+    assert_eq!(
+        database
+            .begin_upload_reservation("before-password", share_id, before_password_epoch)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -2369,10 +2386,21 @@ fn upload_reservation_policy_epoch_rejects_reactivation_and_policy_rotation() {
             .unwrap(),
         UploadReservationCommitOutcome::ShareUnavailable
     );
-
     assert_eq!(
         database
-            .begin_upload_reservation("before-strategy", share_id)
+            .begin_upload_reservation("stale-password", share_id, before_password_epoch)
+            .unwrap(),
+        UploadReservationBeginOutcome::ShareUnavailable
+    );
+
+    let before_strategy_epoch = database
+        .share_by_token("epoch-share")
+        .unwrap()
+        .unwrap()
+        .upload_policy_epoch;
+    assert_eq!(
+        database
+            .begin_upload_reservation("before-strategy", share_id, before_strategy_epoch)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -2394,9 +2422,14 @@ fn upload_reservation_policy_epoch_rejects_reactivation_and_policy_rotation() {
         UploadReservationExtendOutcome::ShareUnavailable
     );
 
+    let before_quota_epoch = database
+        .share_by_token("epoch-share")
+        .unwrap()
+        .unwrap()
+        .upload_policy_epoch;
     assert_eq!(
         database
-            .begin_upload_reservation("before-quota", share_id)
+            .begin_upload_reservation("before-quota", share_id, before_quota_epoch)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -2413,9 +2446,14 @@ fn upload_reservation_policy_epoch_rejects_reactivation_and_policy_rotation() {
         UploadReservationCommitOutcome::ShareUnavailable
     );
 
+    let current_epoch = database
+        .share_by_token("epoch-share")
+        .unwrap()
+        .unwrap()
+        .upload_policy_epoch;
     assert_eq!(
         database
-            .begin_upload_reservation("current-policy", share_id)
+            .begin_upload_reservation("current-policy", share_id, current_epoch)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -2457,7 +2495,9 @@ fn stale_upload_quota_update_does_not_partially_change_strategy() {
     // These reservations represent concurrent uploads started after the UI
     // read its share snapshot but before it submitted strategy plus limits.
     for token in ["upload-one", "upload-two"] {
-        database.begin_upload_reservation(token, share_id).unwrap();
+        database
+            .begin_upload_reservation(token, share_id, 0)
+            .unwrap();
         database.extend_upload_reservation(token, 5).unwrap();
     }
 

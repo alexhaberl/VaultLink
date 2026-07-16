@@ -165,6 +165,7 @@ impl Database {
         &self,
         token: &str,
         share_id: i64,
+        expected_upload_policy_epoch: i64,
     ) -> rusqlite::Result<UploadReservationBeginOutcome> {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
@@ -179,9 +180,9 @@ impl Database {
             .query_row(
                 "SELECT max_upload_total_size,max_upload_files,
                         active,(expires_at IS NULL OR expires_at>?2),
-                        is_directory,permission,upload_policy_epoch
-                 FROM shares WHERE id=?1",
-                params![share_id, now_text],
+                        is_directory,permission
+                 FROM shares WHERE id=?1 AND upload_policy_epoch=?3",
+                params![share_id, now_text, expected_upload_policy_epoch],
                 |row| {
                     Ok((
                         row.get::<_, Option<u64>>(0)?,
@@ -190,7 +191,6 @@ impl Database {
                         row.get::<_, bool>(3)?,
                         row.get::<_, bool>(4)?,
                         row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?,
                     ))
                 },
             )
@@ -202,7 +202,6 @@ impl Database {
             unexpired,
             is_directory,
             permission,
-            upload_policy_epoch,
         )) = limits
         else {
             transaction.commit()?;
@@ -225,7 +224,7 @@ impl Database {
         let active_reservations: u64 = transaction.query_row(
             "SELECT COUNT(*) FROM public_upload_reservations
              WHERE share_id=?1 AND upload_policy_epoch=?2",
-            params![share_id, upload_policy_epoch],
+            params![share_id, expected_upload_policy_epoch],
             |row| row.get(0),
         )?;
         if uploaded_bytes >= total_limit {
@@ -245,7 +244,7 @@ impl Database {
                 share_id,
                 now_text,
                 expires,
-                upload_policy_epoch
+                expected_upload_policy_epoch
             ],
         )?;
         transaction.commit()?;

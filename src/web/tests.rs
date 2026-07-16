@@ -537,6 +537,7 @@ async fn request_cancellation_releases_unclaimed_transfer_and_upload_begins() {
             upload_database,
             "cancelled-upload-reservation".into(),
             upload_share,
+            0,
         )
         .await
         .unwrap();
@@ -639,7 +640,7 @@ async fn consuming_lease_and_quota_guards_finish_their_durable_ownership() {
     assert_eq!(
         state
             .db
-            .begin_upload_reservation("consuming-cancel", upload_share)
+            .begin_upload_reservation("consuming-cancel", upload_share, 0)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -655,7 +656,7 @@ async fn consuming_lease_and_quota_guards_finish_their_durable_ownership() {
     assert_eq!(
         state
             .db
-            .begin_upload_reservation("consuming-commit", upload_share)
+            .begin_upload_reservation("consuming-commit", upload_share, 0)
             .unwrap(),
         UploadReservationBeginOutcome::Reserved
     );
@@ -741,7 +742,7 @@ fn reservation_drop_schedules_blocking_cleanup_before_immediate_runtime_shutdown
         );
         assert_eq!(
             database
-                .begin_upload_reservation("shutdown-upload-reservation", upload_share)
+                .begin_upload_reservation("shutdown-upload-reservation", upload_share, 0)
                 .unwrap(),
             UploadReservationBeginOutcome::Reserved
         );
@@ -5328,6 +5329,74 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
             .status(),
         StatusCode::FORBIDDEN
     );
+}
+
+#[tokio::test]
+async fn password_rotation_rejects_an_authorized_upload_before_its_file_field() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "epoch-upload",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+
+    let boundary = "vaultlink-epoch-boundary";
+    let (body_sender, body_receiver) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(1);
+    let body_stream = futures_util::stream::unfold(body_receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+    let mut upload_request = Request::builder()
+        .method(Method::POST)
+        .uri("/v/epoch-upload/upload")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from_stream(body_stream))
+        .unwrap();
+    upload_request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+    ));
+
+    let app = router(state.clone());
+    let upload = tokio::spawn(async move { app.oneshot(upload_request).await.unwrap() });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.upload_admission.available_permits() != 31 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upload should authorize before polling the file field");
+
+    assert!(state
+        .db
+        .set_share_password(share_id, Some("rotated-password-hash"))
+        .unwrap());
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"late.txt\"\r\nContent-Type: application/octet-stream\r\n\r\nlate\r\n--{boundary}--\r\n"
+    );
+    body_sender.send(Ok(Bytes::from(body))).await.unwrap();
+    drop(body_sender);
+
+    let response = upload.await.unwrap();
+    assert_eq!(response.status(), StatusCode::GONE);
+    assert!(!root.path().join("uploads/late.txt").exists());
+    assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
 }
 
 #[tokio::test]
