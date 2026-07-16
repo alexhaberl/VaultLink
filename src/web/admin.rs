@@ -342,7 +342,7 @@ fn admin_validation_error(error: AdminServiceError) -> AppError {
         ),
         AdminServiceError::InvalidPassword => AppError(
             StatusCode::BAD_REQUEST,
-            "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
+            "Passwort muss mindestens 14 und darf höchstens 256 Zeichen enthalten",
         ),
         AdminServiceError::PasswordConfirmationMismatch => {
             AppError(StatusCode::BAD_REQUEST, "Passwörter stimmen nicht überein")

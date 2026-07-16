@@ -2,7 +2,7 @@ use super::{DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE};
 use chrono::Utc;
 use rusqlite::{params, Connection};
 
-pub(super) const SCHEMA_VERSION: i64 = 15;
+pub(super) const SCHEMA_VERSION: i64 = 16;
 
 pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -449,6 +449,34 @@ CREATE INDEX IF NOT EXISTS idx_upload_reservations_share_epoch
             )?;
         }
         tx.pragma_update(None, "user_version", 15)?;
+    }
+    if version < 16 {
+        let has_admins: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema WHERE type='table' AND name='admins'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_admins {
+            let has_totp_enabled: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('admins')
+                     WHERE name='totp_enabled'
+                 )",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_totp_enabled {
+                tx.execute(
+                    "ALTER TABLE admins
+                     ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 1
+                     CHECK(totp_enabled IN (0, 1))",
+                    [],
+                )?;
+            }
+        }
+        tx.pragma_update(None, "user_version", 16)?;
     }
     tx.commit()
 }

@@ -140,6 +140,7 @@ pub fn router(state: AppState) -> Router {
             "/admin/account/password",
             post(account::change_account_password),
         )
+        .route("/admin/account/totp", post(account::set_account_totp))
         .route("/admin/account/mfa/start", post(account::start_account_mfa))
         .route(
             "/admin/account/mfa/confirm",
@@ -171,6 +172,10 @@ pub fn router(state: AppState) -> Router {
                 .layer(middleware::from_fn(guard_multipart_upload)),
         )
         .route("/admin/files/rename", post(files::rename_file_ui))
+        .route(
+            "/admin/files/download",
+            get(files::admin_download).head(files::admin_download),
+        )
         .route(
             "/admin/files/delete",
             get(files::delete_file_confirmation).post(files::delete_file_ui),

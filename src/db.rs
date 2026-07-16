@@ -70,7 +70,17 @@ pub struct Admin {
     pub username: String,
     pub password_hash: String,
     pub(crate) totp_secret: crate::sensitive::SecretString,
+    pub totp_enabled: bool,
     pub active: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminTotpSettingOutcome {
+    Updated,
+    Unchanged,
+    ReauthenticationRejected,
+    TotpRejected,
+    InsufficientSecurityKeys,
 }
 #[derive(Clone, Debug)]
 pub struct AdminSummary {
@@ -123,6 +133,22 @@ pub enum AdminWebauthnCredentialDeletionOutcome {
 pub enum AuditClientIpDeletionOutcome {
     Deleted(usize),
     LoggingEnabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditSortColumn {
+    Time,
+    Actor,
+    Action,
+    Object,
+    Detail,
+    ClientIp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditSortDirection {
+    Ascending,
+    Descending,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

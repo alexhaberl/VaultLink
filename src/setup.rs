@@ -1219,8 +1219,8 @@ fn legacy_setup_form(token: &str, error: Option<&str>) -> String {
   <section class="vl-form-card"><h2><vl-i18n key="setup.audit_privacy"/></h2><div class="vl-form-grid"><label class="vl-toggle"><input type="checkbox" name="audit_client_ip_enabled"><span><vl-i18n key="setup.audit_ip"/><small><vl-i18n key="setup.audit_ip_help"/></small></span></label></div></section>
   <section class="vl-form-card"><h2><vl-i18n key="setup.first_admin"/></h2><div class="vl-form-grid">
     <label><vl-i18n key="auth.username"/><br><input name="admin_username" value="admin" minlength="3" maxlength="64" required></label>
-    <label><vl-i18n key="auth.password"/><br><input name="admin_password" type="password" minlength="14" maxlength="1024" required></label>
-    <label><vl-i18n key="account.confirm_password"/><br><input name="admin_password_confirm" type="password" minlength="14" maxlength="1024" required></label>
+    <label><vl-i18n key="auth.password"/><br><input name="admin_password" type="password" minlength="14" maxlength="256" required></label>
+    <label><vl-i18n key="account.confirm_password"/><br><input name="admin_password_confirm" type="password" minlength="14" maxlength="256" required></label>
   </div></section>
   <p class="vl-form-actions"><button class="vl-button"><vl-i18n key="setup.write"/></button></p>
 </form>
@@ -2102,7 +2102,7 @@ mod tests {
         .await
         .err()
         .expect("overlong admin passwords must fail");
-        assert!(error.contains("1024"));
+        assert!(error.contains("256"));
         assert!(!config_path.exists());
         assert!(!data.path().join("data.sqlite").exists());
     }

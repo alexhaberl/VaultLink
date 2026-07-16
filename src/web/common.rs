@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, io};
+use std::{cmp::Ordering, collections::VecDeque, io};
 
 use axum::{
     http::{header, HeaderValue, StatusCode},
@@ -89,7 +89,12 @@ pub(super) fn format_audit_time(value: &str) -> String {
 }
 
 pub(super) fn format_file_time(value: std::time::SystemTime) -> String {
-    format_utc_minute(DateTime::<Utc>::from(value))
+    let utc = DateTime::<Utc>::from(value);
+    format!(
+        r#"<time data-local-time datetime="{}">{}</time>"#,
+        utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        format_utc_minute(utc),
+    )
 }
 
 pub(super) fn format_utc_minute(value: DateTime<Utc>) -> String {
@@ -126,8 +131,148 @@ pub(crate) struct BrowseQuery {
     pub(super) path: Option<String>,
     pub(super) page: Option<usize>,
     pub(super) q: Option<String>,
+    pub(super) sort: Option<String>,
+    pub(super) direction: Option<String>,
     pub(super) upload: Option<String>,
     pub(super) notice: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FileSortColumn {
+    Name,
+    Type,
+    Size,
+    Modified,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FileSortDirection {
+    Ascending,
+    Descending,
+}
+
+pub(super) fn file_sort_column(value: Option<&str>) -> FileSortColumn {
+    match value {
+        Some("type") => FileSortColumn::Type,
+        Some("size") => FileSortColumn::Size,
+        Some("modified") => FileSortColumn::Modified,
+        _ => FileSortColumn::Name,
+    }
+}
+
+pub(super) fn file_sort_column_value(column: FileSortColumn) -> &'static str {
+    match column {
+        FileSortColumn::Name => "name",
+        FileSortColumn::Type => "type",
+        FileSortColumn::Size => "size",
+        FileSortColumn::Modified => "modified",
+    }
+}
+
+pub(super) fn file_sort_direction(value: Option<&str>) -> FileSortDirection {
+    match value {
+        Some("desc") => FileSortDirection::Descending,
+        _ => FileSortDirection::Ascending,
+    }
+}
+
+pub(super) fn file_sort_direction_value(direction: FileSortDirection) -> &'static str {
+    match direction {
+        FileSortDirection::Ascending => "asc",
+        FileSortDirection::Descending => "desc",
+    }
+}
+
+fn compare_entries(left: &Entry, right: &Entry, column: FileSortColumn) -> Ordering {
+    let by_name = || {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    };
+    match column {
+        FileSortColumn::Name => by_name(),
+        FileSortColumn::Type => (!left.is_dir).cmp(&(!right.is_dir)).then_with(by_name),
+        FileSortColumn::Size => left.len.cmp(&right.len).then_with(by_name),
+        FileSortColumn::Modified => left.modified.cmp(&right.modified).then_with(by_name),
+    }
+}
+
+pub(super) fn sort_entries(
+    entries: &mut [Entry],
+    column: FileSortColumn,
+    direction: FileSortDirection,
+) {
+    entries.sort_by(|left, right| {
+        let order = compare_entries(left, right, column);
+        if direction == FileSortDirection::Descending {
+            order.reverse()
+        } else {
+            order
+        }
+    });
+}
+
+pub(super) fn sort_search_hits(
+    hits: &mut [SearchHit],
+    column: FileSortColumn,
+    direction: FileSortDirection,
+) {
+    hits.sort_by(|left, right| {
+        let order = compare_entries(&left.entry, &right.entry, column);
+        if direction == FileSortDirection::Descending {
+            order.reverse()
+        } else {
+            order
+        }
+    });
+}
+
+pub(super) fn file_sort_header(
+    label: &str,
+    column: FileSortColumn,
+    current_column: FileSortColumn,
+    current_direction: FileSortDirection,
+    base_url: &str,
+    path: &str,
+    search: Option<&str>,
+) -> String {
+    let active = column == current_column;
+    let next_direction = if active && current_direction == FileSortDirection::Ascending {
+        FileSortDirection::Descending
+    } else {
+        FileSortDirection::Ascending
+    };
+    let aria_sort = if active {
+        match current_direction {
+            FileSortDirection::Ascending => "ascending",
+            FileSortDirection::Descending => "descending",
+        }
+    } else {
+        "none"
+    };
+    let indicator = if active {
+        match current_direction {
+            FileSortDirection::Ascending => "↑",
+            FileSortDirection::Descending => "↓",
+        }
+    } else {
+        ""
+    };
+    let search = search
+        .map(|value| format!("&q={}", encoded(value)))
+        .unwrap_or_default();
+    let href = format!(
+        "{base_url}?path={}&sort={}&direction={}{}",
+        encoded(path),
+        file_sort_column_value(column),
+        file_sort_direction_value(next_direction),
+        search,
+    );
+    format!(
+        r#"<th aria-sort="{aria_sort}"><a class="vl-audit-sort" href="{}">{label}<span class="vl-audit-sort__indicator" aria-hidden="true">{indicator}</span></a></th>"#,
+        esc(&href)
+    )
 }
 
 pub(super) fn human(n: u64) -> String {
@@ -167,6 +312,18 @@ pub(super) fn expiry_picker_html() -> String {
 
 pub(super) fn format_unit_floor(bytes: u64, unit: u64) -> String {
     (bytes / unit).to_string()
+}
+
+pub(super) fn format_unit_decimal(bytes: u64, unit: u64) -> String {
+    let whole = bytes / unit;
+    let remainder = bytes % unit;
+    if remainder == 0 {
+        return whole.to_string();
+    }
+    let width = unit.to_string().len() - 1;
+    debug_assert_eq!(10_u64.checked_pow(width as u32), Some(unit));
+    let fraction = format!("{remainder:0width$}");
+    format!("{whole}.{}", fraction.trim_end_matches('0'))
 }
 
 pub(super) fn parse_unit_to_bytes(value: &str, unit: u64, label: &'static str) -> Result<u64> {
@@ -357,6 +514,7 @@ impl DirectoryAccess for SecureDirectory {
     }
 }
 
+#[cfg(test)]
 pub(super) fn list_directory_page<D: DirectoryAccess>(
     directory: &D,
     relative: &str,
@@ -387,6 +545,40 @@ pub(super) fn list_directory_page<D: DirectoryAccess>(
         }
     }
     Ok((entries, false))
+}
+
+pub(super) fn list_directory_sorted_page<D: DirectoryAccess>(
+    directory: &D,
+    relative: &str,
+    page: usize,
+    scan_limit: usize,
+    column: FileSortColumn,
+    direction: FileSortDirection,
+) -> io::Result<(Vec<Entry>, bool)> {
+    let mut scanned = 0usize;
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    let mut scan = directory.scan_entries(relative)?;
+    loop {
+        let remaining = scan_limit.saturating_sub(scanned);
+        if remaining == 0 {
+            let sentinel = scan.run_batch(1)?;
+            truncated = sentinel.scanned != 0 || !sentinel.complete;
+            break;
+        }
+        let batch = scan.run_batch(remaining.min(100))?;
+        scanned = scanned.saturating_add(batch.scanned);
+        entries.extend(batch.entries);
+        if batch.complete {
+            break;
+        }
+    }
+    sort_entries(&mut entries, column, direction);
+    let skip = page.saturating_mul(100);
+    Ok((
+        entries.into_iter().skip(skip).take(101).collect(),
+        truncated,
+    ))
 }
 
 pub(super) fn search_tree<D: DirectoryAccess>(

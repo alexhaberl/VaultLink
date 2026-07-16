@@ -802,7 +802,7 @@ fn prompt_new_admin_password() -> Result<Zeroizing<String>, Box<dyn std::error::
 
 fn validate_admin_password(password: &str) -> Result<(), &'static str> {
     if !auth::valid_admin_password(password) {
-        return Err("password must contain at least 14 characters and at most 1024 bytes");
+        return Err("password must contain between 14 and 256 characters");
     }
     Ok(())
 }
@@ -1156,8 +1156,10 @@ mod tests {
     fn admin_password_minimum_counts_characters_instead_of_bytes() {
         assert!(validate_admin_password("äääääääääääää").is_err());
         assert!(validate_admin_password("ääääääääääääää").is_ok());
-        assert!(validate_admin_password(&"x".repeat(auth::MAX_PASSWORD_BYTES)).is_ok());
-        assert!(validate_admin_password(&"x".repeat(auth::MAX_PASSWORD_BYTES + 1)).is_err());
+        assert!(validate_admin_password(&"x".repeat(auth::ADMIN_PASSWORD_MAX_CHARACTERS)).is_ok());
+        assert!(
+            validate_admin_password(&"x".repeat(auth::ADMIN_PASSWORD_MAX_CHARACTERS + 1)).is_err()
+        );
     }
 
     #[tokio::test]

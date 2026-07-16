@@ -7,14 +7,17 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 
 use super::{
     admission::PermitBody,
     common::{
-        add_upload_bytes, breadcrumbs, encoded, extension_is_blocked, format_file_time, human,
-        internal, join_display, list_directory_page, parent_path, preview_allowed, preview_kind,
-        search_tree, BrowseQuery,
+        add_upload_bytes, breadcrumbs, encoded, extension_is_blocked, file_sort_column,
+        file_sort_column_value, file_sort_direction, file_sort_direction_value, file_sort_header,
+        format_file_time, human, internal, join_display, list_directory_sorted_page, parent_path,
+        preview_allowed, preview_kind, search_tree, sort_search_hits, BrowseQuery,
     },
     preview_zip::{raw_preview_response, read_preview, PreviewContent},
     public_preview::text_preview_render_permits,
@@ -343,6 +346,58 @@ pub(super) async fn stage_admin_upload(
     Ok((pending, name, total))
 }
 
+async fn ensure_admin_upload_directory(
+    state: &AppState,
+    base: &str,
+    relative: &str,
+    actor: &str,
+) -> Result<String> {
+    let relative = path_security::validate_relative(relative)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if relative.is_empty() {
+        return Ok(base.to_string());
+    }
+    let target = join_display(base, &relative);
+    let guard = state.storage_mutation.clone().lock_owned().await;
+    let guard = file_ops::recover_pending_file_operations_with_guard(state, guard)
+        .await
+        .map_err(storage_recovery_app_error)?;
+    let secure_root = state.secure_root.clone();
+    let base = base.to_string();
+    let tree = relative.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        secure_root
+            .bind_directory(&base)?
+            .ensure_directory_tree(&tree)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::InvalidInput => {
+            AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad")
+        }
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => AppError(
+            StatusCode::CONFLICT,
+            "Uploadordner konnte nicht erstellt werden",
+        ),
+        _ => internal(error),
+    })?;
+    if !created.is_empty() {
+        audit_observation(
+            state,
+            actor.to_string(),
+            "upload_directories_created",
+            Some(target.clone()),
+            Some(format!("created={}", created.len())),
+        )
+        .await;
+    }
+    Ok(target)
+}
+
 pub(super) async fn process_admin_upload(
     state: &AppState,
     headers: &HeaderMap,
@@ -388,6 +443,7 @@ pub(super) async fn process_admin_upload(
     let mut csrf_value: Option<String> = None;
     let mut overwrite_existing = false;
     let mut saw_overwrite = false;
+    let mut folder_path: Option<String> = None;
     let mut staged: Option<(PendingUpload, String, u64)> = None;
     let mut fields_seen = 0usize;
     while let Some(field) = multipart
@@ -451,6 +507,22 @@ pub(super) async fn process_admin_upload(
                     ));
                 }
             }
+            "folder_path" => {
+                if folder_path.is_some() || staged.is_some() {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "Ordnerpfad wurde mehrfach oder zu spät übermittelt",
+                    ));
+                }
+                let value = limited_multipart_text(field, MAX_UPLOAD_PATH_FIELD_BYTES)
+                    .await
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad"))?;
+                let value = path_security::validate_relative(&value)
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad"))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                folder_path = Some(value);
+            }
             "file" => {
                 if staged.is_some() {
                     return Err(AppError(
@@ -468,10 +540,16 @@ pub(super) async fn process_admin_upload(
                         "CSRF-Nachweis muss vor der Datei übermittelt werden",
                     ));
                 }
+                let target = if let Some(folder_path) = folder_path.as_deref() {
+                    ensure_admin_upload_directory(state, target, folder_path, &admin.username)
+                        .await?
+                } else {
+                    target.to_string()
+                };
                 staged = Some(
                     stage_admin_upload(
                         state,
-                        target,
+                        &target,
                         field,
                         settings.max_upload_size,
                         &settings.blocked_extensions,
@@ -488,7 +566,10 @@ pub(super) async fn process_admin_upload(
         }
     }
 
-    let directory = directory.ok_or(AppError(StatusCode::BAD_REQUEST, "Uploadpfad fehlt"))?;
+    let mut directory = directory.ok_or(AppError(StatusCode::BAD_REQUEST, "Uploadpfad fehlt"))?;
+    if let Some(folder_path) = folder_path.as_deref() {
+        directory = join_display(&directory, folder_path);
+    }
     if csrf_value.is_none() {
         return Err(AppError(StatusCode::FORBIDDEN, "CSRF-Nachweis fehlt"));
     }
@@ -723,9 +804,22 @@ pub(super) fn file_operation_app_error(error: file_ops::FileOperationError) -> A
     }
 }
 
-pub(super) fn file_row_actions(path: &str, name: &str, csrf_token: &str) -> String {
+pub(super) fn file_row_actions(
+    path: &str,
+    name: &str,
+    csrf_token: &str,
+    is_directory: bool,
+) -> String {
+    let download = if is_directory {
+        String::new()
+    } else {
+        format!(
+            r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/files/download?path={}"><vl-i18n key="common.download"/></a>"#,
+            encoded(path)
+        )
+    };
     format!(
-        r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/shares/new?path={}"><vl-i18n key="files.share_action"/></a><details class="vl-action-details"><summary class="vl-icon-button" aria-label="<vl-i18n key="share.more_aria"/>">{}</summary><div class="vl-action-panel"><form method="post" action="/admin/files/rename" class="vl-stack"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label class="vl-field"><vl-i18n key="files.new_name"/><input name="name" value="{}" maxlength="255" required></label><button class="vl-button vl-button--small"><vl-i18n key="common.rename"/></button></form><a class="vl-button vl-button--danger vl-button--small" href="/admin/files/delete?path={}">{} <vl-i18n key="common.delete"/></a></div></details>"#,
+        r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/shares/new?path={}"><vl-i18n key="files.share_action"/></a>{download}<details class="vl-action-details"><summary class="vl-icon-button" aria-label="<vl-i18n key="share.more_aria"/>">{}</summary><div class="vl-action-panel"><form method="post" action="/admin/files/rename" class="vl-stack"><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><label class="vl-field"><vl-i18n key="files.new_name"/><input name="name" value="{}" maxlength="255" required></label><button class="vl-button vl-button--small"><vl-i18n key="common.rename"/></button></form><a class="vl-button vl-button--danger vl-button--small" href="/admin/files/delete?path={}">{} <vl-i18n key="common.delete"/></a></div></details>"#,
         encoded(path),
         crate::ui::icon(crate::ui::Icon::More),
         esc(csrf_token),
@@ -779,6 +873,8 @@ pub(super) async fn admin_browser(
         .into_iter()
         .filter(share_is_available)
         .count();
+    let sort_column = file_sort_column(q.sort.as_deref());
+    let sort_direction = file_sort_direction(q.direction.as_deref());
     let raw = q.path.unwrap_or_default();
     let page_number = q.page.unwrap_or(0).min(1_000_000);
     let search =
@@ -820,15 +916,21 @@ pub(super) async fn admin_browser(
     if let Some(search) = search.clone() {
         let base = rel.clone();
         let search_settings = settings.clone();
-        let hits = tokio::task::spawn_blocking(move || {
+        let mut hits = tokio::task::spawn_blocking(move || {
             search_tree(secure_root, &base, &search, &search_settings)
         })
         .await
         .map_err(internal)?
         .map_err(internal)?;
+        sort_search_hits(&mut hits, sort_column, sort_direction);
         for hit in hits {
             let target = encoded(&hit.relative_path);
-            let actions = file_row_actions(&hit.relative_path, &hit.entry.name, &s.csrf_token);
+            let actions = file_row_actions(
+                &hit.relative_path,
+                &hit.entry.name,
+                &s.csrf_token,
+                hit.entry.is_dir,
+            );
             let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings) {
                 format!(
                     r#"<a class="vl-button vl-button--secondary vl-button--small" href="/admin/preview?path={target}"><vl-i18n key="common.view"/></a> "#
@@ -866,7 +968,14 @@ pub(super) async fn admin_browser(
         let listing_path = rel.clone();
         let scan_limit = settings.max_search_entries;
         let (entries, truncated) = tokio::task::spawn_blocking(move || {
-            list_directory_page(&secure_root, &listing_path, page_number, scan_limit)
+            list_directory_sorted_page(
+                &secure_root,
+                &listing_path,
+                page_number,
+                scan_limit,
+                sort_column,
+                sort_direction,
+            )
         })
         .await
         .map_err(internal)?
@@ -879,7 +988,7 @@ pub(super) async fn admin_browser(
             let modified = entry.modified;
             let child = join_display(&rel, &name);
             let target = encoded(&child);
-            let actions = file_row_actions(&child, &name, &s.csrf_token);
+            let actions = file_row_actions(&child, &name, &s.csrf_token, is_dir);
             let display = file_name_cell(&child, &name, is_dir);
             let preview = if !is_dir && preview_allowed(&child, &settings) {
                 format!(
@@ -917,20 +1026,27 @@ pub(super) async fn admin_browser(
     } else {
         format!("&q={}", encoded(search_value))
     };
+    let sort_param = format!(
+        "&sort={}&direction={}",
+        file_sort_column_value(sort_column),
+        file_sort_direction_value(sort_direction)
+    );
     let previous = if page_number > 0 {
         format!(
-            "<a href=\"/admin?path={encoded_path}&page={}{}\"><vl-i18n key=\"common.back\"/></a>",
+            "<a href=\"/admin?path={encoded_path}&page={}{}{}\"><vl-i18n key=\"common.back\"/></a>",
             page_number - 1,
-            search_param
+            search_param,
+            sort_param,
         )
     } else {
         String::new()
     };
     let next = if has_next {
         format!(
-            "<a href=\"/admin?path={encoded_path}&page={}{}\"><vl-i18n key=\"common.continue\"/></a>",
+            "<a href=\"/admin?path={encoded_path}&page={}{}{}\"><vl-i18n key=\"common.continue\"/></a>",
             page_number + 1,
-            search_param
+            search_param,
+            sort_param,
         )
     } else {
         String::new()
@@ -969,14 +1085,51 @@ pub(super) async fn admin_browser(
         r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_conflict"/><small><vl-i18n key="share.after_conflict"/></small></span></label>"#
     };
     let upload_form = format!(
-        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} <vl-i18n key="upload.files"/></summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><div class="vl-panel-head"><div><strong><vl-i18n key="upload.admin"/></strong><p class="vl-muted"><vl-i18n key="upload.sequential"/></p></div><button class="vl-button vl-button--ghost vl-button--small" type="button" data-details-close><vl-i18n key="common.close"/></button></div>{}<label class="vl-upload-dropzone" data-upload-dropzone><strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_add"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-upload-queue" data-upload-list role="status" aria-live="polite"></div><button class="vl-button" data-upload-submit><vl-i18n key="upload.start"/></button></form></details>"#,
+        r#"<details class="vl-create-folder vl-upload-dialog"><summary class="vl-button vl-button--secondary">{} <vl-i18n key="upload.files"/></summary><form method="post" enctype="multipart/form-data" action="/admin/files/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/admin/files/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><div class="vl-panel-head"><div><strong><vl-i18n key="upload.admin"/></strong><p class="vl-muted"><vl-i18n key="upload.sequential"/></p></div><button class="vl-button vl-button--ghost vl-button--small" type="button" data-details-close><vl-i18n key="common.close"/></button></div>{}<label class="vl-upload-dropzone" data-upload-dropzone><strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_add"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-inline-actions"><label class="vl-button vl-button--secondary vl-button--small">{} <vl-i18n key="upload.folder"/><input class="vl-sr-only" type="file" webkitdirectory directory multiple data-upload-folder-input></label></div><div class="vl-upload-queue" data-upload-list role="status" aria-live="polite"></div><button class="vl-button" data-upload-submit><vl-i18n key="upload.start"/></button></form></details>"#,
         crate::ui::icon(crate::ui::Icon::Upload),
         esc(&rel),
         esc(&s.csrf_token),
         overwrite_control,
+        crate::ui::icon(crate::ui::Icon::Folder),
+    );
+    let name_header = file_sort_header(
+        "<vl-i18n key=\"common.name\"/>",
+        super::common::FileSortColumn::Name,
+        sort_column,
+        sort_direction,
+        "/admin",
+        &rel,
+        search.as_deref(),
+    );
+    let type_header = file_sort_header(
+        "<vl-i18n key=\"common.type\"/>",
+        super::common::FileSortColumn::Type,
+        sort_column,
+        sort_direction,
+        "/admin",
+        &rel,
+        search.as_deref(),
+    );
+    let size_header = file_sort_header(
+        "<vl-i18n key=\"common.size\"/>",
+        super::common::FileSortColumn::Size,
+        sort_column,
+        sort_direction,
+        "/admin",
+        &rel,
+        search.as_deref(),
+    );
+    let modified_header = file_sort_header(
+        "<vl-i18n key=\"common.changed\"/>",
+        super::common::FileSortColumn::Modified,
+        sort_column,
+        sort_direction,
+        "/admin",
+        &rel,
+        search.as_deref(),
     );
     let listing = format!(
-        r#"<section class="vl-stat-strip" aria-label="<vl-i18n key="audit.storage_aria"/>"><div><strong>{}</strong><span><vl-i18n key="common.used"/></span></div><div><strong>{}</strong><span><vl-i18n key="common.free"/></span></div><div><strong>{}</strong><span><vl-i18n key="share.active_links"/></span></div></section><section class="vl-panel"><div class="vl-browser-head"><div>{}<p class="vl-muted"><vl-i18n key="files.relative_path"/>: /{}</p></div><div class="vl-inline-actions">{}{}{}<a class="vl-button" href="/admin/shares/new?path={}"><vl-i18n key="share.current_folder"/></a></div></div><form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="files.browse"/></span><input name="q" value="{}" placeholder="<vl-i18n key="files.search_placeholder"/>"></label><button class="vl-button"><vl-i18n key="common.search"/></button></form><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr><th><vl-i18n key="common.name"/></th><th><vl-i18n key="common.type"/></th><th><vl-i18n key="common.size"/></th><th><vl-i18n key="common.changed"/></th><th><vl-i18n key="common.action"/></th></tr></thead><tbody>{}</tbody></table></div><nav class="vl-pagination" aria-label="<vl-i18n key="files.pages_aria"/>">{} {}</nav><p class="vl-muted"><vl-i18n key="files.entries_page"/></p></section><div class="vl-selection-bar" data-selection-bar hidden><span data-selection-name><vl-i18n key="share.one_selected"/></span><a class="vl-button" data-selection-share href="/admin/shares/new"><vl-i18n key="share.selection"/></a></div>"#,
+        r#"<section class="vl-stat-strip" aria-label="<vl-i18n key="audit.storage_aria"/>"><div><strong>{}</strong><span><vl-i18n key="common.used"/></span></div><div><strong>{}</strong><span><vl-i18n key="common.free"/></span></div><div><strong>{}</strong><span><vl-i18n key="share.active_links"/></span></div></section><section class="vl-panel"><div class="vl-browser-head"><div>{}<p class="vl-muted"><vl-i18n key="files.relative_path"/>: /{}</p></div><div class="vl-inline-actions">{}{}{}<a class="vl-button" href="/admin/shares/new?path={}"><vl-i18n key="share.current_folder"/></a></div></div><form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><input type="hidden" name="sort" value="{}"><input type="hidden" name="direction" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="files.browse"/></span><input name="q" value="{}" placeholder="<vl-i18n key="files.search_placeholder"/>"></label><button class="vl-button"><vl-i18n key="common.search"/></button></form><div class="vl-table-wrap"><table class="vl-data-table"><thead><tr>{}{}{}{}<th><vl-i18n key="common.action"/></th></tr></thead><tbody>{}</tbody></table></div><nav class="vl-pagination" aria-label="<vl-i18n key="files.pages_aria"/>">{} {}</nav><p class="vl-muted"><vl-i18n key="files.entries_page"/></p></section><div class="vl-selection-bar" data-selection-bar hidden><span data-selection-name><vl-i18n key="share.one_selected"/></span><a class="vl-button" data-selection-share href="/admin/shares/new"><vl-i18n key="share.selection"/></a></div>"#,
         esc(&used_storage),
         esc(&free_storage),
         active_links,
@@ -987,7 +1140,13 @@ pub(super) async fn admin_browser(
         upload_form,
         current_folder_target,
         esc(&rel),
+        file_sort_column_value(sort_column),
+        file_sort_direction_value(sort_direction),
         esc(search_value),
+        name_header,
+        type_header,
+        size_header,
+        modified_header,
         rows,
         previous,
         next,
@@ -1000,6 +1159,80 @@ pub(super) async fn admin_browser(
         false,
         &s.csrf_token,
     )))
+}
+
+pub(super) async fn admin_download(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    Query(q): Query<ShareQuery>,
+) -> Result<Response> {
+    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let raw = q
+        .path
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
+    let relative = path_security::validate_relative(&raw)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Dateipfad"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let secure_root = state.secure_root.clone();
+    let open_path = relative.clone();
+    let (file, length) = tokio::task::spawn_blocking(move || {
+        let file = secure_root.open_file(&open_path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok::<_, std::io::Error>((file, metadata.len()))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::InvalidInput => AppError(StatusCode::BAD_REQUEST, "Keine Datei"),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar")
+        }
+        _ => internal(error),
+    })?;
+    audit_observation(
+        &state,
+        session.username,
+        "admin_download",
+        Some(relative.clone()),
+        None,
+    )
+    .await;
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from_stream(ReaderStream::new(tokio::fs::File::from_std(file)))
+    };
+    let mut response = Response::new(body);
+    let name = Path::new(&relative)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{}", encoded(name)))
+            .map_err(internal)?,
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&length.to_string()).map_err(internal)?,
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
 }
 
 pub(super) async fn admin_preview(

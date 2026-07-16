@@ -1,6 +1,6 @@
 use super::{
     insert_required_audits, trace_required_audits, AuditClientIpDeletionOutcome, AuditContext,
-    AuditEvent, Database, RequiredAuditEvent, MAX_AUDIT_ROWS,
+    AuditEvent, AuditSortColumn, AuditSortDirection, Database, RequiredAuditEvent, MAX_AUDIT_ROWS,
 };
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -162,11 +162,44 @@ impl Database {
         limit: usize,
         offset: usize,
     ) -> rusqlite::Result<Vec<AuditEvent>> {
+        self.list_audit_sorted(
+            action,
+            limit,
+            offset,
+            AuditSortColumn::Time,
+            AuditSortDirection::Descending,
+        )
+    }
+
+    pub fn list_audit_sorted(
+        &self,
+        action: Option<&str>,
+        limit: usize,
+        offset: usize,
+        column: AuditSortColumn,
+        direction: AuditSortDirection,
+    ) -> rusqlite::Result<Vec<AuditEvent>> {
         let connection = self.try_conn()?;
+        let column = match column {
+            AuditSortColumn::Time => "occurred_at",
+            AuditSortColumn::Actor => "actor COLLATE NOCASE",
+            AuditSortColumn::Action => "action COLLATE NOCASE",
+            AuditSortColumn::Object => "COALESCE(object_id, '') COLLATE NOCASE",
+            AuditSortColumn::Detail => "COALESCE(detail, '') COLLATE NOCASE",
+            AuditSortColumn::ClientIp => "COALESCE(client_ip, '') COLLATE NOCASE",
+        };
+        let direction = match direction {
+            AuditSortDirection::Ascending => "ASC",
+            AuditSortDirection::Descending => "DESC",
+        };
         if let Some(action) = action {
-            let mut statement = connection.prepare(
-                "SELECT occurred_at,actor,action,object_id,detail,client_ip FROM audit WHERE action=?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
-            )?;
+            let query = format!(
+                "SELECT occurred_at,actor,action,object_id,detail,client_ip
+                 FROM audit WHERE action=?1
+                 ORDER BY {column} {direction},id {direction}
+                 LIMIT ?2 OFFSET ?3"
+            );
+            let mut statement = connection.prepare(&query)?;
             let events = statement
                 .query_map(params![action, limit as i64, offset as i64], |row| {
                     Ok(AuditEvent {
@@ -181,9 +214,13 @@ impl Database {
                 .collect();
             events
         } else {
-            let mut statement = connection.prepare(
-                "SELECT occurred_at,actor,action,object_id,detail,client_ip FROM audit ORDER BY id DESC LIMIT ?1 OFFSET ?2",
-            )?;
+            let query = format!(
+                "SELECT occurred_at,actor,action,object_id,detail,client_ip
+                 FROM audit
+                 ORDER BY {column} {direction},id {direction}
+                 LIMIT ?1 OFFSET ?2"
+            );
+            let mut statement = connection.prepare(&query)?;
             let events = statement
                 .query_map(params![limit as i64, offset as i64], |row| {
                     Ok(AuditEvent {

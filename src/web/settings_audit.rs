@@ -12,7 +12,9 @@ use super::{
 };
 use crate::{
     config::MAX_TEXT_PREVIEW_SIZE,
-    db::{AuditClientIpDeletionOutcome, AuditContext, Session},
+    db::{
+        AuditClientIpDeletionOutcome, AuditContext, AuditSortColumn, AuditSortDirection, Session,
+    },
     http_auth::{
         commit_runtime_settings, csrf, database, enabled_audit_client_ip, required_database,
         runtime_settings, session, MissingSession,
@@ -62,6 +64,12 @@ pub(super) async fn settings_page(
     )))
 }
 
+fn field_info_label(label: &str, help_key: &str, tooltip_id: &str) -> String {
+    format!(
+        r#"<span class="vl-field-label">{label}<span class="vl-field-info" role="button" tabindex="0" aria-label='<vl-i18n key="setup.field_info"/>' aria-describedby="{tooltip_id}"><span aria-hidden="true">i</span><span class="vl-field-tooltip" id="{tooltip_id}" role="tooltip"><vl-i18n key="{help_key}"/></span></span></span>"#
+    )
+}
+
 pub(super) fn settings_form(
     session: &Session,
     settings: &RuntimeSettings,
@@ -95,8 +103,88 @@ pub(super) fn settings_form(
     } else {
         ""
     };
+    let public_base_url_label = field_info_label(
+        "Public Base URL",
+        "settings.public_base_url_help",
+        "settings-help-public-base-url",
+    );
+    let upload_limit_label = field_info_label(
+        r#"<vl-i18n key="settings.upload_limit"/>"#,
+        "settings.upload_limit_help",
+        "settings-help-upload-limit",
+    );
+    let blocked_extensions_label = field_info_label(
+        r#"<vl-i18n key="settings.blocked"/>"#,
+        "settings.blocked_help",
+        "settings-help-blocked-extensions",
+    );
+    let password_min_label = field_info_label(
+        r#"<vl-i18n key="settings.password_min"/>"#,
+        "settings.password_min_help",
+        "settings-help-password-min",
+    );
+    let password_max_label = field_info_label(
+        r#"<vl-i18n key="settings.password_max"/>"#,
+        "settings.password_max_help",
+        "settings-help-password-max",
+    );
+    let unlock_minutes_label = field_info_label(
+        r#"<vl-i18n key="settings.unlock_minutes"/>"#,
+        "settings.unlock_minutes_help",
+        "settings-help-unlock-minutes",
+    );
+    let zip_gb_label = field_info_label(
+        r#"<vl-i18n key="settings.zip_gb"/>"#,
+        "settings.zip_gb_help",
+        "settings-help-zip-gb",
+    );
+    let zip_files_label = field_info_label(
+        r#"<vl-i18n key="settings.zip_files"/>"#,
+        "settings.zip_files_help",
+        "settings-help-zip-files",
+    );
+    let search_entries_label = field_info_label(
+        r#"<vl-i18n key="settings.search_entries"/>"#,
+        "settings.search_entries_help",
+        "settings-help-search-entries",
+    );
+    let search_results_label = field_info_label(
+        r#"<vl-i18n key="settings.search_results"/>"#,
+        "settings.search_results_help",
+        "settings-help-search-results",
+    );
+    let text_preview_label = field_info_label(
+        r#"<vl-i18n key="settings.text_preview"/>"#,
+        "settings.text_preview_help",
+        "settings-help-text-preview",
+    );
+    let text_extensions_label = field_info_label(
+        r#"<vl-i18n key="settings.text_extensions"/>"#,
+        "settings.text_extensions_help",
+        "settings-help-text-extensions",
+    );
+    let media_preview_label = field_info_label(
+        r#"<vl-i18n key="settings.media_preview"/>"#,
+        "settings.media_preview_help",
+        "settings-help-media-preview",
+    );
+    let image_extensions_label = field_info_label(
+        r#"<vl-i18n key="settings.image_extensions"/>"#,
+        "settings.image_extensions_help",
+        "settings-help-image-extensions",
+    );
+    let pdf_preview_label = field_info_label(
+        r#"<vl-i18n key="settings.pdf_active"/>"#,
+        "settings.pdf_help",
+        "settings-help-pdf-preview",
+    );
+    let audit_ip_label = field_info_label(
+        r#"<vl-i18n key="settings.audit_ip"/>"#,
+        "settings.audit_ip_help",
+        "settings-help-audit-ip",
+    );
     format!(
-        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="vl-form-grid"><input type="hidden" name="csrf" value="{}"><label>Public Base URL<br><input name="public_base_url" value="{}" {} required><small>{}</small></label><label><vl-i18n key="settings.upload_limit"/><br><input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.blocked"/><br><input name="blocked_extensions" value="{}"></label><label><vl-i18n key="settings.password_min"/><br><input name="share_password_min_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.password_max"/><br><input name="share_password_max_length" type="number" min="8" value="{}" required></label><label><vl-i18n key="settings.unlock_minutes"/><br><input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.zip_gb"/><br><input name="max_zip_size_gb" type="number" min="0" step="1" value="{}" required></label><label><vl-i18n key="settings.zip_files"/><br><input name="max_zip_files" type="number" min="0" value="{}" required></label><label><vl-i18n key="settings.search_entries"/><br><input name="max_search_entries" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.search_results"/><br><input name="max_search_results" type="number" min="1" value="{}" required></label><label><vl-i18n key="settings.text_preview"/><br><input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.text_extensions"/><br><input name="preview_extensions" value="{}" required></label><label><vl-i18n key="settings.media_preview"/><br><input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label><vl-i18n key="settings.image_extensions"/><br><input name="image_preview_extensions" value="{}"></label><label class="vl-toggle"><input type="checkbox" name="pdf_preview_enabled" {}><span><vl-i18n key="settings.pdf_active"/><small><vl-i18n key="settings.pdf_help"/></small></span></label><label class="vl-toggle"><input type="checkbox" name="audit_client_ip_enabled" {}><span><vl-i18n key="settings.audit_ip"/><small><vl-i18n key="settings.audit_ip_help"/></small></span></label><button class="vl-button"><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
+        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="vl-form-grid"><input type="hidden" name="csrf" value="{}"><label>{public_base_url_label}<input name="public_base_url" value="{}" {} required><small>{}</small></label><label>{upload_limit_label}<input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label>{blocked_extensions_label}<input name="blocked_extensions" value="{}"></label><label>{password_min_label}<input name="share_password_min_length" type="number" min="8" value="{}" required></label><label>{password_max_label}<input name="share_password_max_length" type="number" min="8" value="{}" required></label><label>{unlock_minutes_label}<input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label>{zip_gb_label}<input name="max_zip_size_gb" type="number" min="0" step="1" value="{}" required></label><label>{zip_files_label}<input name="max_zip_files" type="number" min="0" value="{}" required></label><label>{search_entries_label}<input name="max_search_entries" type="number" min="1" value="{}" required></label><label>{search_results_label}<input name="max_search_results" type="number" min="1" value="{}" required></label><label>{text_preview_label}<input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>{text_extensions_label}<input name="preview_extensions" value="{}" required></label><label>{media_preview_label}<input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>{image_extensions_label}<input name="image_preview_extensions" value="{}"></label><label class="vl-toggle"><input type="checkbox" name="pdf_preview_enabled" {}><span>{pdf_preview_label}</span></label><label class="vl-toggle"><input type="checkbox" name="audit_client_ip_enabled" {}><span>{audit_ip_label}</span></label><button class="vl-button"><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
         esc(&session.csrf_token),
         esc(&settings.public_base_url),
         public_url_attributes,
@@ -309,10 +397,119 @@ pub(super) async fn delete_audit_ips_ui(
     Ok(Redirect::to("/admin/settings"))
 }
 
+fn audit_sort_column(value: Option<&str>) -> AuditSortColumn {
+    match value {
+        Some("user") => AuditSortColumn::Actor,
+        Some("action") => AuditSortColumn::Action,
+        Some("object") => AuditSortColumn::Object,
+        Some("detail") => AuditSortColumn::Detail,
+        Some("client_ip") => AuditSortColumn::ClientIp,
+        _ => AuditSortColumn::Time,
+    }
+}
+
+fn audit_sort_column_value(column: AuditSortColumn) -> &'static str {
+    match column {
+        AuditSortColumn::Time => "time",
+        AuditSortColumn::Actor => "user",
+        AuditSortColumn::Action => "action",
+        AuditSortColumn::Object => "object",
+        AuditSortColumn::Detail => "detail",
+        AuditSortColumn::ClientIp => "client_ip",
+    }
+}
+
+fn default_audit_sort_direction(column: AuditSortColumn) -> AuditSortDirection {
+    if column == AuditSortColumn::Time {
+        AuditSortDirection::Descending
+    } else {
+        AuditSortDirection::Ascending
+    }
+}
+
+fn audit_sort_direction(value: Option<&str>, column: AuditSortColumn) -> AuditSortDirection {
+    match value {
+        Some("asc") => AuditSortDirection::Ascending,
+        Some("desc") => AuditSortDirection::Descending,
+        _ => default_audit_sort_direction(column),
+    }
+}
+
+fn audit_sort_direction_value(direction: AuditSortDirection) -> &'static str {
+    match direction {
+        AuditSortDirection::Ascending => "asc",
+        AuditSortDirection::Descending => "desc",
+    }
+}
+
+fn toggled_audit_sort_direction(direction: AuditSortDirection) -> AuditSortDirection {
+    match direction {
+        AuditSortDirection::Ascending => AuditSortDirection::Descending,
+        AuditSortDirection::Descending => AuditSortDirection::Ascending,
+    }
+}
+
+fn audit_page_href(
+    action: &str,
+    column: AuditSortColumn,
+    direction: AuditSortDirection,
+    page: usize,
+) -> String {
+    let action = percent_encoding::utf8_percent_encode(action, percent_encoding::NON_ALPHANUMERIC);
+    format!(
+        "/admin/audit?action={action}&sort={}&direction={}&page={page}",
+        audit_sort_column_value(column),
+        audit_sort_direction_value(direction),
+    )
+}
+
+fn audit_sort_header(
+    class_name: &str,
+    label: &str,
+    column: AuditSortColumn,
+    current_column: AuditSortColumn,
+    current_direction: AuditSortDirection,
+    action: &str,
+) -> String {
+    let active = column == current_column;
+    let direction = if active {
+        current_direction
+    } else {
+        default_audit_sort_direction(column)
+    };
+    let next_direction = if active {
+        toggled_audit_sort_direction(direction)
+    } else {
+        direction
+    };
+    let aria_sort = if active {
+        match direction {
+            AuditSortDirection::Ascending => "ascending",
+            AuditSortDirection::Descending => "descending",
+        }
+    } else {
+        "none"
+    };
+    let indicator = if active {
+        match direction {
+            AuditSortDirection::Ascending => "↑",
+            AuditSortDirection::Descending => "↓",
+        }
+    } else {
+        ""
+    };
+    let href = esc(&audit_page_href(action, column, next_direction, 0));
+    format!(
+        r#"<th class="{class_name}" aria-sort="{aria_sort}"><a class="vl-audit-sort" href="{href}">{label}<span class="vl-audit-sort__indicator" aria-hidden="true">{indicator}</span></a></th>"#
+    )
+}
+
 #[derive(Default, Deserialize)]
 pub(super) struct AuditQuery {
     page: Option<usize>,
     action: Option<String>,
+    sort: Option<String>,
+    direction: Option<String>,
 }
 
 pub(super) async fn audit_page(
@@ -324,6 +521,8 @@ pub(super) async fn audit_page(
     let settings = runtime_settings(&state);
     let client_ip_enabled = settings.audit_client_ip_enabled;
     let requested_page = query.page.unwrap_or(0).min(1_000_000);
+    let sort_column = audit_sort_column(query.sort.as_deref());
+    let sort_direction = audit_sort_direction(query.direction.as_deref(), sort_column);
     let action = query
         .action
         .filter(|value| !value.trim().is_empty())
@@ -333,7 +532,13 @@ pub(super) async fn audit_page(
         let total = db.count_audit(action_for_db.as_deref())?;
         let total_pages = total.div_ceil(100).max(1);
         let page_number = requested_page.min(total_pages - 1);
-        let events = db.list_audit(action_for_db.as_deref(), 100, page_number * 100)?;
+        let events = db.list_audit_sorted(
+            action_for_db.as_deref(),
+            100,
+            page_number * 100,
+            sort_column,
+            sort_direction,
+        )?;
         Ok((events, total, page_number))
     })
     .await?;
@@ -359,36 +564,96 @@ pub(super) async fn audit_page(
         );
     }
     let filter_value = action.as_deref().unwrap_or("");
-    let encoded_filter =
-        percent_encoding::utf8_percent_encode(filter_value, percent_encoding::NON_ALPHANUMERIC);
     let previous = if page_number > 0 {
+        let href = esc(&audit_page_href(
+            filter_value,
+            sort_column,
+            sort_direction,
+            page_number - 1,
+        ));
         format!(
-            r#"<a class="vl-button vl-button--ghost" href="/admin/audit?action={encoded_filter}&page={}"><vl-i18n key="common.back"/></a>"#,
-            page_number - 1
+            r#"<a class="vl-button vl-button--ghost" href="{href}"><vl-i18n key="common.back"/></a>"#
         )
     } else {
         String::new()
     };
     let next = if has_next {
+        let href = esc(&audit_page_href(
+            filter_value,
+            sort_column,
+            sort_direction,
+            page_number + 1,
+        ));
         format!(
-            r#"<a class="vl-button vl-button--ghost" href="/admin/audit?action={encoded_filter}&page={}"><vl-i18n key="common.continue"/></a>"#,
-            page_number + 1
+            r#"<a class="vl-button vl-button--ghost" href="{href}"><vl-i18n key="common.continue"/></a>"#
         )
     } else {
         String::new()
     };
     let ip_header = if client_ip_enabled {
-        "<th class=\"vl-audit-ip\">Client-IP</th>"
+        audit_sort_header(
+            "vl-audit-ip",
+            "Client-IP",
+            AuditSortColumn::ClientIp,
+            sort_column,
+            sort_direction,
+            filter_value,
+        )
     } else {
-        ""
+        String::new()
     };
+    let table_header = format!(
+        "{}{}{}{}{}{ip_header}",
+        audit_sort_header(
+            "vl-audit-time",
+            r#"<vl-i18n key="common.time"/>"#,
+            AuditSortColumn::Time,
+            sort_column,
+            sort_direction,
+            filter_value,
+        ),
+        audit_sort_header(
+            "vl-audit-user",
+            "User",
+            AuditSortColumn::Actor,
+            sort_column,
+            sort_direction,
+            filter_value,
+        ),
+        audit_sort_header(
+            "vl-audit-action",
+            r#"<vl-i18n key="common.action"/>"#,
+            AuditSortColumn::Action,
+            sort_column,
+            sort_direction,
+            filter_value,
+        ),
+        audit_sort_header(
+            "vl-audit-object",
+            r#"<vl-i18n key="common.object"/>"#,
+            AuditSortColumn::Object,
+            sort_column,
+            sort_direction,
+            filter_value,
+        ),
+        audit_sort_header(
+            "vl-audit-detail",
+            r#"<vl-i18n key="common.detail"/>"#,
+            AuditSortColumn::Detail,
+            sort_column,
+            sort_direction,
+            filter_value,
+        ),
+    );
+    let sort_value = audit_sort_column_value(sort_column);
+    let direction_value = audit_sort_direction_value(sort_direction);
     let url_scheme = url::Url::parse(&settings.public_base_url)
         .ok()
         .map(|url| url.scheme().to_uppercase())
         .unwrap_or_else(|| i18n::text(i18n::current_locale(), i18n::UNKNOWN).into());
     let trusted_proxy_count = state.config.reverse_proxy.trusted_proxies.len();
     let body = format!(
-        r#"<div class="vl-audit-layout"><section class="vl-panel"><div class="vl-panel-head"><div><p class="vl-eyebrow"><vl-i18n key="audit.traceability"/></p><h2><vl-i18n key="audit.events"/></h2></div><form method="get" class="vl-inline-actions"><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="audit.action_filter"/></span><input name="action" value="{}" placeholder="<vl-i18n key="audit.filter_action"/>"></label><button class="vl-button"><vl-i18n key="common.filter"/></button></form></div><div class="vl-table-wrap"><table class="vl-data-table vl-audit-table"><thead><tr><th class="vl-audit-time"><vl-i18n key="common.time"/></th><th class="vl-audit-user">User</th><th class="vl-audit-action"><vl-i18n key="common.action"/></th><th class="vl-audit-object"><vl-i18n key="common.object"/></th><th class="vl-audit-detail"><vl-i18n key="common.detail"/></th>{ip_header}</tr></thead><tbody>{rows}</tbody></table></div><nav class="vl-pagination" aria-label="<vl-i18n key="audit.pages"/>">{previous}<span><vl-i18n key="common.page_of"/> {} <vl-i18n key="common.of"/> {}</span>{next}</nav></section><aside class="vl-panel vl-security-facts"><p class="vl-eyebrow"><vl-i18n key="audit.security_status"/></p><h2><vl-i18n key="audit.proven_config"/></h2><dl><div><dt>MFA</dt><dd><vl-i18n key="audit.mfa_required"/></dd></div><div><dt><vl-i18n key="audit.server_mode"/></dt><dd>{:?}</dd></div><div><dt><vl-i18n key="audit.url_scheme"/></dt><dd>{}</dd></div><div><dt>Trusted Proxies</dt><dd>{}</dd></div><div><dt><vl-i18n key="audit.ip_capture"/></dt><dd>{}</dd></div><div><dt><vl-i18n key="audit.logging"/></dt><dd><vl-i18n key="audit.structured"/></dd></div></dl></aside></div>"#,
+        r#"<div class="vl-audit-layout"><section class="vl-panel"><div class="vl-panel-head"><div><p class="vl-eyebrow"><vl-i18n key="audit.traceability"/></p><h2><vl-i18n key="audit.events"/></h2></div><form method="get" class="vl-inline-actions"><input type="hidden" name="sort" value="{sort_value}"><input type="hidden" name="direction" value="{direction_value}"><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="audit.action_filter"/></span><input name="action" value="{}" placeholder="<vl-i18n key="audit.filter_action"/>"></label><button class="vl-button"><vl-i18n key="common.filter"/></button></form></div><div class="vl-table-wrap"><table class="vl-data-table vl-audit-table"><thead><tr>{table_header}</tr></thead><tbody>{rows}</tbody></table></div><nav class="vl-pagination" aria-label="<vl-i18n key="audit.pages"/>">{previous}<span><vl-i18n key="common.page_of"/> {} <vl-i18n key="common.of"/> {}</span>{next}</nav></section><aside class="vl-panel vl-security-facts"><p class="vl-eyebrow"><vl-i18n key="audit.security_status"/></p><h2><vl-i18n key="audit.proven_config"/></h2><dl><div><dt>MFA</dt><dd><vl-i18n key="audit.mfa_required"/></dd></div><div><dt><vl-i18n key="audit.server_mode"/></dt><dd>{:?}</dd></div><div><dt><vl-i18n key="audit.url_scheme"/></dt><dd>{}</dd></div><div><dt>Trusted Proxies</dt><dd>{}</dd></div><div><dt><vl-i18n key="audit.ip_capture"/></dt><dd>{}</dd></div><div><dt><vl-i18n key="audit.logging"/></dt><dd><vl-i18n key="audit.structured"/></dd></div></dl></aside></div>"#,
         esc(filter_value),
         page_number + 1,
         total_pages,
