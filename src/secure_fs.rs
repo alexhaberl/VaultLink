@@ -812,6 +812,39 @@ impl SecureRoot {
 }
 
 impl SecureDirectory {
+    /// Creates every missing directory component below this descriptor-bound
+    /// scope. Existing directories are accepted, while files and symlinks fail
+    /// closed when the capability is narrowed to the next component.
+    pub fn ensure_directory_tree(&self, relative: &str) -> io::Result<Vec<String>> {
+        let relative = path_security::validate_relative(relative)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory path"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut current = self.clone();
+        let mut current_path = String::new();
+        let mut created = Vec::new();
+        for component in relative
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            path_security::safe_admin_filename(component).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name")
+            })?;
+            match current.create_directory(component) {
+                Ok(()) => {
+                    current_path = join_relative(&current_path, component);
+                    created.push(current_path.clone());
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    current_path = join_relative(&current_path, component);
+                }
+                Err(error) => return Err(error),
+            }
+            current = current.bind_directory(component)?;
+        }
+        Ok(created)
+    }
+
     fn create_directory(&self, name: &str) -> io::Result<()> {
         path_security::safe_admin_filename(name)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
@@ -983,6 +1016,30 @@ mod tests {
             }
         }
         assert!(root.list("", 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn directory_tree_creation_is_descriptor_bound_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let scope = root.bind_directory("").unwrap();
+        assert_eq!(
+            scope.ensure_directory_tree("album/2026/summer").unwrap(),
+            ["album", "album/2026", "album/2026/summer"]
+        );
+        assert!(scope
+            .ensure_directory_tree("album/2026/summer")
+            .unwrap()
+            .is_empty());
+        std::fs::write(directory.path().join("file"), b"content").unwrap();
+        assert!(scope.ensure_directory_tree("file/child").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), directory.path().join("escape")).unwrap();
+            assert!(scope.ensure_directory_tree("escape/child").is_err());
+            assert!(!outside.path().join("child").exists());
+        }
     }
 
     #[test]

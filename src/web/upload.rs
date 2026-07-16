@@ -521,6 +521,59 @@ struct PublicUploadAdmission {
     _peer: ClientActivityPermit,
 }
 
+async fn ensure_public_upload_directory(
+    state: &AppState,
+    token: &str,
+    expected_share_id: i64,
+    base: &str,
+    relative: &str,
+) -> Result<String> {
+    let relative = crate::path_security::validate_relative(relative)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if relative.is_empty() {
+        return Ok(base.to_string());
+    }
+    let target = join_display(base, &relative);
+    let (share, guard) = get_storage_share(state, token, expected_share_id).await?;
+    if !share.is_directory || !share.permission.can_upload() {
+        return Err(AppError(StatusCode::GONE, "Freigabe wurde geändert"));
+    }
+    let secure_root = state.secure_root.clone();
+    let share_path = share.relative_path;
+    let tree = target.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        secure_root
+            .bind_directory(&share_path)?
+            .ensure_directory_tree(&tree)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::InvalidInput => {
+            AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad")
+        }
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => AppError(
+            StatusCode::CONFLICT,
+            "Uploadordner konnte nicht erstellt werden",
+        ),
+        _ => internal(error),
+    })?;
+    if !created.is_empty() {
+        audit_observation(
+            state,
+            "public".into(),
+            "upload_directories_created",
+            Some(expected_share_id.to_string()),
+            Some(format!("path={target};created={}", created.len())),
+        )
+        .await;
+    }
+    Ok(target)
+}
+
 struct PublicUploadFinalizer {
     state: AppState,
     token: String,
@@ -802,6 +855,7 @@ impl PublicUploadFormPhase<'_> {
             csrf_header_valid,
         } = self;
         let mut upload_subdir = String::new();
+        let mut folder_path: Option<String> = None;
         let mut overwrite_requested = false;
         let mut form_state = UploadFormState::default();
         let mut csrf_validated = required_csrf.is_none() || csrf_header_valid;
@@ -817,6 +871,7 @@ impl PublicUploadFormPhase<'_> {
         })? {
             let field_kind = match field.name().unwrap_or("") {
                 "path" => UploadFormField::Path,
+                "folder_path" => UploadFormField::FolderPath,
                 "overwrite_existing" => UploadFormField::Overwrite,
                 "csrf" => UploadFormField::Csrf,
                 "file" => UploadFormField::File,
@@ -827,6 +882,9 @@ impl PublicUploadFormPhase<'_> {
                     UploadFormStateError::TooManyFields => "Zu viele Multipart-Felder",
                     UploadFormStateError::DuplicateOrLatePath => {
                         "Uploadpfad wurde mehrfach oder zu spät übermittelt"
+                    }
+                    UploadFormStateError::DuplicateOrLateFolderPath => {
+                        "Ordnerpfad wurde mehrfach oder zu spät übermittelt"
                     }
                     UploadFormStateError::DuplicateOverwrite => {
                         "Uploadoption wurde mehrfach übermittelt"
@@ -869,6 +927,30 @@ impl PublicUploadFormPhase<'_> {
                                     "Ungültiger Uploadpfad",
                                 )
                             })?;
+                }
+                UploadFormField::FolderPath => {
+                    let value = limited_multipart_text(field, MAX_UPLOAD_PATH_FIELD_BYTES)
+                        .await
+                        .map_err(|_| {
+                            public_upload_rejection(
+                                token,
+                                &upload_subdir,
+                                StatusCode::BAD_REQUEST,
+                                "Ungültiger Ordnerpfad",
+                            )
+                        })?;
+                    let value = crate::path_security::validate_relative(&value)
+                        .map_err(|_| {
+                            public_upload_rejection(
+                                token,
+                                &upload_subdir,
+                                StatusCode::BAD_REQUEST,
+                                "Ungültiger Ordnerpfad",
+                            )
+                        })?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    folder_path = Some(value);
                 }
                 UploadFormField::Overwrite => {
                     let value = limited_multipart_text(field, MAX_UPLOAD_OPTION_FIELD_BYTES)
@@ -950,6 +1032,17 @@ impl PublicUploadFormPhase<'_> {
                             ));
                         }
                     };
+                    if let Some(folder_path) = folder_path.as_deref() {
+                        upload_subdir = ensure_public_upload_directory(
+                            state,
+                            token,
+                            share.id,
+                            &upload_subdir,
+                            folder_path,
+                        )
+                        .await
+                        .map_err(PublicUploadPhaseError::App)?;
+                    }
                     let target = PublicUploadTarget {
                         share_id: share.id,
                         upload_policy_epoch: share.upload_policy_epoch,

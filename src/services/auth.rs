@@ -109,6 +109,9 @@ impl AuthService {
         if admin.id != command.admin_id {
             return Ok(TotpLoginOutcome::InvalidCode);
         }
+        if !admin.totp_enabled {
+            return Ok(TotpLoginOutcome::InvalidCode);
+        }
         let Some(step) = auth::matching_totp_step_now(
             admin.totp_secret.expose_secret(),
             command.code.expose_secret(),

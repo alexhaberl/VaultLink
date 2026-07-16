@@ -20,6 +20,7 @@ const OVERFLOW_BUCKETS: usize = 256;
 const GLOBAL_CLEANUP_INTERVAL: u64 = 64;
 
 pub const ADMIN_PASSWORD_MIN_CHARACTERS: usize = 14;
+pub const ADMIN_PASSWORD_MAX_CHARACTERS: usize = 256;
 pub const MAX_PASSWORD_BYTES: usize = 1_024;
 
 /// Compares authentication tokens without leaking the first differing byte.
@@ -81,7 +82,8 @@ pub fn valid_admin_username(username: &str) -> bool {
 }
 
 pub fn valid_admin_password(password: &str) -> bool {
-    password.chars().count() >= ADMIN_PASSWORD_MIN_CHARACTERS
+    (ADMIN_PASSWORD_MIN_CHARACTERS..=ADMIN_PASSWORD_MAX_CHARACTERS)
+        .contains(&password.chars().count())
         && password.len() <= MAX_PASSWORD_BYTES
 }
 
@@ -437,8 +439,15 @@ mod tests {
         assert!(valid_admin_password(
             &"ä".repeat(ADMIN_PASSWORD_MIN_CHARACTERS)
         ));
-        assert!(valid_admin_password(&"x".repeat(MAX_PASSWORD_BYTES)));
-        assert!(!valid_admin_password(&"x".repeat(MAX_PASSWORD_BYTES + 1)));
+        assert!(valid_admin_password(
+            &"x".repeat(ADMIN_PASSWORD_MAX_CHARACTERS)
+        ));
+        assert!(!valid_admin_password(
+            &"x".repeat(ADMIN_PASSWORD_MAX_CHARACTERS + 1)
+        ));
+        assert!(valid_admin_password(
+            &"🔑".repeat(ADMIN_PASSWORD_MAX_CHARACTERS)
+        ));
     }
 
     #[test]

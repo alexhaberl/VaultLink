@@ -117,6 +117,7 @@ pub const STYLESHEET: &str = r#"
       radial-gradient(circle at 12% -10%, rgba(90, 167, 255, 0.2), transparent 30rem),
       radial-gradient(circle at 88% 0%, rgba(124, 92, 255, 0.16), transparent 28rem),
       linear-gradient(135deg, var(--vl-canvas), var(--vl-canvas-alt) 62%, #080d1b);
+    background-attachment: fixed;
     color: var(--vl-text);
     font-family: var(--vl-font-sans);
     font-size: var(--vl-text-md);
@@ -951,8 +952,11 @@ pub const STYLESHEET: &str = r#"
     .vl-audit-table .vl-audit-action { width: 10rem; }
     .vl-audit-table .vl-audit-object { width: 11rem; overflow-wrap: anywhere; word-break: break-word; }
     .vl-audit-table .vl-audit-ip { width: 8rem; overflow-wrap: anywhere; }
-    .vl-audit-table .vl-audit-action code { display: inline-block; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
-    .vl-audit-table .vl-audit-detail { overflow-wrap: anywhere; word-break: break-word; }
+  .vl-audit-table .vl-audit-action code { display: inline-block; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+  .vl-audit-table .vl-audit-detail { overflow-wrap: anywhere; word-break: break-word; }
+  .vl-audit-sort { display: flex; gap: var(--vl-space-2); align-items: center; color: inherit; text-decoration: none; }
+  .vl-audit-sort:hover { color: var(--vl-accent-strong); }
+  .vl-audit-sort__indicator { min-width: 1em; color: var(--vl-accent-strong); text-align: center; }
   }
 
   .vl-file-select { display: block; color: var(--vl-text); font-weight: 650; cursor: pointer; }
@@ -1052,6 +1056,19 @@ pub const STYLESHEET: &str = r#"
     gap: var(--vl-space-4); align-items: center; padding: var(--vl-space-4); border-bottom: 1px solid var(--vl-border);
   }
   .vl-share-row:last-child { border-bottom: 0; }
+  .vl-security-key-row {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--vl-space-4);
+    padding: var(--vl-space-4);
+    border: 1px solid var(--vl-border);
+    border-radius: var(--vl-radius-lg);
+    background: rgba(255,255,255,.025);
+  }
+  .vl-security-key-row > div:first-child { display: grid; min-width: 0; gap: var(--vl-space-1); }
+  .vl-security-key-row > div:first-child small { overflow-wrap: anywhere; }
   .vl-share-identity, .vl-share-url, .vl-share-badges, .vl-share-quota { min-width: 0; }
   .vl-share-identity { display: flex; gap: var(--vl-space-3); align-items: center; }
   .vl-share-identity > div, .vl-share-quota { display: grid; gap: var(--vl-space-1); }
@@ -1097,8 +1114,17 @@ pub const STYLESHEET: &str = r#"
   .vl-app-shell { display: grid; grid-template-columns: 15.5rem minmax(0,1fr); min-height: 100vh; }
   .vl-sidebar { position: sticky; top: 0; display: flex; height: 100vh; flex-direction: column; gap: var(--vl-space-6); padding: var(--vl-space-8) var(--vl-space-5) var(--vl-space-5); border-right: 1px solid rgba(255,255,255,.08); background: rgba(7,15,29,.96); }
   .vl-nav { display: grid; gap: var(--vl-space-1); }
-  .vl-nav-link { display: flex; min-height: var(--vl-control-height); align-items: center; gap: var(--vl-space-3); padding: var(--vl-space-3); border: 1px solid transparent; border-radius: var(--vl-radius-md); color: var(--vl-text-soft) !important; text-decoration: none; }
-  .vl-nav-link:hover, .vl-nav-link[aria-current="page"] { border-color: rgba(90,167,255,.34); background: rgba(90,167,255,.11); color: var(--vl-accent) !important; }
+  .vl-nav-link {
+    display: flex; width: 100%; min-height: var(--vl-control-height); align-items: center; gap: var(--vl-space-3);
+    padding: var(--vl-space-3) var(--vl-space-4); border: 0; border-left: 3px solid transparent;
+    border-radius: 0 var(--vl-radius-md) var(--vl-radius-md) 0; background: transparent;
+    color: var(--vl-text-soft) !important; font-weight: 600; text-decoration: none;
+    transition: background-color var(--vl-motion-fast) ease, color var(--vl-motion-fast) ease;
+  }
+  .vl-nav-link:hover { background: rgba(90,167,255,.065); color: var(--vl-text) !important; }
+  .vl-nav-link[aria-current="page"] { border-left-color: #78bdff; background: rgba(22,81,124,.42); color: #79bdff !important; font-weight: 750; }
+  .vl-nav-link[aria-current="page"]:hover { background: rgba(26,93,141,.52); }
+  .vl-nav-link:focus-visible { outline: 3px solid var(--vl-focus); outline-offset: 2px; }
   .vl-system-card { display: grid; gap: var(--vl-space-2); margin-top: auto; padding: var(--vl-space-4); border: 1px solid rgba(85,214,154,.2); border-radius: var(--vl-radius-lg); background: rgba(85,214,154,.06); color: var(--vl-text-muted); font-size: var(--vl-text-sm); overflow-wrap: anywhere; }
   .vl-system-card strong { color: var(--vl-success); }
   .vl-content { min-width: 0; padding: var(--vl-space-8) var(--vl-space-6); }
@@ -1118,7 +1144,8 @@ pub const STYLESHEET: &str = r#"
     .vl-app-shell { display: block; }
     .vl-sidebar { position: relative; height: auto; gap: var(--vl-space-4); padding: var(--vl-space-6) var(--vl-space-4); border-right: 0; border-bottom: 1px solid var(--vl-border); }
     .vl-nav { display: flex; overflow-x: auto; }
-    .vl-nav-link { flex: 0 0 auto; }
+    .vl-nav-link { width: auto; flex: 0 0 auto; border-bottom: 3px solid transparent; border-left: 0; border-radius: var(--vl-radius-md) var(--vl-radius-md) 0 0; }
+    .vl-nav-link[aria-current="page"] { border-bottom-color: #78bdff; }
     .vl-system-card { display: none; }
     .vl-content { padding: var(--vl-space-6) var(--vl-space-4) var(--vl-space-4); }
     .vl-share-row { grid-template-columns: 1fr 1fr auto; }
@@ -1189,6 +1216,7 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
     if (!(form instanceof HTMLFormElement) || form.dataset.uploadQueueReady === "true") return;
 
     const input = form.querySelector("[data-upload-input]");
+    const folderInput = form.querySelector("[data-upload-folder-input]");
     const list = form.querySelector("[data-upload-list]");
     const dropzone = form.querySelector("[data-upload-dropzone]");
     const submit = form.querySelector("[data-upload-submit]");
@@ -1258,7 +1286,7 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
         const description = document.createElement("div");
         description.className = "vl-stack vl-stack--compact";
         const name = document.createElement("strong");
-        name.textContent = item.serverFile || item.file.name;
+        name.textContent = item.relativePath || item.serverFile || item.file.name;
         const meta = document.createElement("span");
         meta.className = "vl-muted";
         meta.textContent = `${formatBytes(item.file.size)} · ${item.message}`;
@@ -1284,9 +1312,16 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
     const addFiles = (fileList) => {
       const files = Array.from(fileList || []).filter((file) => file instanceof File);
       for (const file of files) {
+        const relativePath = typeof file.webkitRelativePath === "string"
+          ? file.webkitRelativePath.replace(/\\/g, "/").replace(/^\/+/, "")
+          : "";
+        const components = relativePath.split("/").filter(Boolean);
+        const relativeDirectory = components.length > 1 ? components.slice(0, -1).join("/") : "";
         items.push({
           id: ++sequence,
           file,
+          relativePath,
+          relativeDirectory,
           status: "ready",
           message: '<vl-i18n key="upload.ready"/>',
           serverFile: "",
@@ -1304,6 +1339,7 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
       for (const fileInput of form.querySelectorAll('input[type="file"][name]')) {
         data.delete(fileInput.name);
       }
+      if (item.relativeDirectory) data.append("folder_path", item.relativeDirectory);
       data.append(input.name, item.file, item.file.name);
       return data;
     };
@@ -1374,6 +1410,16 @@ pub const UPLOAD_QUEUE_JAVASCRIPT: &str = r#"
       addFiles(input.files);
       input.value = "";
     });
+    if (folderInput instanceof HTMLInputElement) {
+      if (!("webkitdirectory" in folderInput)) {
+        folderInput.closest("label")?.setAttribute("hidden", "");
+      } else {
+        folderInput.addEventListener("change", () => {
+          addFiles(folderInput.files);
+          folderInput.value = "";
+        });
+      }
+    }
 
     form.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -1605,7 +1651,10 @@ mod tests {
         }
         assert!(STYLESHEET.contains(":focus-visible"));
         assert!(STYLESHEET.contains("--vl-control-height: 2.75rem"));
+        assert!(STYLESHEET.contains("background-attachment: fixed"));
         assert!(STYLESHEET.contains("prefers-reduced-motion"));
+        assert!(STYLESHEET.contains(".vl-nav-link:hover"));
+        assert!(STYLESHEET.contains(".vl-nav-link[aria-current=\"page\"]"));
     }
 
     #[test]

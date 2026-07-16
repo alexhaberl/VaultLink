@@ -43,6 +43,7 @@ pub fn share_upload_conflict_strategy(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UploadFormField {
     Path,
+    FolderPath,
     Overwrite,
     Csrf,
     File,
@@ -53,6 +54,7 @@ pub enum UploadFormField {
 pub enum UploadFormStateError {
     TooManyFields,
     DuplicateOrLatePath,
+    DuplicateOrLateFolderPath,
     DuplicateOverwrite,
     DuplicateOrLateCsrf,
     MultipleFiles,
@@ -65,6 +67,7 @@ pub enum UploadFormStateError {
 pub struct UploadFormState {
     fields_seen: usize,
     saw_path: bool,
+    saw_folder_path: bool,
     saw_overwrite: bool,
     saw_csrf: bool,
     saw_file: bool,
@@ -84,6 +87,13 @@ impl UploadFormState {
             UploadFormField::Path => {
                 if std::mem::replace(&mut self.saw_path, true) || self.saw_file {
                     Err(UploadFormStateError::DuplicateOrLatePath)
+                } else {
+                    Ok(())
+                }
+            }
+            UploadFormField::FolderPath => {
+                if std::mem::replace(&mut self.saw_folder_path, true) || self.saw_file {
+                    Err(UploadFormStateError::DuplicateOrLateFolderPath)
                 } else {
                     Ok(())
                 }
@@ -413,6 +423,19 @@ mod tests {
         assert_eq!(
             late_path.observe(UploadFormField::Path, 4),
             Err(UploadFormStateError::DuplicateOrLatePath)
+        );
+
+        let mut folder_path = UploadFormState::default();
+        folder_path.observe(UploadFormField::FolderPath, 4).unwrap();
+        assert_eq!(
+            folder_path.observe(UploadFormField::FolderPath, 4),
+            Err(UploadFormStateError::DuplicateOrLateFolderPath)
+        );
+        let mut late_folder_path = UploadFormState::default();
+        late_folder_path.observe(UploadFormField::File, 4).unwrap();
+        assert_eq!(
+            late_folder_path.observe(UploadFormField::FolderPath, 4),
+            Err(UploadFormStateError::DuplicateOrLateFolderPath)
         );
 
         let mut multiple_files = UploadFormState::default();

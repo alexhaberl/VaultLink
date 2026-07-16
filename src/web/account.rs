@@ -18,7 +18,7 @@ use super::{
 use crate::{
     auth,
     db::{
-        AdminMfaEnrollmentActivationOutcome, AdminPasswordChangeOutcome,
+        AdminMfaEnrollmentActivationOutcome, AdminPasswordChangeOutcome, AdminTotpSettingOutcome,
         AdminWebauthnCredentialDeletionOutcome, AdminWebauthnCredentialRegistrationOutcome,
         AuditContext, AuditedAdminMfaEnrollmentStartOutcome,
     },
@@ -43,6 +43,8 @@ struct AccountTemplate<'a> {
     username: &'a str,
     csrf: &'a str,
     security_keys: Vec<SecurityKeyView>,
+    totp_enabled: bool,
+    totp_can_disable: bool,
 }
 
 #[derive(Template)]
@@ -202,7 +204,7 @@ pub(super) async fn finish_security_key_registration(
 pub(super) struct DeleteSecurityKeyForm {
     csrf: String,
     current_password: SecretString,
-    current_code: SecretString,
+    current_code: Option<SecretString>,
 }
 
 pub(super) async fn delete_security_key(
@@ -226,6 +228,7 @@ pub(super) async fn delete_security_key(
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
     let expected_password_hash = admin.password_hash;
     let expected_totp_secret = admin.totp_secret;
+    let totp_enabled = admin.totp_enabled;
     let password = form.current_password;
     if password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
         audit_observation(
@@ -240,15 +243,7 @@ pub(super) async fn delete_security_key(
     }
     let password_valid =
         verify_password_admitted(&state, Some(expected_password_hash.clone()), password).await?;
-    let Some(totp_step) = password_valid
-        .then(|| {
-            auth::matching_totp_step_now(
-                expected_totp_secret.expose_secret(),
-                form.current_code.expose_secret(),
-            )
-        })
-        .flatten()
-    else {
+    if !password_valid {
         audit_observation(
             &state,
             session.username,
@@ -258,20 +253,48 @@ pub(super) async fn delete_security_key(
         )
         .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    let totp_step = if totp_enabled {
+        form.current_code.as_ref().and_then(|code| {
+            auth::matching_totp_step_now(expected_totp_secret.expose_secret(), code.expose_secret())
+        })
+    } else {
+        None
     };
+    if totp_enabled && totp_step.is_none() {
+        audit_observation(
+            &state,
+            session.username,
+            "security_key_reauth_failed",
+            Some(id.to_string()),
+            None,
+        )
+        .await;
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
     // Successful password reauthentication remains rate-limited.
     let admin_id = session.admin_id;
     let audit_client_ip = enabled_audit_client_ip(&state);
     let outcome = required_database(state.db.clone(), move |db| {
-        db.delete_admin_webauthn_credential_with_totp(
-            &token,
-            id,
-            admin_id,
-            &expected_password_hash,
-            expected_totp_secret.expose_secret(),
-            totp_step,
-            audit_client_ip.as_deref(),
-        )
+        if totp_enabled {
+            db.delete_admin_webauthn_credential_with_totp(
+                &token,
+                id,
+                admin_id,
+                &expected_password_hash,
+                expected_totp_secret.expose_secret(),
+                totp_step.expect("enabled TOTP was validated before the database task"),
+                audit_client_ip.as_deref(),
+            )
+        } else {
+            db.delete_admin_webauthn_credential_without_totp(
+                &token,
+                id,
+                admin_id,
+                &expected_password_hash,
+                audit_client_ip.as_deref(),
+            )
+        }
     })
     .await?;
     match outcome {
@@ -301,21 +324,34 @@ pub(super) async fn account_page(
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let admin_id = session.admin_id;
-    let security_keys = database(state.db.clone(), move |db| {
-        db.admin_webauthn_credentials(admin_id)
+    let username = session.username.clone();
+    let (security_keys, totp_enabled) = database(state.db.clone(), move |db| {
+        let keys = db.admin_webauthn_credentials(admin_id)?;
+        let admin = db
+            .admin(&username)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Ok((keys, admin.totp_enabled))
     })
     .await?;
+    let totp_can_disable = security_keys.len() >= 2;
     let body = AccountTemplate {
         username: &session.username,
         csrf: &session.csrf_token,
         security_keys: security_keys
             .into_iter()
-            .map(|key| SecurityKeyView {
-                id: key.id,
-                label: key.label,
-                created_at: key.created_at,
+            .map(|key| {
+                let created_at = DateTime::parse_from_rfc3339(&key.created_at)
+                    .map(|value| format_utc_minute(value.with_timezone(&Utc)))
+                    .unwrap_or(key.created_at);
+                SecurityKeyView {
+                    id: key.id,
+                    label: key.label,
+                    created_at,
+                }
             })
             .collect(),
+        totp_enabled,
+        totp_can_disable,
     };
     Ok(Html(render_admin_page(
         &state,
@@ -325,6 +361,109 @@ pub(super) async fn account_page(
         &session.csrf_token,
         true,
     )?))
+}
+
+#[derive(Deserialize)]
+pub(super) struct AccountTotpSettingForm {
+    csrf: String,
+    current_password: SecretString,
+    current_code: Option<SecretString>,
+    enabled: bool,
+}
+
+pub(super) async fn set_account_totp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AccountTotpSettingForm>,
+) -> Result<Redirect> {
+    let (token, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    csrf(&session, &form.csrf)?;
+    let limiter_key = format!("account-totp-setting:{}", session.admin_id);
+    if !state.limiter.check_and_record_attempt(&limiter_key) {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Zu viele Passwortversuche",
+        ));
+    }
+    let username = session.username.clone();
+    let admin = database(state.db.clone(), move |db| db.admin(&username))
+        .await?
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+    let expected_password_hash = admin.password_hash;
+    let expected_totp_secret = admin.totp_secret;
+    let password = form.current_password;
+    if password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    let password_valid =
+        verify_password_admitted(&state, Some(expected_password_hash.clone()), password).await?;
+    if !password_valid {
+        audit_observation(
+            &state,
+            session.username,
+            "account_totp_setting_reauth_failed",
+            None,
+            None,
+        )
+        .await;
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    let totp_step = if form.enabled {
+        None
+    } else {
+        form.current_code.as_ref().and_then(|code| {
+            auth::matching_totp_step_now(expected_totp_secret.expose_secret(), code.expose_secret())
+        })
+    };
+    if !form.enabled && totp_step.is_none() {
+        audit_observation(
+            &state,
+            session.username,
+            "account_totp_setting_reauth_failed",
+            None,
+            None,
+        )
+        .await;
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+    }
+    let admin_id = session.admin_id;
+    let enabled = form.enabled;
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
+    let outcome = required_database(state.db.clone(), move |db| {
+        let _security_settings_guard = security_settings_guard;
+        db.set_admin_totp_enabled_with_reauthentication(
+            &token,
+            admin_id,
+            &expected_password_hash,
+            expected_totp_secret.expose_secret(),
+            enabled,
+            totp_step,
+            audit_client_ip.as_deref(),
+        )
+    })
+    .await?;
+    match outcome {
+        AdminTotpSettingOutcome::Updated | AdminTotpSettingOutcome::Unchanged => {
+            Ok(Redirect::to("/admin/account"))
+        }
+        AdminTotpSettingOutcome::InsufficientSecurityKeys => Err(AppError(
+            StatusCode::CONFLICT,
+            "Mindestens zwei Sicherheitsschlüssel erforderlich",
+        )),
+        AdminTotpSettingOutcome::ReauthenticationRejected
+        | AdminTotpSettingOutcome::TotpRejected => {
+            audit_observation(
+                &state,
+                session.username,
+                "account_totp_setting_reauth_failed",
+                None,
+                None,
+            )
+            .await;
+            Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -379,7 +518,7 @@ pub(super) async fn change_account_password(
     if !auth::valid_admin_password(form.new_password.expose_secret()) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Passwort muss mindestens 14 Zeichen und darf höchstens 1024 Byte enthalten",
+            "Passwort muss mindestens 14 und darf höchstens 256 Zeichen enthalten",
         ));
     }
     drop(form.password_confirm);

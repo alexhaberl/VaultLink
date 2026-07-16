@@ -84,6 +84,7 @@ fn web_route_inventory_is_explicit_and_complete() {
             "/admin/account/mfa/confirm",
             "post(account::confirm_account_mfa)",
         ),
+        ("/admin/account/totp", "post(account::set_account_totp)"),
         (
             "/admin/account/security-keys/register/start",
             "post(account::start_security_key_registration)",
@@ -109,6 +110,10 @@ fn web_route_inventory_is_explicit_and_complete() {
             "post(files::admin_upload_queue).layer(DefaultBodyLimit::max(limit)).layer(middleware::from_fn(guard_multipart_upload))",
         ),
         ("/admin/files/rename", "post(files::rename_file_ui)"),
+        (
+            "/admin/files/download",
+            "get(files::admin_download).head(files::admin_download)",
+        ),
         (
             "/admin/files/delete",
             "get(files::delete_file_confirmation).post(files::delete_file_ui)",
@@ -188,7 +193,7 @@ fn web_route_inventory_is_explicit_and_complete() {
         ("/favicon.ico", "get(rendering::favicon_png)"),
     ];
 
-    assert_eq!(expected.len(), 51);
+    assert_eq!(expected.len(), 53);
     assert_eq!(occurrences(&router, ".route("), expected.len());
     for (path, methods) in expected {
         assert_route(&router, path, methods);
@@ -268,11 +273,11 @@ fn approved_source_level_registration_counts_include_test_fixtures() {
     let web_router = router_registration_block(WEB_SOURCE);
     let api_router = router_registration_block(API_SOURCE);
 
-    assert_eq!(occurrences(&web, ".route("), 51);
+    assert_eq!(occurrences(&web, ".route("), 53);
     assert_eq!(occurrences(&web_tests, ".route("), 2);
     assert_eq!(
         occurrences(&web, ".route(") + occurrences(&web_tests, ".route("),
-        53
+        55
     );
     assert_eq!(occurrences(&api, ".route("), 27);
     assert_eq!(occurrences(&api_tests, ".route("), 1);

@@ -38,6 +38,7 @@ struct LoginTemplate;
 struct MfaTemplate<'a> {
     csrf: &'a str,
     security_key_enabled: bool,
+    totp_enabled: bool,
 }
 
 pub(super) async fn login_page() -> Result<Html<String>> {
@@ -117,9 +118,13 @@ pub(super) async fn mfa_page(
     let (_, current_session) =
         session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     let admin_id = current_session.admin_id;
-    let security_key_count = database(state.db.clone(), move |db| {
-        db.admin_webauthn_credentials(admin_id)
-            .map(|credentials| credentials.len())
+    let username = current_session.username.clone();
+    let (security_key_count, totp_enabled) = database(state.db.clone(), move |db| {
+        let security_key_count = db.admin_webauthn_credentials(admin_id)?.len();
+        let admin = db
+            .admin(&username)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Ok((security_key_count, admin.totp_enabled))
     })
     .await?;
     Ok(Html(public_page(
@@ -127,6 +132,7 @@ pub(super) async fn mfa_page(
         &MfaTemplate {
             csrf: &current_session.csrf_token,
             security_key_enabled: security_key_count >= 2,
+            totp_enabled,
         },
     )?))
 }

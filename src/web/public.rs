@@ -27,8 +27,10 @@ use crate::{
 
 use super::{
     common::{
-        encoded, format_file_time, format_public_date, human, internal, list_directory_page,
-        parent_path, preview_allowed, public_breadcrumbs, search_tree, BrowseQuery,
+        encoded, file_sort_column, file_sort_column_value, file_sort_direction,
+        file_sort_direction_value, file_sort_header, format_file_time, format_public_date, human,
+        internal, list_directory_sorted_page, parent_path, preview_allowed, public_breadcrumbs,
+        search_tree, sort_search_hits, BrowseQuery, FileSortColumn,
     },
     rendering::{esc, plain_page},
     shares::share_permission_label,
@@ -277,6 +279,8 @@ pub(super) async fn public_page(
     if sh.is_directory && sh.permission.can_download() {
         let sub = q.path.clone().unwrap_or_default();
         let page_number = q.page.unwrap_or(0).min(1_000_000);
+        let sort_column = file_sort_column(q.sort.as_deref());
+        let sort_direction = file_sort_direction(q.direction.as_deref());
         let search =
             q.q.map(|value| value.trim().to_string())
                 .filter(|v| !v.is_empty());
@@ -315,13 +319,15 @@ pub(super) async fn public_page(
         body += &public_breadcrumbs(&token, &clean_sub);
         if let Some(parent) = parent_path(&clean_sub) {
             body += &format!(
-                r#"<p><a href="/v/{token}?path={}"><vl-i18n key="files.up"/></a></p>"#,
+                r#"<p><a class="vl-button vl-button--secondary" href="/v/{token}?path={}"><vl-i18n key="files.up"/></a></p>"#,
                 encoded(&parent)
             );
         }
         body += &format!(
-            r#"<form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="files.browse"/></span><input name="q" value="{}" placeholder="<vl-i18n key="files.search_placeholder"/>"></label><button class="vl-button"><vl-i18n key="common.search"/></button><a class="vl-button vl-button--secondary" href="/v/{token}/download.zip?path={}"><vl-i18n key="files.folder_zip"/></a></form>"#,
+            r#"<form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><input type="hidden" name="sort" value="{}"><input type="hidden" name="direction" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="files.browse"/></span><input name="q" value="{}" placeholder="<vl-i18n key="files.search_placeholder"/>"></label><button class="vl-button"><vl-i18n key="common.search"/></button><a class="vl-button vl-button--secondary" href="/v/{token}/download.zip?path={}"><vl-i18n key="files.folder_zip"/></a></form>"#,
             esc(&clean_sub),
+            file_sort_column_value(sort_column),
+            file_sort_direction_value(sort_direction),
             esc(search.as_deref().unwrap_or("")),
             encoded(&clean_sub)
         );
@@ -330,12 +336,13 @@ pub(super) async fn public_page(
         let mut has_next = false;
         if let Some(search) = search.clone() {
             let search_settings = settings.clone();
-            let hits = tokio::task::spawn_blocking(move || {
+            let mut hits = tokio::task::spawn_blocking(move || {
                 search_tree(secure_root, &relative_dir, &search, &search_settings)
             })
             .await
             .map_err(internal)?
             .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+            sort_search_hits(&mut hits, sort_column, sort_direction);
             for hit in hits {
                 let share_rel = hit.relative_path.clone();
                 let target = encoded(&share_rel);
@@ -366,7 +373,15 @@ pub(super) async fn public_page(
                     )
                 };
                 rows += &format!(
-                    r#"<tr><td data-label="<vl-i18n key="common.name"/>">{name}</td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{modified}</td><td data-label="<vl-i18n key="common.action"/>" class="vl-inline-actions">{}{preview}</td></tr>"#,
+                    r#"<tr><td data-label="<vl-i18n key="common.name"/>">{name}</td><td data-label="<vl-i18n key="common.type"/>">{}</td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{modified}</td><td data-label="<vl-i18n key="common.action"/>" class="vl-inline-actions">{}{preview}</td></tr>"#,
+                    i18n::text(
+                        i18n::current_locale(),
+                        if hit.entry.is_dir {
+                            i18n::FOLDER
+                        } else {
+                            i18n::FILE
+                        }
+                    ),
                     if hit.entry.is_dir {
                         "—".into()
                     } else {
@@ -386,7 +401,14 @@ pub(super) async fn public_page(
         } else {
             let scan_limit = settings.max_search_entries;
             let (entries, truncated) = tokio::task::spawn_blocking(move || {
-                list_directory_page(&secure_root, &relative_dir, page_number, scan_limit)
+                list_directory_sorted_page(
+                    &secure_root,
+                    &relative_dir,
+                    page_number,
+                    scan_limit,
+                    sort_column,
+                    sort_direction,
+                )
             })
             .await
             .map_err(internal)?
@@ -398,7 +420,7 @@ pub(super) async fn public_page(
                 let target = encoded(&rel);
                 if entry.is_dir {
                     rows += &format!(
-                        r#"<tr><td data-label="<vl-i18n key="common.name"/>">{} <a href="/v/{token}?path={target}">{name}</a></td><td data-label="<vl-i18n key="common.size"/>">—</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>"><a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}"><vl-i18n key="common.open"/></a></td></tr>"#,
+                        r#"<tr><td data-label="<vl-i18n key="common.name"/>">{} <a href="/v/{token}?path={target}">{name}</a></td><td data-label="<vl-i18n key="common.type"/>"><vl-i18n key="files.folder"/></td><td data-label="<vl-i18n key="common.size"/>">—</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>"><a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}"><vl-i18n key="common.open"/></a></td></tr>"#,
                         crate::ui::icon(crate::ui::Icon::Folder),
                         entry
                             .modified
@@ -414,7 +436,7 @@ pub(super) async fn public_page(
                         String::new()
                     };
                     rows += &format!(
-                        r#"<tr><td data-label="<vl-i18n key="common.name"/>">{} {name}</td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>" class="vl-inline-actions">{}<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}"><vl-i18n key="common.download"/></a></td></tr>"#,
+                        r#"<tr><td data-label="<vl-i18n key="common.name"/>">{} {name}</td><td data-label="<vl-i18n key="common.type"/>"><vl-i18n key="files.file"/></td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>" class="vl-inline-actions">{}<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}"><vl-i18n key="common.download"/></a></td></tr>"#,
                         crate::ui::icon(crate::ui::Icon::File),
                         human(entry.len),
                         entry
@@ -426,10 +448,49 @@ pub(super) async fn public_page(
                 }
             }
             if truncated {
-                rows += r#"<tr><td colspan="4" class="vl-muted"><vl-i18n key="files.scan_limit"/></td></tr>"#;
+                rows += r#"<tr><td colspan="5" class="vl-muted"><vl-i18n key="files.scan_limit"/></td></tr>"#;
             }
         }
-        body += "<div class=\"vl-table-wrap\"><table class=\"vl-data-table\"><thead><tr><th><vl-i18n key=\"common.name\"/></th><th><vl-i18n key=\"common.size\"/></th><th><vl-i18n key=\"common.changed\"/></th><th><vl-i18n key=\"common.action\"/></th></tr></thead><tbody>";
+        let base_url = format!("/v/{token}");
+        let name_header = file_sort_header(
+            "<vl-i18n key=\"common.name\"/>",
+            FileSortColumn::Name,
+            sort_column,
+            sort_direction,
+            &base_url,
+            &clean_sub,
+            search.as_deref(),
+        );
+        let type_header = file_sort_header(
+            "<vl-i18n key=\"common.type\"/>",
+            FileSortColumn::Type,
+            sort_column,
+            sort_direction,
+            &base_url,
+            &clean_sub,
+            search.as_deref(),
+        );
+        let size_header = file_sort_header(
+            "<vl-i18n key=\"common.size\"/>",
+            FileSortColumn::Size,
+            sort_column,
+            sort_direction,
+            &base_url,
+            &clean_sub,
+            search.as_deref(),
+        );
+        let modified_header = file_sort_header(
+            "<vl-i18n key=\"common.changed\"/>",
+            FileSortColumn::Modified,
+            sort_column,
+            sort_direction,
+            &base_url,
+            &clean_sub,
+            search.as_deref(),
+        );
+        body += &format!(
+            "<div class=\"vl-table-wrap\"><table class=\"vl-data-table\"><thead><tr>{name_header}{type_header}{size_header}{modified_header}<th><vl-i18n key=\"common.action\"/></th></tr></thead><tbody>"
+        );
         body += &rows;
         body += "</tbody></table></div>";
         let encoded_sub = encoded(&clean_sub);
@@ -437,18 +498,25 @@ pub(super) async fn public_page(
             .as_deref()
             .map(|value| format!("&q={}", encoded(value)))
             .unwrap_or_default();
+        let sort_param = format!(
+            "&sort={}&direction={}",
+            file_sort_column_value(sort_column),
+            file_sort_direction_value(sort_direction)
+        );
         if page_number > 0 {
             body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\"><vl-i18n key=\"common.back\"/></a>",
+                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}{}\"><vl-i18n key=\"common.back\"/></a>",
                 page_number - 1,
-                search_param
+                search_param,
+                sort_param,
             );
         }
         if has_next {
             body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}\"><vl-i18n key=\"common.continue\"/></a>",
+                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}{}\"><vl-i18n key=\"common.continue\"/></a>",
                 page_number + 1,
-                search_param
+                search_param,
+                sort_param,
             );
         }
         body += "</section>";
@@ -503,7 +571,7 @@ pub(super) async fn public_page(
         };
         let panel_tag = if split_layout { "aside" } else { "section" };
         body += &format!(
-            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_choose"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label>{}<div class="vl-upload-queue" data-upload-list role="status" aria-live="polite"></div><button class="vl-button" data-upload-submit>{} <vl-i18n key="upload.securely"/></button><p class="vl-muted"><vl-i18n key="share.no_replace_help"/></p></form></{panel_tag}>"#,
+            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_choose"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-inline-actions"><label class="vl-button vl-button--secondary">{} <vl-i18n key="upload.folder"/><input class="vl-sr-only" type="file" webkitdirectory directory multiple data-upload-folder-input></label></div>{}<div class="vl-upload-queue" data-upload-list role="status" aria-live="polite"></div><button class="vl-button" data-upload-submit>{} <vl-i18n key="upload.securely"/></button><p class="vl-muted"><vl-i18n key="share.no_replace_help"/></p></form></{panel_tag}>"#,
             if sh.permission == Permission::UploadOnly {
                 i18n::text(i18n::current_locale(), i18n::UPLOAD_FILE)
             } else {
@@ -512,6 +580,7 @@ pub(super) async fn public_page(
             esc(&upload_path),
             esc(upload_csrf.as_deref().unwrap_or("")),
             crate::ui::icon(crate::ui::Icon::Upload),
+            crate::ui::icon(crate::ui::Icon::Folder),
             overwrite_checkbox,
             crate::ui::icon(crate::ui::Icon::Upload),
         );

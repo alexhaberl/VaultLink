@@ -1297,6 +1297,16 @@ fn multipart_request_with_late_overwrite(uri: &str, name: &str, content: &[u8]) 
     request
 }
 
+fn public_folder_upload_request(
+    uri: &str,
+    path: &str,
+    folder_path: &str,
+    name: &str,
+    content: &[u8],
+) -> Request {
+    folder_upload_request(uri, path, None, folder_path, name, content)
+}
+
 fn raw_multipart_request(uri: &str, boundary: &str, body: Vec<u8>) -> Request {
     let mut request = Request::builder()
         .method(Method::POST)
@@ -1514,6 +1524,65 @@ fn admin_multipart_request(
             )
             .as_bytes(),
         );
+    body.extend_from_slice(content);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+    ));
+    request
+}
+
+fn admin_folder_upload_request(
+    uri: &str,
+    path: &str,
+    csrf: &str,
+    folder_path: &str,
+    name: &str,
+    content: &[u8],
+) -> Request {
+    folder_upload_request(uri, path, Some(csrf), folder_path, name, content)
+}
+
+fn folder_upload_request(
+    uri: &str,
+    path: &str,
+    csrf: Option<&str>,
+    folder_path: &str,
+    name: &str,
+    content: &[u8],
+) -> Request {
+    let boundary = "vaultlink-folder-upload-boundary";
+    let mut body = Vec::new();
+    for (field, value) in [
+        ("path", Some(path)),
+        ("csrf", csrf),
+        ("folder_path", Some(folder_path)),
+    ] {
+        if let Some(value) = value {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
     body.extend_from_slice(content);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     let mut request = Request::builder()
@@ -1813,6 +1882,9 @@ fn upload_policy_helpers() {
     assert_eq!(add_upload_bytes(u64::MAX, 1, u64::MAX), None);
     assert_eq!(human(1_500_000_000), "1.5 GB");
     assert_eq!(format_unit_floor(53_687_091_200, GB), "53");
+    assert_eq!(format_unit_decimal(100_000_000_000, GB), "100");
+    assert_eq!(format_unit_decimal(100_500_000_000, GB), "100.5");
+    assert_eq!(format_unit_decimal(1, GB), "0.000000001");
     assert_eq!(display_limit_unit_floor(1_073_741_824, GB), "1");
     assert_eq!(display_limit_unit_ceil(120_000_000_001, GB), "121");
     assert_eq!(
@@ -1881,6 +1953,7 @@ async fn admin_shell_renders_nav_icons_and_system_panel() {
         assert!(html.contains(&format!("<span>{label}</span>")));
     }
     assert!(html.contains("vl-icon"));
+    assert_eq!(html.matches(r#"class="vl-nav-link""#).count(), 5);
     assert_eq!(html.matches(r#"aria-current="page""#).count(), 1);
     assert!(!html.contains('📁'));
     assert!(html.contains("VaultLink erreichbar"));
@@ -2055,6 +2128,94 @@ fn file_recovery_required_audit_failure_maps_to_ui_503_marker() {
         response.headers().get(ERROR_CODE_HEADER).unwrap(),
         "audit_unavailable"
     );
+}
+
+#[tokio::test]
+async fn audit_table_sorts_columns_and_keeps_time_descending_by_default() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state.runtime.write().unwrap().audit_client_ip_enabled = true;
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "audit-session",
+            1,
+            "audit-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("audit-session").unwrap();
+    state
+        .db
+        .audit_with_client_ip(
+            "zulu",
+            "download",
+            Some("z-object"),
+            Some("z-detail"),
+            Some("203.0.113.2"),
+        )
+        .unwrap();
+    state
+        .db
+        .audit_with_client_ip(
+            "Alpha",
+            "upload",
+            Some("a-object"),
+            Some("a-detail"),
+            Some("203.0.113.1"),
+        )
+        .unwrap();
+    let app = router(state);
+    let cookie = HeaderValue::from_static("vaultlink_session=audit-session");
+
+    let mut default_request = request(Method::GET, "/admin/audit", "");
+    default_request
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let default_page = response_text(app.clone().oneshot(default_request).await.unwrap()).await;
+    assert!(default_page.contains(r#"class="vl-audit-time" aria-sort="descending""#));
+    assert!(default_page.contains("sort=user&amp;direction=asc"));
+    assert!(default_page.contains("sort=client_ip&amp;direction=asc"));
+    assert!(
+        default_page
+            .find(r#"data-label="User">Alpha</td>"#)
+            .unwrap()
+            < default_page.find(r#"data-label="User">zulu</td>"#).unwrap()
+    );
+
+    let mut descending_request = request(Method::GET, "/admin/audit?sort=user&direction=desc", "");
+    descending_request
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let descending_page =
+        response_text(app.clone().oneshot(descending_request).await.unwrap()).await;
+    assert!(descending_page.contains(r#"class="vl-audit-user" aria-sort="descending""#));
+    assert!(descending_page.contains("sort=user&amp;direction=asc"));
+    assert!(
+        descending_page
+            .find(r#"data-label="User">zulu</td>"#)
+            .unwrap()
+            < descending_page
+                .find(r#"data-label="User">Alpha</td>"#)
+                .unwrap()
+    );
+
+    let mut ascending_request = request(
+        Method::GET,
+        "/admin/audit?action=upload&sort=user&direction=asc",
+        "",
+    );
+    ascending_request
+        .headers_mut()
+        .insert(header::COOKIE, cookie);
+    let ascending_page = response_text(app.oneshot(ascending_request).await.unwrap()).await;
+    assert!(ascending_page.contains(r#"name="sort" value="user""#));
+    assert!(ascending_page.contains(r#"name="direction" value="asc""#));
+    assert!(ascending_page.contains("action=upload&amp;sort=user&amp;direction=desc"));
+    assert!(ascending_page.contains(r#"data-label="User">Alpha</td>"#));
+    assert!(!ascending_page.contains(r#"data-label="User">zulu</td>"#));
 }
 
 #[tokio::test]
@@ -2263,6 +2424,10 @@ async fn settings_form_uses_decimal_whole_preview_defaults() {
         r#"name="max_media_preview_size_mb" type="number" min="1" step="1" value="100""#
     ));
     assert!(html.contains("Suche Max. Einträge"));
+    assert_eq!(html.matches(r#"class="vl-field-info""#).count(), 16);
+    assert!(html.contains("Schema, Host und Port müssen exakt"));
+    assert!(html.contains("0 deaktiviert dieses separate Limit"));
+    assert!(!html.contains("Max. Dateien pro ZIP (0 ="));
     assert_no_mojibake("settings form", &html);
     assert!(!html.contains("Media-Preview Max. GB"));
 }
@@ -2300,8 +2465,14 @@ async fn file_time_uses_locale_date_order() {
     let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(60 * 60 * 20 + 32 * 60);
     let de = i18n::scope(Locale::De, "/".into(), async { format_file_time(time) }).await;
     let en = i18n::scope(Locale::En, "/".into(), async { format_file_time(time) }).await;
-    assert_eq!(de, "01.01.1970 20:32 UTC");
-    assert_eq!(en, "1970-01-01 20:32 UTC");
+    assert_eq!(
+        de,
+        r#"<time data-local-time datetime="1970-01-01T20:32:00Z">01.01.1970 20:32 UTC</time>"#
+    );
+    assert_eq!(
+        en,
+        r#"<time data-local-time datetime="1970-01-01T20:32:00Z">1970-01-01 20:32 UTC</time>"#
+    );
 }
 
 #[tokio::test]
@@ -2633,6 +2804,8 @@ async fn share_creation_page_uses_browser_selected_path() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("file.txt"), b"file").unwrap();
+    std::fs::write(root.path().join("B.txt"), b"second").unwrap();
+    std::fs::write(root.path().join("A.txt"), b"first").unwrap();
     std::fs::create_dir(root.path().join("uploads")).unwrap();
     let state = test_state(root.path(), data.path());
     state.runtime.write().unwrap().max_upload_size = 120_000_000_001;
@@ -2659,6 +2832,17 @@ async fn share_creation_page_uses_browser_selected_path() {
     .await;
     assert!(javascript.contains("initDeleteConfirmation"));
     assert!(javascript.contains("input.value!==form.dataset.requiredName"));
+    assert!(javascript.contains("initFieldInfoTooltips"));
+    assert!(javascript.contains("--vl-tooltip-left"));
+    assert!(javascript.contains("closeActionDetails"));
+    assert!(javascript.contains(".vl-action-details[open]"));
+    assert!(javascript.contains("e.key!=='Escape'"));
+    assert!(javascript.contains("summary?.focus()"));
+    assert!(javascript.contains("ensureWebauthnAvailable"));
+    assert!(javascript.contains("webauthnFailureMessage"));
+    assert!(javascript.contains("NotAllowedError"));
+    assert!(javascript.contains("initLocalTimes"));
+    assert!(javascript.contains("time[data-local-time]"));
 
     let mut browser_root = request(Method::GET, "/admin", "");
     browser_root
@@ -2670,6 +2854,37 @@ async fn share_creation_page_uses_browser_selected_path() {
     assert!(browser_root.contains(r#"action="/admin/files/directories""#));
     assert!(browser_root.contains(r#"action="/admin/files/rename""#));
     assert!(browser_root.contains(r#"/admin/files/delete?path=file%2Etxt"#));
+    assert!(browser_root.contains(r#"/admin/files/download?path=file%2Etxt"#));
+    assert!(browser_root.contains("sort=name&amp;direction=desc"));
+    assert!(browser_root.find("A.txt").unwrap() < browser_root.find("B.txt").unwrap());
+
+    let mut descending = request(Method::GET, "/admin?sort=name&direction=desc", "");
+    descending
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let descending = response_text(app.clone().oneshot(descending).await.unwrap()).await;
+    assert!(descending.find("B.txt").unwrap() < descending.find("A.txt").unwrap());
+
+    let mut direct_download = request(Method::GET, "/admin/files/download?path=file.txt", "");
+    direct_download
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let direct_download = app.clone().oneshot(direct_download).await.unwrap();
+    assert_eq!(direct_download.status(), StatusCode::OK);
+    assert_eq!(
+        direct_download
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap(),
+        "attachment; filename*=UTF-8''file%2Etxt"
+    );
+    assert_eq!(
+        axum::body::to_bytes(direct_download.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"file"
+    );
 
     let mut create_folder = request(
         Method::POST,
@@ -2716,7 +2931,7 @@ async fn share_creation_page_uses_browser_selected_path() {
     assert!(folder.contains(r#"pattern="[A-Za-z0-9_-]{12,32}""#));
     assert!(folder.contains(r#"value="upload_only""#));
     assert!(folder.contains(
-        r#"name="max_upload_total_size_gb" type="number" min="1" step="1" value="121" required"#
+        r#"name="max_upload_total_size_gb" type="number" min="1" step="any" value="121" required"#
     ));
 
     let mut file_request = request(Method::GET, "/admin/shares/new?path=file.txt", "");
@@ -2830,6 +3045,44 @@ async fn share_creation_page_uses_browser_selected_path() {
             .count(),
         1
     );
+
+    let edited_share_id = shares
+        .iter()
+        .find(|share| share.max_upload_size == Some(2 * GB))
+        .unwrap()
+        .id;
+    let mut shares_request = request(Method::GET, "/admin/shares", "");
+    shares_request.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=session-token"),
+    );
+    let shares_page = response_text(app.clone().oneshot(shares_request).await.unwrap()).await;
+    assert!(shares_page.contains("Kumulatives Uploadlimit in GB"));
+    assert!(shares_page.contains(r#"name="max_upload_total_size_gb""#));
+    assert!(!shares_page.contains("Kumulatives Uploadlimit (Bytes)"));
+
+    let mut update_quota = request(
+        Method::POST,
+        &format!("/admin/shares/{edited_share_id}/upload-conflict"),
+        "csrf=csrf-token&max_upload_total_size_gb=125.5&max_upload_files=900",
+    );
+    update_quota.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=session-token"),
+    );
+    assert_eq!(
+        app.clone().oneshot(update_quota).await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+    let edited_share = state
+        .db
+        .list_shares()
+        .unwrap()
+        .into_iter()
+        .find(|share| share.id == edited_share_id)
+        .unwrap();
+    assert_eq!(edited_share.max_upload_total_size, Some(125_500_000_000));
+    assert_eq!(edited_share.max_upload_files, Some(900));
 
     state
         .db
@@ -3616,6 +3869,173 @@ async fn http_share_permissions_password_unlock_and_range() {
 }
 
 #[tokio::test]
+async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compact() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    let password = "current-admin-password";
+    let password_hash = auth::hash_password(password).unwrap();
+    let secret = auth::new_totp_secret();
+    state
+        .db
+        .create_admin("admin", &password_hash, &secret)
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "account-security-session",
+            1,
+            "account-security-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("account-security-session").unwrap();
+    let app = router(state.clone());
+    let cookie = HeaderValue::from_static("vaultlink_session=account-security-session");
+
+    let mut before_keys = request(Method::GET, "/admin/account", "");
+    before_keys
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let before_keys = response_text(app.clone().oneshot(before_keys).await.unwrap()).await;
+    assert!(before_keys.contains("Ab zwei Keys änderbar"));
+    assert!(!before_keys.contains(r#"action="/admin/account/totp""#));
+
+    let first = match state
+        .db
+        .add_admin_webauthn_credential_for_session(
+            "account-security-session",
+            1,
+            "Primary",
+            "credential-a",
+            "{}",
+            None,
+        )
+        .unwrap()
+    {
+        crate::db::AdminWebauthnCredentialRegistrationOutcome::Registered(id) => id,
+        crate::db::AdminWebauthnCredentialRegistrationOutcome::SessionUnavailable => {
+            panic!("verified account session must accept a security key")
+        }
+    };
+    state
+        .db
+        .add_admin_webauthn_credential_for_session(
+            "account-security-session",
+            1,
+            "Backup",
+            "credential-b",
+            "{}",
+            None,
+        )
+        .unwrap();
+    let mut with_keys = request(Method::GET, "/admin/account", "");
+    with_keys
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let with_keys = response_text(app.clone().oneshot(with_keys).await.unwrap()).await;
+    assert_eq!(
+        with_keys.matches(r#"class="vl-security-key-row""#).count(),
+        3
+    );
+    assert!(with_keys.contains(r#"action="/admin/account/totp""#));
+    assert!(with_keys.contains("Bearbeiten"));
+    assert!(with_keys.contains(" UTC"));
+    assert!(!with_keys.contains(r#"class="vl-field-info""#));
+
+    let code = auth::totp_code(&secret, Utc::now().timestamp() as u64 / 30).unwrap();
+    let mut disable = request(
+        Method::POST,
+        "/admin/account/totp",
+        &format!(
+            "csrf=account-security-csrf&current_password={password}&current_code={code}&enabled=false"
+        ),
+    );
+    disable.headers_mut().insert(header::COOKIE, cookie.clone());
+    assert_eq!(
+        app.clone().oneshot(disable).await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+    assert!(!state.db.admin("admin").unwrap().unwrap().totp_enabled);
+
+    let mut account = request(Method::GET, "/admin/account", "");
+    account.headers_mut().insert(header::COOKIE, cookie.clone());
+    let account = response_text(app.clone().oneshot(account).await.unwrap()).await;
+    assert!(account.contains("TOTP ist deaktiviert"));
+    assert!(!account.contains(r#"action="/admin/account/mfa/start""#));
+
+    state
+        .db
+        .create_session(
+            "key-only-mfa-session",
+            1,
+            "key-only-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    let mut mfa_page = request(Method::GET, "/mfa", "");
+    mfa_page.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=key-only-mfa-session"),
+    );
+    let mfa_page = response_text(app.clone().oneshot(mfa_page).await.unwrap()).await;
+    assert!(!mfa_page.contains(r#"name="code""#));
+    assert!(mfa_page.contains("data-security-key-login"));
+
+    let mut protected_delete = request(
+        Method::POST,
+        &format!("/admin/account/security-keys/{first}/delete"),
+        &format!("csrf=account-security-csrf&current_password={password}"),
+    );
+    protected_delete
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    assert_eq!(
+        app.clone()
+            .oneshot(protected_delete)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    state
+        .db
+        .add_admin_webauthn_credential_for_session(
+            "account-security-session",
+            1,
+            "Spare",
+            "credential-c",
+            "{}",
+            None,
+        )
+        .unwrap();
+    let mut delete = request(
+        Method::POST,
+        &format!("/admin/account/security-keys/{first}/delete"),
+        &format!("csrf=account-security-csrf&current_password={password}"),
+    );
+    delete.headers_mut().insert(header::COOKIE, cookie.clone());
+    assert_eq!(
+        app.clone().oneshot(delete).await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(state.db.admin_webauthn_credentials(1).unwrap().len(), 2);
+
+    let mut enable = request(
+        Method::POST,
+        "/admin/account/totp",
+        &format!("csrf=account-security-csrf&current_password={password}&enabled=true"),
+    );
+    enable.headers_mut().insert(header::COOKIE, cookie);
+    assert_eq!(
+        app.oneshot(enable).await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+    assert!(state.db.admin("admin").unwrap().unwrap().totp_enabled);
+}
+
+#[tokio::test]
 async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -3653,6 +4073,10 @@ async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
     assert!(account_html.contains(r#"action="/admin/account/password""#));
     assert!(account_html.contains(r#"action="/admin/account/mfa/start""#));
     assert!(account_html.contains(r#"action="/locale""#));
+    assert!(!account_html.contains(r#"class="vl-field-info""#));
+    assert!(account_html.contains("Ab zwei Keys änderbar"));
+    assert!(account_html.contains(r#"maxlength="256""#));
+    assert!(account_html.contains("höchstens 256 Zeichen"));
 
     let mut wrong_password = request(
             Method::POST,
@@ -4087,10 +4511,29 @@ async fn upload_only_never_exposes_target_paths_or_existing_content() {
     assert!(html.contains("Datei hochladen"));
     assert!(html.contains("Vorhandene Dateien und Ordner bleiben verborgen"));
     assert!(html.contains("Erfolgreiche Uploads werden protokolliert"));
+    assert!(html.contains("data-upload-folder-input"));
+    assert!(html.contains("webkitdirectory"));
     assert!(!html.contains("private-drop"));
     assert!(!html.contains("hidden-secret.txt"));
     assert!(!html.contains("Dateien durchsuchen"));
     assert!(!html.contains("Datei herunterladen"));
+
+    let folder_upload = app
+        .clone()
+        .oneshot(public_folder_upload_request(
+            "/v/drop-token/upload/queue",
+            "",
+            "Eingang/Projekt",
+            "neu.txt",
+            b"private folder upload",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(folder_upload.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read(root.path().join("private-drop/Eingang/Projekt/neu.txt")).unwrap(),
+        b"private folder upload"
+    );
 
     let api_body = response_text(
         app.oneshot(request(Method::GET, "/api/v1/public/shares/drop-token", ""))
@@ -4120,7 +4563,7 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
         )
         .unwrap();
     state.db.verify_mfa("session-token").unwrap();
-    let app = router(state);
+    let app = router(state.clone());
     let cookie = HeaderValue::from_static("vaultlink_session=session-token");
 
     let mut wrong_csrf = admin_multipart_request(
@@ -4192,6 +4635,32 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
         b"second"
     );
 
+    let mut folder_upload = admin_folder_upload_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "csrf-token",
+        "Album/2026/Sommer",
+        "foto.txt",
+        b"folder content",
+    );
+    folder_upload
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let folder_upload = app.clone().oneshot(folder_upload).await.unwrap();
+    assert_eq!(folder_upload.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/Album/2026/Sommer/foto.txt")).unwrap(),
+        b"folder content"
+    );
+    assert_eq!(
+        state
+            .db
+            .list_audit(Some("upload_directories_created"), 10, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+
     let mut blocked = admin_multipart_request(
         "/admin/files/upload/queue",
         "uploads",
@@ -4213,6 +4682,8 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
     )
     .await;
     assert!(javascript.contains("input.multiple = true"));
+    assert!(javascript.contains("webkitRelativePath"));
+    assert!(javascript.contains("folder_path"));
     assert!(javascript.contains("await uploadItem(item)"));
     assert!(javascript.contains("Erneut versuchen"));
     assert!(!javascript.contains("Promise.all"));
@@ -5065,6 +5536,8 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
     let data = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("docs/sub")).unwrap();
     std::fs::write(root.path().join("docs/note.txt"), b"<b>hello</b>").unwrap();
+    std::fs::write(root.path().join("docs/B.txt"), b"second").unwrap();
+    std::fs::write(root.path().join("docs/A.txt"), b"first").unwrap();
     std::fs::write(root.path().join("docs/bad.html"), b"<script>x</script>").unwrap();
     std::fs::write(
         root.path().join("docs/image.png"),
@@ -5136,6 +5609,64 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
     assert!(!listing.contains("Hauptnavigation"));
     assert!(!listing.contains("Secure Mode"));
     assert!(!listing.contains("/admin/settings"));
+
+    let folder_upload = app
+        .clone()
+        .oneshot(public_folder_upload_request(
+            "/v/du/upload/queue",
+            "",
+            "Fotos/2026/Sommer",
+            "bild.txt",
+            b"public folder upload",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(folder_upload.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read(root.path().join("docs/Fotos/2026/Sommer/bild.txt")).unwrap(),
+        b"public folder upload"
+    );
+    let traversal = app
+        .clone()
+        .oneshot(public_folder_upload_request(
+            "/v/du/upload/queue",
+            "",
+            "../escape",
+            "blocked.txt",
+            b"blocked",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
+    assert!(!root.path().join("escape/blocked.txt").exists());
+
+    let sorted_listing = response_text(
+        app.clone()
+            .oneshot(request(Method::GET, "/v/du", ""))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(sorted_listing.find("A.txt").unwrap() < sorted_listing.find("B.txt").unwrap());
+    assert!(sorted_listing.contains("sort=name&amp;direction=desc"));
+    assert!(sorted_listing.contains("sort=type&amp;direction=asc"));
+    let descending_listing = response_text(
+        app.clone()
+            .oneshot(request(Method::GET, "/v/du?sort=name&direction=desc", ""))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(descending_listing.find("B.txt").unwrap() < descending_listing.find("A.txt").unwrap());
+    let subfolder_listing = response_text(
+        app.clone()
+            .oneshot(request(Method::GET, "/v/du?path=sub", ""))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(subfolder_listing
+        .contains(r#"<a class="vl-button vl-button--secondary" href="/v/du?path=">Hoch</a>"#));
 
     let preview = response_text(
         app.clone()
@@ -6564,7 +7095,7 @@ async fn external_writers_disable_saved_public_overwrite_policy() {
         HeaderValue::from_static("vaultlink_session=external-admin-session"),
     );
     let admin_page = response_text(app.clone().oneshot(admin_request).await.unwrap()).await;
-    assert!(admin_page.contains("max_upload_total_size"));
+    assert!(admin_page.contains("max_upload_total_size_gb"));
     assert!(admin_page.contains("max_upload_files"));
     assert!(!admin_page.contains("overwrite_allowed"));
 

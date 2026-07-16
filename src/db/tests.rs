@@ -740,6 +740,59 @@ fn audit_client_ips_are_optional_listed_and_purgeable_without_deleting_events() 
 }
 
 #[test]
+fn audit_listing_sorts_only_by_the_selected_whitelisted_column() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .audit("zulu", "z_action", Some("2"), Some("later alphabetically"))
+        .unwrap();
+    database
+        .audit(
+            "Alpha",
+            "a_action",
+            Some("1"),
+            Some("earlier alphabetically"),
+        )
+        .unwrap();
+
+    let default = database.list_audit(None, 10, 0).unwrap();
+    assert_eq!(default[0].actor, "Alpha");
+
+    let ascending = database
+        .list_audit_sorted(
+            None,
+            10,
+            0,
+            AuditSortColumn::Actor,
+            AuditSortDirection::Ascending,
+        )
+        .unwrap();
+    assert_eq!(
+        ascending
+            .iter()
+            .map(|event| event.actor.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha", "zulu"]
+    );
+
+    let descending = database
+        .list_audit_sorted(
+            None,
+            10,
+            0,
+            AuditSortColumn::Actor,
+            AuditSortDirection::Descending,
+        )
+        .unwrap();
+    assert_eq!(
+        descending
+            .iter()
+            .map(|event| event.actor.as_str())
+            .collect::<Vec<_>>(),
+        ["zulu", "Alpha"]
+    );
+}
+
+#[test]
 fn audited_client_ip_purge_rolls_back_when_required_audit_fails() {
     let database = Database::open(":memory:").unwrap();
     database
@@ -1581,6 +1634,7 @@ INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','d
             .unwrap(),
         1
     );
+    assert!(database.admin("admin").unwrap().unwrap().totp_enabled);
 }
 
 #[test]
@@ -3973,6 +4027,131 @@ fn security_mutation_webauthn_deletion_rejects_stale_credentials_and_session() {
             .unwrap(),
         AdminWebauthnCredentialDeletionOutcome::Deleted
     );
+}
+
+#[test]
+fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "password-hash", "totp-secret")
+        .unwrap();
+    assert!(database.admin("admin").unwrap().unwrap().totp_enabled);
+    database
+        .create_session(
+            "authorized-session",
+            1,
+            "csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(database.verify_mfa("authorized-session").unwrap());
+
+    assert_eq!(
+        database
+            .set_admin_totp_enabled_with_reauthentication(
+                "authorized-session",
+                1,
+                "password-hash",
+                "totp-secret",
+                false,
+                Some(41),
+                None,
+            )
+            .unwrap(),
+        AdminTotpSettingOutcome::InsufficientSecurityKeys
+    );
+
+    let first = database
+        .add_admin_webauthn_credential(1, "Primary", "credential-a", "{}")
+        .unwrap();
+    database
+        .add_admin_webauthn_credential(1, "Backup", "credential-b", "{}")
+        .unwrap();
+    assert_eq!(
+        database
+            .set_admin_totp_enabled_with_reauthentication(
+                "authorized-session",
+                1,
+                "password-hash",
+                "totp-secret",
+                false,
+                None,
+                None,
+            )
+            .unwrap(),
+        AdminTotpSettingOutcome::TotpRejected
+    );
+    assert_eq!(
+        database
+            .set_admin_totp_enabled_with_reauthentication(
+                "authorized-session",
+                1,
+                "password-hash",
+                "totp-secret",
+                false,
+                Some(42),
+                Some("203.0.113.60"),
+            )
+            .unwrap(),
+        AdminTotpSettingOutcome::Updated
+    );
+    assert!(!database.admin("admin").unwrap().unwrap().totp_enabled);
+    let disabled_audit = database
+        .list_audit(Some("admin_totp_disabled"), 1, 0)
+        .unwrap();
+    assert_eq!(disabled_audit.len(), 1);
+    assert_eq!(disabled_audit[0].client_ip.as_deref(), Some("203.0.113.60"));
+
+    assert_eq!(
+        database
+            .delete_admin_webauthn_credential_without_totp(
+                "authorized-session",
+                first,
+                1,
+                "password-hash",
+                None,
+            )
+            .unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::NotDeleted
+    );
+    database
+        .add_admin_webauthn_credential(1, "Spare", "credential-c", "{}")
+        .unwrap();
+    assert_eq!(
+        database
+            .delete_admin_webauthn_credential_without_totp(
+                "authorized-session",
+                first,
+                1,
+                "password-hash",
+                None,
+            )
+            .unwrap(),
+        AdminWebauthnCredentialDeletionOutcome::Deleted
+    );
+
+    assert_eq!(
+        database
+            .set_admin_totp_enabled_with_reauthentication(
+                "authorized-session",
+                1,
+                "password-hash",
+                "totp-secret",
+                true,
+                None,
+                None,
+            )
+            .unwrap(),
+        AdminTotpSettingOutcome::Updated
+    );
+    assert!(database.admin("admin").unwrap().unwrap().totp_enabled);
+
+    assert_eq!(
+        database.reset_admin_totp(1, "new-totp-secret").unwrap(),
+        Some("admin".into())
+    );
+    assert!(database.admin("admin").unwrap().unwrap().totp_enabled);
+    assert!(database.admin_webauthn_credentials(1).unwrap().is_empty());
 }
 
 #[test]
