@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use crate::storage_mount;
 
 pub const MOUNT_POINT: &str = "/mnt/storage";
-pub const ROOT_MOUNT_PATH: &str = "/mnt/storage/shared";
+pub const ROOT_MOUNT_PATH: &str = MOUNT_POINT;
 pub const INTERNAL_DIRECTORY: &str = "/mnt/storage/.vaultlink-internal";
 const CREDENTIAL_PATH: &str = "/etc/vaultlink/smb-credentials";
 const MOUNT_UNIT_PATH: &str = "/etc/systemd/system/mnt-storage.mount";
@@ -434,7 +434,6 @@ fn verify_active_mount(expected_source: &str) -> Result<(), CifsProvisionError> 
 
 fn verify_preprovisioned_layout() -> Result<(), CifsProvisionError> {
     for path in [
-        ROOT_MOUNT_PATH,
         INTERNAL_DIRECTORY,
         "/mnt/storage/.vaultlink-internal/uploads",
         "/mnt/storage/.vaultlink-internal/tombstones",
@@ -525,6 +524,7 @@ mod tests {
 
     #[test]
     fn generated_unit_fixes_every_audited_cifs_option() {
+        assert_eq!(ROOT_MOUNT_PATH, MOUNT_POINT);
         let unit = render_mount_unit("//server/share", 123, 456);
         for required in [
             "Type=cifs",

@@ -8,7 +8,7 @@ use std::{
 use rustix::fs::{open, statx, AtFlags, Mode, OFlags, StatxFlags};
 use thiserror::Error;
 
-use crate::config::Storage;
+use crate::{config::Storage, path_security};
 
 const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
 
@@ -267,7 +267,11 @@ fn discover_supported_mounts_from(
         let Ok(source) = mount.source.into_string() else {
             continue;
         };
-        let root_mount_path = mount.mount_point.join("shared");
+        let root_mount_path = if cifs {
+            mount.mount_point.clone()
+        } else {
+            mount.mount_point.join("shared")
+        };
         let internal_directory = mount.mount_point.join(".vaultlink-internal");
         detected.push(DetectedMount {
             mount_point: mount.mount_point,
@@ -303,6 +307,7 @@ pub fn validate_and_open(storage: &Storage) -> Result<ValidatedStorage, StorageM
         &root.canonical_path,
         &internal.canonical_path,
         &data.canonical_path,
+        storage.internal_directory_is_nested(),
     )?;
     validate_service_owned_directory_capability(&root, "root_mount_path")?;
     validate_service_owned_directory_capability(&internal, "internal_directory")?;
@@ -346,7 +351,7 @@ fn reject_unconfigured_remote_storage(
     let mount = unique_mount_for_identity(root.mount_identity, &mounts, &root.canonical_path)?;
     if is_remote_filesystem(&mount.filesystem_type) {
         return Err(mount_error(format!(
-            "remote filesystem type {:?} requires require_mount=true, an explicit mount identity, and pre-provisioned sibling staging",
+            "remote filesystem type {:?} requires require_mount=true, an explicit mount identity, and pre-provisioned private staging",
             mount.filesystem_type
         )));
     }
@@ -415,11 +420,11 @@ fn validate_identity(
             root_path.display()
         )));
     }
-    if internal_path.starts_with(root_path) || root_path.starts_with(internal_path) {
-        return Err(mount_error(
-            "internal_directory must be a sibling outside root_mount_path",
-        ));
-    }
+    validate_internal_relationship(
+        root_path,
+        internal_path,
+        storage.internal_directory_is_nested(),
+    )?;
     if !mount.read_write {
         return Err(mount_error(format!(
             "{} is mounted read-only; VaultLink storage requires a read-write mount",
@@ -605,6 +610,7 @@ fn validate_canonical_relationships(
     root: &Path,
     internal: &Path,
     data: &Path,
+    allow_nested_internal: bool,
 ) -> Result<(), StorageMountError> {
     if data.starts_with(root) {
         return Err(mount_error(format!(
@@ -613,7 +619,26 @@ fn validate_canonical_relationships(
             root.display()
         )));
     }
-    if internal.starts_with(root) || root.starts_with(internal) {
+    validate_internal_relationship(root, internal, allow_nested_internal)?;
+    Ok(())
+}
+
+fn validate_internal_relationship(
+    root: &Path,
+    internal: &Path,
+    allow_nested_internal: bool,
+) -> Result<(), StorageMountError> {
+    if allow_nested_internal {
+        let direct_reserved_child = internal.parent() == Some(root)
+            && internal
+                .file_name()
+                .is_some_and(path_security::is_internal_storage_name);
+        if !direct_reserved_child {
+            return Err(mount_error(
+                "nested internal_directory must be the direct reserved .vaultlink-internal child of root_mount_path",
+            ));
+        }
+    } else if internal.starts_with(root) || root.starts_with(internal) {
         return Err(mount_error(
             "internal_directory must resolve to a sibling outside root_mount_path",
         ));
@@ -907,7 +932,7 @@ mod tests {
                 },
                 DetectedMount {
                     mount_point: "/mnt/storage".into(),
-                    root_mount_path: "/mnt/storage/shared".into(),
+                    root_mount_path: "/mnt/storage".into(),
                     internal_directory: "/mnt/storage/.vaultlink-internal".into(),
                     filesystem_type: "cifs".into(),
                     source: "//nas.example/vault".into(),
@@ -1027,6 +1052,28 @@ mod tests {
     }
 
     #[test]
+    fn accepts_cifs_share_root_with_direct_reserved_internal_child() {
+        let mut nested = storage();
+        nested.root_mount_path = "/mnt/storage".into();
+        nested.internal_directory = Some("/mnt/storage/.vaultlink-internal".into());
+        nested.expected_mount_source = Some("//nas.example/vault".into());
+        let mounts = parse_mountinfo(
+            b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - cifs //nas.example/vault rw,vers=3.1.1,cache=strict,sign,seal,serverino\n\
+              23 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n",
+        )
+        .unwrap();
+
+        validate_identity(
+            &nested,
+            location("/mnt/storage", 41, 0, 42),
+            location("/mnt/storage/.vaultlink-internal", 41, 0, 42),
+            location("/var/lib", 23, 8, 2),
+            &mounts,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn accepts_audited_local_storage_and_sqlite_on_the_same_mount() {
         let local_mounts = parse_mountinfo(
             b"23 1 8:2 / / rw,nosuid,nodev,relatime - ext4 /dev/mapper/vaultlink rw\n",
@@ -1095,9 +1142,33 @@ mod tests {
             &root.canonicalize().unwrap(),
             &internal.canonicalize().unwrap(),
             &data_alias.canonicalize().unwrap(),
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("user-visible root_mount_path"));
+    }
+
+    #[test]
+    fn accepts_only_the_direct_reserved_child_for_nested_internal_storage() {
+        let root = Path::new("/mnt/storage");
+        assert!(validate_internal_relationship(
+            root,
+            Path::new("/mnt/storage/.vaultlink-internal"),
+            true,
+        )
+        .is_ok());
+        assert!(validate_internal_relationship(
+            root,
+            Path::new("/mnt/storage/data/.vaultlink-internal"),
+            true,
+        )
+        .is_err());
+        assert!(validate_internal_relationship(
+            root,
+            Path::new("/mnt/storage/.vaultlink-internal"),
+            false,
+        )
+        .is_err());
     }
 
     #[test]

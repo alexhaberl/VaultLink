@@ -96,7 +96,7 @@ Startregeln:
 - `standalone_tls` + `certificate_source = "files"`: Production, HTTPS-URL, TLS aktiv, Zertifikat und Key vorhanden; optionaler SIGHUP-Reload.
 - `standalone_tls` + `certificate_source = "letsencrypt"`: Production, HTTPS-URL, TLS aktiv, Reverse Proxy aus, DNS-Domain in `public_base_url`, Kontakt-E-Mail und sicherer ACME-Cache innerhalb `data_directory`.
 
-Jeder Production-Modus verlangt `require_mount = true`, ein pre-provisioniertes privates Geschwisterverzeichnis sowie die exakte aktive Mount-Quelle und den Dateisystemtyp. Damit startet auch eine alte Production-Konfiguration nicht auf einem leeren lokalen Fallback, wenn ihr eigentliches Mount ausgefallen ist. Für lokalen Storage kann die Policy beispielsweise so aussehen:
+Jeder Production-Modus verlangt `require_mount = true`, ein pre-provisioniertes privates internes Verzeichnis sowie die exakte aktive Mount-Quelle und den Dateisystemtyp. Damit startet auch eine alte Production-Konfiguration nicht auf einem leeren lokalen Fallback, wenn ihr eigentliches Mount ausgefallen ist. Für lokalen Storage bleibt das interne Verzeichnis ein Geschwisterpfad; die Policy kann beispielsweise so aussehen:
 
 ```toml
 [storage]
@@ -116,20 +116,20 @@ expected_mount_source = "/dev/mapper/vaultlink"
 
 ### Externer SMB-Server mit Standardclients
 
-VaultLink hostet keinen SMB-Server. Es mountet als Linux-SMB-Client einen bestehenden Server-Baum; Windows-, macOS- und Linux-Clients greifen weiterhin direkt und ohne VaultLink-Zusatzsoftware auf den Ordner `shared/` dieses Servers zu:
+VaultLink hostet keinen SMB-Server. Es mountet als Linux-SMB-Client ein bestehendes Share; Windows-, macOS- und Linux-Clients greifen weiterhin direkt und ohne VaultLink-Zusatzsoftware auf dessen Root zu:
 
 ```text
-//fileserver.example/vaultlink  ->  /mnt/storage
-├── shared/                     -> root_mount_path, normale SMB-Clients schreibbar
+//fileserver.example/vaultlink  ->  /mnt/storage = root_mount_path
+├── <Benutzerdaten direkt im Share-Root, normale SMB-Clients schreibbar>
 └── .vaultlink-internal/        -> internal_directory, nur VaultLink-SMB-Konto
     ├── .vaultlink-instance.lock
     ├── uploads/
     └── tombstones/
 ```
 
-Die drei internen Verzeichnisse müssen **vor dem ersten Start serverseitig** provisioniert werden. Ihre Server-ACL erlaubt ausschließlich dem separaten VaultLink-SMB-Dienstkonto Lesen, Schreiben, Löschen und Umbenennen. Co-Writer erhalten Modify-Rechte ausschließlich unter `shared/`, aber keine administrativen Rechte auf Share-Root oder Mount-Basis. Für `.vaultlink-internal` müssen Lesen, Schreiben, Löschen, Umbenennen, Parent-`DELETE_CHILD`, ACL-/Owner-Änderungen (`WRITE_DAC`/`WRITE_OWNER`) sowie `chmod`/`chown`/`setfacl`-Äquivalente verweigert sein. Die lokal sichtbaren CIFS-Modi `0700`/`0600` sind nur eine zusätzliche Prüfung und kein Beweis für diese Server-ACL.
+Die drei internen Verzeichnisse müssen **vor dem ersten Start serverseitig** provisioniert werden. Ihre Server-ACL erlaubt ausschließlich dem separaten VaultLink-SMB-Dienstkonto Lesen, Schreiben, Löschen und Umbenennen. Co-Writer erhalten die benötigten Modify-Rechte für Benutzerdaten direkt im Share-Root, aber keine administrativen Rechte. Für `.vaultlink-internal` müssen Lesen, Schreiben, Löschen, Umbenennen, Parent-`DELETE_CHILD`, ACL-/Owner-Änderungen (`WRITE_DAC`/`WRITE_OWNER`) sowie `chmod`/`chown`/`setfacl`-Äquivalente verweigert sein. VaultLink reserviert den Namen einschließlich case-insensitiver SMB-Aliasse, filtert ihn aus allen Listings und Scans und verbietet in diesem Layout jede Symlink-Auflösung. Die lokal sichtbaren CIFS-Modi `0700`/`0600` sind nur eine zusätzliche Prüfung und kein Beweis für diese Server-ACL.
 
-Pro Storage-Root darf genau **eine** VaultLink-Serverinstanz aktiv sein. Die Lock-Domain ist deshalb nicht frei wählbar: Development verwendet ausschließlich `<root_mount_path>/.vaultlink-internal`, bei `require_mount = true` muss `internal_directory` exakt der direkte private Geschwisterpfad `<root-parent>/.vaultlink-internal` sein. Vor Storage-Mutationsproben, Journal-Recovery und Fragment-Cleanup öffnet VaultLink dort `.vaultlink-instance.lock`, prüft die Lock-Semantik mit zwei unabhängigen Deskriptoren und erwirbt einen exklusiven, nicht blockierenden Linux-`flock` bis zum Ende der Serverlaufzeit. Dieselbe bereits gesperrte Internal-Directory-Capability wird an SecureFS übergeben; Device/Inode des konfigurierten Pfads werden vor jeder Startup-Mutation erneut dagegen geprüft, sodass ein Verzeichnistausch während des Handoffs fail-closed endet. Eine zweite Instanz beendet den Start mit einer klaren Fehlermeldung. Active/active-Replikate, Rolling Starts mit überlappenden Prozessen oder getrennte Kopien des internen Verzeichnisses sind nicht unterstützt. Alle Prozesse für dasselbe sichtbare Storage müssen denselben kanonischen Pfad im selben kohärenten Kernel-/SMB-Lock-Domain sehen; ein nur gleichnamiger Pfad auf einem anderen Mount oder Host schützt die Journals nicht. Die Server-ACL muss außerdem verhindern, dass Co-Writer die Lockdatei löschen oder ersetzen.
+Pro Storage-Root darf genau **eine** VaultLink-Serverinstanz aktiv sein. Die Lock-Domain ist deshalb nicht frei wählbar: CIFS mit direktem Share-Root und Development verwenden ausschließlich `<root_mount_path>/.vaultlink-internal`; andere erforderliche Mounts verwenden den direkten privaten Geschwisterpfad `<root-parent>/.vaultlink-internal`. Vor Storage-Mutationsproben, Journal-Recovery und Fragment-Cleanup öffnet VaultLink dort `.vaultlink-instance.lock`, prüft die Lock-Semantik mit zwei unabhängigen Deskriptoren und erwirbt einen exklusiven, nicht blockierenden Linux-`flock` bis zum Ende der Serverlaufzeit. Dieselbe bereits gesperrte Internal-Directory-Capability wird an SecureFS übergeben; Device/Inode des konfigurierten Pfads werden vor jeder Startup-Mutation erneut dagegen geprüft, sodass ein Verzeichnistausch während des Handoffs fail-closed endet. Eine zweite Instanz beendet den Start mit einer klaren Fehlermeldung. Active/active-Replikate, Rolling Starts mit überlappenden Prozessen oder getrennte Kopien des internen Verzeichnisses sind nicht unterstützt. Alle Prozesse für dasselbe sichtbare Storage müssen denselben kanonischen Pfad im selben kohärenten Kernel-/SMB-Lock-Domain sehen; ein nur gleichnamiger Pfad auf einem anderen Mount oder Host schützt die Journals nicht. Die Server-ACL muss außerdem verhindern, dass Co-Writer die Lockdatei löschen oder ersetzen.
 
 Für den auditierten Co-Writer-Modus gelten:
 
@@ -327,7 +327,7 @@ sudo systemctl daemon-reload
 
 ### CIFS-Mount sicher provisionieren
 
-Vorher auf dem SMB-Server `shared/` und `.vaultlink-internal/{uploads,tombstones}` mit den oben beschriebenen Server-ACLs anlegen. Der Linux-Client kann diese ACL-Grenze nicht zuverlässig beweisen und legt die Verzeichnisse deshalb nicht ersatzweise mit nur lokalen Modusbits an.
+Vorher auf dem SMB-Server `.vaultlink-internal/{uploads,tombstones}` mit den oben beschriebenen Server-ACLs anlegen. Benutzerdaten bleiben direkt im Share-Root. Der Linux-Client kann diese ACL-Grenze nicht zuverlässig beweisen und legt die internen Verzeichnisse deshalb nicht ersatzweise mit nur lokalen Modusbits an.
 
 Danach als Root den Mount provisionieren; das Passwort wird ausschließlich interaktiv vom Terminal gelesen und ist kein CLI-Argument:
 
@@ -340,7 +340,7 @@ sudo /opt/vaultlink/vaultlink provision-cifs \
 
 Der Befehl ist absichtlich auf `/mnt/storage` begrenzt. Er erstellt ausschließlich neue Dateien und verweigert das Überschreiben vorhandener Credentials oder systemd-Units. Die Credential-Datei erhält `root:root 0600`; die Mount-Unit erzwingt `vers=3.1.1`, Signing, Verschlüsselung, `cache=strict`, `serverino`, `nosuid`, `nodev` und `noexec`. Bei Aktivierungs-, Identitäts-, Options- oder Layoutfehlern stoppt er die Unit und entfernt die von diesem Versuch neu angelegten Dateien.
 
-Nach erfolgreichem Mount erkennt das Browser-Setup aktive unterstützte lokale Mounts sowie sichere CIFS/SMB3-Mounts. Bei genau einem vollständig vorbereiteten Mount werden der sichtbare `shared`-Pfad, `.vaultlink-internal`, Dateisystemtyp und die intern geprüfte Mount-Quelle automatisch übernommen. Bei mehreren Mounts erscheint eine Auswahl; eine laufende Setup-Seite kann die Liste über „Mounts aktualisieren“ neu laden. Die Mount-Quelle wird absichtlich nicht als frei editierbares GUI-Feld angeboten.
+Nach erfolgreichem Mount erkennt das Browser-Setup aktive unterstützte lokale Mounts sowie sichere CIFS/SMB3-Mounts. Bei CIFS wird das Share-Root direkt als sichtbarer Root übernommen; lokale Mounts verwenden weiterhin `shared/` mit privatem Geschwisterpfad. `.vaultlink-internal`, Dateisystemtyp und die intern geprüfte Mount-Quelle werden automatisch gesetzt. Bei mehreren Mounts erscheint eine Auswahl; eine laufende Setup-Seite kann die Liste über „Mounts aktualisieren“ neu laden. Die Mount-Quelle wird absichtlich nicht als frei editierbares GUI-Feld angeboten.
 
 ### Erstkonfiguration im Browser über SSH-Tunnel
 
@@ -452,7 +452,7 @@ make run
 - Built-in ACME scheitert: DNS muss auf den Server zeigen, VaultLink muss selbst Port 443 terminieren, Nginx/Caddy darf nicht davor laufen.
 - 403 bei Datei: Pfadvalidierung oder Symlink-Grenze greift.
 - Upload 409: Standard ist no-overwrite. Ohne externe Writer kann Ersetzen pro Upload-Link freigegeben und pro Upload bestätigt werden; im Co-Writer-Modus bleibt es gesperrt.
-- SMB-Start verweigert: Mount-Quelle/-Typ und Optionen in `/proc/self/mountinfo`, vorhandene sibling-Verzeichnisse, Modus `0700`, Server-ACL sowie das lokale SQLite-Dateisystem prüfen.
+- SMB-Start verweigert: Mount-Quelle/-Typ und Optionen in `/proc/self/mountinfo`, vorhandenes reserviertes `.vaultlink-internal`-Layout, Modus `0700`, Server-ACL sowie das lokale SQLite-Dateisystem prüfen.
 - TLS nach Renewal alt: `systemctl status vaultlink`, PEM-Rechte und Journal prüfen.
 
 ## Lizenz

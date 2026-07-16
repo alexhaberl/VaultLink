@@ -7,7 +7,8 @@
 # grant only the VaultLink SMB account access and deny every co-writer read,
 # write, delete, rename, parent DELETE_CHILD, WRITE_DAC/WRITE_OWNER, chmod,
 # chown, setfacl, and share-root administrative rights. Co-writers receive
-# Modify rights only within shared/.
+# Modify rights for user data in the share root, with explicit deny ACLs for
+# the reserved .vaultlink-internal child.
 [Unit]
 Description=External SMB storage for VaultLink
 Wants=network-online.target

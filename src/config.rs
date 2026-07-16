@@ -589,6 +589,17 @@ impl Storage {
     pub fn replacements_allowed(&self) -> bool {
         !self.external_writers || self.allow_external_writer_replace
     }
+
+    pub fn internal_directory_is_nested(&self) -> bool {
+        self.require_mount
+            && self.internal_directory.as_ref().is_some_and(|internal| {
+                internal == &self.root_mount_path.join(DEFAULT_INTERNAL_DIRECTORY_NAME)
+            })
+    }
+
+    pub fn forbid_user_symlinks(&self) -> bool {
+        self.external_writers || self.internal_directory_is_nested()
+    }
 }
 
 fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(), ConfigError> {
@@ -631,13 +642,25 @@ fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(),
             "require_mount=true requires an absolute internal_directory".into(),
         ));
     }
-    if storage.require_mount
-        && (internal_directory.starts_with(&storage.root_mount_path)
-            || storage.root_mount_path.starts_with(internal_directory))
-    {
-        return Err(ConfigError::Invalid(
-            "internal_directory must be a sibling outside the user-visible root_mount_path".into(),
-        ));
+    let nested_internal = storage.internal_directory_is_nested();
+    if storage.require_mount {
+        let paths_overlap = internal_directory.starts_with(&storage.root_mount_path)
+            || storage.root_mount_path.starts_with(internal_directory);
+        if paths_overlap && !nested_internal {
+            return Err(ConfigError::Invalid(
+                "internal_directory must be either the canonical private sibling or the direct reserved child of a CIFS root_mount_path".into(),
+            ));
+        }
+        if nested_internal
+            && !matches!(
+                storage.expected_filesystem_type.as_deref(),
+                Some("cifs" | "smb3")
+            )
+        {
+            return Err(ConfigError::Invalid(
+                "an internal_directory nested below root_mount_path is supported only by the audited cifs/smb3 mount policy".into(),
+            ));
+        }
     }
     if !storage.require_mount {
         if storage.expected_filesystem_type.is_some() || storage.expected_mount_source.is_some() {
@@ -654,18 +677,24 @@ fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(),
             "require_mount=true requires absolute root_mount_path and data_directory paths".into(),
         ));
     }
-    let canonical_lock_domain = storage
-        .root_mount_path
-        .parent()
-        .map(|parent| parent.join(DEFAULT_INTERNAL_DIRECTORY_NAME))
-        .ok_or_else(|| {
-            ConfigError::Invalid(
-                "root_mount_path needs a parent directory for the private lock domain".into(),
-            )
-        })?;
+    let canonical_lock_domain = if nested_internal {
+        storage
+            .root_mount_path
+            .join(DEFAULT_INTERNAL_DIRECTORY_NAME)
+    } else {
+        storage
+            .root_mount_path
+            .parent()
+            .map(|parent| parent.join(DEFAULT_INTERNAL_DIRECTORY_NAME))
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "root_mount_path needs a parent directory for the private lock domain".into(),
+                )
+            })?
+    };
     if internal_directory != canonical_lock_domain {
         return Err(ConfigError::Invalid(format!(
-            "internal_directory must be the canonical private sibling {} so one storage root cannot use multiple lock domains",
+            "internal_directory must be the canonical private lock domain {} so one storage root cannot use multiple lock domains",
             canonical_lock_domain.display()
         )));
     }
@@ -978,6 +1007,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires external_writers=true"));
+    }
+
+    #[test]
+    fn cifs_may_use_only_the_reserved_internal_child_below_the_visible_root() {
+        let mut config = base();
+        config.storage.root_mount_path = "/mnt/storage".into();
+        config.storage.data_directory = "/var/lib/vaultlink".into();
+        config.storage.internal_directory = Some("/mnt/storage/.vaultlink-internal".into());
+        config.storage.require_mount = true;
+        config.storage.expected_filesystem_type = Some("cifs".into());
+        config.storage.expected_mount_source = Some("//nas.example/vaultlink".into());
+        config.validate().unwrap();
+        assert!(config.storage.internal_directory_is_nested());
+        assert!(config.storage.forbid_user_symlinks());
+
+        config.storage.expected_filesystem_type = Some("ext4".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("supported only by the audited cifs/smb3"));
+
+        config.storage.expected_filesystem_type = Some("cifs".into());
+        config.storage.internal_directory = Some("/mnt/storage/data/.vaultlink-internal".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]

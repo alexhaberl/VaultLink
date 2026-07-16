@@ -150,7 +150,7 @@ impl AppState {
             &config.storage.root_mount_path,
             config.storage.internal_directory.as_deref(),
             config.storage.require_mount,
-            config.storage.external_writers,
+            config.storage.forbid_user_symlinks(),
             config.storage.replacements_allowed(),
             storage_instance_lock.clone(),
         )
@@ -742,7 +742,7 @@ mod tests {
             &storage.root_mount_path,
             storage.internal_directory.as_deref(),
             storage.require_mount,
-            storage.external_writers,
+            storage.forbid_user_symlinks(),
             storage.replacements_allowed(),
             first_lock,
         ) {
@@ -776,7 +776,7 @@ mod tests {
             &storage.root_mount_path,
             storage.internal_directory.as_deref(),
             storage.require_mount,
-            storage.external_writers,
+            storage.forbid_user_symlinks(),
             storage.replacements_allowed(),
             lock,
         ) {

@@ -725,13 +725,18 @@ impl SecureRoot {
         };
         let internal = Arc::new(internal);
         let canonical_internal = internal_path.canonicalize()?;
+        let nested_reserved_internal = canonical_internal.parent() == Some(display_root.as_path())
+            && canonical_internal
+                .file_name()
+                .is_some_and(crate::path_security::is_internal_storage_name);
         if require_preprovisioned_internal
-            && (canonical_internal.starts_with(&display_root)
-                || display_root.starts_with(&canonical_internal))
+            && (display_root.starts_with(&canonical_internal)
+                || (canonical_internal.starts_with(&display_root)
+                    && !(forbid_user_symlinks && nested_reserved_internal)))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "external-writer internal storage must be outside the user-visible storage root",
+                "preprovisioned internal storage must be either outside the visible root or its direct reserved child with symlink traversal disabled",
             ));
         }
         if internal.metadata()?.dev() != directory.metadata()?.dev() {
@@ -2128,6 +2133,37 @@ mod tests {
         symlink("../.vaultlink-internal", shared.join("leak")).unwrap();
 
         assert!(root.bind_directory("leak/uploads").is_err());
+    }
+
+    #[test]
+    fn nested_reserved_internal_storage_is_filtered_and_unreachable() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let shared = tempfile::tempdir().unwrap();
+        let internal = shared.path().join(INTERNAL_DIRECTORY_NAME);
+        std::fs::create_dir(&internal).unwrap();
+        std::fs::create_dir(internal.join(UPLOAD_STAGING_DIRECTORY_NAME)).unwrap();
+        std::fs::create_dir(internal.join(TOMBSTONE_STAGING_DIRECTORY_NAME)).unwrap();
+        for path in [
+            internal.as_path(),
+            &internal.join(UPLOAD_STAGING_DIRECTORY_NAME),
+            &internal.join(TOMBSTONE_STAGING_DIRECTORY_NAME),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(shared.path().join("document.txt"), b"visible").unwrap();
+        symlink(
+            INTERNAL_DIRECTORY_NAME,
+            shared.path().join("internal-alias"),
+        )
+        .unwrap();
+
+        let root = SecureRoot::open_configured(shared.path(), Some(&internal), true, true).unwrap();
+        let entries = root.list("", 0, 100).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "document.txt");
+        assert!(root.metadata(INTERNAL_DIRECTORY_NAME).is_err());
+        assert!(root.bind_directory("internal-alias/uploads").is_err());
     }
 
     #[test]
