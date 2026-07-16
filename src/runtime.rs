@@ -360,7 +360,10 @@ mod tests {
             storage: Storage {
                 root_mount_path: ".".into(),
                 data_directory: ".".into(),
-                internal_directory: None,
+                internal_directory: Some(
+                    std::path::PathBuf::from(".")
+                        .join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME),
+                ),
                 require_mount: false,
                 external_writers: false,
                 expected_filesystem_type: None,

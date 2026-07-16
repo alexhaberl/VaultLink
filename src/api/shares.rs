@@ -14,13 +14,14 @@ use crate::{
     },
     file_ops,
     http_auth::{
-        csrf_header, current_audit_client_ip, database, hash_password_admitted, required_database,
-        runtime_settings, session, MissingSession,
+        csrf_header, current_audit_client_ip, database, hash_password_admitted, runtime_settings,
+        session, MissingSession,
     },
     runtime::RuntimeSettings,
     sensitive::SecretString,
     services::share::{
-        CreateShareCommand, SharePasswordInput, ShareService, ShareServiceError, ShareTarget,
+        CreateShareCommand, ShareAuthorityMutation, SharePasswordInput, ShareService,
+        ShareServiceError, ShareTarget,
     },
     AppState,
 };
@@ -133,6 +134,7 @@ pub(super) async fn create_share(
     let storage_guard = file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
         .await
         .map_err(storage_recovery_api_error)?;
+    let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
     let metadata = state
         .secure_root
         .metadata(&rel)
@@ -181,17 +183,17 @@ pub(super) async fn create_share(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    required_database(state.db.clone(), move |_| {
-        // The database task is not cancelled with the request. Retain the
-        // storage lock in the task so rename/delete cannot interleave after
-        // the target metadata check and create a share for a stale path.
-        let _storage_guard = storage_guard;
-        service
-            .create(prepared, password_hash, &audit_context)
-            .map(drop)
-            .map_err(share_database_error)
-    })
-    .await?;
+    authority_mutation
+        .commit(move |_| {
+            // The database task is not cancelled with the request. The authority
+            // mutation retains the storage lock so rename/delete cannot interleave
+            // after the target metadata check and create a share for a stale path.
+            service
+                .create(prepared, password_hash, &audit_context)
+                .map(drop)
+                .map_err(share_database_error)
+        })
+        .await?;
     let share = database(state.db.clone(), move |db| db.share_by_token(&token))
         .await?
         .ok_or_else(|| ApiError::internal(()))?;
@@ -218,13 +220,15 @@ pub(super) async fn update_share(
         && request.upload_conflict_strategy.is_none()
         && request.max_upload_total_size.is_none()
         && request.max_upload_files.is_none();
-    let current_share = find_share_by_id(&state, id).await?;
     if no_changes {
+        let current_share = find_share_by_id(&state, id).await?;
         return Ok(Json(share_response(
             &runtime_settings(&state),
             current_share,
         )));
     }
+    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let current_share = find_share_by_id(&state, id).await?;
     if request
         .upload_conflict_strategy
         .as_ref()
@@ -308,17 +312,18 @@ pub(super) async fn update_share(
             Some(format!("bytes={total};files={files}")),
         ));
     }
-    let outcome = required_database(state.db.clone(), move |db| {
-        db.update_share_controls_and_audit(
-            id,
-            active,
-            strategy_for_db.as_ref(),
-            upload_limits,
-            &audit_context,
-            &audit_events,
-        )
-    })
-    .await?;
+    let outcome = authority_mutation
+        .commit(move |db| {
+            db.update_share_controls_and_audit(
+                id,
+                active,
+                strategy_for_db.as_ref(),
+                upload_limits,
+                &audit_context,
+                &audit_events,
+            )
+        })
+        .await?;
     match outcome {
         ShareControlsUpdateOutcome::Updated => {}
         ShareControlsUpdateOutcome::NotFound => {
@@ -368,19 +373,21 @@ async fn set_share_active_api(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let changed = required_database(state.db.clone(), move |db| {
-        db.set_share_active_and_audit(
-            id,
-            active,
-            &audit_context,
-            if active {
-                "share_activated"
-            } else {
-                "share_deactivated"
-            },
-        )
-    })
-    .await?;
+    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let changed = authority_mutation
+        .commit(move |db| {
+            db.set_share_active_and_audit(
+                id,
+                active,
+                &audit_context,
+                if active {
+                    "share_activated"
+                } else {
+                    "share_deactivated"
+                },
+            )
+        })
+        .await?;
     if !changed {
         return Err(ApiError::not_found("Freigabe nicht gefunden"));
     }
@@ -401,10 +408,10 @@ pub(super) async fn delete_share(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let deleted = required_database(state.db.clone(), move |db| {
-        db.delete_share_and_audit(id, &audit_context)
-    })
-    .await?;
+    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let deleted = authority_mutation
+        .commit(move |db| db.delete_share_and_audit(id, &audit_context))
+        .await?;
     if !deleted {
         return Err(ApiError::not_found("Freigabe nicht gefunden"));
     }
@@ -436,10 +443,12 @@ pub(super) async fn set_share_password(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let changed = required_database(state.db.clone(), move |db| {
-        db.set_share_password_and_audit(id, Some(&hash), &audit_context, "share_password_set")
-    })
-    .await?;
+    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let changed = authority_mutation
+        .commit(move |db| {
+            db.set_share_password_and_audit(id, Some(&hash), &audit_context, "share_password_set")
+        })
+        .await?;
     if !changed {
         return Err(ApiError::not_found("Freigabe nicht gefunden"));
     }
@@ -509,10 +518,12 @@ pub(super) async fn remove_share_password(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let changed = required_database(state.db.clone(), move |db| {
-        db.set_share_password_and_audit(id, None, &audit_context, "share_password_removed")
-    })
-    .await?;
+    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let changed = authority_mutation
+        .commit(move |db| {
+            db.set_share_password_and_audit(id, None, &audit_context, "share_password_removed")
+        })
+        .await?;
     if !changed {
         return Err(ApiError::not_found("Freigabe nicht gefunden"));
     }

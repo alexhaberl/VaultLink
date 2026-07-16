@@ -64,7 +64,7 @@ curl -sS -f -X POST "http://$SETUP_ADDR/" \
     --data-urlencode "public_base_url=http://localhost:18080" \
     --data-urlencode "root_mount_path=$ROOT_DIR" \
     --data-urlencode "data_directory=$DATA_DIR" \
-    --data-urlencode "internal_directory=" \
+    --data-urlencode "internal_directory=$ROOT_DIR/.vaultlink-internal" \
     --data-urlencode "expected_filesystem_type=" \
     --data-urlencode "expected_mount_source=" \
     --data-urlencode "max_upload_size_mb=100" \
@@ -101,6 +101,25 @@ test -s "$DATA_DIR/data.sqlite"
 test ! -e "$DATA_DIR/.vaultlink-initial-setup.pending"
 grep -q 'mode = "development"' "$CONFIG_PATH"
 grep -q "root_mount_path" "$CONFIG_PATH"
+
+# Upgrade/rollback preflight must fail closed on every storage field that
+# became mandatory in 0.5.0, while the current setup process is still running.
+for required_storage_field in internal_directory require_mount external_writers; do
+    incomplete_config="$WORK_DIR/missing-$required_storage_field.toml"
+    incomplete_log="$WORK_DIR/missing-$required_storage_field.log"
+    sed "/^${required_storage_field}[[:space:]]*=/d" \
+        "$CONFIG_PATH" >"$incomplete_config"
+    if "$BIN" readiness-target --config "$incomplete_config" \
+        >"$incomplete_log" 2>&1; then
+        echo "readiness-target accepted missing storage.$required_storage_field" >&2
+        exit 1
+    fi
+    grep -F -q "$required_storage_field" "$incomplete_log" || {
+        echo "readiness-target did not identify missing storage.$required_storage_field" >&2
+        cat "$incomplete_log" >&2
+        exit 1
+    }
+done
 
 cleanup
 unset SETUP_PID

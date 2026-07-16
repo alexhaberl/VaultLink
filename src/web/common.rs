@@ -218,9 +218,7 @@ pub(super) fn extension_is_blocked(name: &str, blocked: &[String]) -> bool {
 }
 
 pub(super) fn add_upload_bytes(total: u64, chunk: usize, maximum: u64) -> Option<u64> {
-    total
-        .checked_add(chunk as u64)
-        .filter(|new_total| *new_total <= maximum)
+    policy::add_upload_bytes(total, chunk as u64, maximum).ok()
 }
 
 pub(super) fn encoded(value: &str) -> String {

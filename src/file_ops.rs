@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::{
     db::AuditContext,
     path_security,
-    secure_fs::{EntryKind, EntryStatus, FileOperationRecovery, SecureRoot, UploadFragmentCleanup},
+    secure_fs::{EntryKind, EntryStatus, FileOperationRecovery, SecureRoot},
     AppState,
 };
 
@@ -20,12 +20,6 @@ impl AuditDurability {
         self == Self::Uncertain
     }
 }
-
-const CLEANUP_BATCH_ENTRIES: usize = 4096;
-#[cfg(not(test))]
-const CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-#[cfg(test)]
-const CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub enum FileOperationError {
@@ -232,8 +226,7 @@ pub async fn delete(
     let guard = state.storage_mutation.clone().lock_owned().await;
     let guard = recover_pending_file_operations_with_guard(state, guard).await?;
     let secure_root = state.secure_root.clone();
-    let cleanup_root = secure_root.clone();
-    let cleanup_lock = state.storage_cleanup.clone();
+    let cleanup = state.storage_cleanup.clone();
     let database = state.db.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _storage_guard = guard;
@@ -305,11 +298,12 @@ pub async fn delete(
                 });
             }
         };
-        if let Some(tombstone_path) = committed.tombstone_path {
-            // Enqueue cleanup from the non-cancellable blocking finalizer. If
-            // the HTTP future is dropped, a journal-free tombstone must not be
-            // stranded until the next process restart.
-            spawn_deletion_cleanup(cleanup_root, cleanup_lock, tombstone_path);
+        if committed.tombstone_path.is_some() {
+            // Signal from the non-cancellable blocking finalizer. If the HTTP
+            // future is dropped, the journal-free tombstone is still visible
+            // to the process-wide worker. Requests are coalesced; the durable
+            // tombstones themselves are the work list.
+            cleanup.request_cleanup();
         }
         Ok::<_, FileOperationError>(DeleteResult {
             path: original_path,
@@ -340,18 +334,17 @@ pub(crate) async fn recover_pending_file_operations_with_guard(
 ) -> Result<tokio::sync::OwnedMutexGuard<()>, FileOperationError> {
     let secure_root = state.secure_root.clone();
     let database = state.db.clone();
-    let cleanup_root = secure_root.clone();
-    let cleanup_lock = state.storage_cleanup.clone();
+    let cleanup = state.storage_cleanup.clone();
     let guard = tokio::task::spawn_blocking(move || {
         // spawn_blocking tasks continue after their awaiting request is
         // cancelled. Owning the guard here keeps recovery serialized until the
         // task has actually finished.
         let cleanup_paths = recover_pending_file_operations_blocking(&secure_root, &database)?;
-        for tombstone_path in cleanup_paths {
-            // Schedule before returning the guard/result: spawn_blocking keeps
+        if !cleanup_paths.is_empty() {
+            // Signal before returning the guard/result: spawn_blocking keeps
             // running after request cancellation, while code after `.await`
             // would be skipped with its result discarded.
-            spawn_deletion_cleanup(cleanup_root.clone(), cleanup_lock.clone(), tombstone_path);
+            cleanup.request_cleanup();
         }
         Ok::<_, FileOperationError>(guard)
     })
@@ -497,80 +490,6 @@ fn map_delete_commit_io(error: io::Error, original_path: &str) -> FileOperationE
     map_io(error)
 }
 
-fn spawn_deletion_cleanup(
-    secure_root: SecureRoot,
-    cleanup_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-    tombstone_path: String,
-) {
-    tokio::spawn(async move {
-        loop {
-            let cleanup_guard = cleanup_lock.clone().lock_owned().await;
-            let start_root = secure_root.clone();
-            let start_path = tombstone_path.clone();
-            let cleanup = tokio::task::spawn_blocking(move || {
-                let cleanup = start_root
-                    .start_deletion_cleanup(&start_path)
-                    .or_else(|_| start_root.start_upload_fragment_cleanup());
-                (cleanup_guard, cleanup)
-            })
-            .await;
-            let (cleanup_guard, cleanup) = match cleanup {
-                Ok((cleanup_guard, Ok(cleanup))) => (cleanup_guard, cleanup),
-                Ok((_cleanup_guard, Err(error))) => {
-                    tracing::warn!(%error, %tombstone_path, "could not start deletion cleanup");
-                    tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, %tombstone_path, "deletion cleanup task failed to start");
-                    tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
-                    continue;
-                }
-            };
-            if run_cleanup(cleanup, &tombstone_path, cleanup_guard).await {
-                return;
-            }
-            tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
-        }
-    });
-}
-
-async fn run_cleanup(
-    mut cleanup: UploadFragmentCleanup,
-    tombstone_path: &str,
-    mut cleanup_guard: tokio::sync::OwnedMutexGuard<()>,
-) -> bool {
-    let mut failures = 0usize;
-    loop {
-        let result = tokio::task::spawn_blocking(move || {
-            let batch = cleanup.run_batch(CLEANUP_BATCH_ENTRIES);
-            (cleanup, cleanup_guard, batch)
-        })
-        .await;
-        let batch = match result {
-            Ok((next, next_guard, Ok(batch))) => {
-                cleanup = next;
-                cleanup_guard = next_guard;
-                batch
-            }
-            Ok((_next, _cleanup_guard, Err(error))) => {
-                tracing::warn!(%error, %tombstone_path, "could not continue deletion cleanup");
-                return false;
-            }
-            Err(error) => {
-                tracing::warn!(%error, %tombstone_path, "deletion cleanup worker failed");
-                return false;
-            }
-        };
-        failures = failures.saturating_add(batch.failed);
-        if batch.complete {
-            tracing::info!(%tombstone_path, removed = batch.removed, failed = failures, "deletion cleanup completed");
-            return failures == 0;
-        }
-        tokio::task::yield_now().await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -593,7 +512,7 @@ mod tests {
             storage: Storage {
                 root_mount_path: root.into(),
                 data_directory: data.into(),
-                internal_directory: None,
+                internal_directory: Some(root.join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)),
                 require_mount: false,
                 external_writers: false,
                 expected_filesystem_type: None,
@@ -951,16 +870,24 @@ mod tests {
             )
             .unwrap();
 
-        // Hold the worker until the synchronous result and durable tombstone can
-        // be asserted. Two start errors cover both the targeted cleanup and its
-        // broad cleanup fallback; the following attempt fails in run_batch.
-        let cleanup_guard = state.storage_cleanup.lock().await;
+        // Hold the sole worker until the synchronous result and durable
+        // tombstone can be asserted. Its first broad scan fails to start; the
+        // following attempt fails in run_batch.
+        let cleanup_guard = state
+            .storage_cleanup
+            .serialization_for_test()
+            .lock_owned()
+            .await;
         state
             .secure_root
-            .fail_next_cleanup_starts(io::ErrorKind::Other, 2);
+            .fail_next_cleanup_starts(io::ErrorKind::Other, 1);
         state
             .secure_root
             .fail_next_cleanup_batch(io::ErrorKind::Other);
+        let cleanup_worker = state
+            .storage_cleanup
+            .start_worker(state.secure_root.clone())
+            .unwrap();
 
         let result = delete(&state, "tree", Some("tree"), AuditContext::system())
             .await
@@ -989,10 +916,11 @@ mod tests {
             tombstone_paths(root.path()).is_empty(),
             "cleanup did not recover after injected start and batch failures"
         );
+        cleanup_worker.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_cleanup_task_keeps_mutex_until_blocking_batch_returns() {
+    async fn cleanup_shutdown_waits_for_a_running_blocking_batch() {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let state = test_state(root.path(), data.path());
@@ -1002,10 +930,66 @@ mod tests {
             entered_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         });
-        let cleanup = state.secure_root.start_upload_fragment_cleanup().unwrap();
-        let cleanup_guard = state.storage_cleanup.clone().lock_owned().await;
-        let worker = tokio::spawn(run_cleanup(cleanup, "test-cleanup", cleanup_guard));
+        let worker = state
+            .storage_cleanup
+            .start_worker(state.secure_root.clone())
+            .unwrap();
 
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("cleanup batch did not reach the test hook");
+        })
+        .await
+        .unwrap();
+        let mut shutdown = tokio::spawn(worker.shutdown());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned before the running blocking batch finished"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut shutdown)
+            .await
+            .expect("cleanup worker did not stop after the blocking batch returned")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.storage_cleanup.serialization_for_test().lock_owned(),
+        )
+        .await
+        .expect("cleanup mutex was not released after the worker stopped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_shutdown_does_not_launch_the_next_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let upload_staging = root
+            .path()
+            .join(crate::config::DEFAULT_INTERNAL_DIRECTORY_NAME)
+            .join("uploads");
+        for index in 0..=crate::storage_cleanup::CLEANUP_BATCH_ENTRIES {
+            std::fs::write(
+                upload_staging.join(format!(".vaultlink-{index:024}.part")),
+                b"",
+            )
+            .unwrap();
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        state.secure_root.before_next_cleanup_batch(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let worker = state
+            .storage_cleanup
+            .start_worker(state.secure_root.clone())
+            .unwrap();
         tokio::task::spawn_blocking(move || {
             entered_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
@@ -1013,24 +997,124 @@ mod tests {
         })
         .await
         .unwrap();
-        worker.abort();
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                state.storage_cleanup.clone().lock_owned(),
-            )
-            .await
-            .is_err(),
-            "cancelling the async wrapper released the cleanup mutex early"
-        );
 
+        worker.request_shutdown();
+        let mut join = tokio::spawn(worker.join());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut join)
+                .await
+                .is_err(),
+            "shutdown returned before the active batch finished"
+        );
         release_tx.send(()).unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            state.storage_cleanup.clone().lock_owned(),
-        )
-        .await
-        .expect("cleanup mutex was not released after the blocking batch returned");
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut join)
+            .await
+            .expect("cleanup worker did not stop after the active batch")
+            .unwrap()
+            .unwrap();
+
+        let remaining = std::fs::read_dir(upload_staging)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| crate::secure_fs::is_upload_fragment_name(&entry.file_name()))
+            .count();
+        assert!(remaining > 0, "shutdown launched another cleanup batch");
+        assert!(
+            remaining < crate::storage_cleanup::CLEANUP_BATCH_ENTRIES + 1,
+            "the active cleanup batch did not finish"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_shutdown_wakes_an_idle_worker_without_starting_another_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let worker = state
+            .storage_cleanup
+            .start_worker(state.secure_root.clone())
+            .unwrap();
+
+        for _ in 0..100 {
+            if state.storage_cleanup.pass_count_for_test() >= 1 {
+                let guard = state
+                    .storage_cleanup
+                    .serialization_for_test()
+                    .lock_owned()
+                    .await;
+                drop(guard);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let completed_passes = state.storage_cleanup.pass_count_for_test();
+        assert_eq!(completed_passes, 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), worker.shutdown())
+            .await
+            .expect("idle cleanup worker did not wake for shutdown")
+            .unwrap();
+        assert_eq!(
+            state.storage_cleanup.pass_count_for_test(),
+            completed_passes
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ten_thousand_cleanup_signals_keep_one_rate_limited_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        state
+            .secure_root
+            .fail_next_cleanup_starts(io::ErrorKind::Other, 10_000);
+
+        for _ in 0..10_000 {
+            state.storage_cleanup.request_cleanup();
+        }
+        let worker = state
+            .storage_cleanup
+            .start_worker(state.secure_root.clone())
+            .unwrap();
+        assert!(matches!(
+            state
+                .storage_cleanup
+                .start_worker(state.secure_root.clone()),
+            Err(crate::storage_cleanup::StorageCleanupStartError::AlreadyRunning)
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+        let attempts = state.storage_cleanup.pass_count_for_test();
+        assert!(attempts >= 2, "the failed cleanup was not retried");
+        assert!(
+            attempts <= 5,
+            "coalesced requests bypassed the retry deadline: {attempts} attempts"
+        );
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_signal_during_a_scan_schedules_one_follow_up_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        let cleanup = state.storage_cleanup.clone();
+        state.secure_root.before_next_cleanup_batch(move || {
+            cleanup.request_cleanup();
+        });
+        let worker = state
+            .storage_cleanup
+            .start_worker(state.secure_root.clone())
+            .unwrap();
+
+        for _ in 0..100 {
+            if state.storage_cleanup.pass_count_for_test() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(state.storage_cleanup.pass_count_for_test(), 2);
+        worker.shutdown().await.unwrap();
     }
 
     #[tokio::test]

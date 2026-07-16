@@ -16,6 +16,48 @@ if ! sh tools/check-cargo-duplicates.sh; then
     report "Cargo duplicate dependency policy failed"
 fi
 
+if ! sh tools/check-version-consistency.sh; then
+    report "package, documentation, and health version policy failed"
+fi
+if ! grep -F -x -q 'release_version=0.5.0' tools/check-version-consistency.sh; then
+    report "candidate and tag version policy must be fixed to the 0.5.0 release line"
+fi
+if ! awk '
+    $0 == "[profile.release]" { release_profile = 1; profiles++; next }
+    /^\[/ { release_profile = 0 }
+    release_profile && $0 == "panic = \"abort\"" { abort_settings++ }
+    END { exit !(profiles == 1 && abort_settings == 1) }
+' Cargo.toml \
+    || [ "$(grep -F -c '#[cfg(panic = "unwind")]' src/web.rs || true)" -ne 2 ] \
+    || [ "$(grep -F -c 'CatchPanicLayer' src/web.rs || true)" -ne 2 ] \
+    || ! grep -F -q 'use tower_http::catch_panic::CatchPanicLayer;' src/web.rs \
+    || ! grep -F -q 'let router = router.layer(CatchPanicLayer::new());' src/web.rs; then
+    report "release builds must use panic=abort and CatchPanicLayer must be unwind-only"
+fi
+if ! grep -F -q 'sh tools/check-version-consistency.sh --binary target/debug/vaultlink' .github/workflows/ci.yml \
+    || ! grep -F -q -- '--release-candidate' .github/workflows/release.yml \
+    || ! grep -F -q -- "--release-tag \"\$GITHUB_REF_NAME\"" .github/workflows/release.yml; then
+    report "CI, candidate preflight, and tag release must enforce their version modes"
+fi
+
+minisign_fixture=$(mktemp)
+trap 'rm -f "$minisign_fixture"' EXIT HUP INT TERM
+minisign_fixture_key=$(
+    (printf Ed; dd if=/dev/zero bs=1 count=40 status=none) | base64 | tr -d '\n'
+)
+printf 'untrusted comment: minisign public key fixture\n%s\n' \
+    "$minisign_fixture_key" >"$minisign_fixture"
+if ! sh tools/check-minisign-public-key.sh "$minisign_fixture"; then
+    report "valid 42-byte Minisign public-key fixture was rejected"
+fi
+printf 'untrusted comment: minisign public key fixture\n%s=\n' \
+    "$minisign_fixture_key" >"$minisign_fixture"
+if sh tools/check-minisign-public-key.sh "$minisign_fixture" >/dev/null 2>&1; then
+    report "padded or wrong-length Minisign public-key fixture was accepted"
+fi
+rm -f "$minisign_fixture"
+trap - EXIT HUP INT TERM
+
 uses_lines=$(grep -R -n -E '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]+' .github/workflows || true)
 bad_uses=$(printf '%s\n' "$uses_lines" | grep -E -v 'uses:[[:space:]]+\./|@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)
 if [ -n "$bad_uses" ]; then
@@ -23,11 +65,76 @@ if [ -n "$bad_uses" ]; then
     report "external actions must use a full 40-character commit SHA"
 fi
 
-if ! grep -E -q '^FROM[[:space:]]+[^[:space:]]+@sha256:[0-9a-f]{64}$' deploy/docker/Dockerfile.setup-smoke; then
-    report "Docker smoke base image must be pinned by digest"
-fi
-
 smoke_dockerfile=deploy/docker/Dockerfile.setup-smoke
+builder_dockerfile=deploy/docker/Dockerfile.release-builder
+snapshot_sources=deploy/docker/debian-snapshot.sources
+package_lock=deploy/docker/debian-packages.lock
+builder_image_lock=deploy/docker/release-builder-image.lock
+for dockerfile in "$smoke_dockerfile" "$builder_dockerfile"; do
+    if ! grep -E -q '^FROM[[:space:]]+[^[:space:]]+@sha256:[0-9a-f]{64}$' "$dockerfile"; then
+        report "$dockerfile base image must be pinned by digest"
+    fi
+done
+locked_builder=$(sed -n '1p' "$builder_image_lock")
+if [ "$(wc -l <"$builder_image_lock")" -ne 1 ]; then
+    report "release builder image lock must contain exactly one line"
+elif [ "$locked_builder" != UNPROVISIONED ] \
+    && ! printf '%s\n' "$locked_builder" \
+        | grep -E -q '^ghcr\.io/alexhaberl/vaultlink-release-builder@sha256:[0-9a-f]{64}$'; then
+    report "release builder image lock must be UNPROVISIONED or the fixed full GHCR digest"
+fi
+if grep -E -q '^COPY[[:space:]].*(Cargo|\.github|src|release-builder-image\.lock)' "$builder_dockerfile" \
+    || ! grep -F -q 'debian-snapshot.sources deploy/docker/debian-packages.lock' "$builder_dockerfile" \
+    || ! grep -F -q 'tools/install-pinned-debian-packages.sh' "$builder_dockerfile"; then
+    report "release builder Dockerfile must be independent of application source and its own image lock"
+fi
+if [ "$(grep -E -c '^URIs: http://snapshot\.debian\.org/archive/debian(-security)?/[0-9]{8}T[0-9]{6}Z$' "$snapshot_sources" || true)" -ne 2 ] \
+    || grep -E -q 'deb\.debian\.org' "$snapshot_sources"; then
+    report "Debian package sources must use one immutable main and security snapshot"
+fi
+if ! awk '
+    /^[[:space:]]*(#|$)/ { next }
+    !/^[a-z0-9][a-z0-9+.-]*=[^[:space:]]+$/ { failed = 1 }
+    {
+        package = $0
+        sub(/=.*/, "", package)
+        if (seen[package]++) failed = 1
+        if (previous != "" && package < previous) failed = 1
+        previous = package
+    }
+    END { exit failed }
+' "$package_lock"; then
+    report "Debian package lock must be sorted, unique, and fully versioned"
+fi
+if ! grep -F -x -q 'inotify-tools=4.23.9.0-2+b1' "$package_lock" \
+    || ! grep -F -x -q 'libinotifytools0=4.23.9.0-2+b1' "$package_lock" \
+    || ! grep -F -q 'inotifywait --quiet --timeout 10' deploy/docker/load-fixture-smoke.sh; then
+    report "root-helper race smoke must use the snapshot-pinned bounded inotify attacker"
+fi
+if ! grep -F -q 'tools/install-pinned-debian-packages.sh' "$smoke_dockerfile" \
+    || ! grep -F -q 'debian-snapshot.sources' "$smoke_dockerfile" \
+    || ! grep -F -q 'debian-packages.lock' "$smoke_dockerfile"; then
+    report "canonical container must install the snapshot-locked Debian package closure"
+fi
+if ! grep -F -q 'rm -f /etc/apt/sources.list' tools/install-pinned-debian-packages.sh \
+    || ! grep -F -q "/etc/apt/sources.list.d" tools/install-pinned-debian-packages.sh \
+    || ! grep -F -q 'source_count=' tools/install-pinned-debian-packages.sh \
+    || ! grep -F -q "comm -13 \"\$manifest_work/before\" \"\$manifest_work/after\"" tools/install-pinned-debian-packages.sh \
+    || ! grep -F -q "comm -23 \"\$manifest_work/changed\" \"\$manifest_work/locked\"" tools/install-pinned-debian-packages.sh; then
+    report "pinned package installer must verify the sole snapshot and every base-image package delta"
+fi
+if grep -E -q 'apt-get[[:space:]]+(update|install)' "$smoke_dockerfile" "$builder_dockerfile" \
+    || grep -E -q 'apt-get[[:space:]]+(update|install)' \
+        .github/workflows/release.yml .github/workflows/reproducibility.yml; then
+    report "Dockerfile, release, and reproducibility workflows must not contain ad-hoc apt operations"
+fi
+for tool in 'cargo-cyclonedx --version 0.5.9' 'cargo-audit --version 0.22.2'; do
+    grep -F -q "$tool" "$smoke_dockerfile" \
+        || report "canonical container is missing pinned $tool"
+    grep -F -q "$tool" "$builder_dockerfile" \
+        || report "release builder is missing pinned $tool"
+done
+
 if ! grep -E -q '^COPY Cargo\.toml Cargo\.lock rust-toolchain\.toml Makefile \.dockerignore \./$' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY .github ./.github' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY deploy ./deploy' "$smoke_dockerfile" \
@@ -38,6 +145,11 @@ if ! grep -F -q 'shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh' "$smoke_d
     || ! grep -F -q 'sh tools/check-supply-chain-policy.sh' "$smoke_dockerfile"; then
     report "Docker smoke build must run shell and supply-chain policy gates"
 fi
+for smoke_script in load-fixture-smoke.sh soak-evidence-smoke.sh; do
+    if ! grep -F -q "docker run --rm --network none \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/$smoke_script" Makefile; then
+        report "make docker-smoke must run $smoke_script without network access"
+    fi
+done
 
 literal_dollar='$'
 release_container_value="${literal_dollar}{{ needs.release_environment.outputs.image }}"
@@ -45,17 +157,51 @@ toolchain_resolver_reference="channel=${literal_dollar}(sh tools/rust-toolchain-
 toolchain_output_value="${literal_dollar}{{ steps.rust_toolchain.outputs.channel }}"
 exact_main_tag_reference="test \"${literal_dollar}tag_commit\" = \"${literal_dollar}main_commit\""
 ancestor_tag_reference="git merge-base --is-ancestor \"${literal_dollar}tag_commit\" \"${literal_dollar}main_commit\""
-release_container_values=$(sed -n 's/^[[:space:]]*container:[[:space:]]*//p' .github/workflows/release.yml)
-release_container_count=$(printf '%s\n' "$release_container_values" | grep -c . || true)
-bad_release_containers=$(printf '%s\n' "$release_container_values" | grep -F -x -v "$release_container_value" || true)
-if [ "$release_container_count" -ne 3 ] || [ -n "$bad_release_containers" ]; then
-    printf '%s\n' "$bad_release_containers" >&2
-    report "every release container must consume the validated Docker smoke image"
+release_container_count=$(grep -F -c "image: $release_container_value" .github/workflows/release.yml || true)
+if [ "$release_container_count" -ne 3 ]; then
+    report "every release container must consume the validated prebuilt release image"
 fi
-if ! grep -F -q "$toolchain_resolver_reference" .github/workflows/release.yml \
-    || ! grep -F -q "deploy/docker/Dockerfile.setup-smoke" .github/workflows/release.yml; then
-    report "release environment must validate the canonical Docker smoke image before containers start"
+repro_container_value="${literal_dollar}{{ needs.release_environment.outputs.image }}"
+if [ "$(grep -F -c "image: $repro_container_value" .github/workflows/reproducibility.yml || true)" -ne 1 ]; then
+    report "reproducibility builds must consume the digest-pinned release builder variable"
 fi
+credential_user="username: ${literal_dollar}{{ github.actor }}"
+credential_password="password: ${literal_dollar}{{ secrets.GITHUB_TOKEN }}"
+if [ "$(grep -F -c "$credential_user" .github/workflows/release.yml || true)" -ne 3 ] \
+    || [ "$(grep -F -c "$credential_password" .github/workflows/release.yml || true)" -ne 3 ] \
+    || [ "$(grep -F -c "$credential_user" .github/workflows/reproducibility.yml || true)" -ne 1 ] \
+    || [ "$(grep -F -c "$credential_password" .github/workflows/reproducibility.yml || true)" -ne 1 ] \
+    || [ "$(grep -E -c '^[[:space:]]+packages:[[:space:]]+read$' .github/workflows/release.yml || true)" -ne 3 ] \
+    || [ "$(grep -E -c '^[[:space:]]+packages:[[:space:]]+read$' .github/workflows/reproducibility.yml || true)" -ne 1 ]; then
+    report "private GHCR job containers require packages: read and explicit GitHub token credentials"
+fi
+if ! grep -F -q 'VAULTLINK_RELEASE_BUILDER_IMAGE' .github/workflows/release.yml \
+    || ! grep -F -q 'ghcr.io/alexhaberl/vaultlink-release-builder@sha256:*' .github/workflows/release.yml \
+    || ! grep -F -q 'deploy/docker/release-builder-image.lock' .github/workflows/release.yml \
+    || ! grep -F -q 'deploy/docker/release-builder-image.lock' .github/workflows/reproducibility.yml \
+    || [ "$(grep -h -F -c "test \"\$image\" = \"\$locked_image\"" .github/workflows/release.yml .github/workflows/reproducibility.yml | awk '{ total += $1 } END { print total + 0 }')" -ne 2 ] \
+    || [ "$(grep -F -c 'sh tools/verify-release-builder.sh' .github/workflows/release.yml || true)" -ne 3 ] \
+    || ! grep -F -q 'sh tools/verify-release-builder.sh' .github/workflows/reproducibility.yml; then
+    report "release and reproducibility jobs must fail closed on the verified digest-pinned builder"
+fi
+if ! grep -F -q 'release-builder-image.lock' tools/verify-release-builder.sh \
+    || ! grep -F -q "RELEASE_BUILDER_IMAGE\" != \"\$locked_image" tools/verify-release-builder.sh \
+    || ! grep -F -q 'UNPROVISIONED' release/README.md \
+    || ! grep -F -q 'Dockerfile.release-builder' docs/SELF-HOSTED-RUNNER.md; then
+    report "checked-in builder pin, exact variable equality, and provisioning blocker must be documented"
+fi
+if grep -E -q '(install-pinned-debian-packages\.sh|cargo[[:space:]]+install[[:space:]])' \
+    .github/workflows/release.yml .github/workflows/reproducibility.yml; then
+    report "release and reproducibility jobs must not install APT or Cargo tooling at runtime"
+fi
+for workflow in .github/workflows/release.yml .github/workflows/reproducibility.yml; do
+    if ! grep -F -q 'sh tools/assemble-release-archive.sh' "$workflow"; then
+        report "$workflow must assemble the same final release archive"
+    fi
+    if ! grep -F -q 'tools/normalize-cyclonedx-sbom.py' "$workflow"; then
+        report "$workflow must normalize its independently generated CycloneDX SBOM"
+    fi
+done
 
 stable_toolchain=$(sh tools/rust-toolchain-channel.sh 2>/dev/null || true)
 ci_toolchain_uses=$(grep -h -c 'uses:[[:space:]]*dtolnay/rust-toolchain@' \
@@ -69,8 +215,9 @@ ci_toolchain_resolvers=$(grep -h -F -c "$toolchain_resolver_reference" \
     .github/workflows/ci.yml .github/workflows/security-audit.yml \
     | awk '{ total += $1 } END { print total + 0 }')
 docker_image=$(sed -n 's/^FROM[[:space:]][[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' deploy/docker/Dockerfile.setup-smoke | head -n 1)
+builder_base_image=$(sed -n 's/^FROM[[:space:]][[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' deploy/docker/Dockerfile.release-builder | head -n 1)
 
-if [ -z "$stable_toolchain" ] || [ -z "$docker_image" ]; then
+if [ -z "$stable_toolchain" ] || [ -z "$docker_image" ] || [ -z "$builder_base_image" ]; then
     report "stable Rust toolchain and canonical container pin must be readable"
 else
     if [ "$ci_toolchain_uses" -ne 2 ] || [ "$ci_toolchain_value_count" -ne 2 ] \
@@ -81,6 +228,9 @@ else
         "rust:${stable_toolchain}-trixie@sha256:"*) ;;
         *) report "container image version must match rust-toolchain.toml" ;;
     esac
+    if [ "$builder_base_image" != "$docker_image" ]; then
+        report "release builder and Docker smoke must share the reviewed Rust/Debian base digest"
+    fi
 fi
 
 for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
@@ -105,9 +255,14 @@ for architecture in amd64 arm64; do
 done
 
 exact_main_tag_gates=$(grep -F -c "$exact_main_tag_reference" .github/workflows/release.yml || true)
-if [ "$exact_main_tag_gates" -ne 2 ] \
+if [ "$exact_main_tag_gates" -ne 3 ] \
     || grep -F -q "$ancestor_tag_reference" .github/workflows/release.yml; then
-    report "release tags must target the exact approved origin/main candidate in build and publish jobs"
+    report "release tags must target the exact approved main candidate in build, verification, and publish jobs"
+fi
+if ! grep -F -q 'repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME' .github/workflows/release.yml \
+    || ! grep -F -q 'test "$remote_tag_object" = "$local_tag_object"' .github/workflows/release.yml \
+    || ! grep -F -q 'repos/$GITHUB_REPOSITORY/git/ref/heads/main' .github/workflows/release.yml; then
+    report "release publish must revalidate the live remote tag object and main commit immediately before creation"
 fi
 
 if grep -R -n -E 'curl[^|]*\|[[:space:]]*(ba)?sh' .github/workflows; then
@@ -235,20 +390,187 @@ for pattern in /config.toml .env '.env.*' '*.sqlite*'; do
     fi
 done
 
-for target in path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy file_mutation_policy multipart_guard; do
+for target in path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_request_state share_request_policy file_mutation_policy multipart_guard; do
     if ! grep -E -q "(^|[[:space:]])${target}([[:space:]]|$)" Makefile; then
         report "Makefile fuzz target list is missing $target"
     fi
 done
 
-for workflow in .github/workflows/fuzz.yml .github/workflows/security-audit.yml; do
-    if ! grep -F -q 'runs-on: [self-hosted, Linux, ARM64, vaultlink]' "$workflow"; then
-        report "$workflow must use the dedicated self-hosted arm64 runner"
+for workflow in .github/workflows/soak-start.yml .github/workflows/soak-collect.yml; do
+    if ! grep -F -q 'runs-on: [self-hosted, Linux, X64, vaultlink-soak]' "$workflow"; then
+        report "$workflow must use the isolated amd64 soak runner"
+    fi
+    if grep -F -q 'pull_request:' "$workflow"; then
+        report "$workflow must never accept pull-request execution"
     fi
 done
+if ! grep -F -q 'vaultlink/72h-soak' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'vaultlink/72h-soak' .github/workflows/soak-collect.yml \
+    || ! grep -F -q 'vaultlink/72h-soak' .github/workflows/release.yml \
+    || ! grep -F -q 'tools/check-soak-evidence.sh' .github/workflows/release.yml; then
+    report "start, collector, and tag release must share the exact-commit soak evidence contract"
+fi
+if grep -F -q 'git fetch' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'git/ref/heads/main' .github/workflows/soak-start.yml; then
+    report "private-repository soak start must resolve the exact main ref through the authenticated GitHub API"
+fi
+if ! grep -F -q 'SOAK_ORCHESTRATION_SHA256' deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q 'orchestration_sha256=' tools/soak-monitor.sh \
+    || ! grep -F -q 'approved_orchestration_sha256=' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'load profiles do not cover all 12 six-hour soak buckets' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'upload_integrity=server_readback' tools/load-test.sh \
+    || ! grep -F -q 'UPLOAD_VERIFY_TOKEN' docs/SOAK-RUNNER.md; then
+    report "soak evidence must bind orchestration, distributed load windows, and server-side upload readback"
+fi
+if ! grep -F -q 'SOAK_START_EPOCH=' deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q 'SOAK_DEADLINE_EPOCH=' deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q "systemctl --quiet is-active \"\$unit\"" tools/collect-soak-evidence.sh \
+    || ! grep -F -q "systemctl --quiet is-failed \"\$unit\"" tools/collect-soak-evidence.sh \
+    || ! grep -F -q 'monitor_deadline_exceeded' tools/collect-soak-evidence.sh \
+    || ! grep -F -q 'collector-failure.env' tools/collect-soak-evidence.sh; then
+    report "collector must turn a dead or overdue monitor into atomic partial failure evidence"
+fi
+if ! grep -F -q "[ \"\$(uname -m)\" = x86_64 ]" deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q "[ \"\$os_id\" = debian ]" deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q "[ \"\$os_version_id\" = 13 ]" deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q 'SOAK_ARCHITECTURE=amd64' deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q 'os_version_id' tools/check-soak-evidence.sh; then
+    report "soak host and evidence must be bound to Debian 13 amd64"
+fi
+if ! grep -F -q 'dd if=/dev/urandom' tools/load-test.sh \
+    || grep -F -q "truncate -s 64M \"\$work/upload.bin\"" tools/load-test.sh \
+    || ! grep -F -q 'at least 16 GiB' docs/SOAK-RUNNER.md; then
+    report "soak uploads must use non-sparse payloads with documented quota reserve"
+fi
+for numeric_script in \
+    tools/load-test.sh \
+    tools/soak-monitor.sh \
+    tools/check-soak-evidence.sh \
+    tools/collect-soak-evidence.sh \
+    deploy/vaultlink-soak-control.sh \
+    deploy/docker/soak-evidence-smoke.sh; do
+    if ! grep -F -x -q 'LC_ALL=C' "$numeric_script" \
+        || ! grep -F -x -q 'LANG=C' "$numeric_script" \
+        || ! grep -F -x -q 'export LC_ALL LANG' "$numeric_script"; then
+        report "$numeric_script must pin C locale for numeric and ordering evidence"
+    fi
+done
+if ! grep -F -q 'continue-on-error: true' .github/workflows/soak-collect.yml \
+    || ! grep -F -q 'collector_verification_failed' .github/workflows/soak-collect.yml \
+    || [ "$(grep -F -c "if: ${literal_dollar}{{ always()" .github/workflows/soak-collect.yml || true)" -lt 4 ]; then
+    report "soak collector must publish failure status and evidence after verification errors"
+fi
+for gate_context in \
+    vaultlink/native-amd64 \
+    vaultlink/native-arm64 \
+    vaultlink/fuzz-600s-amd64 \
+    vaultlink/fuzz-600s-arm64 \
+    vaultlink/release-dry-run \
+    vaultlink/reproducibility-amd64 \
+    vaultlink/reproducibility-arm64; do
+    case "$gate_context" in
+        vaultlink/native-*)
+            producer=.github/workflows/ci.yml
+            producer_context="vaultlink/native-${literal_dollar}{{ matrix.architecture }}"
+            release_context=$gate_context
+            ;;
+        vaultlink/fuzz-*)
+            producer=.github/workflows/fuzz.yml
+            producer_context="vaultlink/fuzz-600s-${literal_dollar}{{ matrix.architecture }}"
+            release_context=$gate_context
+            ;;
+        vaultlink/release-dry-run)
+            producer=.github/workflows/release.yml
+            producer_context=$gate_context
+            release_context=$gate_context
+            ;;
+        vaultlink/reproducibility-*)
+            producer=.github/workflows/reproducibility.yml
+            producer_context="vaultlink/reproducibility-${literal_dollar}{{ matrix.architecture }}"
+            release_context="vaultlink/reproducibility-${literal_dollar}RELEASE_ARCHITECTURE"
+            ;;
+    esac
+    if ! grep -F -q "$producer_context" "$producer" \
+        || ! grep -F -q "$release_context" .github/workflows/release.yml; then
+        report "release preflight and producer must share exact-commit gate $gate_context"
+    fi
+done
+for release_context in vaultlink/release-candidate-preflight vaultlink/release-evidence-preflight; do
+    if ! grep -F -q "$release_context" .github/workflows/release.yml; then
+        report "release workflow must produce and consume $release_context"
+    fi
+done
+if ! grep -F -q "Release candidate \$candidate_commit" .github/workflows/release.yml \
+    || ! grep -F -q "Release evidence \$candidate_commit" .github/workflows/release.yml \
+    || ! grep -F -q '.display_title' .github/workflows/release.yml; then
+    report "release preflight statuses must bind provenance to their workflow-dispatch mode"
+fi
+for gate_context in \
+    vaultlink/native-amd64 \
+    vaultlink/native-arm64 \
+    vaultlink/fuzz-600s-amd64 \
+    vaultlink/fuzz-600s-arm64 \
+    vaultlink/reproducibility-amd64 \
+    vaultlink/reproducibility-arm64 \
+    vaultlink/release-dry-run \
+    vaultlink/release-candidate-preflight; do
+    if ! grep -F -q "$gate_context" .github/workflows/soak-start.yml; then
+        report "soak start must require exact-commit gate $gate_context"
+    fi
+done
+for workflow in .github/workflows/release.yml .github/workflows/soak-start.yml; do
+    if ! grep -F -q "commits/\$candidate_commit/statuses?per_page=100" "$workflow" \
+        && ! grep -F -q "commits/\$APPROVED_COMMIT/statuses?per_page=100" "$workflow"; then
+        report "$workflow must paginate exact-commit status provenance"
+    fi
+    if ! grep -F -q "run_path=\${run_path%%@*}" "$workflow" \
+        || ! grep -E -q '^[[:space:]]+actions:[[:space:]]+read$' "$workflow"; then
+        report "$workflow must normalize Actions workflow paths and grant actions: read"
+    fi
+done
+if ! grep -F -q -- '--name vaultlink-release-amd64' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'sha256sum -c SHA256SUMS-amd64' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'candidate_binary_sha256' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'steps.validate.outputs.binary_sha256' .github/workflows/soak-start.yml; then
+    report "soak start must bind its live binary hash to the candidate-preflight amd64 artifact"
+fi
+if ! grep -F -q 'ExecStart=/usr/local/libexec/vaultlink/soak-monitor.sh' deploy/vaultlink-soak@.service \
+    || ! grep -F -x -q 'Group=github-runner' deploy/vaultlink-soak@.service \
+    || [ "$(grep -F -c -- '-m 2750' deploy/vaultlink-soak-control.sh || true)" -lt 2 ] \
+    || ! grep -F -q "install -d -m 2750 \"\$SOAK_EVIDENCE_DIR\"" tools/soak-monitor.sh \
+    || ! grep -F -q 'SOAK_SECONDS=259200' deploy/vaultlink-soak-control.sh; then
+    report "host-side systemd soak must retain the 72-hour monitor contract"
+fi
+
+repro_workflow=.github/workflows/reproducibility.yml
+if ! grep -F -q "runs_on: '[\"self-hosted\", \"Linux\", \"X64\", \"vaultlink\"]'" "$repro_workflow" \
+    || ! grep -F -q "runs_on: '[\"self-hosted\", \"Linux\", \"ARM64\", \"vaultlink\"]'" "$repro_workflow" \
+    || ! grep -F -q 'target/repro-first' "$repro_workflow" \
+    || ! grep -F -q 'target/repro-second' "$repro_workflow" \
+    || [ "$(grep -E -c '^[[:space:]]+cmp[[:space:]]+' "$repro_workflow" || true)" -ne 3 ]; then
+    report "reproducibility workflow must compare two clean native binary, SBOM, and archive builds"
+fi
+if ! grep -F -q 'release_environment:' "$repro_workflow" \
+    || ! grep -F -q 'needs: release_environment' "$repro_workflow" \
+    || ! grep -F -q 'Validate pinned release image before matrix startup' "$repro_workflow" \
+    || ! grep -F -q "image: ${literal_dollar}{{ needs.release_environment.outputs.image }}" "$repro_workflow"; then
+    report "reproducibility matrix must resolve its digest-pinned builder before container startup"
+fi
+if grep -E -i -q 'APT packages are installed from Debian.s signed live repositories|Do not describe builds as bit-for-bit reproducible' release/README.md \
+    || ! grep -F -q 'debian-snapshot.sources' release/README.md; then
+    report "release signing documentation must describe the immutable snapshot and reproducibility gate"
+fi
+
+if ! grep -F -q "runs_on: '[\"self-hosted\", \"Linux\", \"X64\", \"vaultlink\"]'" .github/workflows/fuzz.yml \
+    || ! grep -F -q "runs_on: '[\"self-hosted\", \"Linux\", \"ARM64\", \"vaultlink\"]'" .github/workflows/fuzz.yml; then
+    report "fuzz workflow must retain native amd64 and arm64 matrix runners"
+fi
+if ! grep -F -q 'runs-on: [self-hosted, Linux, ARM64, vaultlink]' .github/workflows/security-audit.yml; then
+    report "security audit workflow must use the dedicated self-hosted arm64 runner"
+fi
 
 arm64_release_jobs=$(grep -F -c 'runs-on: [self-hosted, Linux, ARM64, vaultlink]' .github/workflows/release.yml || true)
-if [ "$arm64_release_jobs" -ne 3 ]; then
+if [ "$arm64_release_jobs" -ne 4 ]; then
     report "architecture-independent release jobs must use the self-hosted arm64 runner"
 fi
 

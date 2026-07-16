@@ -1,0 +1,36 @@
+# Direct release tools and every package they add beyond the digest-pinned
+# rust:1.97.0-trixie base image. Refresh only against debian-snapshot.sources.
+build-essential=12.12
+ca-certificates=20250419
+clang=1:19.0-63
+clang-19=1:19.1.7-3+b1
+coreutils=9.7-3
+curl=8.14.1-2+deb13u4
+gh=2.46.0-3
+git=1:2.47.3-0+deb13u1
+inotify-tools=4.23.9.0-2+b1
+libapparmor1=4.1.0-1
+libclang-common-19-dev=1:19.1.7-3+b1
+libclang-cpp19=1:19.1.7-3+b1
+libclang1-19=1:19.1.7-3+b1
+libgc1=1:8.2.8-1
+libinotifytools0=4.23.9.0-2+b1
+libllvm19=1:19.1.7-3+b1
+libobjc-14-dev=14.2.0-19
+libobjc4=14.2.0-19
+libsodium23=1.0.18-1+deb13u1
+libssl-dev=3.5.6-1~deb13u2
+libsystemd-shared=257.13-1~deb13u1
+libunwind8=1.8.1-0.1
+libz3-4=4.13.3-1
+llvm-19-linker-tools=1:19.1.7-3+b1
+minisign=0.12-1
+passwd=1:4.17.4-2
+pkg-config=1.8.1-4
+python3=3.13.5-1
+shellcheck=0.10.0-1
+sqlite3=3.46.1-7+deb13u1
+strace=6.13+ds-1
+systemd=257.13-1~deb13u1
+util-linux=2.41-5
+xz-utils=5.8.1-1+deb13u1

@@ -56,6 +56,8 @@ pub struct Database(Arc<DatabaseInner>);
 
 struct DatabaseInner {
     connection: Mutex<Connection>,
+    #[cfg(test)]
+    fail_next_poison_rollback: std::sync::atomic::AtomicBool,
     // Keep the descriptor behind /proc/self/fd alive for the whole connection
     // so the validated directory capability cannot be rebound through file-
     // descriptor reuse while SQLite uses the supplied path.
@@ -430,6 +432,8 @@ impl Database {
         schema::migrate(&mut conn)?;
         Ok(Self(Arc::new(DatabaseInner {
             connection: Mutex::new(conn),
+            #[cfg(test)]
+            fail_next_poison_rollback: std::sync::atomic::AtomicBool::new(false),
             _directory_capability: directory_capability,
         })))
     }
@@ -476,8 +480,56 @@ fn validate_database_metadata(
 }
 
 impl Database {
+    fn try_conn(&self) -> rusqlite::Result<std::sync::MutexGuard<'_, Connection>> {
+        match self.0.connection.lock() {
+            Ok(connection) => Ok(connection),
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned database mutex");
+                let connection = poisoned.into_inner();
+                if !connection.is_autocommit() {
+                    #[cfg(test)]
+                    if self
+                        .0
+                        .fail_next_poison_rollback
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        tracing::error!("injected database poison rollback failure");
+                        return Err(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                            Some("injected database poison rollback failure".into()),
+                        ));
+                    }
+                    if let Err(error) = connection.execute_batch("ROLLBACK") {
+                        tracing::error!(%error, "could not roll back database transaction after lock poisoning");
+                        // Keep the poison marker so a later acquisition retries
+                        // normalization. Most importantly, never expose a
+                        // connection whose transaction boundary is unknown.
+                        return Err(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                            Some(format!(
+                                "database unavailable after failed poison recovery: {error}"
+                            )),
+                        ));
+                    }
+                    if !connection.is_autocommit() {
+                        tracing::error!(
+                            "database remained inside a transaction after poison recovery"
+                        );
+                        return Err(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                            Some("database unavailable after incomplete poison recovery".into()),
+                        ));
+                    }
+                }
+                self.0.connection.clear_poison();
+                Ok(connection)
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.0.connection.lock().expect("database mutex poisoned")
+        self.try_conn().expect("database connection unavailable")
     }
 
     pub(crate) fn required_transaction<T, F>(
@@ -488,7 +540,7 @@ impl Database {
     where
         F: FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<(T, Vec<RequiredAuditEvent>)>,
     {
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (outcome, events) = operation(&transaction)?;

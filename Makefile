@@ -1,11 +1,11 @@
-.PHONY: dev-setup sample-data test security-test fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-upgrade-safety-test
+.PHONY: dev-setup sample-data test security-test fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-upgrade-safety-test
 
 CONFIG ?= config/development.toml
 DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
 FUZZ_MAX_TOTAL_TIME ?= 600
 FUZZ_JOBS ?= 4
 FUZZ_LOG_DIR ?= /tmp/vaultlink-fuzz-logs
-FUZZ_TARGETS := path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_validation_policy api_request_policy file_mutation_policy multipart_guard
+FUZZ_TARGETS := path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_request_state share_request_policy file_mutation_policy multipart_guard
 
 dev-setup: sample-data
 	@command -v cargo >/dev/null || (echo "Rust fehlt: https://rustup.rs installieren" && exit 1)
@@ -61,6 +61,8 @@ docker-smoke: docker-smoke-build
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) cargo test --locked --all-targets
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE)
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/api-smoke.sh
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) sh deploy/docker/load-fixture-smoke.sh
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-evidence-smoke.sh
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh
 
 docker-setup-smoke: docker-smoke-build
@@ -68,6 +70,12 @@ docker-setup-smoke: docker-smoke-build
 
 docker-api-smoke: docker-smoke-build
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/api-smoke.sh
+
+docker-load-fixture-smoke: docker-smoke-build
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) sh deploy/docker/load-fixture-smoke.sh
+
+docker-soak-evidence-smoke: docker-smoke-build
+	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-evidence-smoke.sh
 
 docker-upgrade-safety-test: docker-smoke-build
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh

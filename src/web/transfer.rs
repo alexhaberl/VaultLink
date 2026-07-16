@@ -7,12 +7,13 @@ use axum::{
     response::Response,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::io::ReaderStream;
 
 use crate::{
     http_auth::{
-        current_client_limit_key, database, runtime_settings, share_is_unlocked,
-        try_acquire_client_activity,
+        current_client_limit_key, runtime_settings, share_is_unlocked, try_acquire_client_activity,
+        ClientActivityPermit,
     },
     path_security,
     range::parse_byte_range,
@@ -20,11 +21,194 @@ use crate::{
     AppState,
 };
 
+struct ZipGenerationResources {
+    _zip_permit: OwnedSemaphorePermit,
+    _peer_permit: ClientActivityPermit,
+}
+
+/// Owns every live-request resource while ZIP planning or materialization is
+/// still running. It is deliberately moved into a detached supervisor before
+/// each `spawn_blocking`: cancelling the HTTP future therefore cannot release
+/// either admission permit or the transfer lease while blocking work remains.
+struct ZipTransferResources {
+    generation: ZipGenerationResources,
+    transfer: super::transfer_runtime::PublicTransferLease,
+}
+
+impl ZipTransferResources {
+    fn cookie(&self) -> &str {
+        self.transfer.cookie()
+    }
+
+    async fn cancel(self) {
+        let Self {
+            generation,
+            transfer,
+        } = self;
+        drop(generation);
+        transfer.cancel().await;
+    }
+}
+
+struct ZipMaterializationResources {
+    transfer: ZipTransferResources,
+    reservation: ZipTempReservation,
+}
+
+enum PreparedZip {
+    Materialized(Body),
+    Direct(Body),
+}
+
+impl PreparedZip {
+    fn materialized<F>(resources: ZipTransferResources, body: F) -> Self
+    where
+        F: FnOnce(super::transfer_runtime::PublicTransferLease) -> Body,
+    {
+        let ZipTransferResources {
+            generation,
+            transfer,
+        } = resources;
+        // A materialized archive no longer consumes a generation slot while a
+        // slow client downloads it.
+        drop(generation);
+        Self::Materialized(body(transfer))
+    }
+
+    fn direct<F>(resources: ZipTransferResources, body: F) -> Self
+    where
+        F: FnOnce(super::transfer_runtime::PublicTransferLease, ZipGenerationResources) -> Body,
+    {
+        let ZipTransferResources {
+            generation,
+            transfer,
+        } = resources;
+        Self::Direct(body(transfer, generation))
+    }
+
+    fn into_body(self) -> Body {
+        match self {
+            Self::Materialized(body) | Self::Direct(body) => body,
+        }
+    }
+}
+
+/// Retains `resources` in a detached Tokio task until the blocking operation
+/// actually terminates. Dropping the caller's future detaches the supervisor;
+/// it does not drop the resources around an in-flight blocking task.
+async fn zip_blocking_with_resources<R, T, F>(
+    resources: R,
+    operation: F,
+) -> std::result::Result<(R, T), tokio::task::JoinError>
+where
+    R: Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let supervisor = tokio::spawn(async move {
+        let output = tokio::task::spawn_blocking(operation).await?;
+        Ok::<_, tokio::task::JoinError>((resources, output))
+    });
+    supervisor.await?
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ZipBlockingTestPhase {
+    Plan,
+    Materialize,
+    Direct,
+}
+
+#[cfg(test)]
+pub(super) struct ZipBlockingTestHook {
+    pub(super) path: String,
+    pub(super) phase: ZipBlockingTestPhase,
+    pub(super) panic_after_release: bool,
+    pub(super) entered: std::sync::atomic::AtomicUsize,
+    pub(super) released: std::sync::Mutex<bool>,
+    pub(super) wake: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ZipBlockingTestHook {
+    pub(super) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+pub(super) struct ZipBlockingTestGuard(pub(super) std::sync::Arc<ZipBlockingTestHook>);
+
+#[cfg(test)]
+impl Drop for ZipBlockingTestGuard {
+    fn drop(&mut self) {
+        self.0.release();
+        let mut hooks = ZIP_BLOCKING_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hooks.retain(|active| !std::sync::Arc::ptr_eq(active, &self.0));
+    }
+}
+
+#[cfg(test)]
+pub(super) static ZIP_BLOCKING_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Vec<std::sync::Arc<ZipBlockingTestHook>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(super) fn install_zip_blocking_test_hook(
+    hook: std::sync::Arc<ZipBlockingTestHook>,
+) -> ZipBlockingTestGuard {
+    ZIP_BLOCKING_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(hook.clone());
+    ZipBlockingTestGuard(hook)
+}
+
+#[cfg(test)]
+fn zip_test_phase_active(path: &str, phase: ZipBlockingTestPhase) -> bool {
+    ZIP_BLOCKING_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|hook| hook.path == path && hook.phase == phase)
+}
+
+#[cfg(test)]
+fn block_zip_for_test(path: &str, phase: ZipBlockingTestPhase) {
+    let hook = ZIP_BLOCKING_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|hook| hook.path == path && hook.phase == phase)
+        .cloned();
+    let Some(hook) = hook else {
+        return;
+    };
+    hook.entered
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let mut released = hook.released.lock().unwrap();
+    while !*released {
+        released = hook.wake.wait(released).unwrap();
+    }
+    drop(released);
+    if hook.panic_after_release {
+        panic!("injected ZIP blocking task panic");
+    }
+}
+
 use super::preview_zip::{
-    build_zip_temp, direct_zip_stream, plan_zip, zip_error, ReservedZipStream, ZipTempReservation,
+    build_zip_temp, direct_zip_stream_with_resources, plan_zip, zip_error, ReservedZipStream,
+    ZipTempReservation,
 };
 use super::{
-    admission::{PeerPermitBody, PermitBody},
     common::{encoded, internal, BrowseQuery},
     public::{get_share, get_storage_share},
     transfer_runtime::{
@@ -66,8 +250,8 @@ pub(crate) async fn download_zip(
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger ZIP-Pfad"))?
         .to_string_lossy()
         .replace('\\', "/");
-    let mut expensive_peer_permit = Some(
-        try_acquire_client_activity(
+    let generation = ZipGenerationResources {
+        _peer_permit: try_acquire_client_activity(
             state.expensive_peer_admission.clone(),
             current_client_limit_key(),
             crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
@@ -77,9 +261,7 @@ pub(crate) async fn download_zip(
             StatusCode::SERVICE_UNAVAILABLE,
             "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
         ))?,
-    );
-    let mut zip_permit = Some(
-        state
+        _zip_permit: state
             .zip_generation_admission
             .clone()
             .try_acquire_owned()
@@ -89,7 +271,7 @@ pub(crate) async fn download_zip(
                     "Zu viele gleichzeitige ZIP-Erstellungen",
                 )
             })?,
-    );
+    };
     let settings = runtime_settings(&state);
     let secure_root = state
         .secure_root
@@ -103,100 +285,145 @@ pub(crate) async fn download_zip(
     };
     let transfer =
         begin_public_transfer(&state, &headers, &uri, &sh, resource_key, "zip_download").await?;
-    let transfer_cookie_value = transfer.cookie.clone();
-    let mut transfer = Some(transfer);
+    let resources = ZipTransferResources {
+        generation,
+        transfer,
+    };
+    let transfer_cookie_value = resources.cookie().to_string();
     let plan_scope = secure_root.clone();
     let plan_path = sub.clone();
     let plan_settings = settings.clone();
-    let plan =
-        tokio::task::spawn_blocking(move || plan_zip(&plan_scope, &plan_path, &plan_settings))
-            .await
-            .map_err(internal)?
-            .map_err(zip_error)?;
-    let mut direct_generation = false;
-    let body = if let Some(reservation) = ZipTempReservation::acquire(plan.estimated_archive_size) {
+    #[cfg(test)]
+    let plan_test_path = sh.relative_path.clone();
+    let (resources, plan) = zip_blocking_with_resources(resources, move || {
+        #[cfg(test)]
+        block_zip_for_test(&plan_test_path, ZipBlockingTestPhase::Plan);
+        plan_zip(&plan_scope, &plan_path, &plan_settings)
+    })
+    .await
+    .map_err(internal)?;
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            resources.cancel().await;
+            return Err(zip_error(error));
+        }
+    };
+    #[cfg(test)]
+    let temp_reservation = if zip_test_phase_active(&sh.relative_path, ZipBlockingTestPhase::Direct)
+    {
+        None
+    } else if zip_test_phase_active(&sh.relative_path, ZipBlockingTestPhase::Materialize) {
+        Some(ZipTempReservation::acquire_unchecked_for_test(
+            plan.estimated_archive_size,
+        ))
+    } else {
+        ZipTempReservation::acquire(plan.estimated_archive_size)
+    };
+    #[cfg(not(test))]
+    let temp_reservation = ZipTempReservation::acquire(plan.estimated_archive_size);
+    let prepared = if let Some(reservation) = temp_reservation {
+        let materialization = ZipMaterializationResources {
+            transfer: resources,
+            reservation,
+        };
         let temp_scope = secure_root.clone();
         let temp_plan = plan.clone();
-        match tokio::task::spawn_blocking(move || build_zip_temp(&temp_scope, &temp_plan))
+        #[cfg(test)]
+        let materialization_test_path = sh.relative_path.clone();
+        let (materialization, build_result) =
+            zip_blocking_with_resources(materialization, move || {
+                #[cfg(test)]
+                block_zip_for_test(
+                    &materialization_test_path,
+                    ZipBlockingTestPhase::Materialize,
+                );
+                build_zip_temp(&temp_scope, &temp_plan)
+            })
             .await
-            .map_err(internal)?
-        {
+            .map_err(internal)?;
+        match build_result {
             Ok(file) => {
+                let ZipMaterializationResources {
+                    transfer: resources,
+                    reservation,
+                } = materialization;
                 let content_length = file.metadata().ok().map(|metadata| metadata.len());
-                let stream = ReservedZipStream {
-                    inner: ReaderStream::new(tokio::fs::File::from_std(file)),
-                    _reservation: reservation,
-                };
-                transfer_body(
-                    stream,
-                    &state,
-                    transfer.take().expect("ZIP transfer lease"),
-                    "zip_download",
-                    sh.id,
-                    content_length,
-                )
+                PreparedZip::materialized(resources, move |transfer| {
+                    let stream = ReservedZipStream {
+                        inner: ReaderStream::new(tokio::fs::File::from_std(file)),
+                        _reservation: reservation,
+                    };
+                    transfer_body(
+                        stream,
+                        &state,
+                        transfer,
+                        "zip_download",
+                        sh.id,
+                        content_length,
+                    )
+                })
             }
             Err(error) if error.is_output_capacity_error() => {
+                let ZipMaterializationResources {
+                    transfer: resources,
+                    reservation,
+                } = materialization;
                 drop(reservation);
-                direct_generation = true;
-                transfer_body(
-                    direct_zip_stream(secure_root, plan),
-                    &state,
-                    transfer.take().expect("ZIP transfer lease"),
-                    "zip_download",
-                    sh.id,
-                    None,
-                )
+                #[cfg(test)]
+                let direct_test_path = sh.relative_path.clone();
+                PreparedZip::direct(resources, move |transfer, generation| {
+                    transfer_body(
+                        direct_zip_stream_with_resources(
+                            secure_root,
+                            plan,
+                            generation,
+                            move || {
+                                #[cfg(test)]
+                                block_zip_for_test(&direct_test_path, ZipBlockingTestPhase::Direct);
+                            },
+                        ),
+                        &state,
+                        transfer,
+                        "zip_download",
+                        sh.id,
+                        None,
+                    )
+                })
             }
             Err(error) => {
-                let lease = transfer
-                    .as_ref()
-                    .expect("ZIP transfer lease")
-                    .lease_token
-                    .as_ref()
-                    .expect("ZIP transfer lease token")
-                    .clone();
-                let _ = database(state.db.clone(), move |database| {
-                    database.cancel_transfer_lease(&lease).map(|_| ())
-                })
-                .await;
+                let ZipMaterializationResources {
+                    transfer: resources,
+                    reservation,
+                } = materialization;
+                drop(reservation);
+                resources.cancel().await;
                 return Err(zip_error(error));
             }
         }
     } else {
-        direct_generation = true;
-        transfer_body(
-            direct_zip_stream(secure_root, plan),
-            &state,
-            transfer.take().expect("ZIP transfer lease"),
-            "zip_download",
-            sh.id,
-            None,
-        )
+        #[cfg(test)]
+        let direct_test_path = sh.relative_path.clone();
+        PreparedZip::direct(resources, move |transfer, generation| {
+            transfer_body(
+                direct_zip_stream_with_resources(secure_root, plan, generation, move || {
+                    #[cfg(test)]
+                    block_zip_for_test(&direct_test_path, ZipBlockingTestPhase::Direct);
+                }),
+                &state,
+                transfer,
+                "zip_download",
+                sh.id,
+                None,
+            )
+        })
     };
     let name = Path::new(&sh.relative_path)
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("vaultlink");
     let filename = encoded(&format!("{name}.zip"));
-    let body = if direct_generation {
-        let body = Body::new(PeerPermitBody {
-            inner: body,
-            _permit: expensive_peer_permit
-                .take()
-                .expect("ZIP peer generation permit"),
-        });
-        Body::new(PermitBody {
-            inner: body,
-            _permit: zip_permit.take().expect("ZIP generation permit"),
-        })
-    } else {
-        // The archive has already been materialized. Slow network reads retain
-        // only the bounded temp-file reservation, not a scarce generation slot.
-        drop(zip_permit.take());
-        drop(expensive_peer_permit.take());
-        body
-    };
+    let body = prepared.into_body();
     let mut response = Response::new(body);
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -323,7 +550,7 @@ pub(crate) async fn download(
         .unwrap_or("download");
     let encoded = percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC);
     let (body, transfer_cookie_value) = if let Some(transfer) = transfer {
-        let cookie = transfer.cookie.clone();
+        let cookie = transfer.cookie().to_string();
         let body = if response_length == 0 {
             complete_transfer_without_body(&state, transfer, "download", sh.id).await?;
             Body::empty()
@@ -362,7 +589,7 @@ pub(crate) async fn download(
                 .first_or_octet_stream()
                 .as_ref(),
         )
-        .unwrap(),
+        .map_err(internal)?,
     );
     r.headers_mut().insert(
         header::CONTENT_DISPOSITION,

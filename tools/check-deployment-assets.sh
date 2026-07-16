@@ -54,81 +54,29 @@ for removed_asset in \
     [ ! -e "$removed_asset" ] || fail "$removed_asset is a removed legacy component"
 done
 
-test_root=$(mktemp -d)
-trap 'rm -rf "$test_root"' EXIT HUP INT TERM
-mock_bin="$test_root/bin"
-trace="$test_root/trace"
-output="$test_root/output"
-fixture_storage="$test_root/storage/shared"
-mkdir "$mock_bin"
-mkdir -p "$fixture_storage"
-for command in install truncate chown chmod; do
-    mock="$mock_bin/$command"
-    # These variables belong to the generated mock and must not expand here.
-    # shellcheck disable=SC2016
-    printf '%s\n' \
-        '#!/bin/sh' \
-        'set -eu' \
-        'printf "%s" "${0##*/}" >>"$TRACE_FILE"' \
-        'for argument do printf " <%s>" "$argument" >>"$TRACE_FILE"; done' \
-        'printf "\n" >>"$TRACE_FILE"' \
-        >"$mock"
-    if [ "$command" = chmod ]; then
-        # Preserve the real mode transition so the published root can be
-        # verified in addition to checking the privileged command trace.
-        # shellcheck disable=SC2016
-        printf '%s\n' '[ "$1" != 0750 ] || command -p chmod "$@"' >>"$mock"
-    fi
-    chmod 0755 "$mock"
-done
-
-TRACE_FILE="$trace" PATH="$mock_bin:$PATH" \
-    sh tools/prepare-load-fixture.sh "$fixture_storage" >"$output"
-grep -E -x -q \
-    "chown <vaultlink:vaultlink> <$fixture_storage/\.vaultlink-load\.[A-Za-z0-9]+>" \
-    "$trace" || fail "load fixture does not assign the published root to the VaultLink service"
-grep -E -x -q \
-    "chmod <0750> <$fixture_storage/\.vaultlink-load\.[A-Za-z0-9]+>" \
-    "$trace" || fail "load fixture does not make the published root traversable by VaultLink"
-grep -E -x -q \
-    "install <-d> <-o> <vaultlink> <-g> <vaultlink> <-m> <0750> <$fixture_storage/\.vaultlink-load\.[A-Za-z0-9]+/uploads>" \
-    "$trace" || fail "load fixture does not stage its upload directory below the configured SecureRoot"
-grep -E -x -q \
-    "truncate <-s> <50G> <$fixture_storage/\.vaultlink-load\.[A-Za-z0-9]+/sparse-50GiB\.bin>" \
-    "$trace" || fail "load fixture does not stage its sparse download below the configured SecureRoot"
-[ -d "$fixture_storage/vaultlink-load" ] || \
-    fail "load fixture was not atomically published below the configured SecureRoot"
-[ "$(stat -c '%a' "$fixture_storage/vaultlink-load")" = 750 ] || \
-    fail "published load fixture root is not traversable with mode 0750"
-grep -F -x -q \
-    'Create a download share for vaultlink-load/sparse-50GiB.bin and an upload share for vaultlink-load/uploads.' \
-    "$output" || fail "load fixture prints incorrect SecureRoot-relative share paths"
-
-if TRACE_FILE="$trace" PATH="$mock_bin:$PATH" \
-    sh tools/prepare-load-fixture.sh relative/path >"$output" 2>&1; then
-    fail "load fixture accepted a relative storage root"
-fi
-if TRACE_FILE="$trace" PATH="$mock_bin:$PATH" \
-    sh tools/prepare-load-fixture.sh / >"$output" 2>&1; then
-    fail "load fixture accepted the filesystem root"
-fi
-if TRACE_FILE="$trace" PATH="$mock_bin:$PATH" \
-    sh tools/prepare-load-fixture.sh "$test_root/missing" >"$output" 2>&1; then
-    fail "load fixture accepted a missing storage root"
+helper=tools/prepare-load-fixture.sh
+grep -F -q '/usr/bin/env -i' "$helper" \
+    || fail "load fixture root phase must clear the caller environment"
+grep -F -q '/usr/sbin/runuser -u vaultlink' "$helper" \
+    || fail "load fixture root phase must re-exec as vaultlink"
+grep -F -q '/usr/bin/mv -T -n --' "$helper" \
+    || fail "load fixture publish must be atomic and collision-safe"
+if grep -E -q '(^|[[:space:]/])(chown|install)([[:space:]]|$)' "$helper"; then
+    fail "load fixture must not use privileged ownership-changing helpers"
 fi
 
-ln -s / "$test_root/root-link"
-if TRACE_FILE="$trace" PATH="$mock_bin:$PATH" \
-    sh tools/prepare-load-fixture.sh "$test_root/root-link" >"$output" 2>&1; then
-    fail "load fixture accepted a storage root resolving to the filesystem root"
+# The container gate has a real vaultlink account and root privileges, so it
+# also exercises UID transitions and deterministic symlink interleavings. A
+# developer-side policy check remains useful on systems without either.
+if [ "$(id -u)" -eq 0 ] && id vaultlink >/dev/null 2>&1 \
+    && command -v strace >/dev/null 2>&1; then
+    sh deploy/docker/load-fixture-smoke.sh
 fi
 
-symlink_storage="$test_root/symlink-storage"
-mkdir "$symlink_storage"
-ln -s / "$symlink_storage/vaultlink-load"
-if TRACE_FILE="$trace" PATH="$mock_bin:$PATH" \
-    sh tools/prepare-load-fixture.sh "$symlink_storage" >"$output" 2>&1; then
-    fail "load fixture followed a pre-positioned fixture symlink"
+if [ "$(uname -s)" = Linux ]; then
+    sh deploy/docker/soak-evidence-smoke.sh
+else
+    echo "Skipping Linux-only soak evidence smoke on $(uname -s)"
 fi
 
 echo "Deployment asset checks passed"

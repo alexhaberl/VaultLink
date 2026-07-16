@@ -217,11 +217,7 @@ pub(super) async fn start_security_key_authentication(
         ));
     }
     let keys = decode_security_keys(&rows)?;
-    let webauthn = state
-        .webauthn
-        .read()
-        .expect("WebAuthn service lock poisoned")
-        .clone();
+    let webauthn = crate::http_auth::webauthn_service(&state)?;
     webauthn_start_response(webauthn.start_authentication(&token, admin_id, &keys))
 }
 
@@ -258,11 +254,7 @@ pub(super) async fn finish_security_key_authentication(
     })
     .await?;
     let mut keys = decode_security_keys(&rows)?;
-    let webauthn = state
-        .webauthn
-        .read()
-        .expect("WebAuthn service lock poisoned")
-        .clone();
+    let webauthn = crate::http_auth::webauthn_service(&state)?;
     let index = webauthn
         .finish_authentication(&token, admin_id, &body.credential, &mut keys)
         .map_err(|_| AppError(StatusCode::UNAUTHORIZED, "Ungültiger Sicherheitsschlüssel"))?;

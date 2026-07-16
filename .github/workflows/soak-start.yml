@@ -1,0 +1,138 @@
+name: Start 72-hour release soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact origin/main commit to exercise
+        required: true
+        type: string
+      binary_sha256:
+        description: Confirmation SHA-256 of the deployed candidate amd64 binary
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  statuses: write
+
+concurrency:
+  group: vaultlink-release-soak
+  cancel-in-progress: false
+
+jobs:
+  start:
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Linux, X64, vaultlink-soak]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate exact release candidate
+        id: validate
+        shell: bash
+        env:
+          APPROVED_COMMIT: ${{ inputs.commit_sha }}
+          APPROVED_BINARY_SHA256: ${{ inputs.binary_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$APPROVED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$APPROVED_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(uname -m)" = x86_64
+          test "$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')" = debian
+          test "$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')" = 13
+          test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
+          main_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          test "$main_commit" = "$APPROVED_COMMIT"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" = 0.5.0
+          sh tools/check-version-consistency.sh --release-candidate
+          sh tools/check-supply-chain-policy.sh
+          validate_gate() {
+            context=$1
+            workflow_path=$2
+            expected_title=${3:-}
+            expected_event=${4:-}
+            status_lines=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/commits/$APPROVED_COMMIT/statuses?per_page=100" \
+              --jq ".[] | select(.context == \"$context\") | [.state, .target_url] | @tsv")
+            status_line=$(printf '%s\n' "$status_lines" | sed -n '1p')
+            IFS=$'\t' read -r state target_url <<<"$status_line"
+            test "$state" = success
+            prefix="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/"
+            case "$target_url" in "$prefix"*) ;; *) return 1 ;; esac
+            run_id=${target_url#"$prefix"}
+            [[ "$run_id" =~ ^[0-9]+$ ]]
+            run_line=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+              --jq '[.head_sha, .head_branch, .conclusion, .path, .display_title, .event] | @tsv')
+            IFS=$'\t' read -r run_sha run_branch conclusion run_path run_title run_event <<<"$run_line"
+            run_path=${run_path%%@*}
+            test "$run_sha" = "$APPROVED_COMMIT"
+            test "$run_branch" = main
+            test "$conclusion" = success
+            test "$run_path" = "$workflow_path"
+            if [[ -n "$expected_title" ]]; then
+              test "$run_title" = "$expected_title"
+            fi
+            if [[ -n "$expected_event" ]]; then
+              test "$run_event" = "$expected_event"
+            fi
+            VALIDATED_RUN_ID=$run_id
+          }
+          validate_gate vaultlink/native-amd64 .github/workflows/ci.yml
+          validate_gate vaultlink/native-arm64 .github/workflows/ci.yml
+          validate_gate vaultlink/fuzz-600s-amd64 .github/workflows/fuzz.yml
+          validate_gate vaultlink/fuzz-600s-arm64 .github/workflows/fuzz.yml
+          validate_gate vaultlink/reproducibility-amd64 .github/workflows/reproducibility.yml
+          validate_gate vaultlink/reproducibility-arm64 .github/workflows/reproducibility.yml
+          validate_gate vaultlink/release-dry-run .github/workflows/release.yml
+          validate_gate vaultlink/release-candidate-preflight .github/workflows/release.yml \
+            "Release candidate $APPROVED_COMMIT" workflow_dispatch
+          candidate_run=$VALIDATED_RUN_ID
+          candidate_artifact="$RUNNER_TEMP/release-candidate-amd64"
+          test ! -e "$candidate_artifact"
+          gh run download "$candidate_run" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name vaultlink-release-amd64 \
+            --dir "$candidate_artifact"
+          test "$(find "$candidate_artifact" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 4
+          (
+            cd "$candidate_artifact"
+            sha256sum -c SHA256SUMS-amd64
+          )
+          candidate_binary="$candidate_artifact/vaultlink-0.5.0-debian13-amd64"
+          test -s "$candidate_binary"
+          candidate_binary_sha256=$(sha256sum "$candidate_binary" | awk '{print $1}')
+          test "$candidate_binary_sha256" = "$APPROVED_BINARY_SHA256"
+          echo "binary_sha256=$candidate_binary_sha256" >> "$GITHUB_OUTPUT"
+      - name: Start host-side systemd monitor
+        env:
+          APPROVED_COMMIT: ${{ inputs.commit_sha }}
+          APPROVED_BINARY_SHA256: ${{ steps.validate.outputs.binary_sha256 }}
+        run: |
+          orchestration_sha256=$(
+            for file in \
+              deploy/vaultlink-soak-control.sh \
+              tools/soak-monitor.sh \
+              tools/load-test.sh \
+              deploy/vaultlink-soak@.service; do
+              sha256sum "$file" | awk '{print $1}'
+            done | sha256sum | awk '{print $1}'
+          )
+          sudo /usr/local/sbin/vaultlink-soak-control \
+            start "$APPROVED_COMMIT" "$APPROVED_BINARY_SHA256" "$orchestration_sha256"
+      - name: Publish pending commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVED_COMMIT: ${{ inputs.commit_sha }}
+        shell: bash
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$APPROVED_COMMIT" \
+            -f state=pending \
+            -f context='vaultlink/72h-soak' \
+            -f description='Host-side 72-hour soak is running' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

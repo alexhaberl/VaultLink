@@ -33,6 +33,25 @@ fn ensure_pending_capacity<T>(
     Ok(())
 }
 
+fn ceremony_map<'a, T>(
+    lock: &'a Mutex<HashMap<String, T>>,
+    name: &'static str,
+) -> std::sync::MutexGuard<'a, HashMap<String, T>> {
+    match lock.lock() {
+        Ok(pending) => pending,
+        Err(poisoned) => {
+            tracing::error!(lock = name, "discarding poisoned WebAuthn ceremonies");
+            let mut pending = poisoned.into_inner();
+            // A challenge whose state crossed an unwind cannot be validated.
+            // Dropping all in-flight ceremonies is the conservative recovery;
+            // clients can begin a fresh challenge immediately.
+            pending.clear();
+            lock.clear_poison();
+            pending
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum WebAuthnServiceError {
     #[error("pending WebAuthn ceremony capacity exhausted")]
@@ -115,11 +134,7 @@ impl WebAuthnService {
                 None,
             )
             .map_err(WebAuthnServiceError::ceremony)?;
-        let mut pending = self
-            .inner
-            .registrations
-            .lock()
-            .map_err(WebAuthnServiceError::ceremony)?;
+        let mut pending = ceremony_map(&self.inner.registrations, "WebAuthn registrations");
         pending.retain(|_, value| value.created.elapsed() < CEREMONY_TTL);
         let key = session_key(session_token);
         ensure_pending_capacity(&pending, &key)?;
@@ -140,11 +155,7 @@ impl WebAuthnService {
         admin_id: i64,
         credential: &RegisterPublicKeyCredential,
     ) -> Result<SecurityKey, WebAuthnServiceError> {
-        let pending = self
-            .inner
-            .registrations
-            .lock()
-            .map_err(WebAuthnServiceError::ceremony)?
+        let pending = ceremony_map(&self.inner.registrations, "WebAuthn registrations")
             .remove(&session_key(session_token))
             .ok_or_else(|| {
                 WebAuthnServiceError::Ceremony(
@@ -173,11 +184,7 @@ impl WebAuthnService {
             .engine
             .start_securitykey_authentication(credentials)
             .map_err(WebAuthnServiceError::ceremony)?;
-        let mut pending = self
-            .inner
-            .authentications
-            .lock()
-            .map_err(WebAuthnServiceError::ceremony)?;
+        let mut pending = ceremony_map(&self.inner.authentications, "WebAuthn authentications");
         pending.retain(|_, value| value.created.elapsed() < CEREMONY_TTL);
         let key = session_key(session_token);
         ensure_pending_capacity(&pending, &key)?;
@@ -199,11 +206,7 @@ impl WebAuthnService {
         credential: &PublicKeyCredential,
         credentials: &mut [SecurityKey],
     ) -> Result<usize, WebAuthnServiceError> {
-        let pending = self
-            .inner
-            .authentications
-            .lock()
-            .map_err(WebAuthnServiceError::ceremony)?
+        let pending = ceremony_map(&self.inner.authentications, "WebAuthn authentications")
             .remove(&session_key(session_token))
             .ok_or_else(|| {
                 WebAuthnServiceError::Ceremony(
@@ -556,5 +559,38 @@ mod tests {
         let pending = service.inner.authentications.lock().unwrap();
         assert!(!pending.contains_key(&session_key("expired")));
         assert!(pending.contains_key(&session_key("fresh")));
+    }
+
+    #[test]
+    fn ceremony_map_recovers_after_lock_poisoning() {
+        let service = service();
+        service
+            .start_registration("stale-session", 7, "admin", &[])
+            .unwrap();
+        let stale_key = session_key("stale-session");
+        let poisoned = service.clone();
+        let panic = std::panic::catch_unwind(move || {
+            let _pending = poisoned.inner.registrations.lock().unwrap();
+            panic!("inject WebAuthn registration lock poisoning");
+        });
+        assert!(panic.is_err());
+        assert!(service.inner.registrations.is_poisoned());
+
+        service
+            .start_registration("fresh-session", 7, "admin", &[])
+            .unwrap();
+        assert!(!service.inner.registrations.is_poisoned());
+        assert!(service
+            .inner
+            .registrations
+            .lock()
+            .unwrap()
+            .contains_key(&session_key("fresh-session")));
+        assert!(!service
+            .inner
+            .registrations
+            .lock()
+            .unwrap()
+            .contains_key(&stale_key));
     }
 }

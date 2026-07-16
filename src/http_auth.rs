@@ -57,13 +57,12 @@ pub fn current_client_limit_key() -> IpAddr {
 pub(crate) struct ClientActivityPermit {
     counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
     peer: IpAddr,
+    maximum: usize,
 }
 
 impl Drop for ClientActivityPermit {
     fn drop(&mut self) {
-        let Ok(mut counts) = self.counts.lock() else {
-            return;
-        };
+        let mut counts = client_activity_counts(&self.counts, self.maximum);
         if let Some(count) = counts.get_mut(&self.peer) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -73,21 +72,46 @@ impl Drop for ClientActivityPermit {
     }
 }
 
+fn client_activity_counts(
+    counts: &Mutex<HashMap<IpAddr, usize>>,
+    maximum: usize,
+) -> std::sync::MutexGuard<'_, HashMap<IpAddr, usize>> {
+    match counts.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!("recovering poisoned client activity admission map");
+            let mut guard = poisoned.into_inner();
+            // Counts are conservative admission state, not authority. Remove
+            // impossible zero entries and cap damaged values at the route's
+            // configured ceiling so one poison event cannot lock a peer out
+            // forever while still avoiding an under-count.
+            guard.retain(|_, count| {
+                *count = (*count).min(maximum);
+                *count > 0
+            });
+            counts.clear_poison();
+            guard
+        }
+    }
+}
+
 pub(crate) fn try_acquire_client_activity(
     counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
     peer: IpAddr,
     maximum: usize,
 ) -> io::Result<Option<ClientActivityPermit>> {
-    let mut active = counts
-        .lock()
-        .map_err(|_| io::Error::other("client admission lock poisoned"))?;
+    let mut active = client_activity_counts(&counts, maximum);
     let count = active.entry(peer).or_default();
     if *count >= maximum {
         return Ok(None);
     }
     *count += 1;
     drop(active);
-    Ok(Some(ClientActivityPermit { counts, peer }))
+    Ok(Some(ClientActivityPermit {
+        counts,
+        peer,
+        maximum,
+    }))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -289,11 +313,71 @@ pub async fn audit_observation(
 }
 
 pub fn runtime_settings(state: &AppState) -> RuntimeSettings {
-    state
-        .runtime
-        .read()
-        .expect("runtime settings lock poisoned")
-        .clone()
+    match state.runtime.read() {
+        Ok(settings) => settings.clone(),
+        Err(poisoned) => {
+            tracing::error!("recovering poisoned runtime settings snapshot");
+            let settings = poisoned.into_inner();
+            if settings.validate_for_config(&state.config).is_ok() {
+                let recovered = settings.clone();
+                state.runtime.clear_poison();
+                return recovered;
+            }
+            drop(settings);
+
+            let mut settings = match state.runtime.write() {
+                Ok(settings) => return settings.clone(),
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Another request may have repaired the snapshot while this one
+            // transitioned from a read to a write guard.
+            if settings.validate_for_config(&state.config).is_err() {
+                let replacement = match state.db.runtime_settings() {
+                    Ok(persisted) => {
+                        match crate::runtime_settings_from_persisted(&state.config, &persisted) {
+                            Ok(replacement) => replacement,
+                            Err(error) => {
+                                tracing::error!(%error, "persisted runtime settings were invalid during poison recovery; using validated static defaults");
+                                RuntimeSettings::from_config(&state.config)
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "could not reload runtime settings during poison recovery; using validated static defaults");
+                        RuntimeSettings::from_config(&state.config)
+                    }
+                };
+                *settings = replacement;
+            }
+            let recovered = settings.clone();
+            state.runtime.clear_poison();
+            recovered
+        }
+    }
+}
+
+pub fn webauthn_service(state: &AppState) -> Result<crate::webauthn::WebAuthnService> {
+    match state.webauthn.read() {
+        Ok(service) => Ok(service.clone()),
+        Err(poisoned) => {
+            tracing::error!("recovering poisoned WebAuthn service snapshot");
+            drop(poisoned.into_inner());
+            let public_base_url = runtime_settings(state).public_base_url;
+            let replacement =
+                crate::webauthn::WebAuthnService::from_public_base_url(&public_base_url)
+                    .map_err(internal)?;
+            let mut service = match state.webauthn.write() {
+                Ok(service) => return Ok(service.clone()),
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Pending ceremonies cannot be validated after an unwind. Replace
+            // the complete service and discard every in-flight challenge.
+            *service = replacement;
+            let recovered = service.clone();
+            state.webauthn.clear_poison();
+            Ok(recovered)
+        }
+    }
 }
 
 pub async fn commit_runtime_settings(
@@ -351,7 +435,13 @@ pub async fn commit_runtime_settings(
         let _security_settings_guard = security_settings_guard;
         // Settings commits always acquire locks in Runtime -> Database order. Readers
         // therefore see the old snapshot until SQLite has committed the replacement.
-        let mut current = runtime.write().expect("runtime settings lock poisoned");
+        let mut current = match runtime.write() {
+            Ok(current) => current,
+            Err(poisoned) => {
+                tracing::error!("replacing poisoned runtime settings snapshot");
+                poisoned.into_inner()
+            }
+        };
         let pairs = next.pairs();
         database.replace_runtime_settings_and_audit(
             &pairs,
@@ -360,8 +450,17 @@ pub async fn commit_runtime_settings(
             audit_detail,
         )?;
         *current = next;
+        runtime.clear_poison();
         if let Some(replacement) = replacement_webauthn {
-            *webauthn.write().expect("WebAuthn service lock poisoned") = replacement;
+            let mut service = match webauthn.write() {
+                Ok(service) => service,
+                Err(poisoned) => {
+                    tracing::error!("replacing poisoned WebAuthn service snapshot");
+                    poisoned.into_inner()
+                }
+            };
+            *service = replacement;
+            webauthn.clear_poison();
         }
         Ok(())
     })
@@ -600,6 +699,28 @@ pub fn make_unlock_cookie(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_activity_map_is_normalized_after_poisoning() {
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let zero_peer = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let counts = Arc::new(Mutex::new(HashMap::from([
+            (peer, usize::MAX),
+            (zero_peer, 0usize),
+        ])));
+        let poisoned = counts.clone();
+        assert!(std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("inject client activity map poisoning");
+        })
+        .is_err());
+
+        let recovered = client_activity_counts(&counts, 4);
+        assert_eq!(recovered.get(&peer), Some(&4));
+        assert!(!recovered.contains_key(&zero_peer));
+        drop(recovered);
+        assert!(!counts.is_poisoned());
+    }
 
     #[test]
     fn invalid_response_cookie_is_reported_without_panicking() {

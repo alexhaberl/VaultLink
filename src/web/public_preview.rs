@@ -251,7 +251,7 @@ pub(crate) async fn public_preview(
             let transfer = text_transfer
                 .take()
                 .expect("text previews reserve their transfer before reading");
-            let transfer_cookie_value = transfer.cookie.clone();
+            let transfer_cookie_value = transfer.cookie().to_string();
             let transfer_body = transfer_body(
                 stream,
                 &state,
@@ -459,7 +459,7 @@ pub(crate) async fn public_preview_raw(
         };
         let transfer =
             begin_public_transfer(&state, &headers, &uri, &sh, resource_key, "preview").await?;
-        let transfer_cookie_value = transfer.cookie.clone();
+        let transfer_cookie_value = transfer.cookie().to_string();
         let expected_bytes = response
             .headers()
             .get(header::CONTENT_LENGTH)

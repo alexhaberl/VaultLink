@@ -66,7 +66,7 @@ impl Database {
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<bool> {
         let now = Utc::now().to_rfc3339();
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM public_unlock_sessions WHERE expires_at<=?1",
@@ -105,14 +105,14 @@ impl Database {
         Ok(created)
     }
     pub fn unlock_session(&self, token: &str, share_id: i64) -> rusqlite::Result<bool> {
-        self.conn().query_row("SELECT EXISTS(SELECT 1 FROM public_unlock_sessions WHERE token_hash=?1 AND share_id=?2 AND expires_at>?3)", params![token_hash(token), share_id, Utc::now().to_rfc3339()], |row| row.get(0))
+        self.try_conn()?.query_row("SELECT EXISTS(SELECT 1 FROM public_unlock_sessions WHERE token_hash=?1 AND share_id=?2 AND expires_at>?3)", params![token_hash(token), share_id, Utc::now().to_rfc3339()], |row| row.get(0))
     }
     pub fn unlock_session_csrf(
         &self,
         token: &str,
         share_id: i64,
     ) -> rusqlite::Result<Option<String>> {
-        self.conn()
+        self.try_conn()?
             .query_row(
                 "SELECT csrf_token FROM public_unlock_sessions
                  WHERE token_hash=?1 AND share_id=?2 AND expires_at>?3
@@ -132,7 +132,7 @@ impl Database {
     ) -> rusqlite::Result<PreviewSessionCreateOutcome> {
         let now = Utc::now().to_rfc3339();
         let owner_key_hash = token_hash(owner_key);
-        let mut connection = self.conn();
+        let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM public_preview_sessions WHERE expires_at<=?1",
@@ -213,7 +213,7 @@ impl Database {
         share_id: i64,
         relative_path: &str,
     ) -> rusqlite::Result<bool> {
-        self.conn().query_row(
+        self.try_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM public_preview_sessions WHERE token_hash=?1 AND share_id=?2 AND relative_path=?3 AND expires_at>?4)",
             params![token_hash(token), share_id, relative_path, Utc::now().to_rfc3339()],
             |row| row.get(0),

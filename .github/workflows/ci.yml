@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -52,15 +53,17 @@ jobs:
           test "$(uname -m)" = "${{ matrix.expected_uname }}"
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.expected_rust_host }}"
       - name: Supply-chain policy
-        if: matrix.architecture == 'arm64'
         run: sh tools/check-supply-chain-policy.sh
       - name: Formatting
-        if: matrix.architecture == 'arm64'
         run: cargo fmt --all -- --check
       - name: Lints
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --locked --all-targets
+      - name: Version consistency including executable and health metadata
+        run: |
+          cargo build --locked --bin vaultlink
+          sh tools/check-version-consistency.sh --binary target/debug/vaultlink
       - name: Install pinned coverage tool
         if: matrix.architecture == 'arm64'
         run: |
@@ -82,9 +85,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Fuzz crate compiles
-        run: cargo check --manifest-path fuzz/Cargo.toml --locked
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets
       - name: Deployment artifacts
-        if: matrix.architecture == 'arm64'
         run: shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
       - name: Install pinned cargo-audit
         if: matrix.architecture == 'arm64'
@@ -92,8 +94,28 @@ jobs:
       - name: Audit workspace lockfile
         if: matrix.architecture == 'arm64'
         run: cargo audit --deny warnings
-      - name: Setup, API, upgrade, and rollback smoke tests
+      - name: Setup, API, root-helper, soak-evidence, upgrade, and rollback smokes
         run: make docker-smoke
       - name: Native ${{ matrix.architecture }} release build on main
         if: github.event_name == 'push'
-        run: cargo build --locked --release
+        run: |
+          cargo build --locked --release
+          sh tools/check-version-consistency.sh --binary target/release/vaultlink
+      - name: Publish exact-commit native gate
+        if: ${{ always() && github.event_name == 'push' }}
+        env:
+          GATE_RESULT: ${{ job.status }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          case "$GATE_RESULT" in
+            success) state=success; description='Native CI and release build passed' ;;
+            *) state=failure; description='Native CI or release build failed' ;;
+          esac
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            --data "{\"state\":\"$state\",\"context\":\"vaultlink/native-${{ matrix.architecture }}\",\"description\":\"$description\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}"

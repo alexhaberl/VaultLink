@@ -1,18 +1,18 @@
-# v0.4.3 release checklist
+# v0.5.0 release checklist
 
-Stand: 2026-07-14 für die native Linux-amd64-/arm64-Freigabe von 0.4.3.
+Stand: 2026-07-15 für die native Linux-amd64-/arm64-Freigabe von 0.5.0.
 
 Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfolgt über einen eigenen Pull Request; ein Tag wird erst nach dem Merge auf `main`, bei sauberem Worktree und vollständig grünen Gates gesetzt.
 
-## Feature-Scope für 0.4.3
+## Feature-Scope für 0.5.0
 
 - [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
 - [x] „Mein Konto“ für eigene Passwortänderungen mit aktuellem Passwort sowie zweistufigen MFA-Wechsel; das alte Secret bleibt bis zum bestätigten neuen TOTP-Code aktiv.
 - [x] Lokaler `recover-admin`-Notfallpfad über SSH/Hostzugriff mit `--config` oder direktem `--database`, atomarem Credential-Wechsel, Session-/Pending-Widerruf und secret-freiem Audit.
 - [x] Deutsch/Englisch in Setup-, Auth-, Admin- und Public-Flows; Cookie vor `Accept-Language`, Englisch als Fallback, locale-gerechte Datums-/Zahlen-/JavaScript-Ausgabe.
-- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.4.3.
+- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.5.0.
 - [x] Admin-Dateiverwaltung zum Erstellen von Ordnern, No-Clobber-Umbenennen und permanenten rekursiven Löschen mit serverseitiger Bestätigung sowie clientseitigem Exact-Match-Gating.
-- [x] Begrenzte, neustartfähige Tombstone-Bereinigung mit global serialisierten Cleanup-Workern und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
+- [x] Begrenzte, neustartfähige Tombstone-Bereinigung mit genau einem globalen, signalkoaleszierenden Cleanup-Worker und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
 - [x] API und UI teilen Auth-, Session-, CSRF-, SecureFS-, SQLite-, Runtime-Settings- und Audit-Logik.
 - [x] API-Fehler werden als JSON normalisiert; Streaming-Routen liefern nur bei Erfolg Binärdaten.
 - [x] Root-begrenzter Dateibrowser mit Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der Oberfläche.
@@ -45,9 +45,9 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [x] Optionaler Built-in-Let's-Encrypt-Standalone-TLS-Modus über `tls-alpn-01` und `rustls-acme`.
 - [x] UI-/UX-Polish mit getrennten Auth/Public/Admin-Shells, Logo/Favicon, locale-gerechtem Date-Time-Picker, dezimalen MB/GB-Einheiten und konsistenten Buttons/Switches.
 - [x] Public Upload-Fehlerseiten für validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Größenlimits, fehlende Dateinamen und Speicherfehler.
-- [x] Fuzzing für Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, Upload-Validierung, API-Request-Policy, Dateimutationen und Multipart-Streaming.
+- [x] Fuzzing für Produktionsparser und isolierte Policy-/Zustandskomponenten: Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, `UploadFormState`, Share-Policy, Dateimutationen und Multipart-Envelope-Streaming. Middleware-, Router-, DB-, Async- und Dateisystem-Races gehören ausschließlich zu den separaten Integrations-/Smoke-Gates; siehe [FUZZING.md](FUZZING.md).
 
-## Bewusste Nicht-Ziele für 0.4.3
+## Bewusste Nicht-Ziele für 0.5.0
 
 - DEB-Paket.
 - Öffentliches Repository.
@@ -60,17 +60,20 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 ## Verbindliche native Linux-Gates
 
 - [ ] `cargo check --locked` auf amd64 und arm64
-- [x] `cargo fmt --all -- --check`
+- [ ] `cargo fmt --all -- --check` auf amd64 und arm64
 - [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` auf amd64 und arm64
 - [ ] `cargo test --locked --all-targets` auf amd64 und arm64
-  - Das verbindliche 0.4.3-Gate sind native Linux-Läufe für amd64 und arm64; frühere Windows-Läufe gelten nicht als Freigabenachweis.
+  - Das verbindliche 0.5.0-Gate sind native Linux-Läufe für amd64 und arm64; frühere Windows-Läufe gelten nicht als Freigabenachweis.
   - Enthalten: Account-Passwort/MFA, Recovery-Races, DE/EN-Hauptrouten und Setup, API Login/MFA/Session/CSRF, Secret-Redaction, Setup-Recovery, UTF-8, SecureFS, Preview, Transfers, ZIP, Multipart, Body-Limits, Upload-Atomizität und Migrationen.
 - [ ] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
-  - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_validation_policy`, `api_request_policy`, `file_mutation_policy` und `multipart_guard` kompiliert.
+  - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_request_state`, `share_request_policy`, `file_mutation_policy` und `multipart_guard` kompiliert.
 - [ ] `cargo build --release --locked` auf amd64 und arm64
 - [ ] `cargo audit --deny warnings` für das gemeinsame Workspace-Lockfile auf dem finalen Stand wiederholen.
-- [ ] `make policy-check` beziehungsweise das Shell-Skript in einer Umgebung mit `sh` wiederholen.
-- [ ] `make docker-smoke` auf dem finalen 0.4.3-Stand nativ auf amd64 und arm64 wiederholen.
+- [ ] `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh` und `make policy-check` auf amd64 und arm64 wiederholen.
+- [ ] `make docker-smoke` auf dem finalen 0.5.0-Stand nativ auf amd64 und arm64 wiederholen.
+- [ ] Wöchentlicher/manueller Reproducibility-Workflow baut pro Architektur zweimal mit leeren Target-Verzeichnissen und identischem `SOURCE_DATE_EPOCH`; Binär- und Archiv-SHA-256 sind bitgenau gleich.
+- [ ] Debian-Basisimage, Snapshot-Zeitpunkt sowie direkte und transitive Release-Pakete entsprechen `debian-snapshot.sources` und `debian-packages.lock`; das source-unabhängige `Dockerfile.release-builder` wurde explizit als linux/amd64+linux/arm64-Manifest gebaut und gepusht.
+- [ ] Externen Blocker auflösen: `release-builder-image.lock` enthält nicht mehr `UNPROVISIONED`, sondern die vollständige echte `ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>`-Referenz; `VAULTLINK_RELEASE_BUILDER_IMAGE` ist exakt gleich und das private GHCR-Paket gewährt dem Repository-Actions-Token Lesezugriff. Release-/Reproducibility-Jobs ziehen sie mit `packages: read` und installieren weder APT- noch Cargo-Werkzeuge zur Laufzeit.
 
 ## Historische Beobachtung vor dem 0.3.2-Upgrade
 
@@ -100,23 +103,25 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 
 ## Noch auszuführende Release-Gates
 
-- [ ] Fuzz-Gate jeweils zehn Minuten:
+- [ ] Fuzz-Gate auf amd64 und arm64 jeweils zehn Minuten:
   - Pfadnormalisierung,
   - Byte-Range-Parser,
   - Dateinamen,
   - ZIP/Search/Preview-Pfadfälle inklusive Media-Preview,
   - Upload-Overwrite-Policy,
-  - Upload-Validierungslogik,
-  - API-Request-Policy,
+  - echte Upload-Request-Zustandslogik,
+  - echte Share-Request-Policy,
   - Admin-Dateimutations- und Share-Teilbaumpolicy,
   - Multipart-Streaming-Guard inklusive Chunk-Grenzen, EOF, Header- und Preamble-Limits.
-  - Der Workflow läuft zusätzlich wöchentlich als einzelner Self-hosted-Job, der alle neun Targets mit vier Workern in drei Gruppen und einem 60-Minuten-Timeout ausführt; der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
+  - Der Workflow läuft zusätzlich wöchentlich als native amd64/arm64-Matrix; jede Architektur führt alle neun Targets mit vier Workern in drei Gruppen und einem 60-Minuten-Timeout aus und publiziert einen eigenen Commit-Status. Der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
 - [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
 - [ ] Dabei das gemeinsame Workspace-`Cargo.lock` prüfen.
 - [ ] GitHub Actions CI auf finalem `main` grün.
-- [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `[self-hosted, Linux, ARM64, vaultlink]` grün; beide verwenden den zu `rust-toolchain.toml` passenden, digest-gepinnten Debian-13-/Rust-OCI-Index. Architekturunabhängige Release-Jobs laufen auf arm64.
+- [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `[self-hosted, Linux, ARM64, vaultlink]` grün; beide verwenden exakt `VAULTLINK_RELEASE_BUILDER_IMAGE` als digest-gepinnten Multi-Arch-Builder ohne Laufzeitinstallation von APT-/Cargo-Werkzeugen. Architekturunabhängige Release-Jobs laufen auf arm64.
+- [ ] Vor dem Candidate-Preflight ist `release/minisign.pub` offline erzeugt, committed, nicht leer und als Minisign-Ed25519-Public-Key validiert; die beiden Signing-Secrets sind provisioniert. Keine Key- oder Builder-Pin-Änderung nach Soak-Start.
+- [ ] Reproducibility-Evidenz für amd64 und arm64 gehört zum exakten finalen Commit und enthält gleiche Hashes beider unabhängiger Builds.
 - [ ] Offline erzeugten Minisign-Public-Key als `release/minisign.pub` committen und `MINISIGN_SECRET_KEY` sowie `MINISIGN_PASSWORD` als GitHub-Actions-Secrets provisionieren; ohne alle drei Werte muss der Tag-Publish absichtlich fehlschlagen.
-- [ ] Ein autorisierter Maintainer pusht den annotierten `v0.4.3`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, exakte Gleichheit von Tag-Commit und `origin/main` sowie der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
+- [ ] Ein autorisierter Maintainer pusht den annotierten `v0.5.0`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, exakte Gleichheit von Tag-Commit und `origin/main` sowie der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
 - [ ] Artefakte prüfen:
   - versionierte amd64- und arm64-Archive,
   - eigenständige, architekturspezifische Binaries,
@@ -198,13 +203,17 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 
 ## Finaler 72h-Soak
 
+- [ ] Vor dem Soak ist im obersten Changelog-Eintrag statt `Unreleased release candidate` das geplante echte UTC-Kalenderdatum im Format `YYYY-MM-DD` committed. Der manuelle Release-Workflow im Modus `candidate` ist für exakt diesen Commit erfolgreich und setzt `vaultlink/release-candidate-preflight`.
 - [ ] Erst nach dem letzten Runtime-Deploy starten.
-- [ ] Gate:
+- [ ] Dedizierten Debian-13-amd64-Runner `[self-hosted, Linux, X64, vaultlink-soak]` ausschließlich über den manuellen Start-Workflow auf dem exakten `origin/main`-Commit starten; der Workflow verlangt den Candidate-Preflight und prüft Debian 13 sowie `x86_64` fail-closed.
+- [ ] Gate über mindestens 259200 Sekunden:
   - keine ungeplanten Restarts,
   - `PRAGMA integrity_check = ok`,
-  - kein kontinuierliches RSS-Wachstum > 15 %,
-  - keine auffälligen 5xx-/Panic-/DB-Fehler im Journal.
-- [ ] Lange Soaks werden nach reinen Doku-/CI-/Deploy-Skript-Änderungen ohne neues Binary nicht neu gestartet; geänderte Upgrade-/Rollback-Skripte müssen ihre Staging-Gates trotzdem erneut bestehen. Jedes neue Binary-Deploy setzt den Soak zurück.
+  - Health-Version durchgehend `0.5.0`, keine 5xx-/Panic-/DB-Fehler im Journal,
+  - Metadaten-p95 < 750 ms bei 100 Clients, 40 parallele Streams und zehn parallele Uploads je Lastlauf,
+  - RSS immer ≤ 256 MiB und höchstens 15 % Wachstum zwischen Warm- und Schlussmedian.
+- [ ] Der stündliche Collector hat das atomare Ergebnis, CSV-Metriken, Lastberichte, Journal, Commit und vollständigen Binärhash als `soak-evidence-COMMIT` hochgeladen und den Commit-Status `vaultlink/72h-soak` auf `success` gesetzt.
+- [ ] Jede Änderung am Commit nach Soak-Beginn – einschließlich Doku, CI, Deploy-Skripten, Konfiguration oder Version – invalidiert die Evidenz und startet das vollständige 72h-Gate neu.
 
 ## Tag-Freigabe
 
@@ -213,8 +222,10 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [ ] Release-Dry-Run und `cargo-audit` weiterhin grün.
 - [ ] `make policy-check` grün; alle Dependabot-Pin-Updates gegen die jeweiligen Upstream-Repositories geprüft.
 - [ ] Staging- und Public-Gates grün.
-- [ ] 72h-Soak bestanden.
-- [ ] Annotierten Tag `v0.4.3` erstellen.
+- [ ] `vaultlink/72h-soak` ist für exakt diesen Commit erfolgreich; der Release-Workflow verifiziert Dauer, Metriken, Lastläufe und den vollständigen amd64-Binärhash aus dem verknüpften Evidenzartefakt.
+- [ ] Der manuelle Release-Workflow im Modus `evidence` hat für denselben unveränderten Commit Soak- und Reproducibility-Evidenz heruntergeladen, Binär-/Archivhashes mit beiden Neubauten verglichen und `vaultlink/release-evidence-preflight` auf `success` gesetzt.
+- [ ] Das committed Changelog-Datum entspricht beim Tag-Lauf exakt dem aktuellen UTC-Datum. Wird der geplante Termin verpasst, ist eine Datumsänderung ein neuer Commit und erzwingt Candidate-Preflight sowie vollständigen 72h-Soak erneut.
+- [ ] Annotierten Tag `v0.5.0` erstellen.
 - [ ] Tag-Commit entspricht exakt dem freigegebenen `origin/main`-Commit; Release-Environment/Secrets sind für den Tag freigegeben.
 - [ ] Offline erzeugtes `release/minisign.pub` ist vor dem Tag committed und die beiden Minisign-Secrets sind provisioniert.
 - [ ] Tag-Release-Workflow prüfen:
