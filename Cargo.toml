@@ -22,6 +22,8 @@ axum = { version = "0.8", features = ["multipart"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+chacha20poly1305 = "0.10"
+crc32fast = "1.5"
 data-encoding = "2.6"
 hmac = "0.13"
 http = "1"
@@ -29,10 +31,13 @@ http-body = "1"
 futures-util = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 mime_guess = "2"
+memchr = "2"
 percent-encoding = "2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.10"
 rpassword = "7"
+r2d2 = "0.8"
+r2d2_sqlite = "0.35"
 rusqlite = { version = "0.40", features = ["bundled", "chrono", "fallible_uint"] }
 rustix = { version = "1", features = ["fs", "process"] }
 rustls-acme = { version = "0.15.3", features = ["axum"] }
@@ -51,7 +56,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 tempfile = "3"
-webauthn-rs = { version = "0.5.5", default-features = false }
+webauthn_rp = { version = "=0.3.0", default-features = false, features = ["bin", "serde_relaxed"] }
 zeroize = "1.9"
 
 [dev-dependencies]
@@ -60,4 +65,5 @@ zeroize = "1.9"
 lto = "thin"
 codegen-units = 1
 strip = true
-panic = "abort"
+panic = "unwind"
+overflow-checks = true

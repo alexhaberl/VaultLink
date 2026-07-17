@@ -12,7 +12,9 @@ use super::{
     common::{add_upload_bytes, encoded, internal, join_display},
     files::persist_required_file_audit,
     public::{get_share, get_storage_share},
-    rendering::{storage_full_error, storage_has_room, UploadChunkReservation},
+    rendering::{
+        storage_full_error, storage_has_room, StorageReservationError, UploadChunkReservation,
+    },
     storage_recovery_app_error,
     transfer_runtime::{
         begin_upload_reservation_cancellation_safe, limited_multipart_text, public_share_route,
@@ -264,16 +266,26 @@ impl PublicUploadStaging {
             }
         }
 
-        let Some(_chunk_reservation) =
-            UploadChunkReservation::acquire(state.secure_root.display_root(), chunk.len() as u64)
-        else {
-            return Err(public_upload_rejection(
-                token,
-                &self.target.upload_subdir,
-                StatusCode::INSUFFICIENT_STORAGE,
-                "Nicht genug freier Speicher",
-            ));
-        };
+        let _chunk_reservation =
+            match UploadChunkReservation::acquire(state, chunk.len() as u64).await {
+                Ok(reservation) => reservation,
+                Err(StorageReservationError::CapacityUnavailable) => {
+                    return Err(public_upload_rejection(
+                        token,
+                        &self.target.upload_subdir,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Speicherkapazität nicht ermittelbar",
+                    ))
+                }
+                Err(StorageReservationError::InsufficientStorage) => {
+                    return Err(public_upload_rejection(
+                        token,
+                        &self.target.upload_subdir,
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        "Nicht genug freier Speicher",
+                    ))
+                }
+            };
         self.total = new_total;
         if let Err(error) = self.output.write_all(&chunk).await {
             return if storage_full_error(&error) {
@@ -918,15 +930,16 @@ impl PublicUploadFormPhase<'_> {
                             )
                         })?;
                     upload_subdir =
-                        policy::normalize_public_upload_subdir(share.permission.clone(), &value)
-                            .map_err(|_| {
+                        policy::normalize_public_upload_subdir(share.permission, &value).map_err(
+                            |_| {
                                 public_upload_rejection(
                                     token,
                                     &upload_subdir,
                                     StatusCode::BAD_REQUEST,
                                     "Ungültiger Uploadpfad",
                                 )
-                            })?;
+                            },
+                        )?;
                 }
                 UploadFormField::FolderPath => {
                     let value = limited_multipart_text(field, MAX_UPLOAD_PATH_FIELD_BYTES)
@@ -1291,7 +1304,6 @@ pub(crate) async fn upload(
         current_client_limit_key(),
         crate::MAX_IN_FLIGHT_UPLOADS_PER_CLIENT,
     )
-    .map_err(internal)?
     .ok_or(AppError(
         StatusCode::SERVICE_UNAVAILABLE,
         "Zu viele gleichzeitige Uploads dieses Clients",
@@ -1309,18 +1321,30 @@ pub(crate) async fn upload(
         .max_upload_size
         .unwrap_or(settings.max_upload_size)
         .min(crate::config::MAX_UPLOAD_SIZE);
-    if headers
+    if let Some(length) = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|length| !storage_has_room(state.secure_root.display_root(), length))
     {
-        return Ok(public_upload_error(
-            &token,
-            "",
-            StatusCode::INSUFFICIENT_STORAGE,
-            "Nicht genug freier Speicher",
-        ));
+        match storage_has_room(&state, length).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(public_upload_error(
+                    &token,
+                    "",
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "Nicht genug freier Speicher",
+                ))
+            }
+            Err(_) => {
+                return Ok(public_upload_error(
+                    &token,
+                    "",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Speicherkapazität nicht ermittelbar",
+                ))
+            }
+        }
     }
 
     let form_phase = PublicUploadFormPhase {
@@ -1398,7 +1422,7 @@ pub(super) fn upload_queue_error_response(status: StatusCode, message: &str) -> 
         Json(UploadQueueErrorEnvelope {
             error: UploadQueueError {
                 code: code.to_string(),
-                message,
+                message: message.into_owned(),
             },
         }),
     )

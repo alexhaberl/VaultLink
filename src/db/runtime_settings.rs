@@ -50,20 +50,22 @@ impl Database {
                 statement.execute(params![*key, value.as_str(), admin, updated_at])?;
             }
         }
-        let audit_events = required_audit.as_ref().map(|(_, detail)| {
-            [RequiredAuditEvent::new(
-                "settings_updated",
-                None,
-                Some(detail.clone()),
-            )]
-        });
-        if let (Some((context, _)), Some(events)) = (required_audit.as_ref(), audit_events.as_ref())
-        {
+        let (audit_context, audit_events) =
+            required_audit.map_or((None, None), |(context, detail)| {
+                (
+                    Some(context),
+                    Some([RequiredAuditEvent::new(
+                        "settings_updated",
+                        None,
+                        Some(detail),
+                    )]),
+                )
+            });
+        if let (Some(context), Some(events)) = (audit_context, audit_events.as_ref()) {
             insert_required_audits(&transaction, context, events)?;
         }
         transaction.commit()?;
-        if let (Some((context, _)), Some(events)) = (required_audit.as_ref(), audit_events.as_ref())
-        {
+        if let (Some(context), Some(events)) = (audit_context, audit_events.as_ref()) {
             trace_required_audits(context, events);
         }
         Ok(())

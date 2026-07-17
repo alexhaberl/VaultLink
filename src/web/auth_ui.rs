@@ -18,11 +18,10 @@ use crate::{
     auth,
     db::AuditContext,
     http_auth::{
-        audit_observation, clear_session_cookie, csrf, database, enabled_audit_client_ip,
-        make_session_cookie, password_login_admitted, redirect_with_cookie, required_database,
-        session, MissingSession,
+        audit_observation, clear_session_cookie, csrf, current_client_limit_key, database,
+        enabled_audit_client_ip, make_session_cookie, password_login_admitted,
+        redirect_with_cookie, required_database, session, MissingSession,
     },
-    proxy,
     services::auth::{
         AuthService, PasswordLoginCommand, PasswordLoginOutcome, TotpLoginCommand, TotpLoginOutcome,
     },
@@ -53,15 +52,11 @@ pub(super) struct LoginForm {
 
 pub(super) async fn login(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    _headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Result<Response> {
-    let ip = proxy::client_limit_key(proxy::effective_client_ip(
-        peer.ip(),
-        &headers,
-        &state.config,
-    ));
+    let ip = current_client_limit_key();
     let ip_key = format!("ip:{ip}");
     if !auth::valid_admin_username(&form.username) {
         if !state.limiter.check_and_record_attempt(&ip_key) {
@@ -72,8 +67,12 @@ pub(super) async fn login(
         }
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
-    let key = format!("{}:{}", ip, form.username.to_lowercase());
-    if !state.limiter.check_and_record_attempts(&[&key, &ip_key]) {
+    let normalized_username = form.username.to_lowercase();
+    let key = format!("{ip}:{normalized_username}");
+    let account_key = format!("account:{normalized_username}");
+    if !state.limiter.check_and_record_attempts(&[&key, &ip_key])
+        || !state.account_limiter.check_and_record_attempt(&account_key)
+    {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Zu viele Anmeldeversuche",
@@ -107,7 +106,7 @@ pub(super) async fn login(
     // compromised credentials.
     Ok(redirect_with_cookie(
         "/mfa",
-        make_session_cookie(&state, &token),
+        &make_session_cookie(&state, &token),
     )?)
 }
 
@@ -186,7 +185,7 @@ pub(super) async fn mfa(
     state.limiter.success(&key);
     Ok(redirect_with_cookie(
         "/admin",
-        make_session_cookie(&state, &new_token),
+        &make_session_cookie(&state, &new_token),
     )?)
 }
 
@@ -230,7 +229,7 @@ pub(super) async fn start_security_key_authentication(
 #[derive(Deserialize)]
 pub(super) struct SecurityKeyAuthenticationFinish {
     csrf: String,
-    credential: webauthn_rs::prelude::PublicKeyCredential,
+    credential: serde_json::Value,
 }
 
 pub(super) async fn finish_security_key_authentication(
@@ -266,8 +265,8 @@ pub(super) async fn finish_security_key_authentication(
         .map_err(|_| AppError(StatusCode::UNAUTHORIZED, "Ungültiger Sicherheitsschlüssel"))?;
     let row = rows.get(index).ok_or_else(|| internal(()))?;
     let credential_id = row.id;
-    let expected_credential_json = row.credential_json.clone();
-    let credential_json = serde_json::to_string(&keys[index]).map_err(internal)?;
+    let expected_credential_blob = row.credential_blob.clone();
+    let credential_blob = keys[index].to_blob().map_err(internal)?;
     let new_token = auth::random_token(32);
     let new_csrf = auth::random_token(24);
     let rotated_token = new_token.clone();
@@ -281,8 +280,8 @@ pub(super) async fn finish_security_key_authentication(
             &rotated_csrf,
             credential_id,
             admin_id,
-            &expected_credential_json,
-            &credential_json,
+            &expected_credential_blob,
+            &credential_blob,
             &audit_context,
         )
     })
@@ -317,6 +316,6 @@ pub(super) async fn logout(
     .await?;
     Ok(redirect_with_cookie(
         "/login",
-        clear_session_cookie(&state),
+        &clear_session_cookie(&state),
     )?)
 }

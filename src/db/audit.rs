@@ -3,8 +3,11 @@ use super::{
     AuditEvent, AuditSortColumn, AuditSortDirection, Database, RequiredAuditEvent, MAX_AUDIT_ROWS,
 };
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+#[cfg(test)]
+use rusqlite::Connection;
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
+#[cfg(test)]
 pub(super) fn enforce_audit_retention(
     connection: &Connection,
     maximum_rows: i64,
@@ -51,7 +54,6 @@ pub(super) fn insert_audit_event(
             client_ip
         ],
     )?;
-    enforce_audit_retention(transaction, MAX_AUDIT_ROWS)?;
     Ok(())
 }
 
@@ -76,6 +78,40 @@ fn persisted_audit_client_ip_enabled(
 }
 
 impl Database {
+    pub fn cleanup_audit_retention(&self) -> rusqlite::Result<usize> {
+        const BATCH_SIZE: i64 = 1_000;
+        let cutoff = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let mut deleted_total = 0usize;
+        loop {
+            let mut connection = self.try_conn()?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let count: i64 =
+                transaction.query_row("SELECT COUNT(*) FROM audit", [], |row| row.get(0))?;
+            let excess = count.saturating_sub(MAX_AUDIT_ROWS);
+            if excess == 0 {
+                transaction.commit()?;
+                break;
+            }
+            let batch = excess.min(BATCH_SIZE);
+            let deleted = transaction.execute(
+                "DELETE FROM audit WHERE id IN (
+                     SELECT id FROM audit
+                     WHERE occurred_at<?1
+                     ORDER BY id ASC
+                     LIMIT ?2
+                 )",
+                params![cutoff, batch],
+            )?;
+            transaction.commit()?;
+            deleted_total = deleted_total.saturating_add(deleted);
+            if deleted == 0 {
+                break;
+            }
+        }
+        Ok(deleted_total)
+    }
+
     pub fn audit(
         &self,
         actor: &str,

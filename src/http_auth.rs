@@ -2,7 +2,6 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use std::{
     collections::HashMap,
     future::Future,
-    io,
     net::{IpAddr, Ipv4Addr},
     sync::{Arc, Mutex},
 };
@@ -99,19 +98,19 @@ pub(crate) fn try_acquire_client_activity(
     counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
     peer: IpAddr,
     maximum: usize,
-) -> io::Result<Option<ClientActivityPermit>> {
+) -> Option<ClientActivityPermit> {
     let mut active = client_activity_counts(&counts, maximum);
     let count = active.entry(peer).or_default();
     if *count >= maximum {
-        return Ok(None);
+        return None;
     }
     *count += 1;
     drop(active);
-    Ok(Some(ClientActivityPermit {
+    Some(ClientActivityPermit {
         counts,
         peer,
         maximum,
-    }))
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -195,7 +194,7 @@ pub(crate) async fn hash_password_admitted(
         // Keep the owned permit in the blocking task so cancelling the request
         // cannot release capacity while Argon2 is still consuming CPU and RAM.
         let _permit = permit;
-        crate::auth::hash_secret_password(password)
+        crate::auth::hash_secret_password(&password)
     })
     .await
     .map_err(internal)?
@@ -217,9 +216,9 @@ pub(crate) async fn verify_password_admitted(
         // overload response and both paths consume one admitted Argon2 job.
         let _permit = permit;
         match password_hash {
-            Some(hash) => crate::auth::verify_secret_password(hash, password),
+            Some(hash) => crate::auth::verify_secret_password(&hash, &password),
             None => {
-                let _ = crate::auth::hash_secret_password(password);
+                let _ = crate::auth::hash_secret_password(&password);
                 false
             }
         }
@@ -574,9 +573,9 @@ pub fn clear_session_cookie(state: &AppState) -> String {
     )
 }
 
-pub fn redirect_with_cookie(to: &str, value: String) -> Result<Response> {
+pub fn redirect_with_cookie(to: &str, value: &str) -> Result<Response> {
     let mut response = Redirect::to(to).into_response();
-    let value = HeaderValue::from_str(&value).map_err(internal)?;
+    let value = HeaderValue::from_str(value).map_err(internal)?;
     response.headers_mut().insert(header::SET_COOKIE, value);
     Ok(response)
 }
@@ -724,7 +723,7 @@ mod tests {
 
     #[test]
     fn invalid_response_cookie_is_reported_without_panicking() {
-        let error = redirect_with_cookie("/", "cookie=value\r\nbad=value".to_string())
+        let error = redirect_with_cookie("/", "cookie=value\r\nbad=value")
             .expect_err("invalid cookie header must be rejected");
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
     }

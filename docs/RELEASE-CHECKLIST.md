@@ -141,9 +141,8 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
 - [ ] SQLite-Backup vor Upgrade bei gestopptem Dienst erstellen.
 - [ ] Upgrade-Test durchführen.
   - getrennte alte/neue Binary+Config-Paare vor Downtime validieren,
-  - jedes pre-0.4.1→0.4.1+-Upgrade verweigert ein noch aktives `vaultlink.service` vor jeder Mutation; semantische Downgrades werden vom Upgrade- und Roll-forwards vom Rollback-Einstiegspunkt abgelehnt,
-  - Backup enthält `vaultlink`, `config.toml` und `data.sqlite` mit restriktiven Ownern/Modi,
-  - Candidate-Failure restauriert das vollständige alte Tripel und prüft dessen eigenen Health-Endpunkt,
+  - Backup enthält `vaultlink`, `config.toml`, `data.sqlite` und den passenden `secrets.keyring` mit restriktiven Ownern/Modi,
+  - Candidate-Failure restauriert die vollständige alte Binary/Config/DB/Keyring-Einheit und prüft deren eigenen Health-Endpunkt,
   - paralleles Upgrade/Rollback scheitert vor dem Dienst-Stopp am Maintenance-Lock.
 - [ ] Passwortgeschützte Public-Uploads akzeptieren den Unlock-gebundenen CSRF-Wert als Multipart-Feld beziehungsweise `X-VaultLink-Upload-CSRF` und lehnen fehlende/fremde Werte ab.
 - [ ] Upload-Shares erzwingen Einzeldatei-, kumulatives Byte- und Dateianzahllimit auch bei parallelen Queue-Uploads und Overwrite-Versuchen.
@@ -154,7 +153,6 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
   - exakten lokalen Health-/Versions-Smoke ausführen,
   - fehlgeschlagener Recovery-Stop oder unvollständiger Emergency-Restore bleibt gestoppt.
 - [ ] Reales SMB-3.1.1-Co-Writer-Gate auf einem externen Server:
-  - pre-0.4.1-Share-Root unter vollständiger Writer-Quiesce inventarisieren; `.vaultlink-internal`-Alias- und alte Fragment/Tombstone-Kollisionen auflösen,
   - alle sichtbaren Einträge einschließlich Dotfiles direkt im Share-Root gegen Snapshot/Hashes verifizieren,
   - separates VaultLink-SMB-Konto sowie normale Windows-, macOS- und Linux-Co-Writer-Konten verwenden,
   - SMB-Server/Share erzwingt SMB 3.1.1 Signing und Encryption; dies wird für die VaultLink-Mount-Session und jede direkte Windows-/macOS-/Linux-Session separat verifiziert,

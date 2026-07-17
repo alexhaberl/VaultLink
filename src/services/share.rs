@@ -243,12 +243,7 @@ impl ShareService {
         let is_directory = command.target.is_directory();
         let allows_upload = command.permission.can_upload();
         if matches!(
-            policy::share_upload_conflict_strategy(
-                is_directory,
-                command.permission.clone(),
-                false,
-                false,
-            ),
+            policy::share_upload_conflict_strategy(is_directory, command.permission, false, false,),
             Err(ShareUploadPolicyError::UploadPermissionRequiresDirectory)
         ) {
             return Err(ShareServiceError::UploadPermissionRequiresDirectory);
@@ -306,7 +301,7 @@ impl ShareService {
 
         let upload_conflict_strategy = policy::share_upload_conflict_strategy(
             is_directory,
-            command.permission.clone(),
+            command.permission,
             command.overwrite_allowed,
             self.external_writers,
         )
@@ -420,7 +415,7 @@ impl ShareService {
     pub(crate) fn create(
         &self,
         prepared: PreparedCreateShare,
-        password_hash: Option<String>,
+        password_hash: Option<&str>,
         audit_context: &AuditContext,
     ) -> Result<CreatedShare, ShareServiceError> {
         if prepared.password_protected != password_hash.is_some() {
@@ -440,7 +435,7 @@ impl ShareService {
                 prepared.max_upload_total_size,
                 prepared.max_upload_files,
                 prepared.created_by,
-                password_hash.as_deref(),
+                password_hash,
                 &prepared.upload_conflict_strategy,
                 audit_context,
                 Some(prepared.audit_detail),

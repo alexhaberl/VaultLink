@@ -9,9 +9,12 @@ staged_binary="$install_dir/.vaultlink.rollback.new"
 restore_binary="$install_dir/.vaultlink.rollback.restore"
 data=/var/lib/vaultlink/data.sqlite
 data_dir=/var/lib/vaultlink
+keyring="$data_dir/secrets.keyring"
 backup_root=/var/lib/vaultlink-backups
 staged_data=
+staged_keyring=
 restore_data=
+restore_keyring=
 config_path=/etc/vaultlink/config.toml
 staged_config=/etc/vaultlink/.config.toml.rollback.new
 restore_config=/etc/vaultlink/.config.toml.rollback.restore
@@ -31,9 +34,11 @@ backup_dir=$1
 [ -x "$backup_dir/vaultlink" ] || { echo "backup binary missing" >&2; exit 1; }
 [ -f "$backup_dir/config.toml" ] || { echo "configuration backup missing" >&2; exit 1; }
 [ -f "$backup_dir/data.sqlite" ] || { echo "database backup missing" >&2; exit 1; }
+[ -s "$backup_dir/secrets.keyring" ] || { echo "secrets keyring backup missing or empty" >&2; exit 1; }
 [ -x "$live_binary" ] || { echo "installed VaultLink binary is missing or not executable" >&2; exit 1; }
 [ -f "$config_path" ] || { echo "live VaultLink configuration is missing" >&2; exit 1; }
 [ -f "$data" ] || { echo "live VaultLink database is missing" >&2; exit 1; }
+[ -s "$keyring" ] || { echo "live VaultLink secrets keyring is missing or empty" >&2; exit 1; }
 
 for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock awk; do
     command -v "$required_command" >/dev/null || {
@@ -192,15 +197,6 @@ compare_semver() {
             print prerelease_compare(left_parts[4], right_parts[4])
         }
     '
-}
-
-storage_layout_generation() {
-    layout_order=$(compare_semver "$1" "0.4.1-0") || return 1
-    if [ "$layout_order" -lt 0 ]; then
-        printf '%s\n' legacy
-    else
-        printf '%s\n' sibling
-    fi
 }
 
 derive_readiness_target() {
@@ -372,7 +368,11 @@ restore_pre_rollback_state() {
     if [ -n "$restore_data" ]; then
         rm -f "$restore_data"
     fi
+    if [ -n "$restore_keyring" ]; then
+        rm -f "$restore_keyring"
+    fi
     restore_data=$(mktemp "$data_dir/.data.sqlite.rollback.restore.XXXXXX") || return 1
+    restore_keyring=$(mktemp "$data_dir/.secrets.keyring.rollback.restore.XXXXXX") || return 1
 
     install -o root -g root -m 0755 "$emergency_dir/vaultlink" "$restore_binary" \
         || restore_failed=1
@@ -380,13 +380,16 @@ restore_pre_rollback_state() {
         || restore_failed=1
     install -o vaultlink -g vaultlink -m 0600 "$emergency_dir/data.sqlite" "$restore_data" \
         || restore_failed=1
+    install -o vaultlink -g vaultlink -m 0600 "$emergency_dir/secrets.keyring" "$restore_keyring" \
+        || restore_failed=1
     if [ "$restore_failed" -eq 0 ]; then
         sqlite3 "$restore_data" "PRAGMA integrity_check" | grep -qx ok \
             || restore_failed=1
     fi
     if [ "$restore_failed" -ne 0 ]; then
-        rm -f "$restore_binary" "$restore_config" "$restore_data"
+        rm -f "$restore_binary" "$restore_config" "$restore_data" "$restore_keyring"
         restore_data=
+        restore_keyring=
         return 1
     fi
 
@@ -394,8 +397,10 @@ restore_pre_rollback_state() {
     mv -f "$restore_config" "$config_path" || restore_failed=1
     rm -f "$data-wal" "$data-shm" || restore_failed=1
     mv -f "$restore_data" "$data" || restore_failed=1
-    rm -f "$restore_binary" "$restore_config" "$restore_data"
+    mv -f "$restore_keyring" "$keyring" || restore_failed=1
+    rm -f "$restore_binary" "$restore_config" "$restore_data" "$restore_keyring"
     restore_data=
+    restore_keyring=
     [ "$restore_failed" -eq 0 ]
 }
 
@@ -411,9 +416,17 @@ on_failure() {
         rm -f "$staged_data"
         staged_data=
     fi
+    if [ -n "$staged_keyring" ]; then
+        rm -f "$staged_keyring"
+        staged_keyring=
+    fi
     if [ -n "$restore_data" ]; then
         rm -f "$restore_data"
         restore_data=
+    fi
+    if [ -n "$restore_keyring" ]; then
+        rm -f "$restore_keyring"
+        restore_keyring=
     fi
 
     if [ "$replacement_started" -eq 1 ]; then
@@ -461,6 +474,7 @@ install -d -o root -g root -m 0700 "$backup_root"
 install -o root -g root -m 0755 "$backup_dir/vaultlink" "$staged_binary"
 install -o root -g vaultlink -m 0640 "$backup_dir/config.toml" "$staged_config"
 sqlite3 "$backup_dir/data.sqlite" "PRAGMA integrity_check" | grep -qx ok
+[ -s "$backup_dir/secrets.keyring" ]
 
 # Validate both exact binary/configuration pairs before stopping the service.
 requested_version=$(read_bounded_version "$staged_binary" "rollback binary")
@@ -487,38 +501,37 @@ if [ "$version_order" -gt 0 ]; then
     exit 1
 fi
 
-requested_layout=$(storage_layout_generation "$requested_version")
-current_layout=$(storage_layout_generation "$current_version")
-if [ "$requested_layout" != "$current_layout" ] && [ "$was_active" -eq 1 ]; then
-    echo "a rollback across the pre-0.4.1 storage-layout boundary requires vaultlink.service to be stopped and the matching storage layout to be restored first" >&2
-    exit 1
-fi
-
 stop_attempted=1
 systemctl stop "$service"
 
-# Preserve the exact stopped triple so a failed rollback can itself be rolled back.
+# Preserve the exact stopped binary/configuration/database/keyring unit so a
+# failed rollback can itself be rolled back.
 install -d -o root -g root -m 0700 "$emergency_stage"
 install -o root -g root -m 0700 "$live_binary" "$emergency_stage/vaultlink"
 install -o root -g root -m 0600 "$config_path" "$emergency_stage/config.toml"
+install -o root -g root -m 0600 "$keyring" "$emergency_stage/secrets.keyring"
 sqlite3 "$data" ".timeout 10000" ".backup '$emergency_stage/data.sqlite'"
 chown root:root "$emergency_stage/data.sqlite"
 chmod 0600 "$emergency_stage/data.sqlite"
 sqlite3 "$emergency_stage/data.sqlite" "PRAGMA integrity_check" | grep -qx ok
+[ -s "$emergency_stage/secrets.keyring" ]
 mv "$emergency_stage" "$emergency_dir"
 emergency_valid=1
 
 staged_data=$(mktemp "$data_dir/.data.sqlite.rollback.new.XXXXXX")
+staged_keyring=$(mktemp "$data_dir/.secrets.keyring.rollback.new.XXXXXX")
 install -o vaultlink -g vaultlink -m 0600 "$backup_dir/data.sqlite" "$staged_data"
+install -o vaultlink -g vaultlink -m 0600 "$backup_dir/secrets.keyring" "$staged_keyring"
 sqlite3 "$staged_data" "PRAGMA integrity_check" | grep -qx ok
 
 # Each rename is atomic on its destination filesystem. Handled failures restore
-# the complete emergency triple before any restart is attempted.
+# the complete emergency unit before any restart is attempted.
 replacement_started=1
 mv -f "$staged_binary" "$live_binary"
 mv -f "$staged_config" "$config_path"
 rm -f "$data-wal" "$data-shm"
 mv -f "$staged_data" "$data"
+mv -f "$staged_keyring" "$keyring"
 
 systemctl start "$service"
 wait_until_active

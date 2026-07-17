@@ -9,8 +9,10 @@ staged_binary="$install_dir/.vaultlink.new"
 restore_binary="$install_dir/.vaultlink.restore"
 data=/var/lib/vaultlink/data.sqlite
 data_dir=/var/lib/vaultlink
+keyring="$data_dir/secrets.keyring"
 backup_root=/var/lib/vaultlink-backups
 staged_data=
+staged_keyring=
 config_path=/etc/vaultlink/config.toml
 staged_config=/etc/vaultlink/.config.toml.new
 restore_config=/etc/vaultlink/.config.toml.restore
@@ -32,18 +34,15 @@ new_config=$2
 [ -f "$new_config" ] || { echo "new configuration is missing" >&2; exit 1; }
 [ -x "$live_binary" ] || { echo "installed VaultLink binary is missing or not executable" >&2; exit 1; }
 [ -f "$data" ] || { echo "VaultLink database is missing" >&2; exit 1; }
+[ -s "$keyring" ] || { echo "VaultLink secrets keyring is missing or empty" >&2; exit 1; }
 [ -f "$config_path" ] || { echo "VaultLink configuration is missing: $config_path" >&2; exit 1; }
 
-for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock od tr awk; do
+for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock awk; do
     command -v "$required_command" >/dev/null || {
         echo "$required_command is required for a safe upgrade" >&2
         exit 1
     }
 done
-[ -r /dev/urandom ] || {
-    echo "/dev/urandom is required for safe share-alias migration" >&2
-    exit 1
-}
 
 exec 9>"$maintenance_lock"
 if ! flock -n 9; then
@@ -195,17 +194,6 @@ compare_semver() {
             print prerelease_compare(left_parts[4], right_parts[4])
         }
     '
-}
-
-storage_layout_generation() {
-    # 0.4.1 pre-releases already use the sibling staging layout. The synthetic
-    # -0 boundary sorts before every valid 0.4.1 pre-release.
-    layout_order=$(compare_semver "$1" "0.4.1-0") || return 1
-    if [ "$layout_order" -lt 0 ]; then
-        printf '%s\n' legacy
-    else
-        printf '%s\n' sibling
-    fi
 }
 
 derive_readiness_target() {
@@ -374,11 +362,6 @@ was_active=0
 stop_attempted=0
 backup_valid=0
 candidate_activated=0
-alias_rows=
-alias_sql=
-alias_mapping_temp=
-alias_mapping_path=
-alias_mapping_created=0
 old_readiness_url=
 old_readiness_connect_to=
 old_readiness_insecure=0
@@ -397,7 +380,11 @@ restore_verified_backup() {
     if [ -n "$staged_data" ]; then
         rm -f "$staged_data"
     fi
+    if [ -n "$staged_keyring" ]; then
+        rm -f "$staged_keyring"
+    fi
     staged_data=$(mktemp "$data_dir/.data.sqlite.restore.XXXXXX") || return 1
+    staged_keyring=$(mktemp "$data_dir/.secrets.keyring.restore.XXXXXX") || return 1
 
     install -o root -g root -m 0755 "$backup_dir/vaultlink" "$restore_binary" \
         || restore_failed=1
@@ -405,13 +392,16 @@ restore_verified_backup() {
         || restore_failed=1
     install -o vaultlink -g vaultlink -m 0600 "$backup_dir/data.sqlite" "$staged_data" \
         || restore_failed=1
+    install -o vaultlink -g vaultlink -m 0600 "$backup_dir/secrets.keyring" "$staged_keyring" \
+        || restore_failed=1
     if [ "$restore_failed" -eq 0 ]; then
         sqlite3 "$staged_data" "PRAGMA integrity_check" | grep -qx ok \
             || restore_failed=1
     fi
     if [ "$restore_failed" -ne 0 ]; then
-        rm -f "$restore_binary" "$restore_config" "$staged_data"
+        rm -f "$restore_binary" "$restore_config" "$staged_data" "$staged_keyring"
         staged_data=
+        staged_keyring=
         return 1
     fi
 
@@ -419,113 +409,11 @@ restore_verified_backup() {
     mv -f "$restore_config" "$config_path" || restore_failed=1
     rm -f "$data-wal" "$data-shm" || restore_failed=1
     mv -f "$staged_data" "$data" || restore_failed=1
-    rm -f "$restore_binary" "$restore_config" "$staged_data"
+    mv -f "$staged_keyring" "$keyring" || restore_failed=1
+    rm -f "$restore_binary" "$restore_config" "$staged_data" "$staged_keyring"
     staged_data=
+    staged_keyring=
     [ "$restore_failed" -eq 0 ]
-}
-
-migrate_short_share_aliases() {
-    shares_table_exists=$(sqlite3 "$data" \
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='shares'")
-    [ "$shares_table_exists" = 1 ] || return 0
-
-    alias_rows="$backup_dir/.share-alias-migration.rows.$$"
-    alias_sql="$backup_dir/.share-alias-migration.sql.$$"
-    alias_mapping_temp="$backup_dir/.share-alias-migration.tsv.$$"
-    alias_mapping_path="$backup_dir/share-alias-migration.tsv"
-    tab=$(printf '\t')
-
-    sqlite3 -batch -noheader -separator "$tab" "$data" \
-        "SELECT id, alias FROM shares
-         WHERE alias IS NOT NULL AND alias <> ''
-           AND length(CAST(alias AS BLOB)) < 12
-         ORDER BY id" >"$alias_rows"
-    chown root:root "$alias_rows"
-    chmod 0600 "$alias_rows"
-
-    if [ ! -s "$alias_rows" ]; then
-        rm -f "$alias_rows"
-        alias_rows=
-        return 0
-    fi
-
-    : >"$alias_sql"
-    : >"$alias_mapping_temp"
-    chown root:root "$alias_sql" "$alias_mapping_temp"
-    chmod 0600 "$alias_sql" "$alias_mapping_temp"
-    printf '%s\n' '.timeout 10000' '.bail on' 'BEGIN IMMEDIATE;' \
-        'CREATE TEMP TABLE alias_migration_guard(changed INTEGER NOT NULL CHECK(changed = 1));' \
-        >"$alias_sql"
-    printf 'share_id\told_alias\tnew_alias\n' >"$alias_mapping_temp"
-
-    while IFS="$tab" read -r alias_id old_alias; do
-        case "$alias_id" in
-            ''|*[!0-9]*)
-                echo "share alias migration found an invalid database row id" >&2
-                return 1
-                ;;
-        esac
-        case "$old_alias" in
-            ''|*[!A-Za-z0-9_-]*)
-                echo "share alias migration found an invalid legacy alias" >&2
-                return 1
-                ;;
-        esac
-        if [ "${#old_alias}" -ge 12 ]; then
-            echo "share alias migration found an inconsistent legacy alias" >&2
-            return 1
-        fi
-
-        # Twenty hexadecimal characters add 80 bits from the kernel CSPRNG.
-        # Keeping the old prefix makes the protected operator mapping auditable
-        # while bringing every migrated value safely inside the 12..32 policy.
-        suffix=$(LC_ALL=C od -An -N10 -tx1 /dev/urandom | tr -d ' \n')
-        case "$suffix" in
-            *[!0-9a-f]*)
-                echo "secure share alias generation failed" >&2
-                return 1
-                ;;
-        esac
-        if [ "${#suffix}" -ne 20 ]; then
-            echo "secure share alias generation failed" >&2
-            return 1
-        fi
-        new_alias=$old_alias$suffix
-        if [ "${#new_alias}" -lt 12 ] || [ "${#new_alias}" -gt 32 ]; then
-            echo "generated share alias is outside the supported length" >&2
-            return 1
-        fi
-
-        # Both aliases have been restricted to the URL-safe ASCII alphabet, so
-        # embedding them as SQL literals cannot introduce quoting or SQL syntax.
-        printf "UPDATE shares SET alias = '%s' WHERE id = %s AND alias = '%s';\n" \
-            "$new_alias" "$alias_id" "$old_alias" >>"$alias_sql"
-        printf '%s\n' 'INSERT INTO alias_migration_guard VALUES(changes());' \
-            'DELETE FROM alias_migration_guard;' >>"$alias_sql"
-        printf '%s\t%s\t%s\n' "$alias_id" "$old_alias" "$new_alias" \
-            >>"$alias_mapping_temp"
-    done <"$alias_rows"
-    printf '%s\n' 'COMMIT;' >>"$alias_sql"
-
-    if ! sqlite3 -batch "$data" <"$alias_sql"; then
-        echo "share alias migration failed; refusing to activate the candidate" >&2
-        return 1
-    fi
-    remaining_short_aliases=$(sqlite3 "$data" \
-        "SELECT count(*) FROM shares
-         WHERE alias IS NOT NULL AND alias <> ''
-           AND length(CAST(alias AS BLOB)) < 12")
-    if [ "$remaining_short_aliases" != 0 ]; then
-        echo "share alias migration left legacy aliases behind" >&2
-        return 1
-    fi
-
-    rm -f "$alias_rows" "$alias_sql"
-    alias_rows=
-    alias_sql=
-    mv -f "$alias_mapping_temp" "$alias_mapping_path"
-    alias_mapping_created=1
-    alias_mapping_temp=
 }
 
 on_failure() {
@@ -534,23 +422,16 @@ on_failure() {
     trap '' 1 2 15
     set +e
     restart_allowed=1
-    restore_completed=0
 
     rm -f "$staged_binary" "$staged_config" "$restore_binary" "$restore_config"
     if [ -n "$staged_data" ]; then
         rm -f "$staged_data"
         staged_data=
     fi
-    if [ -n "$alias_rows" ]; then
-        rm -f "$alias_rows"
+    if [ -n "$staged_keyring" ]; then
+        rm -f "$staged_keyring"
+        staged_keyring=
     fi
-    if [ -n "$alias_sql" ]; then
-        rm -f "$alias_sql"
-    fi
-    if [ -n "$alias_mapping_temp" ]; then
-        rm -f "$alias_mapping_temp"
-    fi
-
     if [ "$candidate_activated" -eq 1 ]; then
         echo "upgrade failed; restoring verified backup $backup_dir" >&2
         if ! systemctl stop "$service" >/dev/null 2>&1; then
@@ -560,20 +441,13 @@ on_failure() {
             echo "CRITICAL: automatic restore failed; recover manually from $backup_dir" >&2
             restart_allowed=0
         elif restore_verified_backup; then
-            restore_completed=1
+            :
         else
             echo "CRITICAL: automatic restore failed; recover manually from $backup_dir" >&2
             restart_allowed=0
         fi
     elif [ "$stop_attempted" -eq 1 ]; then
         echo "upgrade failed before activation; keeping the installed binary, configuration, and database" >&2
-    fi
-
-    # A completed database restore makes a published migration map stale. Keep
-    # it only when automatic restore failed and an operator may need it to
-    # inspect or manually recover the possibly migrated live database.
-    if [ "$restore_completed" -eq 1 ] && [ "$alias_mapping_created" -eq 1 ]; then
-        rm -f "$alias_mapping_path"
     fi
 
     if [ "$stop_attempted" -eq 1 ] && [ "$was_active" -eq 1 ] && [ "$restart_allowed" -eq 1 ]; then
@@ -609,6 +483,7 @@ install -d -o root -g root -m 0700 "$backup_root"
 install -d -o root -g root -m 0700 "$backup_stage"
 install -o root -g root -m 0700 "$live_binary" "$backup_stage/vaultlink"
 install -o root -g root -m 0600 "$config_path" "$backup_stage/config.toml"
+install -o root -g root -m 0600 "$keyring" "$backup_stage/secrets.keyring"
 install -o root -g root -m 0755 "$new_binary" "$staged_binary"
 install -o root -g vaultlink -m 0640 "$new_config" "$staged_config"
 
@@ -638,13 +513,6 @@ if [ "$version_order" -lt 0 ]; then
     exit 1
 fi
 
-old_layout=$(storage_layout_generation "$old_version")
-candidate_layout=$(storage_layout_generation "$candidate_version")
-if [ "$old_layout" != "$candidate_layout" ] && [ "$was_active" -eq 1 ]; then
-    echo "an upgrade across the pre-0.4.1 storage-layout boundary requires vaultlink.service to be stopped before the storage migration" >&2
-    exit 1
-fi
-
 stop_attempted=1
 systemctl stop "$service"
 
@@ -652,14 +520,15 @@ sqlite3 "$data" ".timeout 10000" ".backup '$backup_stage/data.sqlite'"
 chown root:root "$backup_stage/data.sqlite"
 chmod 0600 "$backup_stage/data.sqlite"
 sqlite3 "$backup_stage/data.sqlite" "PRAGMA integrity_check" | grep -qx ok
+[ -s "$backup_stage/secrets.keyring" ]
 mv "$backup_stage" "$backup_dir"
 backup_stage=
 backup_valid=1
 
 # Each rename is atomic on its destination filesystem. The handled-failure trap
-# restores the complete verified triple if any later step fails.
+# restores the complete verified binary/configuration/database/keyring unit if
+# any later step fails.
 candidate_activated=1
-migrate_short_share_aliases
 mv -f "$staged_binary" "$live_binary"
 mv -f "$staged_config" "$config_path"
 

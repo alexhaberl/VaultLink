@@ -603,7 +603,7 @@ pub(super) async fn create_share(
             // Keep target revalidation and the non-cancellable SQLite create
             // serialized even when the client disconnects mid-request.
             service
-                .create(prepared, password_hash, &audit_context)
+                .create(prepared, password_hash.as_deref(), &audit_context)
                 .map(drop)
                 .map_err(share_service_database_error)
         })
@@ -689,10 +689,8 @@ pub(super) async fn toggle_share(
     let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&s, &f.csrf)?;
     let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
-    let sh = database(state.db.clone(), |db| db.list_shares())
+    let sh = database(state.db.clone(), move |db| db.share_by_id(id))
         .await?
-        .into_iter()
-        .find(|v| v.id == id)
         .ok_or(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"))?;
     let active = !sh.active;
     let username = s.username;
@@ -747,10 +745,8 @@ pub(super) async fn set_share_upload_conflict(
         ));
     }
     let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
-    let share = database(state.db.clone(), |db| db.list_shares())
+    let share = database(state.db.clone(), move |db| db.share_by_id(id))
         .await?
-        .into_iter()
-        .find(|share| share.id == id)
         .ok_or(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"))?;
     if !share.is_directory || !share.permission.can_upload() {
         return Err(AppError(
@@ -864,10 +860,9 @@ pub(super) async fn set_share_password(
 ) -> Result<Redirect> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
-    if !database(state.db.clone(), |db| db.list_shares())
+    if database(state.db.clone(), move |db| db.share_by_id(id))
         .await?
-        .iter()
-        .any(|share| share.id == id)
+        .is_none()
     {
         return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
     }

@@ -148,13 +148,13 @@ pub(super) async fn create_admin_ui(
             password: form.password,
             confirmation: Some(form.password_confirm),
         })
-        .map_err(admin_validation_error)?;
+        .map_err(|error| admin_validation_error(&error))?;
     let (prepared, password) = validated.into_hash_input();
     let hash = hash_password_admitted(&state, password).await?;
     let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
     let create_result = required_database(state.db.clone(), move |_| {
         service
-            .create(prepared, hash, &audit_context)
+            .create(&prepared, &hash, &audit_context)
             .map_err(admin_database_error)
     })
     .await;
@@ -209,7 +209,7 @@ pub(super) async fn reset_admin_password(
     let service = AdminService::new(state.db.clone());
     let password = service
         .prepare_password(form.password, Some(form.password_confirm))
-        .map_err(admin_validation_error)?;
+        .map_err(|error| admin_validation_error(&error))?;
     let hash = hash_password_admitted(&state, password).await?;
     let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
     let changed = required_database(state.db.clone(), move |_| {
@@ -334,7 +334,7 @@ pub(super) async fn activate_admin(
     Ok(Redirect::to("/admin/admins"))
 }
 
-fn admin_validation_error(error: AdminServiceError) -> AppError {
+fn admin_validation_error(error: &AdminServiceError) -> AppError {
     match error {
         AdminServiceError::InvalidUsername => AppError(
             StatusCode::BAD_REQUEST,

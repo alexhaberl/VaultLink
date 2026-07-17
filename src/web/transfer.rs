@@ -256,7 +256,6 @@ pub(crate) async fn download_zip(
             current_client_limit_key(),
             crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
         )
-        .map_err(internal)?
         .ok_or(AppError(
             StatusCode::SERVICE_UNAVAILABLE,
             "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
@@ -306,22 +305,32 @@ pub(crate) async fn download_zip(
         Ok(plan) => plan,
         Err(error) => {
             resources.cancel().await;
-            return Err(zip_error(error));
+            return Err(zip_error(&error));
         }
     };
     #[cfg(test)]
     let temp_reservation = if zip_test_phase_active(&sh.relative_path, ZipBlockingTestPhase::Direct)
     {
-        None
+        Ok(None)
     } else if zip_test_phase_active(&sh.relative_path, ZipBlockingTestPhase::Materialize) {
-        Some(ZipTempReservation::acquire_unchecked_for_test(
+        Ok(Some(ZipTempReservation::acquire_unchecked_for_test(
             plan.estimated_archive_size,
-        ))
+        )))
     } else {
-        ZipTempReservation::acquire(plan.estimated_archive_size)
+        ZipTempReservation::acquire(&state, plan.estimated_archive_size).await
     };
     #[cfg(not(test))]
-    let temp_reservation = ZipTempReservation::acquire(plan.estimated_archive_size);
+    let temp_reservation = ZipTempReservation::acquire(&state, plan.estimated_archive_size).await;
+    let temp_reservation = match temp_reservation {
+        Ok(reservation) => reservation,
+        Err(_) => {
+            resources.cancel().await;
+            return Err(AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Speicherkapazität nicht ermittelbar",
+            ));
+        }
+    };
     let prepared = if let Some(reservation) = temp_reservation {
         let materialization = ZipMaterializationResources {
             transfer: resources,
@@ -398,7 +407,7 @@ pub(crate) async fn download_zip(
                 } = materialization;
                 drop(reservation);
                 resources.cancel().await;
-                return Err(zip_error(error));
+                return Err(zip_error(&error));
             }
         }
     } else {
@@ -513,6 +522,9 @@ pub(crate) async fn download(
             None => {
                 let mut response = Response::new(Body::empty());
                 *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+                response
+                    .headers_mut()
+                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                 response.headers_mut().insert(
                     header::CONTENT_RANGE,
                     HeaderValue::from_str(&format!("bytes */{length}")).map_err(internal)?,

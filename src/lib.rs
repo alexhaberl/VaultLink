@@ -6,6 +6,7 @@ pub mod auth;
 pub mod cifs_provision;
 pub mod config;
 pub mod db;
+mod disk_stats;
 pub mod file_ops;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -66,6 +67,7 @@ pub struct AppState {
     pub db: Database,
     pub secure_root: secure_fs::SecureRoot,
     pub limiter: auth::LoginLimiter,
+    pub account_limiter: auth::LoginLimiter,
     pub share_limiter: auth::LoginLimiter,
     pub alias_limiter: auth::LoginLimiter,
     pub public_transfer_limiter: auth::LoginLimiter,
@@ -87,6 +89,7 @@ pub struct AppState {
     pub buffered_response_admission: Arc<tokio::sync::Semaphore>,
     pub buffered_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
     pub expensive_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    pub(crate) disk_stats_cache: disk_stats::DiskStatsCache,
     // The descriptor owns the kernel lock. Keeping it in every AppState clone
     // prevents another serving process from entering storage recovery or
     // cleanup for this private storage domain.
@@ -171,6 +174,10 @@ impl AppState {
                 config.security.login_attempts,
                 std::time::Duration::from_secs(config.security.login_window_seconds),
             ),
+            account_limiter: auth::LoginLimiter::new(
+                config.security.account_login_attempts,
+                std::time::Duration::from_secs(config.security.login_window_seconds),
+            ),
             share_limiter: auth::LoginLimiter::new(
                 config.security.share_password_attempts,
                 std::time::Duration::from_secs(300),
@@ -209,6 +216,7 @@ impl AppState {
             )),
             buffered_peer_admission: Arc::new(Mutex::new(HashMap::new())),
             expensive_peer_admission: Arc::new(Mutex::new(HashMap::new())),
+            disk_stats_cache: disk_stats::DiskStatsCache::new(),
             _storage_instance_lock: storage_instance_lock,
             #[cfg(test)]
             upload_directory_sync_failure: Arc::new(std::sync::Mutex::new(None)),
@@ -278,7 +286,7 @@ fn acquire_storage_instance_lock(
             Err(error) if error == rustix::io::Errno::EXIST => {}
             Err(error) => {
                 return Err(StorageInstanceLockError::Prepare {
-                    path: internal_path.clone(),
+                    path: internal_path,
                     source: errno_error(error),
                 });
             }
@@ -314,7 +322,7 @@ fn acquire_storage_instance_lock(
         || internal_metadata.permissions().mode() & 0o077 != 0
     {
         return Err(StorageInstanceLockError::Unsafe {
-            path: internal_path.clone(),
+            path: internal_path,
             reason: "internal_directory must be a private directory on the storage-root filesystem"
                 .into(),
         });

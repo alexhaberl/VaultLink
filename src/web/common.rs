@@ -116,9 +116,11 @@ pub(super) fn internal<T>(_: T) -> AppError {
 }
 pub(super) fn decode_security_keys(
     rows: &[crate::db::AdminWebauthnCredential],
-) -> Result<Vec<webauthn_rs::prelude::SecurityKey>> {
+) -> Result<Vec<crate::webauthn::StoredCredential>> {
     rows.iter()
-        .map(|row| serde_json::from_str(&row.credential_json).map_err(internal))
+        .map(|row| {
+            crate::webauthn::StoredCredential::from_blob(&row.credential_blob).map_err(internal)
+        })
         .collect()
 }
 
@@ -459,7 +461,7 @@ pub(super) fn preview_allowed(path: &str, settings: &RuntimeSettings) -> bool {
     policy::preview_allowed(path, settings)
 }
 
-pub(super) fn public_preview_error(error: io::Error) -> AppError {
+pub(super) fn public_preview_error(error: &io::Error) -> AppError {
     // Linux openat2 reports EXDEV/ELOOP when resolution would cross the
     // descriptor-bound share or follow a forbidden final symlink. Keep that
     // security boundary indistinguishable from a missing public file.
@@ -582,7 +584,7 @@ pub(super) fn list_directory_sorted_page<D: DirectoryAccess>(
 }
 
 pub(super) fn search_tree<D: DirectoryAccess>(
-    secure_root: D,
+    secure_root: &D,
     base: &str,
     query: &str,
     settings: &RuntimeSettings,

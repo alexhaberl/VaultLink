@@ -58,6 +58,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lints
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Mythos lints
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings -W clippy::perf -W clippy::redundant_clone -W clippy::needless_pass_by_value
       - name: Tests
         run: cargo test --locked --all-targets
       - name: Version consistency including executable and health metadata

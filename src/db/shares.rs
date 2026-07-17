@@ -6,14 +6,7 @@ use super::{
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
-fn share_path_matches(candidate: &str, target: &str, is_directory: bool) -> bool {
-    candidate == target
-        || (is_directory
-            && candidate
-                .strip_prefix(target)
-                .is_some_and(|suffix| suffix.starts_with('/')))
-}
-
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn rewrite_share_path(
     candidate: &str,
     target: &str,
@@ -30,6 +23,26 @@ pub fn rewrite_share_path(
         .strip_prefix(target)
         .filter(|suffix| suffix.starts_with('/'))
         .map(|suffix| format!("{replacement}{suffix}"))
+}
+
+fn glob_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '*' => escaped.push_str("[*]"),
+            '?' => escaped.push_str("[?]"),
+            '[' => escaped.push_str("[[]"),
+            ']' => escaped.push_str("[]]"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn path_globs(path: &str) -> (String, String) {
+    let exact = glob_literal(path);
+    let subtree = format!("{exact}/*");
+    (exact, subtree)
 }
 
 impl Database {
@@ -173,17 +186,22 @@ impl Database {
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        let token_digest = token_hash(token);
+        let token_aad = format!("shares.token:{token_digest}");
+        let (token_key_id, token_ciphertext) =
+            self.encrypt_secret(token.as_bytes(), token_aad.as_bytes())?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO shares(
-                 token_hash,token,alias,relative_path,is_directory,permission,expires_at,
+                 token_hash,token_key_id,token_ciphertext,alias,relative_path,is_directory,permission,expires_at,
                  max_downloads,max_upload_size,created_by,created_at,password_hash,
                  upload_conflict_strategy,max_upload_total_size,max_upload_files
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
-                token_hash(token),
-                token,
+                token_digest,
+                token_key_id,
+                token_ciphertext,
                 alias,
                 path,
                 is_dir as i64,
@@ -200,35 +218,50 @@ impl Database {
             ],
         )?;
         let id = transaction.last_insert_rowid();
-        let audit_events = required_audit.as_ref().map(|(_, detail)| {
-            vec![RequiredAuditEvent::new(
-                "share_created",
-                Some(id.to_string()),
-                detail.clone(),
-            )]
-        });
-        if let (Some((context, _)), Some(events)) =
-            (required_audit.as_ref(), audit_events.as_deref())
-        {
+        let (audit_context, audit_events) =
+            required_audit.map_or((None, None), |(context, detail)| {
+                (
+                    Some(context),
+                    Some([RequiredAuditEvent::new(
+                        "share_created",
+                        Some(id.to_string()),
+                        detail,
+                    )]),
+                )
+            });
+        if let (Some(context), Some(events)) = (audit_context, audit_events.as_ref()) {
             insert_required_audits(&transaction, context, events)?;
         }
         transaction.commit()?;
-        if let (Some((context, _)), Some(events)) =
-            (required_audit.as_ref(), audit_events.as_deref())
-        {
+        if let (Some(context), Some(events)) = (audit_context, audit_events.as_ref()) {
             trace_required_audits(context, events);
         }
         Ok(id)
     }
-    fn map_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
-        let exp: Option<String> = r.get(6)?;
+    fn map_share(&self, r: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
+        let token_digest: String = r.get(1)?;
+        let token_key_id: u64 = r.get(2)?;
+        let token_ciphertext: Vec<u8> = r.get(3)?;
+        let token_plaintext = self.decrypt_secret(
+            token_key_id,
+            &token_ciphertext,
+            format!("shares.token:{token_digest}").as_bytes(),
+        )?;
+        let token = String::from_utf8(token_plaintext).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Blob,
+                Box::new(error),
+            )
+        })?;
+        let exp: Option<String> = r.get(8)?;
         let expires_at = exp
             .map(|value| {
                 DateTime::parse_from_rfc3339(&value)
                     .map(|parsed| parsed.with_timezone(&Utc))
                     .map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            6,
+                            8,
                             rusqlite::types::Type::Text,
                             Box::new(error),
                         )
@@ -237,57 +270,65 @@ impl Database {
             .transpose()?;
         Ok(Share {
             id: r.get(0)?,
-            token: r.get(1)?,
-            alias: r.get(2)?,
-            relative_path: r.get(3)?,
-            is_directory: r.get::<_, i64>(4)? != 0,
-            permission: Permission::parse(&r.get::<_, String>(5)?)
+            token,
+            alias: r.get(4)?,
+            relative_path: r.get(5)?,
+            is_directory: r.get::<_, i64>(6)? != 0,
+            permission: Permission::parse(&r.get::<_, String>(7)?)
                 .ok_or(rusqlite::Error::InvalidQuery)?,
             expires_at,
-            max_downloads: r.get(7)?,
-            max_upload_size: r.get(8)?,
-            max_upload_total_size: r.get(9)?,
-            max_upload_files: r.get(10)?,
-            uploaded_bytes: r.get(11)?,
-            uploaded_files: r.get(12)?,
-            download_count: r.get(13)?,
-            active: r.get::<_, i64>(14)? != 0,
-            password_hash: r.get(15)?,
-            upload_conflict_strategy: UploadConflictStrategy::parse(&r.get::<_, String>(16)?)
+            max_downloads: r.get(9)?,
+            max_upload_size: r.get(10)?,
+            max_upload_total_size: r.get(11)?,
+            max_upload_files: r.get(12)?,
+            uploaded_bytes: r.get(13)?,
+            uploaded_files: r.get(14)?,
+            download_count: r.get(15)?,
+            active: r.get::<_, i64>(16)? != 0,
+            password_hash: r.get(17)?,
+            upload_conflict_strategy: UploadConflictStrategy::parse(&r.get::<_, String>(18)?)
                 .ok_or(rusqlite::Error::InvalidQuery)?,
-            created_at: r.get(17)?,
-            upload_policy_epoch: r.get(18)?,
+            created_at: r.get(19)?,
+            upload_policy_epoch: r.get(20)?,
         })
     }
     pub fn share_by_token(&self, token: &str) -> rusqlite::Result<Option<Share>> {
-        self.try_conn()?.query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id WHERE token_hash=?1",[token_hash(token)],Self::map_share).optional()
+        self.try_conn()?.query_row("SELECT shares.id,token_hash,token_key_id,token_ciphertext,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id WHERE token_hash=?1",[token_hash(token)],|row| self.map_share(row)).optional()
     }
     pub fn share_by_alias(&self, alias: &str) -> rusqlite::Result<Option<Share>> {
-        self.try_conn()?.query_row("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id WHERE alias=?1",[alias],Self::map_share).optional()
+        self.try_conn()?.query_row("SELECT shares.id,token_hash,token_key_id,token_ciphertext,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id WHERE alias=?1",[alias],|row| self.map_share(row)).optional()
+    }
+    pub fn share_by_id(&self, id: i64) -> rusqlite::Result<Option<Share>> {
+        self.try_conn()?.query_row("SELECT shares.id,token_hash,token_key_id,token_ciphertext,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id WHERE shares.id=?1",[id],|row| self.map_share(row)).optional()
     }
     pub fn list_shares(&self) -> rusqlite::Result<Vec<Share>> {
         let c = self.try_conn()?;
-        let mut s=c.prepare("SELECT id,token,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id ORDER BY shares.id DESC")?;
+        let mut s=c.prepare_cached("SELECT shares.id,token_hash,token_key_id,token_ciphertext,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id ORDER BY shares.id DESC")?;
         let shares = s
-            .query_map([], Self::map_share)?
+            .query_map([], |row| self.map_share(row))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(shares)
+    }
+    pub fn count_available_shares(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
+        self.try_conn()?.query_row(
+            "SELECT COUNT(*) FROM shares
+             WHERE active=1 AND (expires_at IS NULL OR expires_at>?1)",
+            [now.to_rfc3339()],
+            |row| row.get(0),
+        )
     }
     pub fn count_active_shares_for_path(
         &self,
         path: &str,
         is_directory: bool,
     ) -> rusqlite::Result<usize> {
-        let connection = self.try_conn()?;
-        let mut statement =
-            connection.prepare("SELECT relative_path FROM shares WHERE active=1")?;
-        let mut count = 0usize;
-        for relative_path in statement.query_map([], |row| row.get::<_, String>(0))? {
-            if share_path_matches(&relative_path?, path, is_directory) {
-                count = count.saturating_add(1);
-            }
-        }
-        Ok(count)
+        let (exact, subtree) = path_globs(path);
+        self.try_conn()?.query_row(
+            "SELECT COUNT(*) FROM shares
+             WHERE active=1 AND (relative_path GLOB ?1 OR (?2 AND relative_path GLOB ?3))",
+            params![exact, is_directory, subtree],
+            |row| row.get(0),
+        )
     }
     pub fn rename_share_paths(
         &self,
@@ -323,36 +364,21 @@ impl Database {
     ) -> rusqlite::Result<usize> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let updates = {
-            let mut statement = transaction.prepare("SELECT id,relative_path FROM shares")?;
-            let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let mut updates = Vec::new();
-            for row in rows {
-                let (id, path) = row?;
-                if let Some(rewritten) = rewrite_share_path(&path, old_path, new_path, is_directory)
-                {
-                    updates.push((id, rewritten));
-                }
-            }
-            updates
-        };
-        for (id, path) in &updates {
-            transaction.execute(
-                "UPDATE shares
-                 SET relative_path=?2,upload_policy_epoch=upload_policy_epoch+1
-                 WHERE id=?1",
-                params![id, path],
-            )?;
-        }
+        let (exact, subtree) = path_globs(old_path);
+        let updated = transaction.execute(
+            "UPDATE shares
+             SET relative_path=?1 || substr(relative_path,length(?2)+1),
+                 upload_policy_epoch=upload_policy_epoch+1
+             WHERE relative_path GLOB ?3 OR (?4 AND relative_path GLOB ?5)",
+            params![new_path, old_path, exact, is_directory, subtree],
+        )?;
         let audit_events = required_audit.map(|(_, recovery)| {
             [RequiredAuditEvent::new(
                 "path_renamed",
                 Some(new_path.to_string()),
                 Some(format!(
                     "old_path={old_path};updated_shares={};recovery={recovery}",
-                    updates.len()
+                    updated
                 )),
             )]
         });
@@ -363,7 +389,7 @@ impl Database {
         if let (Some((context, _)), Some(events)) = (required_audit, audit_events.as_ref()) {
             trace_required_audits(context, events);
         }
-        Ok(updates.len())
+        Ok(updated)
     }
     pub fn deactivate_shares_for_path(
         &self,
@@ -396,29 +422,13 @@ impl Database {
     ) -> rusqlite::Result<usize> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let ids = {
-            let mut statement =
-                transaction.prepare("SELECT id,relative_path FROM shares WHERE active=1")?;
-            let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let mut ids = Vec::new();
-            for row in rows {
-                let (id, relative_path) = row?;
-                if share_path_matches(&relative_path, path, is_directory) {
-                    ids.push(id);
-                }
-            }
-            ids
-        };
-        for id in &ids {
-            transaction.execute(
-                "UPDATE shares
-                 SET active=0,upload_policy_epoch=upload_policy_epoch+1
-                 WHERE id=?1",
-                [id],
-            )?;
-        }
+        let (exact, subtree) = path_globs(path);
+        let deactivated = transaction.execute(
+            "UPDATE shares
+             SET active=0,upload_policy_epoch=upload_policy_epoch+1
+             WHERE active=1 AND (relative_path GLOB ?1 OR (?2 AND relative_path GLOB ?3))",
+            params![exact, is_directory, subtree],
+        )?;
         let audit_events = required_audit.map(|(_, recovery, cleanup_pending)| {
             [RequiredAuditEvent::new(
                 "path_deleted",
@@ -426,7 +436,7 @@ impl Database {
                 Some(format!(
                     "kind={};deactivated_shares={};cleanup={};recovery={recovery}",
                     if is_directory { "directory" } else { "file" },
-                    ids.len(),
+                    deactivated,
                     if cleanup_pending {
                         "pending"
                     } else {
@@ -442,7 +452,7 @@ impl Database {
         if let (Some((context, _, _)), Some(events)) = (required_audit, audit_events.as_ref()) {
             trace_required_audits(context, events);
         }
-        Ok(ids.len())
+        Ok(deactivated)
     }
     pub fn set_share_active(&self, id: i64, active: bool) -> rusqlite::Result<bool> {
         Ok(self.try_conn()?.execute(

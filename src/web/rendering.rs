@@ -1,11 +1,11 @@
-use std::{
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
 };
 
 use axum::{
-    extract::{Form, State},
-    http::{header, HeaderValue, StatusCode, Uri},
+    extract::{Form, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
 };
 use serde::Deserialize;
@@ -49,15 +49,42 @@ pub(super) fn escaped_html_len(value: &str) -> Option<usize> {
     })
 }
 
-pub(super) async fn stylesheet_asset() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        crate::ui::STYLESHEET,
-    )
+pub(super) const ASSET_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Default, Deserialize)]
+pub(super) struct AssetQuery {
+    pub(super) v: Option<String>,
+    pub(super) lang: Option<String>,
 }
 
-pub(super) async fn app_js() -> impl IntoResponse {
-    let script = format!(
+fn asset_cache_control(query: &AssetQuery, locale_bound: bool) -> HeaderValue {
+    let version_matches = query.v.as_deref() == Some(ASSET_VERSION);
+    let locale_matches = !locale_bound || matches!(query.lang.as_deref(), Some("de") | Some("en"));
+    if version_matches && locale_matches {
+        HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("no-store")
+    }
+}
+
+pub(super) async fn stylesheet_asset(Query(query): Query<AssetQuery>) -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/css; charset=utf-8"),
+            ),
+            (header::CACHE_CONTROL, asset_cache_control(&query, false)),
+        ],
+        crate::ui::STYLESHEET,
+    )
+        .into_response()
+}
+
+pub(super) async fn app_js(Query(query): Query<AssetQuery>) -> Response {
+    static SCRIPTS: OnceLock<[String; 2]> = OnceLock::new();
+    let scripts = SCRIPTS.get_or_init(|| {
+        let source = format!(
         "{}\n{}",
         r#"function closeActionDetails(except){document.querySelectorAll('.vl-action-details[open]').forEach(details=>{if(details!==except)details.removeAttribute('open');});}
 document.addEventListener('click',async e=>{const closer=e.target.closest('[data-details-close]');if(closer){closer.closest('details')?.removeAttribute('open');return;}const action=e.target.closest('.vl-action-details');const summary=e.target.closest('.vl-action-details > summary');closeActionDetails(summary?.parentElement||action);const b=e.target.closest('[data-copy]');if(!b)return;try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='<vl-i18n key="common.copied"/>';}catch(_){b.textContent='<vl-i18n key="common.copy_failed"/>';}});
@@ -85,39 +112,74 @@ document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[da
 document.addEventListener('submit',e=>{e.target.querySelectorAll('[data-tz-offset]').forEach(i=>{i.value=String(new Date().getTimezoneOffset())})});"#,
         crate::ui::UPLOAD_QUEUE_JAVASCRIPT
     );
-    let script = i18n::render_markers(i18n::current_locale(), &script);
+        [
+            i18n::render_markers(Locale::De, &source),
+            i18n::render_markers(Locale::En, &source),
+        ]
+    });
+    let locale = match query.lang.as_deref() {
+        Some("de") => Locale::De,
+        Some("en") => Locale::En,
+        _ => i18n::current_locale(),
+    };
+    let script = match locale {
+        Locale::De => &scripts[0],
+        Locale::En => &scripts[1],
+    };
     (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        script,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/javascript; charset=utf-8"),
+            ),
+            (header::CACHE_CONTROL, asset_cache_control(&query, true)),
+        ],
+        script.as_str(),
     )
+        .into_response()
 }
 
 pub(super) const MB: u64 = 1_000_000;
 pub(super) const GB: u64 = 1_000_000_000;
 pub(super) const STORAGE_RESERVE_BYTES: u64 = 64 * MB;
 
-pub(super) async fn logo_svg() -> impl IntoResponse {
+pub(super) async fn logo_svg(Query(query): Query<AssetQuery>) -> Response {
     (
-        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+            ),
+            (header::CACHE_CONTROL, asset_cache_control(&query, false)),
+        ],
         LOGO_SVG,
     )
+        .into_response()
 }
 
-pub(super) async fn favicon_svg() -> impl IntoResponse {
+pub(super) async fn favicon_svg(Query(query): Query<AssetQuery>) -> Response {
     (
-        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+            ),
+            (header::CACHE_CONTROL, asset_cache_control(&query, false)),
+        ],
         LOGO_SVG,
     )
+        .into_response()
 }
 
-pub(super) async fn favicon_png() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "image/png")],
-        crate::ui::FAVICON_PNG,
-    )
+pub(super) async fn favicon_png(Query(query): Query<AssetQuery>) -> Response {
+    let mut response = crate::ui::FAVICON_PNG.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, asset_cache_control(&query, false));
+    response
 }
 
 pub(super) const LOGO_SVG: &str = crate::ui::LOGO_SVG;
@@ -145,8 +207,20 @@ pub(super) fn safe_internal_return_to(value: &str) -> String {
 
 pub(super) async fn set_locale(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Form(form): Form<LocaleForm>,
 ) -> Result<Response> {
+    let expected = url::Url::parse(&state.config.server.public_base_url).map_err(internal)?;
+    let supplied = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| url::Url::parse(value).ok());
+    if supplied.as_ref().map(url::Url::origin) != Some(expected.origin()) {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            "Cross-Site-Sprachwechsel abgelehnt",
+        ));
+    }
     let locale = Locale::parse(&form.locale)
         .ok_or(AppError(StatusCode::BAD_REQUEST, "Ungültige Sprache"))?;
     let return_to = safe_internal_return_to(&form.return_to);
@@ -255,33 +329,18 @@ pub(super) fn admin_page_with_locale_switcher(
     .expect("the admin page template writes only to an in-memory string")
 }
 
-pub(super) struct DiskStats {
-    pub(super) free: u64,
-    pub(super) total: u64,
-}
-
-pub(super) fn disk_stats(path: &Path) -> Option<DiskStats> {
-    disk_stats_linux(path)
-}
-
-pub(super) fn disk_stats_linux(path: &Path) -> Option<DiskStats> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let stat = rustix::fs::statvfs(&canonical).ok()?;
-    let block_size = stat.f_bsize;
-    Some(DiskStats {
-        free: stat.f_bavail.saturating_mul(block_size),
-        total: stat.f_blocks.saturating_mul(block_size),
-    })
-}
-
-pub(super) fn storage_has_room(path: &Path, needed: u64) -> bool {
-    disk_stats(path).is_none_or(|stats| {
-        stats
-            .free
-            .saturating_sub(STORAGE_RESERVE_BYTES)
-            .saturating_sub(needed)
-            > 0
-    })
+pub(super) async fn storage_has_room(state: &AppState, needed: u64) -> std::io::Result<bool> {
+    state
+        .disk_stats_cache
+        .get(state.secure_root.display_root())
+        .await
+        .map(|stats| {
+            stats
+                .free
+                .saturating_sub(STORAGE_RESERVE_BYTES)
+                .saturating_sub(needed)
+                > 0
+        })
 }
 
 pub(super) static UPLOAD_BYTES_RESERVED: AtomicU64 = AtomicU64::new(0);
@@ -290,29 +349,39 @@ pub(super) struct UploadChunkReservation {
     bytes: u64,
 }
 
+pub(super) enum StorageReservationError {
+    CapacityUnavailable,
+    InsufficientStorage,
+}
+
 impl UploadChunkReservation {
-    pub(super) fn acquire(path: &Path, bytes: u64) -> Option<Self> {
+    pub(super) async fn acquire(
+        state: &AppState,
+        bytes: u64,
+    ) -> std::result::Result<Self, StorageReservationError> {
+        let stats = state
+            .disk_stats_cache
+            .get(state.secure_root.display_root())
+            .await
+            .map_err(|_| StorageReservationError::CapacityUnavailable)?;
         loop {
             let reserved = UPLOAD_BYTES_RESERVED.load(Ordering::Acquire);
-            if disk_stats(path).is_some_and(|stats| {
-                stats
-                    .free
-                    .saturating_sub(STORAGE_RESERVE_BYTES)
-                    .saturating_sub(reserved)
-                    <= bytes
-            }) {
-                return None;
+            if stats
+                .free
+                .saturating_sub(STORAGE_RESERVE_BYTES)
+                .saturating_sub(reserved)
+                <= bytes
+            {
+                return Err(StorageReservationError::InsufficientStorage);
             }
+            let next = reserved
+                .checked_add(bytes)
+                .ok_or(StorageReservationError::InsufficientStorage)?;
             if UPLOAD_BYTES_RESERVED
-                .compare_exchange_weak(
-                    reserved,
-                    reserved.checked_add(bytes)?,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange_weak(reserved, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(Self { bytes });
+                return Ok(Self { bytes });
             }
         }
     }

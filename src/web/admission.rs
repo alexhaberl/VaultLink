@@ -107,7 +107,7 @@ impl HttpBody for BufferedAdmissionBody {
         }
         if let Some(pending) = this.pending.take() {
             let length = pending.len().min(BUFFERED_RESPONSE_CHUNK_BYTES);
-            let chunk = Bytes::copy_from_slice(&pending[..length]);
+            let chunk = pending.slice(..length);
             if length < pending.len() {
                 this.pending = Some(pending.slice(length..));
             }
@@ -117,7 +117,7 @@ impl HttpBody for BufferedAdmissionBody {
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(data) => {
                     let length = data.len().min(BUFFERED_RESPONSE_CHUNK_BYTES);
-                    let chunk = Bytes::copy_from_slice(&data[..length]);
+                    let chunk = data.slice(..length);
                     if length < data.len() {
                         this.pending = Some(data.slice(length..));
                     }
@@ -260,8 +260,8 @@ pub(super) async fn response_admission(
             peer,
             crate::MAX_IN_FLIGHT_STREAMS_PER_CLIENT,
         ) {
-            Ok(Some(permit)) => permit,
-            Ok(None) => {
+            Some(permit) => permit,
+            None => {
                 drop(global);
                 drop(permit);
                 let mut response = (
@@ -273,11 +273,6 @@ pub(super) async fn response_admission(
                     .headers_mut()
                     .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
                 return response;
-            }
-            Err(_) => {
-                drop(global);
-                drop(permit);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Interner Fehler").into_response();
             }
         };
         (global, peer_permit)
@@ -306,8 +301,8 @@ pub(super) async fn response_admission(
             peer,
             crate::MAX_IN_FLIGHT_BUFFERED_RESPONSES_PER_CLIENT,
         ) {
-            Ok(Some(permit)) => permit,
-            Ok(None) => {
+            Some(permit) => permit,
+            None => {
                 drop(global);
                 drop(permit);
                 let mut response = (
@@ -319,11 +314,6 @@ pub(super) async fn response_admission(
                     .headers_mut()
                     .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
                 return response;
-            }
-            Err(_) => {
-                drop(global);
-                drop(permit);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Interner Fehler").into_response();
             }
         };
         (global, peer_permit)
@@ -454,12 +444,15 @@ pub(super) async fn audit_client_ip_context(
     req: Request,
     next: Next,
 ) -> Response {
-    let client_ip = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(peer)| {
-            proxy::effective_client_ip(peer.ip(), req.headers(), &state.config)
-        });
+    let client_ip = match req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        Some(ConnectInfo(peer)) => {
+            match proxy::validated_effective_client_ip(peer.ip(), req.headers(), &state.config) {
+                Ok(client_ip) => Some(client_ip),
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+        None => None,
+    };
     with_audit_client_ip(client_ip, next.run(req)).await
 }
 

@@ -324,6 +324,7 @@ struct MultipartScanner {
     boundary_padding_seen: usize,
     boundary_suffix_phase: BoundarySuffixPhase,
     initial_boundary: ByteMatcher,
+    preamble_boundary: ByteMatcher,
     body_boundary: ByteMatcher,
     header_end: ByteMatcher,
 }
@@ -331,6 +332,7 @@ struct MultipartScanner {
 impl MultipartScanner {
     fn new(boundary: &[u8], limits: MultipartGuardLimits) -> Self {
         let initial = [b"--".as_slice(), boundary].concat();
+        let preamble = [b"\r\n--".as_slice(), boundary].concat();
         let body = [b"\r\n--".as_slice(), boundary].concat();
         Self {
             phase: ScannerPhase::Preamble,
@@ -340,13 +342,23 @@ impl MultipartScanner {
             boundary_padding_seen: 0,
             boundary_suffix_phase: BoundarySuffixPhase::First,
             initial_boundary: ByteMatcher::new(initial),
+            preamble_boundary: ByteMatcher::new(preamble),
             body_boundary: ByteMatcher::new(body),
             header_end: ByteMatcher::new(b"\r\n\r\n".to_vec()),
         }
     }
 
     fn scan(&mut self, bytes: &[u8]) -> Result<(), MultipartGuardBodyError> {
-        for &byte in bytes {
+        let mut index = 0;
+        while index < bytes.len() {
+            if self.phase == ScannerPhase::Body && self.body_boundary.matched == 0 {
+                let Some(offset) = memchr::memchr(b'\r', &bytes[index..]) else {
+                    return Ok(());
+                };
+                index += offset;
+            }
+            let byte = bytes[index];
+            index += 1;
             match self.phase {
                 ScannerPhase::Preamble => self.scan_preamble(byte)?,
                 ScannerPhase::BoundarySuffix => self.scan_boundary_suffix(byte)?,
@@ -360,10 +372,16 @@ impl MultipartScanner {
 
     fn scan_preamble(&mut self, byte: u8) -> Result<(), MultipartGuardBodyError> {
         self.preamble_seen = self.preamble_seen.saturating_add(1);
-        if self.initial_boundary.feed(byte) {
-            let preamble_len = self
-                .preamble_seen
-                .saturating_sub(self.initial_boundary.pattern_len());
+        let opening_at_start = self.preamble_seen <= self.initial_boundary.pattern_len()
+            && self.initial_boundary.feed(byte);
+        let opening_after_preamble = self.preamble_boundary.feed(byte);
+        if opening_at_start || opening_after_preamble {
+            let matched_len = if opening_at_start {
+                self.initial_boundary.pattern_len()
+            } else {
+                self.preamble_boundary.pattern_len()
+            };
+            let preamble_len = self.preamble_seen.saturating_sub(matched_len);
             if preamble_len > self.limits.max_preamble_bytes {
                 return Err(MultipartGuardBodyError::PreambleTooLarge);
             }
@@ -373,7 +391,7 @@ impl MultipartScanner {
                 > self
                     .limits
                     .max_preamble_bytes
-                    .saturating_add(self.initial_boundary.pattern_len())
+                    .saturating_add(self.preamble_boundary.pattern_len())
             {
                 return Err(MultipartGuardBodyError::PreambleTooLarge);
             }

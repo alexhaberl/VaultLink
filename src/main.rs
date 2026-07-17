@@ -359,10 +359,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
         return recover_admin(&options);
     }
+    if args.get(1).is_some_and(|value| value == "rotate-secrets") {
+        let options = RotateSecretsOptions::parse(&args).map_err(std::io::Error::other)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .init();
+        return rotate_secrets(&options);
+    }
     if args.get(1).is_some_and(|value| value == "provision-cifs") {
         let options = vaultlink::cifs_provision::CifsProvisionOptions::parse(&args)
             .map_err(std::io::Error::other)?;
-        return vaultlink::cifs_provision::run(options).map_err(Into::into);
+        return vaultlink::cifs_provision::run(&options).map_err(Into::into);
     }
     let mode = command_mode(&args).map_err(std::io::Error::other)?;
     let config_path = arg(&args, "--config")
@@ -390,6 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return init_admin(&config, &args);
     }
     let state = AppState::new(config.clone())?;
+    start_audit_retention_worker(state.db.clone());
     vaultlink::file_ops::recover_pending_file_operations(&state).await?;
     let effective_public_base_url = vaultlink::http_auth::runtime_settings(&state).public_base_url;
     let cleanup_coordinator = state.storage_cleanup.clone();
@@ -504,6 +512,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server_result
 }
 
+fn start_audit_retention_worker(database: Database) {
+    tokio::spawn(async move {
+        loop {
+            let worker_database = database.clone();
+            match tokio::task::spawn_blocking(move || worker_database.cleanup_audit_retention())
+                .await
+            {
+                Ok(Ok(deleted)) if deleted > 0 => {
+                    tracing::info!(deleted, "expired audit events removed")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::error!(%error, "audit retention cleanup failed"),
+                Err(error) => tracing::error!(%error, "audit retention worker failed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        }
+    });
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommandMode {
     Serve,
@@ -576,6 +603,58 @@ struct RecoverAdminOptions {
     username: String,
     reset_password: bool,
     reset_mfa: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RotateSecretsOptions {
+    source: RecoveryDatabaseSource,
+}
+
+impl RotateSecretsOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        if args.get(1).map(String::as_str) != Some("rotate-secrets") {
+            return Err("rotate-secrets parser requires the rotate-secrets command".into());
+        }
+        let mut config_path = None;
+        let mut database_path = None;
+        let mut index = 2;
+        while index < args.len() {
+            let option = args[index].as_str();
+            if option != "--config" && option != "--database" {
+                return Err(if option.starts_with('-') {
+                    format!("unknown rotate-secrets option: {option}")
+                } else {
+                    format!("unexpected rotate-secrets positional argument: {option}")
+                });
+            }
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("{option} requires one non-option value"))?;
+            if value.is_empty() || value.starts_with('-') {
+                return Err(format!("{option} requires one non-option value"));
+            }
+            let duplicate = if option == "--config" {
+                config_path.replace(PathBuf::from(value)).is_some()
+            } else {
+                database_path.replace(PathBuf::from(value)).is_some()
+            };
+            if duplicate {
+                return Err(format!("{option} may only be provided once"));
+            }
+            index += 2;
+        }
+        let source = match (config_path, database_path) {
+            (Some(path), None) => RecoveryDatabaseSource::Config(path),
+            (None, Some(path)) => RecoveryDatabaseSource::Database(path),
+            (None, None) => {
+                return Err("rotate-secrets requires exactly one of --config or --database".into())
+            }
+            (Some(_), Some(_)) => {
+                return Err("rotate-secrets accepts only one of --config or --database".into())
+            }
+        };
+        Ok(Self { source })
+    }
 }
 
 impl RecoverAdminOptions {
@@ -690,6 +769,20 @@ fn recovery_database_path(
             Ok(config.storage.data_directory.join("data.sqlite"))
         }
     }
+}
+
+fn rotate_secrets(options: &RotateSecretsOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let database_path = recovery_database_path(&options.source)?;
+    if !database_path.is_file() {
+        return Err(format!(
+            "database does not exist or is not a regular file: {}",
+            database_path.display()
+        )
+        .into());
+    }
+    Database::rotate_secrets(&database_path)?;
+    tracing::info!(database = %database_path.display(), "secret rotation completed");
+    Ok(())
 }
 
 fn init_admin(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

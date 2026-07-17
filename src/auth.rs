@@ -49,7 +49,7 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
 /// Hashes an owned password on a worker thread without requiring the caller to
 /// retain a second application-owned plaintext allocation.
 pub(crate) fn hash_secret_password(
-    password: SecretString,
+    password: &SecretString,
 ) -> Result<String, argon2::password_hash::Error> {
     hash_password(password.expose_secret())
 }
@@ -70,8 +70,8 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
 
 /// Verifies owned task inputs and zeroes the plaintext password when the task
 /// finishes. Password hashes are not treated as secrets.
-pub(crate) fn verify_secret_password(hash: String, password: SecretString) -> bool {
-    verify_password(&hash, password.expose_secret())
+pub(crate) fn verify_secret_password(hash: &str, password: &SecretString) -> bool {
+    verify_password(hash, password.expose_secret())
 }
 
 pub fn valid_admin_username(username: &str) -> bool {

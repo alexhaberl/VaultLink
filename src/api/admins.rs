@@ -80,7 +80,7 @@ pub(super) async fn create_admin(
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
     let created = required_database(state.db.clone(), move |_| {
         service
-            .create(prepared, password_hash, &audit_context)
+            .create(&prepared, &password_hash, &audit_context)
             .map_err(admin_database_error)
     })
     .await?;

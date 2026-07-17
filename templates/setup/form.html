@@ -3,8 +3,7 @@
   <div class="vl-side-panel"><strong><vl-i18n key="setup.security"/></strong><p class="vl-muted"><vl-i18n key="setup.acme_proxy_help"/></p></div>
 </section>
 {% if let Some(error) = error %}<p class="vl-danger-text" role="alert">{{ error }}</p>{% endif %}
-<form method="post" class="vl-stack" data-setup-token="{{ token }}">
-  <input type="hidden" name="token" value="{{ token }}">
+<form method="post" class="vl-stack" data-setup-form>
   <section class="vl-form-card">
     <h2><vl-i18n key="setup.server"/></h2>
     <div class="vl-form-grid">

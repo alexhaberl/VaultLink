@@ -18,7 +18,7 @@ pub fn is_internal_storage_name(name: &OsStr) -> bool {
     })
 }
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum PathError {
     #[error("invalid relative path")]
     Invalid,

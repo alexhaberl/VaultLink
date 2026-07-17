@@ -67,11 +67,11 @@ impl AuthService {
             // Keep unknown accounts on one admitted Argon2 job too. The caller
             // runs this whole service operation behind the shared admission
             // semaphore, so overload behavior stays identical for both paths.
-            let _ = auth::hash_secret_password(command.password);
+            let _ = auth::hash_secret_password(&command.password);
             return Ok(PasswordLoginOutcome::InvalidCredentials);
         };
         let expected_password_hash = admin.password_hash.clone();
-        if !auth::verify_secret_password(admin.password_hash, command.password) {
+        if !auth::verify_secret_password(&admin.password_hash, &command.password) {
             return Ok(PasswordLoginOutcome::InvalidCredentials);
         }
 
