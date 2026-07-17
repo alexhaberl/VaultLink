@@ -587,8 +587,8 @@ if ! grep -E -q '^[[:space:]]+CARGO_BUILD_JOBS:[[:space:]]+2$' .github/workflows
     report "fuzz workflow must bound memory-intensive instrumented builds to two jobs"
 fi
 
-if ! grep -E -q '^[[:space:]]+timeout-minutes:[[:space:]]+60$' .github/workflows/fuzz.yml; then
-    report "fuzz workflow must allow one hour for instrumented builds and three target waves"
+if ! grep -E -q '^[[:space:]]+timeout-minutes:[[:space:]]+120$' .github/workflows/fuzz.yml; then
+    report "fuzz workflow must allow two hours for instrumented builds and three target waves"
 fi
 
 if ! grep -F -x -q 'LimitNOFILE=4096' deploy/vaultlink.service; then

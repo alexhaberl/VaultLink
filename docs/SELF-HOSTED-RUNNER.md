@@ -44,7 +44,7 @@ automatically.
 The weekly and manually dispatched fuzz campaign runs as a native amd64/arm64
 matrix. Each architecture runs all nine targets for ten minutes each across four
 workers (`FUZZ_JOBS=4`) and publishes its own exact-commit status. Each matrix
-entry has a 60-minute timeout so a cold instrumented Nightly build and all three
+entry has a 120-minute timeout so a cold instrumented Nightly build and all three
 target waves have sufficient headroom. Security auditing, release-environment
 resolution, combined
 artifact verification, signing, publishing, and release dry runs also use the

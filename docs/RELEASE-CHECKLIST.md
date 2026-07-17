@@ -99,7 +99,7 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
 
 ## Remaining release gates
 
-- [ ] Ten-minute fuzz gate on amd64 and arm64 for path normalization, byte range, filenames, ZIP/search/preview paths, overwrite policy, real upload-request state, real Share-request policy, file mutation/subtree policy, and multipart streaming boundaries. The weekly native matrix runs all nine targets with four workers in three groups and a 60-minute timeout; the manual final-commit run remains the release gate.
+- [ ] Ten-minute fuzz gate on amd64 and arm64 for path normalization, byte range, filenames, ZIP/search/preview paths, overwrite policy, real upload-request state, real Share-request policy, file mutation/subtree policy, and multipart streaming boundaries. The weekly native matrix runs all nine targets with four workers in three groups and a 120-minute timeout; the manual final-commit run remains the release gate.
 - [ ] Repeat `cargo-audit 0.22.2 --deny warnings` and inspect the shared `Cargo.lock`.
 - [ ] GitHub Actions CI green on final `main`.
 - [ ] Locked release dry-run green on `[self-hosted, Linux, X64, vaultlink]` and `[self-hosted, Linux, ARM64, vaultlink]`, using exactly the digest-pinned multi-arch builder with no runtime APT/Cargo installation. Architecture-independent release jobs run on arm64.
