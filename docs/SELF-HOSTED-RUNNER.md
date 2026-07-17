@@ -11,10 +11,12 @@ labelled `[self-hosted, Linux, X64, vaultlink-soak]`. It never accepts pull
 requests and follows the provisioning and evidence procedure in
 [`SOAK-RUNNER.md`](SOAK-RUNNER.md).
 
-No workflow uses GitHub-hosted compute. Jobs that require a native amd64 result
-run on the x64 runner, jobs that require a native arm64 result run on the arm64
-runner, and architecture-independent jobs default to the lower-cost arm64
-runner.
+The CI workflow runs eligible pull requests on disposable GitHub-hosted runners
+(`ubuntu-24.04` for amd64 and `ubuntu-24.04-arm` for arm64). Self-hosted runners
+only execute trusted main-branch and manually dispatched work. Jobs that require
+a native amd64 result run on the x64 runner, jobs that require a native arm64
+result run on the arm64 runner, and architecture-independent jobs default to the
+lower-cost arm64 runner.
 
 ## Self-hosted runner baselines
 
@@ -28,8 +30,8 @@ runner.
 
 The Docker group is root-equivalent. The VM must therefore be dedicated to CI,
 must not contain unrelated secrets or services, and must only run trusted
-private-repository changes. Do not route pull requests from untrusted forks to
-this runner.
+main-branch or manually dispatched changes. Do not route pull requests to this
+runner.
 
 ## Workflow behavior
 

@@ -259,10 +259,15 @@ for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
     fi
 done
 
-unexpected_hosted_runners=$(grep -R -n -E 'runs[_-]on:.*(ubuntu-|windows-|macos-)' .github/workflows || true)
-if [ -n "$unexpected_hosted_runners" ]; then
-    printf '%s\n' "$unexpected_hosted_runners" >&2
-    report "workflows must not use GitHub-hosted compute"
+hosted_runner_references=$(grep -R -n -E '^[[:space:]]*runs-on:.*(ubuntu-|windows-|macos-)' .github/workflows || true)
+if [ -n "$hosted_runner_references" ]; then
+    printf '%s\n' "$hosted_runner_references" >&2
+    report "GitHub-hosted runners must only be selected through CI pull_request_runs_on entries"
+fi
+if ! grep -F -q "pull_request_runs_on: '[\"ubuntu-24.04\"]'" .github/workflows/ci.yml \
+    || ! grep -F -q "pull_request_runs_on: '[\"ubuntu-24.04-arm\"]'" .github/workflows/ci.yml \
+    || ! grep -F -q "github.event_name == 'pull_request' && matrix.pull_request_runs_on || matrix.runs_on" .github/workflows/ci.yml; then
+    report "CI pull requests must use disposable GitHub-hosted runners"
 fi
 
 for architecture in amd64 arm64; do

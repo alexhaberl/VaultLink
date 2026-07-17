@@ -24,13 +24,15 @@ jobs:
         include:
           - architecture: amd64
             runs_on: '["self-hosted", "Linux", "X64", "vaultlink"]'
+            pull_request_runs_on: '["ubuntu-24.04"]'
             expected_uname: x86_64
             expected_rust_host: x86_64-unknown-linux-gnu
           - architecture: arm64
             runs_on: '["self-hosted", "Linux", "ARM64", "vaultlink"]'
+            pull_request_runs_on: '["ubuntu-24.04-arm"]'
             expected_uname: aarch64
             expected_rust_host: aarch64-unknown-linux-gnu
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && matrix.pull_request_runs_on || matrix.runs_on) }}
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
