@@ -327,13 +327,6 @@ pub(super) fn display_limit_unit_ceil(bytes: u64, unit: u64) -> String {
     bytes.div_ceil(unit).to_string()
 }
 
-pub(super) fn expiry_picker_html() -> String {
-    format!(
-        r#"<label class="vl-field"><vl-i18n key="share.expires_optional"/><div class="vl-datetime-picker vl-input-action" data-datetime-picker><input name="expires_local" data-datetime-input placeholder="<vl-i18n key="date.placeholder"/>" autocomplete="off" inputmode="numeric"><button class="vl-button vl-button--secondary" type="button" data-datetime-toggle aria-label="<vl-i18n key="share.date_select"/>" aria-expanded="false">{}</button><div class="vl-datetime-popover" data-datetime-popover hidden><div class="vl-datetime-popover__grid"><label><vl-i18n key="date.year"/><select data-dt-year></select></label><label><vl-i18n key="date.month"/><select data-dt-month data-pad="2"></select></label><label><vl-i18n key="date.day"/><select data-dt-day data-pad="2"></select></label><label><vl-i18n key="date.hour"/><select data-dt-hour data-pad="2"></select></label><label><vl-i18n key="date.minute"/><select data-dt-minute data-pad="2"></select></label></div><div class="vl-datetime-popover__actions"><button class="vl-button vl-button--secondary vl-button--small" type="button" data-datetime-clear><vl-i18n key="common.delete"/></button><button class="vl-button vl-button--small" type="button" data-datetime-apply><vl-i18n key="common.apply"/></button></div></div></div><small><vl-i18n key="date.format"/></small></label>"#,
-        crate::ui::icon(crate::ui::Icon::Calendar)
-    )
-}
-
 pub(super) fn format_unit_floor(bytes: u64, unit: u64) -> String {
     (bytes / unit).to_string()
 }

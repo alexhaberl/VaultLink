@@ -1,3 +1,4 @@
+use askama::Template;
 use axum::{
     extract::{Form, Path as AxPath, Query, State},
     http::{HeaderMap, StatusCode},
@@ -8,12 +9,14 @@ use serde::Deserialize;
 
 use super::{
     common::{
-        display_limit_unit_ceil, display_limit_unit_floor, encoded, expiry_picker_html,
-        format_unit_decimal, format_utc_minute, human, internal, parse_expiry, parse_unit_to_bytes,
-        upload_limit_label, CsrfForm,
+        display_limit_unit_ceil, display_limit_unit_floor, encoded, format_unit_decimal,
+        format_utc_minute, human, internal, parse_expiry, parse_unit_to_bytes, upload_limit_label,
+        CsrfForm,
     },
-    rendering::{admin_page, esc, PageId, GB},
-    storage_recovery_app_error, AppError, Result,
+    rendering::{PageId, GB},
+    storage_recovery_app_error,
+    templates::{self, TrustedMarkup},
+    AppError, Result,
 };
 use crate::{
     auth,
@@ -81,14 +84,6 @@ pub(super) fn share_public_url(settings: &RuntimeSettings, share: &Share) -> Str
     }
 }
 
-pub(super) fn selected(current: &str, value: &str) -> &'static str {
-    if current == value {
-        "selected"
-    } else {
-        ""
-    }
-}
-
 pub(super) fn share_list_url(query: &str, status: &str, sort: &str, cursor: Option<i64>) -> String {
     let mut url = format!(
         "/admin/shares?q={}&status={}&sort={}",
@@ -100,6 +95,74 @@ pub(super) fn share_list_url(query: &str, status: &str, sort: &str, cursor: Opti
         url.push_str(&format!("&cursor={cursor}"));
     }
     url
+}
+
+struct ShareUploadRulesView {
+    show_overwrite: bool,
+    overwrite_checked: bool,
+    max_total_size_gb: String,
+    max_files: u64,
+}
+
+struct ShareRowView {
+    id: i64,
+    display_name: String,
+    relative_path: String,
+    url: String,
+    permission_label: &'static str,
+    status_label: &'static str,
+    status_tone: &'static str,
+    password_protected: bool,
+    download_count: u64,
+    maximum: String,
+    progress: Option<u64>,
+    upload_limit: String,
+    toggle_label: &'static str,
+    upload_rules: Option<ShareUploadRulesView>,
+}
+
+#[derive(Template)]
+#[template(path = "web/shares/index.html")]
+struct ShareIndexTemplate {
+    active_count: usize,
+    protected_count: usize,
+    monthly_download: u64,
+    monthly_zip_download: u64,
+    monthly_preview: u64,
+    month: String,
+    statistics_started_label: String,
+    query: String,
+    status: &'static str,
+    sort: &'static str,
+    rows: Vec<ShareRowView>,
+    previous_url: Option<String>,
+    next_url: Option<String>,
+    csrf_token: String,
+    password_min_length: usize,
+    password_max_length: usize,
+}
+
+#[derive(Template)]
+#[template(path = "web/shares/no_target.html")]
+struct ShareNoTargetTemplate;
+
+#[derive(Template)]
+#[template(path = "web/shares/create.html")]
+struct ShareCreateTemplate {
+    csrf_token: String,
+    relative_path: String,
+    target_type: &'static str,
+    is_directory: bool,
+    alias_pattern: String,
+    calendar_icon: TrustedMarkup,
+    password_min_length: usize,
+    password_max_length: usize,
+    max_upload_size_ceiling_gb: String,
+    global_upload_size_gb: String,
+    default_total_size_gb: String,
+    default_max_files: u64,
+    replacements_allowed: bool,
+    url_preview: String,
 }
 
 pub(super) async fn share_index_page(
@@ -129,7 +192,11 @@ pub(super) async fn share_index_page(
         .unwrap_or(statistics_started_at);
     let query = q.q.as_deref().unwrap_or("").trim().to_string();
     let status = match q.status.as_deref().unwrap_or("all") {
-        value @ ("active" | "protected" | "expired" | "limit" | "inactive") => value,
+        "active" => "active",
+        "protected" => "protected",
+        "expired" => "expired",
+        "limit" => "limit",
+        "inactive" => "inactive",
         _ => "all",
     };
     let sort = if q.sort.as_deref() == Some("oldest") {
@@ -155,122 +222,95 @@ pub(super) async fn share_index_page(
     .await?;
     let active_count = summary.available;
     let protected_count = summary.protected;
-    let mut share_rows = String::new();
-    for share in &page_data.shares {
-        let url = share_public_url(&settings, share);
-        let display_name = share
-            .alias
-            .as_deref()
-            .or_else(|| share.relative_path.rsplit('/').next())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| i18n::text(i18n::current_locale(), i18n::DEFAULT_SHARE_NAME));
-        let (status_label, status_tone) = share_primary_status(share);
-        let password_badge = if share.password_hash.is_some() {
-            r#"<span class="vl-badge vl-badge--neutral"><vl-i18n key="auth.password"/></span>"#
-        } else {
-            ""
-        };
-        let maximum = share
-            .max_downloads
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "∞".into());
-        let progress = share
-            .max_downloads
-            .map(|maximum| {
-                let value = share
+    let locale = i18n::current_locale();
+    let rows = page_data
+        .shares
+        .iter()
+        .map(|share| {
+            let url = share_public_url(&settings, share);
+            let display_name = share
+                .alias
+                .as_deref()
+                .or_else(|| share.relative_path.rsplit('/').next())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| i18n::text(i18n::current_locale(), i18n::DEFAULT_SHARE_NAME));
+            let (status_label, status_tone) = share_primary_status(share);
+            let maximum = share
+                .max_downloads
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "∞".into());
+            let progress = share.max_downloads.map(|maximum| {
+                share
                     .download_count
                     .saturating_mul(100)
                     .saturating_div(maximum.max(1))
-                    .min(100);
-                format!(r#"<progress max="100" value="{value}">{value}%</progress>"#)
-            })
-            .unwrap_or_default();
-        let upload_settings = if share.is_directory && share.permission.can_upload() {
-            let overwrite_control = if !state.config.storage.replacements_allowed() {
-                String::new()
+                    .min(100)
+            });
+            let upload_settings = if share.is_directory && share.permission.can_upload() {
+                Some(ShareUploadRulesView {
+                    show_overwrite: state.config.storage.replacements_allowed(),
+                    overwrite_checked: share.upload_conflict_strategy.can_overwrite(),
+                    max_total_size_gb: format_unit_decimal(
+                        share
+                            .max_upload_total_size
+                            .unwrap_or(DEFAULT_SHARE_UPLOAD_TOTAL_SIZE),
+                        GB,
+                    ),
+                    max_files: share
+                        .max_upload_files
+                        .unwrap_or(DEFAULT_SHARE_UPLOAD_FILE_COUNT),
+                })
             } else {
-                let checked = if share.upload_conflict_strategy.can_overwrite() {
-                    "checked"
+                None
+            };
+            let single_upload_limit = share
+                .max_upload_size
+                .map(upload_limit_label)
+                .unwrap_or_else(|| format!("global {}", human(settings.max_upload_size)));
+            let upload_limit = if share.permission.can_upload() {
+                let (cumulative, files) = if locale == i18n::Locale::De {
+                    ("kumulativ", "Dateien")
                 } else {
-                    ""
+                    ("cumulative", "Files")
                 };
                 format!(
-                    r#"<label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1" {checked}><span><vl-i18n key="share.allow_overwrite"/><small><vl-i18n key="share.uploader_confirm_each"/></small></span></label>"#
-                )
-            };
-            format!(
-                r#"<details><summary><vl-i18n key="share.upload_rules"/></summary><form method="post" action="/admin/shares/{}/upload-conflict" class="vl-stack"><input type="hidden" name="csrf" value="{}">{}<label class="vl-field"><vl-i18n key="share.cumulative_upload_limit_gb"/><input name="max_upload_total_size_gb" type="number" min="0.000000001" step="any" value="{}" required></label><label class="vl-field"><vl-i18n key="share.max_upload_files"/><input name="max_upload_files" type="number" min="1" value="{}" required></label><button class="vl-button vl-button--secondary"><vl-i18n key="common.apply"/></button></form></details>"#,
-                share.id,
-                esc(&session_data.csrf_token),
-                overwrite_control,
-                format_unit_decimal(
+                    "{single_upload_limit}; {cumulative} {} / {}; {files} {} / {}",
+                    human(share.uploaded_bytes),
                     share
                         .max_upload_total_size
-                        .unwrap_or(DEFAULT_SHARE_UPLOAD_TOTAL_SIZE),
-                    GB,
-                ),
-                share
-                    .max_upload_files
-                    .unwrap_or(DEFAULT_SHARE_UPLOAD_FILE_COUNT),
-            )
-        } else {
-            String::new()
-        };
-        let single_upload_limit = share
-            .max_upload_size
-            .map(upload_limit_label)
-            .unwrap_or_else(|| format!("global {}", human(settings.max_upload_size)));
-        let upload_limit = if share.permission.can_upload() {
-            format!(
-                "{single_upload_limit}; kumulativ {} / {}; Dateien {} / {}",
-                human(share.uploaded_bytes),
-                share
-                    .max_upload_total_size
-                    .map(human)
-                    .unwrap_or_else(|| "—".into()),
-                share.uploaded_files,
-                share
-                    .max_upload_files
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "—".into()),
-            )
-        } else {
-            single_upload_limit
-        };
-        share_rows += &format!(
-            r#"<article class="vl-share-row"><div class="vl-share-identity"><span class="vl-file-kind" aria-hidden="true"></span><div><strong>{}</strong><span class="vl-muted">/{}</span></div></div><div class="vl-share-url"><code>{}</code><button class="vl-button vl-button--secondary vl-button--small vl-copy-button" type="button" data-copy="{}" aria-label="<vl-i18n key="share.copy_aria"/>"><vl-i18n key="common.copy"/></button></div><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span><span class="vl-badge vl-badge--{}">{}</span>{}</div><div class="vl-share-quota"><span>{} / {} <vl-i18n key="share.counted_transfers"/></span>{}<small class="vl-muted"><vl-i18n key="share.upload_limit_label"/>: {}</small></div><details class="vl-action-details"><summary class="vl-icon-button"><vl-i18n key="common.actions"/></summary><div class="vl-action-panel"><a class="vl-button vl-button--ghost" href="{}"><vl-i18n key="common.open"/></a><form method="post" action="/admin/shares/{}/toggle"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--ghost">{}</button></form><details><summary><vl-i18n key="account.change_password"/></summary><form method="post" action="/admin/shares/{}/password" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="account.new_password"/><input type="password" name="password" minlength="{}" maxlength="{}"></label><label class="vl-field"><vl-i18n key="common.confirm"/><input type="password" name="password_confirm"></label><div class="vl-inline-actions"><button class="vl-button"><vl-i18n key="common.set"/></button><button class="vl-button vl-button--secondary" name="remove" value="1"><vl-i18n key="common.remove"/></button></div></form></details>{}<form method="post" action="/admin/shares/{}/delete"><input type="hidden" name="csrf" value="{}"><button class="vl-button vl-button--danger"><vl-i18n key="common.delete"/></button></form></div></details></article>"#,
-            esc(display_name),
-            esc(&share.relative_path),
-            esc(&url),
-            esc(&url),
-            esc(share_permission_label(&share.permission)),
-            status_tone,
-            status_label,
-            password_badge,
-            share.download_count,
-            maximum,
-            progress,
-            esc(&upload_limit),
-            esc(&url),
-            share.id,
-            esc(&session_data.csrf_token),
-            if share.active {
-                i18n::text(i18n::current_locale(), i18n::DEACTIVATE_COMMON)
+                        .map(human)
+                        .unwrap_or_else(|| "—".into()),
+                    share.uploaded_files,
+                    share
+                        .max_upload_files
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                )
             } else {
-                i18n::text(i18n::current_locale(), i18n::ACTIVATE)
-            },
-            share.id,
-            esc(&session_data.csrf_token),
-            settings.share_password_min_length,
-            settings.share_password_max_length,
-            upload_settings,
-            share.id,
-            esc(&session_data.csrf_token),
-        );
-    }
-    if share_rows.is_empty() {
-        share_rows = r#"<div class="vl-empty"><strong><vl-i18n key="share.no_links"/></strong><p class="vl-muted"><vl-i18n key="share.adjust_filters"/></p></div>"#.into();
-    }
+                single_upload_limit
+            };
+            ShareRowView {
+                id: share.id,
+                display_name: display_name.to_string(),
+                relative_path: share.relative_path.clone(),
+                url,
+                permission_label: share_permission_label(&share.permission),
+                status_label,
+                status_tone,
+                password_protected: share.password_hash.is_some(),
+                download_count: share.download_count,
+                maximum,
+                progress,
+                upload_limit,
+                toggle_label: if share.active {
+                    i18n::text(i18n::current_locale(), i18n::DEACTIVATE_COMMON)
+                } else {
+                    i18n::text(i18n::current_locale(), i18n::ACTIVATE)
+                },
+                upload_rules: upload_settings,
+            }
+        })
+        .collect();
     let previous = q
         .cursor
         .filter(|cursor| *cursor > 0)
@@ -278,43 +318,32 @@ pub(super) async fn share_index_page(
     let next = page_data
         .next_cursor
         .map(|cursor| share_list_url(&query, status, sort, Some(cursor)));
-    let body = format!(
-        r#"<section class="vl-stat-strip" aria-label="<vl-i18n key="share.overview_aria"/>"><div><strong>{active_count}</strong><span><vl-i18n key="share.active_links"/></span></div><div><strong>{protected_count}</strong><span><vl-i18n key="share.password_protected_lower"/></span></div><div><strong>{}</strong><span><vl-i18n key="files.file"/> · {}</span></div><div><strong>{}</strong><span>ZIP · {}</span></div><div><strong>{}</strong><span><vl-i18n key="files.preview"/> · {}</span></div></section><p class="vl-muted"><vl-i18n key="share.monthly_values"/> {}.</p><section class="vl-panel"><form method="get" class="vl-toolbar"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="share.search_links"/></span><input name="q" value="{}" placeholder="<vl-i18n key="share.search_links"/>"></label><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="common.status"/></span><select name="status"><option value="all" {}><vl-i18n key="common.all"/></option><option value="active" {}><vl-i18n key="common.active"/></option><option value="protected" {}><vl-i18n key="common.protected"/></option><option value="expired" {}><vl-i18n key="common.expired"/></option><option value="limit" {}><vl-i18n key="share.limit_reached"/></option><option value="inactive" {}><vl-i18n key="common.inactive"/></option></select></label><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="files.sorting"/></span><select name="sort"><option value="newest" {}><vl-i18n key="files.newest_first"/></option><option value="oldest" {}><vl-i18n key="files.oldest_first"/></option></select></label><button class="vl-button"><vl-i18n key="common.filter"/></button></form><div class="vl-share-list">{share_rows}</div><nav class="vl-pagination" aria-label="<vl-i18n key="common.page_navigation"/>">{}{}</nav></section>"#,
-        monthly.download,
-        esc(&monthly.month),
-        monthly.zip_download,
-        esc(&monthly.month),
-        monthly.preview,
-        esc(&monthly.month),
-        esc(&statistics_started_label),
-        esc(&query),
-        selected(status, "all"),
-        selected(status, "active"),
-        selected(status, "protected"),
-        selected(status, "expired"),
-        selected(status, "limit"),
-        selected(status, "inactive"),
-        selected(sort, "newest"),
-        selected(sort, "oldest"),
-        previous
-            .map(|url| format!(
-                r#"<a class="vl-button vl-button--ghost" href="{}"><vl-i18n key="common.back"/></a>"#,
-                esc(&url)
-            ))
-            .unwrap_or_default(),
-        next.map(|url| format!(
-            r#"<a class="vl-button vl-button--ghost" href="{}"><vl-i18n key="common.continue"/></a>"#,
-            esc(&url)
-        ))
-        .unwrap_or_default(),
-    );
-    Ok(Html(admin_page(
+    let body = ShareIndexTemplate {
+        active_count,
+        protected_count,
+        monthly_download: monthly.download,
+        monthly_zip_download: monthly.zip_download,
+        monthly_preview: monthly.preview,
+        month: monthly.month,
+        statistics_started_label,
+        query,
+        status,
+        sort,
+        rows,
+        previous_url: previous,
+        next_url: next,
+        csrf_token: session_data.csrf_token.clone(),
+        password_min_length: settings.share_password_min_length,
+        password_max_length: settings.share_password_max_length,
+    };
+    Ok(Html(templates::admin_page(
         &state,
         PageId::Links,
         &body,
         false,
         &session_data.csrf_token,
-    ))
+        true,
+    )?)
     .into_response())
 }
 
@@ -327,14 +356,14 @@ pub(super) async fn share_create_page(
         session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let settings = runtime_settings(&state);
     let Some(raw_path) = query.path.as_deref().filter(|path| !path.is_empty()) else {
-        let body = r#"<section class="vl-panel vl-empty"><strong><vl-i18n key="share.select_target"/></strong><p class="vl-muted"><vl-i18n key="share.open_browser"/></p><a class="vl-button" href="/admin"><vl-i18n key="share.to_browser"/></a></section>"#;
-        return Ok(Html(admin_page(
+        return Ok(Html(templates::admin_page(
             &state,
             PageId::CreateLink,
-            body,
+            &ShareNoTargetTemplate,
             false,
             &session_data.csrf_token,
-        )));
+            true,
+        )?));
     };
     let relative_path = path_security::validate_relative(raw_path)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid target path"))?
@@ -347,31 +376,6 @@ pub(super) async fn share_create_page(
         .map_err(internal)?
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid target path"))?;
     let is_directory = metadata.is_dir();
-    let permission_fields = if is_directory {
-        r#"<div class="vl-segmented" role="radiogroup" aria-label="<vl-i18n key="share.permission_aria"/>"><label><input type="radio" name="permission" value="download_only" checked><span><vl-i18n key="share.download_only"/></span></label><label><input type="radio" name="permission" value="upload_only"><span><vl-i18n key="share.upload_only"/></span></label><label><input type="radio" name="permission" value="download_upload"><span><vl-i18n key="share.download_upload"/></span></label></div>"#
-    } else {
-        r#"<input type="hidden" name="permission" value="download_only"><span class="vl-badge vl-badge--accent"><vl-i18n key="share.download_only"/></span><p class="vl-muted"><vl-i18n key="share.upload_folder_only"/></p>"#
-    };
-    let overwrite_rule = if !state.config.storage.replacements_allowed() {
-        ""
-    } else {
-        r#"<label class="vl-switch"><input type="checkbox" name="overwrite_allowed" value="1"><span><vl-i18n key="share.existing_replace"/><small><vl-i18n key="share.uploader_confirm"/></small></span></label>"#
-    };
-    let upload_rules = if is_directory {
-        format!(
-            r#"<section class="vl-form-section" data-upload-rules><h2><vl-i18n key="share.step_upload"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.max_file"/><input name="max_upload_size_gb" type="number" min="1" max="{}" step="1" placeholder="Global: {} GB"><small><vl-i18n key="share.empty_global"/></small></label><label class="vl-field"><vl-i18n key="share.cumulative_upload_limit_gb"/><input name="max_upload_total_size_gb" type="number" min="1" step="any" value="{}" required></label><label class="vl-field"><vl-i18n key="share.max_upload_files"/><input name="max_upload_files" type="number" min="1" value="{}" required></label>{}</div></section>"#,
-            display_limit_unit_floor(crate::config::MAX_UPLOAD_SIZE, GB),
-            display_limit_unit_floor(settings.max_upload_size, GB),
-            display_limit_unit_ceil(
-                DEFAULT_SHARE_UPLOAD_TOTAL_SIZE.max(settings.max_upload_size),
-                GB,
-            ),
-            DEFAULT_SHARE_UPLOAD_FILE_COUNT,
-            overwrite_rule,
-        )
-    } else {
-        String::new()
-    };
     let url_preview = format!(
         "{}/v/••••••••",
         settings.public_base_url.trim_end_matches('/')
@@ -381,32 +385,40 @@ pub(super) async fn share_create_page(
         path_security::SHARE_ALIAS_MIN_LENGTH,
         path_security::SHARE_ALIAS_MAX_LENGTH
     );
-    let body = format!(
-        r#"<div class="vl-create-layout"><form method="post" action="/admin/shares" class="vl-panel vl-stack" data-share-create><input type="hidden" name="csrf" value="{}"><input type="hidden" name="path" value="{}"><input type="hidden" name="expires_tz_offset_minutes" data-tz-offset value="0"><section class="vl-target-card"><div><span class="vl-eyebrow"><vl-i18n key="share.selected_target"/></span><strong>/{}</strong><small class="vl-muted">{}</small></div><a class="vl-button vl-button--ghost" href="/admin"><vl-i18n key="share.change_target"/></a></section><section class="vl-form-section"><h2><vl-i18n key="share.step_permission"/></h2>{permission_fields}</section><section class="vl-form-section"><h2><vl-i18n key="share.step_link"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.short_alias"/><input name="alias" pattern="{alias_pattern}" data-share-alias><small><vl-i18n key="share.alias_help"/></small></label>{}<label class="vl-field"><vl-i18n key="share.max_transfers"/><input name="max_downloads" type="number" min="1"><small><vl-i18n key="share.empty_unlimited"/></small></label></div></section><section class="vl-form-section"><h2><vl-i18n key="share.step_protection"/></h2><label class="vl-switch"><input type="checkbox" name="password_enabled" value="1" data-password-toggle><span><vl-i18n key="share.password_protection"/><small><vl-i18n key="share.password_enable"/></small></span></label><div class="vl-form-grid" data-password-fields><label class="vl-field"><vl-i18n key="auth.password"/><input name="password" type="password" minlength="{}" maxlength="{}" autocomplete="new-password"></label><label class="vl-field"><vl-i18n key="account.confirm_password"/><input name="password_confirm" type="password" autocomplete="new-password"></label></div></section>{upload_rules}<button class="vl-button vl-button--primary" type="submit"><vl-i18n key="share.create_secure"/></button></form><aside class="vl-panel vl-review-card" data-share-review><h2><vl-i18n key="share.review"/></h2><dl class="vl-review-list"><div><dt><vl-i18n key="common.target"/></dt><dd>/{}</dd></div><div><dt><vl-i18n key="share.permission"/></dt><dd data-review-permission><vl-i18n key="share.download_only"/></dd></div><div><dt><vl-i18n key="auth.password"/></dt><dd data-review-password><vl-i18n key="share.no_password"/></dd></div><div><dt><vl-i18n key="share.limit"/></dt><dd data-review-limit><vl-i18n key="common.unlimited"/></dd></div></dl><div class="vl-field"><span><vl-i18n key="share.url_preview"/></span><code data-review-url>{}</code></div><p class="vl-muted"><vl-i18n key="share.audit_help"/></p></aside></div>"#,
-        esc(&session_data.csrf_token),
-        esc(&relative_path),
-        esc(&relative_path),
-        i18n::text(
+    let body = ShareCreateTemplate {
+        csrf_token: session_data.csrf_token.clone(),
+        relative_path,
+        target_type: i18n::text(
             i18n::current_locale(),
             if is_directory {
                 i18n::FOLDER
             } else {
                 i18n::FILE
-            }
+            },
         ),
-        expiry_picker_html(),
-        settings.share_password_min_length,
-        settings.share_password_max_length,
-        esc(&relative_path),
-        esc(&url_preview),
-    );
-    Ok(Html(admin_page(
+        is_directory,
+        alias_pattern,
+        calendar_icon: TrustedMarkup::static_icon(crate::ui::Icon::Calendar),
+        password_min_length: settings.share_password_min_length,
+        password_max_length: settings.share_password_max_length,
+        max_upload_size_ceiling_gb: display_limit_unit_floor(crate::config::MAX_UPLOAD_SIZE, GB),
+        global_upload_size_gb: display_limit_unit_floor(settings.max_upload_size, GB),
+        default_total_size_gb: display_limit_unit_ceil(
+            DEFAULT_SHARE_UPLOAD_TOTAL_SIZE.max(settings.max_upload_size),
+            GB,
+        ),
+        default_max_files: DEFAULT_SHARE_UPLOAD_FILE_COUNT,
+        replacements_allowed: state.config.storage.replacements_allowed(),
+        url_preview,
+    };
+    Ok(Html(templates::admin_page(
         &state,
         PageId::CreateLink,
         &body,
         false,
         &session_data.csrf_token,
-    )))
+        true,
+    )?))
 }
 
 #[derive(Deserialize)]

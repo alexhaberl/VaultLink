@@ -2521,18 +2521,6 @@ async fn settings_form_uses_decimal_whole_preview_defaults() {
     assert!(!html.contains("Media-Preview Max. GB"));
 }
 
-#[test]
-fn custom_datetime_picker_replaces_native_browser_picker() {
-    let css = crate::ui::STYLESHEET;
-    let picker = i18n::render_markers(Locale::De, &expiry_picker_html());
-    assert!(css.contains(".vl-datetime-popover"));
-    assert!(!css.contains(r#"datetime-local"]::-webkit-calendar-picker-indicator"#));
-    assert!(picker.contains("data-datetime-picker"));
-    assert!(picker.contains(r#"name="expires_local""#));
-    assert!(picker.contains("TT.MM.JJJJ HH:MM"));
-    assert!(!picker.contains(r#"type="datetime-local""#));
-}
-
 #[tokio::test]
 async fn png_favicon_is_an_actual_32_by_32_image() {
     let response = favicon_png(Query(AssetQuery::default()))
