@@ -1,5 +1,5 @@
 use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, KeyInit, Mac};
@@ -25,6 +25,20 @@ const UNKNOWN_ADMIN_IP_BUCKETS: usize = 256;
 pub const ADMIN_PASSWORD_MIN_CHARACTERS: usize = 14;
 pub const ADMIN_PASSWORD_MAX_CHARACTERS: usize = 256;
 pub const MAX_PASSWORD_BYTES: usize = 1_024;
+const ARGON2_MEMORY_KIB: u32 = 19 * 1024;
+const ARGON2_ITERATIONS: u32 = 2;
+const ARGON2_PARALLELISM: u32 = 1;
+
+fn password_argon2() -> Argon2<'static> {
+    let params = Params::new(
+        ARGON2_MEMORY_KIB,
+        ARGON2_ITERATIONS,
+        ARGON2_PARALLELISM,
+        None,
+    )
+    .expect("VaultLink Argon2id parameters are valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
 
 /// Compares authentication tokens without leaking the first differing byte.
 ///
@@ -44,7 +58,7 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
     let mut salt_bytes = [0u8; 16];
     fill_random(&mut salt_bytes);
     let salt = SaltString::encode_b64(&salt_bytes)?;
-    Argon2::default()
+    password_argon2()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
 }
@@ -64,7 +78,7 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
     PasswordHash::new(hash)
         .ok()
         .and_then(|h| {
-            Argon2::default()
+            password_argon2()
                 .verify_password(password.as_bytes(), &h)
                 .ok()
         })
@@ -606,6 +620,7 @@ mod tests {
     fn password_round_trip() {
         let first = hash_password("correct horse battery staple").unwrap();
         let second = hash_password("correct horse battery staple").unwrap();
+        assert!(first.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
         assert_ne!(first, second);
         assert!(verify_password(&first, "correct horse battery staple"));
         assert!(verify_password(&second, "correct horse battery staple"));
@@ -614,6 +629,21 @@ mod tests {
             &first,
             &"x".repeat(MAX_PASSWORD_BYTES + 1)
         ));
+    }
+
+    #[test]
+    fn password_verification_accepts_existing_argon2id_parameter_sets() {
+        let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
+        let legacy = Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(4_096, 3, 1, None).unwrap(),
+        )
+        .hash_password(b"legacy password", &salt)
+        .unwrap()
+        .to_string();
+        assert!(legacy.contains("m=4096,t=3,p=1"));
+        assert!(verify_password(&legacy, "legacy password"));
     }
 
     #[test]

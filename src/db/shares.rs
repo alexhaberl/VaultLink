@@ -1,7 +1,7 @@
 use super::{
     insert_required_audits, token_hash, trace_required_audits, AuditContext, Database, Permission,
-    RequiredAuditEvent, Share, ShareControlsUpdateOutcome, UploadConflictStrategy,
-    MAX_SQLITE_UNSIGNED,
+    RequiredAuditEvent, Share, ShareControlsUpdateOutcome, ShareListOptions, ShareListSort,
+    SharePage, ShareSummary, UploadConflictStrategy, MAX_SQLITE_UNSIGNED,
 };
 #[cfg(test)]
 use super::{DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE};
@@ -313,10 +313,100 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(shares)
     }
+    pub fn list_share_page(&self, options: &ShareListOptions) -> rusqlite::Result<SharePage> {
+        const BATCH_SIZE: usize = 256;
+        const SELECT: &str = "SELECT shares.id,token_hash,token_key_id,token_ciphertext,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id";
+        let cursor_predicate = match options.sort {
+            ShareListSort::Newest => "(?3 IS NULL OR shares.id<?3) ORDER BY shares.id DESC",
+            ShareListSort::Oldest => "(?3 IS NULL OR shares.id>?3) ORDER BY shares.id ASC",
+        };
+        let sql = format!(
+            "{SELECT} WHERE
+             (CASE ?1
+                WHEN 'all' THEN 1
+                WHEN 'active' THEN active=1 AND (expires_at IS NULL OR expires_at>?2)
+                     AND (max_downloads IS NULL OR download_count<max_downloads)
+                WHEN 'protected' THEN password_hash IS NOT NULL
+                WHEN 'expired' THEN expires_at IS NOT NULL AND expires_at<=?2
+                WHEN 'limit' THEN max_downloads IS NOT NULL AND download_count>=max_downloads
+                WHEN 'inactive' THEN active=0
+                ELSE 0
+              END)
+             AND {cursor_predicate} LIMIT ?4"
+        );
+        let query = options
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(unicode_search_key);
+        let limit = options.limit.clamp(1, 200);
+        let mut scan_cursor = options.cursor;
+        let mut shares = Vec::with_capacity(limit.saturating_add(1));
+        let connection = self.try_conn()?;
+        let mut statement = connection.prepare(&sql)?;
+        loop {
+            let mut rows = statement.query(params![
+                options.status.as_str(),
+                options.now.to_rfc3339(),
+                scan_cursor,
+                BATCH_SIZE as i64
+            ])?;
+            let mut scanned = 0usize;
+            while let Some(row) = rows.next()? {
+                scanned += 1;
+                let share = self.map_share(row)?;
+                scan_cursor = Some(share.id);
+                let matches = query.as_ref().is_none_or(|needle| {
+                    unicode_search_key(&share.relative_path).contains(needle)
+                        || share
+                            .alias
+                            .as_deref()
+                            .is_some_and(|alias| unicode_search_key(alias).contains(needle))
+                });
+                if matches {
+                    shares.push(share);
+                    if shares.len() > limit {
+                        break;
+                    }
+                }
+            }
+            if shares.len() > limit || scanned < BATCH_SIZE {
+                break;
+            }
+        }
+        let next_cursor = if shares.len() > limit {
+            shares.pop();
+            shares.last().map(|share| share.id)
+        } else {
+            None
+        };
+        Ok(SharePage {
+            shares,
+            next_cursor,
+        })
+    }
+    pub fn share_summary(&self, now: DateTime<Utc>) -> rusqlite::Result<ShareSummary> {
+        self.try_conn()?.query_row(
+            "SELECT
+                 COALESCE(SUM(active=1 AND (expires_at IS NULL OR expires_at>?1)
+                     AND (max_downloads IS NULL OR download_count<max_downloads)),0),
+                 COALESCE(SUM(password_hash IS NOT NULL),0)
+             FROM shares",
+            [now.to_rfc3339()],
+            |row| {
+                Ok(ShareSummary {
+                    available: row.get(0)?,
+                    protected: row.get(1)?,
+                })
+            },
+        )
+    }
     pub fn count_available_shares(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
         self.try_conn()?.query_row(
             "SELECT COUNT(*) FROM shares
-             WHERE active=1 AND (expires_at IS NULL OR expires_at>?1)",
+             WHERE active=1 AND (expires_at IS NULL OR expires_at>?1)
+               AND (max_downloads IS NULL OR download_count<max_downloads)",
             [now.to_rfc3339()],
             |row| row.get(0),
         )
@@ -693,4 +783,19 @@ impl Database {
             Ok((changed, events))
         })
     }
+}
+
+fn unicode_search_key(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for character in value.chars().flat_map(char::to_lowercase) {
+        // Rust's lowercase mapping is Unicode-aware but is not a full case
+        // fold. Normalize sharp-s as well so common German searches such as
+        // "GRÜS" match "Grüße" after the remaining Unicode lowercase pass.
+        if character == 'ß' {
+            normalized.push_str("ss");
+        } else {
+            normalized.push(character);
+        }
+    }
+    normalized
 }

@@ -357,7 +357,7 @@ fn nesting_layer_order_and_original_uri_contract_remain_visible() {
     assert_fragments_in_order(
         &web_router,
         &[
-            r#".nest("/api/v1", crate::api::router(state.clone()))"#,
+            r#".nest("/api/v2", crate::api::router(state.clone()))"#,
             r#".route("/", get(|| async { Redirect::to("/admin") }))"#,
             ".layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT))",
             ".layer(middleware::from_fn(admission::absolute_request_body_deadline))",
@@ -395,6 +395,17 @@ fn nesting_layer_order_and_original_uri_contract_remain_visible() {
             "nested public handler must keep OriginalUri extraction: {handler_signature}"
         );
     }
+}
+
+#[test]
+fn api_v1_router_is_fully_removed() {
+    let current_sources =
+        format!("{WEB_SOURCE}{API_SOURCE}{WEB_PUBLIC_PREVIEW_SOURCE}{WEB_UPLOAD_SOURCE}");
+    assert!(
+        !current_sources.contains(&format!("/api/{}", "v1")),
+        "the removed API v1 namespace must not reappear"
+    );
+    assert!(WEB_SOURCE.contains(r#".nest("/api/v2", crate::api::router(state.clone()))"#));
 }
 
 #[test]

@@ -181,7 +181,7 @@ unset SETUP_PID
 "$BIN" --config "$CONFIG_PATH" >"$APP_LOG" 2>&1 &
 APP_PID="$!"
 wait_http "http://$APP_ADDR/login" "200"
-if ! HEALTH_JSON="$(curl -sS -f "http://$APP_ADDR/api/v1/health")"; then
+if ! HEALTH_JSON="$(curl -sS -f "http://$APP_ADDR/api/v2/health")"; then
     fail "health endpoint did not return HTTP success"
 fi
 if ! printf '%s' "$HEALTH_JSON" | assert_health_json; then
@@ -191,7 +191,7 @@ fi
 LOGIN_JSON="$(
     curl -sS -f -c "$COOKIE_JAR" \
         -H "content-type: application/json" \
-        -X POST "http://$APP_ADDR/api/v1/session/login" \
+        -X POST "http://$APP_ADDR/api/v2/session/login" \
         -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}"
 )"
 CSRF="$(printf '%s' "$LOGIN_JSON" | json_get csrf_token)"
@@ -202,23 +202,23 @@ MFA_JSON="$(
     curl -sS -f -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
         -H "content-type: application/json" \
         -H "x-csrf-token: $CSRF" \
-        -X POST "http://$APP_ADDR/api/v1/session/mfa" \
+        -X POST "http://$APP_ADDR/api/v2/session/mfa" \
         -d "{\"code\":\"$MFA_CODE\"}"
 )"
 printf '%s' "$MFA_JSON" | grep -q '"mfa_verified":true' || fail "MFA did not verify"
 CSRF="$(printf '%s' "$MFA_JSON" | json_get csrf_token)"
 
-curl -sS -f -b "$COOKIE_JAR" "http://$APP_ADDR/api/v1/session/me" | grep -q '"username":"admin"' \
+curl -sS -f -b "$COOKIE_JAR" "http://$APP_ADDR/api/v2/session/me" | grep -q '"username":"admin"' \
     || fail "session/me did not return admin"
 
-curl -sS -f -b "$COOKIE_JAR" "http://$APP_ADDR/api/v1/files?path=" | grep -q '"readme.txt"' \
+curl -sS -f -b "$COOKIE_JAR" "http://$APP_ADDR/api/v2/files?path=" | grep -q '"readme.txt"' \
     || fail "files API did not list readme.txt"
 
 CREATE_DIRECTORY_JSON="$(
     curl -sS -f -b "$COOKIE_JAR" \
         -H "content-type: application/json" \
         -H "x-csrf-token: $CSRF" \
-        -X POST "http://$APP_ADDR/api/v1/files/directories" \
+        -X POST "http://$APP_ADDR/api/v2/files/directories" \
         -d '{"parent":"","name":"managed"}'
 )"
 printf '%s' "$CREATE_DIRECTORY_JSON" | grep -q '"path":"managed"' \
@@ -240,7 +240,7 @@ MUTATION_SHARE_JSON="$(
     curl -sS -f -b "$COOKIE_JAR" \
         -H "content-type: application/json" \
         -H "x-csrf-token: $CSRF" \
-        -X POST "http://$APP_ADDR/api/v1/shares" \
+        -X POST "http://$APP_ADDR/api/v2/shares" \
         -d '{"path":"managed/child.txt","permission":"download_only"}'
 )"
 MUTATION_SHARE_TOKEN="$(printf '%s' "$MUTATION_SHARE_JSON" | json_get token)"
@@ -250,17 +250,17 @@ RENAME_JSON="$(
     curl -sS -f -b "$COOKIE_JAR" \
         -H "content-type: application/json" \
         -H "x-csrf-token: $CSRF" \
-        -X PATCH "http://$APP_ADDR/api/v1/files" \
+        -X PATCH "http://$APP_ADDR/api/v2/files" \
         -d '{"path":"managed","name":"renamed"}'
 )"
 printf '%s' "$RENAME_JSON" | grep -q '"path":"renamed"' \
     || fail "directory rename did not return the renamed path"
 printf '%s' "$RENAME_JSON" | grep -q '"updated_shares":1' \
     || fail "directory rename did not update the affected share"
-curl -sS -f "http://$APP_ADDR/api/v1/public/shares/$MUTATION_SHARE_TOKEN" \
+curl -sS -f "http://$APP_ADDR/api/v2/public/shares/$MUTATION_SHARE_TOKEN" \
     | grep -q '"path":"renamed/child.txt"' \
     || fail "renamed share did not expose its updated path"
-curl -sS -f "http://$APP_ADDR/api/v1/public/shares/$MUTATION_SHARE_TOKEN/download" \
+curl -sS -f "http://$APP_ADDR/api/v2/public/shares/$MUTATION_SHARE_TOKEN/download" \
     -o "$WORK_DIR/renamed-child.txt"
 cmp "$WORK_DIR/renamed-child.txt" "$ROOT_DIR/renamed/child.txt" \
     || fail "renamed share download returned unexpected content"
@@ -270,7 +270,7 @@ UNCONFIRMED_DELETE_STATUS="$(
         -b "$COOKIE_JAR" \
         -H "content-type: application/json" \
         -H "x-csrf-token: $CSRF" \
-        -X DELETE "http://$APP_ADDR/api/v1/files" \
+        -X DELETE "http://$APP_ADDR/api/v2/files" \
         -d '{"path":"renamed"}'
 )"
 [[ "$UNCONFIRMED_DELETE_STATUS" == "409" ]] \
@@ -281,7 +281,7 @@ DELETE_JSON="$(
     curl -sS -f -b "$COOKIE_JAR" \
         -H "content-type: application/json" \
         -H "x-csrf-token: $CSRF" \
-        -X DELETE "http://$APP_ADDR/api/v1/files" \
+        -X DELETE "http://$APP_ADDR/api/v2/files" \
         -d '{"path":"renamed","confirm_name":"renamed"}'
 )"
 printf '%s' "$DELETE_JSON" | grep -q '"cleanup_pending":true' \
@@ -289,7 +289,7 @@ printf '%s' "$DELETE_JSON" | grep -q '"cleanup_pending":true' \
 [[ ! -e "$ROOT_DIR/renamed" ]] || fail "deleted tree remained visible"
 INACTIVE_SHARE_STATUS="$(
     curl -sS -o "$WORK_DIR/inactive-share.json" -w '%{http_code}' \
-        "http://$APP_ADDR/api/v1/public/shares/$MUTATION_SHARE_TOKEN"
+        "http://$APP_ADDR/api/v2/public/shares/$MUTATION_SHARE_TOKEN"
 )"
 [[ "$INACTIVE_SHARE_STATUS" == "410" ]] \
     || fail "deleted tree share returned $INACTIVE_SHARE_STATUS instead of 410"
@@ -299,13 +299,13 @@ DOWNLOAD_SHARE_JSON="$(
     curl -sS -f -b "$COOKIE_JAR" \
         -H "content-type: application/json" \
         -H "x-csrf-token: $CSRF" \
-        -X POST "http://$APP_ADDR/api/v1/shares" \
+        -X POST "http://$APP_ADDR/api/v2/shares" \
         -d '{"path":".","permission":"download_only"}'
 )"
 DOWNLOAD_SHARE_TOKEN="$(printf '%s' "$DOWNLOAD_SHARE_JSON" | json_get token)"
 [[ -n "$DOWNLOAD_SHARE_TOKEN" ]] || fail "download share create did not return token"
 curl -sS -f \
-    "http://$APP_ADDR/api/v1/public/shares/$DOWNLOAD_SHARE_TOKEN/download.zip" \
+    "http://$APP_ADDR/api/v2/public/shares/$DOWNLOAD_SHARE_TOKEN/download.zip" \
     -o "$WORK_DIR/download.zip"
 python3 - "$WORK_DIR/download.zip" <<'PY'
 import sys
@@ -320,7 +320,7 @@ PY
 NO_CSRF_STATUS="$(
     curl -sS -o "$WORK_DIR/no-csrf.json" -w '%{http_code}' -b "$COOKIE_JAR" \
         -H "content-type: application/json" \
-        -X POST "http://$APP_ADDR/api/v1/shares" \
+        -X POST "http://$APP_ADDR/api/v2/shares" \
         -d '{"path":"uploads","permission":"upload_only"}'
 )"
 [[ "$NO_CSRF_STATUS" == "403" ]] || fail "share create without CSRF returned $NO_CSRF_STATUS instead of 403"
@@ -330,19 +330,19 @@ SHARE_JSON="$(
     curl -sS -f -b "$COOKIE_JAR" \
         -H "content-type: application/json" \
         -H "x-csrf-token: $CSRF" \
-        -X POST "http://$APP_ADDR/api/v1/shares" \
+        -X POST "http://$APP_ADDR/api/v2/shares" \
         -d '{"path":"uploads","permission":"upload_only","overwrite_allowed":false}'
 )"
 SHARE_TOKEN="$(printf '%s' "$SHARE_JSON" | json_get token)"
 [[ -n "$SHARE_TOKEN" ]] || fail "share create did not return token"
 
-curl -sS -f "http://$APP_ADDR/api/v1/public/shares/$SHARE_TOKEN" | grep -q '"permission":"upload_only"' \
+curl -sS -f "http://$APP_ADDR/api/v2/public/shares/$SHARE_TOKEN" | grep -q '"permission":"upload_only"' \
     || fail "public share API did not return upload_only"
 
 printf 'blocked' > "$WORK_DIR/blocked.exe"
 UPLOAD_STATUS="$(
     curl -sS -o "$WORK_DIR/upload-error.json" -w '%{http_code}' \
-        -X POST "http://$APP_ADDR/api/v1/public/shares/$SHARE_TOKEN/upload" \
+        -X POST "http://$APP_ADDR/api/v2/public/shares/$SHARE_TOKEN/upload" \
         -F "file=@$WORK_DIR/blocked.exe;filename=blocked.exe"
 )"
 [[ "$UPLOAD_STATUS" == "415" ]] || fail "blocked upload returned $UPLOAD_STATUS instead of 415"

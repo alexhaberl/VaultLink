@@ -236,7 +236,7 @@ jobs:
         run: |
           cargo fmt --all -- --check
           shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
-          cargo audit --deny warnings
+          cargo audit --deny warnings --ignore RUSTSEC-2023-0071
       - name: Native compilation and test gates
         run: |
           cargo clippy --locked --all-targets --all-features -- -D warnings

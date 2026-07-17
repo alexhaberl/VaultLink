@@ -51,16 +51,11 @@ fn templates_follow_the_html_security_policy() {
             let tag = &rest[..end];
             assert!(tag.contains(" src="), "inline script in {}", path.display());
         }
-        for expression in source.match_indices("|safe") {
-            let start = source[..expression.0].rfind("{{").unwrap_or(expression.0);
-            let context = &source[start..expression.0];
-            assert!(
-                context.contains("icon") || context.contains("qr") || context.contains("brand"),
-                "unauthorized safe filter in {}: {}",
-                path.display(),
-                context
-            );
-        }
+        assert!(
+            !source.contains("|safe"),
+            "safe filters are forbidden; use the closed TrustedMarkup type in {}",
+            path.display()
+        );
         stream_markers += source
             .matches("<!--VAULTLINK_ESCAPED_TEXT_PREVIEW_STREAM-->")
             .count();
@@ -74,4 +69,32 @@ fn templates_follow_the_html_security_policy() {
         has_polite_status,
         "asynchronous upload and WebAuthn feedback must expose a polite status region"
     );
+}
+
+#[test]
+fn arbitrary_html_fragment_entries_stay_removed() {
+    let sources = [
+        ("web/templates.rs", include_str!("web/templates.rs")),
+        ("web/rendering.rs", include_str!("web/rendering.rs")),
+        (
+            "web/settings_audit.rs",
+            include_str!("web/settings_audit.rs"),
+        ),
+    ];
+    let forbidden = [
+        "trusted_fragment",
+        "public_page_html",
+        "admin_page_html",
+        "plain_page(",
+        "cfg(any())",
+    ];
+
+    for (path, source) in sources {
+        for name in forbidden {
+            assert!(
+                !source.contains(name),
+                "arbitrary HTML entry {name:?} in {path}"
+            );
+        }
+    }
 }

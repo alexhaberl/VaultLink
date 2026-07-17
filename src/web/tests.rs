@@ -29,6 +29,11 @@ use crate::{
     i18n::{self, Locale},
     proxy, AppState,
 };
+use askama::Template as _;
+
+#[derive(askama::Template)]
+#[template(source = r#"<section class="vl-panel"></section>"#, ext = "html")]
+struct EmptyPanelTemplate;
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, Query, Request},
@@ -136,8 +141,8 @@ fn public_preview_back_link_returns_share_parent() {
         "/v/tok?path=folder"
     );
     assert_eq!(
-        public_back_link("/api/v1/public/shares/tok", "folder/file.txt", true),
-        "/api/v1/public/shares/tok?path=folder"
+        public_back_link("/api/v2/public/shares/tok", "folder/file.txt", true),
+        "/api/v2/public/shares/tok?path=folder"
     );
 }
 
@@ -441,7 +446,7 @@ async fn absolute_body_deadline_stops_a_body_that_never_yields() {
     assert!(error.to_string().contains("deadline"));
     assert!(!upload_request_path("/login"));
     assert!(upload_request_path("/v/token/upload"));
-    assert!(upload_request_path("/api/v1/public/shares/token/upload"));
+    assert!(upload_request_path("/api/v2/public/shares/token/upload"));
 }
 
 #[tokio::test]
@@ -1106,7 +1111,7 @@ async fn upload_routes_reject_multipart_headers_before_the_parser_can_buffer_the
 
     let mut missing_content_type = Request::builder()
         .method(Method::POST)
-        .uri("/api/v1/public/shares/missing/upload")
+        .uri("/api/v2/public/shares/missing/upload")
         .body(Body::empty())
         .unwrap();
     missing_content_type.extensions_mut().insert(ConnectInfo(
@@ -1228,6 +1233,20 @@ fn filtered_directory_items_consume_listing_search_and_zip_budgets() {
     let (entries, truncated) = list_directory_page(&scope, "", 0, 1).unwrap();
     assert!(entries.is_empty());
     assert!(truncated);
+    let cursor_page = list_directory_cursor_page(
+        &scope,
+        "",
+        None,
+        None,
+        1,
+        FileSortColumn::Name,
+        FileSortDirection::Ascending,
+    )
+    .unwrap();
+    assert!(cursor_page.entries.is_empty());
+    assert!(cursor_page.truncated);
+    assert_eq!(cursor_page.scanned, 1);
+    assert!(cursor_page.peak_retained <= 101);
     assert!(search_tree(&scope, "", "missing", &settings)
         .unwrap()
         .is_empty());
@@ -1455,7 +1474,7 @@ fn api_share_strategy_request(
 ) -> Request {
     let mut request = Request::builder()
         .method(Method::PATCH)
-        .uri(format!("/api/v1/shares/{share_id}"))
+        .uri(format!("/api/v2/shares/{share_id}"))
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, format!("vaultlink_session={session_token}"))
         .header("x-csrf-token", csrf_token)
@@ -1825,9 +1844,30 @@ fn missing_session_error_redirects_to_login() {
 
 #[test]
 fn invalid_credentials_remain_an_error() {
-    let response = AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten").into_response();
+    let response = AppError(StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(response.headers().get(header::LOCATION).is_none());
+}
+
+#[tokio::test]
+async fn english_backend_capacity_message_is_localized_only_at_the_ui_boundary() {
+    assert_eq!(
+        crate::http_auth::ARGON2_BUSY_MESSAGE,
+        "Password processing temporarily unavailable"
+    );
+    let german = i18n::scope(Locale::De, "/login".into(), async {
+        response_text(
+            AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::http_auth::ARGON2_BUSY_MESSAGE,
+            )
+            .into_response(),
+        )
+        .await
+    })
+    .await;
+    assert!(german.contains("Passwortverarbeitung vorübergehend nicht verfügbar"));
+    assert!(!german.contains(crate::http_auth::ARGON2_BUSY_MESSAGE));
 }
 
 #[test]
@@ -1969,13 +2009,15 @@ async fn admin_shell_renders_nav_icons_and_system_panel() {
     let data = tempfile::tempdir().unwrap();
     let state = test_state(root.path(), data.path());
     let html = i18n::scope(Locale::De, "/admin".into(), async {
-        admin_page(
+        super::templates::admin_page(
             &state,
             PageId::Files,
-            r#"<section class="vl-panel"></section>"#,
+            &EmptyPanelTemplate,
             true,
             "csrf",
+            true,
         )
+        .unwrap()
     })
     .await;
     assert!(html.contains("<title>Dateien · VaultLink</title>"));
@@ -2133,12 +2175,16 @@ async fn queue_errors_localize_message_without_changing_machine_code() {
 
 #[tokio::test]
 async fn queue_reports_required_audit_failures_with_stable_machine_code() {
-    let response = upload_queue_error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE,
-    );
+    let response = i18n::scope(Locale::De, "/admin".into(), async {
+        upload_queue_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE,
+        )
+    })
+    .await;
     let body = response_text(response).await;
     assert!(body.contains(r#""code":"audit_unavailable""#));
+    assert!(body.contains("Sicherheitsprotokoll vorübergehend nicht verfügbar"));
 }
 
 #[test]
@@ -2455,7 +2501,9 @@ async fn settings_form_uses_decimal_whole_preview_defaults() {
     let html = i18n::scope(Locale::De, "/admin/settings".into(), async {
         i18n::render_markers(
             Locale::De,
-            &settings_form(&session, &settings, 0, "", false),
+            &settings_form_template(&session, &settings, 0, "", false)
+                .render()
+                .unwrap(),
         )
     })
     .await;
@@ -2477,18 +2525,6 @@ async fn settings_form_uses_decimal_whole_preview_defaults() {
     assert!(!html.contains("Max. Dateien pro ZIP (0 ="));
     assert_no_mojibake("settings form", &html);
     assert!(!html.contains("Media-Preview Max. GB"));
-}
-
-#[test]
-fn custom_datetime_picker_replaces_native_browser_picker() {
-    let css = crate::ui::STYLESHEET;
-    let picker = i18n::render_markers(Locale::De, &expiry_picker_html());
-    assert!(css.contains(".vl-datetime-popover"));
-    assert!(!css.contains(r#"datetime-local"]::-webkit-calendar-picker-indicator"#));
-    assert!(picker.contains("data-datetime-picker"));
-    assert!(picker.contains(r#"name="expires_local""#));
-    assert!(picker.contains("TT.MM.JJJJ HH:MM"));
-    assert!(!picker.contains(r#"type="datetime-local""#));
 }
 
 #[tokio::test]
@@ -2539,18 +2575,68 @@ async fn versioned_assets_are_immutable_and_app_javascript_is_cached_per_locale(
 }
 
 #[tokio::test]
+async fn full_router_preserves_asset_cache_policy_and_keeps_pages_no_store() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let app = router(test_state(root.path(), data.path()));
+
+    let asset = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            &format!("/assets/app.js?v={ASSET_VERSION}&lang=en"),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        asset.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static(
+            "public, max-age=31536000, immutable"
+        ))
+    );
+
+    let page = app
+        .oneshot(request(Method::GET, "/login", ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+}
+
+#[tokio::test]
+async fn full_router_exposes_only_the_v2_api_namespace() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let app = router(test_state(root.path(), data.path()));
+    let removed = format!("/api/{}/health", "v1");
+    assert_eq!(
+        app.clone()
+            .oneshot(request(Method::GET, &removed, ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.oneshot(request(Method::GET, "/api/v2/health", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn file_time_uses_locale_date_order() {
     let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(60 * 60 * 20 + 32 * 60);
-    let de = i18n::scope(Locale::De, "/".into(), async { format_file_time(time) }).await;
-    let en = i18n::scope(Locale::En, "/".into(), async { format_file_time(time) }).await;
-    assert_eq!(
-        de,
-        r#"<time data-local-time datetime="1970-01-01T20:32:00Z">01.01.1970 20:32 UTC</time>"#
-    );
-    assert_eq!(
-        en,
-        r#"<time data-local-time datetime="1970-01-01T20:32:00Z">1970-01-01 20:32 UTC</time>"#
-    );
+    let utc = chrono::DateTime::<Utc>::from(time);
+    let de = i18n::scope(Locale::De, "/".into(), async { format_utc_minute(utc) }).await;
+    let en = i18n::scope(Locale::En, "/".into(), async { format_utc_minute(utc) }).await;
+    assert_eq!(de, "01.01.1970 20:32 UTC");
+    assert_eq!(en, "1970-01-01 20:32 UTC");
 }
 
 #[tokio::test]
@@ -2598,13 +2684,14 @@ fn removed_compatibility_symbols_and_html_rewrites_stay_removed() {
 
 #[test]
 fn public_preview_actions_are_rendered_above_content() {
-    let body =
-            r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><pre>long text</pre></section>"#
-                .to_string();
-    let html = i18n::render_markers(
-        Locale::De,
-        &add_public_preview_actions(&body, "/v/token", Some("/v/token/download")),
-    );
+    let body = PublicTextPreviewTemplate {
+        back_link: "/v/token",
+        download_link: "/v/token/download",
+    }
+    .render()
+    .unwrap()
+    .replace("<!--VAULTLINK_ESCAPED_TEXT_PREVIEW_STREAM-->", "long text");
+    let html = i18n::render_markers(Locale::De, &body);
     let actions = html.find("Zurück zur Freigabe").unwrap();
     let content = html.find("<pre>long text</pre>").unwrap();
     assert!(actions < content);
@@ -4665,7 +4752,7 @@ async fn upload_only_never_exposes_target_paths_or_existing_content() {
     );
 
     let api_body = response_text(
-        app.oneshot(request(Method::GET, "/api/v1/public/shares/drop-token", ""))
+        app.oneshot(request(Method::GET, "/api/v2/public/shares/drop-token", ""))
             .await
             .unwrap(),
     )
@@ -5876,7 +5963,7 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
         .oneshot(range_request(Method::HEAD, &raw_image_uri, None))
         .await
         .unwrap();
-    assert_eq!(head_image.status(), StatusCode::OK);
+    assert_eq!(head_image.status(), StatusCode::GONE);
     let bad_range = app
         .clone()
         .oneshot(range_request(
@@ -5886,14 +5973,14 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
         ))
         .await
         .unwrap();
-    assert_eq!(bad_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(bad_range.status(), StatusCode::GONE);
     assert_eq!(
         app.clone()
             .oneshot(request(Method::GET, "/v/media/preview?path=image.png", ""))
             .await
             .unwrap()
             .status(),
-        StatusCode::OK
+        StatusCode::GONE
     );
     assert_eq!(
         app.clone()
@@ -7349,7 +7436,7 @@ async fn api_upload_route_can_stream_beyond_the_buffered_body_limit() {
     let content = vec![b'x'; DEFAULT_REQUEST_BODY_LIMIT + 64 * 1024];
     let response = app
         .oneshot(multipart_request(
-            "/api/v1/public/shares/large-upload/upload",
+            "/api/v2/public/shares/large-upload/upload",
             "large.bin",
             &content,
         ))
@@ -7362,7 +7449,7 @@ async fn api_upload_route_can_stream_beyond_the_buffered_body_limit() {
         .unwrap()
         .to_str()
         .unwrap()
-        .starts_with("/api/v1/public/shares/large-upload"));
+        .starts_with("/api/v2/public/shares/large-upload"));
     assert_eq!(
         std::fs::metadata(root.path().join("uploads/large.bin"))
             .unwrap()

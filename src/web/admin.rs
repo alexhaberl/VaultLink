@@ -21,7 +21,7 @@ use crate::{
 use super::{
     common::{format_audit_time, otpauth_url, qr_svg, CsrfForm},
     rendering::PageId,
-    templates::admin_page as render_admin_page,
+    templates::{admin_page as render_admin_page, TrustedMarkup},
     AppError, Result,
 };
 
@@ -56,7 +56,7 @@ struct TotpSecretTemplate<'a> {
     title_key: &'static str,
     help_key: &'static str,
     username: &'a str,
-    qr: &'a str,
+    qr: &'a TrustedMarkup,
     secret: &'a str,
     otpauth: &'a str,
 }
@@ -165,10 +165,7 @@ pub(super) async fn create_admin_ui(
             return Err(error.into());
         }
         Err(_) => {
-            return Err(AppError(
-                StatusCode::CONFLICT,
-                "Benutzername existiert bereits",
-            ));
+            return Err(AppError(StatusCode::CONFLICT, "Username already exists"));
         }
     };
     state
@@ -207,7 +204,7 @@ pub(super) async fn reset_admin_password(
     if id == session.admin_id {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Eigenes Passwort kann hier nicht zurückgesetzt werden",
+            "Your own password cannot be reset here",
         ));
     }
     let service = AdminService::new(state.db.clone());
@@ -223,7 +220,7 @@ pub(super) async fn reset_admin_password(
     })
     .await?;
     if !changed {
-        return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
+        return Err(AppError(StatusCode::NOT_FOUND, "Admin not found"));
     }
     Ok(Redirect::to("/admin/admins?notice=password_reset"))
 }
@@ -239,7 +236,7 @@ pub(super) async fn reset_admin_totp(
     if id == session.admin_id {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Eigene MFA kann hier nicht zurückgesetzt werden",
+            "Your own MFA cannot be reset here",
         ));
     }
     let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
@@ -250,7 +247,7 @@ pub(super) async fn reset_admin_totp(
             .map_err(admin_database_error)
     })
     .await?
-    .ok_or(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"))?;
+    .ok_or(AppError(StatusCode::NOT_FOUND, "Admin not found"))?;
     let username = reset.username;
     let response_secret = reset.totp_secret;
     let otpauth = otpauth_url(&username, response_secret.expose_secret());
@@ -284,7 +281,7 @@ pub(super) async fn deactivate_admin(
     if id == session.admin_id {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Eigener Admin kann nicht stillgelegt werden",
+            "Your own administrator account cannot be deactivated",
         ));
     }
     let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
@@ -305,15 +302,15 @@ pub(super) async fn deactivate_admin(
             AdminDeactivationOutcome::LastActive => {
                 return Err(AppError(
                     StatusCode::BAD_REQUEST,
-                    "Letzter aktiver Admin kann nicht stillgelegt werden",
+                    "The final active admin cannot be deactivated",
                 ));
             }
             AdminDeactivationOutcome::NotFound => {
-                return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
+                return Err(AppError(StatusCode::NOT_FOUND, "Admin not found"));
             }
         },
         AdminActivationResult::NotFound => {
-            return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
+            return Err(AppError(StatusCode::NOT_FOUND, "Admin not found"));
         }
         AdminActivationResult::Changed => {}
     }
@@ -341,7 +338,7 @@ pub(super) async fn activate_admin(
         .admin_login_limiter
         .replace_active_admins(active_admins);
     if outcome == AdminActivationResult::NotFound {
-        return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
+        return Err(AppError(StatusCode::NOT_FOUND, "Admin not found"));
     }
     Ok(Redirect::to("/admin/admins"))
 }
@@ -350,17 +347,17 @@ fn admin_validation_error(error: &AdminServiceError) -> AppError {
     match error {
         AdminServiceError::InvalidUsername => AppError(
             StatusCode::BAD_REQUEST,
-            "Benutzername muss 3-64 sichere ASCII-Zeichen enthalten",
+            "Username must contain 3-64 safe ASCII characters",
         ),
         AdminServiceError::InvalidPassword => AppError(
             StatusCode::BAD_REQUEST,
-            "Passwort muss mindestens 14 und darf höchstens 256 Zeichen enthalten",
+            "Password must contain at least 14 and at most 256 characters",
         ),
         AdminServiceError::PasswordConfirmationMismatch => {
-            AppError(StatusCode::BAD_REQUEST, "Passwörter stimmen nicht überein")
+            AppError(StatusCode::BAD_REQUEST, "Passwords do not match")
         }
         AdminServiceError::Database(_) => {
-            AppError(StatusCode::INTERNAL_SERVER_ERROR, "Datenbankfehler")
+            AppError(StatusCode::INTERNAL_SERVER_ERROR, "Database error")
         }
     }
 }

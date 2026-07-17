@@ -417,6 +417,82 @@ fn file_mutations_update_only_exact_share_subtrees() {
 }
 
 #[test]
+fn share_cursor_pages_are_gapless_sorted_and_unicode_searchable() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let aliases = ["alpha", "Grüße", "gamma", "delta", "omega"];
+    let mut ids = Vec::new();
+    for (index, alias) in aliases.iter().enumerate() {
+        ids.push(
+            database
+                .create_share(
+                    &format!("cursor-token-{index}"),
+                    Some(alias),
+                    &format!("folder/{index}.txt"),
+                    false,
+                    &Permission::DownloadOnly,
+                    None,
+                    None,
+                    None,
+                    1,
+                    None,
+                    &UploadConflictStrategy::Reject,
+                )
+                .unwrap(),
+        );
+    }
+    database.set_share_active(ids[3], false).unwrap();
+    let now = Utc::now();
+    let mut cursor = None;
+    let mut newest_ids = Vec::new();
+    loop {
+        let page = database
+            .list_share_page(&ShareListOptions {
+                query: None,
+                status: ShareListStatus::All,
+                sort: ShareListSort::Newest,
+                cursor,
+                limit: 2,
+                now,
+            })
+            .unwrap();
+        newest_ids.extend(page.shares.iter().map(|share| share.id));
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
+    }
+    assert_eq!(newest_ids.len(), aliases.len());
+    assert!(newest_ids.windows(2).all(|ids| ids[0] > ids[1]));
+
+    let unicode = database
+        .list_share_page(&ShareListOptions {
+            query: Some("GRÜS".into()),
+            status: ShareListStatus::All,
+            sort: ShareListSort::Oldest,
+            cursor: None,
+            limit: 50,
+            now,
+        })
+        .unwrap();
+    assert_eq!(unicode.shares.len(), 1);
+    assert_eq!(unicode.shares[0].alias.as_deref(), Some("Grüße"));
+
+    let inactive = database
+        .list_share_page(&ShareListOptions {
+            query: None,
+            status: ShareListStatus::Inactive,
+            sort: ShareListSort::Newest,
+            cursor: None,
+            limit: 50,
+            now,
+        })
+        .unwrap();
+    assert_eq!(inactive.shares.len(), 1);
+    assert_eq!(inactive.shares[0].id, ids[3]);
+    let summary = database.share_summary(now).unwrap();
+    assert_eq!(summary.available, 4);
+}
+
+#[test]
 fn download_limit_is_atomic() {
     let d = Database::open(":memory:").unwrap();
     d.create_admin("a", "h", "s").unwrap();
@@ -1560,7 +1636,7 @@ fn rejects_unknown_newer_schema() {
 }
 
 #[test]
-fn fresh_database_is_exactly_schema_two_without_plaintext_secret_columns() {
+fn fresh_database_is_exactly_schema_three_without_plaintext_secret_columns() {
     let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
     assert_eq!(
@@ -1571,12 +1647,22 @@ fn fresh_database_is_exactly_schema_two_without_plaintext_secret_columns() {
     );
     let migration_records: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version=2 AND length(applied_at)>0",
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3) AND length(applied_at)>0",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migration_records, 1);
+    assert_eq!(migration_records, 2);
+    for index in ["idx_shares_active_id", "idx_shares_active_expires"] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?1)",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "schema 3 index {index} is missing");
+    }
     for (table, forbidden) in [
         ("shares", "token"),
         ("admins", "totp_secret"),
@@ -1649,7 +1735,11 @@ fn populated_schema_one_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u
 
     let connection = Connection::open(&path).unwrap();
     connection
-        .execute_batch("DROP TABLE vaultlink_schema_migrations")
+        .execute_batch(
+            "DROP TABLE vaultlink_schema_migrations;
+             DROP INDEX idx_shares_active_id;
+             DROP INDEX idx_shares_active_expires;",
+        )
         .unwrap();
     connection
         .execute(
@@ -1660,6 +1750,29 @@ fn populated_schema_one_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u
     connection.pragma_update(None, "user_version", 1).unwrap();
     drop(connection);
     (directory, path, share_ciphertext, totp_ciphertext)
+}
+
+fn schema_two_fixture() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("schema-two.sqlite");
+    drop(Database::open(&path).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX idx_shares_active_id;
+             DROP INDEX idx_shares_active_expires;
+             DELETE FROM vaultlink_schema_migrations WHERE target_version=3;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+            [schema::SCHEMA_2_FINGERPRINT],
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 2).unwrap();
+    drop(connection);
+    (directory, path)
 }
 
 #[test]
@@ -1707,26 +1820,55 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
         .unwrap();
     assert_eq!(migrated_share_ciphertext, share_ciphertext);
     assert_eq!(migrated_totp_ciphertext, totp_ciphertext);
-    let applied_at: String = connection
-        .query_row(
-            "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=2",
-            [],
-            |row| row.get(0),
+    let applied_at: Vec<(i64, String)> = connection
+        .prepare(
+            "SELECT target_version,applied_at FROM vaultlink_schema_migrations
+             WHERE target_version IN (2,3) ORDER BY target_version",
         )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
         .unwrap();
     drop(connection);
     drop(database);
 
     let reopened = Database::open(&path).unwrap();
-    let reopened_applied_at: String = reopened
-        .conn()
-        .query_row(
-            "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=2",
-            [],
-            |row| row.get(0),
+    let reopened_connection = reopened.conn();
+    let reopened_applied_at: Vec<(i64, String)> = reopened_connection
+        .prepare(
+            "SELECT target_version,applied_at FROM vaultlink_schema_migrations
+             WHERE target_version IN (2,3) ORDER BY target_version",
         )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(reopened_applied_at, applied_at);
+}
+
+#[test]
+fn schema_two_migrates_to_three_with_expected_indexes() {
+    let (_directory, path) = schema_two_fixture();
+    let database = Database::open(path).unwrap();
+    let connection = database.conn();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    for index in ["idx_shares_active_id", "idx_shares_active_expires"] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?1)",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present);
+    }
 }
 
 #[test]
@@ -1780,6 +1922,41 @@ fn failed_schema_one_migration_rolls_back_every_change() {
         )
         .unwrap();
     assert!(!migration_table);
+}
+
+#[test]
+fn failed_schema_two_migration_rolls_back_indexes_and_metadata() {
+    let (_directory, path) = schema_two_fixture();
+    schema::fail_next_schema_2_to_3_migration();
+    assert!(matches!(
+        Database::open(&path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        2
+    );
+    let fingerprint: String = connection
+        .query_row(
+            "SELECT fingerprint FROM vaultlink_schema WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fingerprint, schema::SCHEMA_2_FINGERPRINT);
+    let schema_three_artifacts: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='index' AND name IN ('idx_shares_active_id','idx_shares_active_expires')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema_three_artifacts, 0);
 }
 
 #[test]

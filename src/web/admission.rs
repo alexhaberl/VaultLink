@@ -220,7 +220,7 @@ pub(super) async fn response_admission(
         Err(_) => {
             let mut response = (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Zu viele gleichzeitige Anfragen",
+                "Too many concurrent requests",
             )
                 .into_response();
             response
@@ -244,7 +244,7 @@ pub(super) async fn response_admission(
                 drop(permit);
                 let mut response = (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Zu viele gleichzeitige Downloads",
+                    "Too many concurrent downloads",
                 )
                     .into_response();
                 response
@@ -264,7 +264,7 @@ pub(super) async fn response_admission(
                 drop(permit);
                 let mut response = (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Zu viele gleichzeitige Downloads dieses Clients",
+                    "Too many concurrent downloads from this client",
                 )
                     .into_response();
                 response
@@ -285,7 +285,7 @@ pub(super) async fn response_admission(
                 drop(permit);
                 let mut response = (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Zu viele gleichzeitige Antworten",
+                    "Too many concurrent responses",
                 )
                     .into_response();
                 response
@@ -305,7 +305,7 @@ pub(super) async fn response_admission(
                 drop(permit);
                 let mut response = (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Zu viele gleichzeitige Antworten dieses Clients",
+                    "Too many concurrent responses from this client",
                 )
                     .into_response();
                 response
@@ -357,7 +357,7 @@ pub(super) fn streaming_response_path(path: &str) -> bool {
         || path.ends_with("/download.zip")
         || path.ends_with("/preview/raw")
         || (path.ends_with("/preview")
-            && (path.starts_with("/v/") || path.starts_with("/api/v1/public/shares/")))
+            && (path.starts_with("/v/") || path.starts_with("/api/v2/public/shares/")))
 }
 
 pub(super) fn upload_request_path(path: &str) -> bool {
@@ -460,6 +460,7 @@ pub(super) async fn security_headers(
     req: Request,
     next: Next,
 ) -> Response {
+    let asset_response = req.uri().path().starts_with("/assets/");
     let mut response = next.run(req).await;
     let h = response.headers_mut();
     h.insert("content-security-policy",HeaderValue::from_static("default-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
@@ -479,13 +480,15 @@ pub(super) async fn security_headers(
             HeaderValue::from_static("max-age=31536000; includeSubDomains"),
         );
     }
-    h.insert("cache-control", HeaderValue::from_static("no-store"));
+    if !asset_response || !h.contains_key("cache-control") {
+        h.insert("cache-control", HeaderValue::from_static("no-store"));
+    }
     response
 }
 
 pub(crate) async fn guard_multipart_upload(request: Request, next: Next) -> Response {
     match crate::multipart_guard::guard_multipart_request(request) {
         Ok(request) => next.run(request).await,
-        Err(error) => AppError(error.status_code(), "Ungültiger Multipart-Upload").into_response(),
+        Err(error) => AppError(error.status_code(), "Invalid multipart upload").into_response(),
     }
 }

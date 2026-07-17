@@ -17,8 +17,8 @@ use crate::{
 
 pub const SESSION_COOKIE: &str = "vaultlink_session";
 pub const SECURE_SESSION_COOKIE: &str = "__Host-vaultlink_session";
-pub(crate) const AUDIT_UNAVAILABLE_MESSAGE: &str =
-    "Sicherheitsprotokoll vorübergehend nicht verfügbar";
+pub(crate) const AUDIT_UNAVAILABLE_MESSAGE: &str = "Security audit log temporarily unavailable";
+pub(crate) const ARGON2_BUSY_MESSAGE: &str = "Password processing temporarily unavailable";
 const TRANSFER_COOKIE_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 
 tokio::task_local! {
@@ -177,13 +177,13 @@ impl HttpAuthError {
 pub type Result<T> = std::result::Result<T, HttpAuthError>;
 
 pub fn internal<T>(_: T) -> HttpAuthError {
-    HttpAuthError::status(StatusCode::INTERNAL_SERVER_ERROR, "Interner Fehler")
+    HttpAuthError::status(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
 }
 
 fn argon2_busy<T>(_: T) -> HttpAuthError {
     HttpAuthError::with_kind(
         StatusCode::SERVICE_UNAVAILABLE,
-        "Passwortverarbeitung vorübergehend ausgelastet",
+        ARGON2_BUSY_MESSAGE,
         HttpAuthErrorKind::CapacityUnavailable,
     )
 }
@@ -395,16 +395,13 @@ pub async fn commit_runtime_settings(
 ) -> Result<()> {
     let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
     next.validate_for_config(&state.config)
-        .map_err(|_| HttpAuthError::status(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
+        .map_err(|_| HttpAuthError::status(StatusCode::BAD_REQUEST, "Invalid setting"))?;
     let public_url_changed = runtime_settings(state).public_base_url != next.public_base_url;
     let replacement_webauthn = if public_url_changed {
         Some(
             crate::webauthn::WebAuthnService::from_public_base_url(&next.public_base_url).map_err(
                 |_| {
-                    HttpAuthError::status(
-                        StatusCode::BAD_REQUEST,
-                        "Ungültige WebAuthn-Konfiguration",
-                    )
+                    HttpAuthError::status(StatusCode::BAD_REQUEST, "Invalid WebAuthn configuration")
                 },
             )?,
         )
@@ -419,7 +416,7 @@ pub async fn commit_runtime_settings(
         if credential_count > 0 {
             return Err(HttpAuthError::status(
                 StatusCode::CONFLICT,
-                "Public Base URL kann mit registrierten Sicherheitsschlüsseln nicht geändert werden",
+                "Public base URL cannot be changed while security keys are registered",
             ));
         }
     }
@@ -516,7 +513,7 @@ pub async fn session(
     let token = session_cookie(state, headers).ok_or_else(|| match missing {
         MissingSession::RedirectToLogin => HttpAuthError::redirect("/login"),
         MissingSession::Unauthorized => {
-            HttpAuthError::status(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich")
+            HttpAuthError::status(StatusCode::UNAUTHORIZED, "Sign-in required")
         }
     })?;
     let session_token = token.to_string();
@@ -525,13 +522,13 @@ pub async fn session(
         .ok_or_else(|| match missing {
             MissingSession::RedirectToLogin => HttpAuthError::redirect("/login"),
             MissingSession::Unauthorized => {
-                HttpAuthError::status(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich")
+                HttpAuthError::status(StatusCode::UNAUTHORIZED, "Sign-in required")
             }
         })?;
     if require_mfa && !session.mfa_verified {
         return Err(HttpAuthError::status(
             StatusCode::FORBIDDEN,
-            "MFA-Verifikation erforderlich",
+            "MFA verification required",
         ));
     }
     Ok((token.to_string(), session))
@@ -541,7 +538,7 @@ pub fn csrf(session: &Session, value: &str) -> Result<()> {
     if !auth::constant_time_eq(&session.csrf_token, value) {
         return Err(HttpAuthError::status(
             StatusCode::FORBIDDEN,
-            "Ungültiges CSRF-Token",
+            "Invalid CSRF token",
         ));
     }
     Ok(())
@@ -551,7 +548,7 @@ pub fn csrf_header(session: &Session, headers: &HeaderMap) -> Result<()> {
     let value = headers
         .get("x-csrf-token")
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| HttpAuthError::status(StatusCode::FORBIDDEN, "CSRF-Token fehlt"))?;
+        .ok_or_else(|| HttpAuthError::status(StatusCode::FORBIDDEN, "CSRF token missing"))?;
     csrf(session, value)
 }
 
@@ -661,7 +658,7 @@ pub fn make_transfer_cookie(
 ) -> String {
     let path = match scope {
         TransferCookieScope::Web => format!("/v/{}", share.token),
-        TransferCookieScope::Api => format!("/api/v1/public/shares/{}", share.token),
+        TransferCookieScope::Api => format!("/api/v2/public/shares/{}", share.token),
     };
     format!(
         "{}={}; Path={}; HttpOnly; SameSite=Strict; Max-Age={};{}",
@@ -686,7 +683,7 @@ pub fn make_unlock_cookie(
     let settings = runtime_settings(state);
     let path = match scope {
         UnlockCookieScope::Web => format!("/v/{}", share.token),
-        UnlockCookieScope::Api => format!("/api/v1/public/shares/{}", share.token),
+        UnlockCookieScope::Api => format!("/api/v2/public/shares/{}", share.token),
     };
     format!(
         "{}={}; Path={}; HttpOnly; SameSite=Strict; Max-Age={};{}",

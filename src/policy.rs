@@ -180,6 +180,7 @@ pub enum ShareAvailability {
     Available,
     Inactive,
     Expired,
+    LimitReached,
 }
 
 pub fn share_availability(share: &Share, now: DateTime<Utc>) -> ShareAvailability {
@@ -187,6 +188,11 @@ pub fn share_availability(share: &Share, now: DateTime<Utc>) -> ShareAvailabilit
         ShareAvailability::Inactive
     } else if share.expires_at.is_some_and(|expires| expires <= now) {
         ShareAvailability::Expired
+    } else if share
+        .max_downloads
+        .is_some_and(|maximum| share.download_count >= maximum)
+    {
+        ShareAvailability::LimitReached
     } else {
         ShareAvailability::Available
     }
@@ -368,6 +374,13 @@ mod tests {
         assert_eq!(
             share_availability(&share(false, None), now),
             ShareAvailability::Inactive
+        );
+        let mut limited = share(true, None);
+        limited.max_downloads = Some(2);
+        limited.download_count = 2;
+        assert_eq!(
+            share_availability(&limited, now),
+            ShareAvailability::LimitReached
         );
     }
 

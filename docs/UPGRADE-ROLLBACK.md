@@ -1,6 +1,6 @@
 # Upgrade, backup and rollback
 
-VaultLink currently uses schema 2. Fresh databases are created directly at schema 2, and a validated schema-1 database is migrated once to schema 2 in an `IMMEDIATE` transaction. The migration adds `vaultlink_schema_migrations`, records target version 2, updates the schema fingerprint and changes `PRAGMA user_version` last. Startup rejects future versions, unknown versions, non-empty unversioned databases, fingerprint mismatches and legacy plaintext-secret layouts.
+VaultLink currently uses schema 3. Fresh databases are created directly at schema 3. A validated schema-1 database is migrated through schema 2, and a schema-2 database is migrated to schema 3 in separate `IMMEDIATE` transactions. Schema 3 records target version 3 and adds the share indexes `(active,id)` and `(active,expires_at)`; each migration updates the schema fingerprint and changes `PRAGMA user_version` last. Startup rejects future versions, unknown versions, non-empty unversioned databases, fingerprint mismatches and legacy plaintext-secret layouts.
 
 Schema migrations are forward-only. VaultLink does not migrate legacy plaintext WebAuthn or secret columns and does not perform an in-place schema downgrade. A rollback must restore the old binary, matching configuration, database and keyring from the same backup.
 
@@ -27,7 +27,7 @@ The script takes an exclusive maintenance lock, validates the installed and cand
 
 If activation, startup, readiness or the post-start integrity check fails, the script restores the complete four-file backup. A `CRITICAL` message means automatic recovery failed; keep the service stopped and restore the reported backup directory manually.
 
-The candidate binary performs any supported forward schema migration when it starts. The upgrade script does not edit schemas, aliases, credentials or storage layouts itself. Because startup can advance the database to schema 2, keep the complete pre-upgrade backup until the candidate has been accepted.
+The candidate binary performs any supported forward schema migration when it starts. The upgrade script does not edit schemas, aliases, credentials or storage layouts itself. Because startup can advance the database to schema 3, keep the complete pre-upgrade backup until the candidate has been accepted.
 
 ## Rollback
 

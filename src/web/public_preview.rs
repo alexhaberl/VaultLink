@@ -15,31 +15,53 @@ use super::{
     common::{
         encoded, human, internal, parent_path, preview_kind, public_preview_error, BrowseQuery,
     },
-    files::{media_viewer, preview_too_large_body},
     preview_zip::{
         raw_preview_response, raw_preview_secure_file_response, read_preview,
         read_preview_secure_file, PreviewContent,
     },
-    public::{get_share, get_storage_share},
-    rendering::{esc, escaped_html_len, plain_page},
+    public::{
+        get_share, get_share_for_transfer, get_storage_share, get_storage_share_for_transfer,
+    },
+    rendering::escaped_html_len,
     shares::PreviewRawQuery,
     transfer_runtime::{
-        begin_public_transfer, complete_transfer_without_body, escaped_text_page_stream,
-        public_share_route, set_transfer_cookie, transfer_body,
+        begin_public_transfer, check_public_transfer_availability, complete_transfer_without_body,
+        escaped_text_page_stream, public_share_route, set_transfer_cookie, transfer_body,
     },
     AppError, Result, MAX_RENDERED_TEXT_PREVIEW_BYTES, TEXT_PREVIEW_RENDER_UNIT_BYTES,
 };
 
 #[derive(Template)]
 #[template(path = "web/public/text_preview.html")]
-struct PublicTextPreviewTemplate<'a> {
-    back_link: &'a str,
-    download_link: &'a str,
+pub(super) struct PublicTextPreviewTemplate<'a> {
+    pub(super) back_link: &'a str,
+    pub(super) download_link: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "web/public/preview_too_large.html")]
+struct PublicPreviewTooLargeTemplate {
+    back_link: String,
+    download_link: String,
+    path: String,
+    message: String,
+    size: String,
+}
+
+#[derive(Template)]
+#[template(path = "web/public/media_preview.html")]
+struct PublicMediaPreviewTemplate {
+    back_link: String,
+    download_link: String,
+    size: String,
+    raw_url: String,
+    image: bool,
 }
 use crate::{
     auth,
     db::PreviewSessionCreateOutcome,
     http_auth::{current_client_limit_key, database, runtime_settings, share_is_unlocked},
+    i18n,
     policy::PreviewKind,
     AppState,
 };
@@ -60,32 +82,6 @@ pub(super) fn public_back_link(
     }
 }
 
-pub(super) fn add_public_preview_actions(
-    body: &str,
-    back_link: &str,
-    download_link: Option<&str>,
-) -> String {
-    let download = download_link
-        .map(|link| {
-            format!(
-                r#"<a class="vl-button vl-button--secondary" href="{}"><vl-i18n key="common.download"/></a>"#,
-                esc(link)
-            )
-        })
-        .unwrap_or_default();
-    const PREFIX: &str = r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1>"#;
-    let content = body
-        .strip_prefix(PREFIX)
-        .and_then(|body| body.strip_suffix("</section>"))
-        .unwrap_or(body);
-    format!(
-        r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href="{}"><vl-i18n key="share.back"/></a>{}</p>{}</section>"#,
-        esc(back_link),
-        download,
-        content
-    )
-}
-
 pub(super) fn text_preview_render_permits(max_preview_size: u64) -> u32 {
     max_preview_size
         .div_ceil(TEXT_PREVIEW_RENDER_UNIT_BYTES)
@@ -101,23 +97,23 @@ pub(crate) async fn public_preview(
 ) -> Result<Response> {
     let sh = get_share(&state, &token).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !sh.permission.can_download() {
-        return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
+        return Err(AppError(StatusCode::FORBIDDEN, "Preview not allowed"));
     }
     let expected_id = sh.id;
     let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !sh.permission.can_download() {
-        return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
+        return Err(AppError(StatusCode::FORBIDDEN, "Preview not allowed"));
     }
     let requested_path = q.path.clone().unwrap_or_default();
     let relative_file = if sh.is_directory {
         if requested_path.is_empty() {
-            return Err(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"));
+            return Err(AppError(StatusCode::BAD_REQUEST, "File path missing"));
         }
         requested_path.clone()
     } else {
@@ -129,7 +125,7 @@ pub(crate) async fn public_preview(
                 state
                     .secure_root
                     .bind_directory(&sh.relative_path)
-                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?,
+                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Share target unavailable"))?,
             ),
             None,
         )
@@ -140,7 +136,7 @@ pub(crate) async fn public_preview(
                 state
                     .secure_root
                     .bind_file(&sh.relative_path)
-                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?,
+                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "File unavailable"))?,
             ),
         )
     };
@@ -156,7 +152,7 @@ pub(crate) async fn public_preview(
                 .map_err(|_| {
                     AppError(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "Zu viele gleichzeitige Textvorschauen",
+                        "Too many concurrent text previews",
                     )
                 })?,
         )
@@ -223,18 +219,18 @@ pub(crate) async fn public_preview(
         format!("{public_route}/download")
     };
     if let PreviewContent::TooLarge { size } = &content {
-        let body = preview_too_large_body(
-            &share_rel,
-            *size,
-            "Datei ist größer als das Preview-Limit.",
-            Some(&download_link),
-        );
-        let body = add_public_preview_actions(
-            &body,
-            &public_back_link(&public_route, &share_rel, sh.is_directory),
-            Some(&download_link),
-        );
-        return Ok(Html(plain_page("Vorschau", &body)).into_response());
+        let body = PublicPreviewTooLargeTemplate {
+            back_link: public_back_link(&public_route, &share_rel, sh.is_directory),
+            download_link,
+            path: share_rel,
+            message: i18n::localized_text(
+                i18n::current_locale(),
+                "File exceeds the preview limit.",
+            )
+            .into_owned(),
+            size: human(*size),
+        };
+        return Ok(Html(super::templates::public_page("Preview", &body)?).into_response());
     }
     let mut response = match content {
         PreviewContent::TooLarge { .. } => {
@@ -246,7 +242,7 @@ pub(crate) async fn public_preview(
                 back_link: &back_link,
                 download_link: &download_link,
             };
-            let page = super::templates::public_page("Vorschau", &body)?;
+            let page = super::templates::public_page("Preview", &body)?;
             let (stream, page_length) = escaped_text_page_stream(page, text).map_err(internal)?;
             let transfer = text_transfer
                 .take()
@@ -281,7 +277,7 @@ pub(crate) async fn public_preview(
             {
                 return Err(AppError(
                     StatusCode::TOO_MANY_REQUESTS,
-                    "Zu viele Vorschau-Anfragen",
+                    "Too many preview requests",
                 ));
             }
             let preview_token = auth::random_token(32);
@@ -311,7 +307,7 @@ pub(crate) async fn public_preview(
                 | PreviewSessionCreateOutcome::GlobalCapacityReached => {
                     return Err(AppError(
                         StatusCode::TOO_MANY_REQUESTS,
-                        "Zu viele aktive Vorschau-Sitzungen",
+                        "Too many active preview sessions",
                     ));
                 }
             }
@@ -327,18 +323,14 @@ pub(crate) async fn public_preview(
                     encoded(&preview_token)
                 )
             };
-            let viewer = media_viewer(kind, &raw_url);
-            let body = format!(
-                r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><p class="vl-muted">{} - <vl-i18n key="files.raw_token"/></p>{}</section>"#,
-                human(size),
-                viewer
-            );
-            let body = add_public_preview_actions(
-                &body,
-                &public_back_link(&public_route, &share_rel, sh.is_directory),
-                Some(&download_link),
-            );
-            Response::new(Body::from(plain_page("Vorschau", &body)))
+            let body = PublicMediaPreviewTemplate {
+                back_link: public_back_link(&public_route, &share_rel, sh.is_directory),
+                download_link,
+                size: human(size),
+                raw_url,
+                image: matches!(kind, PreviewKind::Image(_)),
+            };
+            Response::new(Body::from(super::templates::public_page("Preview", &body)?))
         }
     };
     response.headers_mut().insert(
@@ -356,25 +348,25 @@ pub(crate) async fn public_preview_raw(
     AxPath(token): AxPath<String>,
     Query(q): Query<PreviewRawQuery>,
 ) -> Result<Response> {
-    let sh = get_share(&state, &token).await?;
+    let sh = get_share_for_transfer(&state, &token).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !sh.permission.can_download() {
-        return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
+        return Err(AppError(StatusCode::FORBIDDEN, "Preview not allowed"));
     }
     let expected_id = sh.id;
-    let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
+    let (sh, storage_guard) = get_storage_share_for_transfer(&state, &token, expected_id).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !sh.permission.can_download() {
-        return Err(AppError(StatusCode::FORBIDDEN, "Vorschau nicht erlaubt"));
+        return Err(AppError(StatusCode::FORBIDDEN, "Preview not allowed"));
     }
     let requested_path = q.path.clone().unwrap_or_default();
     let relative_file = if sh.is_directory {
         if requested_path.is_empty() {
-            return Err(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"));
+            return Err(AppError(StatusCode::BAD_REQUEST, "File path missing"));
         }
         requested_path.clone()
     } else {
@@ -386,7 +378,7 @@ pub(crate) async fn public_preview_raw(
                 state
                     .secure_root
                     .bind_directory(&sh.relative_path)
-                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?,
+                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Share target unavailable"))?,
             ),
             None,
         )
@@ -397,14 +389,14 @@ pub(crate) async fn public_preview_raw(
                 state
                     .secure_root
                     .bind_file(&sh.relative_path)
-                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?,
+                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "File unavailable"))?,
             ),
         )
     };
     drop(storage_guard);
     let preview_token = q
         .preview_token
-        .ok_or(AppError(StatusCode::FORBIDDEN, "Preview-Token fehlt"))?;
+        .ok_or(AppError(StatusCode::FORBIDDEN, "Preview token missing"))?;
     let share_id = sh.id;
     let token_path = if sh.is_directory {
         requested_path.clone()
@@ -418,15 +410,22 @@ pub(crate) async fn public_preview_raw(
     if !token_valid {
         return Err(AppError(
             StatusCode::FORBIDDEN,
-            "Preview-Token ungueltig oder abgelaufen",
+            "Preview token is invalid or expired",
         ));
     }
+    let resource_key = if sh.is_directory {
+        relative_file.clone()
+    } else {
+        sh.relative_path.clone()
+    };
+    check_public_transfer_availability(&state, &headers, &sh, resource_key.clone(), "preview")
+        .await?;
     let settings = runtime_settings(&state);
     let kind = preview_kind(&relative_file, &settings)
         .filter(|kind| kind.is_media())
         .ok_or(AppError(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Vorschau nicht erlaubt",
+            "Preview not allowed",
         ))?;
     let mut response = if sh.is_directory {
         let scope = preview_scope.expect("directory raw preview scope is bound");
@@ -452,11 +451,6 @@ pub(crate) async fn public_preview_raw(
         .await?
     };
     if method == Method::GET && response.status().is_success() {
-        let resource_key = if sh.is_directory {
-            relative_file
-        } else {
-            sh.relative_path.clone()
-        };
         let transfer =
             begin_public_transfer(&state, &headers, &uri, &sh, resource_key, "preview").await?;
         let transfer_cookie_value = transfer.cookie().to_string();

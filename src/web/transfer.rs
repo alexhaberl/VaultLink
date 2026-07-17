@@ -210,7 +210,7 @@ use super::preview_zip::{
 };
 use super::{
     common::{encoded, internal, BrowseQuery},
-    public::{get_share, get_storage_share},
+    public::{get_share_for_transfer, get_storage_share_for_transfer},
     transfer_runtime::{
         begin_public_transfer, check_public_transfer_availability, complete_transfer_without_body,
         set_transfer_cookie, transfer_body,
@@ -225,29 +225,23 @@ pub(crate) async fn download_zip(
     AxPath(token): AxPath<String>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response> {
-    let sh = get_share(&state, &token).await?;
+    let sh = get_share_for_transfer(&state, &token).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !sh.is_directory || !sh.permission.can_download() {
-        return Err(AppError(
-            StatusCode::FORBIDDEN,
-            "ZIP-Download nicht erlaubt",
-        ));
+        return Err(AppError(StatusCode::FORBIDDEN, "ZIP download not allowed"));
     }
     let expected_id = sh.id;
-    let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
+    let (sh, storage_guard) = get_storage_share_for_transfer(&state, &token, expected_id).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !sh.is_directory || !sh.permission.can_download() {
-        return Err(AppError(
-            StatusCode::FORBIDDEN,
-            "ZIP-Download nicht erlaubt",
-        ));
+        return Err(AppError(StatusCode::FORBIDDEN, "ZIP download not allowed"));
     }
     let sub = path_security::validate_relative(q.path.as_deref().unwrap_or_default())
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger ZIP-Pfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid ZIP path"))?
         .to_string_lossy()
         .replace('\\', "/");
     let generation = ZipGenerationResources {
@@ -258,7 +252,7 @@ pub(crate) async fn download_zip(
         )
         .ok_or(AppError(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
+            "Too many concurrent expensive operations from this client",
         ))?,
         _zip_permit: state
             .zip_generation_admission
@@ -267,7 +261,7 @@ pub(crate) async fn download_zip(
             .map_err(|_| {
                 AppError(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Zu viele gleichzeitige ZIP-Erstellungen",
+                    "Too many concurrent ZIP builds",
                 )
             })?,
     };
@@ -275,7 +269,7 @@ pub(crate) async fn download_zip(
     let secure_root = state
         .secure_root
         .bind_directory(&sh.relative_path)
-        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Share target unavailable"))?;
     drop(storage_guard);
     let resource_key = if sub.is_empty() {
         ".".to_string()
@@ -327,7 +321,7 @@ pub(crate) async fn download_zip(
             resources.cancel().await;
             return Err(AppError(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Speicherkapazität nicht ermittelbar",
+                "Storage capacity could not be determined",
             ));
         }
     };
@@ -457,27 +451,27 @@ pub(crate) async fn download(
     AxPath(token): AxPath<String>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<Response> {
-    let sh = get_share(&state, &token).await?;
+    let sh = get_share_for_transfer(&state, &token).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !sh.permission.can_download() {
-        return Err(AppError(StatusCode::FORBIDDEN, "Download nicht erlaubt"));
+        return Err(AppError(StatusCode::FORBIDDEN, "Download not allowed"));
     }
     let expected_id = sh.id;
-    let (sh, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
+    let (sh, storage_guard) = get_storage_share_for_transfer(&state, &token, expected_id).await?;
     if !share_is_unlocked(&state, &headers, &sh).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !sh.permission.can_download() {
-        return Err(AppError(StatusCode::FORBIDDEN, "Download nicht erlaubt"));
+        return Err(AppError(StatusCode::FORBIDDEN, "Download not allowed"));
     }
     let relative_file = if sh.is_directory {
         let rel = q
             .path
-            .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
+            .ok_or(AppError(StatusCode::BAD_REQUEST, "File path missing"))?;
         path_security::validate_relative(&rel)
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Dateipfad"))?
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid file path"))?
             .to_string_lossy()
             .replace('\\', "/")
     } else {
@@ -495,20 +489,12 @@ pub(crate) async fn download(
             .bind_file(&sh.relative_path)
             .map(SecureFile::into_file)
     }
-    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
+    .map_err(|_| AppError(StatusCode::NOT_FOUND, "File unavailable"))?;
     drop(storage_guard);
-    if method == Method::HEAD {
-        check_public_transfer_availability(
-            &state,
-            &headers,
-            &sh,
-            relative_file.clone(),
-            "download",
-        )
+    check_public_transfer_availability(&state, &headers, &sh, relative_file.clone(), "download")
         .await?;
-    }
     if !file.metadata().map_err(internal)?.is_file() {
-        return Err(AppError(StatusCode::BAD_REQUEST, "Keine Datei"));
+        return Err(AppError(StatusCode::BAD_REQUEST, "Not a file"));
     }
     let mut f = tokio::fs::File::from_std(file);
     let length = f.metadata().await.map_err(internal)?.len();

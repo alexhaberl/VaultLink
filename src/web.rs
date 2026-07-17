@@ -29,7 +29,7 @@ mod public_preview;
 mod rendering;
 mod settings_audit;
 mod shares;
-mod templates;
+pub(crate) mod templates;
 mod transfer;
 mod transfer_runtime;
 mod upload;
@@ -71,10 +71,17 @@ impl IntoResponse for AppError {
         if self.0.is_redirection() {
             return Redirect::to(self.1).into_response();
         }
-        let message = i18n::text_from_german(i18n::current_locale(), self.1);
+        let locale = i18n::current_locale();
+        let message = if self.1 == crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE {
+            std::borrow::Cow::Borrowed(i18n::text(locale, i18n::AUDIT_TEMPORARILY_UNAVAILABLE))
+        } else if self.1 == crate::http_auth::ARGON2_BUSY_MESSAGE {
+            std::borrow::Cow::Borrowed(i18n::text(locale, i18n::PASSWORD_PROCESSING_UNAVAILABLE))
+        } else {
+            i18n::localized_text(locale, self.1)
+        };
         let audit_unavailable = self.0 == StatusCode::SERVICE_UNAVAILABLE
             && self.1 == crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE;
-        let page = templates::public_page("Fehler", &ErrorTemplate { message: &message });
+        let page = templates::public_page("Error", &ErrorTemplate { message: &message });
         let mut response = match page {
             Ok(page) => (self.0, Html(page)).into_response(),
             Err(_) => (self.0, message).into_response(),
@@ -84,6 +91,13 @@ impl IntoResponse for AppError {
                 ERROR_CODE_HEADER,
                 HeaderValue::from_static("audit_unavailable"),
             );
+        }
+        if self.0 == StatusCode::SERVICE_UNAVAILABLE
+            && self.1 == crate::http_auth::ARGON2_BUSY_MESSAGE
+        {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         response
     }
@@ -102,7 +116,7 @@ fn storage_recovery_app_error(error: crate::file_ops::FileOperationError) -> App
         }
         _ => AppError(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Speicherzustand wird wiederhergestellt",
+            "Storage state is being recovered",
         ),
     }
 }
@@ -120,7 +134,7 @@ impl From<crate::http_auth::HttpAuthError> for AppError {
 pub fn router(state: AppState) -> Router {
     let limit = HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize;
     let router = Router::new()
-        .nest("/api/v1", crate::api::router(state.clone()))
+        .nest("/api/v2", crate::api::router(state.clone()))
         .route("/", get(|| async { Redirect::to("/admin") }))
         .route("/login", get(auth_ui::login_page).post(auth_ui::login))
         .route("/mfa", get(auth_ui::mfa_page).post(auth_ui::mfa))

@@ -131,7 +131,7 @@ impl PublicUploadStaging {
                     token,
                     &target.upload_subdir,
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "Kumulatives Uploadlimit erreicht",
+                    "Cumulative upload limit reached",
                 ));
             }
             UploadReservationBeginOutcome::FileQuotaReached => {
@@ -139,7 +139,7 @@ impl PublicUploadStaging {
                     token,
                     &target.upload_subdir,
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "Maximale Anzahl hochgeladener Dateien erreicht",
+                    "Maximum number of uploaded files reached",
                 ));
             }
             UploadReservationBeginOutcome::ShareUnavailable => {
@@ -147,7 +147,7 @@ impl PublicUploadStaging {
                     token,
                     &target.upload_subdir,
                     StatusCode::GONE,
-                    "Freigabe nicht verfügbar",
+                    "Share unavailable",
                 ));
             }
         };
@@ -170,7 +170,7 @@ impl PublicUploadStaging {
                     token,
                     &target.upload_subdir,
                     StatusCode::NOT_FOUND,
-                    "Zielordner nicht verfügbar",
+                    "Target folder unavailable",
                 ));
             }
             Err(PendingUploadFileError::Take(error)) => {
@@ -198,7 +198,7 @@ impl PublicUploadStaging {
                 token,
                 &self.target.upload_subdir,
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "Upload ist zu groß",
+                "Upload is too large",
             ));
         };
         if new_total > self.reservation.reserved_bytes
@@ -244,7 +244,7 @@ impl PublicUploadStaging {
                         token,
                         &self.target.upload_subdir,
                         StatusCode::INSUFFICIENT_STORAGE,
-                        "Kumulatives Uploadlimit erreicht",
+                        "Cumulative upload limit reached",
                     ));
                 }
                 UploadReservationExtendOutcome::NotFound => {
@@ -252,7 +252,7 @@ impl PublicUploadStaging {
                         token,
                         &self.target.upload_subdir,
                         StatusCode::REQUEST_TIMEOUT,
-                        "Uploadreservierung ist abgelaufen",
+                        "Upload reservation has expired",
                     ));
                 }
                 UploadReservationExtendOutcome::ShareUnavailable => {
@@ -260,7 +260,7 @@ impl PublicUploadStaging {
                         token,
                         &self.target.upload_subdir,
                         StatusCode::GONE,
-                        "Freigabe wurde während des Uploads deaktiviert",
+                        "Share was disabled during upload",
                     ));
                 }
             }
@@ -274,7 +274,7 @@ impl PublicUploadStaging {
                         token,
                         &self.target.upload_subdir,
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "Speicherkapazität nicht ermittelbar",
+                        "Storage capacity could not be determined",
                     ))
                 }
                 Err(StorageReservationError::InsufficientStorage) => {
@@ -282,7 +282,7 @@ impl PublicUploadStaging {
                         token,
                         &self.target.upload_subdir,
                         StatusCode::INSUFFICIENT_STORAGE,
-                        "Nicht genug freier Speicher",
+                        "Not enough free storage",
                     ))
                 }
             };
@@ -293,7 +293,7 @@ impl PublicUploadStaging {
                     token,
                     &self.target.upload_subdir,
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "Nicht genug freier Speicher",
+                    "Not enough free storage",
                 ))
             } else {
                 Err(PublicUploadPhaseError::App(upload_io_error(error)))
@@ -309,7 +309,7 @@ impl PublicUploadStaging {
                     token,
                     &self.target.upload_subdir,
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "Nicht genug freier Speicher",
+                    "Not enough free storage",
                 ))
             } else {
                 Err(PublicUploadPhaseError::App(upload_io_error(error)))
@@ -325,7 +325,7 @@ impl PublicUploadStaging {
                     token,
                     &self.target.upload_subdir,
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "Nicht genug freier Speicher",
+                    "Not enough free storage",
                 ))
             } else {
                 Err(PublicUploadPhaseError::App(upload_io_error(error)))
@@ -541,7 +541,7 @@ async fn ensure_public_upload_directory(
     relative: &str,
 ) -> Result<String> {
     let relative = crate::path_security::validate_relative(relative)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid folder path"))?
         .to_string_lossy()
         .replace('\\', "/");
     if relative.is_empty() {
@@ -550,7 +550,7 @@ async fn ensure_public_upload_directory(
     let target = join_display(base, &relative);
     let (share, guard) = get_storage_share(state, token, expected_share_id).await?;
     if !share.is_directory || !share.permission.can_upload() {
-        return Err(AppError(StatusCode::GONE, "Freigabe wurde geändert"));
+        return Err(AppError(StatusCode::GONE, "Share changed"));
     }
     let secure_root = state.secure_root.clone();
     let share_path = share.relative_path;
@@ -565,12 +565,11 @@ async fn ensure_public_upload_directory(
     .map_err(internal)?
     .map_err(|error| match error.kind() {
         std::io::ErrorKind::InvalidInput => {
-            AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad")
+            AppError(StatusCode::BAD_REQUEST, "Invalid folder path")
         }
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => AppError(
-            StatusCode::CONFLICT,
-            "Uploadordner konnte nicht erstellt werden",
-        ),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            AppError(StatusCode::CONFLICT, "Upload folder could not be created")
+        }
         _ => internal(error),
     })?;
     if !created.is_empty() {
@@ -650,7 +649,7 @@ impl PublicUploadFinalizer {
                 &token,
                 &upload_subdir,
                 StatusCode::GONE,
-                "Freigabe wurde während des Uploads geändert",
+                "Share changed during upload",
             ));
         }
         // Carry only the uploader's immutable intent across request streaming.
@@ -671,7 +670,7 @@ impl PublicUploadFinalizer {
                     &token,
                     &upload_subdir,
                     StatusCode::CONFLICT,
-                    "Uploadziel wurde während des Uploads geändert",
+                    "Upload target changed during upload",
                 ));
             }
         };
@@ -688,7 +687,7 @@ impl PublicUploadFinalizer {
                 &token,
                 &upload_subdir,
                 StatusCode::CONFLICT,
-                "Uploadziel wurde während des Uploads geändert",
+                "Upload target changed during upload",
             ));
         }
         let existed = match upload.destination_exists() {
@@ -705,7 +704,7 @@ impl PublicUploadFinalizer {
                 &token,
                 &upload_subdir,
                 StatusCode::CONFLICT,
-                "Datei existiert bereits.",
+                "File already exists.",
             ));
         }
 
@@ -727,7 +726,7 @@ impl PublicUploadFinalizer {
                     &token,
                     &upload_subdir,
                     StatusCode::REQUEST_TIMEOUT,
-                    "Uploadreservierung ist abgelaufen",
+                    "Upload reservation has expired",
                 ));
             }
             PublicUploadCommit::ShareUnavailable => {
@@ -735,7 +734,7 @@ impl PublicUploadFinalizer {
                     &token,
                     &upload_subdir,
                     StatusCode::GONE,
-                    "Freigabe wurde während des Uploads deaktiviert",
+                    "Share was disabled during upload",
                 ));
             }
         };
@@ -751,7 +750,7 @@ impl PublicUploadFinalizer {
                         &token,
                         &upload_subdir,
                         StatusCode::CONFLICT,
-                        "Datei existiert bereits.",
+                        "File already exists.",
                     ));
                 }
                 return if storage_full_error(&error) {
@@ -759,7 +758,7 @@ impl PublicUploadFinalizer {
                         &token,
                         &upload_subdir,
                         StatusCode::INSUFFICIENT_STORAGE,
-                        "Nicht genug freier Speicher",
+                        "Not enough free storage",
                     ))
                 } else {
                     Err(internal(error))
@@ -878,7 +877,7 @@ impl PublicUploadFormPhase<'_> {
                 token,
                 &upload_subdir,
                 StatusCode::BAD_REQUEST,
-                "Ungültiger Upload",
+                "Invalid upload",
             )
         })? {
             let field_kind = match field.name().unwrap_or("") {
@@ -891,23 +890,23 @@ impl PublicUploadFormPhase<'_> {
             };
             if let Err(error) = form_state.observe(field_kind, MAX_UPLOAD_MULTIPART_FIELDS) {
                 let message = match error {
-                    UploadFormStateError::TooManyFields => "Zu viele Multipart-Felder",
+                    UploadFormStateError::TooManyFields => "Too many multipart fields",
                     UploadFormStateError::DuplicateOrLatePath => {
-                        "Uploadpfad wurde mehrfach oder zu spät übermittelt"
+                        "Upload path was submitted more than once or too late"
                     }
                     UploadFormStateError::DuplicateOrLateFolderPath => {
-                        "Ordnerpfad wurde mehrfach oder zu spät übermittelt"
+                        "Folder path was submitted more than once or too late"
                     }
                     UploadFormStateError::DuplicateOverwrite => {
-                        "Uploadoption wurde mehrfach übermittelt"
+                        "Upload option was submitted more than once"
                     }
                     UploadFormStateError::DuplicateOrLateCsrf => {
-                        "CSRF-Token wurde mehrfach oder zu spät übermittelt"
+                        "CSRF token was submitted more than once or too late"
                     }
                     UploadFormStateError::MultipleFiles => {
-                        "Pro Request ist genau eine Datei erlaubt"
+                        "Exactly one file is allowed per request"
                     }
-                    UploadFormStateError::UnknownField => "Unbekanntes Multipart-Feld",
+                    UploadFormStateError::UnknownField => "Unknown multipart field",
                 };
                 return Err(public_upload_rejection(
                     token,
@@ -926,7 +925,7 @@ impl PublicUploadFormPhase<'_> {
                                 token,
                                 &upload_subdir,
                                 StatusCode::BAD_REQUEST,
-                                "Ungültiger Uploadpfad",
+                                "Invalid upload path",
                             )
                         })?;
                     upload_subdir =
@@ -936,7 +935,7 @@ impl PublicUploadFormPhase<'_> {
                                     token,
                                     &upload_subdir,
                                     StatusCode::BAD_REQUEST,
-                                    "Ungültiger Uploadpfad",
+                                    "Invalid upload path",
                                 )
                             },
                         )?;
@@ -949,7 +948,7 @@ impl PublicUploadFormPhase<'_> {
                                 token,
                                 &upload_subdir,
                                 StatusCode::BAD_REQUEST,
-                                "Ungültiger Ordnerpfad",
+                                "Invalid folder path",
                             )
                         })?;
                     let value = crate::path_security::validate_relative(&value)
@@ -958,7 +957,7 @@ impl PublicUploadFormPhase<'_> {
                                 token,
                                 &upload_subdir,
                                 StatusCode::BAD_REQUEST,
-                                "Ungültiger Ordnerpfad",
+                                "Invalid folder path",
                             )
                         })?
                         .to_string_lossy()
@@ -973,7 +972,7 @@ impl PublicUploadFormPhase<'_> {
                                 token,
                                 &upload_subdir,
                                 StatusCode::BAD_REQUEST,
-                                "Ungültiger Upload",
+                                "Invalid upload",
                             )
                         })?;
                     overwrite_requested = value == "1";
@@ -982,7 +981,7 @@ impl PublicUploadFormPhase<'_> {
                             token,
                             &upload_subdir,
                             StatusCode::BAD_REQUEST,
-                            "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+                            "Overwriting is disabled with external storage writers",
                         ));
                     }
                 }
@@ -992,7 +991,7 @@ impl PublicUploadFormPhase<'_> {
                             token,
                             &upload_subdir,
                             StatusCode::FORBIDDEN,
-                            "Ungültiges CSRF-Token",
+                            "Invalid CSRF token",
                         )
                     })?;
                     csrf_validated = required_csrf
@@ -1002,7 +1001,7 @@ impl PublicUploadFormPhase<'_> {
                             token,
                             &upload_subdir,
                             StatusCode::FORBIDDEN,
-                            "Ungültiges CSRF-Token",
+                            "Invalid CSRF token",
                         ));
                     }
                 }
@@ -1012,7 +1011,7 @@ impl PublicUploadFormPhase<'_> {
                             token,
                             &upload_subdir,
                             StatusCode::FORBIDDEN,
-                            "CSRF-Token fehlt",
+                            "CSRF token missing",
                         ));
                     }
                     let Some(file_name) = field.file_name() else {
@@ -1020,7 +1019,7 @@ impl PublicUploadFormPhase<'_> {
                             token,
                             &upload_subdir,
                             StatusCode::BAD_REQUEST,
-                            "Dateiname fehlt",
+                            "File name missing",
                         ));
                     };
                     let name = match policy::validate_public_upload_filename(
@@ -1033,7 +1032,7 @@ impl PublicUploadFormPhase<'_> {
                                 token,
                                 &upload_subdir,
                                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                                "Dateityp blockiert",
+                                "File type blocked",
                             ));
                         }
                         Err(_) => {
@@ -1041,7 +1040,7 @@ impl PublicUploadFormPhase<'_> {
                                 token,
                                 &upload_subdir,
                                 StatusCode::BAD_REQUEST,
-                                "Ungültiger Dateiname",
+                                "Invalid file name",
                             ));
                         }
                     };
@@ -1076,7 +1075,7 @@ impl PublicUploadFormPhase<'_> {
                                 token,
                                 &upload_subdir,
                                 StatusCode::BAD_REQUEST,
-                                "Upload abgebrochen",
+                                "Upload aborted",
                             )
                         })?;
                         staging.write_chunk(state, token, maximum, chunk).await?;
@@ -1090,7 +1089,7 @@ impl PublicUploadFormPhase<'_> {
                         token,
                         &upload_subdir,
                         StatusCode::BAD_REQUEST,
-                        "Unbekanntes Multipart-Feld",
+                        "Unknown multipart field",
                     ));
                 }
             }
@@ -1101,7 +1100,7 @@ impl PublicUploadFormPhase<'_> {
                 token,
                 &upload_subdir,
                 StatusCode::BAD_REQUEST,
-                "Datei fehlt",
+                "File is missing",
             )
         })?;
         Ok(staged_upload.prepare(PublicUploadIntent {
@@ -1260,27 +1259,27 @@ pub(crate) async fn upload(
 ) -> Result<Response> {
     let share = get_share(&state, &token).await?;
     if !share_is_unlocked(&state, &headers, &share).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !share.is_directory || !share.permission.can_upload() {
-        return Err(AppError(StatusCode::FORBIDDEN, "Upload nicht erlaubt"));
+        return Err(AppError(StatusCode::FORBIDDEN, "Upload not allowed"));
     }
     let required_csrf = share_unlock_csrf(&state, &headers, &share).await?;
     if share.password_hash.is_some() && required_csrf.is_none() {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
 
     let expected_id = share.id;
     let (share, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
     if !share_is_unlocked(&state, &headers, &share).await? {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     if !share.is_directory || !share.permission.can_upload() {
-        return Err(AppError(StatusCode::FORBIDDEN, "Upload nicht erlaubt"));
+        return Err(AppError(StatusCode::FORBIDDEN, "Upload not allowed"));
     }
     let required_csrf = share_unlock_csrf(&state, &headers, &share).await?;
     if share.password_hash.is_some() && required_csrf.is_none() {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Freigabe ist gesperrt"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Share is locked"));
     }
     let csrf_header_valid = required_csrf.as_deref().is_some_and(|expected| {
         headers
@@ -1296,7 +1295,7 @@ pub(crate) async fn upload(
         .map_err(|_| {
             AppError(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Zu viele gleichzeitige Uploads",
+                "Too many concurrent uploads",
             )
         })?;
     let upload_peer_permit = try_acquire_client_activity(
@@ -1306,12 +1305,12 @@ pub(crate) async fn upload(
     )
     .ok_or(AppError(
         StatusCode::SERVICE_UNAVAILABLE,
-        "Zu viele gleichzeitige Uploads dieses Clients",
+        "Too many concurrent uploads from this client",
     ))?;
     let share_scope = state
         .secure_root
         .bind_directory(&share.relative_path)
-        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Zielordner nicht verfügbar"))?;
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Target folder unavailable"))?;
     // The descriptor remains bound to the revalidated directory after releasing
     // the mutation lock, so a long request body cannot block admin operations.
     drop(storage_guard);
@@ -1333,7 +1332,7 @@ pub(crate) async fn upload(
                     &token,
                     "",
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "Nicht genug freier Speicher",
+                    "Not enough free storage",
                 ))
             }
             Err(_) => {
@@ -1341,7 +1340,7 @@ pub(crate) async fn upload(
                     &token,
                     "",
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Speicherkapazität nicht ermittelbar",
+                    "Storage capacity could not be determined",
                 ))
             }
         }
@@ -1416,7 +1415,14 @@ pub(super) fn upload_queue_error_response(status: StatusCode, message: &str) -> 
         StatusCode::INSUFFICIENT_STORAGE => "insufficient_storage",
         _ => "upload_failed",
     };
-    let message = i18n::text_from_german(i18n::current_locale(), message);
+    let locale = i18n::current_locale();
+    let message = if message == crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE {
+        std::borrow::Cow::Borrowed(i18n::text(locale, i18n::AUDIT_TEMPORARILY_UNAVAILABLE))
+    } else if message == crate::http_auth::ARGON2_BUSY_MESSAGE {
+        std::borrow::Cow::Borrowed(i18n::text(locale, i18n::PASSWORD_PROCESSING_UNAVAILABLE))
+    } else {
+        i18n::localized_text(locale, message)
+    };
     (
         status,
         Json(UploadQueueErrorEnvelope {
@@ -1463,7 +1469,7 @@ pub(super) async fn upload_queue(
     let status = response.status();
     Ok(upload_queue_error_response(
         status,
-        status.canonical_reason().unwrap_or("Upload fehlgeschlagen"),
+        status.canonical_reason().unwrap_or("Upload failed"),
     ))
 }
 

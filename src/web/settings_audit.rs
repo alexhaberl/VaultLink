@@ -1,3 +1,4 @@
+use askama::Template;
 use axum::{
     extract::{Form, Query, State},
     http::{HeaderMap, StatusCode},
@@ -7,9 +8,85 @@ use serde::Deserialize;
 
 use super::{
     common::{display_limit_unit_floor, format_audit_time, parse_unit_to_bytes},
-    rendering::{admin_page, esc, PageId, GB, MB},
-    AppError, Result,
+    rendering::{PageId, GB, MB},
+    templates, AppError, Result,
 };
+
+#[derive(Template)]
+#[template(path = "web/settings/form.html")]
+pub(super) struct SettingsFormTemplate {
+    csrf_token: String,
+    message: Option<String>,
+    public_base_url: String,
+    public_url_locked: bool,
+    public_url_hint: &'static str,
+    max_upload_size_gb: String,
+    max_upload_size_gb_ceiling: String,
+    blocked_extensions: String,
+    share_password_min_length: usize,
+    share_password_max_length: usize,
+    share_unlock_minutes: i64,
+    max_zip_size_gb: String,
+    max_zip_files: usize,
+    max_search_entries: usize,
+    max_search_results: usize,
+    max_preview_size_mb: String,
+    max_text_preview_size_mb: u64,
+    preview_extensions: String,
+    max_media_preview_size_mb: String,
+    image_preview_extensions: String,
+    pdf_preview_enabled: bool,
+    audit_client_ip_enabled: bool,
+    show_purge_link: bool,
+    audit_ip_count: u64,
+}
+
+#[derive(Template)]
+#[template(path = "web/settings/delete_audit_ips.html")]
+struct DeleteAuditIpsTemplate<'a> {
+    count: u64,
+    csrf_token: &'a str,
+}
+
+struct AuditHeaderView {
+    class_name: &'static str,
+    aria_sort: &'static str,
+    action: String,
+    sort: &'static str,
+    direction: &'static str,
+    label_key: Option<&'static str>,
+    label: &'static str,
+    indicator: &'static str,
+}
+
+struct AuditRowView {
+    time: String,
+    actor: String,
+    action: String,
+    object_id: String,
+    detail: String,
+    client_ip: String,
+}
+
+#[derive(Template)]
+#[template(path = "web/settings/audit.html")]
+struct AuditPageTemplate {
+    sort_value: &'static str,
+    direction_value: &'static str,
+    filter_value: String,
+    filter_encoded: String,
+    headers: Vec<AuditHeaderView>,
+    rows: Vec<AuditRowView>,
+    client_ip_enabled: bool,
+    previous_page: Option<usize>,
+    next_page: Option<usize>,
+    page_number: usize,
+    total_pages: usize,
+    server_mode: String,
+    url_scheme: String,
+    trusted_proxy_count: usize,
+    ip_capture_label: &'static str,
+}
 use crate::{
     config::MAX_TEXT_PREVIEW_SIZE,
     db::{
@@ -54,179 +131,58 @@ pub(super) async fn settings_page(
     let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
     let public_url_locked = state.config.server.mode == crate::config::ServerMode::StandaloneTls
         && state.config.tls.certificate_source == crate::config::CertificateSource::LetsEncrypt;
-    let body = settings_form(&session, &settings, ip_count, "", public_url_locked);
-    Ok(Html(admin_page(
+    let body = settings_form_template(&session, &settings, ip_count, "", public_url_locked);
+    Ok(Html(templates::admin_page(
         &state,
         PageId::Settings,
         &body,
         false,
         &session.csrf_token,
-    )))
+        true,
+    )?))
 }
 
-fn field_info_label(label: &str, help_key: &str, tooltip_id: &str) -> String {
-    format!(
-        r#"<span class="vl-field-label">{label}<span class="vl-field-info" role="button" tabindex="0" aria-label='<vl-i18n key="setup.field_info"/>' aria-describedby="{tooltip_id}"><span aria-hidden="true">i</span><span class="vl-field-tooltip" id="{tooltip_id}" role="tooltip"><vl-i18n key="{help_key}"/></span></span></span>"#
-    )
-}
-
-pub(super) fn settings_form(
+pub(super) fn settings_form_template(
     session: &Session,
     settings: &RuntimeSettings,
     audit_ip_count: u64,
     message: &str,
     public_url_locked: bool,
-) -> String {
-    let message = if message.is_empty() {
-        String::new()
-    } else {
-        format!(
-            r#"<p class="vl-muted">{}</p>"#,
-            esc(&i18n::text_from_german(i18n::current_locale(), message))
-        )
-    };
-    let purge_link = if !settings.audit_client_ip_enabled && audit_ip_count > 0 {
-        format!(
-            r#"<p><a class="vl-button vl-button--danger" href="/admin/settings/audit-ips/delete">{} <vl-i18n key="settings.delete_ips"/></a></p>"#,
-            audit_ip_count
-        )
-    } else {
-        String::new()
-    };
-    let public_url_attributes = if public_url_locked {
-        "readonly aria-readonly=\"true\""
-    } else {
-        ""
-    };
-    let public_url_hint = if public_url_locked {
-        "Im Let's-Encrypt-Modus wird diese URL durch die statische TLS-Konfiguration festgelegt."
-    } else {
-        ""
-    };
-    let public_base_url_label = field_info_label(
-        "Public Base URL",
-        "settings.public_base_url_help",
-        "settings-help-public-base-url",
-    );
-    let upload_limit_label = field_info_label(
-        r#"<vl-i18n key="settings.upload_limit"/>"#,
-        "settings.upload_limit_help",
-        "settings-help-upload-limit",
-    );
-    let blocked_extensions_label = field_info_label(
-        r#"<vl-i18n key="settings.blocked"/>"#,
-        "settings.blocked_help",
-        "settings-help-blocked-extensions",
-    );
-    let password_min_label = field_info_label(
-        r#"<vl-i18n key="settings.password_min"/>"#,
-        "settings.password_min_help",
-        "settings-help-password-min",
-    );
-    let password_max_label = field_info_label(
-        r#"<vl-i18n key="settings.password_max"/>"#,
-        "settings.password_max_help",
-        "settings-help-password-max",
-    );
-    let unlock_minutes_label = field_info_label(
-        r#"<vl-i18n key="settings.unlock_minutes"/>"#,
-        "settings.unlock_minutes_help",
-        "settings-help-unlock-minutes",
-    );
-    let zip_gb_label = field_info_label(
-        r#"<vl-i18n key="settings.zip_gb"/>"#,
-        "settings.zip_gb_help",
-        "settings-help-zip-gb",
-    );
-    let zip_files_label = field_info_label(
-        r#"<vl-i18n key="settings.zip_files"/>"#,
-        "settings.zip_files_help",
-        "settings-help-zip-files",
-    );
-    let search_entries_label = field_info_label(
-        r#"<vl-i18n key="settings.search_entries"/>"#,
-        "settings.search_entries_help",
-        "settings-help-search-entries",
-    );
-    let search_results_label = field_info_label(
-        r#"<vl-i18n key="settings.search_results"/>"#,
-        "settings.search_results_help",
-        "settings-help-search-results",
-    );
-    let text_preview_label = field_info_label(
-        r#"<vl-i18n key="settings.text_preview"/>"#,
-        "settings.text_preview_help",
-        "settings-help-text-preview",
-    );
-    let text_extensions_label = field_info_label(
-        r#"<vl-i18n key="settings.text_extensions"/>"#,
-        "settings.text_extensions_help",
-        "settings-help-text-extensions",
-    );
-    let media_preview_label = field_info_label(
-        r#"<vl-i18n key="settings.media_preview"/>"#,
-        "settings.media_preview_help",
-        "settings-help-media-preview",
-    );
-    let image_extensions_label = field_info_label(
-        r#"<vl-i18n key="settings.image_extensions"/>"#,
-        "settings.image_extensions_help",
-        "settings-help-image-extensions",
-    );
-    let pdf_preview_label = field_info_label(
-        r#"<vl-i18n key="settings.pdf_active"/>"#,
-        "settings.pdf_help",
-        "settings-help-pdf-preview",
-    );
-    let audit_ip_label = field_info_label(
-        r#"<vl-i18n key="settings.audit_ip"/>"#,
-        "settings.audit_ip_help",
-        "settings-help-audit-ip",
-    );
-    format!(
-        r#"<section class="vl-panel"><h2><vl-i18n key="settings.runtime"/></h2>{message}<p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p><form method="post" class="vl-form-grid"><input type="hidden" name="csrf" value="{}"><label>{public_base_url_label}<input name="public_base_url" value="{}" {} required><small>{}</small></label><label>{upload_limit_label}<input name="max_upload_size_gb" type="number" min="1" step="1" value="{}" required></label><label>{blocked_extensions_label}<input name="blocked_extensions" value="{}"></label><label>{password_min_label}<input name="share_password_min_length" type="number" min="8" value="{}" required></label><label>{password_max_label}<input name="share_password_max_length" type="number" min="8" value="{}" required></label><label>{unlock_minutes_label}<input name="share_unlock_minutes" type="number" min="1" value="{}" required></label><label>{zip_gb_label}<input name="max_zip_size_gb" type="number" min="0" step="1" value="{}" required></label><label>{zip_files_label}<input name="max_zip_files" type="number" min="0" value="{}" required></label><label>{search_entries_label}<input name="max_search_entries" type="number" min="1" value="{}" required></label><label>{search_results_label}<input name="max_search_results" type="number" min="1" value="{}" required></label><label>{text_preview_label}<input name="max_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>{text_extensions_label}<input name="preview_extensions" value="{}" required></label><label>{media_preview_label}<input name="max_media_preview_size_mb" type="number" min="1" step="1" value="{}" required></label><label>{image_extensions_label}<input name="image_preview_extensions" value="{}"></label><label class="vl-toggle"><input type="checkbox" name="pdf_preview_enabled" {}><span>{pdf_preview_label}</span></label><label class="vl-toggle"><input type="checkbox" name="audit_client_ip_enabled" {}><span>{audit_ip_label}</span></label><button class="vl-button"><vl-i18n key="common.save"/></button></form>{purge_link}</section>"#,
-        esc(&session.csrf_token),
-        esc(&settings.public_base_url),
-        public_url_attributes,
-        public_url_hint,
-        display_limit_unit_floor(settings.max_upload_size, GB),
-        esc(&settings.blocked_extensions.join(",")),
-        settings.share_password_min_length,
-        settings.share_password_max_length,
-        settings.share_unlock_minutes,
-        display_limit_unit_floor(settings.max_zip_size, GB),
-        settings.max_zip_files,
-        settings.max_search_entries,
-        settings.max_search_results,
-        display_limit_unit_floor(settings.max_preview_size, MB),
-        esc(&settings.preview_extensions.join(",")),
-        display_limit_unit_floor(settings.max_media_preview_size, MB),
-        esc(&settings.image_preview_extensions.join(",")),
-        if settings.pdf_preview_enabled {
-            "checked"
+) -> SettingsFormTemplate {
+    SettingsFormTemplate {
+        csrf_token: session.csrf_token.clone(),
+        message: (!message.is_empty())
+            .then(|| i18n::localized_text(i18n::current_locale(), message).into_owned()),
+        public_base_url: settings.public_base_url.clone(),
+        public_url_locked,
+        public_url_hint: if public_url_locked {
+            i18n::text(
+                i18n::current_locale(),
+                i18n::SETTINGS_PUBLIC_URL_LOCKED_HINT,
+            )
         } else {
             ""
         },
-        if settings.audit_client_ip_enabled {
-            "checked"
-        } else {
-            ""
-        },
-    )
-    .replace(
-        r#"name="max_preview_size_mb" type="number" min="1""#,
-        &format!(
-            r#"name="max_preview_size_mb" type="number" min="1" max="{}""#,
-            MAX_TEXT_PREVIEW_SIZE / MB
-        ),
-    )
-    .replace(
-        r#"name="max_upload_size_gb" type="number" min="1""#,
-        &format!(
-            r#"name="max_upload_size_gb" type="number" min="1" max="{}""#,
-            display_limit_unit_floor(crate::config::MAX_UPLOAD_SIZE, GB)
-        ),
-    )
+        max_upload_size_gb: display_limit_unit_floor(settings.max_upload_size, GB),
+        max_upload_size_gb_ceiling: display_limit_unit_floor(crate::config::MAX_UPLOAD_SIZE, GB),
+        blocked_extensions: settings.blocked_extensions.join(","),
+        share_password_min_length: settings.share_password_min_length,
+        share_password_max_length: settings.share_password_max_length,
+        share_unlock_minutes: settings.share_unlock_minutes,
+        max_zip_size_gb: display_limit_unit_floor(settings.max_zip_size, GB),
+        max_zip_files: settings.max_zip_files,
+        max_search_entries: settings.max_search_entries,
+        max_search_results: settings.max_search_results,
+        max_preview_size_mb: display_limit_unit_floor(settings.max_preview_size, MB),
+        max_text_preview_size_mb: MAX_TEXT_PREVIEW_SIZE / MB,
+        preview_extensions: settings.preview_extensions.join(","),
+        max_media_preview_size_mb: display_limit_unit_floor(settings.max_media_preview_size, MB),
+        image_preview_extensions: settings.image_preview_extensions.join(","),
+        pdf_preview_enabled: settings.pdf_preview_enabled,
+        audit_client_ip_enabled: settings.audit_client_ip_enabled,
+        show_purge_link: !settings.audit_client_ip_enabled && audit_ip_count > 0,
+        audit_ip_count,
+    }
 }
 
 pub(super) async fn update_settings(
@@ -238,18 +194,18 @@ pub(super) async fn update_settings(
     csrf(&session, &form.csrf)?;
     let mut next = runtime_settings(&state);
     let max_upload_size =
-        parse_unit_to_bytes(&form.max_upload_size_gb, GB, "Ungültiges Uploadlimit")?.to_string();
+        parse_unit_to_bytes(&form.max_upload_size_gb, GB, "Invalid upload limit")?.to_string();
     let max_zip_size = if form.max_zip_size_gb.trim() == "0" {
         "0".to_string()
     } else {
-        parse_unit_to_bytes(&form.max_zip_size_gb, GB, "Ungültiges ZIP-Limit")?.to_string()
+        parse_unit_to_bytes(&form.max_zip_size_gb, GB, "Invalid ZIP limit")?.to_string()
     };
     let max_preview_size =
-        parse_unit_to_bytes(&form.max_preview_size_mb, MB, "Ungültiges Preview-Limit")?.to_string();
+        parse_unit_to_bytes(&form.max_preview_size_mb, MB, "Invalid preview limit")?.to_string();
     let max_media_preview_size = parse_unit_to_bytes(
         &form.max_media_preview_size_mb,
         MB,
-        "Ungültiges Media-Preview-Limit",
+        "Invalid media preview limit",
     )?
     .to_string();
     let share_password_max_length = form.share_password_max_length.unwrap_or_default();
@@ -295,7 +251,7 @@ pub(super) async fn update_settings(
         ),
     ];
     next.apply_many(entries)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid setting"))?;
     if state.config.server.production_mode
         && url::Url::parse(&next.public_base_url)
             .ok()
@@ -303,7 +259,7 @@ pub(super) async fn update_settings(
     {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Production public_base_url muss HTTPS verwenden",
+            "Production public_base_url must use HTTPS",
         ));
     }
     let admin_id = session.admin_id;
@@ -319,21 +275,22 @@ pub(super) async fn update_settings(
     )
     .await?;
     let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
-    Ok(Html(admin_page(
+    let body = settings_form_template(
+        &session,
+        &next,
+        ip_count,
+        "Settings saved.",
+        state.config.server.mode == crate::config::ServerMode::StandaloneTls
+            && state.config.tls.certificate_source == crate::config::CertificateSource::LetsEncrypt,
+    );
+    Ok(Html(templates::admin_page(
         &state,
         PageId::Settings,
-        &settings_form(
-            &session,
-            &next,
-            ip_count,
-            "Einstellungen gespeichert.",
-            state.config.server.mode == crate::config::ServerMode::StandaloneTls
-                && state.config.tls.certificate_source
-                    == crate::config::CertificateSource::LetsEncrypt,
-        ),
+        &body,
         false,
         &session.csrf_token,
-    )))
+        true,
+    )?))
 }
 
 #[derive(Deserialize)]
@@ -350,21 +307,22 @@ pub(super) async fn audit_ips_delete_confirmation(
     if runtime_settings(&state).audit_client_ip_enabled {
         return Err(AppError(
             StatusCode::CONFLICT,
-            "IP-Erfassung muss vor dem Löschen deaktiviert werden",
+            "IP capture must be disabled before deletion",
         ));
     }
     let count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
-    let body = format!(
-        r#"<section class="vl-panel vl-confirm-card"><h2><vl-i18n key="settings.delete_ip_data"/></h2><p><vl-i18n key="settings.values_prefix"/> <strong>{count}</strong> <vl-i18n key="settings.delete_ip_values"/></p><form method="post" action="/admin/settings/audit-ips/delete" class="vl-stack"><input type="hidden" name="csrf" value="{}"><label class="vl-field"><vl-i18n key="settings.enter_confirm"/> <code>IP-DATEN LÖSCHEN</code><input name="confirmation" autocomplete="off" required></label><div class="vl-inline-actions"><button class="vl-button vl-button--danger"><vl-i18n key="settings.delete_ip_action"/></button><a class="vl-button vl-button--secondary" href="/admin/settings"><vl-i18n key="common.cancel"/></a></div></form></section>"#,
-        esc(&session.csrf_token),
-    );
-    Ok(Html(admin_page(
+    let body = DeleteAuditIpsTemplate {
+        count,
+        csrf_token: &session.csrf_token,
+    };
+    Ok(Html(templates::admin_page(
         &state,
         PageId::Settings,
         &body,
         false,
         &session.csrf_token,
-    )))
+        true,
+    )?))
 }
 
 pub(super) async fn delete_audit_ips_ui(
@@ -377,7 +335,7 @@ pub(super) async fn delete_audit_ips_ui(
     if form.confirmation != "IP-DATEN LÖSCHEN" {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Exakte Bestätigung IP-DATEN LÖSCHEN erforderlich",
+            "Exact confirmation IP-DATEN LÖSCHEN required",
         ));
     }
     let fallback_logging_enabled = runtime_settings(&state).audit_client_ip_enabled;
@@ -391,7 +349,7 @@ pub(super) async fn delete_audit_ips_ui(
     let AuditClientIpDeletionOutcome::Deleted(_) = outcome else {
         return Err(AppError(
             StatusCode::CONFLICT,
-            "IP-Erfassung muss vor dem Löschen deaktiviert werden",
+            "IP capture must be disabled before deletion",
         ));
     };
     Ok(Redirect::to("/admin/settings"))
@@ -449,28 +407,15 @@ fn toggled_audit_sort_direction(direction: AuditSortDirection) -> AuditSortDirec
     }
 }
 
-fn audit_page_href(
-    action: &str,
-    column: AuditSortColumn,
-    direction: AuditSortDirection,
-    page: usize,
-) -> String {
-    let action = percent_encoding::utf8_percent_encode(action, percent_encoding::NON_ALPHANUMERIC);
-    format!(
-        "/admin/audit?action={action}&sort={}&direction={}&page={page}",
-        audit_sort_column_value(column),
-        audit_sort_direction_value(direction),
-    )
-}
-
 fn audit_sort_header(
-    class_name: &str,
-    label: &str,
+    class_name: &'static str,
+    label_key: Option<&'static str>,
+    label: &'static str,
     column: AuditSortColumn,
     current_column: AuditSortColumn,
     current_direction: AuditSortDirection,
     action: &str,
-) -> String {
+) -> AuditHeaderView {
     let active = column == current_column;
     let direction = if active {
         current_direction
@@ -498,10 +443,17 @@ fn audit_sort_header(
     } else {
         ""
     };
-    let href = esc(&audit_page_href(action, column, next_direction, 0));
-    format!(
-        r#"<th class="{class_name}" aria-sort="{aria_sort}"><a class="vl-audit-sort" href="{href}">{label}<span class="vl-audit-sort__indicator" aria-hidden="true">{indicator}</span></a></th>"#
-    )
+    AuditHeaderView {
+        class_name,
+        aria_sort,
+        action: percent_encoding::utf8_percent_encode(action, percent_encoding::NON_ALPHANUMERIC)
+            .to_string(),
+        sort: audit_sort_column_value(column),
+        direction: audit_sort_direction_value(next_direction),
+        label_key,
+        label,
+        indicator,
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -544,107 +496,78 @@ pub(super) async fn audit_page(
     .await?;
     let total_pages = total.div_ceil(100).max(1);
     let has_next = page_number + 1 < total_pages;
-    let mut rows = String::new();
-    for event in events {
-        let client_ip = if client_ip_enabled {
-            format!(
-                r#"<td class="vl-audit-ip" data-label="Client IP">{}</td>"#,
-                event.client_ip.as_deref().map(esc).unwrap_or_default()
-            )
-        } else {
-            String::new()
-        };
-        rows += &format!(
-            r#"<tr><td class="vl-audit-time" data-label="<vl-i18n key="common.time"/>">{}</td><td class="vl-audit-user" data-label="User">{}</td><td class="vl-audit-action" data-label="<vl-i18n key="common.action"/>"><code>{}</code></td><td class="vl-audit-object" data-label="<vl-i18n key="common.object"/>">{}</td><td class="vl-audit-detail" data-label="<vl-i18n key="common.detail"/>">{}</td>{client_ip}</tr>"#,
-            esc(&format_audit_time(&event.occurred_at)),
-            esc(&event.actor),
-            esc(&event.action),
-            event.object_id.as_deref().map(esc).unwrap_or_default(),
-            event.detail.as_deref().map(esc).unwrap_or_default()
-        );
-    }
-    let filter_value = action.as_deref().unwrap_or("");
-    let previous = if page_number > 0 {
-        let href = esc(&audit_page_href(
-            filter_value,
-            sort_column,
-            sort_direction,
-            page_number - 1,
-        ));
-        format!(
-            r#"<a class="vl-button vl-button--ghost" href="{href}"><vl-i18n key="common.back"/></a>"#
-        )
-    } else {
-        String::new()
-    };
-    let next = if has_next {
-        let href = esc(&audit_page_href(
-            filter_value,
-            sort_column,
-            sort_direction,
-            page_number + 1,
-        ));
-        format!(
-            r#"<a class="vl-button vl-button--ghost" href="{href}"><vl-i18n key="common.continue"/></a>"#
-        )
-    } else {
-        String::new()
-    };
-    let ip_header = if client_ip_enabled {
-        audit_sort_header(
-            "vl-audit-ip",
-            "Client-IP",
-            AuditSortColumn::ClientIp,
-            sort_column,
-            sort_direction,
-            filter_value,
-        )
-    } else {
-        String::new()
-    };
-    let table_header = format!(
-        "{}{}{}{}{}{ip_header}",
+    let rows = events
+        .into_iter()
+        .map(|event| AuditRowView {
+            time: format_audit_time(&event.occurred_at),
+            actor: event.actor,
+            action: event.action,
+            object_id: event.object_id.unwrap_or_default(),
+            detail: event.detail.unwrap_or_default(),
+            client_ip: event.client_ip.unwrap_or_default(),
+        })
+        .collect();
+    let filter_value = action.unwrap_or_default();
+    let previous_page = page_number.checked_sub(1);
+    let next_page = has_next.then_some(page_number + 1);
+    let mut headers = vec![
         audit_sort_header(
             "vl-audit-time",
-            r#"<vl-i18n key="common.time"/>"#,
+            Some("common.time"),
+            "",
             AuditSortColumn::Time,
             sort_column,
             sort_direction,
-            filter_value,
+            &filter_value,
         ),
         audit_sort_header(
             "vl-audit-user",
+            None,
             "User",
             AuditSortColumn::Actor,
             sort_column,
             sort_direction,
-            filter_value,
+            &filter_value,
         ),
         audit_sort_header(
             "vl-audit-action",
-            r#"<vl-i18n key="common.action"/>"#,
+            Some("common.action"),
+            "",
             AuditSortColumn::Action,
             sort_column,
             sort_direction,
-            filter_value,
+            &filter_value,
         ),
         audit_sort_header(
             "vl-audit-object",
-            r#"<vl-i18n key="common.object"/>"#,
+            Some("common.object"),
+            "",
             AuditSortColumn::Object,
             sort_column,
             sort_direction,
-            filter_value,
+            &filter_value,
         ),
         audit_sort_header(
             "vl-audit-detail",
-            r#"<vl-i18n key="common.detail"/>"#,
+            Some("common.detail"),
+            "",
             AuditSortColumn::Detail,
             sort_column,
             sort_direction,
-            filter_value,
+            &filter_value,
         ),
-    );
+    ];
+    if client_ip_enabled {
+        headers.push(audit_sort_header(
+            "vl-audit-ip",
+            None,
+            "Client-IP",
+            AuditSortColumn::ClientIp,
+            sort_column,
+            sort_direction,
+            &filter_value,
+        ));
+    }
     let sort_value = audit_sort_column_value(sort_column);
     let direction_value = audit_sort_direction_value(sort_direction);
     let url_scheme = url::Url::parse(&settings.public_base_url)
@@ -652,25 +575,36 @@ pub(super) async fn audit_page(
         .map(|url| url.scheme().to_uppercase())
         .unwrap_or_else(|| i18n::text(i18n::current_locale(), i18n::UNKNOWN).into());
     let trusted_proxy_count = state.config.reverse_proxy.trusted_proxies.len();
-    let body = format!(
-        r#"<div class="vl-audit-layout"><section class="vl-panel"><div class="vl-panel-head"><div><p class="vl-eyebrow"><vl-i18n key="audit.traceability"/></p><h2><vl-i18n key="audit.events"/></h2></div><form method="get" class="vl-inline-actions"><input type="hidden" name="sort" value="{sort_value}"><input type="hidden" name="direction" value="{direction_value}"><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="audit.action_filter"/></span><input name="action" value="{}" placeholder="<vl-i18n key="audit.filter_action"/>"></label><button class="vl-button"><vl-i18n key="common.filter"/></button></form></div><div class="vl-table-wrap"><table class="vl-data-table vl-audit-table"><thead><tr>{table_header}</tr></thead><tbody>{rows}</tbody></table></div><nav class="vl-pagination" aria-label="<vl-i18n key="audit.pages"/>">{previous}<span><vl-i18n key="common.page_of"/> {} <vl-i18n key="common.of"/> {}</span>{next}</nav></section><aside class="vl-panel vl-security-facts"><p class="vl-eyebrow"><vl-i18n key="audit.security_status"/></p><h2><vl-i18n key="audit.proven_config"/></h2><dl><div><dt>MFA</dt><dd><vl-i18n key="audit.mfa_required"/></dd></div><div><dt><vl-i18n key="audit.server_mode"/></dt><dd>{:?}</dd></div><div><dt><vl-i18n key="audit.url_scheme"/></dt><dd>{}</dd></div><div><dt>Trusted Proxies</dt><dd>{}</dd></div><div><dt><vl-i18n key="audit.ip_capture"/></dt><dd>{}</dd></div><div><dt><vl-i18n key="audit.logging"/></dt><dd><vl-i18n key="audit.structured"/></dd></div></dl></aside></div>"#,
-        esc(filter_value),
-        page_number + 1,
+    let filter_encoded =
+        percent_encoding::utf8_percent_encode(&filter_value, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
+    let body = AuditPageTemplate {
+        sort_value,
+        direction_value,
+        filter_value,
+        filter_encoded,
+        headers,
+        rows,
+        client_ip_enabled,
+        previous_page,
+        next_page,
+        page_number: page_number + 1,
         total_pages,
-        state.config.server.mode,
-        esc(&url_scheme),
+        server_mode: format!("{:?}", state.config.server.mode),
+        url_scheme,
         trusted_proxy_count,
-        if client_ip_enabled {
+        ip_capture_label: if client_ip_enabled {
             i18n::text(i18n::current_locale(), i18n::ENABLED)
         } else {
             i18n::text(i18n::current_locale(), i18n::DISABLED)
         },
-    );
-    Ok(Html(admin_page(
+    };
+    Ok(Html(templates::admin_page(
         &state,
         PageId::AuditSecurity,
         &body,
         false,
         &session.csrf_token,
-    )))
+        true,
+    )?))
 }

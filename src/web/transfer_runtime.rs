@@ -5,6 +5,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use askama::Template;
 use axum::{
     body::{Body, Bytes},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
@@ -14,10 +15,17 @@ use futures_util::Stream;
 
 use super::{
     common::{encoded, internal},
-    rendering::{esc, escaped_html_len, plain_page, push_html_escaped, storage_full_error},
+    rendering::{escaped_html_len, push_html_escaped, storage_full_error},
     AppError, Result, BUFFERED_RESPONSE_CHUNK_BYTES, MAX_RENDERED_TEXT_PREVIEW_BYTES,
     TEXT_PREVIEW_STREAM_MARKER,
 };
+
+#[derive(Template)]
+#[template(path = "web/public/upload_error.html")]
+struct PublicUploadErrorTemplate {
+    message: String,
+    back_link: String,
+}
 use crate::{
     auth,
     db::{
@@ -179,7 +187,7 @@ pub(super) fn start_transfer_heartbeat(
 }
 
 pub(super) fn transfer_scope(uri: &Uri) -> TransferCookieScope {
-    if uri.path().starts_with("/api/v1/") {
+    if uri.path().starts_with("/api/v2/") {
         TransferCookieScope::Api
     } else {
         TransferCookieScope::Web
@@ -187,8 +195,8 @@ pub(super) fn transfer_scope(uri: &Uri) -> TransferCookieScope {
 }
 
 pub(super) fn public_share_route(uri: &Uri, token: &str) -> String {
-    if uri.path().starts_with("/api/v1/") {
-        format!("/api/v1/public/shares/{token}")
+    if uri.path().starts_with("/api/v2/") {
+        format!("/api/v2/public/shares/{token}")
     } else {
         format!("/v/{token}")
     }
@@ -209,7 +217,7 @@ pub(super) async fn begin_public_transfer(
     {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele öffentliche Übertragungen",
+            "Too many public transfers",
         ));
     }
     let session_token = transfer_cookie(headers, share.id)
@@ -255,10 +263,10 @@ pub(super) async fn begin_public_transfer(
             Ok(lease)
         }
         TransferLeaseBeginOutcome::LimitReached => {
-            Err(AppError(StatusCode::GONE, "Übertragungslimit erreicht"))
+            Err(AppError(StatusCode::GONE, "Transfer limit reached"))
         }
         TransferLeaseBeginOutcome::ShareUnavailable => {
-            Err(AppError(StatusCode::GONE, "Freigabe nicht verfügbar"))
+            Err(AppError(StatusCode::GONE, "Share unavailable"))
         }
     }
 }
@@ -328,10 +336,10 @@ pub(super) async fn check_public_transfer_availability(
             Ok(())
         }
         TransferAvailabilityOutcome::LimitReached => {
-            Err(AppError(StatusCode::GONE, "Übertragungslimit erreicht"))
+            Err(AppError(StatusCode::GONE, "Transfer limit reached"))
         }
         TransferAvailabilityOutcome::ShareUnavailable => {
-            Err(AppError(StatusCode::GONE, "Freigabe nicht verfügbar"))
+            Err(AppError(StatusCode::GONE, "Share unavailable"))
         }
     }
 }
@@ -857,10 +865,7 @@ pub(super) fn set_transfer_cookie(response: &mut Response, cookie: &str) -> Resu
 
 pub(super) fn upload_io_error(error: std::io::Error) -> AppError {
     if storage_full_error(&error) {
-        AppError(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "Nicht genug freier Speicher",
-        )
+        AppError(StatusCode::INSUFFICIENT_STORAGE, "Not enough free storage")
     } else {
         internal(error)
     }
@@ -895,22 +900,17 @@ pub(super) fn public_upload_error(
     status: StatusCode,
     message: &str,
 ) -> Response {
-    let message = i18n::text_from_german(i18n::current_locale(), message);
+    let message = i18n::localized_text(i18n::current_locale(), message).into_owned();
     let back = if upload_subdir.is_empty() {
         format!("/v/{token}")
     } else {
         format!("/v/{token}?path={}", encoded(upload_subdir))
     };
-    (
-        status,
-        Html(plain_page(
-            "Fehler",
-            &format!(
-            r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p>{}</p><p><a class="vl-button vl-button--secondary" href="{}"><vl-i18n key="share.back"/></a></p></section>"#,
-                esc(&message),
-                esc(&back)
-            ),
-        )),
-    )
-        .into_response()
+    let body = PublicUploadErrorTemplate {
+        message,
+        back_link: back,
+    };
+    let page = super::templates::public_page("Error", &body)
+        .expect("the public upload error template writes only to an in-memory string");
+    (status, Html(page)).into_response()
 }

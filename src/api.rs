@@ -52,6 +52,7 @@ struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: &'static str,
+    retry_after_seconds: Option<u64>,
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -81,6 +82,7 @@ impl ApiError {
             status,
             code,
             message,
+            retry_after_seconds: None,
         }
     }
     fn bad_request(message: &'static str) -> Self {
@@ -132,7 +134,11 @@ impl From<crate::http_auth::HttpAuthError> for ApiError {
                 _ => "Request failed",
             },
         };
-        Self::new(value.status, code, message)
+        let mut error = Self::new(value.status, code, message);
+        if value.kind == crate::http_auth::HttpAuthErrorKind::CapacityUnavailable {
+            error.retry_after_seconds = Some(1);
+        }
+        error
     }
 }
 
@@ -147,7 +153,7 @@ impl IntoResponse for ApiError {
             code: &'static str,
             message: &'static str,
         }
-        (
+        let mut response = (
             self.status,
             Json(ErrorBody {
                 error: ErrorObject {
@@ -156,7 +162,15 @@ impl IntoResponse for ApiError {
                 },
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(seconds) = self.retry_after_seconds {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&seconds.to_string())
+                    .expect("Retry-After seconds are a valid header value"),
+            );
+        }
+        response
     }
 }
 

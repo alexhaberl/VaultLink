@@ -1,6 +1,7 @@
 use std::fmt::{self, Display, Formatter};
 
 use askama::{filters::HtmlSafe, Template};
+use qrcode::{render::svg, QrCode};
 
 use super::{common::human, rendering::PageId, AppError, Result};
 use crate::{http_auth::runtime_settings, i18n, AppState};
@@ -11,7 +12,7 @@ pub(super) struct PublicShell {
     pub(super) locale_code: &'static str,
     pub(super) title: String,
     pub(super) skip_to_content: &'static str,
-    pub(super) brand_html: String,
+    pub(super) brand_html: TrustedMarkup,
     pub(super) language_label: &'static str,
     pub(super) return_to: String,
     pub(super) german: bool,
@@ -28,6 +29,40 @@ impl Display for RenderedHtml {
 
 impl HtmlSafe for RenderedHtml {}
 
+/// HTML from a closed set of internal generators. User-controlled values must
+/// never be accepted at this boundary.
+#[derive(Clone)]
+pub(crate) struct TrustedMarkup(String);
+
+impl TrustedMarkup {
+    pub(crate) fn static_icon(icon: crate::ui::Icon) -> Self {
+        Self(crate::ui::icon(icon))
+    }
+
+    pub(crate) fn brand(tagline: &'static str) -> Self {
+        Self(crate::ui::brand_lockup(tagline))
+    }
+
+    pub(crate) fn generated_qr(data: &str) -> std::result::Result<Self, qrcode::types::QrError> {
+        let code = QrCode::new(data.as_bytes())?;
+        Ok(Self(
+            code.render::<svg::Color<'_>>()
+                .min_dimensions(220, 220)
+                .dark_color(svg::Color("#081226"))
+                .light_color(svg::Color("#f8fbff"))
+                .build(),
+        ))
+    }
+}
+
+impl Display for TrustedMarkup {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl HtmlSafe for TrustedMarkup {}
+
 #[derive(Template)]
 #[template(path = "web/public_base.html")]
 struct PublicPageTemplate<'a> {
@@ -40,9 +75,9 @@ pub(super) fn public_shell(title: &str) -> PublicShell {
     PublicShell {
         asset_version: super::rendering::ASSET_VERSION,
         locale_code: locale.code(),
-        title: i18n::text_from_german(locale, title).into_owned(),
+        title: i18n::localized_text(locale, title).into_owned(),
         skip_to_content: i18n::text(locale, i18n::SKIP_TO_CONTENT),
-        brand_html: crate::ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
+        brand_html: TrustedMarkup::brand(i18n::text(locale, i18n::BRAND_TAGLINE)),
         language_label: i18n::text(locale, i18n::LANGUAGE),
         return_to: i18n::current_return_to(),
         german: locale == i18n::Locale::De,
@@ -54,7 +89,7 @@ pub(super) fn public_shell(title: &str) -> PublicShell {
 pub(super) struct AdminNavItem {
     pub(super) href: &'static str,
     pub(super) label: &'static str,
-    pub(super) icon_html: String,
+    pub(super) icon_html: TrustedMarkup,
     pub(super) active: bool,
 }
 
@@ -64,7 +99,7 @@ pub(super) struct AdminShell {
     pub(super) locale_code: &'static str,
     pub(super) title: &'static str,
     pub(super) skip_to_content: &'static str,
-    pub(super) brand_html: String,
+    pub(super) brand_html: TrustedMarkup,
     pub(super) navigation_label: &'static str,
     pub(super) navigation: Vec<AdminNavItem>,
     pub(super) available_label: &'static str,
@@ -74,17 +109,17 @@ pub(super) struct AdminShell {
     pub(super) server_mode: String,
     pub(super) admin_label: &'static str,
     pub(super) show_create_link: bool,
-    pub(super) create_link_icon: String,
+    pub(super) create_link_icon: TrustedMarkup,
     pub(super) create_link_label: &'static str,
     pub(super) show_locale_switcher: bool,
     pub(super) language_label: &'static str,
     pub(super) return_to: String,
     pub(super) german: bool,
     pub(super) english: bool,
-    pub(super) account_icon: String,
+    pub(super) account_icon: TrustedMarkup,
     pub(super) account_label: &'static str,
     pub(super) csrf_token: String,
-    pub(super) logout_icon: String,
+    pub(super) logout_icon: TrustedMarkup,
     pub(super) logout_label: &'static str,
 }
 
@@ -140,7 +175,7 @@ pub(super) fn admin_shell(
     .map(|(href, label, icon, section)| AdminNavItem {
         href,
         label: i18n::text(locale, label),
-        icon_html: crate::ui::icon(icon),
+        icon_html: TrustedMarkup::static_icon(icon),
         active: active == Some(section),
     })
     .collect();
@@ -152,7 +187,7 @@ pub(super) fn admin_shell(
         locale_code: locale.code(),
         title: i18n::text(locale, page.title()),
         skip_to_content: i18n::text(locale, i18n::SKIP_TO_CONTENT),
-        brand_html: crate::ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
+        brand_html: TrustedMarkup::brand(i18n::text(locale, i18n::BRAND_TAGLINE)),
         navigation_label: i18n::text(locale, i18n::MAIN_NAVIGATION),
         navigation,
         available_label: i18n::text(locale, i18n::VAULTLINK_AVAILABLE),
@@ -168,17 +203,17 @@ pub(super) fn admin_shell(
         server_mode: format!("{:?}", state.config.server.mode),
         admin_label: i18n::text(locale, i18n::VAULTLINK_ADMIN),
         show_create_link,
-        create_link_icon: crate::ui::icon(crate::ui::Icon::Link),
+        create_link_icon: TrustedMarkup::static_icon(crate::ui::Icon::Link),
         create_link_label: i18n::text(locale, i18n::CREATE_LINK),
         show_locale_switcher,
         language_label: i18n::text(locale, i18n::LANGUAGE),
         return_to: i18n::current_return_to(),
         german: locale == i18n::Locale::De,
         english: locale == i18n::Locale::En,
-        account_icon: crate::ui::icon(crate::ui::Icon::User),
+        account_icon: TrustedMarkup::static_icon(crate::ui::Icon::User),
         account_label: i18n::text(locale, i18n::ACCOUNT_LINK),
         csrf_token: csrf_token.into(),
-        logout_icon: crate::ui::icon(crate::ui::Icon::Logout),
+        logout_icon: TrustedMarkup::static_icon(crate::ui::Icon::Logout),
         logout_label: i18n::text(locale, i18n::LOG_OUT),
     }
 }
@@ -187,7 +222,7 @@ pub(super) fn render<T: Template>(template: &T) -> Result<String> {
     let html = template.render().map_err(|_| {
         AppError(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Template konnte nicht gerendert werden",
+            "Template could not be rendered",
         )
     })?;
     Ok(i18n::render_markers(i18n::current_locale(), &html))
@@ -197,20 +232,8 @@ pub(super) fn render_fragment<T: Template>(template: &T) -> Result<RenderedHtml>
     render(template).map(RenderedHtml)
 }
 
-fn trusted_fragment(html: &str) -> RenderedHtml {
-    RenderedHtml(i18n::render_markers(i18n::current_locale(), html))
-}
-
 pub(super) fn public_page<T: Template>(title: &'static str, body: &T) -> Result<String> {
     let body = render_fragment(body)?;
-    render(&PublicPageTemplate {
-        shell: public_shell(title),
-        body: &body,
-    })
-}
-
-pub(super) fn public_page_html(title: &str, body: &str) -> Result<String> {
-    let body = trusted_fragment(body);
     render(&PublicPageTemplate {
         shell: public_shell(title),
         body: &body,
@@ -226,27 +249,6 @@ pub(super) fn admin_page<T: Template>(
     show_locale_switcher: bool,
 ) -> Result<String> {
     let body = render_fragment(body)?;
-    render(&AdminPageTemplate {
-        shell: admin_shell(
-            state,
-            page,
-            show_create_link,
-            csrf_token,
-            show_locale_switcher,
-        ),
-        body: &body,
-    })
-}
-
-pub(super) fn admin_page_html(
-    state: &AppState,
-    page: PageId,
-    body: &str,
-    show_create_link: bool,
-    csrf_token: &str,
-    show_locale_switcher: bool,
-) -> Result<String> {
-    let body = trusted_fragment(body);
     render(&AdminPageTemplate {
         shell: admin_shell(
             state,

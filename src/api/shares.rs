@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path as AxPath, State},
+    extract::{Path as AxPath, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -10,7 +10,8 @@ use crate::{
     auth,
     db::{
         AuditContext, Permission, RequiredAuditEvent, Share, ShareControlsUpdateOutcome,
-        UploadConflictStrategy, MAX_SQLITE_UNSIGNED,
+        ShareListOptions, ShareListSort, ShareListStatus, UploadConflictStrategy,
+        MAX_SQLITE_UNSIGNED,
     },
     file_ops,
     http_auth::{
@@ -85,19 +86,71 @@ fn share_response(settings: &RuntimeSettings, share: Share) -> ShareResponse {
     }
 }
 
+#[derive(Default, Deserialize)]
+pub(super) struct ShareListQuery {
+    limit: Option<usize>,
+    cursor: Option<i64>,
+    q: Option<String>,
+    status: Option<String>,
+    sort: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ShareListResponse {
+    shares: Vec<ShareResponse>,
+    next_cursor: Option<i64>,
+}
+
 pub(super) async fn list_shares(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> ApiResult<Json<Vec<ShareResponse>>> {
+    Query(query): Query<ShareListQuery>,
+) -> ApiResult<Json<ShareListResponse>> {
     session(&state, &headers, true, MissingSession::Unauthorized).await?;
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=200).contains(&limit) {
+        return Err(ApiError::bad_request(
+            "Share list limit must be between 1 and 200",
+        ));
+    }
+    if query.cursor.is_some_and(|cursor| cursor <= 0) {
+        return Err(ApiError::bad_request("Share list cursor is invalid"));
+    }
+    let query_text = query
+        .q
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if query_text
+        .as_ref()
+        .is_some_and(|value| value.len() > super::MAX_SEARCH_QUERY_BYTES)
+    {
+        return Err(ApiError::bad_request("Share search query is too long"));
+    }
+    let status = ShareListStatus::parse(query.status.as_deref().unwrap_or("all"))
+        .ok_or_else(|| ApiError::bad_request("Share list status is invalid"))?;
+    let sort = match query.sort.as_deref().unwrap_or("newest") {
+        "newest" => ShareListSort::Newest,
+        "oldest" => ShareListSort::Oldest,
+        _ => return Err(ApiError::bad_request("Share list sort is invalid")),
+    };
+    let options = ShareListOptions {
+        query: query_text,
+        status,
+        sort,
+        cursor: query.cursor,
+        limit,
+        now: Utc::now(),
+    };
     let settings = runtime_settings(&state);
-    let shares = database(state.db.clone(), |db| db.list_shares()).await?;
-    Ok(Json(
-        shares
+    let page = database(state.db.clone(), move |db| db.list_share_page(&options)).await?;
+    Ok(Json(ShareListResponse {
+        shares: page
+            .shares
             .into_iter()
             .map(|share| share_response(&settings, share))
             .collect(),
-    ))
+        next_cursor: page.next_cursor,
+    }))
 }
 
 #[derive(Deserialize)]

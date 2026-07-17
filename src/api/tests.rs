@@ -142,7 +142,7 @@ async fn health_reports_the_exact_package_version() {
     let data = tempfile::tempdir().unwrap();
     let app = crate::web::router(test_state(root.path(), data.path()));
     let response = app
-        .oneshot(json_request(Method::GET, "/api/v1/health", ""))
+        .oneshot(json_request(Method::GET, "/api/v2/health", ""))
         .await
         .unwrap();
 
@@ -214,7 +214,7 @@ async fn argon2_overload_is_identical_for_known_and_unknown_logins() {
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/session/login",
+            "/api/v2/session/login",
             r#"{"username":"admin","password":"wrong password"}"#,
         ))
         .await
@@ -222,7 +222,7 @@ async fn argon2_overload_is_identical_for_known_and_unknown_logins() {
     let unknown = app
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/session/login",
+            "/api/v2/session/login",
             r#"{"username":"absent","password":"wrong password"}"#,
         ))
         .await
@@ -230,6 +230,8 @@ async fn argon2_overload_is_identical_for_known_and_unknown_logins() {
 
     assert_eq!(known.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(unknown.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(known.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    assert_eq!(unknown.headers().get(header::RETRY_AFTER).unwrap(), "1");
     assert_eq!(response_text(known).await, response_text(unknown).await);
 }
 
@@ -251,7 +253,7 @@ async fn known_and_unknown_login_errors_are_identical_english_with_a_german_cook
     let login = |username: &str| {
         let mut request = json_request(
             Method::POST,
-            "/api/v1/session/login",
+            "/api/v2/session/login",
             &format!(r#"{{"username":"{username}","password":"wrong password"}}"#),
         );
         request.headers_mut().insert(
@@ -284,7 +286,7 @@ async fn api_login(state: &AppState, secret: &str) -> (String, String) {
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/session/login",
+            "/api/v2/session/login",
             r#"{"username":"admin","password":"correct horse battery staple"}"#,
         ))
         .await
@@ -296,7 +298,7 @@ async fn api_login(state: &AppState, secret: &str) -> (String, String) {
     let mfa_code = current_totp(secret);
     let mut missing_csrf = json_request(
         Method::POST,
-        "/api/v1/session/mfa",
+        "/api/v2/session/mfa",
         &format!(r#"{{"code":"{mfa_code}"}}"#),
     );
     missing_csrf.headers_mut().insert(
@@ -309,7 +311,7 @@ async fn api_login(state: &AppState, secret: &str) -> (String, String) {
     );
     let mut mfa = json_request(
         Method::POST,
-        "/api/v1/session/mfa",
+        "/api/v2/session/mfa",
         &format!(r#"{{"code":"{mfa_code}"}}"#),
     );
     mfa.headers_mut().insert(
@@ -339,7 +341,7 @@ async fn api_session_requires_mfa_and_csrf() {
 
     let (session_cookie, csrf) = api_login(&state, &secret).await;
     let app = crate::web::router(state.clone());
-    let mut me = json_request(Method::GET, "/api/v1/session/me", "");
+    let mut me = json_request(Method::GET, "/api/v2/session/me", "");
     me.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -350,7 +352,7 @@ async fn api_session_requires_mfa_and_csrf() {
     assert!(body.contains(r#""username":"admin""#));
     assert!(body.contains(&csrf));
 
-    let mut logout_without_csrf = json_request(Method::POST, "/api/v1/session/logout", "{}");
+    let mut logout_without_csrf = json_request(Method::POST, "/api/v2/session/logout", "{}");
     logout_without_csrf.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -378,7 +380,7 @@ async fn api_rejects_reusing_one_totp_code_for_two_sessions() {
             .clone()
             .oneshot(json_request(
                 Method::POST,
-                "/api/v1/session/login",
+                "/api/v2/session/login",
                 r#"{"username":"admin","password":"correct horse battery staple"}"#,
             ))
             .await
@@ -393,7 +395,7 @@ async fn api_rejects_reusing_one_totp_code_for_two_sessions() {
     for (index, (session_cookie, csrf)) in pending_sessions.into_iter().enumerate() {
         let mut request = json_request(
             Method::POST,
-            "/api/v1/session/mfa",
+            "/api/v2/session/mfa",
             &format!(r#"{{"code":"{code}"}}"#),
         );
         request.headers_mut().insert(
@@ -433,7 +435,7 @@ async fn api_creates_share_and_hides_secrets() {
             .unwrap();
     let mut special_target = json_request(
         Method::POST,
-        "/api/v1/shares",
+        "/api/v2/shares",
         r#"{"path":"special-share-target.sock","permission":"download_only"}"#,
     );
     special_target.headers_mut().insert(
@@ -456,7 +458,7 @@ async fn api_creates_share_and_hides_secrets() {
 
     let mut invalid_limit = json_request(
         Method::POST,
-        "/api/v1/shares",
+        "/api/v2/shares",
         r#"{"path":"docs","permission":"download_only","max_downloads":0}"#,
     );
     invalid_limit.headers_mut().insert(
@@ -473,7 +475,7 @@ async fn api_creates_share_and_hides_secrets() {
 
     let mut oversized_limit = json_request(
         Method::POST,
-        "/api/v1/shares",
+        "/api/v2/shares",
         r#"{"path":"docs","permission":"download_only","max_downloads":9223372036854775808}"#,
     );
     oversized_limit.headers_mut().insert(
@@ -490,7 +492,7 @@ async fn api_creates_share_and_hides_secrets() {
 
     let mut expired = json_request(
         Method::POST,
-        "/api/v1/shares",
+        "/api/v2/shares",
         r#"{"path":"docs","permission":"download_only","expires_at":"2000-01-01T00:00:00Z"}"#,
     );
     expired.headers_mut().insert(
@@ -507,7 +509,7 @@ async fn api_creates_share_and_hides_secrets() {
 
     let mut create = json_request(
         Method::POST,
-        "/api/v1/shares",
+        "/api/v2/shares",
         r#"{"path":"docs","permission":"download_upload","alias":"docs-api-123","max_downloads":5,"password":"very strong share password","overwrite_allowed":true}"#,
     );
     create.headers_mut().insert(
@@ -536,7 +538,7 @@ async fn api_creates_share_and_hides_secrets() {
 
     let share_id = json_i64_value(&body, "id");
     let audit_count = state.db.count_audit(None).unwrap();
-    let mut empty_update = json_request(Method::PATCH, &format!("/api/v1/shares/{share_id}"), "{}");
+    let mut empty_update = json_request(Method::PATCH, &format!("/api/v2/shares/{share_id}"), "{}");
     empty_update.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -551,7 +553,7 @@ async fn api_creates_share_and_hides_secrets() {
     assert!(empty_update_body.contains(r#""active":true"#));
     assert_eq!(state.db.count_audit(None).unwrap(), audit_count);
 
-    let mut list = json_request(Method::GET, "/api/v1/shares", "");
+    let mut list = json_request(Method::GET, "/api/v2/shares", "");
     list.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -562,10 +564,23 @@ async fn api_creates_share_and_hides_secrets() {
     assert!(body.contains("docs-api-123"));
     assert!(!body.contains("very strong share password"));
     assert!(!body.contains("password_hash"));
+    let list_body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(list_body["shares"].as_array().unwrap().len(), 1);
+    assert!(list_body["next_cursor"].is_null());
+
+    let mut invalid_page = json_request(Method::GET, "/api/v2/shares?limit=0", "");
+    invalid_page.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_str(&session_cookie).unwrap(),
+    );
+    assert_eq!(
+        app.clone().oneshot(invalid_page).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
 
     let mut update = json_request(
         Method::PATCH,
-        &format!("/api/v1/shares/{share_id}"),
+        &format!("/api/v2/shares/{share_id}"),
         r#"{"active":false}"#,
     );
     authorize_mutation(&mut update, &session_cookie, &csrf);
@@ -576,7 +591,7 @@ async fn api_creates_share_and_hides_secrets() {
 
     let mut activate = json_request(
         Method::POST,
-        &format!("/api/v1/shares/{share_id}/activate"),
+        &format!("/api/v2/shares/{share_id}/activate"),
         "{}",
     );
     authorize_mutation(&mut activate, &session_cookie, &csrf);
@@ -587,7 +602,7 @@ async fn api_creates_share_and_hides_secrets() {
 
     let mut deactivate = json_request(
         Method::POST,
-        &format!("/api/v1/shares/{share_id}/deactivate"),
+        &format!("/api/v2/shares/{share_id}/deactivate"),
         "{}",
     );
     authorize_mutation(&mut deactivate, &session_cookie, &csrf);
@@ -598,7 +613,7 @@ async fn api_creates_share_and_hides_secrets() {
 
     let mut set_password = json_request(
         Method::PUT,
-        &format!("/api/v1/shares/{share_id}/password"),
+        &format!("/api/v2/shares/{share_id}/password"),
         r#"{"password":"replacement share password"}"#,
     );
     authorize_mutation(&mut set_password, &session_cookie, &csrf);
@@ -609,7 +624,7 @@ async fn api_creates_share_and_hides_secrets() {
 
     let mut remove_password = json_request(
         Method::DELETE,
-        &format!("/api/v1/shares/{share_id}/password"),
+        &format!("/api/v2/shares/{share_id}/password"),
         "",
     );
     authorize_mutation(&mut remove_password, &session_cookie, &csrf);
@@ -618,7 +633,7 @@ async fn api_creates_share_and_hides_secrets() {
         StatusCode::OK
     );
 
-    let mut delete = json_request(Method::DELETE, &format!("/api/v1/shares/{share_id}"), "");
+    let mut delete = json_request(Method::DELETE, &format!("/api/v2/shares/{share_id}"), "");
     authorize_mutation(&mut delete, &session_cookie, &csrf);
     assert_eq!(
         app.clone().oneshot(delete).await.unwrap().status(),
@@ -626,7 +641,7 @@ async fn api_creates_share_and_hides_secrets() {
     );
     assert!(state.db.list_shares().unwrap().is_empty());
 
-    let mut missing_delete = json_request(Method::DELETE, "/api/v1/shares/999999", "");
+    let mut missing_delete = json_request(Method::DELETE, "/api/v2/shares/999999", "");
     missing_delete.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -667,7 +682,7 @@ async fn api_hashes_share_password_before_waiting_for_storage_mutation() {
         .unwrap();
     let mut create = json_request(
         Method::POST,
-        "/api/v1/shares",
+        "/api/v2/shares",
         r#"{"path":"docs","permission":"download_only","password":"very strong share password"}"#,
     );
     authorize_mutation(&mut create, "vaultlink_session=session-token", "csrf-token");
@@ -697,7 +712,7 @@ async fn external_writers_reject_api_overwrite_configuration() {
 
     let mut create = json_request(
         Method::POST,
-        "/api/v1/shares",
+        "/api/v2/shares",
         r#"{"path":"docs","permission":"download_upload","overwrite_allowed":true}"#,
     );
     create.headers_mut().insert(
@@ -731,7 +746,7 @@ async fn external_writers_reject_api_overwrite_configuration() {
     state.db.set_share_active(share_id, false).unwrap();
     let mut update = json_request(
         Method::PATCH,
-        &format!("/api/v1/shares/{share_id}"),
+        &format!("/api/v2/shares/{share_id}"),
         r#"{"active":true,"upload_conflict_strategy":"overwrite_allowed"}"#,
     );
     update.headers_mut().insert(
@@ -766,7 +781,7 @@ async fn external_writer_replace_opt_in_allows_api_overwrite_configuration() {
 
     let mut create = json_request(
         Method::POST,
-        "/api/v1/shares",
+        "/api/v2/shares",
         r#"{"path":"docs","permission":"download_upload","overwrite_allowed":true}"#,
     );
     create.headers_mut().insert(
@@ -795,7 +810,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
 
     let mut create_admin = json_request(
         Method::POST,
-        "/api/v1/admins",
+        "/api/v2/admins",
         r#"{"username":"ops","password":"another correct horse password"}"#,
     );
     create_admin.headers_mut().insert(
@@ -815,7 +830,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
 
     let mut deactivate = json_request(
         Method::POST,
-        &format!("/api/v1/admins/{ops_id}/deactivate"),
+        &format!("/api/v2/admins/{ops_id}/deactivate"),
         "{}",
     );
     deactivate.headers_mut().insert(
@@ -827,7 +842,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
     let body = response_text(response).await;
     assert!(body.contains(r#""message":"Request forbidden""#));
 
-    let mut list = json_request(Method::GET, "/api/v1/admins", "");
+    let mut list = json_request(Method::GET, "/api/v2/admins", "");
     list.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -840,7 +855,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
 
     let mut deactivate = json_request(
         Method::POST,
-        &format!("/api/v1/admins/{ops_id}/deactivate"),
+        &format!("/api/v2/admins/{ops_id}/deactivate"),
         "{}",
     );
     authorize_mutation(&mut deactivate, &session_cookie, &csrf);
@@ -852,7 +867,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
 
     let mut activate = json_request(
         Method::POST,
-        &format!("/api/v1/admins/{ops_id}/activate"),
+        &format!("/api/v2/admins/{ops_id}/activate"),
         "{}",
     );
     authorize_mutation(&mut activate, &session_cookie, &csrf);
@@ -864,7 +879,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
 
     let mut reset_password = json_request(
         Method::PUT,
-        &format!("/api/v1/admins/{ops_id}/password"),
+        &format!("/api/v2/admins/{ops_id}/password"),
         r#"{"password":"rotated correct horse password"}"#,
     );
     authorize_mutation(&mut reset_password, &session_cookie, &csrf);
@@ -875,7 +890,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
 
     let mut reset_totp = json_request(
         Method::POST,
-        &format!("/api/v1/admins/{ops_id}/totp/reset"),
+        &format!("/api/v2/admins/{ops_id}/totp/reset"),
         "{}",
     );
     authorize_mutation(&mut reset_totp, &session_cookie, &csrf);
@@ -885,14 +900,14 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
     assert!(body.contains(r#""username":"ops""#));
     assert!(body.contains("otpauth://totp/VaultLink:ops"));
 
-    let mut self_deactivate = json_request(Method::POST, "/api/v1/admins/1/deactivate", "{}");
+    let mut self_deactivate = json_request(Method::POST, "/api/v2/admins/1/deactivate", "{}");
     authorize_mutation(&mut self_deactivate, &session_cookie, &csrf);
     assert_eq!(
         app.clone().oneshot(self_deactivate).await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
 
-    let mut missing = json_request(Method::POST, "/api/v1/admins/999999/activate", "{}");
+    let mut missing = json_request(Method::POST, "/api/v2/admins/999999/activate", "{}");
     authorize_mutation(&mut missing, &session_cookie, &csrf);
     assert_eq!(
         app.oneshot(missing).await.unwrap().status(),
@@ -916,7 +931,7 @@ async fn api_settings_are_canonical_and_restart_safe() {
     let mut invalid_body = settings_body(runtime_settings(&state));
     invalid_body.public_base_url.clear();
     let invalid_json = serde_json::to_string(&invalid_body).unwrap();
-    let mut invalid = json_request(Method::PUT, "/api/v1/settings", &invalid_json);
+    let mut invalid = json_request(Method::PUT, "/api/v2/settings", &invalid_json);
     invalid.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -935,7 +950,7 @@ async fn api_settings_are_canonical_and_restart_safe() {
     valid_body.blocked_extensions = vec!["EXE, .SH".into()];
     valid_body.audit_client_ip_enabled = Some(true);
     let valid_json = serde_json::to_string(&valid_body).unwrap();
-    let mut valid = json_request(Method::PUT, "/api/v1/settings", &valid_json);
+    let mut valid = json_request(Method::PUT, "/api/v2/settings", &valid_json);
     valid.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -964,7 +979,7 @@ async fn api_settings_are_canonical_and_restart_safe() {
         .remove("audit_client_ip_enabled");
     let mut legacy_update = json_request(
         Method::PUT,
-        "/api/v1/settings",
+        "/api/v2/settings",
         &serde_json::to_string(&legacy_json).unwrap(),
     );
     legacy_update.headers_mut().insert(
@@ -1005,7 +1020,7 @@ async fn api_audit_client_ips_are_opt_in_and_can_be_deleted_only_when_disabled()
     assert_eq!(state.db.count_audit_client_ips().unwrap(), 1);
     let app = crate::web::router(state.clone());
 
-    let mut list_disabled = json_request(Method::GET, "/api/v1/audit", "");
+    let mut list_disabled = json_request(Method::GET, "/api/v2/audit", "");
     list_disabled.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -1018,7 +1033,7 @@ async fn api_audit_client_ips_are_opt_in_and_can_be_deleted_only_when_disabled()
     assert!(!body.contains("203.0.113.10"));
 
     state.runtime.write().unwrap().audit_client_ip_enabled = true;
-    let mut list_enabled = json_request(Method::GET, "/api/v1/audit", "");
+    let mut list_enabled = json_request(Method::GET, "/api/v2/audit", "");
     list_enabled.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -1031,7 +1046,7 @@ async fn api_audit_client_ips_are_opt_in_and_can_be_deleted_only_when_disabled()
 
     let mut wrong_confirmation = json_request(
         Method::DELETE,
-        "/api/v1/audit/client-ips",
+        "/api/v2/audit/client-ips",
         r#"{"confirmation":"LÖSCHEN"}"#,
     );
     wrong_confirmation.headers_mut().insert(
@@ -1050,7 +1065,7 @@ async fn api_audit_client_ips_are_opt_in_and_can_be_deleted_only_when_disabled()
 
     let mut delete_enabled = json_request(
         Method::DELETE,
-        "/api/v1/audit/client-ips",
+        "/api/v2/audit/client-ips",
         r#"{"confirmation":"IP-DATEN LÖSCHEN"}"#,
     );
     delete_enabled.headers_mut().insert(
@@ -1070,7 +1085,7 @@ async fn api_audit_client_ips_are_opt_in_and_can_be_deleted_only_when_disabled()
     state.runtime.write().unwrap().audit_client_ip_enabled = false;
     let mut delete_without_csrf = json_request(
         Method::DELETE,
-        "/api/v1/audit/client-ips",
+        "/api/v2/audit/client-ips",
         r#"{"confirmation":"IP-DATEN LÖSCHEN"}"#,
     );
     delete_without_csrf.headers_mut().insert(
@@ -1089,7 +1104,7 @@ async fn api_audit_client_ips_are_opt_in_and_can_be_deleted_only_when_disabled()
 
     let mut delete = json_request(
         Method::DELETE,
-        "/api/v1/audit/client-ips",
+        "/api/v2/audit/client-ips",
         r#"{"confirmation":"IP-DATEN LÖSCHEN"}"#,
     );
     delete.headers_mut().insert(
@@ -1119,7 +1134,7 @@ async fn api_file_search_filters_before_pagination() {
     state.db.create_admin("admin", &hash, &secret).unwrap();
     let (session_cookie, _) = api_login(&state, &secret).await;
     let app = crate::web::router(state.clone());
-    let mut request = json_request(Method::GET, "/api/v1/files?path=&q=only-late-match", "");
+    let mut request = json_request(Method::GET, "/api/v2/files?path=&q=only-late-match", "");
     request.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -1134,7 +1149,7 @@ async fn api_file_search_filters_before_pagination() {
     let too_long = "x".repeat(MAX_SEARCH_QUERY_BYTES + 1);
     let mut request = json_request(
         Method::GET,
-        &format!("/api/v1/files?path=&q={too_long}"),
+        &format!("/api/v2/files?path=&q={too_long}"),
         "",
     );
     request.headers_mut().insert(
@@ -1151,7 +1166,7 @@ async fn api_file_search_filters_before_pagination() {
         .clone()
         .try_acquire_many_owned(crate::MAX_CONCURRENT_SEARCHES as u32)
         .unwrap();
-    let mut request = json_request(Method::GET, "/api/v1/files?path=", "");
+    let mut request = json_request(Method::GET, "/api/v2/files?path=", "");
     request.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -1160,7 +1175,7 @@ async fn api_file_search_filters_before_pagination() {
         app.clone().oneshot(request).await.unwrap().status(),
         StatusCode::OK
     );
-    let mut request = json_request(Method::GET, "/api/v1/files?path=&q=ordinary", "");
+    let mut request = json_request(Method::GET, "/api/v2/files?path=&q=ordinary", "");
     request.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -1182,7 +1197,7 @@ async fn api_file_search_filters_before_pagination() {
             .unwrap()
         })
         .collect::<Vec<_>>();
-    let mut request = json_request(Method::GET, "/api/v1/files?path=", "");
+    let mut request = json_request(Method::GET, "/api/v2/files?path=", "");
     request.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -1191,7 +1206,7 @@ async fn api_file_search_filters_before_pagination() {
         app.clone().oneshot(request).await.unwrap().status(),
         StatusCode::OK
     );
-    let mut request = json_request(Method::GET, "/api/v1/files?path=&q=ordinary", "");
+    let mut request = json_request(Method::GET, "/api/v2/files?path=&q=ordinary", "");
     request.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&session_cookie).unwrap(),
@@ -1253,7 +1268,7 @@ async fn api_unlock_cookie_authorizes_followup_api_download() {
         .clone()
         .oneshot(json_request(
             Method::GET,
-            "/api/v1/public/shares/protected-token",
+            "/api/v2/public/shares/protected-token",
             "",
         ))
         .await
@@ -1264,7 +1279,7 @@ async fn api_unlock_cookie_authorizes_followup_api_download() {
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/public/shares/protected-token/unlock",
+            "/api/v2/public/shares/protected-token/unlock",
             r#"{"password":"very strong share password"}"#,
         ))
         .await
@@ -1277,12 +1292,12 @@ async fn api_unlock_cookie_authorizes_followup_api_download() {
         .to_str()
         .unwrap()
         .to_string();
-    assert!(set_cookie.contains("Path=/api/v1/public/shares/protected-token"));
+    assert!(set_cookie.contains("Path=/api/v2/public/shares/protected-token"));
     let unlock_cookie = set_cookie.split(';').next().unwrap().to_string();
 
     let mut download = json_request(
         Method::GET,
-        "/api/v1/public/shares/protected-token/download",
+        "/api/v2/public/shares/protected-token/download",
         "",
     );
     download.headers_mut().insert(
@@ -1298,7 +1313,7 @@ async fn api_unlock_cookie_authorizes_followup_api_download() {
         .any(|value| value
             .to_str()
             .unwrap()
-            .contains("Path=/api/v1/public/shares/protected-token")));
+            .contains("Path=/api/v2/public/shares/protected-token")));
     assert_eq!(response_text(download).await, "protected content");
     for _ in 0..100 {
         if state
@@ -1314,16 +1329,13 @@ async fn api_unlock_cookie_authorizes_followup_api_download() {
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     let mut metadata_request =
-        json_request(Method::GET, "/api/v1/public/shares/protected-token", "");
+        json_request(Method::GET, "/api/v2/public/shares/protected-token", "");
     metadata_request.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&unlock_cookie).unwrap(),
     );
     let metadata = app.oneshot(metadata_request).await.unwrap();
-    assert_eq!(metadata.status(), StatusCode::OK);
-    assert!(response_text(metadata)
-        .await
-        .contains(r#""download_count":1"#));
+    assert_eq!(metadata.status(), StatusCode::GONE);
 }
 
 #[tokio::test]
@@ -1356,7 +1368,7 @@ async fn api_media_preview_keeps_unlock_and_raw_routes_api_scoped() {
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/public/shares/media-token/unlock",
+            "/api/v2/public/shares/media-token/unlock",
             r#"{"password":"very strong share password"}"#,
         ))
         .await
@@ -1375,7 +1387,7 @@ async fn api_media_preview_keeps_unlock_and_raw_routes_api_scoped() {
 
     let mut preview = json_request(
         Method::GET,
-        "/api/v1/public/shares/media-token/preview?path=image.png",
+        "/api/v2/public/shares/media-token/preview?path=image.png",
         "",
     );
     preview.headers_mut().insert(
@@ -1385,8 +1397,8 @@ async fn api_media_preview_keeps_unlock_and_raw_routes_api_scoped() {
     let preview = app.clone().oneshot(preview).await.unwrap();
     assert_eq!(preview.status(), StatusCode::OK);
     let preview = response_text(preview).await;
-    assert!(preview.contains("/api/v1/public/shares/media-token/preview/raw?path=image%2Epng"));
-    assert!(preview.contains("href=\"/api/v1/public/shares/media-token\""));
+    assert!(preview.contains("/api/v2/public/shares/media-token/preview/raw?path=image%2Epng"));
+    assert!(preview.contains("href=\"/api/v2/public/shares/media-token\""));
     assert!(!preview.contains("/v/media-token/preview/raw"));
     assert!(!preview.contains("href=\"/v/media-token\""));
     let token_start = preview.find("preview_token=").unwrap() + "preview_token=".len();
@@ -1398,7 +1410,7 @@ async fn api_media_preview_keeps_unlock_and_raw_routes_api_scoped() {
     let mut raw = json_request(
             Method::GET,
             &format!(
-                "/api/v1/public/shares/media-token/preview/raw?path=image.png&preview_token={preview_token}"
+                "/api/v2/public/shares/media-token/preview/raw?path=image.png&preview_token={preview_token}"
             ),
             "",
         );
@@ -1470,7 +1482,7 @@ async fn api_reports_active_upload_reservations_as_quota_conflict() {
     let app = crate::web::router(state.clone());
     let mut update = json_request(
         Method::PATCH,
-        &format!("/api/v1/shares/{share_id}"),
+        &format!("/api/v2/shares/{share_id}"),
         r#"{"upload_conflict_strategy":"overwrite_allowed","max_upload_total_size":5,"max_upload_files":1}"#,
     );
     authorize_mutation(&mut update, &session_cookie, &csrf);
@@ -1519,7 +1531,7 @@ async fn api_admin_file_mutations_update_shares_and_require_tree_confirmation() 
 
     let mut create = json_request(
         Method::POST,
-        "/api/v1/files/directories",
+        "/api/v2/files/directories",
         r#"{"parent":"","name":"tree"}"#,
     );
     authorize_mutation(&mut create, &session_cookie, &csrf);
@@ -1530,7 +1542,7 @@ async fn api_admin_file_mutations_update_shares_and_require_tree_confirmation() 
 
     let mut rename = json_request(
         Method::PATCH,
-        "/api/v1/files",
+        "/api/v2/files",
         r#"{"path":"docs/file.txt","name":"final.txt"}"#,
     );
     authorize_mutation(&mut rename, &session_cookie, &csrf);
@@ -1565,7 +1577,7 @@ async fn api_admin_file_mutations_update_shares_and_require_tree_confirmation() 
             &UploadConflictStrategy::Reject,
         )
         .unwrap();
-    let mut unconfirmed = json_request(Method::DELETE, "/api/v1/files", r#"{"path":"tree"}"#);
+    let mut unconfirmed = json_request(Method::DELETE, "/api/v2/files", r#"{"path":"tree"}"#);
     authorize_mutation(&mut unconfirmed, &session_cookie, &csrf);
     let unconfirmed = app.clone().oneshot(unconfirmed).await.unwrap();
     assert_eq!(unconfirmed.status(), StatusCode::CONFLICT);
@@ -1585,7 +1597,7 @@ async fn api_admin_file_mutations_update_shares_and_require_tree_confirmation() 
         .unwrap();
     let mut confirmed = json_request(
         Method::DELETE,
-        "/api/v1/files",
+        "/api/v2/files",
         r#"{"path":"tree","confirm_name":"tree"}"#,
     );
     authorize_mutation(&mut confirmed, &session_cookie, &csrf);
@@ -1665,7 +1677,7 @@ async fn api_delegated_public_upload_errors_are_json() {
     let app = crate::web::router(state);
     let response = app
         .oneshot(multipart_request(
-            "/api/v1/public/shares/upload-token/upload",
+            "/api/v2/public/shares/upload-token/upload",
             "blocked.exe",
             b"blocked",
         ))
@@ -1723,7 +1735,7 @@ async fn api_upload_reports_required_audit_failure_and_never_publishes_the_file(
 
     let response = app
         .oneshot(multipart_request(
-            "/api/v1/public/shares/audit-failure-upload/upload",
+            "/api/v2/public/shares/audit-failure-upload/upload",
             "must-not-appear.txt",
             b"payload",
         ))
@@ -1793,7 +1805,7 @@ async fn api_upload_reports_post_publication_audit_uncertainty_without_retry_sig
 
     let response = app
         .oneshot(multipart_request(
-            "/api/v1/public/shares/post-publish-audit-failure/upload",
+            "/api/v2/public/shares/post-publish-audit-failure/upload",
             "already-visible.txt",
             b"payload",
         ))
@@ -1923,7 +1935,7 @@ async fn api_share_creation_preserves_audit_unavailable_from_real_pending_recove
     let app = crate::web::router(state.clone());
     let mut request = json_request(
         Method::POST,
-        "/api/v1/shares",
+        "/api/v2/shares",
         r#"{"path":"new.txt","permission":"download_only"}"#,
     );
     authorize_mutation(&mut request, &session_cookie, &csrf);
