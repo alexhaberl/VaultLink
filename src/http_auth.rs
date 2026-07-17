@@ -53,6 +53,13 @@ pub fn current_client_limit_key() -> IpAddr {
     )
 }
 
+/// Shared web/API admission for administrator password login.
+pub fn admin_login_attempt_admitted(state: &AppState, username: &str) -> bool {
+    state
+        .admin_login_limiter
+        .check_and_record_attempt(username, current_client_limit_key())
+}
+
 pub(crate) struct ClientActivityPermit {
     counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
     peer: IpAddr,

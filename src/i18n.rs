@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, future::Future, sync::OnceLock};
 
-use axum::http::{header, HeaderMap};
+use axum::http::HeaderMap;
 
 use crate::http_auth::named_cookie;
 
@@ -34,40 +34,8 @@ impl Locale {
     pub fn resolve(headers: &HeaderMap) -> Self {
         named_cookie(headers, LOCALE_COOKIE)
             .and_then(Self::parse)
-            .or_else(|| preferred_from_accept_language(headers))
             .unwrap_or(Self::En)
     }
-}
-
-fn preferred_from_accept_language(headers: &HeaderMap) -> Option<Locale> {
-    let value = headers.get(header::ACCEPT_LANGUAGE)?.to_str().ok()?;
-    let mut best: Option<(Locale, f32, usize)> = None;
-    for (position, item) in value.split(',').enumerate() {
-        let mut parts = item.trim().split(';');
-        let Some(locale) = parts.next().and_then(Locale::parse) else {
-            continue;
-        };
-        let mut quality = 1.0_f32;
-        for parameter in parts {
-            if let Some(raw) = parameter.trim().strip_prefix("q=") {
-                let Some(parsed) = raw.parse::<f32>().ok().filter(|q| (0.0..=1.0).contains(q))
-                else {
-                    quality = 0.0;
-                    break;
-                };
-                quality = parsed;
-            }
-        }
-        if quality == 0.0 {
-            continue;
-        }
-        if best.is_none_or(|(_, best_quality, best_position)| {
-            quality > best_quality || (quality == best_quality && position < best_position)
-        }) {
-            best = Some((locale, quality, position));
-        }
-    }
-    best.map(|(locale, _, _)| locale)
 }
 
 #[derive(Clone, Debug)]
@@ -743,6 +711,61 @@ catalog! {
     INVALID_MEDIA_PREVIEW_LIMIT, "error.invalid_media_preview_limit", "Ungültiges Media-Preview-Limit", "Invalid media preview limit";
     FILE_ALREADY_EXISTS, "error.file_already_exists", "Datei existiert bereits.", "File already exists.";
     FILE_MISSING, "error.file_missing", "Datei fehlt", "File is missing";
+    MAX_UPLOAD_FILES, "share.max_upload_files", "Maximale Upload-Dateien", "Maximum upload files";
+    DATABASE_ERROR, "error.database", "Datenbankfehler", "Database error";
+    SHARE_CHANGED, "error.share_changed", "Freigabe wurde geändert", "Share changed";
+    SEARCH_QUERY_TOO_LONG, "error.search_query_too_long", "Suchbegriff ist zu lang", "Search query is too long";
+    INVALID_FOLDER_PATH, "error.invalid_folder_path", "Ungültiger Ordnerpfad", "Invalid folder path";
+    INVALID_SECURITY_KEY, "error.invalid_security_key", "Ungültiger Sicherheitsschlüssel", "Invalid security key";
+    INVALID_UPLOAD_FILE_LIMIT, "error.invalid_upload_file_limit", "Ungültiges Upload-Dateilimit", "Invalid upload file limit";
+    INVALID_CUMULATIVE_UPLOAD_LIMIT, "error.invalid_cumulative_upload_limit", "Ungültiges kumulatives Uploadlimit", "Invalid cumulative upload limit";
+    CUMULATIVE_UPLOAD_LIMIT_INVALID, "error.cumulative_upload_limit_invalid", "Das kumulative Uploadlimit ist ungültig", "The cumulative upload limit is invalid";
+    UPLOAD_FILE_LIMIT_INVALID, "error.upload_file_limit_invalid", "Das Upload-Dateilimit ist ungültig", "The upload file limit is invalid";
+    MFA_ALREADY_VERIFIED, "error.mfa_already_verified", "MFA wurde bereits bestätigt", "MFA has already been verified";
+    TOO_MANY_SECURITY_KEY_REQUESTS, "error.security_key_requests", "Zu viele Sicherheitsschluessel-Anfragen", "Too many security-key requests";
+    NO_SECURITY_KEY, "error.no_security_key", "Kein Sicherheitsschlüssel registriert", "No security key is registered";
+    SECURITY_KEY_CHANGED, "error.security_key_changed", "Sicherheitsschlüssel wurde gleichzeitig geändert", "Security key changed concurrently";
+    SECURITY_KEY_START_FAILED, "error.security_key_start", "Sicherheitsschlüssel konnte nicht gestartet werden", "Security key authentication could not be started";
+    WEBAUTHN_BUSY, "error.webauthn_busy", "WebAuthn ist vorübergehend ausgelastet", "WebAuthn is temporarily busy";
+    SECURITY_KEY_ALREADY_REGISTERED, "error.security_key_registered", "Sicherheitsschlüssel ist bereits registriert", "Security key is already registered";
+    SECURITY_KEY_NOT_FOUND, "error.security_key_not_found", "Sicherheitsschlüssel nicht gefunden", "Security key not found";
+    INVALID_SECURITY_KEY_RESPONSE, "error.security_key_response", "Ungültige Sicherheitsschlüssel-Antwort", "Invalid security-key response";
+    INVALID_SECURITY_KEY_LABEL, "error.security_key_label", "Ungültiger Schlüsselname", "Invalid security-key label";
+    TWO_SECURITY_KEYS_REQUIRED, "error.two_security_keys", "Mindestens zwei Sicherheitsschlüssel erforderlich", "At least two security keys are required";
+    CSRF_TOKEN_DUPLICATE_OR_LATE, "error.csrf_token_duplicate_late", "CSRF-Token wurde mehrfach oder zu spät übermittelt", "CSRF token was submitted more than once or too late";
+    FOLDER_PATH_DUPLICATE_OR_LATE, "error.folder_path_duplicate_late", "Ordnerpfad wurde mehrfach oder zu spät übermittelt", "Folder path was submitted more than once or too late";
+    SHARE_CHANGED_DURING_UPLOAD, "error.share_changed_during_upload", "Freigabe wurde während des Uploads geändert", "Share changed during upload";
+    SHARE_DISABLED_DURING_UPLOAD, "error.share_disabled_during_upload", "Freigabe wurde während des Uploads deaktiviert", "Share was disabled during upload";
+    SHARE_CHANGED_IN_MEANTIME, "error.share_changed_in_meantime", "Freigabe wurde zwischenzeitlich geändert", "Share changed in the meantime";
+    UPLOAD_TARGET_CHANGED, "error.upload_target_changed", "Uploadziel wurde während des Uploads geändert", "Upload target changed during upload";
+    UPLOAD_TARGET_CHANGED_IN_MEANTIME, "error.upload_target_changed_in_meantime", "Uploadziel wurde zwischenzeitlich geändert", "Upload target changed in the meantime";
+    UPLOAD_RESERVATION_EXPIRED, "error.upload_reservation_expired", "Uploadreservierung ist abgelaufen", "Upload reservation has expired";
+    UPLOAD_FOLDER_CREATE_FAILED, "error.upload_folder_create", "Uploadordner konnte nicht erstellt werden", "Upload folder could not be created";
+    CUMULATIVE_UPLOAD_LIMIT_REACHED, "error.cumulative_upload_limit_reached", "Kumulatives Uploadlimit erreicht", "Cumulative upload limit reached";
+    UPLOAD_FILE_COUNT_REACHED, "error.upload_file_count_reached", "Maximale Anzahl hochgeladener Dateien erreicht", "Maximum number of uploaded files reached";
+    STORAGE_CAPACITY_UNAVAILABLE, "error.storage_capacity", "Speicherkapazität nicht ermittelbar", "Storage capacity could not be determined";
+    TOO_MANY_CONCURRENT_REQUESTS, "error.concurrent_requests", "Zu viele gleichzeitige Anfragen", "Too many concurrent requests";
+    TOO_MANY_CONCURRENT_RESPONSES, "error.concurrent_responses", "Zu viele gleichzeitige Antworten", "Too many concurrent responses";
+    TOO_MANY_CLIENT_RESPONSES, "error.client_responses", "Zu viele gleichzeitige Antworten dieses Clients", "Too many concurrent responses from this client";
+    TOO_MANY_DOWNLOADS, "error.concurrent_downloads", "Zu viele gleichzeitige Downloads", "Too many concurrent downloads";
+    TOO_MANY_CLIENT_DOWNLOADS, "error.client_downloads", "Zu viele gleichzeitige Downloads dieses Clients", "Too many concurrent downloads from this client";
+    TOO_MANY_CLIENT_OPERATIONS, "error.client_operations", "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients", "Too many concurrent expensive operations from this client";
+    TOO_MANY_FILE_SEARCHES, "error.file_searches", "Zu viele gleichzeitige Dateisuchen", "Too many concurrent file searches";
+    TOO_MANY_CLIENT_UPLOADS, "error.client_uploads", "Zu viele gleichzeitige Uploads dieses Clients", "Too many concurrent uploads from this client";
+    TOO_MANY_ZIP_BUILDS, "error.zip_builds", "Zu viele gleichzeitige ZIP-Erstellungen", "Too many concurrent ZIP builds";
+    TOO_MANY_PUBLIC_TRANSFERS, "error.public_transfers", "Zu viele öffentliche Übertragungen", "Too many public transfers";
+    TOO_MANY_PREVIEW_REQUESTS, "error.preview_requests", "Zu viele Vorschau-Anfragen", "Too many preview requests";
+    TOO_MANY_ACTIVE_PREVIEWS, "error.active_previews", "Zu viele aktive Vorschau-Sitzungen", "Too many active preview sessions";
+    TOO_MANY_TEXT_PREVIEWS, "error.text_previews", "Zu viele gleichzeitige Textvorschauen", "Too many concurrent text previews";
+    TOO_MANY_ALIAS_REQUESTS, "error.alias_requests", "Zu viele Alias-Anfragen", "Too many alias requests";
+    REGULAR_SHARE_TARGET_ONLY, "error.regular_share_target", "Freigaben sind nur für reguläre Dateien oder Ordner erlaubt", "Shares are allowed only for regular files or directories";
+    TARGET_CHANGED_DURING_PROCESSING, "error.target_changed", "Ziel wurde während der Verarbeitung geändert", "Target changed during processing";
+    OVERWRITE_NOT_ALLOWED, "error.overwrite_not_allowed", "Überschreiben ist für diese Freigabe nicht erlaubt", "Overwriting is not allowed for this share";
+    OVERWRITE_EXTERNAL_WRITER, "error.overwrite_external_writer", "Überschreiben ist bei externen Storage-Schreibern deaktiviert", "Overwriting is disabled with external storage writers";
+    UPLOAD_LIMITS_UPLOAD_SHARES_ONLY, "error.upload_limits_share", "Uploadlimits sind nur für Upload-Freigaben erlaubt", "Upload limits are allowed only for upload shares";
+    TEMPLATE_RENDER_FAILED, "error.template_render", "Template konnte nicht gerendert werden", "Template could not be rendered";
+    STORAGE_STATE_RECOVERING, "error.storage_recovering", "Speicherzustand wird wiederhergestellt", "Storage state is being recovered";
+    UPLOAD_LIMIT_IN_USE, "error.upload_limit_in_use", "Uploadlimit wird von laufenden Uploads belegt", "Upload capacity is in use by active uploads";
 }
 
 pub fn text(locale: Locale, key: MessageKey) -> &'static str {
@@ -813,10 +836,10 @@ pub fn render_markers(locale: Locale, source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::http::{header, HeaderValue};
 
     #[test]
-    fn cookie_wins_over_accept_language() {
+    fn locale_cookie_selects_german_or_english() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
@@ -827,37 +850,31 @@ mod tests {
             HeaderValue::from_static("en-US,en;q=0.8"),
         );
         assert_eq!(Locale::resolve(&headers), Locale::De);
-    }
-
-    #[test]
-    fn accept_language_honors_quality_and_region() {
-        let mut headers = HeaderMap::new();
         headers.insert(
-            header::ACCEPT_LANGUAGE,
-            HeaderValue::from_static("de-AT;q=0.4, en-GB;q=0.9"),
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_locale=en"),
         );
         assert_eq!(Locale::resolve(&headers), Locale::En);
     }
 
     #[test]
-    fn unsupported_or_missing_language_falls_back_to_english() {
+    fn accept_language_is_ignored_without_a_locale_cookie() {
         assert_eq!(Locale::resolve(&HeaderMap::new()), Locale::En);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::ACCEPT_LANGUAGE,
-            HeaderValue::from_static("fr, it;q=0.8"),
-        );
-        assert_eq!(Locale::resolve(&headers), Locale::En);
-    }
-
-    #[test]
-    fn invalid_quality_does_not_hide_later_supported_languages() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::ACCEPT_LANGUAGE,
-            HeaderValue::from_static("de;q=broken, en;q=0.8"),
-        );
-        assert_eq!(Locale::resolve(&headers), Locale::En);
+        for value in [
+            "de",
+            "de-AT,de;q=0.9",
+            "en-US,en;q=0.8",
+            "fr, de;q=0.8",
+            "*",
+            "de;q=broken",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::ACCEPT_LANGUAGE,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert_eq!(Locale::resolve(&headers), Locale::En, "{value}");
+        }
     }
 
     #[test]

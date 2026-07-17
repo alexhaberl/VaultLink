@@ -1560,15 +1560,23 @@ fn rejects_unknown_newer_schema() {
 }
 
 #[test]
-fn fresh_database_is_exactly_schema_one_without_plaintext_secret_columns() {
+fn fresh_database_is_exactly_schema_two_without_plaintext_secret_columns() {
     let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
     assert_eq!(
         connection
             .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        1
+        SCHEMA_VERSION
     );
+    let migration_records: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version=2 AND length(applied_at)>0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migration_records, 1);
     for (table, forbidden) in [
         ("shares", "token"),
         ("admins", "totp_secret"),
@@ -1598,6 +1606,180 @@ fn fresh_database_is_exactly_schema_one_without_plaintext_secret_columns() {
             assert_eq!(count, 1, "encrypted column {table}.{column} missing");
         }
     }
+}
+
+fn populated_schema_one_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u8>) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("schema-one.sqlite");
+    let database = Database::open(&path).unwrap();
+    database
+        .create_admin("admin", "password-hash", "TOTP-SECRET")
+        .unwrap();
+    database
+        .create_share(
+            "share-token",
+            Some("fixture"),
+            "fixture.txt",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            Some(7),
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    database
+        .replace_runtime_settings(&[("public_base_url", "https://fixture.invalid".into())], 1)
+        .unwrap();
+    database
+        .audit("admin", "fixture_event", Some("1"), Some("preserved"))
+        .unwrap();
+    let (share_ciphertext, totp_ciphertext) = database
+        .conn()
+        .query_row(
+            "SELECT shares.token_ciphertext,admins.totp_ciphertext
+             FROM shares JOIN admins ON admins.id=shares.created_by",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(database);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch("DROP TABLE vaultlink_schema_migrations")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+            [schema::SCHEMA_1_FINGERPRINT],
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
+    drop(connection);
+    (directory, path, share_ciphertext, totp_ciphertext)
+}
+
+#[test]
+fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
+    let (_directory, path, share_ciphertext, totp_ciphertext) = populated_schema_one_fixture();
+    let database = Database::open(&path).unwrap();
+    assert_eq!(database.active_admin_usernames().unwrap(), ["admin"]);
+    assert_eq!(
+        database
+            .admin("admin")
+            .unwrap()
+            .unwrap()
+            .totp_secret
+            .expose_secret(),
+        "TOTP-SECRET"
+    );
+    assert_eq!(
+        database
+            .share_by_token("share-token")
+            .unwrap()
+            .unwrap()
+            .alias
+            .as_deref(),
+        Some("fixture")
+    );
+    assert_eq!(
+        database.runtime_settings().unwrap(),
+        [("public_base_url".into(), "https://fixture.invalid".into())]
+    );
+    assert_eq!(database.count_audit(Some("fixture_event")).unwrap(), 1);
+    let connection = database.conn();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    let (migrated_share_ciphertext, migrated_totp_ciphertext): (Vec<u8>, Vec<u8>) = connection
+        .query_row(
+            "SELECT shares.token_ciphertext,admins.totp_ciphertext
+             FROM shares JOIN admins ON admins.id=shares.created_by",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(migrated_share_ciphertext, share_ciphertext);
+    assert_eq!(migrated_totp_ciphertext, totp_ciphertext);
+    let applied_at: String = connection
+        .query_row(
+            "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    drop(database);
+
+    let reopened = Database::open(&path).unwrap();
+    let reopened_applied_at: String = reopened
+        .conn()
+        .query_row(
+            "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reopened_applied_at, applied_at);
+}
+
+#[test]
+fn corrupt_schema_fingerprint_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("corrupt-fingerprint.sqlite");
+    drop(Database::open(&path).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint='corrupt' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        Database::open(path),
+        Err(DatabaseError::Schema(_))
+    ));
+}
+
+#[test]
+fn failed_schema_one_migration_rolls_back_every_change() {
+    let (_directory, path, _, _) = populated_schema_one_fixture();
+    schema::fail_next_schema_1_to_2_migration();
+    assert!(matches!(
+        Database::open(&path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        1
+    );
+    let fingerprint: String = connection
+        .query_row(
+            "SELECT fingerprint FROM vaultlink_schema WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fingerprint, schema::SCHEMA_1_FINGERPRINT);
+    let migration_table: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='vaultlink_schema_migrations')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!migration_table);
 }
 
 #[test]

@@ -136,7 +136,6 @@ curl -sS -o /dev/null -w '%{http_code}' \
 
 curl -sS -f -X POST "http://$SETUP_ADDR/" \
     -b "$SETUP_COOKIE_JAR" \
-    -H "Accept-Language: de" \
     --data-urlencode "server_mode=development" \
     --data-urlencode "listen_address=$APP_ADDR" \
     --data-urlencode "public_base_url=http://localhost:18081" \
@@ -169,13 +168,12 @@ curl -sS -f -X POST "http://$SETUP_ADDR/" \
     --data-urlencode "admin_password_confirm=$ADMIN_PASSWORD" \
     >"$SETUP_RESPONSE"
 
-grep -q "Setup abgeschlossen" "$SETUP_RESPONSE" || fail "setup did not complete"
+grep -q "Setup complete" "$SETUP_RESPONSE" || fail "setup did not complete"
 TOTP_SECRET="$(grep -Eo '[A-Z2-7]{32}' "$SETUP_RESPONSE" | head -n 1)"
 [[ -n "$TOTP_SECRET" ]] || fail "TOTP secret was not rendered"
 curl -sS -f -X POST "http://$SETUP_ADDR/complete" \
     -b "$SETUP_COOKIE_JAR" \
-    -H "Accept-Language: de" \
-    | grep -q "Setup best" || fail "setup confirmation failed"
+    | grep -q "Setup confirmed" || fail "setup confirmation failed"
 
 cleanup
 unset SETUP_PID

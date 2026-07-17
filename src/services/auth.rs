@@ -57,13 +57,16 @@ impl AuthService {
         &self,
         command: PasswordLoginCommand,
     ) -> rusqlite::Result<PasswordLoginOutcome> {
-        if !auth::valid_admin_username(&command.username)
-            || command.password.expose_secret().len() > auth::MAX_PASSWORD_BYTES
-        {
+        if command.password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
             return Ok(PasswordLoginOutcome::InvalidCredentials);
         }
 
-        let Some(admin) = self.database.admin(&command.username)? else {
+        let admin = if auth::valid_admin_username(&command.username) {
+            self.database.admin(&command.username)?
+        } else {
+            None
+        };
+        let Some(admin) = admin else {
             // Keep unknown accounts on one admitted Argon2 job too. The caller
             // runs this whole service operation behind the shared admission
             // semaphore, so overload behavior stays identical for both paths.

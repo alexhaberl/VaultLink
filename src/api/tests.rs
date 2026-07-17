@@ -199,6 +199,9 @@ async fn argon2_overload_is_identical_for_known_and_unknown_logins() {
         .db
         .create_admin("admin", &hash, &auth::new_totp_secret())
         .unwrap();
+    state
+        .admin_login_limiter
+        .replace_active_admins(state.db.active_admin_usernames().unwrap());
     let _capacity = state
         .argon2_admission
         .clone()
@@ -228,6 +231,51 @@ async fn argon2_overload_is_identical_for_known_and_unknown_logins() {
     assert_eq!(known.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(unknown.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response_text(known).await, response_text(unknown).await);
+}
+
+#[tokio::test]
+async fn known_and_unknown_login_errors_are_identical_english_with_a_german_cookie() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    let hash = auth::hash_password("correct horse battery staple").unwrap();
+    state
+        .db
+        .create_admin("admin", &hash, &auth::new_totp_secret())
+        .unwrap();
+    state
+        .admin_login_limiter
+        .replace_active_admins(state.db.active_admin_usernames().unwrap());
+    let app = crate::web::router(state);
+
+    let login = |username: &str| {
+        let mut request = json_request(
+            Method::POST,
+            "/api/v1/session/login",
+            &format!(r#"{{"username":"{username}","password":"wrong password"}}"#),
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_locale=de"),
+        );
+        request.headers_mut().insert(
+            header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("de-AT,de;q=0.9"),
+        );
+        request
+    };
+
+    let known = app.clone().oneshot(login("admin")).await.unwrap();
+    let unknown = app.oneshot(login("absent")).await.unwrap();
+    assert_eq!(known.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+    let known_body = response_text(known).await;
+    let unknown_body = response_text(unknown).await;
+    assert_eq!(known_body, unknown_body);
+    assert_eq!(
+        known_body,
+        r#"{"error":{"code":"invalid_credentials","message":"Invalid credentials"}}"#
+    );
 }
 
 async fn api_login(state: &AppState, secret: &str) -> (String, String) {
@@ -311,7 +359,7 @@ async fn api_session_requires_mfa_and_csrf() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let body = response_text(response).await;
     assert!(body.contains(r#""code":"forbidden""#));
-    assert!(body.contains("CSRF"));
+    assert!(body.contains(r#""message":"Request forbidden""#));
 }
 
 #[tokio::test]
@@ -763,6 +811,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
     assert!(body.contains(r#""username":"ops""#));
     assert!(body.contains("otpauth://totp/VaultLink:ops"));
     let ops_id = json_i64_value(&body, "id");
+    assert!(state.admin_login_limiter.has_active_admin("OPS"));
 
     let mut deactivate = json_request(
         Method::POST,
@@ -776,7 +825,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
     let response = app.clone().oneshot(deactivate).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let body = response_text(response).await;
-    assert!(body.contains("CSRF"));
+    assert!(body.contains(r#""message":"Request forbidden""#));
 
     let mut list = json_request(Method::GET, "/api/v1/admins", "");
     list.headers_mut().insert(
@@ -799,6 +848,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
         app.clone().oneshot(deactivate).await.unwrap().status(),
         StatusCode::OK
     );
+    assert!(!state.admin_login_limiter.has_active_admin("ops"));
 
     let mut activate = json_request(
         Method::POST,
@@ -810,6 +860,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
         app.clone().oneshot(activate).await.unwrap().status(),
         StatusCode::OK
     );
+    assert!(state.admin_login_limiter.has_active_admin("ops"));
 
     let mut reset_password = json_request(
         Method::PUT,
@@ -1817,7 +1868,7 @@ fn file_recovery_required_audit_failure_maps_to_stable_503_code() {
     ));
     assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(mapped.code, "audit_unavailable");
-    assert_eq!(mapped.message, crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE);
+    assert_eq!(mapped.message, "Security audit temporarily unavailable");
 }
 
 #[tokio::test]

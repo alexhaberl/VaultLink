@@ -78,12 +78,16 @@ pub(super) async fn create_admin(
     let audit_actor = session_data.username;
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
-    let created = required_database(state.db.clone(), move |_| {
-        service
+    let (created, active_admins) = required_database(state.db.clone(), move |database| {
+        let created = service
             .create(&prepared, &password_hash, &audit_context)
-            .map_err(admin_database_error)
+            .map_err(admin_database_error)?;
+        Ok((created, database.active_admin_usernames()?))
     })
     .await?;
+    state
+        .admin_login_limiter
+        .replace_active_admins(active_admins);
     let response_secret = created.totp_secret.into_one_time_response();
     let otpauth_url = format!(
         "otpauth://totp/VaultLink:{}?secret={}&issuer=VaultLink",
@@ -123,33 +127,37 @@ async fn set_admin_active_api(
     csrf_header(&session_data, &headers)?;
     if !active && id == session_data.admin_id {
         return Err(ApiError::bad_request(
-            "Eigener Admin kann nicht stillgelegt werden",
+            "You cannot deactivate your own administrator account",
         ));
     }
     let audit_actor = session_data.username;
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
     let service = AdminService::new(state.db.clone());
-    let outcome = required_database(state.db.clone(), move |_| {
-        service
+    let (outcome, active_admins) = required_database(state.db.clone(), move |database| {
+        let outcome = service
             .set_active(id, active, &audit_context)
-            .map_err(admin_database_error)
+            .map_err(admin_database_error)?;
+        Ok((outcome, database.active_admin_usernames()?))
     })
     .await?;
+    state
+        .admin_login_limiter
+        .replace_active_admins(active_admins);
     match outcome {
         AdminActivationResult::Changed => {}
         AdminActivationResult::NotFound => {
-            return Err(ApiError::not_found("Admin nicht gefunden"));
+            return Err(ApiError::not_found("Administrator not found"));
         }
         AdminActivationResult::Deactivation(outcome) => match outcome {
             AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive => {}
             AdminDeactivationOutcome::LastActive => {
                 return Err(ApiError::bad_request(
-                    "Letzter aktiver Admin kann nicht stillgelegt werden",
+                    "The last active administrator cannot be deactivated",
                 ));
             }
             AdminDeactivationOutcome::NotFound => {
-                return Err(ApiError::not_found("Admin nicht gefunden"));
+                return Err(ApiError::not_found("Administrator not found"));
             }
         },
     }
@@ -166,7 +174,7 @@ pub(super) async fn reset_admin_password(
     csrf_header(&session_data, &headers)?;
     if id == session_data.admin_id {
         return Err(ApiError::bad_request(
-            "Das eigene Passwort wird über „Mein Konto“ geändert",
+            "Change your own password through My account",
         ));
     }
     let service = AdminService::new(state.db.clone());
@@ -184,7 +192,7 @@ pub(super) async fn reset_admin_password(
     })
     .await?;
     if !changed {
-        return Err(ApiError::not_found("Admin nicht gefunden"));
+        return Err(ApiError::not_found("Administrator not found"));
     }
     Ok(Json(SimpleResponse { ok: true }))
 }
@@ -198,7 +206,7 @@ pub(super) async fn reset_admin_totp(
     csrf_header(&session_data, &headers)?;
     if id == session_data.admin_id {
         return Err(ApiError::bad_request(
-            "Die eigene MFA wird über „Mein Konto“ geändert",
+            "Change your own MFA through My account",
         ));
     }
     let audit_actor = session_data.username;
@@ -211,7 +219,7 @@ pub(super) async fn reset_admin_totp(
             .map_err(admin_database_error)
     })
     .await?
-    .ok_or_else(|| ApiError::not_found("Admin nicht gefunden"))?;
+    .ok_or_else(|| ApiError::not_found("Administrator not found"))?;
     let username = reset.username;
     let response_secret = reset.totp_secret.into_one_time_response();
     let otpauth_url =
@@ -226,10 +234,14 @@ pub(super) async fn reset_admin_totp(
 
 fn admin_validation_error(error: AdminServiceError) -> ApiError {
     match error {
-        AdminServiceError::InvalidUsername => ApiError::bad_request("Ungültiger Benutzername"),
-        AdminServiceError::InvalidPassword => ApiError::bad_request("Ungültiges Admin-Passwort"),
+        AdminServiceError::InvalidUsername => {
+            ApiError::bad_request("Invalid administrator username")
+        }
+        AdminServiceError::InvalidPassword => {
+            ApiError::bad_request("Invalid administrator password")
+        }
         AdminServiceError::PasswordConfirmationMismatch => {
-            ApiError::bad_request("Passwörter stimmen nicht überein")
+            ApiError::bad_request("Passwords do not match")
         }
         AdminServiceError::Database(error) => ApiError::internal(error),
     }

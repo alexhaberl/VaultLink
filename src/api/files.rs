@@ -109,7 +109,7 @@ pub(super) async fn files(
         .as_ref()
         .is_some_and(|value| value.len() > MAX_SEARCH_QUERY_BYTES)
     {
-        return Err(ApiError::bad_request("Suchbegriff ist zu lang"));
+        return Err(ApiError::bad_request("Search query is too long"));
     }
     let (scan_peer_permit, scan_permit) = if search.is_some() {
         let peer = try_acquire_client_activity(
@@ -121,7 +121,7 @@ pub(super) async fn files(
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "search_busy",
-                "Zu viele gleichzeitige Dateisuchen dieses Clients",
+                "Too many concurrent file searches from this client",
             )
         })?;
         let global = state
@@ -132,7 +132,7 @@ pub(super) async fn files(
                 ApiError::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "search_busy",
-                    "Zu viele gleichzeitige Dateisuchen",
+                    "Too many concurrent file searches",
                 )
             })?;
         (Some(peer), Some(global))
@@ -349,21 +349,21 @@ pub(super) fn file_operation_error(error: file_ops::FileOperationError) -> ApiEr
     use file_ops::FileOperationError;
     match error {
         FileOperationError::InvalidPath => {
-            ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", "Ungültiger Pfad")
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", "Invalid path")
         }
         FileOperationError::InvalidName => {
-            ApiError::new(StatusCode::BAD_REQUEST, "invalid_name", "Ungültiger Name")
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_name", "Invalid name")
         }
-        FileOperationError::NotFound => ApiError::not_found("Ziel nicht gefunden"),
+        FileOperationError::NotFound => ApiError::not_found("Target not found"),
         FileOperationError::Conflict => ApiError::new(
             StatusCode::CONFLICT,
             "conflict",
-            "Zielname ist bereits vorhanden",
+            "Target name already exists",
         ),
         FileOperationError::ConfirmationRequired { .. } => ApiError::new(
             StatusCode::CONFLICT,
             "confirmation_required",
-            "Der exakte Ordnername muss bestätigt werden",
+            "The exact directory name must be confirmed",
         ),
         FileOperationError::Database(database_error)
             if crate::db::is_audit_unavailable(&database_error) =>
@@ -371,7 +371,7 @@ pub(super) fn file_operation_error(error: file_ops::FileOperationError) -> ApiEr
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "audit_unavailable",
-                crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE,
+                "Security audit temporarily unavailable",
             )
         }
         other @ (FileOperationError::Database(_)

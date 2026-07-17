@@ -237,7 +237,7 @@ pub(super) async fn share_index_page(
                 )
             };
             format!(
-                r#"<details><summary><vl-i18n key="share.upload_rules"/></summary><form method="post" action="/admin/shares/{}/upload-conflict" class="vl-stack"><input type="hidden" name="csrf" value="{}">{}<label class="vl-field"><vl-i18n key="share.cumulative_upload_limit_gb"/><input name="max_upload_total_size_gb" type="number" min="0.000000001" step="any" value="{}" required></label><label class="vl-field">Maximale Upload-Dateien<input name="max_upload_files" type="number" min="1" value="{}" required></label><button class="vl-button vl-button--secondary"><vl-i18n key="common.apply"/></button></form></details>"#,
+                r#"<details><summary><vl-i18n key="share.upload_rules"/></summary><form method="post" action="/admin/shares/{}/upload-conflict" class="vl-stack"><input type="hidden" name="csrf" value="{}">{}<label class="vl-field"><vl-i18n key="share.cumulative_upload_limit_gb"/><input name="max_upload_total_size_gb" type="number" min="0.000000001" step="any" value="{}" required></label><label class="vl-field"><vl-i18n key="share.max_upload_files"/><input name="max_upload_files" type="number" min="1" value="{}" required></label><button class="vl-button vl-button--secondary"><vl-i18n key="common.apply"/></button></form></details>"#,
                 share.id,
                 esc(&session_data.csrf_token),
                 overwrite_control,
@@ -394,7 +394,7 @@ pub(super) async fn share_create_page(
     };
     let upload_rules = if is_directory {
         format!(
-            r#"<section class="vl-form-section" data-upload-rules><h2><vl-i18n key="share.step_upload"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.max_file"/><input name="max_upload_size_gb" type="number" min="1" max="{}" step="1" placeholder="Global: {} GB"><small><vl-i18n key="share.empty_global"/></small></label><label class="vl-field"><vl-i18n key="share.cumulative_upload_limit_gb"/><input name="max_upload_total_size_gb" type="number" min="1" step="any" value="{}" required></label><label class="vl-field">Maximale Upload-Dateien<input name="max_upload_files" type="number" min="1" value="{}" required></label>{}</div></section>"#,
+            r#"<section class="vl-form-section" data-upload-rules><h2><vl-i18n key="share.step_upload"/></h2><div class="vl-form-grid"><label class="vl-field"><vl-i18n key="share.max_file"/><input name="max_upload_size_gb" type="number" min="1" max="{}" step="1" placeholder="Global: {} GB"><small><vl-i18n key="share.empty_global"/></small></label><label class="vl-field"><vl-i18n key="share.cumulative_upload_limit_gb"/><input name="max_upload_total_size_gb" type="number" min="1" step="any" value="{}" required></label><label class="vl-field"><vl-i18n key="share.max_upload_files"/><input name="max_upload_files" type="number" min="1" value="{}" required></label>{}</div></section>"#,
             display_limit_unit_floor(crate::config::MAX_UPLOAD_SIZE, GB),
             display_limit_unit_floor(settings.max_upload_size, GB),
             display_limit_unit_ceil(

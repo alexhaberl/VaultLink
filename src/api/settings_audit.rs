@@ -123,7 +123,7 @@ pub(super) async fn update_settings(
     ])
     .map_err(|_| ApiError::bad_request("Invalid runtime setting"))?;
     next.validate()
-        .map_err(|_| ApiError::bad_request("Ungültige Einstellung"))?;
+        .map_err(|_| ApiError::bad_request("Invalid setting"))?;
     let admin_id = session_data.admin_id;
     let changed_keys = current.changed_keys(&next).join(",");
     commit_runtime_settings(
@@ -228,7 +228,7 @@ pub(super) async fn delete_audit_client_ips(
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "confirmation_required",
-            "Exakte Bestätigung IP-DATEN LÖSCHEN erforderlich",
+            "Exact confirmation IP-DATEN LÖSCHEN is required",
         ));
     }
     let fallback_logging_enabled = runtime_settings(&state).audit_client_ip_enabled;
@@ -243,7 +243,7 @@ pub(super) async fn delete_audit_client_ips(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "client_ip_logging_enabled",
-            "Client-IP-Logging muss vor dem Löschen deaktiviert werden",
+            "Client IP logging must be disabled before deletion",
         ));
     };
     Ok(Json(DeletedAuditClientIpsResponse { deleted }))

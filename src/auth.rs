@@ -6,8 +6,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use rand::{rngs::SysRng, TryRng};
 use sha1::Sha1;
 use std::{
-    collections::{hash_map::RandomState, HashMap},
+    collections::{hash_map::RandomState, HashMap, HashSet},
     hash::BuildHasher,
+    net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,6 +19,8 @@ use crate::sensitive::SecretString;
 const MAX_LIMITER_KEYS: usize = 10_000;
 const OVERFLOW_BUCKETS: usize = 256;
 const GLOBAL_CLEANUP_INTERVAL: u64 = 64;
+const UNKNOWN_ADMIN_ACCOUNT_BUCKETS: usize = 256;
+const UNKNOWN_ADMIN_IP_BUCKETS: usize = 256;
 
 pub const ADMIN_PASSWORD_MIN_CHARACTERS: usize = 14;
 pub const ADMIN_PASSWORD_MAX_CHARACTERS: usize = 256;
@@ -168,6 +171,188 @@ struct LimiterState {
 
 struct AttemptHistory {
     attempts: Vec<Instant>,
+}
+
+impl AttemptHistory {
+    fn new() -> Self {
+        Self {
+            attempts: Vec::new(),
+        }
+    }
+}
+
+/// Process-local password-login admission with isolated state for active admins.
+///
+/// Unknown and invalid usernames are deliberately confined to fixed bucket
+/// arrays so username churn can neither allocate unbounded state nor consume an
+/// active administrator's exact counters.
+#[derive(Clone)]
+pub struct AdminLoginLimiter {
+    inner: Arc<Mutex<AdminLoginLimiterState>>,
+    origin_max: usize,
+    account_max: usize,
+    window: Duration,
+}
+
+struct AdminLoginLimiterState {
+    active_admins: HashSet<String>,
+    known_accounts: HashMap<String, AttemptHistory>,
+    known_origins: HashMap<(String, IpAddr), AttemptHistory>,
+    unknown_accounts: Vec<Option<AttemptHistory>>,
+    unknown_ips: Vec<Option<AttemptHistory>>,
+    hash_builder: RandomState,
+}
+
+impl AdminLoginLimiter {
+    pub fn new(
+        active_admins: impl IntoIterator<Item = String>,
+        origin_max: usize,
+        account_max: usize,
+        window: Duration,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AdminLoginLimiterState {
+                active_admins: active_admins
+                    .into_iter()
+                    .map(|username| username.to_ascii_lowercase())
+                    .collect(),
+                known_accounts: HashMap::new(),
+                known_origins: HashMap::new(),
+                unknown_accounts: std::iter::repeat_with(|| None)
+                    .take(UNKNOWN_ADMIN_ACCOUNT_BUCKETS)
+                    .collect(),
+                unknown_ips: std::iter::repeat_with(|| None)
+                    .take(UNKNOWN_ADMIN_IP_BUCKETS)
+                    .collect(),
+                hash_builder: RandomState::new(),
+            })),
+            origin_max,
+            account_max,
+            window,
+        }
+    }
+
+    pub fn replace_active_admins(&self, usernames: impl IntoIterator<Item = String>) {
+        let mut state = self.state();
+        state.active_admins = usernames
+            .into_iter()
+            .map(|username| username.to_ascii_lowercase())
+            .collect();
+        let active_admins = state.active_admins.clone();
+        state
+            .known_accounts
+            .retain(|username, _| active_admins.contains(username));
+        state
+            .known_origins
+            .retain(|(username, _), _| active_admins.contains(username));
+    }
+
+    /// Records the global account attempt before inspecting origin state.
+    ///
+    /// If the origin check rejects the request, the account attempt remains
+    /// consumed. If the account is already exhausted, no origin entry or bucket
+    /// is created or consumed.
+    pub fn check_and_record_attempt(&self, username: &str, origin: IpAddr) -> bool {
+        if self.origin_max == 0 || self.account_max == 0 || self.window.is_zero() {
+            return false;
+        }
+
+        let normalized = username.to_ascii_lowercase();
+        let mut state = self.state();
+        let now = Instant::now();
+        let known = valid_admin_username(username) && state.active_admins.contains(&normalized);
+
+        if known {
+            state.known_origins.retain(|(account, _), history| {
+                if account != &normalized {
+                    return true;
+                }
+                LoginLimiter::prune_history(history, now, self.window);
+                !history.attempts.is_empty()
+            });
+            let account = state
+                .known_accounts
+                .entry(normalized.clone())
+                .or_insert_with(AttemptHistory::new);
+            if !Self::record(account, self.account_max, now, self.window) {
+                return false;
+            }
+
+            let origin_history = state
+                .known_origins
+                .entry((normalized, origin))
+                .or_insert_with(AttemptHistory::new);
+            return Self::record(origin_history, self.origin_max, now, self.window);
+        }
+
+        let account_bucket = (state
+            .hash_builder
+            .hash_one(("unknown-account", normalized.as_str()))
+            as usize)
+            % state.unknown_accounts.len();
+        let account =
+            state.unknown_accounts[account_bucket].get_or_insert_with(AttemptHistory::new);
+        if !Self::record(account, self.account_max, now, self.window) {
+            return false;
+        }
+
+        let ip_bucket = (state.hash_builder.hash_one(("unknown-ip", origin)) as usize)
+            % state.unknown_ips.len();
+        let ip = state.unknown_ips[ip_bucket].get_or_insert_with(AttemptHistory::new);
+        Self::record(ip, self.origin_max, now, self.window)
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, AdminLoginLimiterState> {
+        match self.inner.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                tracing::error!("recovering poisoned admin login limiter state");
+                self.inner.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn record(
+        history: &mut AttemptHistory,
+        maximum: usize,
+        now: Instant,
+        window: Duration,
+    ) -> bool {
+        LoginLimiter::prune_history(history, now, window);
+        if history.attempts.len() >= maximum {
+            return false;
+        }
+        history.attempts.push(now);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_admin(&self, username: &str) -> bool {
+        self.state()
+            .active_admins
+            .contains(&username.to_ascii_lowercase())
+    }
+
+    #[cfg(test)]
+    fn state_sizes(&self) -> (usize, usize, usize, usize) {
+        let state = self.state();
+        (
+            state.known_accounts.len(),
+            state.known_origins.len(),
+            state.unknown_accounts.len(),
+            state.unknown_ips.len(),
+        )
+    }
+
+    #[cfg(test)]
+    fn used_unknown_ip_buckets(&self) -> usize {
+        self.state()
+            .unknown_ips
+            .iter()
+            .filter(|history| history.is_some())
+            .count()
+    }
 }
 
 impl LimiterState {
@@ -616,6 +801,87 @@ mod tests {
 
         let no_window = LoginLimiter::new(2, Duration::ZERO);
         assert!(!no_window.check_and_record_attempt("x"));
+    }
+
+    #[test]
+    fn unknown_username_churn_cannot_consume_known_admin_counters() {
+        let limiter = AdminLoginLimiter::new(["Admin".to_string()], 2, 2, Duration::from_secs(60));
+        let origin = "192.0.2.1".parse().unwrap();
+        assert!(limiter.check_and_record_attempt("ADMIN", origin));
+
+        for index in 0..50_000 {
+            let _ = limiter.check_and_record_attempt(
+                &format!("random-{index}"),
+                "198.51.100.10".parse().unwrap(),
+            );
+        }
+
+        assert!(limiter.check_and_record_attempt("admin", origin));
+        assert!(!limiter.check_and_record_attempt("admin", origin));
+    }
+
+    #[test]
+    fn unknown_admin_limiter_state_stays_fixed_size_under_concurrency() {
+        use std::{sync::Barrier, thread};
+
+        let limiter = AdminLoginLimiter::new([], 5, 10, Duration::from_secs(60));
+        let barrier = Arc::new(Barrier::new(16));
+        let handles = (0..16)
+            .map(|worker| {
+                let limiter = limiter.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for attempt in 0..2_000 {
+                        let username = format!("unknown-{worker}-{attempt}");
+                        let origin = format!("198.51.{}.{}", worker + 1, attempt % 250 + 1)
+                            .parse()
+                            .unwrap();
+                        let _ = limiter.check_and_record_attempt(&username, origin);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            limiter.state_sizes(),
+            (
+                0,
+                0,
+                UNKNOWN_ADMIN_ACCOUNT_BUCKETS,
+                UNKNOWN_ADMIN_IP_BUCKETS
+            )
+        );
+    }
+
+    #[test]
+    fn exhausted_admin_account_budget_does_not_grow_origin_state() {
+        let limiter = AdminLoginLimiter::new(["admin".to_string()], 5, 1, Duration::from_secs(60));
+        assert!(limiter.check_and_record_attempt("admin", "192.0.2.1".parse().unwrap()));
+        let sizes = limiter.state_sizes();
+        assert!(!limiter.check_and_record_attempt("admin", "192.0.2.2".parse().unwrap()));
+        assert_eq!(limiter.state_sizes(), sizes);
+
+        let unknown = AdminLoginLimiter::new([], 5, 1, Duration::from_secs(60));
+        assert!(unknown.check_and_record_attempt("unknown", "198.51.100.1".parse().unwrap()));
+        let used_ip_buckets = unknown.used_unknown_ip_buckets();
+        assert!(!unknown.check_and_record_attempt("unknown", "203.0.113.1".parse().unwrap()));
+        assert_eq!(unknown.used_unknown_ip_buckets(), used_ip_buckets);
+    }
+
+    #[test]
+    fn known_admins_keep_per_origin_and_global_account_limits() {
+        let limiter = AdminLoginLimiter::new(["admin".to_string()], 2, 4, Duration::from_secs(60));
+        let first = "192.0.2.1".parse().unwrap();
+        let second = "192.0.2.2".parse().unwrap();
+        assert!(limiter.check_and_record_attempt("admin", first));
+        assert!(limiter.check_and_record_attempt("admin", first));
+        assert!(!limiter.check_and_record_attempt("admin", first));
+        assert!(limiter.check_and_record_attempt("admin", second));
+        assert!(!limiter.check_and_record_attempt("admin", second));
     }
 
     #[test]
