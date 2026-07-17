@@ -70,3 +70,31 @@ fn templates_follow_the_html_security_policy() {
         "asynchronous upload and WebAuthn feedback must expose a polite status region"
     );
 }
+
+#[test]
+fn arbitrary_html_fragment_entries_stay_removed() {
+    let sources = [
+        ("web/templates.rs", include_str!("web/templates.rs")),
+        ("web/rendering.rs", include_str!("web/rendering.rs")),
+        (
+            "web/settings_audit.rs",
+            include_str!("web/settings_audit.rs"),
+        ),
+    ];
+    let forbidden = [
+        "trusted_fragment",
+        "public_page_html",
+        "admin_page_html",
+        "plain_page(",
+        "cfg(any())",
+    ];
+
+    for (path, source) in sources {
+        for name in forbidden {
+            assert!(
+                !source.contains(name),
+                "arbitrary HTML entry {name:?} in {path}"
+            );
+        }
+    }
+}

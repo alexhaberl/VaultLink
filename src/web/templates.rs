@@ -232,20 +232,8 @@ pub(super) fn render_fragment<T: Template>(template: &T) -> Result<RenderedHtml>
     render(template).map(RenderedHtml)
 }
 
-fn trusted_fragment(html: &str) -> RenderedHtml {
-    RenderedHtml(i18n::render_markers(i18n::current_locale(), html))
-}
-
 pub(super) fn public_page<T: Template>(title: &'static str, body: &T) -> Result<String> {
     let body = render_fragment(body)?;
-    render(&PublicPageTemplate {
-        shell: public_shell(title),
-        body: &body,
-    })
-}
-
-pub(super) fn public_page_html(title: &str, body: &str) -> Result<String> {
-    let body = trusted_fragment(body);
     render(&PublicPageTemplate {
         shell: public_shell(title),
         body: &body,
@@ -261,27 +249,6 @@ pub(super) fn admin_page<T: Template>(
     show_locale_switcher: bool,
 ) -> Result<String> {
     let body = render_fragment(body)?;
-    render(&AdminPageTemplate {
-        shell: admin_shell(
-            state,
-            page,
-            show_create_link,
-            csrf_token,
-            show_locale_switcher,
-        ),
-        body: &body,
-    })
-}
-
-pub(super) fn admin_page_html(
-    state: &AppState,
-    page: PageId,
-    body: &str,
-    show_create_link: bool,
-    csrf_token: &str,
-    show_locale_switcher: bool,
-) -> Result<String> {
-    let body = trusted_fragment(body);
     render(&AdminPageTemplate {
         shell: admin_shell(
             state,

@@ -16,6 +16,7 @@ use crate::{
     AppState,
 };
 
+#[cfg(test)]
 pub(super) fn esc(s: &str) -> String {
     let mut escaped = String::with_capacity(
         escaped_html_len(s).expect("an existing string has a representable escaped length"),
@@ -242,11 +243,6 @@ pub(super) async fn set_locale(
     Ok(response)
 }
 
-pub(super) fn plain_page(title: &str, body: &str) -> String {
-    super::templates::public_page_html(title, body)
-        .expect("the public page template writes only to an in-memory string")
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NavSection {
     Files,
@@ -298,35 +294,6 @@ impl PageId {
             Self::AuditSecurity => Some(NavSection::Audit),
         }
     }
-}
-
-pub(super) fn admin_page(
-    state: &AppState,
-    page: PageId,
-    body: &str,
-    show_create_link: bool,
-    csrf_token: &str,
-) -> String {
-    admin_page_with_locale_switcher(state, page, body, show_create_link, csrf_token, true)
-}
-
-pub(super) fn admin_page_with_locale_switcher(
-    state: &AppState,
-    page: PageId,
-    body: &str,
-    show_create_link: bool,
-    csrf_token: &str,
-    show_locale_switcher: bool,
-) -> String {
-    super::templates::admin_page_html(
-        state,
-        page,
-        body,
-        show_create_link,
-        csrf_token,
-        show_locale_switcher,
-    )
-    .expect("the admin page template writes only to an in-memory string")
 }
 
 pub(super) async fn storage_has_room(state: &AppState, needed: u64) -> std::io::Result<bool> {

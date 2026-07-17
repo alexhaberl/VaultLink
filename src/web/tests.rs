@@ -30,6 +30,10 @@ use crate::{
     proxy, AppState,
 };
 use askama::Template as _;
+
+#[derive(askama::Template)]
+#[template(source = r#"<section class="vl-panel"></section>"#, ext = "html")]
+struct EmptyPanelTemplate;
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, Query, Request},
@@ -2005,13 +2009,15 @@ async fn admin_shell_renders_nav_icons_and_system_panel() {
     let data = tempfile::tempdir().unwrap();
     let state = test_state(root.path(), data.path());
     let html = i18n::scope(Locale::De, "/admin".into(), async {
-        admin_page(
+        super::templates::admin_page(
             &state,
             PageId::Files,
-            r#"<section class="vl-panel"></section>"#,
+            &EmptyPanelTemplate,
             true,
             "csrf",
+            true,
         )
+        .unwrap()
     })
     .await;
     assert!(html.contains("<title>Dateien · VaultLink</title>"));
@@ -2626,16 +2632,11 @@ async fn full_router_exposes_only_the_v2_api_namespace() {
 #[tokio::test]
 async fn file_time_uses_locale_date_order() {
     let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(60 * 60 * 20 + 32 * 60);
-    let de = i18n::scope(Locale::De, "/".into(), async { format_file_time(time) }).await;
-    let en = i18n::scope(Locale::En, "/".into(), async { format_file_time(time) }).await;
-    assert_eq!(
-        de,
-        r#"<time data-local-time datetime="1970-01-01T20:32:00Z">01.01.1970 20:32 UTC</time>"#
-    );
-    assert_eq!(
-        en,
-        r#"<time data-local-time datetime="1970-01-01T20:32:00Z">1970-01-01 20:32 UTC</time>"#
-    );
+    let utc = chrono::DateTime::<Utc>::from(time);
+    let de = i18n::scope(Locale::De, "/".into(), async { format_utc_minute(utc) }).await;
+    let en = i18n::scope(Locale::En, "/".into(), async { format_utc_minute(utc) }).await;
+    assert_eq!(de, "01.01.1970 20:32 UTC");
+    assert_eq!(en, "1970-01-01 20:32 UTC");
 }
 
 #[tokio::test]
@@ -2683,13 +2684,14 @@ fn removed_compatibility_symbols_and_html_rewrites_stay_removed() {
 
 #[test]
 fn public_preview_actions_are_rendered_above_content() {
-    let body =
-            r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><pre>long text</pre></section>"#
-                .to_string();
-    let html = i18n::render_markers(
-        Locale::De,
-        &add_public_preview_actions(&body, "/v/token", Some("/v/token/download")),
-    );
+    let body = PublicTextPreviewTemplate {
+        back_link: "/v/token",
+        download_link: "/v/token/download",
+    }
+    .render()
+    .unwrap()
+    .replace("<!--VAULTLINK_ESCAPED_TEXT_PREVIEW_STREAM-->", "long text");
+    let html = i18n::render_markers(Locale::De, &body);
     let actions = html.find("Zurück zur Freigabe").unwrap();
     let content = html.find("<pre>long text</pre>").unwrap();
     assert!(actions < content);

@@ -15,7 +15,7 @@ use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    rendering::{esc, GB, MB},
+    rendering::{GB, MB},
     AppError, Result,
 };
 use crate::{
@@ -91,15 +91,6 @@ pub(super) fn format_audit_time(value: &str) -> String {
             }
         })
         .unwrap_or_else(|_| value.to_string())
-}
-
-pub(super) fn format_file_time(value: std::time::SystemTime) -> String {
-    let utc = DateTime::<Utc>::from(value);
-    format!(
-        r#"<time data-local-time datetime="{}">{}</time>"#,
-        utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        format_utc_minute(utc),
-    )
 }
 
 pub(super) fn format_utc_minute(value: DateTime<Utc>) -> String {
@@ -252,53 +243,6 @@ pub(super) fn sort_search_hits(
     });
 }
 
-pub(super) fn file_sort_header(
-    label: &str,
-    column: FileSortColumn,
-    current_column: FileSortColumn,
-    current_direction: FileSortDirection,
-    base_url: &str,
-    path: &str,
-    search: Option<&str>,
-) -> String {
-    let active = column == current_column;
-    let next_direction = if active && current_direction == FileSortDirection::Ascending {
-        FileSortDirection::Descending
-    } else {
-        FileSortDirection::Ascending
-    };
-    let aria_sort = if active {
-        match current_direction {
-            FileSortDirection::Ascending => "ascending",
-            FileSortDirection::Descending => "descending",
-        }
-    } else {
-        "none"
-    };
-    let indicator = if active {
-        match current_direction {
-            FileSortDirection::Ascending => "↑",
-            FileSortDirection::Descending => "↓",
-        }
-    } else {
-        ""
-    };
-    let search = search
-        .map(|value| format!("&q={}", encoded(value)))
-        .unwrap_or_default();
-    let href = format!(
-        "{base_url}?path={}&sort={}&direction={}{}",
-        encoded(path),
-        file_sort_column_value(column),
-        file_sort_direction_value(next_direction),
-        search,
-    );
-    format!(
-        r#"<th aria-sort="{aria_sort}"><a class="vl-audit-sort" href="{}">{label}<span class="vl-audit-sort__indicator" aria-hidden="true">{indicator}</span></a></th>"#,
-        esc(&href)
-    )
-}
-
 pub(super) fn human(n: u64) -> String {
     let mut value = if n >= GB {
         format!("{:.1} GB", n as f64 / GB as f64)
@@ -430,36 +374,6 @@ pub(super) fn parent_path(path: &str) -> Option<String> {
         .rsplit_once('/')
         .map(|(parent, _)| parent.to_string())
         .or_else(|| Some(String::new()))
-}
-
-pub(super) fn breadcrumbs(path: &str, base_url: &str) -> String {
-    let clean = path.trim_matches('/');
-    let mut html = String::from(
-        r#"<p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href=""#,
-    );
-    html.push_str(base_url);
-    html.push_str(r#"">/</a>"#);
-    if clean.is_empty() {
-        html.push_str("</p>");
-        return html;
-    }
-    let mut current = String::new();
-    for part in clean.split('/') {
-        current = join_display(&current, part);
-        html.push_str(" / ");
-        html.push_str(&format!(
-            r#"<a class="vl-button vl-button--secondary" href="{}?path={}">{}</a>"#,
-            base_url,
-            encoded(&current),
-            esc(part)
-        ));
-    }
-    html.push_str("</p>");
-    html
-}
-
-pub(super) fn public_breadcrumbs(token: &str, path: &str) -> String {
-    breadcrumbs(path, &format!("/v/{token}"))
 }
 
 pub(super) fn preview_kind(path: &str, settings: &RuntimeSettings) -> Option<PreviewKind> {

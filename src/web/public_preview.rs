@@ -15,7 +15,6 @@ use super::{
     common::{
         encoded, human, internal, parent_path, preview_kind, public_preview_error, BrowseQuery,
     },
-    files::{media_viewer, preview_too_large_body},
     preview_zip::{
         raw_preview_response, raw_preview_secure_file_response, read_preview,
         read_preview_secure_file, PreviewContent,
@@ -23,7 +22,7 @@ use super::{
     public::{
         get_share, get_share_for_transfer, get_storage_share, get_storage_share_for_transfer,
     },
-    rendering::{esc, escaped_html_len, plain_page},
+    rendering::escaped_html_len,
     shares::PreviewRawQuery,
     transfer_runtime::{
         begin_public_transfer, check_public_transfer_availability, complete_transfer_without_body,
@@ -34,14 +33,35 @@ use super::{
 
 #[derive(Template)]
 #[template(path = "web/public/text_preview.html")]
-struct PublicTextPreviewTemplate<'a> {
-    back_link: &'a str,
-    download_link: &'a str,
+pub(super) struct PublicTextPreviewTemplate<'a> {
+    pub(super) back_link: &'a str,
+    pub(super) download_link: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "web/public/preview_too_large.html")]
+struct PublicPreviewTooLargeTemplate {
+    back_link: String,
+    download_link: String,
+    path: String,
+    message: String,
+    size: String,
+}
+
+#[derive(Template)]
+#[template(path = "web/public/media_preview.html")]
+struct PublicMediaPreviewTemplate {
+    back_link: String,
+    download_link: String,
+    size: String,
+    raw_url: String,
+    image: bool,
 }
 use crate::{
     auth,
     db::PreviewSessionCreateOutcome,
     http_auth::{current_client_limit_key, database, runtime_settings, share_is_unlocked},
+    i18n,
     policy::PreviewKind,
     AppState,
 };
@@ -60,32 +80,6 @@ pub(super) fn public_back_link(
     } else {
         format!("{public_route}?path={}", encoded(&parent))
     }
-}
-
-pub(super) fn add_public_preview_actions(
-    body: &str,
-    back_link: &str,
-    download_link: Option<&str>,
-) -> String {
-    let download = download_link
-        .map(|link| {
-            format!(
-                r#"<a class="vl-button vl-button--secondary" href="{}"><vl-i18n key="common.download"/></a>"#,
-                esc(link)
-            )
-        })
-        .unwrap_or_default();
-    const PREFIX: &str = r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1>"#;
-    let content = body
-        .strip_prefix(PREFIX)
-        .and_then(|body| body.strip_suffix("</section>"))
-        .unwrap_or(body);
-    format!(
-        r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href="{}"><vl-i18n key="share.back"/></a>{}</p>{}</section>"#,
-        esc(back_link),
-        download,
-        content
-    )
 }
 
 pub(super) fn text_preview_render_permits(max_preview_size: u64) -> u32 {
@@ -225,18 +219,18 @@ pub(crate) async fn public_preview(
         format!("{public_route}/download")
     };
     if let PreviewContent::TooLarge { size } = &content {
-        let body = preview_too_large_body(
-            &share_rel,
-            *size,
-            "File exceeds the preview limit.",
-            Some(&download_link),
-        );
-        let body = add_public_preview_actions(
-            &body,
-            &public_back_link(&public_route, &share_rel, sh.is_directory),
-            Some(&download_link),
-        );
-        return Ok(Html(plain_page("Preview", &body)).into_response());
+        let body = PublicPreviewTooLargeTemplate {
+            back_link: public_back_link(&public_route, &share_rel, sh.is_directory),
+            download_link,
+            path: share_rel,
+            message: i18n::localized_text(
+                i18n::current_locale(),
+                "File exceeds the preview limit.",
+            )
+            .into_owned(),
+            size: human(*size),
+        };
+        return Ok(Html(super::templates::public_page("Preview", &body)?).into_response());
     }
     let mut response = match content {
         PreviewContent::TooLarge { .. } => {
@@ -329,18 +323,14 @@ pub(crate) async fn public_preview(
                     encoded(&preview_token)
                 )
             };
-            let viewer = media_viewer(kind, &raw_url);
-            let body = format!(
-                r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><p class="vl-muted">{} - <vl-i18n key="files.raw_token"/></p>{}</section>"#,
-                human(size),
-                viewer
-            );
-            let body = add_public_preview_actions(
-                &body,
-                &public_back_link(&public_route, &share_rel, sh.is_directory),
-                Some(&download_link),
-            );
-            Response::new(Body::from(plain_page("Preview", &body)))
+            let body = PublicMediaPreviewTemplate {
+                back_link: public_back_link(&public_route, &share_rel, sh.is_directory),
+                download_link,
+                size: human(size),
+                raw_url,
+                image: matches!(kind, PreviewKind::Image(_)),
+            };
+            Response::new(Body::from(super::templates::public_page("Preview", &body)?))
         }
     };
     response.headers_mut().insert(

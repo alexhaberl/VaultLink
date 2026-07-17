@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Deserialize;
 
 use crate::{
@@ -28,11 +28,9 @@ use crate::{
 use super::{
     common::{
         encoded, file_sort_column, file_sort_column_value, file_sort_direction,
-        file_sort_direction_value, file_sort_header, format_file_time, format_public_date, human,
-        internal, list_directory_cursor_page, parent_path, preview_allowed, public_breadcrumbs,
-        search_tree, sort_search_hits, BrowseQuery, FileSortColumn,
+        file_sort_direction_value, format_public_date, human, internal, list_directory_cursor_page,
+        parent_path, preview_allowed, search_tree, sort_search_hits, BrowseQuery, FileSortColumn,
     },
-    rendering::{esc, plain_page},
     shares::share_permission_label,
     storage_recovery_app_error,
     templates::{self, TrustedMarkup},
@@ -47,6 +45,168 @@ use super::{
 struct ProtectedShareTemplate<'a> {
     token: &'a str,
     lock_icon: TrustedMarkup,
+}
+
+struct PublicQuotaView {
+    used: u64,
+    maximum: u64,
+    percent: u64,
+}
+
+struct PublicBreadcrumbView {
+    label: String,
+    url: String,
+}
+
+struct PublicSortHeaderView {
+    label_key: &'static str,
+    aria_sort: &'static str,
+    indicator: &'static str,
+    token: String,
+    path: String,
+    sort: &'static str,
+    direction: &'static str,
+    search: Option<String>,
+}
+
+struct PublicFileRowView {
+    name: String,
+    icon: TrustedMarkup,
+    type_label: &'static str,
+    size: String,
+    modified_datetime: Option<String>,
+    modified_label: String,
+    is_directory: bool,
+    open_url: Option<String>,
+    preview_url: Option<String>,
+    download_url: Option<String>,
+}
+
+struct PublicDirectoryView {
+    root_url: String,
+    breadcrumbs: Vec<PublicBreadcrumbView>,
+    parent_url: Option<String>,
+    path: String,
+    path_encoded: String,
+    sort: &'static str,
+    direction: &'static str,
+    search: String,
+    zip_url: String,
+    headers: Vec<PublicSortHeaderView>,
+    rows: Vec<PublicFileRowView>,
+    truncated: bool,
+    previous_cursor: Option<String>,
+    next_cursor: Option<String>,
+    search_encoded: Option<String>,
+}
+
+struct PublicFileView {
+    size: String,
+    modified_datetime: Option<String>,
+    modified_label: String,
+    preview_url: Option<String>,
+    download_url: String,
+}
+
+struct PublicUploadView {
+    heading: &'static str,
+    hide_existing: bool,
+    path: String,
+    action_url: String,
+    queue_url: String,
+    csrf: String,
+    allow_overwrite: bool,
+    upload_icon: TrustedMarkup,
+    folder_icon: TrustedMarkup,
+}
+
+#[derive(Template)]
+#[template(path = "web/public/share.html")]
+struct PublicShareTemplate {
+    token: String,
+    display_name: String,
+    public_base_url: String,
+    permission_label: &'static str,
+    password_protected: bool,
+    expiry: Option<String>,
+    quota: Option<PublicQuotaView>,
+    transport_label: &'static str,
+    upload_notice: Option<&'static str>,
+    split_layout: bool,
+    directory: Option<PublicDirectoryView>,
+    file: Option<PublicFileView>,
+    upload: Option<PublicUploadView>,
+}
+
+fn public_file_time(value: std::time::SystemTime) -> (String, String) {
+    let utc = DateTime::<Utc>::from(value);
+    (
+        utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+        super::common::format_utc_minute(utc),
+    )
+}
+
+fn public_breadcrumb_views(token: &str, path: &str) -> Vec<PublicBreadcrumbView> {
+    let mut current = String::new();
+    path.trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            current = if current.is_empty() {
+                part.to_string()
+            } else {
+                format!("{current}/{part}")
+            };
+            PublicBreadcrumbView {
+                label: part.to_string(),
+                url: format!("/v/{token}?path={}", encoded(&current)),
+            }
+        })
+        .collect()
+}
+
+fn public_sort_header_view(
+    label_key: &'static str,
+    column: FileSortColumn,
+    current_column: FileSortColumn,
+    current_direction: super::common::FileSortDirection,
+    token: &str,
+    path: &str,
+    search: Option<&str>,
+) -> PublicSortHeaderView {
+    use super::common::FileSortDirection;
+    let active = column == current_column;
+    let next_direction = if active && current_direction == FileSortDirection::Ascending {
+        FileSortDirection::Descending
+    } else {
+        FileSortDirection::Ascending
+    };
+    let aria_sort = if active {
+        match current_direction {
+            FileSortDirection::Ascending => "ascending",
+            FileSortDirection::Descending => "descending",
+        }
+    } else {
+        "none"
+    };
+    let indicator = if active {
+        match current_direction {
+            FileSortDirection::Ascending => "↑",
+            FileSortDirection::Descending => "↓",
+        }
+    } else {
+        ""
+    };
+    PublicSortHeaderView {
+        label_key,
+        aria_sort,
+        indicator,
+        token: token.to_string(),
+        path: encoded(path),
+        sort: file_sort_column_value(column),
+        direction: file_sort_direction_value(next_direction),
+        search: search.map(encoded),
+    }
 }
 
 pub(super) fn usable(sh: &Share) -> Result<()> {
@@ -263,43 +423,20 @@ pub(super) async fn public_page(
     let secure_transport = url::Url::parse(&settings.public_base_url)
         .ok()
         .is_some_and(|url| url.scheme() == "https");
-    let expiry_badge = sh
-        .expires_at
-        .map(|expires_at| {
-            format!(
-                r#"<span class="vl-badge"><vl-i18n key="public.valid_until"/> {}</span>"#,
-                format_public_date(expires_at)
-            )
-        })
-        .unwrap_or_else(|| {
-            r#"<span class="vl-badge"><vl-i18n key="share.no_expiry"/></span>"#.into()
-        });
-    let password_badge = if sh.password_hash.is_some() {
-        r#"<span class="vl-badge vl-badge--neutral"><vl-i18n key="share.password_protected"/></span>"#
-    } else {
-        ""
-    };
+    let expiry = sh.expires_at.map(format_public_date);
     let quota = sh.max_downloads.map(|maximum| {
         let value = sh
             .download_count
             .saturating_mul(100)
             .saturating_div(maximum.max(1))
             .min(100);
-        format!(r#"<div class="vl-public-quota"><span>{} <vl-i18n key="public.transfers_used_prefix"/> {} <vl-i18n key="public.transfers_used_suffix"/></span><progress class="vl-public-progress" max="100" value="{value}">{value}%</progress></div>"#, sh.download_count, maximum)
-    }).unwrap_or_default();
-    let mut body = format!(
-        r#"<section class="vl-panel vl-public-hero"><div><p class="vl-eyebrow"><vl-i18n key="share.secure"/></p><h1>{}</h1><p class="vl-muted"><vl-i18n key="public.provided_by"/> {}</p><div class="vl-share-badges"><span class="vl-badge vl-badge--accent">{}</span>{password_badge}{expiry_badge}</div></div><div>{}<p class="vl-muted">{}</p></div></section>"#,
-        esc(&display_name),
-        esc(&settings.public_base_url),
-        esc(share_permission_label(&sh.permission)),
-        quota,
-        if secure_transport {
-            i18n::text(i18n::current_locale(), i18n::HTTPS_SECURE)
-        } else {
-            i18n::text(i18n::current_locale(), i18n::LOCAL_HTTP)
-        },
-    );
-    if let Some(upload_status) = q.upload.as_deref() {
+        PublicQuotaView {
+            used: sh.download_count,
+            maximum,
+            percent: value,
+        }
+    });
+    let upload_notice = q.upload.as_deref().and_then(|upload_status| {
         let message = match upload_status {
             "replaced" => i18n::text(i18n::current_locale(), i18n::FILE_REPLACED_SUCCESS),
             "ok" => i18n::text(i18n::current_locale(), i18n::UPLOAD_COMPLETED),
@@ -312,17 +449,13 @@ pub(super) async fn public_page(
             }
             _ => "",
         };
-        if !message.is_empty() {
-            body += &format!(r#"<p class="vl-notice vl-notice--success">{message}</p>"#);
-        }
-    }
+        (!message.is_empty()).then_some(message)
+    });
     let split_layout =
         sh.is_directory && sh.permission.can_download() && sh.permission.can_upload();
-    if split_layout {
-        body += r#"<div class="vl-public-share-layout"><section class="vl-panel">"#;
-    } else if sh.is_directory && sh.permission.can_download() {
-        body += r#"<section class="vl-panel">"#;
-    }
+    let mut directory_view = None;
+    let mut file_view = None;
+    let mut upload_view = None;
     if sh.is_directory && sh.permission.can_download() {
         let sub = q.path.clone().unwrap_or_default();
         let after_cursor = q.after.clone();
@@ -378,23 +511,9 @@ pub(super) async fn public_page(
                     "Too many concurrent file searches",
                 )
             })?;
-        body += &public_breadcrumbs(&token, &clean_sub);
-        if let Some(parent) = parent_path(&clean_sub) {
-            body += &format!(
-                r#"<p><a class="vl-button vl-button--secondary" href="/v/{token}?path={}"><vl-i18n key="files.up"/></a></p>"#,
-                encoded(&parent)
-            );
-        }
-        body += &format!(
-            r#"<form method="get" class="vl-toolbar"><input type="hidden" name="path" value="{}"><input type="hidden" name="sort" value="{}"><input type="hidden" name="direction" value="{}"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="files.browse"/></span><input name="q" value="{}" placeholder="<vl-i18n key="files.search_placeholder"/>"></label><button class="vl-button"><vl-i18n key="common.search"/></button><a class="vl-button vl-button--secondary" href="/v/{token}/download.zip?path={}"><vl-i18n key="files.folder_zip"/></a></form>"#,
-            esc(&clean_sub),
-            file_sort_column_value(sort_column),
-            file_sort_direction_value(sort_direction),
-            esc(search.as_deref().unwrap_or("")),
-            encoded(&clean_sub)
-        );
         let secure_root = share_scope;
-        let mut rows = String::new();
+        let mut rows = Vec::new();
+        let mut truncated = false;
         let mut previous_cursor = None;
         let mut next_cursor = None;
         if let Some(search) = search.clone() {
@@ -415,57 +534,53 @@ pub(super) async fn public_page(
             for hit in hits {
                 let share_rel = hit.relative_path.clone();
                 let target = encoded(&share_rel);
-                let preview = if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings)
+                let open_url = if hit.entry.is_dir {
+                    Some(format!("/v/{token}?path={target}"))
+                } else {
+                    None
+                };
+                let preview_url =
+                    if !hit.entry.is_dir && preview_allowed(&hit.relative_path, &settings) {
+                        Some(format!("/v/{token}/preview?path={target}"))
+                    } else {
+                        None
+                    };
+                let download_url =
+                    (!hit.entry.is_dir).then(|| format!("/v/{token}/download?path={target}"));
+                let modified = hit.entry.modified.map(public_file_time);
+                let (modified_datetime, modified_label) = if let Some((datetime, label)) = modified
                 {
-                    format!(
-                        r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}/preview?path={target}"><vl-i18n key="common.view"/></a> "#
-                    )
+                    (Some(datetime), label)
                 } else {
-                    String::new()
+                    (None, "—".into())
                 };
-                let modified = hit
-                    .entry
-                    .modified
-                    .map(format_file_time)
-                    .unwrap_or_else(|| "—".into());
-                let name = if hit.entry.is_dir {
-                    format!(
-                        r#"{} <a href="/v/{token}?path={target}">{}</a>"#,
-                        crate::ui::icon(crate::ui::Icon::Folder),
-                        esc(&share_rel)
-                    )
-                } else {
-                    format!(
-                        "{} {}",
-                        crate::ui::icon(crate::ui::Icon::File),
-                        esc(&share_rel)
-                    )
-                };
-                rows += &format!(
-                    r#"<tr><td data-label="<vl-i18n key="common.name"/>">{name}</td><td data-label="<vl-i18n key="common.type"/>">{}</td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{modified}</td><td data-label="<vl-i18n key="common.action"/>" class="vl-inline-actions">{}{preview}</td></tr>"#,
-                    i18n::text(
+                rows.push(PublicFileRowView {
+                    name: share_rel,
+                    icon: TrustedMarkup::static_icon(if hit.entry.is_dir {
+                        crate::ui::Icon::Folder
+                    } else {
+                        crate::ui::Icon::File
+                    }),
+                    type_label: i18n::text(
                         i18n::current_locale(),
                         if hit.entry.is_dir {
                             i18n::FOLDER
                         } else {
                             i18n::FILE
-                        }
+                        },
                     ),
-                    if hit.entry.is_dir {
+                    size: if hit.entry.is_dir {
                         "—".into()
                     } else {
                         human(hit.entry.len)
                     },
-                    if hit.entry.is_dir {
-                        format!(
-                            r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}"><vl-i18n key="common.open"/></a>"#
-                        )
-                    } else {
-                        format!(
-                            r#"<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}"><vl-i18n key="common.download"/></a>"#
-                        )
-                    },
-                );
+                    modified_datetime,
+                    modified_label,
+                    is_directory: hit.entry.is_dir,
+                    open_url,
+                    preview_url,
+                    download_url,
+                });
             }
         } else {
             let scan_limit = settings.max_search_entries;
@@ -495,110 +610,85 @@ pub(super) async fn public_page(
             next_cursor = listing_page.next_cursor;
             for entry in listing_page.entries {
                 let rel = joined_relative(&clean_sub, &entry.name)?;
-                let name = esc(&entry.name);
                 let target = encoded(&rel);
-                if entry.is_dir {
-                    rows += &format!(
-                        r#"<tr><td data-label="<vl-i18n key="common.name"/>">{} <a href="/v/{token}?path={target}">{name}</a></td><td data-label="<vl-i18n key="common.type"/>"><vl-i18n key="files.folder"/></td><td data-label="<vl-i18n key="common.size"/>">—</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>"><a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}?path={target}"><vl-i18n key="common.open"/></a></td></tr>"#,
-                        crate::ui::icon(crate::ui::Icon::Folder),
-                        entry
-                            .modified
-                            .map(format_file_time)
-                            .unwrap_or_else(|| "—".into())
-                    );
+                let modified = entry.modified.map(public_file_time);
+                let (modified_datetime, modified_label) = if let Some((datetime, label)) = modified
+                {
+                    (Some(datetime), label)
                 } else {
-                    let preview = if preview_allowed(&rel, &settings) {
-                        format!(
-                            r#"<a class="vl-button vl-button--ghost vl-button--small" href="/v/{token}/preview?path={target}"><vl-i18n key="common.view"/></a> "#
-                        )
+                    (None, "—".into())
+                };
+                rows.push(PublicFileRowView {
+                    name: entry.name,
+                    icon: TrustedMarkup::static_icon(if entry.is_dir {
+                        crate::ui::Icon::Folder
                     } else {
-                        String::new()
-                    };
-                    rows += &format!(
-                        r#"<tr><td data-label="<vl-i18n key="common.name"/>">{} {name}</td><td data-label="<vl-i18n key="common.type"/>"><vl-i18n key="files.file"/></td><td data-label="<vl-i18n key="common.size"/>">{}</td><td data-label="<vl-i18n key="common.changed"/>">{}</td><td data-label="<vl-i18n key="common.action"/>" class="vl-inline-actions">{}<a class="vl-button vl-button--secondary vl-button--small" href="/v/{token}/download?path={target}"><vl-i18n key="common.download"/></a></td></tr>"#,
-                        crate::ui::icon(crate::ui::Icon::File),
-                        human(entry.len),
-                        entry
-                            .modified
-                            .map(format_file_time)
-                            .unwrap_or_else(|| "—".into()),
-                        preview,
-                    );
-                }
+                        crate::ui::Icon::File
+                    }),
+                    type_label: i18n::text(
+                        i18n::current_locale(),
+                        if entry.is_dir {
+                            i18n::FOLDER
+                        } else {
+                            i18n::FILE
+                        },
+                    ),
+                    size: if entry.is_dir {
+                        "—".into()
+                    } else {
+                        human(entry.len)
+                    },
+                    modified_datetime,
+                    modified_label,
+                    is_directory: entry.is_dir,
+                    open_url: entry.is_dir.then(|| format!("/v/{token}?path={target}")),
+                    preview_url: (!entry.is_dir && preview_allowed(&rel, &settings))
+                        .then(|| format!("/v/{token}/preview?path={target}")),
+                    download_url: (!entry.is_dir)
+                        .then(|| format!("/v/{token}/download?path={target}")),
+                });
             }
-            if listing_page.truncated {
-                rows += r#"<tr><td colspan="5" class="vl-muted"><vl-i18n key="files.scan_limit"/></td></tr>"#;
-            }
+            truncated = listing_page.truncated;
         }
-        let base_url = format!("/v/{token}");
-        let name_header = file_sort_header(
-            "<vl-i18n key=\"common.name\"/>",
-            FileSortColumn::Name,
-            sort_column,
-            sort_direction,
-            &base_url,
-            &clean_sub,
-            search.as_deref(),
-        );
-        let type_header = file_sort_header(
-            "<vl-i18n key=\"common.type\"/>",
-            FileSortColumn::Type,
-            sort_column,
-            sort_direction,
-            &base_url,
-            &clean_sub,
-            search.as_deref(),
-        );
-        let size_header = file_sort_header(
-            "<vl-i18n key=\"common.size\"/>",
-            FileSortColumn::Size,
-            sort_column,
-            sort_direction,
-            &base_url,
-            &clean_sub,
-            search.as_deref(),
-        );
-        let modified_header = file_sort_header(
-            "<vl-i18n key=\"common.changed\"/>",
-            FileSortColumn::Modified,
-            sort_column,
-            sort_direction,
-            &base_url,
-            &clean_sub,
-            search.as_deref(),
-        );
-        body += &format!(
-            "<div class=\"vl-table-wrap\"><table class=\"vl-data-table\"><thead><tr>{name_header}{type_header}{size_header}{modified_header}<th><vl-i18n key=\"common.action\"/></th></tr></thead><tbody>"
-        );
-        body += &rows;
-        body += "</tbody></table></div>";
         let encoded_sub = encoded(&clean_sub);
-        let search_param = search
-            .as_deref()
-            .map(|value| format!("&q={}", encoded(value)))
-            .unwrap_or_default();
-        let sort_param = format!(
-            "&sort={}&direction={}",
-            file_sort_column_value(sort_column),
-            file_sort_direction_value(sort_direction)
-        );
-        if let Some(cursor) = previous_cursor {
-            body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&before={}{}{}\"><vl-i18n key=\"common.back\"/></a>",
-                encoded(&cursor),
-                search_param,
-                sort_param,
-            );
-        }
-        if let Some(cursor) = next_cursor {
-            body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&after={}{}{}\"><vl-i18n key=\"common.continue\"/></a>",
-                encoded(&cursor),
-                search_param,
-                sort_param,
-            );
-        }
-        body += "</section>";
+        let search_encoded = search.as_deref().map(encoded);
+        let headers = [
+            ("common.name", FileSortColumn::Name),
+            ("common.type", FileSortColumn::Type),
+            ("common.size", FileSortColumn::Size),
+            ("common.changed", FileSortColumn::Modified),
+        ]
+        .into_iter()
+        .map(|(label, column)| {
+            public_sort_header_view(
+                label,
+                column,
+                sort_column,
+                sort_direction,
+                &token,
+                &clean_sub,
+                search.as_deref(),
+            )
+        })
+        .collect();
+        directory_view = Some(PublicDirectoryView {
+            root_url: format!("/v/{token}"),
+            breadcrumbs: public_breadcrumb_views(&token, &clean_sub),
+            parent_url: parent_path(&clean_sub)
+                .map(|parent| format!("/v/{token}?path={}", encoded(&parent))),
+            path: clean_sub.clone(),
+            path_encoded: encoded_sub.clone(),
+            sort: file_sort_column_value(sort_column),
+            direction: file_sort_direction_value(sort_direction),
+            search: search.clone().unwrap_or_default(),
+            zip_url: format!("/v/{token}/download.zip?path={encoded_sub}"),
+            headers,
+            rows,
+            truncated,
+            previous_cursor: previous_cursor.map(|cursor| encoded(&cursor)),
+            next_cursor: next_cursor.map(|cursor| encoded(&cursor)),
+            search_encoded,
+        });
     } else if !sh.is_directory && sh.permission.can_download() {
         let secure_root = state.secure_root.clone();
         let metadata_path = sh.relative_path.clone();
@@ -606,22 +696,20 @@ pub(super) async fn public_page(
             .await
             .map_err(internal)?
             .map_err(|_| AppError(StatusCode::NOT_FOUND, "Shared file unavailable"))?;
-        let preview = if preview_allowed(&sh.relative_path, &settings) {
-            format!(
-                r#"<a class="vl-button vl-button--secondary" href="/v/{token}/preview"><vl-i18n key="files.view_browser"/></a> "#
-            )
+        let modified = metadata.modified().ok().map(public_file_time);
+        let (modified_datetime, modified_label) = if let Some((datetime, label)) = modified {
+            (Some(datetime), label)
         } else {
-            String::new()
+            (None, "—".into())
         };
-        body += &format!(
-            r#"<section class="vl-panel"><p class="vl-muted">{} · <vl-i18n key="files.modified_label"/> {}</p><div class="vl-inline-actions">{}<a class="vl-button" href="/v/{token}/download"><vl-i18n key="files.download_file"/></a></div></section>"#,
-            human(metadata.len()),
-            metadata
-                .modified()
-                .map(format_file_time)
-                .unwrap_or_else(|_| "—".into()),
-            preview,
-        );
+        file_view = Some(PublicFileView {
+            size: human(metadata.len()),
+            modified_datetime,
+            modified_label,
+            preview_url: preview_allowed(&sh.relative_path, &settings)
+                .then(|| format!("/v/{token}/preview")),
+            download_url: format!("/v/{token}/download"),
+        });
     }
     if sh.is_directory && sh.permission.can_upload() {
         let upload_path = if sh.permission.can_download() {
@@ -632,42 +720,43 @@ pub(super) async fn public_page(
         } else {
             String::new()
         };
-        let overwrite_checkbox = if sh.upload_conflict_strategy.can_overwrite()
-            && state.config.storage.replacements_allowed()
-        {
-            r#"<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_existing_file"/><small><vl-i18n key="share.replace_concrete"/></small></span></label>"#
-        } else {
-            ""
-        };
-        let target_hint = if sh.permission == Permission::UploadOnly {
-            r#"<p class="vl-notice"><strong><vl-i18n key="share.existing_hidden"/></strong></p>"#
-                .to_string()
-        } else {
-            format!(
-                r#"<p class="vl-muted"><vl-i18n key="public.target_folder"/>: /{}</p>"#,
-                esc(&upload_path)
-            )
-        };
-        let panel_tag = if split_layout { "aside" } else { "section" };
-        body += &format!(
-            r#"<{panel_tag} class="vl-panel vl-upload-panel"><h2>{}</h2>{target_hint}<form method="post" enctype="multipart/form-data" action="/v/{token}/upload" class="vl-stack" data-upload-queue data-queue-endpoint="/v/{token}/upload/queue"><input type="hidden" name="path" value="{}"><input type="hidden" name="csrf" value="{}"><label class="vl-upload-dropzone" data-upload-dropzone>{}<strong><vl-i18n key="upload.drop_here"/></strong><span class="vl-muted"><vl-i18n key="upload.or_choose"/></span><input class="vl-upload-input" type="file" name="file" required data-upload-input></label><div class="vl-inline-actions"><label class="vl-button vl-button--secondary">{} <vl-i18n key="upload.folder"/><input class="vl-sr-only" type="file" webkitdirectory directory multiple data-upload-folder-input></label></div>{}<div class="vl-upload-queue" data-upload-list role="status" aria-live="polite"></div><button class="vl-button" data-upload-submit>{} <vl-i18n key="upload.securely"/></button><p class="vl-muted"><vl-i18n key="share.no_replace_help"/></p></form></{panel_tag}>"#,
-            if sh.permission == Permission::UploadOnly {
+        upload_view = Some(PublicUploadView {
+            heading: if sh.permission == Permission::UploadOnly {
                 i18n::text(i18n::current_locale(), i18n::UPLOAD_FILE)
             } else {
                 i18n::text(i18n::current_locale(), i18n::UPLOAD_FILES_PUBLIC)
             },
-            esc(&upload_path),
-            esc(upload_csrf.as_deref().unwrap_or("")),
-            crate::ui::icon(crate::ui::Icon::Upload),
-            crate::ui::icon(crate::ui::Icon::Folder),
-            overwrite_checkbox,
-            crate::ui::icon(crate::ui::Icon::Upload),
-        );
+            hide_existing: sh.permission == Permission::UploadOnly,
+            path: upload_path,
+            action_url: format!("/v/{token}/upload"),
+            queue_url: format!("/v/{token}/upload/queue"),
+            csrf: upload_csrf.unwrap_or_default(),
+            allow_overwrite: sh.upload_conflict_strategy.can_overwrite()
+                && state.config.storage.replacements_allowed(),
+            upload_icon: TrustedMarkup::static_icon(crate::ui::Icon::Upload),
+            folder_icon: TrustedMarkup::static_icon(crate::ui::Icon::Folder),
+        });
     }
-    if split_layout {
-        body += "</div>";
-    }
-    Ok(Html(plain_page("Share", &body)))
+    let body = PublicShareTemplate {
+        token,
+        display_name,
+        public_base_url: settings.public_base_url.clone(),
+        permission_label: share_permission_label(&sh.permission),
+        password_protected: sh.password_hash.is_some(),
+        expiry,
+        quota,
+        transport_label: if secure_transport {
+            i18n::text(i18n::current_locale(), i18n::HTTPS_SECURE)
+        } else {
+            i18n::text(i18n::current_locale(), i18n::LOCAL_HTTP)
+        },
+        upload_notice,
+        split_layout,
+        directory: directory_view,
+        file: file_view,
+        upload: upload_view,
+    };
+    Ok(Html(templates::public_page("Share", &body)?))
 }
 fn joined_relative(base: &str, child: &str) -> Result<String> {
     let mut path = path_security::validate_relative(base)
