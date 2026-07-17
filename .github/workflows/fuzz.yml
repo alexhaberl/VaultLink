@@ -30,6 +30,9 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
+      # Instrumented ASan/coverage linkers can use several GiB each. Keep the
+      # build fan-out independent from the four runtime fuzz workers below.
+      CARGO_BUILD_JOBS: 2
       FUZZ_JOBS: 4
       FUZZ_MAX_TOTAL_TIME: 600
     steps:
