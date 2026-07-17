@@ -32,6 +32,10 @@ impl SecureRoot {
     pub fn begin_upload(&self, directory: &str) -> io::Result<PendingUpload> {
         self.root.begin_upload(directory)
     }
+
+    pub fn begin_staged_upload(&self) -> io::Result<PendingUpload> {
+        self.root.begin_staged_upload()
+    }
 }
 
 impl SecureDirectory {
@@ -41,9 +45,21 @@ impl SecureDirectory {
             &directory,
             linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
         )?;
+        let mut pending = PendingUpload::new(
+            self.staging.as_ref().try_clone()?,
+            self.allow_replace,
+            self._storage_instance_lock.clone(),
+        )?;
+        pending.bind_destination_file(destination)?;
+        Ok(pending)
+    }
+
+    /// Allocates an upload fragment without opening or creating its eventual
+    /// destination. The caller can therefore finish quota admission before a
+    /// user-visible directory is mutated.
+    pub fn begin_staged_upload(&self) -> io::Result<PendingUpload> {
         PendingUpload::new(
             self.staging.as_ref().try_clone()?,
-            destination,
             self.allow_replace,
             self._storage_instance_lock.clone(),
         )
@@ -61,7 +77,7 @@ fn upload_destination_name(name: &str) -> io::Result<&str> {
 
 pub struct PendingUpload {
     staging: File,
-    destination: File,
+    destination: Option<File>,
     temporary_name: String,
     file: Option<File>,
     active_key: Option<ActiveUploadFragmentKey>,
@@ -76,18 +92,11 @@ pub struct PendingUpload {
 impl PendingUpload {
     fn new(
         staging: File,
-        destination: File,
         allow_replace: bool,
         storage_instance_lock: Option<Arc<crate::StorageInstanceLock>>,
     ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
 
-        if staging.metadata()?.dev() != destination.metadata()?.dev() {
-            return Err(io::Error::new(
-                io::ErrorKind::CrossesDevices,
-                "upload staging and destination must be on the same filesystem",
-            ));
-        }
         for _ in 0..16 {
             let temporary_name = upload_fragment_name();
             if !active_upload_fragment_guard().insert(temporary_name.clone()) {
@@ -112,7 +121,7 @@ impl PendingUpload {
                     let active_key = temporary_name.clone();
                     return Ok(Self {
                         staging,
-                        destination,
+                        destination: None,
                         temporary_name,
                         file: Some(file),
                         active_key: Some(active_key),
@@ -146,6 +155,40 @@ impl PendingUpload {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "upload file already taken"))
     }
 
+    /// Binds the already-staged fragment to its final directory capability.
+    /// Binding is one-shot so an admitted upload cannot silently change target.
+    pub fn bind_destination(&mut self, directory: &SecureDirectory) -> io::Result<()> {
+        self.bind_destination_file(directory.directory.as_ref().try_clone()?)
+    }
+
+    fn bind_destination_file(&mut self, destination: File) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        if self.destination.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "upload destination is already bound",
+            ));
+        }
+        if self.staging.metadata()?.dev() != destination.metadata()?.dev() {
+            return Err(io::Error::new(
+                io::ErrorKind::CrossesDevices,
+                "upload staging and destination must be on the same filesystem",
+            ));
+        }
+        self.destination = Some(destination);
+        Ok(())
+    }
+
+    fn destination(&self) -> io::Result<&File> {
+        self.destination.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "upload destination is not bound",
+            )
+        })
+    }
+
     /// Confirms that the directory capability captured before the request body
     /// still names the directory that is currently authorized by the caller.
     /// Callers must perform this check while the storage-mutation lock is held,
@@ -153,7 +196,7 @@ impl PendingUpload {
     pub fn destination_matches(&self, directory: &SecureDirectory) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
 
-        let captured = self.destination.metadata()?;
+        let captured = self.destination()?.metadata()?;
         let current = directory.directory.metadata()?;
         Ok(captured.is_dir()
             && current.is_dir()
@@ -163,19 +206,11 @@ impl PendingUpload {
     pub fn publish(&mut self, name: &str) -> io::Result<PublishOutcome> {
         let name = upload_destination_name(name)?;
         self.validate_staging_identity()?;
-        let rename = linux::rename_noreplace_between(
-            &self.staging,
-            &self.temporary_name,
-            &self.destination,
-            name,
-        );
+        let destination = self.destination()?;
+        let rename =
+            linux::rename_noreplace_between(&self.staging, &self.temporary_name, destination, name);
         if let Err(error) = rename {
-            if entry_matches_identity(
-                &self.destination,
-                name,
-                self.expected_identity,
-                EntryKind::File,
-            ) {
+            if entry_matches_identity(destination, name, self.expected_identity, EntryKind::File) {
                 tracing::warn!(%error, destination = %name, "upload rename returned an error after publication; continuing with verified identity");
             } else {
                 return Err(error);
@@ -193,19 +228,11 @@ impl PendingUpload {
         }
         let name = upload_destination_name(name)?;
         self.validate_staging_identity()?;
-        let rename = linux::rename_replace_between(
-            &self.staging,
-            &self.temporary_name,
-            &self.destination,
-            name,
-        );
+        let destination = self.destination()?;
+        let rename =
+            linux::rename_replace_between(&self.staging, &self.temporary_name, destination, name);
         if let Err(error) = rename {
-            if entry_matches_identity(
-                &self.destination,
-                name,
-                self.expected_identity,
-                EntryKind::File,
-            ) {
+            if entry_matches_identity(destination, name, self.expected_identity, EntryKind::File) {
                 tracing::warn!(%error, destination = %name, "replacement rename returned an error after publication; continuing with verified identity");
             } else {
                 return Err(error);
@@ -257,7 +284,7 @@ impl PendingUpload {
         if let Some(kind) = self.next_directory_sync_error.take() {
             return Err(io::Error::new(kind, "injected directory sync failure"));
         }
-        self.destination.sync_all()?;
+        self.destination()?.sync_all()?;
         self.staging.sync_all()
     }
 

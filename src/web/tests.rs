@@ -7235,7 +7235,14 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     );
     assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
 
-    let mut over_quota = multipart_request("/v/protected-upload/upload", "too-large.txt", b"56");
+    let mut over_quota = folder_upload_request(
+        "/v/protected-upload/upload",
+        "",
+        Some(&upload_csrf),
+        "unaccounted/directories",
+        "too-large.txt",
+        b"56",
+    );
     over_quota.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&unlock_cookie).unwrap(),
@@ -7261,6 +7268,7 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
         .unwrap();
     assert_eq!((share.uploaded_bytes, share.uploaded_files), (4, 1));
     assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+    assert!(!root.path().join("uploads/unaccounted").exists());
 
     let mut exact_quota = multipart_request("/v/protected-upload/upload", "last.txt", b"5");
     exact_quota.headers_mut().insert(
