@@ -27,7 +27,7 @@ jobs:
             runs_on: '["self-hosted", "Linux", "ARM64", "vaultlink"]'
             expected_uname: aarch64
     runs-on: ${{ fromJSON(matrix.runs_on) }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       CARGO_TERM_COLOR: always
       # Instrumented ASan/coverage linkers can use several GiB each. Keep the
