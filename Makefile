@@ -55,15 +55,15 @@ docker-smoke-build:
 	docker build -f deploy/docker/Dockerfile.setup-smoke -t $(DOCKER_SMOKE_IMAGE) .
 
 docker-test: docker-smoke-build
-	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) cargo test --locked --all-targets
+	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) cargo test --locked --all-targets
 
 docker-smoke: docker-smoke-build
-	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) cargo test --locked --all-targets
+	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) cargo test --locked --all-targets
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE)
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/api-smoke.sh
-	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) sh deploy/docker/load-fixture-smoke.sh
+	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) sh deploy/docker/load-fixture-smoke.sh
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-evidence-smoke.sh
-	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh
+	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh
 
 docker-setup-smoke: docker-smoke-build
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE)
@@ -72,10 +72,10 @@ docker-api-smoke: docker-smoke-build
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/api-smoke.sh
 
 docker-load-fixture-smoke: docker-smoke-build
-	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) sh deploy/docker/load-fixture-smoke.sh
+	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) sh deploy/docker/load-fixture-smoke.sh
 
 docker-soak-evidence-smoke: docker-smoke-build
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-evidence-smoke.sh
 
 docker-upgrade-safety-test: docker-smoke-build
-	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh
+	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh

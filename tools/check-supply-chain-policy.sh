@@ -161,11 +161,12 @@ if ! grep -F -q 'shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh' "$smoke_d
     || ! grep -F -q 'sh tools/check-supply-chain-policy.sh' "$smoke_dockerfile"; then
     report "Docker smoke build must run shell and supply-chain policy gates"
 fi
-for smoke_script in load-fixture-smoke.sh soak-evidence-smoke.sh; do
-    if ! grep -F -q "docker run --rm --network none \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/$smoke_script" Makefile; then
-        report "make docker-smoke must run $smoke_script without network access"
-    fi
-done
+if ! grep -F -q "docker run --rm --network none --user root \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/load-fixture-smoke.sh" Makefile; then
+    report "make docker-smoke must run load-fixture-smoke.sh as root without network access"
+fi
+if ! grep -F -q "docker run --rm --network none \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-evidence-smoke.sh" Makefile; then
+    report "make docker-smoke must run soak-evidence-smoke.sh as vaultlink without network access"
+fi
 
 literal_dollar='$'
 release_container_value="${literal_dollar}{{ needs.release_environment.outputs.image }}"
