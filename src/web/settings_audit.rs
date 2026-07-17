@@ -82,7 +82,7 @@ pub(super) fn settings_form(
     } else {
         format!(
             r#"<p class="vl-muted">{}</p>"#,
-            esc(&i18n::text_from_german(i18n::current_locale(), message))
+            esc(&i18n::localized_text(i18n::current_locale(), message))
         )
     };
     let purge_link = if !settings.audit_client_ip_enabled && audit_ip_count > 0 {
@@ -99,7 +99,10 @@ pub(super) fn settings_form(
         ""
     };
     let public_url_hint = if public_url_locked {
-        "Im Let's-Encrypt-Modus wird diese URL durch die statische TLS-Konfiguration festgelegt."
+        i18n::text(
+            i18n::current_locale(),
+            i18n::SETTINGS_PUBLIC_URL_LOCKED_HINT,
+        )
     } else {
         ""
     };
@@ -238,18 +241,18 @@ pub(super) async fn update_settings(
     csrf(&session, &form.csrf)?;
     let mut next = runtime_settings(&state);
     let max_upload_size =
-        parse_unit_to_bytes(&form.max_upload_size_gb, GB, "Ungültiges Uploadlimit")?.to_string();
+        parse_unit_to_bytes(&form.max_upload_size_gb, GB, "Invalid upload limit")?.to_string();
     let max_zip_size = if form.max_zip_size_gb.trim() == "0" {
         "0".to_string()
     } else {
-        parse_unit_to_bytes(&form.max_zip_size_gb, GB, "Ungültiges ZIP-Limit")?.to_string()
+        parse_unit_to_bytes(&form.max_zip_size_gb, GB, "Invalid ZIP limit")?.to_string()
     };
     let max_preview_size =
-        parse_unit_to_bytes(&form.max_preview_size_mb, MB, "Ungültiges Preview-Limit")?.to_string();
+        parse_unit_to_bytes(&form.max_preview_size_mb, MB, "Invalid preview limit")?.to_string();
     let max_media_preview_size = parse_unit_to_bytes(
         &form.max_media_preview_size_mb,
         MB,
-        "Ungültiges Media-Preview-Limit",
+        "Invalid media preview limit",
     )?
     .to_string();
     let share_password_max_length = form.share_password_max_length.unwrap_or_default();
@@ -295,7 +298,7 @@ pub(super) async fn update_settings(
         ),
     ];
     next.apply_many(entries)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Einstellung"))?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid setting"))?;
     if state.config.server.production_mode
         && url::Url::parse(&next.public_base_url)
             .ok()
@@ -303,7 +306,7 @@ pub(super) async fn update_settings(
     {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Production public_base_url muss HTTPS verwenden",
+            "Production public_base_url must use HTTPS",
         ));
     }
     let admin_id = session.admin_id;
@@ -326,7 +329,7 @@ pub(super) async fn update_settings(
             &session,
             &next,
             ip_count,
-            "Einstellungen gespeichert.",
+            "Settings saved.",
             state.config.server.mode == crate::config::ServerMode::StandaloneTls
                 && state.config.tls.certificate_source
                     == crate::config::CertificateSource::LetsEncrypt,
@@ -350,7 +353,7 @@ pub(super) async fn audit_ips_delete_confirmation(
     if runtime_settings(&state).audit_client_ip_enabled {
         return Err(AppError(
             StatusCode::CONFLICT,
-            "IP-Erfassung muss vor dem Löschen deaktiviert werden",
+            "IP capture must be disabled before deletion",
         ));
     }
     let count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
@@ -377,7 +380,7 @@ pub(super) async fn delete_audit_ips_ui(
     if form.confirmation != "IP-DATEN LÖSCHEN" {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Exakte Bestätigung IP-DATEN LÖSCHEN erforderlich",
+            "Exact confirmation IP-DATEN LÖSCHEN required",
         ));
     }
     let fallback_logging_enabled = runtime_settings(&state).audit_client_ip_enabled;
@@ -391,7 +394,7 @@ pub(super) async fn delete_audit_ips_ui(
     let AuditClientIpDeletionOutcome::Deleted(_) = outcome else {
         return Err(AppError(
             StatusCode::CONFLICT,
-            "IP-Erfassung muss vor dem Löschen deaktiviert werden",
+            "IP capture must be disabled before deletion",
         ));
     };
     Ok(Redirect::to("/admin/settings"))

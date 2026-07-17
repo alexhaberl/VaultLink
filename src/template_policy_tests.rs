@@ -51,16 +51,11 @@ fn templates_follow_the_html_security_policy() {
             let tag = &rest[..end];
             assert!(tag.contains(" src="), "inline script in {}", path.display());
         }
-        for expression in source.match_indices("|safe") {
-            let start = source[..expression.0].rfind("{{").unwrap_or(expression.0);
-            let context = &source[start..expression.0];
-            assert!(
-                context.contains("icon") || context.contains("qr") || context.contains("brand"),
-                "unauthorized safe filter in {}: {}",
-                path.display(),
-                context
-            );
-        }
+        assert!(
+            !source.contains("|safe"),
+            "safe filters are forbidden; use the closed TrustedMarkup type in {}",
+            path.display()
+        );
         stream_markers += source
             .matches("<!--VAULTLINK_ESCAPED_TEXT_PREVIEW_STREAM-->")
             .count();

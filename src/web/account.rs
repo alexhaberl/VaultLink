@@ -12,7 +12,7 @@ use super::common::webauthn_start_response;
 use super::{
     common::{decode_security_keys, format_utc_minute, internal, otpauth_url, qr_svg},
     rendering::PageId,
-    templates::admin_page as render_admin_page,
+    templates::{admin_page as render_admin_page, TrustedMarkup},
     AppError, Result,
 };
 use crate::{
@@ -50,7 +50,7 @@ struct AccountTemplate<'a> {
 #[derive(Template)]
 #[template(path = "web/account/mfa_enrollment.html")]
 struct MfaEnrollmentTemplate<'a> {
-    qr: &'a str,
+    qr: &'a TrustedMarkup,
     secret: &'a str,
     otpauth: &'a str,
     expires_at: &'a str,
@@ -76,20 +76,20 @@ pub(super) async fn start_security_key_registration(
     if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele Passwortversuche",
+            "Too many password attempts",
         ));
     }
     let label = body.label.trim();
     if label.is_empty() || label.chars().count() > 80 {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Ungültiger Schlüsselname",
+            "Invalid security-key label",
         ));
     }
     let username = session.username.clone();
     let admin = database(state.db.clone(), move |db| db.admin(&username))
         .await?
-        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let password_hash = admin.password_hash;
     let current_password = body.current_password;
     if current_password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
@@ -101,7 +101,7 @@ pub(super) async fn start_security_key_registration(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     let password_valid =
         verify_password_admitted(&state, Some(password_hash), current_password).await?;
@@ -114,7 +114,7 @@ pub(super) async fn start_security_key_registration(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     // Successful password reauthentication remains rate-limited.
     let admin_id = session.admin_id;
@@ -150,19 +150,14 @@ pub(super) async fn finish_security_key_registration(
     if label.is_empty() || label.chars().count() > 80 {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Ungültiger Schlüsselname",
+            "Invalid security-key label",
         ));
     }
     let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
     let webauthn = crate::http_auth::webauthn_service(&state)?;
     let key = webauthn
         .finish_registration(&token, session.admin_id, &body.credential)
-        .map_err(|_| {
-            AppError(
-                StatusCode::BAD_REQUEST,
-                "Ungültige Sicherheitsschlüssel-Antwort",
-            )
-        })?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid security-key response"))?;
     let credential_id =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.credential_id());
     let credential_blob = key.to_blob().map_err(internal)?;
@@ -190,13 +185,10 @@ pub(super) async fn finish_security_key_registration(
         if error.status == StatusCode::SERVICE_UNAVAILABLE {
             return AppError::from(error);
         }
-        AppError(
-            StatusCode::CONFLICT,
-            "Sicherheitsschlüssel ist bereits registriert",
-        )
+        AppError(StatusCode::CONFLICT, "Security key is already registered")
     })?;
     if registration == AdminWebauthnCredentialRegistrationOutcome::SessionUnavailable {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"));
     }
     Ok(Json(serde_json::json!({"redirect":"/admin/account"})))
 }
@@ -220,13 +212,13 @@ pub(super) async fn delete_security_key(
     if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele Passwortversuche",
+            "Too many password attempts",
         ));
     }
     let username = session.username.clone();
     let admin = database(state.db.clone(), move |db| db.admin(&username))
         .await?
-        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let expected_password_hash = admin.password_hash;
     let expected_totp_secret = admin.totp_secret;
     let expected_totp_generation = admin.totp_generation;
@@ -241,7 +233,7 @@ pub(super) async fn delete_security_key(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     let password_valid =
         verify_password_admitted(&state, Some(expected_password_hash.clone()), password).await?;
@@ -254,7 +246,7 @@ pub(super) async fn delete_security_key(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     let totp_step = if totp_enabled {
         form.current_code.as_ref().and_then(|code| {
@@ -272,7 +264,7 @@ pub(super) async fn delete_security_key(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     // Successful password reauthentication remains rate-limited.
     let admin_id = session.admin_id;
@@ -311,12 +303,11 @@ pub(super) async fn delete_security_key(
                 None,
             )
             .await;
-            Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"))
+            Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"))
         }
-        AdminWebauthnCredentialDeletionOutcome::NotDeleted => Err(AppError(
-            StatusCode::CONFLICT,
-            "Sicherheitsschlüssel nicht gefunden",
-        )),
+        AdminWebauthnCredentialDeletionOutcome::NotDeleted => {
+            Err(AppError(StatusCode::CONFLICT, "Security key not found"))
+        }
     }
 }
 
@@ -384,19 +375,19 @@ pub(super) async fn set_account_totp(
     if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele Passwortversuche",
+            "Too many password attempts",
         ));
     }
     let username = session.username.clone();
     let admin = database(state.db.clone(), move |db| db.admin(&username))
         .await?
-        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let expected_password_hash = admin.password_hash;
     let expected_totp_secret = admin.totp_secret;
     let expected_totp_generation = admin.totp_generation;
     let password = form.current_password;
     if password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     let password_valid =
         verify_password_admitted(&state, Some(expected_password_hash.clone()), password).await?;
@@ -409,7 +400,7 @@ pub(super) async fn set_account_totp(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     let totp_step = if form.enabled {
         None
@@ -427,7 +418,7 @@ pub(super) async fn set_account_totp(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     let admin_id = session.admin_id;
     let enabled = form.enabled;
@@ -452,7 +443,7 @@ pub(super) async fn set_account_totp(
         }
         AdminTotpSettingOutcome::InsufficientSecurityKeys => Err(AppError(
             StatusCode::CONFLICT,
-            "Mindestens zwei Sicherheitsschlüssel erforderlich",
+            "At least two security keys are required",
         )),
         AdminTotpSettingOutcome::ReauthenticationRejected
         | AdminTotpSettingOutcome::TotpRejected => {
@@ -464,7 +455,7 @@ pub(super) async fn set_account_totp(
                 None,
             )
             .await;
-            Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"))
+            Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"))
         }
     }
 }
@@ -488,24 +479,24 @@ pub(super) async fn change_account_password(
     if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele Passwortversuche",
+            "Too many password attempts",
         ));
     }
 
     let username = session.username.clone();
     let admin = database(state.db.clone(), move |db| db.admin(&username))
         .await?
-        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let expected_hash = admin.password_hash.clone();
     let verification_hash = expected_hash.clone();
     let current_password = form.current_password;
     if current_password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     let current_password_valid =
         verify_password_admitted(&state, Some(verification_hash), current_password).await?;
     if !current_password_valid {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     // Successful password reauthentication remains rate-limited.
 
@@ -513,15 +504,12 @@ pub(super) async fn change_account_password(
         .new_password
         .matches_confirmation(&form.password_confirm)
     {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Passwörter stimmen nicht überein",
-        ));
+        return Err(AppError(StatusCode::BAD_REQUEST, "Passwords do not match"));
     }
     if !auth::valid_admin_password(form.new_password.expose_secret()) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Passwort muss mindestens 14 und darf höchstens 256 Zeichen enthalten",
+            "Password must contain at least 14 and at most 256 characters",
         ));
     }
     drop(form.password_confirm);
@@ -546,12 +534,11 @@ pub(super) async fn change_account_password(
             "/login",
             &clear_session_cookie(&state),
         )?),
-        AdminPasswordChangeOutcome::StalePassword => Err(AppError(
-            StatusCode::CONFLICT,
-            "Kontoänderung fehlgeschlagen.",
-        )),
+        AdminPasswordChangeOutcome::StalePassword => {
+            Err(AppError(StatusCode::CONFLICT, "Account change failed."))
+        }
         AdminPasswordChangeOutcome::Inactive | AdminPasswordChangeOutcome::NotFound => {
-            Err(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))
+            Err(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))
         }
     }
 }
@@ -574,18 +561,18 @@ pub(super) async fn start_account_mfa(
     if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele MFA-Versuche",
+            "Too many MFA attempts",
         ));
     }
 
     let username = session.username.clone();
     let admin = database(state.db.clone(), move |db| db.admin(&username))
         .await?
-        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
+        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let verification_hash = admin.password_hash;
     let current_password = form.current_password;
     if current_password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     let current_password_valid =
         verify_password_admitted(&state, Some(verification_hash), current_password).await?;
@@ -598,7 +585,7 @@ pub(super) async fn start_account_mfa(
         })
         .flatten();
     let Some(totp_step) = totp_step else {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     };
     // Successful password reauthentication remains rate-limited.
 
@@ -623,10 +610,10 @@ pub(super) async fn start_account_mfa(
         AuditedAdminMfaEnrollmentStartOutcome::Started { expires_at } => expires_at,
         AuditedAdminMfaEnrollmentStartOutcome::AdminInactive
         | AuditedAdminMfaEnrollmentStartOutcome::AdminNotFound => {
-            return Err(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"));
+            return Err(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"));
         }
         AuditedAdminMfaEnrollmentStartOutcome::TotpRejected => {
-            return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+            return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
         }
     };
     let expires_at = DateTime::parse_from_rfc3339(&expires_at)
@@ -667,16 +654,13 @@ pub(super) async fn confirm_account_mfa(
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
     if form.enrollment_token.is_empty() || form.enrollment_token.len() > 256 {
-        return Err(AppError(
-            StatusCode::BAD_REQUEST,
-            "Kontoänderung fehlgeschlagen.",
-        ));
+        return Err(AppError(StatusCode::BAD_REQUEST, "Account change failed."));
     }
     let limiter_key = format!("account-mfa-confirm:{}", session.admin_id);
     if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele MFA-Versuche",
+            "Too many MFA attempts",
         ));
     }
     let admin_id = session.admin_id;
@@ -685,15 +669,12 @@ pub(super) async fn confirm_account_mfa(
         db.admin_mfa_enrollment(admin_id, &lookup_token)
     })
     .await?
-    .ok_or(AppError(
-        StatusCode::CONFLICT,
-        "Kontoänderung fehlgeschlagen.",
-    ))?;
+    .ok_or(AppError(StatusCode::CONFLICT, "Account change failed."))?;
     let Some(totp_step) = auth::matching_totp_step_now(
         enrollment.totp_secret.expose_secret(),
         form.code.expose_secret(),
     ) else {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid MFA code"));
     };
     let activation_token = form.enrollment_token;
     let audit_client_ip = runtime_settings(&state)
@@ -718,9 +699,8 @@ pub(super) async fn confirm_account_mfa(
                 &clear_session_cookie(&state),
             )?)
         }
-        AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired => Err(AppError(
-            StatusCode::CONFLICT,
-            "Kontoänderung fehlgeschlagen.",
-        )),
+        AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired => {
+            Err(AppError(StatusCode::CONFLICT, "Account change failed."))
+        }
     }
 }

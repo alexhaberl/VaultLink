@@ -218,11 +218,11 @@ pub(super) async fn set_locale(
     if supplied.as_ref().map(url::Url::origin) != Some(expected.origin()) {
         return Err(AppError(
             StatusCode::FORBIDDEN,
-            "Cross-Site-Sprachwechsel abgelehnt",
+            "Cross-site locale change rejected",
         ));
     }
-    let locale = Locale::parse(&form.locale)
-        .ok_or(AppError(StatusCode::BAD_REQUEST, "Ungültige Sprache"))?;
+    let locale =
+        Locale::parse(&form.locale).ok_or(AppError(StatusCode::BAD_REQUEST, "Invalid language"))?;
     let return_to = safe_internal_return_to(&form.return_to);
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000;{}",

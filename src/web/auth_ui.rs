@@ -41,7 +41,7 @@ struct MfaTemplate<'a> {
 }
 
 pub(super) async fn login_page() -> Result<Html<String>> {
-    Ok(Html(public_page("Login", &LoginTemplate)?))
+    Ok(Html(public_page("Sign in", &LoginTemplate)?))
 }
 
 #[derive(Deserialize)]
@@ -59,7 +59,7 @@ pub(super) async fn login(
     if !admin_login_attempt_admitted(&state, &form.username) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele Anmeldeversuche",
+            "Too many sign-in attempts",
         ));
     }
     let attempted_username = form.username.clone();
@@ -80,7 +80,7 @@ pub(super) async fn login(
     .await?;
     if outcome == PasswordLoginOutcome::InvalidCredentials {
         audit_observation(&state, attempted_username, "login_failed", None, None).await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     // Successful password verifications remain in the fixed window as well. This
     // bounds Argon2 work, pre-MFA session creation and audit growth for valid but
@@ -134,7 +134,7 @@ pub(super) async fn mfa(
     if !state.limiter.check_and_record_attempt(&key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele MFA-Versuche",
+            "Too many MFA attempts",
         ));
     }
     let new_token = auth::random_token(32);
@@ -156,11 +156,11 @@ pub(super) async fn mfa(
         TotpLoginOutcome::Created => {}
         TotpLoginOutcome::InvalidCode => {
             audit_observation(&state, s.username, "mfa_failed", None, None).await;
-            return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
+            return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid MFA code"));
         }
         TotpLoginOutcome::ReplayedOrStale => {
             audit_observation(&state, s.username, "mfa_replayed", None, None).await;
-            return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiger MFA-Code"));
+            return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid MFA code"));
         }
     }
     state.limiter.success(&key);
@@ -180,7 +180,7 @@ pub(super) async fn start_security_key_authentication(
     if session.mfa_verified {
         return Err(AppError(
             StatusCode::CONFLICT,
-            "MFA wurde bereits bestätigt",
+            "MFA has already been verified",
         ));
     }
     csrf(&session, &body.csrf)?;
@@ -188,7 +188,7 @@ pub(super) async fn start_security_key_authentication(
     if !state.limiter.check_and_record_attempt(&start_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele Sicherheitsschluessel-Anfragen",
+            "Too many security-key requests",
         ));
     }
     let admin_id = session.admin_id;
@@ -199,7 +199,7 @@ pub(super) async fn start_security_key_authentication(
     if rows.len() < 2 {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Kein Sicherheitsschlüssel registriert",
+            "No security key is registered",
         ));
     }
     let keys = decode_security_keys(&rows)?;
@@ -223,7 +223,7 @@ pub(super) async fn finish_security_key_authentication(
     if session.mfa_verified {
         return Err(AppError(
             StatusCode::CONFLICT,
-            "MFA wurde bereits bestätigt",
+            "MFA has already been verified",
         ));
     }
     csrf(&session, &body.csrf)?;
@@ -231,7 +231,7 @@ pub(super) async fn finish_security_key_authentication(
     if !state.limiter.check_and_record_attempt(&attempt_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele MFA-Versuche",
+            "Too many MFA attempts",
         ));
     }
     let admin_id = session.admin_id;
@@ -243,7 +243,7 @@ pub(super) async fn finish_security_key_authentication(
     let webauthn = crate::http_auth::webauthn_service(&state)?;
     let index = webauthn
         .finish_authentication(&token, admin_id, &body.credential, &mut keys)
-        .map_err(|_| AppError(StatusCode::UNAUTHORIZED, "Ungültiger Sicherheitsschlüssel"))?;
+        .map_err(|_| AppError(StatusCode::UNAUTHORIZED, "Invalid security key"))?;
     let row = rows.get(index).ok_or_else(|| internal(()))?;
     let credential_id = row.id;
     let expected_credential_blob = row.credential_blob.clone();
@@ -270,7 +270,7 @@ pub(super) async fn finish_security_key_authentication(
     if !completed {
         return Err(AppError(
             StatusCode::CONFLICT,
-            "Sicherheitsschlüssel wurde gleichzeitig geändert",
+            "Security key changed concurrently",
         ));
     }
     state.limiter.success(&attempt_key);

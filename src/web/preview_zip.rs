@@ -578,12 +578,11 @@ impl Stream for ReservedZipStream {
 
 pub(super) fn zip_error(error: &ZipBuildError) -> AppError {
     match error {
-        ZipBuildError::Limit(_) => AppError(StatusCode::PAYLOAD_TOO_LARGE, "ZIP-Limit erreicht"),
-        ZipBuildError::Source(_) => AppError(StatusCode::NOT_FOUND, "ZIP-Quelle nicht verfügbar"),
-        ZipBuildError::Output(_) => AppError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ZIP-Erstellung fehlgeschlagen",
-        ),
+        ZipBuildError::Limit(_) => AppError(StatusCode::PAYLOAD_TOO_LARGE, "ZIP limit reached"),
+        ZipBuildError::Source(_) => AppError(StatusCode::NOT_FOUND, "ZIP source unavailable"),
+        ZipBuildError::Output(_) => {
+            AppError(StatusCode::INTERNAL_SERVER_ERROR, "ZIP creation failed")
+        }
     }
 }
 
@@ -763,7 +762,7 @@ pub(super) async fn raw_preview_response<D: DirectoryAccess>(
     let file = tokio::task::spawn_blocking(move || secure_root.open_regular_file(&open_path))
         .await
         .map_err(internal)?
-        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar"))?;
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "File unavailable"))?;
     raw_preview_opened_response(file, method, headers, relative_file, kind, max_size).await
 }
 
@@ -795,14 +794,14 @@ async fn raw_preview_opened_response(
     max_size: u64,
 ) -> Result<Response> {
     if !file.metadata().map_err(internal)?.is_file() {
-        return Err(AppError(StatusCode::BAD_REQUEST, "Keine Datei"));
+        return Err(AppError(StatusCode::BAD_REQUEST, "Not a file"));
     }
     let mut f = tokio::fs::File::from_std(file);
     let length = f.metadata().await.map_err(internal)?.len();
     if length > max_size {
         return Err(AppError(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "Vorschau-Limit erreicht",
+            "Preview limit reached",
         ));
     }
     let range = match headers.get(header::RANGE) {

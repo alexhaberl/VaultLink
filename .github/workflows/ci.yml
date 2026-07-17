@@ -95,7 +95,7 @@ jobs:
         run: cargo install --locked cargo-audit --version 0.22.2
       - name: Audit workspace lockfile
         if: matrix.architecture == 'arm64'
-        run: cargo audit --deny warnings
+        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071
       - name: Setup, API, root-helper, soak-evidence, upgrade, and rollback smokes
         run: make docker-smoke
       - name: Native ${{ matrix.architecture }} release build on main

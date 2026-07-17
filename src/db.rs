@@ -419,6 +419,81 @@ pub struct Share {
     pub upload_policy_epoch: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShareListStatus {
+    #[default]
+    All,
+    Active,
+    Protected,
+    Expired,
+    LimitReached,
+    Inactive,
+}
+
+impl ShareListStatus {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "active" => Some(Self::Active),
+            "protected" => Some(Self::Protected),
+            "expired" => Some(Self::Expired),
+            "limit" => Some(Self::LimitReached),
+            "inactive" => Some(Self::Inactive),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Protected => "protected",
+            Self::Expired => "expired",
+            Self::LimitReached => "limit",
+            Self::Inactive => "inactive",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShareListSort {
+    #[default]
+    Newest,
+    Oldest,
+}
+
+impl ShareListSort {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "newest" => Some(Self::Newest),
+            "oldest" => Some(Self::Oldest),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ShareListOptions {
+    pub query: Option<String>,
+    pub status: ShareListStatus,
+    pub sort: ShareListSort,
+    pub cursor: Option<i64>,
+    pub limit: usize,
+    pub now: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharePage {
+    pub shares: Vec<Share>,
+    pub next_cursor: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShareSummary {
+    pub available: usize,
+    pub protected: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct AuditEvent {
     pub occurred_at: String,

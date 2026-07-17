@@ -136,8 +136,8 @@ fn public_preview_back_link_returns_share_parent() {
         "/v/tok?path=folder"
     );
     assert_eq!(
-        public_back_link("/api/v1/public/shares/tok", "folder/file.txt", true),
-        "/api/v1/public/shares/tok?path=folder"
+        public_back_link("/api/v2/public/shares/tok", "folder/file.txt", true),
+        "/api/v2/public/shares/tok?path=folder"
     );
 }
 
@@ -441,7 +441,7 @@ async fn absolute_body_deadline_stops_a_body_that_never_yields() {
     assert!(error.to_string().contains("deadline"));
     assert!(!upload_request_path("/login"));
     assert!(upload_request_path("/v/token/upload"));
-    assert!(upload_request_path("/api/v1/public/shares/token/upload"));
+    assert!(upload_request_path("/api/v2/public/shares/token/upload"));
 }
 
 #[tokio::test]
@@ -1106,7 +1106,7 @@ async fn upload_routes_reject_multipart_headers_before_the_parser_can_buffer_the
 
     let mut missing_content_type = Request::builder()
         .method(Method::POST)
-        .uri("/api/v1/public/shares/missing/upload")
+        .uri("/api/v2/public/shares/missing/upload")
         .body(Body::empty())
         .unwrap();
     missing_content_type.extensions_mut().insert(ConnectInfo(
@@ -1228,6 +1228,20 @@ fn filtered_directory_items_consume_listing_search_and_zip_budgets() {
     let (entries, truncated) = list_directory_page(&scope, "", 0, 1).unwrap();
     assert!(entries.is_empty());
     assert!(truncated);
+    let cursor_page = list_directory_cursor_page(
+        &scope,
+        "",
+        None,
+        None,
+        1,
+        FileSortColumn::Name,
+        FileSortDirection::Ascending,
+    )
+    .unwrap();
+    assert!(cursor_page.entries.is_empty());
+    assert!(cursor_page.truncated);
+    assert_eq!(cursor_page.scanned, 1);
+    assert!(cursor_page.peak_retained <= 101);
     assert!(search_tree(&scope, "", "missing", &settings)
         .unwrap()
         .is_empty());
@@ -1455,7 +1469,7 @@ fn api_share_strategy_request(
 ) -> Request {
     let mut request = Request::builder()
         .method(Method::PATCH)
-        .uri(format!("/api/v1/shares/{share_id}"))
+        .uri(format!("/api/v2/shares/{share_id}"))
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, format!("vaultlink_session={session_token}"))
         .header("x-csrf-token", csrf_token)
@@ -1825,9 +1839,30 @@ fn missing_session_error_redirects_to_login() {
 
 #[test]
 fn invalid_credentials_remain_an_error() {
-    let response = AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten").into_response();
+    let response = AppError(StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(response.headers().get(header::LOCATION).is_none());
+}
+
+#[tokio::test]
+async fn english_backend_capacity_message_is_localized_only_at_the_ui_boundary() {
+    assert_eq!(
+        crate::http_auth::ARGON2_BUSY_MESSAGE,
+        "Password processing temporarily unavailable"
+    );
+    let german = i18n::scope(Locale::De, "/login".into(), async {
+        response_text(
+            AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::http_auth::ARGON2_BUSY_MESSAGE,
+            )
+            .into_response(),
+        )
+        .await
+    })
+    .await;
+    assert!(german.contains("Passwortverarbeitung vorübergehend nicht verfügbar"));
+    assert!(!german.contains(crate::http_auth::ARGON2_BUSY_MESSAGE));
 }
 
 #[test]
@@ -2133,12 +2168,16 @@ async fn queue_errors_localize_message_without_changing_machine_code() {
 
 #[tokio::test]
 async fn queue_reports_required_audit_failures_with_stable_machine_code() {
-    let response = upload_queue_error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE,
-    );
+    let response = i18n::scope(Locale::De, "/admin".into(), async {
+        upload_queue_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE,
+        )
+    })
+    .await;
     let body = response_text(response).await;
     assert!(body.contains(r#""code":"audit_unavailable""#));
+    assert!(body.contains("Sicherheitsprotokoll vorübergehend nicht verfügbar"));
 }
 
 #[test]
@@ -2536,6 +2575,61 @@ async fn versioned_assets_are_immutable_and_app_javascript_is_cached_per_locale(
     }))
     .await;
     assert!(response_text(english).await.contains("Copied"));
+}
+
+#[tokio::test]
+async fn full_router_preserves_asset_cache_policy_and_keeps_pages_no_store() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let app = router(test_state(root.path(), data.path()));
+
+    let asset = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            &format!("/assets/app.js?v={ASSET_VERSION}&lang=en"),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        asset.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static(
+            "public, max-age=31536000, immutable"
+        ))
+    );
+
+    let page = app
+        .oneshot(request(Method::GET, "/login", ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+}
+
+#[tokio::test]
+async fn full_router_exposes_only_the_v2_api_namespace() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let app = router(test_state(root.path(), data.path()));
+    let removed = format!("/api/{}/health", "v1");
+    assert_eq!(
+        app.clone()
+            .oneshot(request(Method::GET, &removed, ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.oneshot(request(Method::GET, "/api/v2/health", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -4665,7 +4759,7 @@ async fn upload_only_never_exposes_target_paths_or_existing_content() {
     );
 
     let api_body = response_text(
-        app.oneshot(request(Method::GET, "/api/v1/public/shares/drop-token", ""))
+        app.oneshot(request(Method::GET, "/api/v2/public/shares/drop-token", ""))
             .await
             .unwrap(),
     )
@@ -5876,7 +5970,7 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
         .oneshot(range_request(Method::HEAD, &raw_image_uri, None))
         .await
         .unwrap();
-    assert_eq!(head_image.status(), StatusCode::OK);
+    assert_eq!(head_image.status(), StatusCode::GONE);
     let bad_range = app
         .clone()
         .oneshot(range_request(
@@ -5886,14 +5980,14 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
         ))
         .await
         .unwrap();
-    assert_eq!(bad_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(bad_range.status(), StatusCode::GONE);
     assert_eq!(
         app.clone()
             .oneshot(request(Method::GET, "/v/media/preview?path=image.png", ""))
             .await
             .unwrap()
             .status(),
-        StatusCode::OK
+        StatusCode::GONE
     );
     assert_eq!(
         app.clone()
@@ -7349,7 +7443,7 @@ async fn api_upload_route_can_stream_beyond_the_buffered_body_limit() {
     let content = vec![b'x'; DEFAULT_REQUEST_BODY_LIMIT + 64 * 1024];
     let response = app
         .oneshot(multipart_request(
-            "/api/v1/public/shares/large-upload/upload",
+            "/api/v2/public/shares/large-upload/upload",
             "large.bin",
             &content,
         ))
@@ -7362,7 +7456,7 @@ async fn api_upload_route_can_stream_beyond_the_buffered_body_limit() {
         .unwrap()
         .to_str()
         .unwrap()
-        .starts_with("/api/v1/public/shares/large-upload"));
+        .starts_with("/api/v2/public/shares/large-upload"));
     assert_eq!(
         std::fs::metadata(root.path().join("uploads/large.bin"))
             .unwrap()

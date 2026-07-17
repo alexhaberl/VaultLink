@@ -40,6 +40,11 @@ pub(super) fn usable(share: &Share) -> ApiResult<()> {
             "share_expired",
             "Share has expired",
         )),
+        ShareAvailability::LimitReached => Err(ApiError::new(
+            StatusCode::GONE,
+            "share_limit_reached",
+            "Share transfer limit has been reached",
+        )),
     }
 }
 

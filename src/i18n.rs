@@ -178,6 +178,8 @@ catalog! {
     MFA_REQUIRED, "error.mfa_required", "MFA-Verifikation erforderlich", "MFA verification required";
     INTERNAL_ERROR, "error.internal", "Interner Fehler", "Internal error";
     INVALID_LANGUAGE, "error.invalid_language", "Ungültige Sprache", "Invalid language";
+    AUDIT_TEMPORARILY_UNAVAILABLE, "error.audit_unavailable", "Sicherheitsprotokoll vorübergehend nicht verfügbar", "Security audit log temporarily unavailable";
+    PASSWORD_PROCESSING_UNAVAILABLE, "error.password_processing_unavailable", "Passwortverarbeitung vorübergehend nicht verfügbar", "Password processing temporarily unavailable";
 
     SETUP_TITLE, "setup.title", "VaultLink Setup", "VaultLink Setup";
     SETUP_INITIAL_SETUP, "setup.initial_setup", "Ersteinrichtung", "Initial setup";
@@ -766,6 +768,11 @@ catalog! {
     TEMPLATE_RENDER_FAILED, "error.template_render", "Template konnte nicht gerendert werden", "Template could not be rendered";
     STORAGE_STATE_RECOVERING, "error.storage_recovering", "Speicherzustand wird wiederhergestellt", "Storage state is being recovered";
     UPLOAD_LIMIT_IN_USE, "error.upload_limit_in_use", "Uploadlimit wird von laufenden Uploads belegt", "Upload capacity is in use by active uploads";
+    CROSS_SITE_LOCALE_REJECTED, "error.cross_site_locale", "Cross-Site-Sprachwechsel abgelehnt", "Cross-site locale change rejected";
+    INVALID_CUMULATIVE_UPLOAD_LIMITS, "error.invalid_cumulative_upload_limits", "Ungültige kumulative Uploadlimits", "Invalid cumulative upload limits";
+    INVALID_DIRECTORY_CURSOR, "error.invalid_directory_cursor", "Ungültiger Verzeichnis-Cursor", "Invalid directory cursor";
+    DIRECTORY_CURSOR_WITH_SEARCH, "error.directory_cursor_with_search", "Verzeichnis-Cursor können nicht mit der Suche kombiniert werden", "Directory cursors cannot be combined with search";
+    SETTINGS_PUBLIC_URL_LOCKED_HINT, "settings.public_url_locked_hint", "Im Let's-Encrypt-Modus wird diese URL durch die statische TLS-Konfiguration festgelegt.", "In Let's Encrypt mode, this URL is determined by the static TLS configuration.";
 }
 
 pub fn text(locale: Locale, key: MessageKey) -> &'static str {
@@ -778,14 +785,21 @@ pub fn text(locale: Locale, key: MessageKey) -> &'static str {
     }
 }
 
-pub fn text_from_german<'a>(locale: Locale, source: &'a str) -> Cow<'a, str> {
-    catalog_by_german()
+pub fn localized_text<'a>(locale: Locale, source: &'a str) -> Cow<'a, str> {
+    catalog_by_english()
         .get(source)
+        .or_else(|| catalog_by_german().get(source))
         .map(|entry| match locale {
             Locale::De => Cow::Borrowed(entry.de),
             Locale::En => Cow::Borrowed(entry.en),
         })
         .unwrap_or_else(|| Cow::Borrowed(source))
+}
+
+/// Compatibility helper for older UI assembly code. New non-UI feedback uses
+/// English source strings and calls [`localized_text`] at the HTML boundary.
+pub fn text_from_german<'a>(locale: Locale, source: &'a str) -> Cow<'a, str> {
+    localized_text(locale, source)
 }
 
 fn catalog_by_key() -> &'static HashMap<&'static str, &'static CatalogEntry> {
@@ -801,6 +815,20 @@ fn catalog_by_key() -> &'static HashMap<&'static str, &'static CatalogEntry> {
 fn catalog_by_german() -> &'static HashMap<&'static str, &'static CatalogEntry> {
     static INDEX: OnceLock<HashMap<&'static str, &'static CatalogEntry>> = OnceLock::new();
     INDEX.get_or_init(|| CATALOG.iter().map(|entry| (entry.de, entry)).collect())
+}
+
+fn catalog_by_english() -> &'static HashMap<&'static str, &'static CatalogEntry> {
+    static INDEX: OnceLock<HashMap<&'static str, &'static CatalogEntry>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut index = HashMap::new();
+        for entry in CATALOG {
+            // Some visible labels intentionally share the same English text.
+            // Keep the first, more specific catalog entry instead of allowing
+            // a later generic action label to silently replace it.
+            index.entry(entry.en).or_insert(entry);
+        }
+        index
+    })
 }
 
 /// Replace only explicit internal translation markers. Dynamic values must be

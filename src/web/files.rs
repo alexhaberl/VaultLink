@@ -17,7 +17,7 @@ use super::{
     common::{
         add_upload_bytes, breadcrumbs, encoded, extension_is_blocked, file_sort_column,
         file_sort_column_value, file_sort_direction, file_sort_direction_value, file_sort_header,
-        format_file_time, human, internal, join_display, list_directory_sorted_page, parent_path,
+        format_file_time, human, internal, join_display, list_directory_cursor_page, parent_path,
         preview_allowed, preview_kind, search_tree, sort_search_hits, BrowseQuery,
     },
     preview_zip::{raw_preview_response, read_preview, PreviewContent},
@@ -285,14 +285,14 @@ pub(super) async fn stage_admin_upload(
 ) -> Result<(PendingUpload, String, u64)> {
     let file_name = field
         .file_name()
-        .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateiname fehlt"))?;
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "File name missing"))?;
     let name = path_security::safe_admin_filename(file_name)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Dateiname"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid file name"))?
         .to_string();
     if extension_is_blocked(&name, blocked_extensions) {
         return Err(AppError(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Dateityp blockiert",
+            "File type blocked",
         ));
     }
 
@@ -310,10 +310,7 @@ pub(super) async fn stage_admin_upload(
     let (pending, file) = match pending_file {
         Ok(value) => value,
         Err(PendingUploadFileError::Begin) => {
-            return Err(AppError(
-                StatusCode::NOT_FOUND,
-                "Zielordner nicht verfügbar",
-            ))
+            return Err(AppError(StatusCode::NOT_FOUND, "Target folder unavailable"))
         }
         Err(PendingUploadFileError::Take(error)) => return Err(upload_io_error(error)),
     };
@@ -323,11 +320,11 @@ pub(super) async fn stage_admin_upload(
     let stream = field;
     tokio::pin!(stream);
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| AppError(StatusCode::BAD_REQUEST, "Upload abgebrochen"))?;
+        let chunk = chunk.map_err(|_| AppError(StatusCode::BAD_REQUEST, "Upload aborted"))?;
         let Some(new_total) = add_upload_bytes(total, chunk.len(), maximum) else {
             return Err(AppError(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "Upload ist zu groß",
+                "Upload is too large",
             ));
         };
         let _reservation = match UploadChunkReservation::acquire(state, chunk.len() as u64).await {
@@ -335,13 +332,13 @@ pub(super) async fn stage_admin_upload(
             Err(StorageReservationError::CapacityUnavailable) => {
                 return Err(AppError(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Speicherkapazität nicht ermittelbar",
+                    "Storage capacity could not be determined",
                 ))
             }
             Err(StorageReservationError::InsufficientStorage) => {
                 return Err(AppError(
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "Nicht genug freier Speicher",
+                    "Not enough free storage",
                 ))
             }
         };
@@ -361,7 +358,7 @@ async fn ensure_admin_upload_directory(
     actor: &str,
 ) -> Result<String> {
     let relative = path_security::validate_relative(relative)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid folder path"))?
         .to_string_lossy()
         .replace('\\', "/");
     if relative.is_empty() {
@@ -385,12 +382,11 @@ async fn ensure_admin_upload_directory(
     .map_err(internal)?
     .map_err(|error| match error.kind() {
         std::io::ErrorKind::InvalidInput => {
-            AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad")
+            AppError(StatusCode::BAD_REQUEST, "Invalid folder path")
         }
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => AppError(
-            StatusCode::CONFLICT,
-            "Uploadordner konnte nicht erstellt werden",
-        ),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            AppError(StatusCode::CONFLICT, "Upload folder could not be created")
+        }
         _ => internal(error),
     })?;
     if !created.is_empty() {
@@ -421,7 +417,7 @@ pub(super) async fn process_admin_upload(
         .map_err(|_| {
             AppError(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Zu viele gleichzeitige Uploads",
+                "Too many concurrent uploads",
             )
         })?;
     let _upload_peer_permit = try_acquire_client_activity(
@@ -431,7 +427,7 @@ pub(super) async fn process_admin_upload(
     )
     .ok_or(AppError(
         StatusCode::SERVICE_UNAVAILABLE,
-        "Zu viele gleichzeitige Uploads dieses Clients",
+        "Too many concurrent uploads from this client",
     ))?;
     let settings = runtime_settings(state);
     if let Some(length) = headers
@@ -444,13 +440,13 @@ pub(super) async fn process_admin_upload(
             Ok(false) => {
                 return Err(AppError(
                     StatusCode::INSUFFICIENT_STORAGE,
-                    "Nicht genug freier Speicher",
+                    "Not enough free storage",
                 ))
             }
             Err(_) => {
                 return Err(AppError(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Speicherkapazität nicht ermittelbar",
+                    "Storage capacity could not be determined",
                 ))
             }
         }
@@ -466,13 +462,13 @@ pub(super) async fn process_admin_upload(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Upload"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid upload"))?
     {
         fields_seen += 1;
         if fields_seen > 5 {
             return Err(AppError(
                 StatusCode::BAD_REQUEST,
-                "Zu viele Multipart-Felder",
+                "Too many multipart fields",
             ));
         }
         let field_name = field.name().unwrap_or("").to_string();
@@ -481,14 +477,14 @@ pub(super) async fn process_admin_upload(
                 if directory.is_some() || staged.is_some() {
                     return Err(AppError(
                         StatusCode::BAD_REQUEST,
-                        "Uploadpfad wurde mehrfach oder zu spät übermittelt",
+                        "Upload path was submitted more than once or too late",
                     ));
                 }
                 let value = limited_multipart_text(field, MAX_UPLOAD_PATH_FIELD_BYTES)
                     .await
-                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Uploadpfad"))?;
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid upload path"))?;
                 let value = path_security::validate_relative(&value)
-                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Uploadpfad"))?
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid upload path"))?
                     .to_string_lossy()
                     .replace('\\', "/");
                 directory = Some(value);
@@ -497,12 +493,12 @@ pub(super) async fn process_admin_upload(
                 if csrf_value.is_some() || staged.is_some() {
                     return Err(AppError(
                         StatusCode::BAD_REQUEST,
-                        "CSRF-Nachweis wurde mehrfach oder zu spät übermittelt",
+                        "CSRF proof was submitted more than once or too late",
                     ));
                 }
                 let value = limited_multipart_text(field, 512)
                     .await
-                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger CSRF-Nachweis"))?;
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid CSRF proof"))?;
                 csrf(&admin, &value)?;
                 csrf_value = Some(value);
             }
@@ -510,17 +506,17 @@ pub(super) async fn process_admin_upload(
                 if std::mem::replace(&mut saw_overwrite, true) || staged.is_some() {
                     return Err(AppError(
                         StatusCode::BAD_REQUEST,
-                        "Uploadoption wurde mehrfach oder zu spät übermittelt",
+                        "Upload option was submitted more than once or too late",
                     ));
                 }
                 let value = limited_multipart_text(field, MAX_UPLOAD_OPTION_FIELD_BYTES)
                     .await
-                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültige Uploadoption"))?;
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid upload option"))?;
                 overwrite_existing = value == "1";
                 if overwrite_existing && !state.config.storage.replacements_allowed() {
                     return Err(AppError(
                         StatusCode::BAD_REQUEST,
-                        "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+                        "Overwriting is disabled with external storage writers",
                     ));
                 }
             }
@@ -528,14 +524,14 @@ pub(super) async fn process_admin_upload(
                 if folder_path.is_some() || staged.is_some() {
                     return Err(AppError(
                         StatusCode::BAD_REQUEST,
-                        "Ordnerpfad wurde mehrfach oder zu spät übermittelt",
+                        "Folder path was submitted more than once or too late",
                     ));
                 }
                 let value = limited_multipart_text(field, MAX_UPLOAD_PATH_FIELD_BYTES)
                     .await
-                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad"))?;
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid folder path"))?;
                 let value = path_security::validate_relative(&value)
-                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Ordnerpfad"))?
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid folder path"))?
                     .to_string_lossy()
                     .replace('\\', "/");
                 folder_path = Some(value);
@@ -544,17 +540,17 @@ pub(super) async fn process_admin_upload(
                 if staged.is_some() {
                     return Err(AppError(
                         StatusCode::BAD_REQUEST,
-                        "Pro Request ist genau eine Datei erlaubt",
+                        "Exactly one file is allowed per request",
                     ));
                 }
                 let target = directory.as_deref().ok_or(AppError(
                     StatusCode::BAD_REQUEST,
-                    "Uploadpfad muss vor der Datei übermittelt werden",
+                    "Upload path must be submitted before the file",
                 ))?;
                 if csrf_value.is_none() {
                     return Err(AppError(
                         StatusCode::BAD_REQUEST,
-                        "CSRF-Nachweis muss vor der Datei übermittelt werden",
+                        "CSRF proof must be submitted before the file",
                     ));
                 }
                 let target = if let Some(folder_path) = folder_path.as_deref() {
@@ -574,25 +570,21 @@ pub(super) async fn process_admin_upload(
                     .await?,
                 );
             }
-            _ => {
-                return Err(AppError(
-                    StatusCode::BAD_REQUEST,
-                    "Unbekanntes Multipart-Feld",
-                ))
-            }
+            _ => return Err(AppError(StatusCode::BAD_REQUEST, "Unknown multipart field")),
         }
     }
 
-    let mut directory = directory.ok_or(AppError(StatusCode::BAD_REQUEST, "Uploadpfad fehlt"))?;
+    let mut directory =
+        directory.ok_or(AppError(StatusCode::BAD_REQUEST, "Upload path missing"))?;
     if let Some(folder_path) = folder_path.as_deref() {
         directory = join_display(&directory, folder_path);
     }
     if csrf_value.is_none() {
-        return Err(AppError(StatusCode::FORBIDDEN, "CSRF-Nachweis fehlt"));
+        return Err(AppError(StatusCode::FORBIDDEN, "CSRF proof missing"));
     }
     let (mut pending, name, total) = staged.ok_or(AppError(
         StatusCode::BAD_REQUEST,
-        "Pro Request ist genau eine Datei erforderlich",
+        "Exactly one file is required per request",
     ))?;
     let destination = join_display(&directory, &name);
     let publish_name = name.clone();
@@ -622,7 +614,7 @@ pub(super) async fn process_admin_upload(
         let current_destination = state.secure_root.bind_directory(&directory).map_err(|_| {
             AppError(
                 StatusCode::CONFLICT,
-                "Uploadziel wurde zwischenzeitlich geändert",
+                "Upload target changed in the meantime",
             )
         })?;
         if !pending
@@ -631,7 +623,7 @@ pub(super) async fn process_admin_upload(
         {
             return Err(AppError(
                 StatusCode::CONFLICT,
-                "Uploadziel wurde zwischenzeitlich geändert",
+                "Upload target changed in the meantime",
             ));
         }
         let existed = match state.secure_root.metadata(&destination) {
@@ -665,7 +657,7 @@ pub(super) async fn process_admin_upload(
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(AppError(
                     StatusCode::CONFLICT,
-                    "Datei existiert bereits; Ersetzen muss für diese Datei bestätigt werden",
+                    "File already exists; replacement must be confirmed for this file",
                 ))
             }
             Err(error) => return Err(upload_io_error(error)),
@@ -797,15 +789,15 @@ pub(super) fn browser_redirect(path: &str, notice: &str) -> String {
 pub(super) fn file_operation_app_error(error: file_ops::FileOperationError) -> AppError {
     use file_ops::FileOperationError;
     match error {
-        FileOperationError::InvalidPath => AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"),
-        FileOperationError::InvalidName => AppError(StatusCode::BAD_REQUEST, "Ungültiger Name"),
-        FileOperationError::NotFound => AppError(StatusCode::NOT_FOUND, "Ziel nicht gefunden"),
+        FileOperationError::InvalidPath => AppError(StatusCode::BAD_REQUEST, "Invalid path"),
+        FileOperationError::InvalidName => AppError(StatusCode::BAD_REQUEST, "Invalid name"),
+        FileOperationError::NotFound => AppError(StatusCode::NOT_FOUND, "Target not found"),
         FileOperationError::Conflict => {
-            AppError(StatusCode::CONFLICT, "Zielname ist bereits vorhanden")
+            AppError(StatusCode::CONFLICT, "Target name already exists")
         }
         FileOperationError::ConfirmationRequired { .. } => AppError(
             StatusCode::CONFLICT,
-            "Der exakte Ordnername muss bestätigt werden",
+            "The exact folder name must be confirmed",
         ),
         FileOperationError::Database(database_error)
             if crate::db::is_audit_unavailable(&database_error) =>
@@ -896,18 +888,34 @@ pub(super) async fn admin_browser(
     let sort_column = file_sort_column(q.sort.as_deref());
     let sort_direction = file_sort_direction(q.direction.as_deref());
     let raw = q.path.unwrap_or_default();
-    let page_number = q.page.unwrap_or(0).min(1_000_000);
+    let after_cursor = q.after.clone();
+    let before_cursor = q.before.clone();
     let search =
         q.q.map(|value| value.trim().to_string())
             .filter(|v| !v.is_empty());
+    if after_cursor.is_some() && before_cursor.is_some() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Invalid directory cursor",
+        ));
+    }
+    if search.is_some() && (after_cursor.is_some() || before_cursor.is_some()) {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Directory cursors cannot be combined with search",
+        ));
+    }
     if search
         .as_ref()
         .is_some_and(|value| value.len() > MAX_SEARCH_QUERY_BYTES)
     {
-        return Err(AppError(StatusCode::BAD_REQUEST, "Suchbegriff ist zu lang"));
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "Search query is too long",
+        ));
     }
     let rel = path_security::validate_relative(&raw)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid path"))?
         .to_string_lossy()
         .replace('\\', "/");
     let secure_root = state.secure_root.clone();
@@ -918,7 +926,7 @@ pub(super) async fn admin_browser(
     )
     .ok_or(AppError(
         StatusCode::SERVICE_UNAVAILABLE,
-        "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
+        "Too many concurrent expensive operations from this client",
     ))?;
     let _scan_permit = state
         .search_admission
@@ -927,11 +935,12 @@ pub(super) async fn admin_browser(
         .map_err(|_| {
             AppError(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Zu viele gleichzeitige Dateisuchen",
+                "Too many concurrent file searches",
             )
         })?;
     let mut rows = String::new();
-    let mut has_next = false;
+    let mut previous_cursor = None;
+    let mut next_cursor = None;
     if let Some(search) = search.clone() {
         let base = rel.clone();
         let search_settings = settings.clone();
@@ -986,11 +995,14 @@ pub(super) async fn admin_browser(
     } else {
         let listing_path = rel.clone();
         let scan_limit = settings.max_search_entries;
-        let (entries, truncated) = tokio::task::spawn_blocking(move || {
-            list_directory_sorted_page(
+        let cursor_after = after_cursor.clone();
+        let cursor_before = before_cursor.clone();
+        let listing_page = tokio::task::spawn_blocking(move || {
+            list_directory_cursor_page(
                 &secure_root,
                 &listing_path,
-                page_number,
+                cursor_after.as_deref(),
+                cursor_before.as_deref(),
                 scan_limit,
                 sort_column,
                 sort_direction,
@@ -998,9 +1010,16 @@ pub(super) async fn admin_browser(
         })
         .await
         .map_err(internal)?
-        .map_err(internal)?;
-        has_next = entries.len() > 100;
-        for entry in entries.into_iter().take(100) {
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                AppError(StatusCode::BAD_REQUEST, "Invalid directory cursor")
+            } else {
+                internal(error)
+            }
+        })?;
+        previous_cursor = listing_page.previous_cursor;
+        next_cursor = listing_page.next_cursor;
+        for entry in listing_page.entries {
             let name = entry.name;
             let is_dir = entry.is_dir;
             let size = entry.len;
@@ -1029,7 +1048,7 @@ pub(super) async fn admin_browser(
                 actions
             );
         }
-        if truncated {
+        if listing_page.truncated {
             rows += r#"<tr><td colspan="5" class="vl-muted"><vl-i18n key="files.scan_limit"/></td></tr>"#;
         }
     }
@@ -1050,20 +1069,20 @@ pub(super) async fn admin_browser(
         file_sort_column_value(sort_column),
         file_sort_direction_value(sort_direction)
     );
-    let previous = if page_number > 0 {
+    let previous = if let Some(cursor) = previous_cursor {
         format!(
-            "<a href=\"/admin?path={encoded_path}&page={}{}{}\"><vl-i18n key=\"common.back\"/></a>",
-            page_number - 1,
+            "<a href=\"/admin?path={encoded_path}&before={}{}{}\"><vl-i18n key=\"common.back\"/></a>",
+            encoded(&cursor),
             search_param,
             sort_param,
         )
     } else {
         String::new()
     };
-    let next = if has_next {
+    let next = if let Some(cursor) = next_cursor {
         format!(
-            "<a href=\"/admin?path={encoded_path}&page={}{}{}\"><vl-i18n key=\"common.continue\"/></a>",
-            page_number + 1,
+            "<a href=\"/admin?path={encoded_path}&after={}{}{}\"><vl-i18n key=\"common.continue\"/></a>",
+            encoded(&cursor),
             search_param,
             sort_param,
         )
@@ -1189,9 +1208,9 @@ pub(super) async fn admin_download(
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let raw = q
         .path
-        .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "File path missing"))?;
     let relative = path_security::validate_relative(&raw)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Dateipfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid file path"))?
         .to_string_lossy()
         .replace('\\', "/");
     let secure_root = state.secure_root.clone();
@@ -1210,9 +1229,9 @@ pub(super) async fn admin_download(
     .await
     .map_err(internal)?
     .map_err(|error| match error.kind() {
-        std::io::ErrorKind::InvalidInput => AppError(StatusCode::BAD_REQUEST, "Keine Datei"),
+        std::io::ErrorKind::InvalidInput => AppError(StatusCode::BAD_REQUEST, "Not a file"),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
-            AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar")
+            AppError(StatusCode::NOT_FOUND, "File unavailable")
         }
         _ => internal(error),
     })?;
@@ -1262,9 +1281,9 @@ pub(super) async fn admin_preview(
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let raw = q
         .path
-        .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "File path missing"))?;
     let rel = path_security::validate_relative(&raw)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid path"))?
         .to_string_lossy()
         .replace('\\', "/");
     let settings = runtime_settings(&state);
@@ -1277,7 +1296,7 @@ pub(super) async fn admin_preview(
                 .map_err(|_| {
                     AppError(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "Zu viele gleichzeitige Textvorschauen",
+                        "Too many concurrent text previews",
                     )
                 })?,
         )
@@ -1290,7 +1309,7 @@ pub(super) async fn admin_preview(
         tokio::task::spawn_blocking(move || read_preview(&secure_root, &preview_path, &settings))
             .await
             .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;
+            .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Preview not allowed"))?;
     let content = match content {
         PreviewContent::Text(text)
             if escaped_html_len(&text)
@@ -1348,8 +1367,7 @@ pub(super) async fn admin_preview(
             Ok(response)
         }
         PreviewContent::TooLarge { size } => {
-            let body =
-                preview_too_large_body(&rel, size, "Datei ist größer als das Preview-Limit.", None);
+            let body = preview_too_large_body(&rel, size, "File exceeds the preview limit.", None);
             Ok(Html(admin_page(
                 &state,
                 PageId::Preview,
@@ -1382,9 +1400,9 @@ pub(super) async fn admin_preview_raw(
     session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let raw = q
         .path
-        .ok_or(AppError(StatusCode::BAD_REQUEST, "Dateipfad fehlt"))?;
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "File path missing"))?;
     let rel = path_security::validate_relative(&raw)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid path"))?
         .to_string_lossy()
         .replace('\\', "/");
     let settings = runtime_settings(&state);
@@ -1392,7 +1410,7 @@ pub(super) async fn admin_preview_raw(
         .filter(|kind| kind.is_media())
         .ok_or(AppError(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Vorschau nicht erlaubt",
+            "Preview not allowed",
         ))?;
     raw_preview_response(
         state.secure_root.clone(),
@@ -1437,7 +1455,7 @@ pub(super) fn preview_too_large_body(
     message: &str,
     download_link: Option<&str>,
 ) -> String {
-    let message = i18n::text_from_german(i18n::current_locale(), message);
+    let message = i18n::localized_text(i18n::current_locale(), message);
     let is_public = download_link.is_some();
     let back = if is_public {
         String::new()

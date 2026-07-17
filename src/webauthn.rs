@@ -36,6 +36,16 @@ const CREDENTIAL_BLOB_VERSION: u8 = 1;
 type OwnedPublicKey = CompressedPubKey<[u8; 32], [u8; 32], [u8; 48], Vec<u8>>;
 type OwnedStaticState = StaticState<OwnedPublicKey>;
 
+fn decode_supported_static_state(data: &[u8]) -> Result<OwnedStaticState, WebAuthnServiceError> {
+    let state = OwnedStaticState::decode(data).map_err(WebAuthnServiceError::ceremony)?;
+    if matches!(state.credential_public_key, CompressedPubKey::Rsa(_)) {
+        return Err(WebAuthnServiceError::Ceremony(
+            "RS256 WebAuthn credentials are not supported".into(),
+        ));
+    }
+    Ok(state)
+}
+
 fn session_key(session_token: &str) -> String {
     let digest = Sha256::digest(session_token.as_bytes());
     data_encoding::HEXLOWER.encode(digest.as_ref())
@@ -115,8 +125,7 @@ impl StoredCredential {
         let user_id = take_array::<USER_HANDLE_MAX_LEN>(&mut input)?;
         UserHandle64::decode(user_id).map_err(WebAuthnServiceError::ceremony)?;
         let static_state = take_vec(&mut input)?;
-        OwnedStaticState::decode(static_state.as_slice())
-            .map_err(WebAuthnServiceError::ceremony)?;
+        decode_supported_static_state(static_state.as_slice())?;
         let dynamic_state = take_array::<7>(&mut input)?;
         DynamicState::decode(dynamic_state).map_err(WebAuthnServiceError::ceremony)?;
         let metadata = take_vec(&mut input)?;
@@ -512,5 +521,18 @@ mod tests {
             .expect("registration options contain credential parameters");
         assert!(algorithms.iter().any(|parameter| parameter["alg"] == -7));
         assert!(algorithms.iter().all(|parameter| parameter["alg"] != -257));
+    }
+
+    #[test]
+    fn authentication_rejects_persisted_rs256_credentials() {
+        let mut encoded_static_state = vec![3, 0, 1];
+        encoded_static_state.extend(std::iter::repeat_n(1, 256));
+        encoded_static_state.extend_from_slice(&65_537u32.to_le_bytes());
+        encoded_static_state.extend_from_slice(&[0, 0]);
+        assert!(matches!(
+            decode_supported_static_state(&encoded_static_state),
+            Err(WebAuthnServiceError::Ceremony(message))
+                if message == "RS256 WebAuthn credentials are not supported"
+        ));
     }
 }

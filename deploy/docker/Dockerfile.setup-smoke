@@ -53,4 +53,6 @@ RUN cargo build --release --locked
 
 EXPOSE 8081/tcp
 
+USER vaultlink
+
 CMD ["bash", "deploy/docker/setup-smoke.sh"]

@@ -315,7 +315,7 @@ impl Config {
 
         if self.server.mode != ServerMode::StandaloneTls {
             return Ok(LocalReadinessTarget {
-                url: format!("http://{local}/api/v1/health"),
+                url: format!("http://{local}/api/v2/health"),
                 connect_to: None,
                 insecure: false,
             });
@@ -330,7 +330,7 @@ impl Config {
         let public_port = public_url.port_or_known_default().ok_or_else(|| {
             ConfigError::Invalid("public_base_url must contain a known port".into())
         })?;
-        public_url.set_path("/api/v1/health");
+        public_url.set_path("/api/v2/health");
         public_url.set_query(None);
         public_url.set_fragment(None);
 
@@ -1438,7 +1438,7 @@ mod tests {
         assert_eq!(
             c.local_readiness_target().unwrap(),
             LocalReadinessTarget {
-                url: "http://127.0.0.1:8080/api/v1/health".into(),
+                url: "http://127.0.0.1:8080/api/v2/health".into(),
                 connect_to: None,
                 insecure: false,
             }
@@ -1463,7 +1463,7 @@ mod tests {
         assert_eq!(
             c.local_readiness_target().unwrap(),
             LocalReadinessTarget {
-                url: "https://files.example.test/api/v1/health".into(),
+                url: "https://files.example.test/api/v2/health".into(),
                 connect_to: Some("files.example.test:443:127.0.0.1:443".into()),
                 insecure: true,
             }
@@ -1488,7 +1488,7 @@ mod tests {
         assert_eq!(
             c.local_readiness_target().unwrap(),
             LocalReadinessTarget {
-                url: "https://files.example.test:8443/api/v1/health".into(),
+                url: "https://files.example.test:8443/api/v2/health".into(),
                 connect_to: Some("files.example.test:8443:[::1]:8443".into()),
                 insecure: true,
             }

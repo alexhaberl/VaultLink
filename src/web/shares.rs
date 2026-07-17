@@ -19,8 +19,8 @@ use crate::{
     auth,
     db::{
         AuditContext, Permission, RequiredAuditEvent, Share, ShareControlsUpdateOutcome,
-        UploadConflictStrategy, DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE,
-        MAX_SQLITE_UNSIGNED,
+        ShareListOptions, ShareListSort, ShareListStatus, UploadConflictStrategy,
+        DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE, MAX_SQLITE_UNSIGNED,
     },
     file_ops,
     http_auth::{
@@ -29,6 +29,7 @@ use crate::{
     },
     i18n::{self},
     path_security,
+    policy::{self, ShareAvailability},
     runtime::RuntimeSettings,
     sensitive::SecretString,
     services::share::{
@@ -44,7 +45,7 @@ pub(super) struct ShareQuery {
     pub(super) q: Option<String>,
     pub(super) status: Option<String>,
     pub(super) sort: Option<String>,
-    pub(super) page: Option<usize>,
+    pub(super) cursor: Option<i64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -62,32 +63,13 @@ pub(super) fn share_permission_label(permission: &Permission) -> &'static str {
     }
 }
 
-pub(super) fn share_is_expired(share: &Share) -> bool {
-    share
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= Utc::now())
-}
-
-pub(super) fn share_limit_reached(share: &Share) -> bool {
-    share
-        .max_downloads
-        .is_some_and(|maximum| share.download_count >= maximum)
-}
-
-pub(super) fn share_is_available(share: &Share) -> bool {
-    share.active && !share_is_expired(share) && !share_limit_reached(share)
-}
-
 pub(super) fn share_primary_status(share: &Share) -> (&'static str, &'static str) {
     let locale = i18n::current_locale();
-    if !share.active {
-        (i18n::text(locale, i18n::INACTIVE), "neutral")
-    } else if share_is_expired(share) {
-        (i18n::text(locale, i18n::EXPIRED), "warning")
-    } else if share_limit_reached(share) {
-        (i18n::text(locale, i18n::LIMIT_REACHED), "warning")
-    } else {
-        (i18n::text(locale, i18n::ACTIVE), "success")
+    match policy::share_availability(share, Utc::now()) {
+        ShareAvailability::Inactive => (i18n::text(locale, i18n::INACTIVE), "neutral"),
+        ShareAvailability::Expired => (i18n::text(locale, i18n::EXPIRED), "warning"),
+        ShareAvailability::LimitReached => (i18n::text(locale, i18n::LIMIT_REACHED), "warning"),
+        ShareAvailability::Available => (i18n::text(locale, i18n::ACTIVE), "success"),
     }
 }
 
@@ -107,13 +89,17 @@ pub(super) fn selected(current: &str, value: &str) -> &'static str {
     }
 }
 
-pub(super) fn share_list_url(query: &str, status: &str, sort: &str, page: usize) -> String {
-    format!(
-        "/admin/shares?q={}&status={}&sort={}&page={page}",
+pub(super) fn share_list_url(query: &str, status: &str, sort: &str, cursor: Option<i64>) -> String {
+    let mut url = format!(
+        "/admin/shares?q={}&status={}&sort={}",
         encoded(query),
         encoded(status),
         encoded(sort)
-    )
+    );
+    if let Some(cursor) = cursor {
+        url.push_str(&format!("&cursor={cursor}"));
+    }
+    url
 }
 
 pub(super) async fn share_index_page(
@@ -129,7 +115,7 @@ pub(super) async fn share_index_page(
         );
     }
     let settings = runtime_settings(&state);
-    let all_shares = database(state.db.clone(), |database| database.list_shares()).await?;
+    let now = Utc::now();
     let monthly = database(state.db.clone(), |database| {
         database.current_transfer_monthly_counts()
     })
@@ -141,16 +127,7 @@ pub(super) async fn share_index_page(
     let statistics_started_label = DateTime::parse_from_rfc3339(&statistics_started_at)
         .map(|value| format_utc_minute(value.with_timezone(&Utc)))
         .unwrap_or(statistics_started_at);
-    let active_count = all_shares
-        .iter()
-        .filter(|share| share_is_available(share))
-        .count();
-    let protected_count = all_shares
-        .iter()
-        .filter(|share| share.password_hash.is_some())
-        .count();
     let query = q.q.as_deref().unwrap_or("").trim().to_string();
-    let query_lower = query.to_lowercase();
     let status = match q.status.as_deref().unwrap_or("all") {
         value @ ("active" | "protected" | "expired" | "limit" | "inactive") => value,
         _ => "all",
@@ -160,41 +137,26 @@ pub(super) async fn share_index_page(
     } else {
         "newest"
     };
-    let mut shares = all_shares
-        .into_iter()
-        .filter(|share| {
-            let matches_query = query_lower.is_empty()
-                || share.relative_path.to_lowercase().contains(&query_lower)
-                || share
-                    .alias
-                    .as_deref()
-                    .is_some_and(|alias| alias.to_lowercase().contains(&query_lower));
-            let matches_status = match status {
-                "active" => share_is_available(share),
-                "protected" => share.password_hash.is_some(),
-                "expired" => share_is_expired(share),
-                "limit" => share_limit_reached(share),
-                "inactive" => !share.active,
-                _ => true,
-            };
-            matches_query && matches_status
-        })
-        .collect::<Vec<_>>();
-    if sort == "oldest" {
-        shares.reverse();
-    }
-    const PAGE_SIZE: usize = 50;
-    let total = shares.len();
-    let total_pages = total.div_ceil(PAGE_SIZE).max(1);
-    let page = q
-        .page
-        .unwrap_or(0)
-        .min(1_000_000)
-        .min(total_pages.saturating_sub(1));
-    let start = page.saturating_mul(PAGE_SIZE).min(total);
-    let end = start.saturating_add(PAGE_SIZE).min(total);
+    let options = ShareListOptions {
+        query: (!query.is_empty()).then(|| query.clone()),
+        status: ShareListStatus::parse(status).unwrap_or_default(),
+        sort: ShareListSort::parse(sort).unwrap_or_default(),
+        cursor: q.cursor.filter(|cursor| *cursor > 0),
+        limit: 50,
+        now,
+    };
+    let page_data = database(state.db.clone(), move |database| {
+        database.list_share_page(&options)
+    })
+    .await?;
+    let summary = database(state.db.clone(), move |database| {
+        database.share_summary(now)
+    })
+    .await?;
+    let active_count = summary.available;
+    let protected_count = summary.protected;
     let mut share_rows = String::new();
-    for share in &shares[start..end] {
+    for share in &page_data.shares {
         let url = share_public_url(&settings, share);
         let display_name = share
             .alias
@@ -309,10 +271,15 @@ pub(super) async fn share_index_page(
     if share_rows.is_empty() {
         share_rows = r#"<div class="vl-empty"><strong><vl-i18n key="share.no_links"/></strong><p class="vl-muted"><vl-i18n key="share.adjust_filters"/></p></div>"#.into();
     }
-    let previous = (page > 0).then(|| share_list_url(&query, status, sort, page - 1));
-    let next = (page + 1 < total_pages).then(|| share_list_url(&query, status, sort, page + 1));
+    let previous = q
+        .cursor
+        .filter(|cursor| *cursor > 0)
+        .map(|_| share_list_url(&query, status, sort, None));
+    let next = page_data
+        .next_cursor
+        .map(|cursor| share_list_url(&query, status, sort, Some(cursor)));
     let body = format!(
-        r#"<section class="vl-stat-strip" aria-label="<vl-i18n key="share.overview_aria"/>"><div><strong>{active_count}</strong><span><vl-i18n key="share.active_links"/></span></div><div><strong>{protected_count}</strong><span><vl-i18n key="share.password_protected_lower"/></span></div><div><strong>{}</strong><span><vl-i18n key="files.file"/> · {}</span></div><div><strong>{}</strong><span>ZIP · {}</span></div><div><strong>{}</strong><span><vl-i18n key="files.preview"/> · {}</span></div></section><p class="vl-muted"><vl-i18n key="share.monthly_values"/> {}.</p><section class="vl-panel"><form method="get" class="vl-toolbar"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="share.search_links"/></span><input name="q" value="{}" placeholder="<vl-i18n key="share.search_links"/>"></label><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="common.status"/></span><select name="status"><option value="all" {}><vl-i18n key="common.all"/></option><option value="active" {}><vl-i18n key="common.active"/></option><option value="protected" {}><vl-i18n key="common.protected"/></option><option value="expired" {}><vl-i18n key="common.expired"/></option><option value="limit" {}><vl-i18n key="share.limit_reached"/></option><option value="inactive" {}><vl-i18n key="common.inactive"/></option></select></label><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="files.sorting"/></span><select name="sort"><option value="newest" {}><vl-i18n key="files.newest_first"/></option><option value="oldest" {}><vl-i18n key="files.oldest_first"/></option></select></label><button class="vl-button"><vl-i18n key="common.filter"/></button></form><div class="vl-share-list">{share_rows}</div><nav class="vl-pagination" aria-label="<vl-i18n key="common.page_navigation"/>">{}<span><vl-i18n key="common.page_of"/> {} <vl-i18n key="common.of"/> {}</span>{}</nav></section>"#,
+        r#"<section class="vl-stat-strip" aria-label="<vl-i18n key="share.overview_aria"/>"><div><strong>{active_count}</strong><span><vl-i18n key="share.active_links"/></span></div><div><strong>{protected_count}</strong><span><vl-i18n key="share.password_protected_lower"/></span></div><div><strong>{}</strong><span><vl-i18n key="files.file"/> · {}</span></div><div><strong>{}</strong><span>ZIP · {}</span></div><div><strong>{}</strong><span><vl-i18n key="files.preview"/> · {}</span></div></section><p class="vl-muted"><vl-i18n key="share.monthly_values"/> {}.</p><section class="vl-panel"><form method="get" class="vl-toolbar"><label class="vl-field vl-search"><span class="vl-sr-only"><vl-i18n key="share.search_links"/></span><input name="q" value="{}" placeholder="<vl-i18n key="share.search_links"/>"></label><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="common.status"/></span><select name="status"><option value="all" {}><vl-i18n key="common.all"/></option><option value="active" {}><vl-i18n key="common.active"/></option><option value="protected" {}><vl-i18n key="common.protected"/></option><option value="expired" {}><vl-i18n key="common.expired"/></option><option value="limit" {}><vl-i18n key="share.limit_reached"/></option><option value="inactive" {}><vl-i18n key="common.inactive"/></option></select></label><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="files.sorting"/></span><select name="sort"><option value="newest" {}><vl-i18n key="files.newest_first"/></option><option value="oldest" {}><vl-i18n key="files.oldest_first"/></option></select></label><button class="vl-button"><vl-i18n key="common.filter"/></button></form><div class="vl-share-list">{share_rows}</div><nav class="vl-pagination" aria-label="<vl-i18n key="common.page_navigation"/>">{}{}</nav></section>"#,
         monthly.download,
         esc(&monthly.month),
         monthly.zip_download,
@@ -335,8 +302,6 @@ pub(super) async fn share_index_page(
                 esc(&url)
             ))
             .unwrap_or_default(),
-        page + 1,
-        total_pages,
         next.map(|url| format!(
             r#"<a class="vl-button vl-button--ghost" href="{}"><vl-i18n key="common.continue"/></a>"#,
             esc(&url)
@@ -372,7 +337,7 @@ pub(super) async fn share_create_page(
         )));
     };
     let relative_path = path_security::validate_relative(raw_path)
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid target path"))?
         .to_string_lossy()
         .replace('\\', "/");
     let secure_root = state.secure_root.clone();
@@ -380,7 +345,7 @@ pub(super) async fn share_create_page(
     let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
         .await
         .map_err(internal)?
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid target path"))?;
     let is_directory = metadata.is_dir();
     let permission_fields = if is_directory {
         r#"<div class="vl-segmented" role="radiogroup" aria-label="<vl-i18n key="share.permission_aria"/>"><label><input type="radio" name="permission" value="download_only" checked><span><vl-i18n key="share.download_only"/></span></label><label><input type="radio" name="permission" value="upload_only"><span><vl-i18n key="share.upload_only"/></span></label><label><input type="radio" name="permission" value="download_upload"><span><vl-i18n key="share.download_upload"/></span></label></div>"#
@@ -478,7 +443,7 @@ pub(super) async fn create_share(
         .normalize_target_path(&f.path)
         .map_err(share_service_app_error)?;
     let permission = Permission::parse(&f.permission)
-        .ok_or(AppError(StatusCode::BAD_REQUEST, "Ungültige Berechtigung"))?;
+        .ok_or(AppError(StatusCode::BAD_REQUEST, "Invalid permission"))?;
     let alias = f.alias.filter(|value| !value.is_empty());
     let exp = parse_expiry(
         f.expires_local.as_deref(),
@@ -495,7 +460,7 @@ pub(super) async fn create_share(
     if password_requested && password.is_none() && password_confirm.is_none() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Passwort und Bestätigung sind für den Passwortschutz verpflichtend",
+            "Password and confirmation are required for password protection",
         ));
     }
     let password = if password_requested {
@@ -511,11 +476,11 @@ pub(super) async fn create_share(
     let target_metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
         .await
         .map_err(internal)?
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"))?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid target path"))?;
     if !target_metadata.is_file() && !target_metadata.is_dir() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Freigaben sind nur für reguläre Dateien oder Ordner erlaubt",
+            "Shares are allowed only for regular files or directories",
         ));
     }
     let target = if target_metadata.is_dir() {
@@ -530,7 +495,7 @@ pub(super) async fn create_share(
         .filter(|value| !value.is_empty())
         .map(|value| value.parse::<u64>())
         .transpose()
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Übertragungslimit"))?;
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid transfer limit"))?;
     // The browser keeps the directory upload controls in the form and hides
     // them when `download_only` is selected. Hidden successful controls are
     // still submitted, so ignore every upload-only field unless the selected
@@ -542,14 +507,14 @@ pub(super) async fn create_share(
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(|value| parse_unit_to_bytes(value, GB, "Ungültiges Uploadlimit"))
+                .map(|value| parse_unit_to_bytes(value, GB, "Invalid upload limit"))
                 .transpose()?;
             let max_upload_total_size = f
                 .max_upload_total_size_gb
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(|value| parse_unit_to_bytes(value, GB, "Ungültiges kumulatives Uploadlimit"))
+                .map(|value| parse_unit_to_bytes(value, GB, "Invalid cumulative upload limit"))
                 .transpose()?;
             let max_upload_files = f
                 .max_upload_files
@@ -558,7 +523,7 @@ pub(super) async fn create_share(
                 .filter(|value| !value.is_empty())
                 .map(str::parse::<u64>)
                 .transpose()
-                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Upload-Dateilimit"))?;
+                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid upload file limit"))?;
             (max_upload_size, max_upload_total_size, max_upload_files)
         } else {
             (None, None, None)
@@ -597,12 +562,7 @@ pub(super) async fn create_share(
         tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
             .await
             .map_err(internal)?
-            .map_err(|_| {
-                AppError(
-                    StatusCode::CONFLICT,
-                    "Ziel wurde während der Verarbeitung geändert",
-                )
-            })?;
+            .map_err(|_| AppError(StatusCode::CONFLICT, "Target changed during processing"))?;
     let current_target = if current_metadata.is_dir() {
         ShareTarget::Directory
     } else if current_metadata.is_file() {
@@ -610,13 +570,13 @@ pub(super) async fn create_share(
     } else {
         return Err(AppError(
             StatusCode::CONFLICT,
-            "Ziel wurde während der Verarbeitung geändert",
+            "Target changed during processing",
         ));
     };
     if current_target != target {
         return Err(AppError(
             StatusCode::CONFLICT,
-            "Ziel wurde während der Verarbeitung geändert",
+            "Target changed during processing",
         ));
     }
     let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
@@ -641,7 +601,7 @@ pub(super) async fn create_share(
             if error.status == StatusCode::SERVICE_UNAVAILABLE {
                 AppError::from(error)
             } else {
-                AppError(StatusCode::CONFLICT, "Token oder Alias bereits vorhanden")
+                AppError(StatusCode::CONFLICT, "Token or alias already exists")
             }
         })?;
     Ok(Redirect::to("/admin/shares"))
@@ -649,54 +609,52 @@ pub(super) async fn create_share(
 
 fn share_service_app_error(error: ShareServiceError) -> AppError {
     match error {
-        ShareServiceError::InvalidPath => AppError(StatusCode::BAD_REQUEST, "Ungültiger Zielpfad"),
-        ShareServiceError::InvalidAlias => AppError(StatusCode::BAD_REQUEST, "Ungültiger Alias"),
-        ShareServiceError::ExpirationNotFuture => AppError(
-            StatusCode::BAD_REQUEST,
-            "Ablaufdatum liegt in der Vergangenheit",
-        ),
+        ShareServiceError::InvalidPath => AppError(StatusCode::BAD_REQUEST, "Invalid target path"),
+        ShareServiceError::InvalidAlias => AppError(StatusCode::BAD_REQUEST, "Invalid alias"),
+        ShareServiceError::ExpirationNotFuture => {
+            AppError(StatusCode::BAD_REQUEST, "Expiration date is in the past")
+        }
         ShareServiceError::UploadPermissionRequiresDirectory => AppError(
             StatusCode::BAD_REQUEST,
-            "Uploads sind nur für Ordnerlinks erlaubt",
+            "Uploads are available for folder links only",
         ),
         ShareServiceError::InvalidDownloadLimit => {
-            AppError(StatusCode::BAD_REQUEST, "Ungültiges Übertragungslimit")
+            AppError(StatusCode::BAD_REQUEST, "Invalid transfer limit")
         }
         ShareServiceError::InvalidUploadLimit => {
-            AppError(StatusCode::BAD_REQUEST, "Ungültiges Uploadlimit")
+            AppError(StatusCode::BAD_REQUEST, "Invalid upload limit")
         }
         ShareServiceError::UploadLimitsRequireDirectoryUpload => AppError(
             StatusCode::BAD_REQUEST,
-            "Uploadlimits sind nur für Upload-Freigaben erlaubt",
+            "Upload limits are allowed only for upload shares",
         ),
         ShareServiceError::InvalidUploadTotalLimit
         | ShareServiceError::UploadTotalBelowSingleLimit => AppError(
             StatusCode::BAD_REQUEST,
-            "Das kumulative Uploadlimit ist ungültig",
+            "The cumulative upload limit is invalid",
         ),
-        ShareServiceError::InvalidUploadFileLimit => AppError(
-            StatusCode::BAD_REQUEST,
-            "Das Upload-Dateilimit ist ungültig",
-        ),
+        ShareServiceError::InvalidUploadFileLimit => {
+            AppError(StatusCode::BAD_REQUEST, "The upload file limit is invalid")
+        }
         ShareServiceError::OverwriteRequiresDirectoryUpload => AppError(
             StatusCode::BAD_REQUEST,
-            "Überschreiben ist für diese Freigabe nicht erlaubt",
+            "Overwriting is not allowed for this share",
         ),
         ShareServiceError::OverwriteDisabledForExternalWriters => AppError(
             StatusCode::BAD_REQUEST,
-            "Überschreiben ist bei externen Storage-Schreibern deaktiviert",
+            "Overwriting is disabled with external storage writers",
         ),
         ShareServiceError::PasswordConfirmationRequired => AppError(
             StatusCode::BAD_REQUEST,
-            "Passwort und Bestätigung sind für den Passwortschutz verpflichtend",
+            "Password and confirmation are required for password protection",
         ),
         ShareServiceError::PasswordConfirmationMismatch => {
-            AppError(StatusCode::BAD_REQUEST, "Passwörter stimmen nicht überein")
+            AppError(StatusCode::BAD_REQUEST, "Passwords do not match")
         }
         ShareServiceError::InvalidPasswordCharacterLength
         | ShareServiceError::PasswordTooManyBytes => AppError(
             StatusCode::BAD_REQUEST,
-            "Freigabepasswort entspricht nicht der Richtlinie",
+            "Share password does not meet the policy",
         ),
         ShareServiceError::PasswordHashStateMismatch => internal(()),
         ShareServiceError::Database(error) => internal(error),
@@ -720,7 +678,7 @@ pub(super) async fn toggle_share(
     let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
     let sh = database(state.db.clone(), move |db| db.share_by_id(id))
         .await?
-        .ok_or(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"))?;
+        .ok_or(AppError(StatusCode::NOT_FOUND, "Link not found"))?;
     let active = !sh.active;
     let username = s.username;
     let audit_client_ip = runtime_settings(&state)
@@ -735,7 +693,7 @@ pub(super) async fn toggle_share(
         })
         .await?;
     if !changed {
-        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+        return Err(AppError(StatusCode::NOT_FOUND, "Link not found"));
     }
     Ok(Redirect::to("/admin/shares"))
 }
@@ -760,7 +718,7 @@ pub(super) async fn set_share_upload_conflict(
     let strategy = if let Some(strategy) = form.strategy.as_deref() {
         UploadConflictStrategy::parse(strategy).ok_or(AppError(
             StatusCode::BAD_REQUEST,
-            "Ungültige Upload-Konfliktstrategie",
+            "Invalid upload conflict strategy",
         ))?
     } else if form.overwrite_allowed.as_deref() == Some("1") {
         UploadConflictStrategy::OverwriteAllowed
@@ -770,17 +728,17 @@ pub(super) async fn set_share_upload_conflict(
     if strategy.can_overwrite() && !state.config.storage.replacements_allowed() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Ueberschreiben ist bei externen Storage-Schreibern deaktiviert",
+            "Overwriting is disabled with external storage writers",
         ));
     }
     let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
     let share = database(state.db.clone(), move |db| db.share_by_id(id))
         .await?
-        .ok_or(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"))?;
+        .ok_or(AppError(StatusCode::NOT_FOUND, "Link not found"))?;
     if !share.is_directory || !share.permission.can_upload() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Überschreiben ist nur für Ordnerlinks mit Uploadrecht erlaubt",
+            "Overwrite is available only for folder shares with upload permission",
         ));
     }
     let total_limit = form
@@ -788,14 +746,9 @@ pub(super) async fn set_share_upload_conflict(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| parse_unit_to_bytes(value, GB, "Ungültiges kumulatives Uploadlimit"))
+        .map(|value| parse_unit_to_bytes(value, GB, "Invalid cumulative upload limit"))
         .transpose()
-        .map_err(|_| {
-            AppError(
-                StatusCode::BAD_REQUEST,
-                "Ungültiges kumulatives Uploadlimit",
-            )
-        })?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid cumulative upload limit"))?
         .unwrap_or_else(|| {
             share
                 .max_upload_total_size
@@ -808,7 +761,7 @@ pub(super) async fn set_share_upload_conflict(
         .filter(|value| !value.is_empty())
         .map(str::parse::<u64>)
         .transpose()
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Upload-Dateilimit"))?
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid upload file limit"))?
         .unwrap_or_else(|| {
             share
                 .max_upload_files
@@ -827,7 +780,7 @@ pub(super) async fn set_share_upload_conflict(
     {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Ungültige kumulative Uploadlimits",
+            "Invalid cumulative upload limits",
         ));
     }
     let stored_strategy = strategy.clone();
@@ -861,12 +814,12 @@ pub(super) async fn set_share_upload_conflict(
     match outcome {
         ShareControlsUpdateOutcome::Updated => {}
         ShareControlsUpdateOutcome::NotFound => {
-            return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+            return Err(AppError(StatusCode::NOT_FOUND, "Link not found"));
         }
         ShareControlsUpdateOutcome::QuotaConflict => {
             return Err(AppError(
                 StatusCode::CONFLICT,
-                "Uploadlimit wird von laufenden Uploads belegt",
+                "Upload capacity is in use by active uploads",
             ));
         }
     }
@@ -893,7 +846,7 @@ pub(super) async fn set_share_password(
         .await?
         .is_none()
     {
-        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+        return Err(AppError(StatusCode::NOT_FOUND, "Link not found"));
     }
     let remove = form.remove.as_deref() == Some("1");
     let settings = runtime_settings(&state);
@@ -913,7 +866,7 @@ pub(super) async fn set_share_password(
             .map_err(share_service_app_error)?
             .ok_or(AppError(
                 StatusCode::BAD_REQUEST,
-                "Freigabepasswort entspricht nicht der Richtlinie",
+                "Share password does not meet the policy",
             ))?;
         Some(hash_password_admitted(&state, password).await?)
     };
@@ -936,7 +889,7 @@ pub(super) async fn set_share_password(
         })
         .await?;
     if !changed {
-        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+        return Err(AppError(StatusCode::NOT_FOUND, "Link not found"));
     }
     Ok(Redirect::to("/admin/shares"))
 }
@@ -961,7 +914,7 @@ pub(super) async fn delete_share(
         .commit(move |db| db.delete_share_and_audit(id, &audit_context))
         .await?;
     if !deleted {
-        return Err(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"));
+        return Err(AppError(StatusCode::NOT_FOUND, "Link not found"));
     }
     Ok(Redirect::to("/admin/shares"))
 }

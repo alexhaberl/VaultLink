@@ -32,7 +32,7 @@ VaultLink/
 ├── src/
 │   ├── main.rs             CLI, server startup, TLS/ACME
 │   ├── config.rs           TOML and startup validation
-│   ├── api.rs              stable JSON API facade and /api/v1 router
+│   ├── api.rs              stable JSON API facade and /api/v2 router
 │   ├── api/                authentication, files, shares, admins, settings, public handlers
 │   ├── auth.rs             Argon2id, TOTP, rate limiting
 │   ├── cifs_provision.rs   privileged, tightly scoped CIFS/systemd provisioning
@@ -70,7 +70,7 @@ SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and
 
 `shares.max_upload_size` is the optional per-file limit; `NULL` uses the global runtime limit. Upload shares also have cumulative `max_upload_total_size` and `max_upload_files` limits, with baseline defaults of 100,000,000,000 bytes and 1,000 fail-closed accounted files. Byte and file usage is recorded atomically before visible publication; if publication later fails, quota use deliberately remains so a visible file can never be unaccounted.
 
-Fresh installations create schema 2 and a version-2 migration record. A valid schema-1 encrypted-secret database is migrated once in an `IMMEDIATE` transaction. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
+Fresh installations create schema 3 and version-2/version-3 migration records. Valid schema-1 and schema-2 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
 
 The database defaults to `/var/lib/vaultlink/data.sqlite`; its required matching keyring is `/var/lib/vaultlink/secrets.keyring`. Both must be owned by `vaultlink:vaultlink` with mode `0600`. The database contains encrypted secrets, but the matching keyring can decrypt them, so the pair and every complete backup are production credentials.
 
@@ -170,27 +170,33 @@ Other network filesystems with external writers are not approved in 0.5.0. Runti
 
 `max_downloads` counts completed content transfers (download, ZIP, counted preview), not public metadata/landing requests or uploads. `HEAD` returns metadata only when the equivalent `GET` could begin under the current transfer session and does not itself consume quota.
 
-The session-based JSON API under `/api/v1` uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Version 0.5.0 intentionally has no API tokens. Mutating administrator API routes require `X-CSRF-Token`. Every `/api/v1` error message is English regardless of locale cookie or `Accept-Language`.
+The session-based JSON API under `/api/v2` uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Version 0.5.0 intentionally has no API tokens. Mutating administrator API routes require `X-CSRF-Token`. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
 
-After `/api/v1/session/mfa`, clients must retain both the rotated `Set-Cookie` value and returned `csrf_token`; the pre-MFA token becomes invalid. Before a password-protected Share is unlocked, public metadata returns only `{"locked":true}`. The unlock response returns an upload CSRF token sent as multipart field `csrf` by browser forms or `X-VaultLink-Upload-CSRF` by API clients.
+After `/api/v2/session/mfa`, clients must retain both the rotated `Set-Cookie` value and returned `csrf_token`; the pre-MFA token becomes invalid. Before a password-protected Share is unlocked, public metadata returns only `{"locked":true}`. The unlock response returns an upload CSRF token sent as multipart field `csrf` by browser forms or `X-VaultLink-Upload-CSRF` by API clients.
 
 Important API routes:
 
 | Route | Method | Purpose |
 |---|---:|---|
-| `/api/v1/health` | GET | health/version |
-| `/api/v1/session/login`, `/mfa`, `/logout`, `/me` | GET/POST | session lifecycle |
-| `/api/v1/files` | GET/PATCH/DELETE | JSON file browser and mutations |
-| `/api/v1/shares`, `/api/v1/shares/:id` | GET/POST/PATCH/DELETE | Share lifecycle |
-| `/api/v1/admins` | GET/POST | administrator lifecycle |
-| `/api/v1/settings` | GET/PUT | runtime settings |
-| `/api/v1/audit` | GET | paginated audit events |
-| `/api/v1/public/shares/:token` | GET | public Share metadata |
-| `/api/v1/public/shares/:token/unlock` | POST | unlock protected Share |
-| `/api/v1/public/shares/:token/download` | GET/HEAD | safe streamed download |
-| `/api/v1/public/shares/:token/upload` | POST | safe streamed upload |
-| `/api/v1/public/shares/:token/preview` | GET | safe preview |
-| `/api/v1/public/shares/:token/download.zip` | GET | safe ZIP transfer |
+| `/api/v2/health` | GET | health/version |
+| `/api/v2/session/login`, `/mfa`, `/logout`, `/me` | GET/POST | session lifecycle |
+| `/api/v2/files` | GET/PATCH/DELETE | JSON file browser and mutations |
+| `/api/v2/shares`, `/api/v2/shares/:id` | GET/POST/PATCH/DELETE | Share lifecycle |
+| `/api/v2/admins` | GET/POST | administrator lifecycle |
+| `/api/v2/settings` | GET/PUT | runtime settings |
+| `/api/v2/audit` | GET | paginated audit events |
+| `/api/v2/public/shares/:token` | GET | public Share metadata |
+| `/api/v2/public/shares/:token/unlock` | POST | unlock protected Share |
+| `/api/v2/public/shares/:token/download` | GET/HEAD | safe streamed download |
+| `/api/v2/public/shares/:token/upload` | POST | safe streamed upload |
+| `/api/v2/public/shares/:token/preview` | GET | safe preview |
+| `/api/v2/public/shares/:token/download.zip` | GET | safe ZIP transfer |
+
+`GET /api/v2/shares` accepts `limit` (default 50, range 1–200), `cursor`, `q`,
+`status=all|active|protected|expired|limit|inactive`, and
+`sort=newest|oldest`. It returns
+`{"shares":[...],"next_cursor":<id|null>}`. All other v2 response schemas match
+their former v1 counterparts; the v1 router is intentionally absent.
 
 JSON errors have this envelope:
 

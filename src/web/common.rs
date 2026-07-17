@@ -1,12 +1,17 @@
-use std::{cmp::Ordering, collections::VecDeque, io};
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, VecDeque},
+    io,
+    time::{Instant, UNIX_EPOCH},
+};
 
 use axum::{
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use qrcode::{render::svg, QrCode};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -31,7 +36,7 @@ pub(super) fn webauthn_start_response<T: Serialize>(
         Err(WebAuthnServiceError::CapacityExceeded) => {
             let mut response = (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "WebAuthn ist vorübergehend ausgelastet",
+                "WebAuthn is temporarily busy",
             )
                 .into_response();
             response
@@ -41,7 +46,7 @@ pub(super) fn webauthn_start_response<T: Serialize>(
         }
         Err(WebAuthnServiceError::Ceremony(_)) => Err(AppError(
             StatusCode::BAD_REQUEST,
-            "Sicherheitsschlüssel konnte nicht gestartet werden",
+            "Security key authentication could not be started",
         )),
     }
 }
@@ -112,7 +117,7 @@ pub(super) fn format_public_date(value: DateTime<Utc>) -> String {
 }
 
 pub(super) fn internal<T>(_: T) -> AppError {
-    AppError(StatusCode::INTERNAL_SERVER_ERROR, "Interner Fehler")
+    AppError(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
 }
 pub(super) fn decode_security_keys(
     rows: &[crate::db::AdminWebauthnCredential],
@@ -131,7 +136,8 @@ pub(super) struct CsrfForm {
 #[derive(Default, Deserialize)]
 pub(crate) struct BrowseQuery {
     pub(super) path: Option<String>,
-    pub(super) page: Option<usize>,
+    pub(super) after: Option<String>,
+    pub(super) before: Option<String>,
     pub(super) q: Option<String>,
     pub(super) sort: Option<String>,
     pub(super) direction: Option<String>,
@@ -139,7 +145,8 @@ pub(crate) struct BrowseQuery {
     pub(super) notice: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(super) enum FileSortColumn {
     Name,
     Type,
@@ -147,7 +154,8 @@ pub(super) enum FileSortColumn {
     Modified,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(super) enum FileSortDirection {
     Ascending,
     Descending,
@@ -197,6 +205,20 @@ fn compare_entries(left: &Entry, right: &Entry, column: FileSortColumn) -> Order
         FileSortColumn::Type => (!left.is_dir).cmp(&(!right.is_dir)).then_with(by_name),
         FileSortColumn::Size => left.len.cmp(&right.len).then_with(by_name),
         FileSortColumn::Modified => left.modified.cmp(&right.modified).then_with(by_name),
+    }
+}
+
+fn compare_entries_directed(
+    left: &Entry,
+    right: &Entry,
+    column: FileSortColumn,
+    direction: FileSortDirection,
+) -> Ordering {
+    let order = compare_entries(left, right, column);
+    if direction == FileSortDirection::Descending {
+        order.reverse()
+    } else {
+        order
     }
 }
 
@@ -353,18 +375,18 @@ pub(super) fn parse_expiry(
             .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S"))
             .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M"))
             .or_else(|_| NaiveDateTime::parse_from_str(value, "%d.%m.%Y %H:%M"))
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"))?;
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid expiration date"))?;
         let offset = offset_minutes
             .unwrap_or("0")
             .trim()
             .parse::<i64>()
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"))?;
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid expiration date"))?;
         if !(-1_440..=1_440).contains(&offset) {
-            return Err(AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"));
+            return Err(AppError(StatusCode::BAD_REQUEST, "Invalid expiration date"));
         }
         let utc_naive = naive
             .checked_add_signed(Duration::minutes(offset))
-            .ok_or(AppError(StatusCode::BAD_REQUEST, "Ungültiges Ablaufdatum"))?;
+            .ok_or(AppError(StatusCode::BAD_REQUEST, "Invalid expiration date"))?;
         return Ok(Some(DateTime::<Utc>::from_naive_utc_and_offset(
             utc_naive, Utc,
         )));
@@ -394,14 +416,8 @@ pub(super) fn otpauth_url(username: &str, secret: &str) -> SecretString {
     ))
 }
 
-pub(super) fn qr_svg(data: &str) -> Result<String> {
-    let code = QrCode::new(data.as_bytes()).map_err(internal)?;
-    Ok(code
-        .render::<svg::Color<'_>>()
-        .min_dimensions(220, 220)
-        .dark_color(svg::Color("#081226"))
-        .light_color(svg::Color("#f8fbff"))
-        .build())
+pub(super) fn qr_svg(data: &str) -> Result<super::templates::TrustedMarkup> {
+    super::templates::TrustedMarkup::generated_qr(data).map_err(internal)
 }
 
 pub(super) fn join_display(base: &str, child: &str) -> String {
@@ -466,13 +482,13 @@ pub(super) fn public_preview_error(error: &io::Error) -> AppError {
     // descriptor-bound share or follow a forbidden final symlink. Keep that
     // security boundary indistinguishable from a missing public file.
     if matches!(error.raw_os_error(), Some(18 | 40)) {
-        return AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar");
+        return AppError(StatusCode::NOT_FOUND, "File unavailable");
     }
     match error.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
-            AppError(StatusCode::NOT_FOUND, "Datei nicht verfügbar")
+            AppError(StatusCode::NOT_FOUND, "File unavailable")
         }
-        _ => AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"),
+        _ => AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Preview not allowed"),
     }
 }
 
@@ -549,16 +565,179 @@ pub(super) fn list_directory_page<D: DirectoryAccess>(
     Ok((entries, false))
 }
 
-pub(super) fn list_directory_sorted_page<D: DirectoryAccess>(
+const DIRECTORY_PAGE_SIZE: usize = 100;
+const DIRECTORY_CURSOR_MAX_BYTES: usize = 4_096;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DirectoryCursor {
+    version: u8,
+    column: FileSortColumn,
+    direction: FileSortDirection,
+    name: String,
+    is_dir: bool,
+    len: u64,
+    modified_nanos: Option<u64>,
+}
+
+impl DirectoryCursor {
+    fn from_entry(
+        entry: &Entry,
+        column: FileSortColumn,
+        direction: FileSortDirection,
+    ) -> io::Result<Self> {
+        let modified_nanos = entry
+            .modified
+            .map(|modified| {
+                modified
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| invalid_cursor())?
+                    .as_nanos()
+                    .try_into()
+                    .map_err(|_| invalid_cursor())
+            })
+            .transpose()?;
+        Ok(Self {
+            version: 1,
+            column,
+            direction,
+            name: entry.name.clone(),
+            is_dir: entry.is_dir,
+            len: entry.len,
+            modified_nanos,
+        })
+    }
+
+    fn entry(&self) -> Entry {
+        Entry {
+            name: self.name.clone(),
+            is_dir: self.is_dir,
+            len: self.len,
+            modified: self
+                .modified_nanos
+                .map(|nanos| UNIX_EPOCH + std::time::Duration::from_nanos(nanos)),
+        }
+    }
+}
+
+fn invalid_cursor() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "Invalid directory cursor")
+}
+
+fn encode_directory_cursor(
+    entry: &Entry,
+    column: FileSortColumn,
+    direction: FileSortDirection,
+) -> io::Result<String> {
+    let json = serde_json::to_vec(&DirectoryCursor::from_entry(entry, column, direction)?)
+        .map_err(|_| invalid_cursor())?;
+    Ok(URL_SAFE_NO_PAD.encode(json))
+}
+
+fn decode_directory_cursor(
+    value: &str,
+    column: FileSortColumn,
+    direction: FileSortDirection,
+) -> io::Result<Entry> {
+    if value.is_empty() || value.len() > DIRECTORY_CURSOR_MAX_BYTES {
+        return Err(invalid_cursor());
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| invalid_cursor())?;
+    if bytes.len() > DIRECTORY_CURSOR_MAX_BYTES {
+        return Err(invalid_cursor());
+    }
+    let cursor: DirectoryCursor = serde_json::from_slice(&bytes).map_err(|_| invalid_cursor())?;
+    if cursor.version != 1 || cursor.column != column || cursor.direction != direction {
+        return Err(invalid_cursor());
+    }
+    Ok(cursor.entry())
+}
+
+#[derive(Debug)]
+struct RankedEntry {
+    entry: Entry,
+    column: FileSortColumn,
+    direction: FileSortDirection,
+    reverse: bool,
+}
+
+impl PartialEq for RankedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedEntry {}
+
+impl PartialOrd for RankedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let order =
+            compare_entries_directed(&self.entry, &other.entry, self.column, self.direction);
+        if self.reverse {
+            order.reverse()
+        } else {
+            order
+        }
+    }
+}
+
+fn retain_ranked_entry(
+    heap: &mut BinaryHeap<RankedEntry>,
+    entry: Entry,
+    column: FileSortColumn,
+    direction: FileSortDirection,
+    backwards: bool,
+) {
+    heap.push(RankedEntry {
+        entry,
+        column,
+        direction,
+        reverse: backwards,
+    });
+    if heap.len() > DIRECTORY_PAGE_SIZE + 1 {
+        heap.pop();
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DirectoryCursorPage {
+    pub(super) entries: Vec<Entry>,
+    pub(super) previous_cursor: Option<String>,
+    pub(super) next_cursor: Option<String>,
+    #[cfg(test)]
+    pub(super) scanned: usize,
+    pub(super) truncated: bool,
+    #[cfg(test)]
+    pub(super) peak_retained: usize,
+}
+
+pub(super) fn list_directory_cursor_page<D: DirectoryAccess>(
     directory: &D,
     relative: &str,
-    page: usize,
+    after: Option<&str>,
+    before: Option<&str>,
     scan_limit: usize,
     column: FileSortColumn,
     direction: FileSortDirection,
-) -> io::Result<(Vec<Entry>, bool)> {
+) -> io::Result<DirectoryCursorPage> {
+    if after.is_some() && before.is_some() {
+        return Err(invalid_cursor());
+    }
+    let started = Instant::now();
+    let boundary = after
+        .or(before)
+        .map(|cursor| decode_directory_cursor(cursor, column, direction))
+        .transpose()?;
+    let backwards = before.is_some();
+    let mut heap = BinaryHeap::with_capacity(DIRECTORY_PAGE_SIZE + 1);
     let mut scanned = 0usize;
-    let mut entries = Vec::new();
     let mut truncated = false;
     let mut scan = directory.scan_entries(relative)?;
     loop {
@@ -568,19 +747,74 @@ pub(super) fn list_directory_sorted_page<D: DirectoryAccess>(
             truncated = sentinel.scanned != 0 || !sentinel.complete;
             break;
         }
-        let batch = scan.run_batch(remaining.min(100))?;
+        let batch = scan.run_batch(remaining.min(256))?;
         scanned = scanned.saturating_add(batch.scanned);
-        entries.extend(batch.entries);
+        for entry in batch.entries {
+            let include = boundary.as_ref().is_none_or(|boundary| {
+                let order = compare_entries_directed(&entry, boundary, column, direction);
+                if backwards {
+                    order.is_lt()
+                } else {
+                    order.is_gt()
+                }
+            });
+            if !include {
+                continue;
+            }
+            retain_ranked_entry(&mut heap, entry, column, direction, backwards);
+        }
         if batch.complete {
             break;
         }
     }
+    #[cfg(test)]
+    let peak_retained = heap.len();
+    let mut entries = heap
+        .into_iter()
+        .map(|ranked| ranked.entry)
+        .collect::<Vec<_>>();
     sort_entries(&mut entries, column, direction);
-    let skip = page.saturating_mul(100);
-    Ok((
-        entries.into_iter().skip(skip).take(101).collect(),
+    let has_more = entries.len() > DIRECTORY_PAGE_SIZE;
+    if has_more {
+        if backwards {
+            entries.remove(0);
+        } else {
+            entries.pop();
+        }
+    }
+    let previous_cursor = if !entries.is_empty() && (has_more && backwards || after.is_some()) {
+        Some(encode_directory_cursor(&entries[0], column, direction)?)
+    } else {
+        None
+    };
+    let next_cursor = if !entries.is_empty() && (has_more && !backwards || before.is_some()) {
+        Some(encode_directory_cursor(
+            entries.last().expect("non-empty page"),
+            column,
+            direction,
+        )?)
+    } else {
+        None
+    };
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        directory = relative,
+        scanned,
+        returned = entries.len(),
         truncated,
-    ))
+        elapsed_ms,
+        "directory listing scan completed"
+    );
+    Ok(DirectoryCursorPage {
+        entries,
+        previous_cursor,
+        next_cursor,
+        #[cfg(test)]
+        scanned,
+        truncated,
+        #[cfg(test)]
+        peak_retained,
+    })
 }
 
 pub(super) fn search_tree<D: DirectoryAccess>(
@@ -630,4 +864,89 @@ pub(super) fn search_tree<D: DirectoryAccess>(
         }
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod directory_cursor_tests {
+    use super::*;
+
+    fn entry(index: usize) -> Entry {
+        Entry {
+            name: format!("entry-{index:05}.txt"),
+            is_dir: index.is_multiple_of(7),
+            len: (50_000 - index) as u64,
+            modified: Some(UNIX_EPOCH + std::time::Duration::from_secs((index % 997) as u64)),
+        }
+    }
+
+    fn identity(entry: &Entry) -> (&str, bool, u64, Option<std::time::SystemTime>) {
+        (&entry.name, entry.is_dir, entry.len, entry.modified)
+    }
+
+    #[test]
+    fn fifty_thousand_entry_reference_sort_retains_at_most_101_candidates() {
+        for column in [
+            FileSortColumn::Name,
+            FileSortColumn::Type,
+            FileSortColumn::Size,
+            FileSortColumn::Modified,
+        ] {
+            for direction in [FileSortDirection::Ascending, FileSortDirection::Descending] {
+                let mut expected = (0..50_000).map(entry).collect::<Vec<_>>();
+                sort_entries(&mut expected, column, direction);
+                for backwards in [false, true] {
+                    let mut heap = BinaryHeap::new();
+                    for candidate in (0..50_000).map(entry) {
+                        retain_ranked_entry(&mut heap, candidate, column, direction, backwards);
+                        assert!(heap.len() <= 101);
+                    }
+                    let mut actual = heap
+                        .into_iter()
+                        .map(|ranked| ranked.entry)
+                        .collect::<Vec<_>>();
+                    sort_entries(&mut actual, column, direction);
+                    let reference = if backwards {
+                        &expected[expected.len() - 101..]
+                    } else {
+                        &expected[..101]
+                    };
+                    assert_eq!(
+                        actual.iter().map(identity).collect::<Vec<_>>(),
+                        reference.iter().map(identity).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn directory_cursor_is_versioned_bounded_and_bound_to_sorting() {
+        let boundary = entry(42);
+        let cursor = encode_directory_cursor(
+            &boundary,
+            FileSortColumn::Modified,
+            FileSortDirection::Descending,
+        )
+        .unwrap();
+        assert!(cursor.len() <= DIRECTORY_CURSOR_MAX_BYTES);
+        let decoded = decode_directory_cursor(
+            &cursor,
+            FileSortColumn::Modified,
+            FileSortDirection::Descending,
+        )
+        .unwrap();
+        assert_eq!(identity(&decoded), identity(&boundary));
+        assert!(decode_directory_cursor(
+            &cursor,
+            FileSortColumn::Name,
+            FileSortDirection::Descending
+        )
+        .is_err());
+        assert!(decode_directory_cursor(
+            &"x".repeat(DIRECTORY_CURSOR_MAX_BYTES + 1),
+            FileSortColumn::Name,
+            FileSortDirection::Ascending
+        )
+        .is_err());
+    }
 }

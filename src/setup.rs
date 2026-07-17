@@ -19,7 +19,6 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use qrcode::{render::svg, QrCode};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -34,6 +33,7 @@ use crate::{
     runtime,
     sensitive::SecretString,
     storage_mount, ui,
+    web::templates::TrustedMarkup,
 };
 
 #[derive(Clone)]
@@ -63,7 +63,7 @@ struct SetupPageTemplate<'a> {
     locale_code: &'static str,
     title: &'static str,
     skip_to_content: &'static str,
-    brand_html: String,
+    brand_html: TrustedMarkup,
     show_locale_switcher: bool,
     language_label: &'static str,
     return_to: String,
@@ -77,6 +77,55 @@ struct SetupPageTemplate<'a> {
 struct SetupFormTemplate<'a> {
     error: Option<&'a str>,
     max_text_preview_size_mb: u64,
+}
+
+#[derive(Template)]
+#[template(
+    source = r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="{{ message_key }}"/></p></section>"#,
+    ext = "html"
+)]
+struct SetupMessageTemplate {
+    message_key: &'static str,
+}
+
+#[derive(Template)]
+#[template(
+    source = r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p>{% if prefix_key != "" %}<vl-i18n key="{{ prefix_key }}"/> {% endif %}{{ detail }}</p></section>"#,
+    ext = "html"
+)]
+struct SetupErrorTemplate<'a> {
+    prefix_key: &'static str,
+    detail: &'a str,
+}
+
+#[derive(Template)]
+#[template(
+    source = r#"<section class="vl-panel"><h1><vl-i18n key="setup.completed"/></h1><p><vl-i18n key="setup.config_admin_created"/></p><p><vl-i18n key="setup.totp_recovery_help"/></p><div class="vl-qr-card" aria-label="<vl-i18n key="setup.totp_qr_code"/>">{{ qr }}</div><div class="vl-secret-block"><code>{{ secret }}</code><code>{{ otpauth }}</code></div><form method="post" action="/complete"><button class="vl-button"><vl-i18n key="setup.secret_saved"/></button></form></section>"#,
+    ext = "html"
+)]
+struct SetupCompletedTemplate<'a> {
+    qr: &'a TrustedMarkup,
+    secret: &'a str,
+    otpauth: &'a str,
+}
+
+#[derive(Template)]
+#[template(
+    source = r#"<section class="vl-panel"><h1><vl-i18n key="setup.confirmed"/></h1><p>{{ message }}</p><p><vl-i18n key="setup.configured_for_mode"/> <strong>{{ mode }}</strong>.</p><form method="post" action="/start"><button class="vl-button"><vl-i18n key="setup.start_now"/></button></form><p class="vl-muted"><vl-i18n key="setup.service_start_help"/></p></section>"#,
+    ext = "html"
+)]
+struct SetupConfirmedTemplate<'a> {
+    message: &'a str,
+    mode: &'static str,
+}
+
+#[derive(Template)]
+#[template(
+    source = r#"<section class="vl-panel"><h1><vl-i18n key="setup.starting"/></h1><p><vl-i18n key="setup.listener_transition"/></p><p><a class="vl-button" href="{{ url }}"><vl-i18n key="setup.open_vaultlink"/></a></p><p class="vl-muted"><vl-i18n key="setup.start_delay"/></p></section>"#,
+    ext = "html"
+)]
+struct SetupStartingTemplate<'a> {
+    url: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -278,7 +327,9 @@ async fn set_setup_locale(Form(form): Form<SetupLocaleForm>) -> Response {
         return (
             StatusCode::BAD_REQUEST,
             Html(page(
-                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="error.invalid_language"/></p></section>"#,
+                &SetupMessageTemplate {
+                    message_key: "error.invalid_language",
+                },
                 None,
             )),
         )
@@ -374,7 +425,9 @@ async fn setup_page(State(state): State<SetupState>, headers: HeaderMap) -> Resp
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
-                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                &SetupMessageTemplate {
+                    message_key: "setup.token_invalid",
+                },
                 None,
             )),
         )
@@ -392,7 +445,9 @@ async fn submit_setup(
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
-                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                &SetupMessageTemplate {
+                    message_key: "setup.token_invalid",
+                },
                 None,
             )),
         )
@@ -403,45 +458,42 @@ async fn submit_setup(
         return (
             StatusCode::CONFLICT,
             Html(page(
-                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.already_completed"/></p></section>"#,
+                &SetupMessageTemplate {
+                    message_key: "setup.already_completed",
+                },
                 None,
             )),
         )
             .into_response();
     }
     match build_and_store(&state.config_path, form).await {
-        Ok(result) => match qr_svg(result.otpauth.expose_secret()) {
-            Ok(qr) => {
-                Html(page_without_locale_switcher(
-                    &format!(
-                    r#"<section class="vl-panel"><h1><vl-i18n key="setup.completed"/></h1><p><vl-i18n key="setup.config_admin_created"/></p><p><vl-i18n key="setup.totp_recovery_help"/></p><div class="vl-qr-card" aria-label="<vl-i18n key="setup.totp_qr_code"/>">{}</div><div class="vl-secret-block"><code>{}</code><code>{}</code></div><form method="post" action="/complete"><button class="vl-button"><vl-i18n key="setup.secret_saved"/></button></form></section>"#,
-                    qr,
-                    esc(result.totp_secret.expose_secret()),
-                    esc(result.otpauth.expose_secret())
-                ),
-                ))
-                .into_response()
+        Ok(result) => match TrustedMarkup::generated_qr(result.otpauth.expose_secret()) {
+            Ok(qr) => Html(page_without_locale_switcher(&SetupCompletedTemplate {
+                qr: &qr,
+                secret: result.totp_secret.expose_secret(),
+                otpauth: result.otpauth.expose_secret(),
+            }))
+            .into_response(),
+            Err(error) => {
+                let error = error.to_string();
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Html(page(
+                        &SetupErrorTemplate {
+                            prefix_key: "",
+                            detail: &error,
+                        },
+                        None,
+                    )),
+                )
+                    .into_response()
             }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(page(
-                    &format!(
-                        r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p>{}</p></section>"#,
-                        esc(&error)
-                    ),
-                    None,
-                )),
-            )
-                .into_response(),
         },
-        Err(error) => {
-            let body = setup_form(Some(&error));
-            (
-                StatusCode::BAD_REQUEST,
-                Html(page(&body, None)),
-            )
-                .into_response()
-        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Html(page(&setup_form(Some(&error)), None)),
+        )
+            .into_response(),
     }
 }
 
@@ -450,7 +502,9 @@ async fn complete_setup(State(state): State<SetupState>, headers: HeaderMap) -> 
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
-                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                &SetupMessageTemplate {
+                    message_key: "setup.token_invalid",
+                },
                 None,
             )),
         )
@@ -467,10 +521,10 @@ async fn complete_setup(State(state): State<SetupState>, headers: HeaderMap) -> 
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(page(
-                    &format!(
-                        r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
-                        esc(&error.to_string())
-                    ),
+                    &SetupErrorTemplate {
+                        prefix_key: "setup.config_load_failed",
+                        detail: &error.to_string(),
+                    },
                     None,
                 )),
             )
@@ -483,10 +537,10 @@ async fn complete_setup(State(state): State<SetupState>, headers: HeaderMap) -> 
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(page(
-                    &format!(
-                        r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
-                        esc(&error.to_string())
-                    ),
+                    &SetupErrorTemplate {
+                        prefix_key: "setup.config_load_failed",
+                        detail: &error.to_string(),
+                    },
                     None,
                 )),
             )
@@ -505,10 +559,10 @@ async fn complete_setup(State(state): State<SetupState>, headers: HeaderMap) -> 
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Html(page(
-                &format!(
-                    r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.confirmation_failed"/> {}</p></section>"#,
-                    esc(&error)
-                ),
+                &SetupErrorTemplate {
+                    prefix_key: "setup.confirmation_failed",
+                    detail: &error,
+                },
                 None,
             )),
         )
@@ -516,16 +570,13 @@ async fn complete_setup(State(state): State<SetupState>, headers: HeaderMap) -> 
     }
 }
 
-fn setup_confirmed_body(config: &Config, message: &str) -> String {
+fn setup_confirmed_body<'a>(config: &Config, message: &'a str) -> SetupConfirmedTemplate<'a> {
     let mode = match &config.server.mode {
         ServerMode::Development => "Development",
         ServerMode::ReverseProxy => "Reverse Proxy",
         ServerMode::StandaloneTls => "Standalone TLS",
     };
-    format!(
-        r#"<section class="vl-panel"><h1><vl-i18n key="setup.confirmed"/></h1><p>{}</p><p><vl-i18n key="setup.configured_for_mode"/> <strong>{mode}</strong>.</p><form method="post" action="/start"><button class="vl-button"><vl-i18n key="setup.start_now"/></button></form><p class="vl-muted"><vl-i18n key="setup.service_start_help"/></p></section>"#,
-        esc(message)
-    )
+    SetupConfirmedTemplate { message, mode }
 }
 
 async fn start_server(State(state): State<SetupState>, headers: HeaderMap) -> Response {
@@ -533,7 +584,9 @@ async fn start_server(State(state): State<SetupState>, headers: HeaderMap) -> Re
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
-                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.token_invalid"/></p></section>"#,
+                &SetupMessageTemplate {
+                    message_key: "setup.token_invalid",
+                },
                 None,
             )),
         )
@@ -543,7 +596,9 @@ async fn start_server(State(state): State<SetupState>, headers: HeaderMap) -> Re
         return (
             StatusCode::CONFLICT,
             Html(page(
-                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.totp_confirm_first"/></p></section>"#,
+                &SetupMessageTemplate {
+                    message_key: "setup.totp_confirm_first",
+                },
                 None,
             )),
         )
@@ -555,10 +610,10 @@ async fn start_server(State(state): State<SetupState>, headers: HeaderMap) -> Re
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(page(
-                    &format!(
-                        r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.config_load_failed"/> {}</p></section>"#,
-                        esc(&error.to_string())
-                    ),
+                    &SetupErrorTemplate {
+                        prefix_key: "setup.config_load_failed",
+                        detail: &error.to_string(),
+                    },
                     None,
                 )),
             )
@@ -569,7 +624,9 @@ async fn start_server(State(state): State<SetupState>, headers: HeaderMap) -> Re
         return (
             StatusCode::CONFLICT,
             Html(page(
-                r#"<section class="vl-panel"><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="setup.start_already_requested"/></p></section>"#,
+                &SetupMessageTemplate {
+                    message_key: "setup.start_already_requested",
+                },
                 None,
             )),
         )
@@ -583,12 +640,9 @@ async fn start_server(State(state): State<SetupState>, headers: HeaderMap) -> Re
             start_requested.store(false, Ordering::Release);
         }
     });
-    Html(page_without_locale_switcher(
-        &format!(
-            r#"<section class="vl-panel"><h1><vl-i18n key="setup.starting"/></h1><p><vl-i18n key="setup.listener_transition"/></p><p><a class="vl-button" href="{}"><vl-i18n key="setup.open_vaultlink"/></a></p><p class="vl-muted"><vl-i18n key="setup.start_delay"/></p></section>"#,
-            esc(&config.server.public_base_url),
-        ),
-    ))
+    Html(page_without_locale_switcher(&SetupStartingTemplate {
+        url: &config.server.public_base_url,
+    }))
     .into_response()
 }
 
@@ -1227,18 +1281,14 @@ fn setup_picker_file_allowed(path: &Path, file_kind: Option<&str>) -> bool {
     )
 }
 
-fn setup_form(error: Option<&str>) -> String {
-    let template = SetupFormTemplate {
+fn setup_form(error: Option<&str>) -> SetupFormTemplate<'_> {
+    SetupFormTemplate {
         error,
         max_text_preview_size_mb: MAX_TEXT_PREVIEW_SIZE / 1_000_000,
-    };
-    let html = template
-        .render()
-        .expect("the setup form template writes only to an in-memory string");
-    i18n::render_markers(i18n::current_locale(), &html)
+    }
 }
 
-fn page(body: &str, token: Option<&str>) -> String {
+fn page<T: Template>(body: &T, token: Option<&str>) -> String {
     render_page(body, token, true)
 }
 
@@ -1248,18 +1298,21 @@ fn page(body: &str, token: Option<&str>) -> String {
 // replayed safely after a locale redirect. The application-owned SecretString
 // is zeroed after rendering, but the framework and network response buffers
 // cannot be reliably zeroized.
-fn page_without_locale_switcher(body: &str) -> String {
+fn page_without_locale_switcher<T: Template>(body: &T) -> String {
     render_page(body, None, false)
 }
 
-fn render_page(body: &str, token: Option<&str>, show_locale_switcher: bool) -> String {
+fn render_page<T: Template>(body: &T, token: Option<&str>, show_locale_switcher: bool) -> String {
     let locale = i18n::current_locale();
-    let body = SetupRenderedHtml(i18n::render_markers(locale, body));
+    let rendered_body = body
+        .render()
+        .expect("the setup fragment template writes only to an in-memory string");
+    let body = SetupRenderedHtml(i18n::render_markers(locale, &rendered_body));
     SetupPageTemplate {
         locale_code: locale.code(),
         title: i18n::text(locale, i18n::SETUP_TITLE),
         skip_to_content: i18n::text(locale, i18n::SKIP_TO_CONTENT),
-        brand_html: ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
+        brand_html: TrustedMarkup::brand(i18n::text(locale, i18n::BRAND_TAGLINE)),
         show_locale_switcher,
         language_label: i18n::text(locale, i18n::LANGUAGE),
         return_to: setup_return_to(token),
@@ -1590,24 +1643,6 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 "#;
-
-fn qr_svg(data: &str) -> Result<String, String> {
-    let code = QrCode::new(data.as_bytes()).map_err(|error| error.to_string())?;
-    Ok(code
-        .render::<svg::Color<'_>>()
-        .min_dimensions(220, 220)
-        .dark_color(svg::Color("#081226"))
-        .light_color(svg::Color("#f8fbff"))
-        .build())
-}
-
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
 
 #[cfg(test)]
 mod tests {
@@ -2048,11 +2083,34 @@ mod tests {
         assert!(html.contains("Initial setup"));
     }
 
+    #[tokio::test]
+    async fn setup_error_payloads_are_autoescaped_by_askama() {
+        let payload = r#"<img src=x onerror=alert(1)>"#;
+        let html = i18n::scope(Locale::En, "/".into(), async {
+            page(&setup_form(Some(payload)), None)
+        })
+        .await;
+        assert!(!html.contains(payload));
+        assert!(!html.contains("<img src=x"));
+        assert!(html.contains("img src=x onerror=alert(1)"));
+    }
+
     #[test]
     fn setup_qr_svg_renders_totp_code() {
-        let qr = qr_svg("otpauth://totp/VaultLink:admin?secret=ABC&issuer=VaultLink").unwrap();
-        assert!(qr.contains("<svg"));
-        assert!(qr.contains("#081226"));
+        let qr = TrustedMarkup::generated_qr(
+            "otpauth://totp/VaultLink:admin?secret=ABC&issuer=VaultLink",
+        )
+        .unwrap();
+        let rendered = SetupCompletedTemplate {
+            qr: &qr,
+            secret: "ABC",
+            otpauth: "otpauth://fixture",
+        }
+        .render()
+        .unwrap();
+        assert!(rendered.contains("<svg"));
+        assert!(rendered.contains("#081226"));
+        assert!(!rendered.contains("&lt;svg"));
     }
 
     #[test]
@@ -2293,10 +2351,10 @@ mod tests {
         assert!(!result.totp_secret.expose_secret().is_empty());
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.storage.max_preview_size, 1_000_000);
-        let confirmed = i18n::render_markers(
-            Locale::De,
-            &setup_confirmed_body(&config, "Secret geschlossen."),
-        );
+        let confirmed_fragment = setup_confirmed_body(&config, "Secret geschlossen.")
+            .render()
+            .unwrap();
+        let confirmed = i18n::render_markers(Locale::De, &confirmed_fragment);
         assert!(confirmed.contains("VaultLink jetzt starten"));
         assert!(confirmed.contains("Development"));
         assert!(!confirmed.contains("<vl-i18n"));

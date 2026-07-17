@@ -1,23 +1,29 @@
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub(super) const SCHEMA_VERSION: i64 = 2;
+pub(super) const SCHEMA_VERSION: i64 = 3;
 pub(super) const SCHEMA_1_FINGERPRINT: &str = "vaultlink-schema-1-encrypted-secrets-2026-07-17";
-const SCHEMA_2_FINGERPRINT: &str = "vaultlink-schema-2-migration-history-2026-07-17";
+pub(super) const SCHEMA_2_FINGERPRINT: &str = "vaultlink-schema-2-migration-history-2026-07-17";
+const SCHEMA_3_FINGERPRINT: &str = "vaultlink-schema-3-share-indexes-2026-07-17";
 
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_SCHEMA_1_TO_2_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_SCHEMA_2_TO_3_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         0 => initialize_empty_database(conn),
-        1 => migrate_schema_1_to_2(conn),
-        SCHEMA_VERSION => validate_schema_2(conn).and_then(|()| validate_database(conn)),
+        1 => {
+            migrate_schema_1_to_2(conn)?;
+            migrate_schema_2_to_3(conn)
+        }
+        2 => migrate_schema_2_to_3(conn),
+        SCHEMA_VERSION => validate_schema_3(conn).and_then(|()| validate_database(conn)),
         _ => Err(schema_error(format!(
-            "unsupported VaultLink database schema {version}; this build accepts schemas 1 and {SCHEMA_VERSION}"
+            "unsupported VaultLink database schema {version}; this build accepts schemas 1, 2, and {SCHEMA_VERSION}"
         ))),
     }
 }
@@ -42,7 +48,7 @@ CREATE TABLE vaultlink_schema(
     fingerprint TEXT NOT NULL
 );
 INSERT INTO vaultlink_schema(singleton,fingerprint)
-VALUES(1,'vaultlink-schema-2-migration-history-2026-07-17');
+VALUES(1,'vaultlink-schema-3-share-indexes-2026-07-17');
 
 CREATE TABLE vaultlink_schema_migrations(
     target_version INTEGER PRIMARY KEY CHECK(target_version > 0),
@@ -95,6 +101,8 @@ CREATE TABLE shares(
     upload_policy_epoch INTEGER NOT NULL DEFAULT 0 CHECK(upload_policy_epoch >= 0)
 );
 CREATE INDEX idx_shares_relative_path ON shares(relative_path);
+CREATE INDEX idx_shares_active_id ON shares(active,id);
+CREATE INDEX idx_shares_active_expires ON shares(active,expires_at);
 
 CREATE TABLE audit(
     id INTEGER PRIMARY KEY,
@@ -226,8 +234,12 @@ CREATE INDEX idx_upload_reservations_share_epoch
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(2,?1)",
         [Utc::now().to_rfc3339()],
     )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(3,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    validate_schema_2(&tx)?;
+    validate_schema_3(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }
@@ -258,8 +270,36 @@ fn migrate_schema_1_to_2(conn: &mut Connection) -> rusqlite::Result<()> {
 
     // Keep this as the final mutation so a rollback always leaves a schema-1
     // database with its matching fingerprint and no migration table.
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", 2)?;
     validate_schema_2(&tx)?;
+    validate_database(&tx)?;
+    tx.commit()
+}
+
+fn migrate_schema_2_to_3(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_schema_2(&tx)?;
+    validate_database(&tx)?;
+    tx.execute_batch(
+        "CREATE INDEX idx_shares_active_id ON shares(active,id);
+         CREATE INDEX idx_shares_active_expires ON shares(active,expires_at);",
+    )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(3,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+        [SCHEMA_3_FINGERPRINT],
+    )?;
+
+    #[cfg(test)]
+    if FAIL_NEXT_SCHEMA_2_TO_3_MIGRATION.with(|flag| flag.replace(false)) {
+        return Err(schema_error("injected schema 2 to 3 migration failure"));
+    }
+
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    validate_schema_3(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }
@@ -292,6 +332,35 @@ fn validate_schema_2(conn: &Connection) -> rusqlite::Result<()> {
         return Err(schema_error(
             "schema 2 migration record is missing or invalid",
         ));
+    }
+    validate_encrypted_shape(conn)
+}
+
+fn validate_schema_3(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_3_FINGERPRINT)?;
+    for target_version in [2, 3] {
+        let migration_record = conn
+            .query_row(
+                "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=?1",
+                [target_version],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if migration_record.as_deref().is_none_or(str::is_empty) {
+            return Err(schema_error(format!(
+                "schema {target_version} migration record is missing or invalid"
+            )));
+        }
+    }
+    for index in ["idx_shares_active_id", "idx_shares_active_expires"] {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?1)",
+            [index],
+            |row| row.get(0),
+        )?;
+        if !present {
+            return Err(schema_error(format!("schema 3 index {index} is missing")));
+        }
     }
     validate_encrypted_shape(conn)
 }
@@ -352,6 +421,11 @@ fn validate_database(conn: &Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 pub(super) fn fail_next_schema_1_to_2_migration() {
     FAIL_NEXT_SCHEMA_1_TO_2_MIGRATION.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_schema_2_to_3_migration() {
+    FAIL_NEXT_SCHEMA_2_TO_3_MIGRATION.with(|flag| flag.set(true));
 }
 
 #[derive(Debug)]

@@ -32,7 +32,7 @@ Actions logs:
 
 ```text
 VAULTLINK_BASE_URL=http://127.0.0.1:8080
-VAULTLINK_HEALTH_URL=http://127.0.0.1:8080/api/v1/health
+VAULTLINK_HEALTH_URL=http://127.0.0.1:8080/api/v2/health
 VAULTLINK_DATABASE=/var/lib/vaultlink/data.sqlite
 VAULTLINK_CONFIG=/etc/vaultlink/config.toml
 DOWNLOAD_TOKEN=REPLACE_WITH_STAGING_DOWNLOAD_TOKEN

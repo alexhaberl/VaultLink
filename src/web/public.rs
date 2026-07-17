@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use askama::Template;
 use axum::{
     extract::{ConnectInfo, Form, Path as AxPath, Query, State},
     http::{HeaderMap, StatusCode},
@@ -28,29 +29,61 @@ use super::{
     common::{
         encoded, file_sort_column, file_sort_column_value, file_sort_direction,
         file_sort_direction_value, file_sort_header, format_file_time, format_public_date, human,
-        internal, list_directory_sorted_page, parent_path, preview_allowed, public_breadcrumbs,
+        internal, list_directory_cursor_page, parent_path, preview_allowed, public_breadcrumbs,
         search_tree, sort_search_hits, BrowseQuery, FileSortColumn,
     },
     rendering::{esc, plain_page},
     shares::share_permission_label,
-    storage_recovery_app_error, AppError, Result, MAX_SEARCH_QUERY_BYTES,
+    storage_recovery_app_error,
+    templates::{self, TrustedMarkup},
+    AppError, Result, MAX_SEARCH_QUERY_BYTES,
 };
+
+#[derive(Template)]
+#[template(
+    source = r#"<section class="vl-panel vl-auth-card"><p class="vl-eyebrow"><vl-i18n key="share.secure"/></p><h1><vl-i18n key="public.protected_title"/></h1><p class="vl-muted"><vl-i18n key="public.enter_share_password"/></p><form method="post" action="/v/{{ token }}/unlock" class="vl-stack"><label class="vl-field"><vl-i18n key="auth.password"/><input type="password" name="password" autocomplete="current-password" required></label><button class="vl-button">{{ lock_icon }} <vl-i18n key="public.unlock"/></button></form></section>"#,
+    ext = "html"
+)]
+struct ProtectedShareTemplate<'a> {
+    token: &'a str,
+    lock_icon: TrustedMarkup,
+}
 
 pub(super) fn usable(sh: &Share) -> Result<()> {
     match policy::share_availability(sh, Utc::now()) {
         ShareAvailability::Available => Ok(()),
-        ShareAvailability::Inactive | ShareAvailability::Expired => Err(AppError(
-            StatusCode::GONE,
-            "Dieser Link ist nicht mehr aktiv",
-        )),
+        ShareAvailability::Inactive
+        | ShareAvailability::Expired
+        | ShareAvailability::LimitReached => {
+            Err(AppError(StatusCode::GONE, "This link is no longer active"))
+        }
     }
 }
+
+fn usable_for_transfer(sh: &Share) -> Result<()> {
+    match policy::share_availability(sh, Utc::now()) {
+        ShareAvailability::Available | ShareAvailability::LimitReached => Ok(()),
+        ShareAvailability::Inactive | ShareAvailability::Expired => {
+            Err(AppError(StatusCode::GONE, "This link is no longer active"))
+        }
+    }
+}
+
 pub(super) async fn get_share(state: &AppState, token: &str) -> Result<Share> {
     let token = token.to_string();
     let sh = database(state.db.clone(), move |db| db.share_by_token(&token))
         .await?
-        .ok_or(AppError(StatusCode::NOT_FOUND, "Link nicht gefunden"))?;
+        .ok_or(AppError(StatusCode::NOT_FOUND, "Link not found"))?;
     usable(&sh)?;
+    Ok(sh)
+}
+
+pub(super) async fn get_share_for_transfer(state: &AppState, token: &str) -> Result<Share> {
+    let token = token.to_string();
+    let sh = database(state.db.clone(), move |db| db.share_by_token(&token))
+        .await?
+        .ok_or(AppError(StatusCode::NOT_FOUND, "Link not found"))?;
+    usable_for_transfer(&sh)?;
     Ok(sh)
 }
 
@@ -65,10 +98,23 @@ pub(super) async fn get_storage_share(
         .map_err(storage_recovery_app_error)?;
     let share = get_share(state, token).await?;
     if share.id != expected_id {
-        return Err(AppError(
-            StatusCode::GONE,
-            "Freigabe wurde zwischenzeitlich geändert",
-        ));
+        return Err(AppError(StatusCode::GONE, "Share changed in the meantime"));
+    }
+    Ok((share, guard))
+}
+
+pub(super) async fn get_storage_share_for_transfer(
+    state: &AppState,
+    token: &str,
+    expected_id: i64,
+) -> Result<(Share, tokio::sync::OwnedMutexGuard<()>)> {
+    let guard = state.storage_mutation.clone().lock_owned().await;
+    let guard = file_ops::recover_pending_file_operations_with_guard(state, guard)
+        .await
+        .map_err(storage_recovery_app_error)?;
+    let share = get_share_for_transfer(state, token).await?;
+    if share.id != expected_id {
+        return Err(AppError(StatusCode::GONE, "Share changed in the meantime"));
     }
     Ok((share, guard))
 }
@@ -100,7 +146,7 @@ pub(super) async fn unlock_share(
     {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele Passwortversuche",
+            "Too many password attempts",
         ));
     }
     let password = form.password;
@@ -113,7 +159,7 @@ pub(super) async fn unlock_share(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiges Passwort"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid password"));
     }
     let valid = verify_password_admitted(&state, Some(password_hash), password).await?;
     if !valid {
@@ -125,7 +171,7 @@ pub(super) async fn unlock_share(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiges Passwort"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid password"));
     }
     // Do not clear successful unlock attempts: a known share password must not
     // provide an unlimited Argon2/session/audit oracle.
@@ -157,7 +203,7 @@ pub(super) async fn unlock_share(
             None,
         )
         .await;
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültiges Passwort"));
+        return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid password"));
     }
     Ok(redirect_with_cookie(
         &format!("/v/{token}"),
@@ -166,12 +212,14 @@ pub(super) async fn unlock_share(
 }
 
 fn protected_share_page(token: &str) -> Html<String> {
-    let body = format!(
-        r#"<section class="vl-panel vl-auth-card"><p class="vl-eyebrow"><vl-i18n key="share.secure"/></p><h1><vl-i18n key="public.protected_title"/></h1><p class="vl-muted"><vl-i18n key="public.enter_share_password"/></p><form method="post" action="/v/{0}/unlock" class="vl-stack"><label class="vl-field"><vl-i18n key="auth.password"/><input type="password" name="password" autocomplete="current-password" required></label><button class="vl-button">{1} <vl-i18n key="public.unlock"/></button></form></section>"#,
-        esc(token),
-        crate::ui::icon(crate::ui::Icon::Lock),
-    );
-    Html(plain_page("Geschützte Freigabe", &body))
+    let body = ProtectedShareTemplate {
+        token,
+        lock_icon: TrustedMarkup::static_icon(crate::ui::Icon::Lock),
+    };
+    Html(
+        templates::public_page("Protected share", &body)
+            .expect("the protected-share template writes only to an in-memory string"),
+    )
 }
 
 pub(super) async fn public_page(
@@ -196,7 +244,7 @@ pub(super) async fn public_page(
             state
                 .secure_root
                 .bind_directory(&sh.relative_path)
-                .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?,
+                .map_err(|_| AppError(StatusCode::NOT_FOUND, "Share target unavailable"))?,
         )
     } else {
         None
@@ -277,20 +325,36 @@ pub(super) async fn public_page(
     }
     if sh.is_directory && sh.permission.can_download() {
         let sub = q.path.clone().unwrap_or_default();
-        let page_number = q.page.unwrap_or(0).min(1_000_000);
+        let after_cursor = q.after.clone();
+        let before_cursor = q.before.clone();
         let sort_column = file_sort_column(q.sort.as_deref());
         let sort_direction = file_sort_direction(q.direction.as_deref());
         let search =
             q.q.map(|value| value.trim().to_string())
                 .filter(|v| !v.is_empty());
+        if after_cursor.is_some() && before_cursor.is_some() {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "Invalid directory cursor",
+            ));
+        }
+        if search.is_some() && (after_cursor.is_some() || before_cursor.is_some()) {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "Directory cursors cannot be combined with search",
+            ));
+        }
         if search
             .as_ref()
             .is_some_and(|value| value.len() > MAX_SEARCH_QUERY_BYTES)
         {
-            return Err(AppError(StatusCode::BAD_REQUEST, "Suchbegriff ist zu lang"));
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "Search query is too long",
+            ));
         }
         let clean_sub = path_security::validate_relative(&sub)
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
+            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid path"))?
             .to_string_lossy()
             .replace('\\', "/");
         let relative_dir = clean_sub.clone();
@@ -302,7 +366,7 @@ pub(super) async fn public_page(
         )
         .ok_or(AppError(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
+            "Too many concurrent expensive operations from this client",
         ))?;
         let _scan_permit = state
             .search_admission
@@ -311,7 +375,7 @@ pub(super) async fn public_page(
             .map_err(|_| {
                 AppError(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Zu viele gleichzeitige Dateisuchen",
+                    "Too many concurrent file searches",
                 )
             })?;
         body += &public_breadcrumbs(&token, &clean_sub);
@@ -331,7 +395,8 @@ pub(super) async fn public_page(
         );
         let secure_root = share_scope;
         let mut rows = String::new();
-        let mut has_next = false;
+        let mut previous_cursor = None;
+        let mut next_cursor = None;
         if let Some(search) = search.clone() {
             let search_settings = settings.clone();
             let mut hits = tokio::task::spawn_blocking(move || {
@@ -339,7 +404,13 @@ pub(super) async fn public_page(
             })
             .await
             .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    AppError(StatusCode::BAD_REQUEST, "Invalid directory cursor")
+                } else {
+                    AppError(StatusCode::NOT_FOUND, "Share target unavailable")
+                }
+            })?;
             sort_search_hits(&mut hits, sort_column, sort_direction);
             for hit in hits {
                 let share_rel = hit.relative_path.clone();
@@ -398,11 +469,14 @@ pub(super) async fn public_page(
             }
         } else {
             let scan_limit = settings.max_search_entries;
-            let (entries, truncated) = tokio::task::spawn_blocking(move || {
-                list_directory_sorted_page(
+            let cursor_after = after_cursor.clone();
+            let cursor_before = before_cursor.clone();
+            let listing_page = tokio::task::spawn_blocking(move || {
+                list_directory_cursor_page(
                     &secure_root,
                     &relative_dir,
-                    page_number,
+                    cursor_after.as_deref(),
+                    cursor_before.as_deref(),
                     scan_limit,
                     sort_column,
                     sort_direction,
@@ -410,9 +484,16 @@ pub(super) async fn public_page(
             })
             .await
             .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabeziel nicht verfügbar"))?;
-            has_next = entries.len() > 100;
-            for entry in entries.into_iter().take(100) {
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    AppError(StatusCode::BAD_REQUEST, "Invalid directory cursor")
+                } else {
+                    AppError(StatusCode::NOT_FOUND, "Share target unavailable")
+                }
+            })?;
+            previous_cursor = listing_page.previous_cursor;
+            next_cursor = listing_page.next_cursor;
+            for entry in listing_page.entries {
                 let rel = joined_relative(&clean_sub, &entry.name)?;
                 let name = esc(&entry.name);
                 let target = encoded(&rel);
@@ -445,7 +526,7 @@ pub(super) async fn public_page(
                     );
                 }
             }
-            if truncated {
+            if listing_page.truncated {
                 rows += r#"<tr><td colspan="5" class="vl-muted"><vl-i18n key="files.scan_limit"/></td></tr>"#;
             }
         }
@@ -501,18 +582,18 @@ pub(super) async fn public_page(
             file_sort_column_value(sort_column),
             file_sort_direction_value(sort_direction)
         );
-        if page_number > 0 {
+        if let Some(cursor) = previous_cursor {
             body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}{}\"><vl-i18n key=\"common.back\"/></a>",
-                page_number - 1,
+                " <a href=\"/v/{token}?path={encoded_sub}&before={}{}{}\"><vl-i18n key=\"common.back\"/></a>",
+                encoded(&cursor),
                 search_param,
                 sort_param,
             );
         }
-        if has_next {
+        if let Some(cursor) = next_cursor {
             body += &format!(
-                " <a href=\"/v/{token}?path={encoded_sub}&page={}{}{}\"><vl-i18n key=\"common.continue\"/></a>",
-                page_number + 1,
+                " <a href=\"/v/{token}?path={encoded_sub}&after={}{}{}\"><vl-i18n key=\"common.continue\"/></a>",
+                encoded(&cursor),
                 search_param,
                 sort_param,
             );
@@ -524,7 +605,7 @@ pub(super) async fn public_page(
         let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
             .await
             .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Freigabedatei nicht verfügbar"))?;
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Shared file unavailable"))?;
         let preview = if preview_allowed(&sh.relative_path, &settings) {
             format!(
                 r#"<a class="vl-button vl-button--secondary" href="/v/{token}/preview"><vl-i18n key="files.view_browser"/></a> "#
@@ -545,7 +626,7 @@ pub(super) async fn public_page(
     if sh.is_directory && sh.permission.can_upload() {
         let upload_path = if sh.permission.can_download() {
             path_security::validate_relative(q.path.as_deref().unwrap_or_default())
-                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Ungültiger Pfad"))?
+                .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid path"))?
                 .to_string_lossy()
                 .replace('\\', "/")
         } else {
@@ -586,14 +667,14 @@ pub(super) async fn public_page(
     if split_layout {
         body += "</div>";
     }
-    Ok(Html(plain_page("Freigabe", &body)))
+    Ok(Html(plain_page("Share", &body)))
 }
 fn joined_relative(base: &str, child: &str) -> Result<String> {
     let mut path = path_security::validate_relative(base)
-        .map_err(|_| AppError(StatusCode::FORBIDDEN, "Ungültiger Pfad"))?;
+        .map_err(|_| AppError(StatusCode::FORBIDDEN, "Invalid path"))?;
     path.push(
         path_security::validate_relative(child)
-            .map_err(|_| AppError(StatusCode::FORBIDDEN, "Ungültiger Pfad"))?,
+            .map_err(|_| AppError(StatusCode::FORBIDDEN, "Invalid path"))?,
     );
     Ok(path.to_string_lossy().replace('\\', "/"))
 }
@@ -611,15 +692,15 @@ pub(super) async fn short_redirect(
     {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
-            "Zu viele Alias-Anfragen",
+            "Too many alias requests",
         ));
     }
     if path_security::validate_share_alias(&alias).is_err() {
-        return Err(AppError(StatusCode::NOT_FOUND, "Alias nicht gefunden"));
+        return Err(AppError(StatusCode::NOT_FOUND, "Alias not found"));
     }
     let sh = database(state.db.clone(), move |db| db.share_by_alias(&alias))
         .await?
-        .ok_or(AppError(StatusCode::NOT_FOUND, "Alias nicht gefunden"))?;
+        .ok_or(AppError(StatusCode::NOT_FOUND, "Alias not found"))?;
     usable(&sh)?;
     Ok(Redirect::to(&format!("/v/{}", sh.token)))
 }

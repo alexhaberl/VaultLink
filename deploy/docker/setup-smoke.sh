@@ -2,6 +2,11 @@
 set -euo pipefail
 umask 077
 
+if [[ "$(id -u)" -eq 0 ]]; then
+    echo "Setup smoke must run as an unprivileged user" >&2
+    exit 1
+fi
+
 WORK_DIR="${VAULTLINK_SMOKE_DIR:-/tmp/vaultlink-setup-smoke}"
 BIN="${VAULTLINK_BIN:-/work/target/release/vaultlink}"
 ENTRYPOINT="${VAULTLINK_CONTAINER_ENTRYPOINT:-/work/deploy/docker/container-entrypoint.sh}"
@@ -134,7 +139,7 @@ curl -sS -f -X POST "http://$PROXY_ADDR/start" \
     | grep -q "VaultLink is starting"
 
 wait_http "http://$PROXY_ADDR/login" "200"
-wait_http "http://$PROXY_ADDR/api/v1/health" "200"
+wait_http "http://$PROXY_ADDR/api/v2/health" "200"
 kill -0 "$CONTAINER_PID"
 
 if grep -Fq "$ADMIN_PASSWORD" "$CONTAINER_LOG"; then

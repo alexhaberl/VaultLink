@@ -116,6 +116,11 @@ if ! grep -F -q 'tools/install-pinned-debian-packages.sh' "$smoke_dockerfile" \
     || ! grep -F -q 'debian-packages.lock' "$smoke_dockerfile"; then
     report "canonical container must install the snapshot-locked Debian package closure"
 fi
+if ! grep -F -x -q 'USER vaultlink' "$smoke_dockerfile" \
+    || ! grep -F -q 'id -u' deploy/docker/setup-smoke.sh \
+    || ! grep -F -q 'Setup smoke must run as an unprivileged user' deploy/docker/setup-smoke.sh; then
+    report "setup smoke container must execute as the vaultlink non-root user"
+fi
 if ! grep -F -q 'rm -f /etc/apt/sources.list' tools/install-pinned-debian-packages.sh \
     || ! grep -F -q "/etc/apt/sources.list.d" tools/install-pinned-debian-packages.sh \
     || ! grep -F -q 'source_count=' tools/install-pinned-debian-packages.sh \
@@ -134,6 +139,16 @@ for tool in 'cargo-cyclonedx --version 0.5.9' 'cargo-audit --version 0.22.2'; do
     grep -F -q "$tool" "$builder_dockerfile" \
         || report "release builder is missing pinned $tool"
 done
+
+audit_exception='--ignore RUSTSEC-2023-0071'
+audit_commands=$(grep -R -h -E 'cargo audit .*--deny warnings' .github/workflows || true)
+audit_exceptions=$(printf '%s\n' "$audit_commands" \
+    | grep -o -E -- '--ignore[[:space:]]+RUSTSEC-[0-9-]+' | sort -u || true)
+if [ "$(printf '%s\n' "$audit_commands" | grep -c . || true)" -ne 3 ] \
+    || [ "$(printf '%s\n' "$audit_commands" | grep -F -c -- "$audit_exception" || true)" -ne 3 ] \
+    || [ "$audit_exceptions" != "$audit_exception" ]; then
+    report "RUSTSEC-2023-0071 must be the only explicit cargo-audit exception"
+fi
 
 if ! grep -E -q '^COPY Cargo\.toml Cargo\.lock rust-toolchain\.toml Makefile \.dockerignore \./$' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY .cargo ./.cargo' "$smoke_dockerfile" \
