@@ -66,8 +66,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub db: Database,
     pub secure_root: secure_fs::SecureRoot,
+    pub admin_login_limiter: auth::AdminLoginLimiter,
     pub limiter: auth::LoginLimiter,
-    pub account_limiter: auth::LoginLimiter,
     pub share_limiter: auth::LoginLimiter,
     pub alias_limiter: auth::LoginLimiter,
     pub public_transfer_limiter: auth::LoginLimiter,
@@ -164,18 +164,21 @@ impl AppState {
         })?;
         validated_storage.verify_path_bindings(&config.storage)?;
         let db = Database::open_in_directory(validated_storage.data_file()?)?;
+        let active_admin_usernames = db.active_admin_usernames()?;
         let persisted_runtime = db.runtime_settings()?;
         let runtime = runtime_settings_from_persisted(&config, &persisted_runtime)
             .map_err(|error| format!("invalid persisted runtime settings: {error}"))?;
         let webauthn = webauthn::WebAuthnService::from_public_base_url(&runtime.public_base_url)
             .map_err(|error| format!("invalid WebAuthn configuration: {error}"))?;
         Ok(Self {
-            limiter: auth::LoginLimiter::new(
+            admin_login_limiter: auth::AdminLoginLimiter::new(
+                active_admin_usernames,
                 config.security.login_attempts,
+                config.security.account_login_attempts,
                 std::time::Duration::from_secs(config.security.login_window_seconds),
             ),
-            account_limiter: auth::LoginLimiter::new(
-                config.security.account_login_attempts,
+            limiter: auth::LoginLimiter::new(
+                config.security.login_attempts,
                 std::time::Duration::from_secs(config.security.login_window_seconds),
             ),
             share_limiter: auth::LoginLimiter::new(

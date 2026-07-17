@@ -140,7 +140,7 @@ pub(super) async fn unlock_share(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
-            "Zu viele Passwortversuche",
+            "Too many password attempts",
         ));
     }
     let password = request.password;
@@ -156,7 +156,7 @@ pub(super) async fn unlock_share(
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_share_password",
-            "Ungültiges Passwort",
+            "Invalid password",
         ));
     }
     let valid = verify_password_admitted(&state, Some(hash), password).await?;
@@ -172,7 +172,7 @@ pub(super) async fn unlock_share(
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_share_password",
-            "Ungültiges Passwort",
+            "Invalid password",
         ));
     }
     // Successful unlocks stay inside the fixed-window budget as well.
@@ -208,7 +208,7 @@ pub(super) async fn unlock_share(
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_share_password",
-            "Ungültiges Passwort",
+            "Invalid password",
         ));
     }
     let mut response = Json(UnlockResponse {

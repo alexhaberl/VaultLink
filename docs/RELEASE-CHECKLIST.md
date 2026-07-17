@@ -1,92 +1,91 @@
 # v0.5.0 release checklist
 
-Stand: 2026-07-15 für die native Linux-amd64-/arm64-Freigabe von 0.5.0.
+Status: 2026-07-17 for the native Linux amd64/arm64 release of 0.5.0.
 
-Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfolgt über einen eigenen Pull Request; ein Tag wird erst nach dem Merge auf `main`, bei sauberem Worktree und vollständig grünen Gates gesetzt.
+Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered through a dedicated pull request; the tag is created only after merge to `main`, with a clean worktree and every gate green.
 
-## Feature-Scope für 0.5.0
+## Feature scope for 0.5.0
 
-- [x] Admin Login, TOTP-MFA, Sessions, Logout, CSRF.
-- [x] „Mein Konto“ für eigene Passwortänderungen mit aktuellem Passwort sowie zweistufigen MFA-Wechsel; das alte Secret bleibt bis zum bestätigten neuen TOTP-Code aktiv.
-- [x] Lokaler `recover-admin`-Notfallpfad über SSH/Hostzugriff mit `--config` oder direktem `--database`, atomarem Credential-Wechsel, Session-/Pending-Widerruf und secret-freiem Audit.
-- [x] Deutsch/Englisch in Setup-, Auth-, Admin- und Public-Flows; Cookie vor `Accept-Language`, Englisch als Fallback, locale-gerechte Datums-/Zahlen-/JavaScript-Ausgabe.
-- [x] Session-basierte JSON-API unter `/api/v1`; keine API-Tokens in 0.5.0.
-- [x] Admin-Dateiverwaltung zum Erstellen von Ordnern, No-Clobber-Umbenennen und permanenten rekursiven Löschen mit serverseitiger Bestätigung sowie clientseitigem Exact-Match-Gating.
-- [x] Begrenzte, neustartfähige Tombstone-Bereinigung mit genau einem globalen, signalkoaleszierenden Cleanup-Worker und automatische Anpassung beziehungsweise Deaktivierung betroffener Freigaben.
-- [x] API und UI teilen Auth-, Session-, CSRF-, SecureFS-, SQLite-, Runtime-Settings- und Audit-Logik.
-- [x] API-Fehler werden als JSON normalisiert; Streaming-Routen liefern nur bei Erfolg Binärdaten.
-- [x] Root-begrenzter Dateibrowser mit Breadcrumbs, Hoch-Link, Pagination, Suche und Linkerstellung aus der Oberfläche.
-- [x] Linkverwaltung für Datei-/Ordnerlinks mit `download_only`, `upload_only`, `download_upload`.
-- [x] Passwortgeschützte Shares mit Argon2id, Unlock-Cookies und Rate-Limit.
-- [x] Optionaler Kurzlink-Alias.
-- [x] Download-Streaming mit `HEAD`, `Accept-Ranges`, einzelnem Byte-Range, `206` und `416`; HEAD prüft die verfügbare Quote ohne Reservierung oder Zählung, feste Transfer-Grants zählen erst vollständige Antworten und fassen Range-Resumes ohne Sliding-Expiry zusammen.
-- [x] Sichere Uploads mit temporärer Datei, `fsync`, atomarem No-Replace-Publish, globalem und optionalem per-Share-Uploadlimit.
-- [x] Optionales Upload-Überschreiben pro Upload-Ordnerlink; bei `external_writers=true` erzwingen UI, API und Publish-Pfad standardmäßig No-Replace. Der separate Opt-in `allow_external_writer_replace=true` dokumentiert und testet bewusstes Last-Writer-Wins.
-- [x] Upload in navigierten Unterordnern für `download_upload`-Ordnerlinks.
-- [x] Upload-only-Freigaben listen keine Ordnerinhalte und erlauben keine Preview/Downloads.
-- [x] Inkrementeller ZIP-Download für Ordnerfreigaben mit durchgehendem ZIP64, Datei-, Scan- und Größenlimits, gecappten Quelldateien, Temp-Budget und backpressured Direct-Stream-Fallback.
-- [x] Begrenzte case-insensitive Dateinamensuche; Listing, Suche und ZIP zählen auch gefilterte rohe Verzeichniseinträge und setzen Scans ohne Offset-Rescan fort.
-- [x] Sichere Browser-Textvorschau für allowlistete Endungen; escaped HTML in `<pre>`, kein Inline-User-MIME.
-- [x] Sichere Browser-Vorschau für allowlistete Rasterbilder und PDFs über Raw-Preview-Routen mit `inline`, `nosniff`, `HEAD`, `206` und `416`.
-- [x] Admin-UI für zusätzliche Admins; TOTP-Secret wird genau einmal angezeigt. Initial-Setup kann ein noch nicht bestätigtes Secret lokal und passwortgebunden wiederanzeigen.
-- [x] Runtime-editierbare Policy-Settings in SQLite, nicht in `/etc/vaultlink/config.toml`.
-- [x] Audit-Dashboard mit Pagination und Action-Filter.
-- [x] Loopback-only Setup-UI (`vaultlink setup --config <path> --listen 127.0.0.1:8090`) mit dokumentiertem Headless-Zugriff über einen expliziten IPv4-SSH-Tunnel: `ssh -4 -N -L 127.0.0.1:8090:127.0.0.1:8090 user@server`.
-- [x] Setup überschreibt keine bestehende Konfiguration; Config-ohne-Admin und committed Admin vor verlorener TOTP-Antwort sind wiederaufnehmbar.
-- [x] Pro-Share SecureFS-Capabilities verhindern Symlink-Wechsel in Sibling-Shares für Listing, Preview, Download, ZIP und Upload.
-- [x] Linux-only auf x86_64 und aarch64; Windows-Dateinamensinteroperabilität bleibt für Standard-SMB-Clients erhalten.
-- [x] Externer CIFS-Co-Writer-Modus mit geprüftem direkten Share-Root, reserviertem pre-provisioniertem `.vaultlink-internal`, Mount-ID/-Quelle/-Optionen, lokalem SQLite und crash-sicherem Pending-/Committed-Delete-Protokoll.
-- [x] Separater Root-Befehl für die nicht überschreibende `/mnt/storage`-CIFS-Provisionierung mit interaktiver Credential-Eingabe und Rollback; das unprivilegierte Browser-Setup erkennt sichere aktive SMB-Mounts und übernimmt Pfade, Typ und Quelle.
-- [x] Exklusiver, nicht blockierender Lifetime-Lock im gemeinsamen `internal_directory` wird vor Storage-Recovery/Cleanup erworben, auf wirksame Lock-Semantik geprüft und verhindert überlappende VaultLink-Server für dieselbe Journal-Domain.
-- [x] Jede Production-Konfiguration verlangt eine exakte fail-closed Mount-Identität; ein ausgefallener CIFS-Mount darf auch dann nicht auf das lokale Fallback-Verzeichnis starten, wenn dort gerade ext4 sichtbar ist. Auditiertes lokales Production-Storage darf SQLite außerhalb des sichtbaren Baums auf demselben lokalen Mount halten.
-- [x] Browser-Setup und `init-admin` prüfen Root/Internal/Data-Mount und kanonische Pfade vor Konfiguration, Datenbank oder Credential-Secrets; Symlink-Aliase in den sichtbaren Baum werden abgewiesen.
-- [x] Upgrade-/Rollback-Backups und Recovery bestehen immer aus einem validierten Binary/Config/SQLite-Tripel; Candidate-Konfigurationen verändern die Live-Konfiguration nicht vor der Downtime.
-- [x] Gepufferte Form-/JSON-Bodies sind klein begrenzt; ausschließlich Uploadrouten erhalten den großen Streaming-Rahmen. Ein konstanter Streaming-Guard begrenzt Präambel und jeden Multipart-Headerblock, zusätzlich sind Feldanzahl und Metadaten klein begrenzt.
-- [x] Reverse-Proxy-Modus, Standalone-TLS-Modus, SIGHUP-Zertifikatsreload für PEM-Dateien.
-- [x] Optionaler Built-in-Let's-Encrypt-Standalone-TLS-Modus über `tls-alpn-01` und `rustls-acme`.
-- [x] UI-/UX-Polish mit getrennten Auth/Public/Admin-Shells, Logo/Favicon, locale-gerechtem Date-Time-Picker, dezimalen MB/GB-Einheiten und konsistenten Buttons/Switches.
-- [x] Public Upload-Fehlerseiten für validierbare Fehler inklusive blockierter Dateitypen, Konflikte, Größenlimits, fehlende Dateinamen und Speicherfehler.
-- [x] Fuzzing für Produktionsparser und isolierte Policy-/Zustandskomponenten: Pfade, Byte-Ranges, Dateinamen, ZIP/Search/Preview-Pfade, Upload-Overwrite, `UploadFormState`, Share-Policy, Dateimutationen und Multipart-Envelope-Streaming. Middleware-, Router-, DB-, Async- und Dateisystem-Races gehören ausschließlich zu den separaten Integrations-/Smoke-Gates; siehe [FUZZING.md](FUZZING.md).
+- [x] Administrator login, TOTP MFA, sessions, logout, and CSRF.
+- [x] My account password changes with current-password verification and staged MFA replacement; the old secret remains valid until the new TOTP code is confirmed.
+- [x] Local `recover-admin` emergency path through SSH/host access using `--config` or direct `--database`, with atomic credential replacement, session/pending revocation, and secret-free audit.
+- [x] German and English setup/auth/admin/public flows. A valid locale cookie selects the language; without one, English is used and `Accept-Language` is ignored. Date, number, and JavaScript output is locale-aware.
+- [x] Session-based JSON API under `/api/v1`, with English-only error messages and no API tokens in 0.5.0.
+- [x] Administrator file operations for directory creation, no-clobber rename, and permanent recursive deletion with server confirmation and client exact-match gating.
+- [x] Bounded restartable tombstone cleanup with one global signal-coalescing worker and automatic adjustment or deactivation of affected Shares.
+- [x] API and UI share authentication, session, CSRF, SecureFS, SQLite, runtime-settings, and audit logic.
+- [x] API errors use the stable JSON envelope; streaming routes return binary data only on success.
+- [x] Root-confined file browser with breadcrumbs, parent navigation, pagination, search, and Share creation from the current selection.
+- [x] File/directory Shares with `download_only`, `upload_only`, and `download_upload`.
+- [x] Argon2id-protected Shares with unlock cookies and rate limiting.
+- [x] Optional short aliases.
+- [x] Streamed downloads with `HEAD`, `Accept-Ranges`, one byte range, `206`, and `416`; HEAD checks quota without reserving or counting, fixed grants count complete responses, and range resumes do not extend expiry.
+- [x] Secure uploads through a temporary file, `fsync`, atomic no-replace publication, and global/per-Share limits.
+- [x] Optional overwrite per upload directory Share. With `external_writers=true`, UI, API, and publication default to no-replace; `allow_external_writer_replace=true` explicitly accepts tested last-writer-wins behavior.
+- [x] Upload into navigated subdirectories for `download_upload` Shares.
+- [x] Upload-only Shares do not list, preview, or download content.
+- [x] Incremental ZIP64 directory downloads with file, scan, source-size, temporary-space, and backpressure limits.
+- [x] Bounded case-insensitive filename search; listing, search, and ZIP count filtered raw directory entries and continue without offset rescans.
+- [x] Escaped text preview for allowlisted extensions and fixed-MIME `nosniff` preview for allowlisted raster images and PDFs.
+- [x] Administrator UI for additional admins; TOTP secrets are shown once. Initial setup can recover an unconfirmed secret locally after password verification.
+- [x] Runtime-editable policy settings in SQLite rather than `/etc/vaultlink/config.toml`.
+- [x] Paginated, action-filterable audit dashboard.
+- [x] Loopback-only setup UI with documented IPv4 SSH tunnel: `ssh -4 -N -L 127.0.0.1:8090:127.0.0.1:8090 user@server`.
+- [x] Setup never overwrites configuration; config-without-admin and committed-admin-before-lost-TOTP-response states are resumable.
+- [x] Per-Share SecureFS capabilities prevent symlink switching into sibling Shares for listing, preview, download, ZIP, and upload.
+- [x] Linux-only x86_64/aarch64 support while retaining Windows filename interoperability for standard SMB clients.
+- [x] External CIFS co-writer mode with checked direct Share root, reserved pre-provisioned `.vaultlink-internal`, mount ID/source/options, local SQLite, and crash-safe pending/committed delete protocol.
+- [x] Separate root-only non-overwriting `/mnt/storage` CIFS provisioner with interactive credentials and rollback; unprivileged browser setup detects secure active SMB mounts.
+- [x] Exclusive non-blocking lifetime lock in shared `internal_directory`, acquired and semantics-tested before recovery/cleanup.
+- [x] Every production configuration requires exact fail-closed mount identity; local audited production storage may keep SQLite outside the visible tree on the same supported local mount.
+- [x] Setup and `init-admin` validate root/internal/data mounts and canonical paths before writing config, database, or credentials.
+- [x] Upgrade/rollback backups and recovery always use a validated binary/config/SQLite/keyring unit. Candidate configuration never changes live configuration before downtime.
+- [x] Fresh databases use schema 2; validated schema 1 migrates once and transactionally. Forward-only rollback restores the matching full old backup.
+- [x] Small buffered form/JSON body limits; only upload routes receive the large streaming allowance. Multipart preamble, headers, field count, and metadata are bounded.
+- [x] Reverse-proxy mode, standalone TLS, SIGHUP PEM reload, and optional built-in Let's Encrypt `tls-alpn-01` standalone TLS.
+- [x] UI polish with separate auth/public/admin shells, logo/favicon, locale-aware date/time inputs, decimal MB/GB units, and consistent controls.
+- [x] Public upload error pages for validation errors, blocked types, conflicts, limits, missing names, and storage errors.
+- [x] Fuzzing for production parsers and isolated policy/state components: paths, byte ranges, filenames, ZIP/search/preview paths, overwrite policy, upload request state, Share policy, file mutation, and multipart envelope streaming. Router/DB/async/filesystem races remain integration/smoke gates; see [FUZZING.md](FUZZING.md).
 
-## Bewusste Nicht-Ziele für 0.5.0
+## Explicit non-goals for 0.5.0
 
-- DEB-Paket.
-- Öffentliches Repository.
-- API-Tokens oder externe API-Clients als stabile Public Contract Garantie.
-- Inline-Preview für alle anderen Dateitypen.
-- Built-in ACME hinter Nginx/Caddy; Auto-TLS ist ausschließlich für echten Standalone-Port-443-Betrieb.
-- Unbegrenzte ZIPs und Kompression; das durchgehend verwendete ZIP64-Format ändert nichts an den konfigurierten Datei-, Scan- und Größenlimits.
-- Admin-Löschen; Admins können deaktiviert/reaktiviert werden.
+- DEB package.
+- Public repository.
+- API tokens or third-party API clients as a stable public contract.
+- Inline preview for other file types.
+- Built-in ACME behind Nginx/Caddy; automatic TLS is for direct standalone port 443 only.
+- Unlimited ZIPs or compression; ZIP64 does not remove configured file, scan, or size limits.
+- Administrator deletion; admins can be deactivated and reactivated.
 
-## Verbindliche native Linux-Gates
+## Mandatory native Linux gates
 
-- [ ] `cargo check --locked` auf amd64 und arm64
-- [ ] `cargo fmt --all -- --check` auf amd64 und arm64
-- [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` auf amd64 und arm64
-- [ ] `cargo test --locked --all-targets` auf amd64 und arm64
-  - Das verbindliche 0.5.0-Gate sind native Linux-Läufe für amd64 und arm64; frühere Windows-Läufe gelten nicht als Freigabenachweis.
-  - Enthalten: Account-Passwort/MFA, Recovery-Races, DE/EN-Hauptrouten und Setup, API Login/MFA/Session/CSRF, Secret-Redaction, Setup-Recovery, UTF-8, SecureFS, Preview, Transfers, ZIP, Multipart, Body-Limits, Upload-Atomizität und Migrationen.
-- [ ] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
-  - Fuzz-Crate inklusive `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_request_state`, `share_request_policy`, `file_mutation_policy` und `multipart_guard` kompiliert.
-- [ ] `cargo build --release --locked` auf amd64 und arm64
-- [ ] `cargo audit --deny warnings` für das gemeinsame Workspace-Lockfile auf dem finalen Stand wiederholen.
-- [ ] `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh` und `make policy-check` auf amd64 und arm64 wiederholen.
-- [ ] `make docker-smoke` auf dem finalen 0.5.0-Stand nativ auf amd64 und arm64 wiederholen.
-- [ ] Wöchentlicher/manueller Reproducibility-Workflow baut pro Architektur zweimal mit leeren Target-Verzeichnissen und identischem `SOURCE_DATE_EPOCH`; Binär- und Archiv-SHA-256 sind bitgenau gleich.
-- [ ] Debian-Basisimage, Snapshot-Zeitpunkt sowie direkte und transitive Release-Pakete entsprechen `debian-snapshot.sources` und `debian-packages.lock`; das source-unabhängige `Dockerfile.release-builder` wurde explizit als linux/amd64+linux/arm64-Manifest gebaut und gepusht.
-- [ ] Externen Blocker auflösen: `release-builder-image.lock` enthält nicht mehr `UNPROVISIONED`, sondern die vollständige echte `ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>`-Referenz; `VAULTLINK_RELEASE_BUILDER_IMAGE` ist exakt gleich und das private GHCR-Paket gewährt dem Repository-Actions-Token Lesezugriff. Release-/Reproducibility-Jobs ziehen sie mit `packages: read` und installieren weder APT- noch Cargo-Werkzeuge zur Laufzeit.
+- [ ] `cargo check --locked` on amd64 and arm64.
+- [ ] `cargo fmt --all -- --check` on amd64 and arm64.
+- [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` on amd64 and arm64.
+- [ ] `cargo test --locked --all-targets` on amd64 and arm64.
+  - Native Linux runs are authoritative; earlier Windows runs are not release evidence.
+  - Coverage includes account password/MFA, recovery races, German/English main routes and setup, English-only API errors, login/MFA/session/CSRF, secret redaction, setup recovery, UTF-8, SecureFS, preview, transfers, ZIP, multipart, body limits, upload atomicity, limiter partitioning, and schema migration.
+- [ ] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`.
+  - Includes `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_request_state`, `share_request_policy`, `file_mutation_policy`, and `multipart_guard`.
+- [ ] `cargo build --release --locked` on amd64 and arm64.
+- [ ] `cargo audit --deny warnings` against the shared workspace lockfile.
+- [ ] `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh` and `make policy-check` on amd64 and arm64.
+- [ ] `make docker-smoke` on the final 0.5.0 source on amd64 and arm64.
+- [ ] Weekly/manual reproducibility workflow builds twice per architecture with empty targets and identical `SOURCE_DATE_EPOCH`; binary and archive SHA-256 values match bit-for-bit.
+- [ ] Debian image, snapshot, and direct/transitive packages match `debian-snapshot.sources` and `debian-packages.lock`; the source-independent release builder is a linux/amd64+linux/arm64 manifest.
+- [ ] Replace `UNPROVISIONED` in `release-builder-image.lock` with the full `ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>` reference; `VAULTLINK_RELEASE_BUILDER_IMAGE` must match and Actions must have package read access.
 
-## Historische Beobachtung vor dem 0.3.2-Upgrade
+## Historical observation before the 0.3.2 upgrade
 
-- [x] Bestehendes `0.3.0`-Binary auf beiden Testsystemen vor jeder Änderung geprüft; identischer SHA-256 `d6def1640bf8c93ddb5f30689731c4f3f2efb62d13c949b75a0012bd0cfb2946`.
-- [x] Reverse-Proxy-Testsystem nach 10 h 11 min und Standalone-TLS-Testsystem nach 10 h 08 min weiterhin `active/running`, jeweils `NRestarts=0` und ohne fehlgeschlagene systemd-Units.
-- [x] `PRAGMA integrity_check = ok`, leere WAL-Dateien sowie erfolgreiche lokale beziehungsweise öffentliche `/api/v1/health`-Antworten mit Version `0.3.0`.
-- [x] Aktueller RSS 10.5 MiB auf dem Reverse-Proxy-System und 13.0 MiB auf dem Standalone-TLS-System; im ausgewerteten Dienstjournal keine VaultLink-Warnungen, Panics oder Fehler.
-- [ ] Diese Beobachtung ist kein formaler Soak-Gate: Es lief weder `soak-monitor.sh` noch das Lastprofil. Der finale 72h-Soak wurde bewusst noch nicht gestartet.
+- [x] Existing `0.3.0` binary checked on both test systems with identical SHA-256 `d6def1640bf8c93ddb5f30689731c4f3f2efb62d13c949b75a0012bd0cfb2946`.
+- [x] Reverse-proxy system remained active for 10 h 11 min and standalone TLS for 10 h 08 min, both with `NRestarts=0` and no failed systemd units.
+- [x] `PRAGMA integrity_check = ok`, empty WAL files, and successful local/public `/api/v1/health` responses reporting `0.3.0`.
+- [x] RSS was 10.5 MiB and 13.0 MiB respectively, with no VaultLink warnings, panics, or errors in the reviewed journal.
+- [ ] This was not a formal soak: neither `soak-monitor.sh` nor the load profile ran. The final 72-hour soak has not yet started.
 
-## Historische 0.3.x-Debian-/Docker-Verifikation
+## Historical 0.3.x Debian/Docker verification
 
-- [x] Digest-gepinntes Debian-13-amd64-Testimage, Build im Container und read-only Workspace-Mount nur für Fuzz-/Shell-Checks:
+- [x] Digest-pinned Debian-13-amd64 image with container build and read-only workspace for fuzz/shell checks:
   - `cargo fmt --all -- --check`
   - `cargo test --locked --all-targets`
   - `cargo clippy --locked --all-targets --all-features -- -D warnings`
@@ -94,140 +93,70 @@ Ziel: privates GitHub-Release für Debian 13 amd64 und arm64. Die Umsetzung erfo
   - `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`
   - `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh`
   - `sh tools/check-supply-chain-policy.sh`
-- [x] Nach diesem Feature-Update erneut auf dem Reverse-Proxy-Testsystem bauen/deployen und Public-Smoke ausführen.
-  - Transaktionales Upgrade auf `0.3.2` mit verifiziertem Backup `/var/lib/vaultlink/backups/20260710T173328Z` erfolgreich.
-  - Binary-SHA-256 `d382903ff9d238cbc44f616c6af39c9d27d6afb61e1bea5d1ac3706e55fa6e2c`, `NRestarts=0`, SQLite `ok`, lokale und öffentliche Health-Antwort exakt `{"ok":true,"version":"0.3.2"}`, öffentlicher Login HTTP 200.
-- [x] Standalone-Testsystem erneut bauen/deployen und Public-HTTPS-Smoke ausführen.
-  - Transaktionales Upgrade auf `0.3.2` mit verifiziertem Backup `/var/lib/vaultlink/backups/20260710T173409Z` erfolgreich.
-  - Identischer Binary-SHA-256, `NRestarts=0`, SQLite `ok`, öffentliche HTTPS-Health-Antwort exakt `{"ok":true,"version":"0.3.2"}`, Login HTTP 200 und gecachtes Let's-Encrypt-Zertifikat erfolgreich geladen.
-- [x] Erweiterten isolierten Runtime-Smoke auf beiden Debian-13-Systemen ausgeführt: Setup, Login/MFA/CSRF, Exact-Match-Lösch-UI, Ordnererstellung, Share-Erstellung, Share-Pfadänderung nach Umbenennung, Bestätigungspflicht, permanente Teilbaumlöschung, Share-Deaktivierung und Tombstone-Wiederaufnahme nach Prozessneustart.
+- [x] Reverse-proxy test system upgraded transactionally to `0.3.2` with verified backup `/var/lib/vaultlink/backups/20260710T173328Z`; SHA-256 `d382903ff9d238cbc44f616c6af39c9d27d6afb61e1bea5d1ac3706e55fa6e2c`, no restarts, SQLite `ok`, exact health response, login HTTP 200.
+- [x] Standalone system upgraded with verified backup `/var/lib/vaultlink/backups/20260710T173409Z`; identical binary hash, no restarts, SQLite `ok`, exact HTTPS health response, login HTTP 200, cached Let's Encrypt certificate loaded.
+- [x] Extended isolated runtime smoke on both Debian-13 systems: setup, login/MFA/CSRF, exact-match deletion, directory creation, Share creation/path adjustment, confirmation, subtree deletion, deactivation, and tombstone recovery after restart.
 
-## Noch auszuführende Release-Gates
+## Remaining release gates
 
-- [ ] Fuzz-Gate auf amd64 und arm64 jeweils zehn Minuten:
-  - Pfadnormalisierung,
-  - Byte-Range-Parser,
-  - Dateinamen,
-  - ZIP/Search/Preview-Pfadfälle inklusive Media-Preview,
-  - Upload-Overwrite-Policy,
-  - echte Upload-Request-Zustandslogik,
-  - echte Share-Request-Policy,
-  - Admin-Dateimutations- und Share-Teilbaumpolicy,
-  - Multipart-Streaming-Guard inklusive Chunk-Grenzen, EOF, Header- und Preamble-Limits.
-  - Der Workflow läuft zusätzlich wöchentlich als native amd64/arm64-Matrix; jede Architektur führt alle neun Targets mit vier Workern in drei Gruppen und einem 60-Minuten-Timeout aus und publiziert einen eigenen Commit-Status. Der manuelle Lauf auf dem finalen Commit bleibt das Release-Gate.
-- [ ] Dependency-Gate mit `cargo-audit 0.22.2 --deny warnings` final wiederholen.
-- [ ] Dabei das gemeinsame Workspace-`Cargo.lock` prüfen.
-- [ ] GitHub Actions CI auf finalem `main` grün.
-- [ ] Release-Dry-Run mit `--locked` für amd64 auf `[self-hosted, Linux, X64, vaultlink]` und arm64 auf `[self-hosted, Linux, ARM64, vaultlink]` grün; beide verwenden exakt `VAULTLINK_RELEASE_BUILDER_IMAGE` als digest-gepinnten Multi-Arch-Builder ohne Laufzeitinstallation von APT-/Cargo-Werkzeugen. Architekturunabhängige Release-Jobs laufen auf arm64.
-- [ ] Vor dem Candidate-Preflight ist `release/minisign.pub` offline erzeugt, committed, nicht leer und als Minisign-Ed25519-Public-Key validiert; die beiden Signing-Secrets sind provisioniert. Keine Key- oder Builder-Pin-Änderung nach Soak-Start.
-- [ ] Reproducibility-Evidenz für amd64 und arm64 gehört zum exakten finalen Commit und enthält gleiche Hashes beider unabhängiger Builds.
-- [ ] Offline erzeugten Minisign-Public-Key als `release/minisign.pub` committen und `MINISIGN_SECRET_KEY` sowie `MINISIGN_PASSWORD` als GitHub-Actions-Secrets provisionieren; ohne alle drei Werte muss der Tag-Publish absichtlich fehlschlagen.
-- [ ] Ein autorisierter Maintainer pusht den annotierten `v0.5.0`-Tag erst nach Merge und allen Gates. Das private GitHub-Free-Repository besitzt kein wirksames Environment-Approval-Gate; Tag-Autorisierung, exakte Gleichheit von Tag-Commit und `origin/main` sowie der tag-only `contents: write`-Job bilden deshalb die explizite Freigabekette.
-- [ ] Artefakte prüfen:
-  - versionierte amd64- und arm64-Archive,
-  - eigenständige, architekturspezifische Binaries,
-  - README,
-  - LICENSE,
-  - Beispielkonfigurationen,
-  - systemd/deploy-Dateien,
-  - `SHA256SUMS-amd64` und `SHA256SUMS-arm64`,
-  - architekturspezifische CycloneDX-SBOMs,
-  - deterministisches `tar.gz`,
-  - Minisign-Signatur nur beim Tag-Release.
+- [ ] Ten-minute fuzz gate on amd64 and arm64 for path normalization, byte range, filenames, ZIP/search/preview paths, overwrite policy, real upload-request state, real Share-request policy, file mutation/subtree policy, and multipart streaming boundaries. The weekly native matrix runs all nine targets with four workers in three groups and a 60-minute timeout; the manual final-commit run remains the release gate.
+- [ ] Repeat `cargo-audit 0.22.2 --deny warnings` and inspect the shared `Cargo.lock`.
+- [ ] GitHub Actions CI green on final `main`.
+- [ ] Locked release dry-run green on `[self-hosted, Linux, X64, vaultlink]` and `[self-hosted, Linux, ARM64, vaultlink]`, using exactly the digest-pinned multi-arch builder with no runtime APT/Cargo installation. Architecture-independent release jobs run on arm64.
+- [ ] Before candidate preflight, generate and commit non-empty valid Minisign Ed25519 `release/minisign.pub` offline and provision both signing secrets. Do not change keys or builder pins after soak begins.
+- [ ] amd64 and arm64 reproducibility evidence belongs to the exact final commit and contains equal hashes for both independent builds.
+- [ ] Provision `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD`; tag publication must fail without all three key materials.
+- [ ] An authorized maintainer pushes annotated `v0.5.0` only after merge and all gates. Because the private GitHub Free repository has no effective environment approval, tag authorization, exact tag/main equality, and the tag-only `contents: write` job form the explicit approval chain.
+- [ ] Verify versioned amd64/arm64 archives, standalone binaries, README, LICENSE, examples, systemd/deploy files, `SHA256SUMS-*`, architecture-specific CycloneDX SBOMs, deterministic `tar.gz`, and tag-only Minisign signatures.
 
-## Staging- und Public-Gates vor finalem Soak
+## Staging and public gates before final soak
 
-- [ ] Finalen Release-Candidate auf je einem Debian-13-amd64- und Debian-13-arm64-Staging-System deployen.
-- [ ] SQLite-Backup vor Upgrade bei gestopptem Dienst erstellen.
-- [ ] Upgrade-Test durchführen.
-  - getrennte alte/neue Binary+Config-Paare vor Downtime validieren,
-  - Backup enthält `vaultlink`, `config.toml`, `data.sqlite` und den passenden `secrets.keyring` mit restriktiven Ownern/Modi,
-  - Candidate-Failure restauriert die vollständige alte Binary/Config/DB/Keyring-Einheit und prüft deren eigenen Health-Endpunkt,
-  - paralleles Upgrade/Rollback scheitert vor dem Dienst-Stopp am Maintenance-Lock.
-- [ ] Passwortgeschützte Public-Uploads akzeptieren den Unlock-gebundenen CSRF-Wert als Multipart-Feld beziehungsweise `X-VaultLink-Upload-CSRF` und lehnen fehlende/fremde Werte ab.
-- [ ] Upload-Shares erzwingen Einzeldatei-, kumulatives Byte- und Dateianzahllimit auch bei parallelen Queue-Uploads und Overwrite-Versuchen.
-- [ ] Rollback-Test durchführen:
-  - Dienst stoppen,
-  - vorheriges Binary, passende Konfiguration und SQLite-Backup wiederherstellen,
-  - Dienst starten,
-  - exakten lokalen Health-/Versions-Smoke ausführen,
-  - fehlgeschlagener Recovery-Stop oder unvollständiger Emergency-Restore bleibt gestoppt.
-- [ ] Reales SMB-3.1.1-Co-Writer-Gate auf einem externen Server:
-  - alle sichtbaren Einträge einschließlich Dotfiles direkt im Share-Root gegen Snapshot/Hashes verifizieren,
-  - separates VaultLink-SMB-Konto sowie normale Windows-, macOS- und Linux-Co-Writer-Konten verwenden,
-  - SMB-Server/Share erzwingt SMB 3.1.1 Signing und Encryption; dies wird für die VaultLink-Mount-Session und jede direkte Windows-/macOS-/Linux-Session separat verifiziert,
-  - das Share-Root ist für alle beabsichtigten Co-Writer im benötigten Umfang les-/schreibbar,
-  - Co-Writer besitzen Modify für Benutzerdaten im Share-Root, niemals administrative Rechte oder Zugriff auf `.vaultlink-internal`,
-  - `.vaultlink-internal/{uploads,tombstones}` ist vorab vorhanden und für Co-Writer weder lesbar noch schreib-, lösch- oder umbenennbar; Parent-`DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` sowie chmod/chown/setfacl-Äquivalente sind verweigert,
-  - `/proc/self/mountinfo` zeigt `vers=3.1.1`, `seal`, `cache=strict`, `nosuid`, `nodev`, `noexec` und keine verbotenen Optionen,
-  - SQLite liegt auf einem separaten lokalen Dateisystem,
-  - paralleles SMB-Put und VaultLink-No-Replace erzeugen exakt einen Gewinner, niemals Mischinhalt oder Clobbering,
-  - bestehende Overwrite-Shares liefern im Co-Writer-Modus 409/400 und ersetzen keine externe Datei,
-  - Disconnect/Reconnect, Dienstneustart, Pending-Delete-Recovery und Mount-Race schlagen sicher beziehungsweise recoverable fehl,
-  - kompletter CIFS-Unmount bei vorhandenem lokalen Mountpoint wird in Production vor jedem Secret-/DB-Zugriff fail-closed abgewiesen,
-  - eine lokale ext4-/XFS-Production-Policy mit Root/Internal/Data auf demselben Mount wird außerhalb des sichtbaren Baums akzeptiert; group-/other-/ACL-schreibbare lokale Roots werden abgewiesen,
-  - direkte SMB-Änderungen erscheinen im SMB-Server-Audit; ihr Bypass von VaultLink-Audit und Linklimits ist abgenommen.
-- [ ] Debian-13-amd64 Lastprofil erneut:
-  - 100 parallele Nutzer,
-  - 40 Downloadstreams,
-  - Sparse-Datei mit 50 GiB,
-  - parallele Uploadstreams,
-  - keine 5xx,
-  - keine korrupten Dateien,
-  - p95 Metadatenseiten < 750 ms,
-  - maximal 256 MiB zusätzlicher RSS bei 40 Streams.
-- [ ] Konfigurierten öffentlichen Reverse-Proxy-Endpunkt erneut prüfen:
-  - TLS und HTTP->HTTPS Redirect,
-  - Security Header,
-  - Secure/SameSite/HttpOnly Cookies,
-  - Login, MFA, Logout,
-  - Registrierung, Anmeldung und geschütztes Entfernen mit zwei realen FIDO2-Sicherheitsschlüsseln,
-  - Admins,
-  - Settings,
-  - Audit,
-  - Linkerstellung mit Passwort und per-Share-Uploadlimit,
-  - Suche,
-  - ZIP,
-  - Textpreview,
-  - Bildpreview,
-  - PDFpreview,
-  - Raw-Preview Range/HEAD,
-  - Upload in Subfolder,
-  - Upload-Replace nur bei Linkrecht plus Public-Bestätigung,
-  - Download/Range/HEAD,
-  - Upload-only darf nicht listen/downloaden/previewen,
-  - Revoke/Expiry/Downloadlimit,
-  - JSON-API Login/MFA/CSRF/Files/Shares/Admins/Settings/Audit/Public-Share-Flows.
-- [ ] Standalone Auto-TLS nur mit Let's-Encrypt-Staging auf einem direkt erreichbaren Standalone-Testendpunkt prüfen; nicht hinter einem Reverse Proxy.
+- [ ] Deploy the final candidate to Debian-13 amd64 and arm64 staging systems.
+- [ ] Create a stopped-service SQLite/keyring backup before upgrade.
+- [ ] Upgrade test:
+  - validate separate old/new binary/config pairs before downtime;
+  - backup contains `vaultlink`, `config.toml`, `data.sqlite`, and matching `secrets.keyring` with restrictive ownership/modes;
+  - candidate failure restores the full old unit and verifies its own health endpoint;
+  - concurrent upgrade/rollback fails on the maintenance lock before service stop;
+  - real schema-1 fixture migrates once to schema 2; rollback restores the complete schema-1 backup.
+- [ ] Password-protected public uploads accept the unlock-bound CSRF value as multipart field or `X-VaultLink-Upload-CSRF` and reject missing/foreign values.
+- [ ] Upload Shares enforce per-file, cumulative byte, and file-count limits under parallel queue uploads and overwrite attempts.
+- [ ] Rollback test stops the service, restores matching binary/config/database/keyring, starts it, verifies exact local health/version, and remains stopped after failed recovery stop or incomplete emergency restore.
+- [ ] Real SMB 3.1.1 co-writer gate:
+  - compare every visible entry including dotfiles with snapshots/hashes;
+  - use a separate VaultLink SMB account and normal Windows/macOS/Linux co-writer accounts;
+  - require SMB 3.1.1 signing/encryption for the mount and every direct client session;
+  - allow required root user-data access but no administrative or `.vaultlink-internal` access;
+  - pre-create `.vaultlink-internal/{uploads,tombstones}` and deny read/write/delete/rename, parent `DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER`, and chmod/chown/setfacl equivalents to co-writers;
+  - confirm `vers=3.1.1`, `seal`, `cache=strict`, `nosuid`, `nodev`, `noexec`, and no forbidden options in `/proc/self/mountinfo`;
+  - keep SQLite on a separate local filesystem;
+  - parallel SMB put and VaultLink no-replace yield exactly one winner with no mixed content or clobber;
+  - overwrite Shares return 409/400 in safe co-writer mode;
+  - disconnect/reconnect, restart, pending-delete recovery, and mount races fail safely or recoverably;
+  - complete CIFS unmount with a local fallback mountpoint is rejected before secret/database access;
+  - local ext4/XFS production accepts root/internal/data on one mount outside the visible tree and rejects group/other/ACL-writable roots;
+  - direct SMB changes appear in SMB-server audit and their VaultLink-audit/quota bypass is accepted.
+- [ ] Debian-13-amd64 load profile: 100 concurrent users, 40 download streams, 50-GiB sparse file, parallel uploads, no 5xx or corruption, metadata p95 below 750 ms, at most 256 MiB additional RSS.
+- [ ] Public reverse-proxy endpoint: TLS/redirect, headers, cookies, login/MFA/logout, two real FIDO2 keys, admins, settings, audit, password/limit Shares, search, ZIP, previews, range/HEAD, subdirectory upload, authorized confirmed replacement only, upload-only restrictions, revoke/expiry/limit, and all JSON API flows.
+- [ ] Standalone automatic TLS only with Let's Encrypt staging on a directly reachable standalone endpoint, never behind a reverse proxy.
 
-## Finaler 72h-Soak
+## Final 72-hour soak
 
-- [ ] Vor dem Soak ist im obersten Changelog-Eintrag statt `Unreleased release candidate` das geplante echte UTC-Kalenderdatum im Format `YYYY-MM-DD` committed. Der manuelle Release-Workflow im Modus `candidate` ist für exakt diesen Commit erfolgreich und setzt `vaultlink/release-candidate-preflight`.
-- [ ] Erst nach dem letzten Runtime-Deploy starten.
-- [ ] Dedizierten Debian-13-amd64-Runner `[self-hosted, Linux, X64, vaultlink-soak]` ausschließlich über den manuellen Start-Workflow auf dem exakten `origin/main`-Commit starten; der Workflow verlangt den Candidate-Preflight und prüft Debian 13 sowie `x86_64` fail-closed.
-- [ ] Gate über mindestens 259200 Sekunden:
-  - keine ungeplanten Restarts,
-  - `PRAGMA integrity_check = ok`,
-  - Health-Version durchgehend `0.5.0`, keine 5xx-/Panic-/DB-Fehler im Journal,
-  - Metadaten-p95 < 750 ms bei 100 Clients, 40 parallele Streams und zehn parallele Uploads je Lastlauf,
-  - RSS immer ≤ 256 MiB und höchstens 15 % Wachstum zwischen Warm- und Schlussmedian.
-- [ ] Der stündliche Collector hat das atomare Ergebnis, CSV-Metriken, Lastberichte, Journal, Commit und vollständigen Binärhash als `soak-evidence-COMMIT` hochgeladen und den Commit-Status `vaultlink/72h-soak` auf `success` gesetzt.
-- [ ] Jede Änderung am Commit nach Soak-Beginn – einschließlich Doku, CI, Deploy-Skripten, Konfiguration oder Version – invalidiert die Evidenz und startet das vollständige 72h-Gate neu.
+- [ ] Before soak, replace `Unreleased release candidate` in the top changelog entry with the real planned UTC date (`YYYY-MM-DD`). Candidate-mode manual release workflow succeeds for that exact commit and sets `vaultlink/release-candidate-preflight`.
+- [ ] Start only after the final runtime deployment.
+- [ ] Start dedicated `[self-hosted, Linux, X64, vaultlink-soak]` Debian-13 runner only through the manual workflow on the exact `origin/main`; require candidate preflight and fail closed on OS/architecture mismatch.
+- [ ] Run at least 259200 seconds with no unplanned restarts, `PRAGMA integrity_check = ok`, continuous version `0.5.0`, no 5xx/panic/database journal errors, metadata p95 below 750 ms at the specified load, RSS at most 256 MiB and at most 15% growth between warm/final medians.
+- [ ] Hourly collector uploads atomic result, CSV, load reports, journal, commit, and full binary hash as `soak-evidence-COMMIT`, setting `vaultlink/72h-soak` to success.
+- [ ] Any commit change after soak begins, including docs/CI/deploy/config/version, invalidates the evidence and restarts the full gate.
 
-## Tag-Freigabe
+## Tag release
 
-- [ ] Sauberer Worktree.
-- [ ] Grüner CI-Run auf finalem `main`.
-- [ ] Release-Dry-Run und `cargo-audit` weiterhin grün.
-- [ ] `make policy-check` grün; alle Dependabot-Pin-Updates gegen die jeweiligen Upstream-Repositories geprüft.
-- [ ] Staging- und Public-Gates grün.
-- [ ] `vaultlink/72h-soak` ist für exakt diesen Commit erfolgreich; der Release-Workflow verifiziert Dauer, Metriken, Lastläufe und den vollständigen amd64-Binärhash aus dem verknüpften Evidenzartefakt.
-- [ ] Der manuelle Release-Workflow im Modus `evidence` hat für denselben unveränderten Commit Soak- und Reproducibility-Evidenz heruntergeladen, Binär-/Archivhashes mit beiden Neubauten verglichen und `vaultlink/release-evidence-preflight` auf `success` gesetzt.
-- [ ] Das committed Changelog-Datum entspricht beim Tag-Lauf exakt dem aktuellen UTC-Datum. Wird der geplante Termin verpasst, ist eine Datumsänderung ein neuer Commit und erzwingt Candidate-Preflight sowie vollständigen 72h-Soak erneut.
-- [ ] Annotierten Tag `v0.5.0` erstellen.
-- [ ] Tag-Commit entspricht exakt dem freigegebenen `origin/main`-Commit; Release-Environment/Secrets sind für den Tag freigegeben.
-- [ ] Offline erzeugtes `release/minisign.pub` ist vor dem Tag committed und die beiden Minisign-Secrets sind provisioniert.
-- [ ] Tag-Release-Workflow prüfen:
-  - GitHub Release ist privat,
-  - Artefakte stammen ausschließlich aus CI,
-  - beide Archive, Binaries sowie `SHA256SUMS-amd64` und `SHA256SUMS-arm64` mit den jeweils architekturspezifischen Minisign-Dateien gegen `release/minisign.pub` verifizieren.
+- [ ] Clean worktree and green CI on final `main`.
+- [ ] Release dry-run, `cargo-audit`, and `make policy-check` remain green; Dependabot pin updates are checked against upstream.
+- [ ] Staging/public gates are green.
+- [ ] `vaultlink/72h-soak` succeeds for the exact commit and the release workflow verifies duration, metrics, load runs, and full amd64 binary hash.
+- [ ] Evidence-mode manual workflow downloads soak/reproducibility evidence, compares binary/archive hashes with both rebuilds, and sets `vaultlink/release-evidence-preflight`.
+- [ ] Changelog date equals the current UTC date during tagging. A missed date requires a new commit, candidate preflight, and full soak.
+- [ ] Create annotated `v0.5.0`; tag commit exactly equals approved `origin/main` and release secrets are authorized.
+- [ ] Offline `release/minisign.pub` is committed and both signing secrets are provisioned.
+- [ ] Tag workflow creates a private GitHub Release from CI-only artifacts; verify both archives, binaries, and architecture-specific `SHA256SUMS`/Minisign files against `release/minisign.pub`.

@@ -18,7 +18,7 @@ use crate::{
     auth,
     db::AuditContext,
     http_auth::{
-        audit_observation, clear_session_cookie, csrf, current_client_limit_key, database,
+        admin_login_attempt_admitted, audit_observation, clear_session_cookie, csrf, database,
         enabled_audit_client_ip, make_session_cookie, password_login_admitted,
         redirect_with_cookie, required_database, session, MissingSession,
     },
@@ -56,30 +56,11 @@ pub(super) async fn login(
     _headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Result<Response> {
-    let ip = current_client_limit_key();
-    let ip_key = format!("ip:{ip}");
-    if !auth::valid_admin_username(&form.username) {
-        if !state.limiter.check_and_record_attempt(&ip_key) {
-            return Err(AppError(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Zu viele Anmeldeversuche",
-            ));
-        }
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
-    }
-    let normalized_username = form.username.to_lowercase();
-    let key = format!("{ip}:{normalized_username}");
-    let account_key = format!("account:{normalized_username}");
-    if !state.limiter.check_and_record_attempts(&[&key, &ip_key])
-        || !state.account_limiter.check_and_record_attempt(&account_key)
-    {
+    if !admin_login_attempt_admitted(&state, &form.username) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Zu viele Anmeldeversuche",
         ));
-    }
-    if form.password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
-        return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
     }
     let attempted_username = form.username.clone();
     let token = auth::random_token(32);

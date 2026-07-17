@@ -135,10 +135,10 @@ pub(super) async fn create_share(
     let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
         .await
         .map_err(ApiError::internal)?
-        .map_err(|_| ApiError::not_found("Ziel nicht gefunden"))?;
+        .map_err(|_| ApiError::not_found("Target not found"))?;
     if !metadata.is_file() && !metadata.is_dir() {
         return Err(ApiError::bad_request(
-            "Freigaben sind nur für reguläre Dateien oder Ordner erlaubt",
+            "Shares are allowed only for regular files or directories",
         ));
     }
     let target = if metadata.is_dir() {
@@ -184,20 +184,16 @@ pub(super) async fn create_share(
         tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
             .await
             .map_err(ApiError::internal)?
-            .map_err(|_| ApiError::conflict("Ziel wurde während der Verarbeitung geändert"))?;
+            .map_err(|_| ApiError::conflict("Target changed during processing"))?;
     let current_target = if current_metadata.is_dir() {
         ShareTarget::Directory
     } else if current_metadata.is_file() {
         ShareTarget::File
     } else {
-        return Err(ApiError::conflict(
-            "Ziel wurde während der Verarbeitung geändert",
-        ));
+        return Err(ApiError::conflict("Target changed during processing"));
     };
     if current_target != target {
-        return Err(ApiError::conflict(
-            "Ziel wurde während der Verarbeitung geändert",
-        ));
+        return Err(ApiError::conflict("Target changed during processing"));
     }
     let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
     let username = session_data.username;
@@ -264,14 +260,14 @@ pub(super) async fn update_share(
         })
     {
         return Err(ApiError::bad_request(
-            "Überschreiben ist für diese Freigabe nicht erlaubt",
+            "Overwriting is not allowed for this share",
         ));
     }
     let upload_limits =
         if request.max_upload_total_size.is_some() || request.max_upload_files.is_some() {
             if !current_share.is_directory || !current_share.permission.can_upload() {
                 return Err(ApiError::bad_request(
-                    "Uploadlimits sind nur für Upload-Freigaben erlaubt",
+                    "Upload limits are allowed only for upload shares",
                 ));
             }
             let total = request
@@ -293,7 +289,7 @@ pub(super) async fn update_share(
                 || files < current_share.uploaded_files
                 || files > MAX_SQLITE_UNSIGNED
             {
-                return Err(ApiError::bad_request("Ungültige kumulative Uploadlimits"));
+                return Err(ApiError::bad_request("Invalid cumulative upload limits"));
             }
             Some((total, files))
         } else {
@@ -351,13 +347,13 @@ pub(super) async fn update_share(
     match outcome {
         ShareControlsUpdateOutcome::Updated => {}
         ShareControlsUpdateOutcome::NotFound => {
-            return Err(ApiError::not_found("Freigabe nicht gefunden"));
+            return Err(ApiError::not_found("Share not found"));
         }
         ShareControlsUpdateOutcome::QuotaConflict => {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "upload_quota_in_use",
-                "Uploadlimit wird von laufenden Uploads belegt",
+                "Upload limit is reserved by active uploads",
             ));
         }
     }
@@ -413,7 +409,7 @@ async fn set_share_active_api(
         })
         .await?;
     if !changed {
-        return Err(ApiError::not_found("Freigabe nicht gefunden"));
+        return Err(ApiError::not_found("Share not found"));
     }
     Ok(Json(SimpleResponse { ok: true }))
 }
@@ -437,7 +433,7 @@ pub(super) async fn delete_share(
         .commit(move |db| db.delete_share_and_audit(id, &audit_context))
         .await?;
     if !deleted {
-        return Err(ApiError::not_found("Freigabe nicht gefunden"));
+        return Err(ApiError::not_found("Share not found"));
     }
     Ok(Json(SimpleResponse { ok: true }))
 }
@@ -458,7 +454,7 @@ pub(super) async fn set_share_password(
     let password = service
         .prepare_password(SharePasswordInput::Direct(request.password))
         .map_err(share_validation_error)?
-        .ok_or_else(|| ApiError::bad_request("Ungültiges Freigabepasswort"))?;
+        .ok_or_else(|| ApiError::bad_request("Invalid share password"))?;
     let hash = hash_password_admitted(&state, password).await?;
     let username = session_data.username;
     let audit_client_ip = runtime_settings(&state)
@@ -474,48 +470,46 @@ pub(super) async fn set_share_password(
         })
         .await?;
     if !changed {
-        return Err(ApiError::not_found("Freigabe nicht gefunden"));
+        return Err(ApiError::not_found("Share not found"));
     }
     Ok(Json(SimpleResponse { ok: true }))
 }
 
 fn share_validation_error(error: ShareServiceError) -> ApiError {
     match error {
-        ShareServiceError::InvalidPath => ApiError::bad_request("Ungültiger Pfad"),
-        ShareServiceError::InvalidAlias => ApiError::bad_request("Ungültiger Alias"),
+        ShareServiceError::InvalidPath => ApiError::bad_request("Invalid path"),
+        ShareServiceError::InvalidAlias => ApiError::bad_request("Invalid alias"),
         ShareServiceError::ExpirationNotFuture => {
-            ApiError::bad_request("Ablaufzeit muss in der Zukunft liegen")
+            ApiError::bad_request("Expiration time must be in the future")
         }
         ShareServiceError::UploadPermissionRequiresDirectory => {
-            ApiError::bad_request("Upload-Rechte sind für Datei-Freigaben nicht erlaubt")
+            ApiError::bad_request("Upload permission is not allowed for file shares")
         }
-        ShareServiceError::InvalidDownloadLimit => {
-            ApiError::bad_request("Ungültiges Übertragungslimit")
-        }
-        ShareServiceError::InvalidUploadLimit => ApiError::bad_request("Ungültiges Uploadlimit"),
+        ShareServiceError::InvalidDownloadLimit => ApiError::bad_request("Invalid transfer limit"),
+        ShareServiceError::InvalidUploadLimit => ApiError::bad_request("Invalid upload limit"),
         ShareServiceError::UploadLimitsRequireDirectoryUpload => {
-            ApiError::bad_request("Uploadlimits sind nur für Upload-Freigaben erlaubt")
+            ApiError::bad_request("Upload limits are allowed only for upload shares")
         }
         ShareServiceError::InvalidUploadTotalLimit
         | ShareServiceError::UploadTotalBelowSingleLimit => {
-            ApiError::bad_request("Ungültiges kumulatives Uploadlimit")
+            ApiError::bad_request("Invalid cumulative upload limit")
         }
         ShareServiceError::InvalidUploadFileLimit => {
-            ApiError::bad_request("Ungültiges Upload-Dateilimit")
+            ApiError::bad_request("Invalid upload file limit")
         }
         ShareServiceError::OverwriteRequiresDirectoryUpload => {
-            ApiError::bad_request("Überschreiben ist für diese Freigabe nicht erlaubt")
+            ApiError::bad_request("Overwriting is not allowed for this share")
         }
         ShareServiceError::OverwriteDisabledForExternalWriters => {
-            ApiError::bad_request("Überschreiben ist bei externen Storage-Schreibern deaktiviert")
+            ApiError::bad_request("Overwriting is disabled with external storage writers")
         }
         ShareServiceError::PasswordConfirmationRequired
         | ShareServiceError::PasswordConfirmationMismatch
         | ShareServiceError::InvalidPasswordCharacterLength => {
-            ApiError::bad_request("Ungültiges Freigabepasswort")
+            ApiError::bad_request("Invalid share password")
         }
         ShareServiceError::PasswordTooManyBytes => {
-            ApiError::bad_request("Freigabepasswort ist zu lang")
+            ApiError::bad_request("Share password is too long")
         }
         ShareServiceError::PasswordHashStateMismatch => ApiError::internal(()),
         ShareServiceError::Database(error) => ApiError::internal(error),
@@ -549,7 +543,7 @@ pub(super) async fn remove_share_password(
         })
         .await?;
     if !changed {
-        return Err(ApiError::not_found("Freigabe nicht gefunden"));
+        return Err(ApiError::not_found("Share not found"));
     }
     Ok(Json(SimpleResponse { ok: true }))
 }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth,
     http_auth::{
-        audit_observation, clear_session_cookie, csrf_header, current_client_limit_key,
+        admin_login_attempt_admitted, audit_observation, clear_session_cookie, csrf_header,
         enabled_audit_client_ip, make_session_cookie, password_login_admitted, required_database,
         session, MissingSession,
     },
@@ -46,39 +46,11 @@ pub(super) async fn login(
     _headers: HeaderMap,
     Json(form): Json<LoginRequest>,
 ) -> ApiResult<Response> {
-    let ip = current_client_limit_key();
-    let ip_key = format!("ip:{ip}");
-    if !auth::valid_admin_username(&form.username) {
-        if !state.limiter.check_and_record_attempt(&ip_key) {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "Zu viele Anmeldeversuche",
-            ));
-        }
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "invalid_credentials",
-            "Ungültige Zugangsdaten",
-        ));
-    }
-    let normalized_username = form.username.to_lowercase();
-    let key = format!("{ip}:{normalized_username}");
-    let account_key = format!("account:{normalized_username}");
-    if !state.limiter.check_and_record_attempts(&[&key, &ip_key])
-        || !state.account_limiter.check_and_record_attempt(&account_key)
-    {
+    if !admin_login_attempt_admitted(&state, &form.username) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
-            "Zu viele Anmeldeversuche",
-        ));
-    }
-    if form.password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "invalid_credentials",
-            "Ungültige Zugangsdaten",
+            "Too many sign-in attempts",
         ));
     }
     let attempted_username = form.username.clone();
@@ -102,7 +74,7 @@ pub(super) async fn login(
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_credentials",
-            "Ungültige Zugangsdaten",
+            "Invalid credentials",
         ));
     }
     // Successful password checks consume the same fixed-window budget so valid
@@ -135,7 +107,7 @@ pub(super) async fn mfa(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "mfa_already_verified",
-            "MFA wurde bereits bestätigt",
+            "MFA has already been verified",
         ));
     }
     csrf_header(&session_data, &headers)?;
@@ -144,7 +116,7 @@ pub(super) async fn mfa(
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
-            "Zu viele MFA-Versuche",
+            "Too many MFA attempts",
         ));
     }
     let new_token = auth::random_token(32);
@@ -169,7 +141,7 @@ pub(super) async fn mfa(
             return Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "invalid_mfa",
-                "Ungültiger MFA-Code",
+                "Invalid MFA code",
             ));
         }
         TotpLoginOutcome::ReplayedOrStale => {
@@ -177,7 +149,7 @@ pub(super) async fn mfa(
             return Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "invalid_mfa",
-                "Ungültiger MFA-Code",
+                "Invalid MFA code",
             ));
         }
     }

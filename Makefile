@@ -8,12 +8,12 @@ FUZZ_LOG_DIR ?= /tmp/vaultlink-fuzz-logs
 FUZZ_TARGETS := path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_request_state share_request_policy file_mutation_policy multipart_guard
 
 dev-setup: sample-data
-	@command -v cargo >/dev/null || (echo "Rust fehlt: https://rustup.rs installieren" && exit 1)
+	@command -v cargo >/dev/null || (echo "Rust is missing; install it from https://rustup.rs" && exit 1)
 	cargo fetch
 
 sample-data:
 	mkdir -p dev/mount/Dokumente dev/mount/Uploads dev/data
-	printf '%s\n' 'VaultLink Testdatei' > dev/mount/Dokumente/beispiel.txt
+	printf '%s\n' 'VaultLink test file' > dev/mount/Dokumente/beispiel.txt
 
 test:
 	cargo test --all-targets
@@ -22,10 +22,10 @@ security-test:
 	cargo test path_security
 	cargo test secure_fs
 	cargo test range
-	cargo test db::tests::fresh_database_is_exactly_schema_one_without_plaintext_secret_columns
+	cargo test db::tests::fresh_database_is_exactly_schema_two_without_plaintext_secret_columns
 	cargo test proxy
 	cargo test auth
-	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi
+	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh; else echo "shellcheck is not installed; skipping script checks"; fi
 	sh tools/check-supply-chain-policy.sh
 
 fuzz: fuzz-parallel
@@ -51,7 +51,7 @@ policy-check:
 	sh tools/check-supply-chain-policy.sh
 
 docker-smoke-build:
-	@docker version >/dev/null 2>&1 || (echo "Docker fehlt oder WSL-Integration ist nicht aktiv" && exit 1)
+	@docker version >/dev/null 2>&1 || (echo "Docker is missing or WSL integration is not active" && exit 1)
 	docker build -f deploy/docker/Dockerfile.setup-smoke -t $(DOCKER_SMOKE_IMAGE) .
 
 docker-test: docker-smoke-build

@@ -64,13 +64,13 @@ fn storage_recovery_api_error(error: crate::file_ops::FileOperationError) -> Api
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "audit_unavailable",
-                crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE,
+                "Security audit temporarily unavailable",
             )
         }
         _ => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "storage_recovery",
-            "Speicherzustand wird wiederhergestellt",
+            "Storage state is being recovered",
         ),
     }
 }
@@ -96,7 +96,7 @@ impl ApiError {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
-            "Interner Fehler",
+            "Internal error",
         )
     }
 }
@@ -113,7 +113,26 @@ impl From<crate::http_auth::HttpAuthError> for ApiError {
                 _ => "request_failed",
             },
         };
-        Self::new(value.status, code, value.message)
+        let message = match value.kind {
+            crate::http_auth::HttpAuthErrorKind::AuditUnavailable => {
+                "Security audit temporarily unavailable"
+            }
+            crate::http_auth::HttpAuthErrorKind::CapacityUnavailable => {
+                "Request processing capacity is temporarily unavailable"
+            }
+            crate::http_auth::HttpAuthErrorKind::Request => match value.status {
+                StatusCode::BAD_REQUEST => "Invalid request",
+                StatusCode::UNAUTHORIZED => "Authentication required",
+                StatusCode::FORBIDDEN => "Request forbidden",
+                StatusCode::NOT_FOUND => "Resource not found",
+                StatusCode::CONFLICT => "Request conflict",
+                StatusCode::TOO_MANY_REQUESTS => "Too many requests",
+                StatusCode::SERVICE_UNAVAILABLE => "Service temporarily unavailable",
+                StatusCode::INTERNAL_SERVER_ERROR => "Internal error",
+                _ => "Request failed",
+            },
+        };
+        Self::new(value.status, code, message)
     }
 }
 

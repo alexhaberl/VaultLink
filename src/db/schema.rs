@@ -1,16 +1,23 @@
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub(super) const SCHEMA_VERSION: i64 = 1;
-const SCHEMA_FINGERPRINT: &str = "vaultlink-schema-1-encrypted-secrets-2026-07-17";
+pub(super) const SCHEMA_VERSION: i64 = 2;
+pub(super) const SCHEMA_1_FINGERPRINT: &str = "vaultlink-schema-1-encrypted-secrets-2026-07-17";
+const SCHEMA_2_FINGERPRINT: &str = "vaultlink-schema-2-migration-history-2026-07-17";
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_SCHEMA_1_TO_2_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         0 => initialize_empty_database(conn),
-        SCHEMA_VERSION => validate_schema(conn),
+        1 => migrate_schema_1_to_2(conn),
+        SCHEMA_VERSION => validate_schema_2(conn).and_then(|()| validate_database(conn)),
         _ => Err(schema_error(format!(
-            "unsupported VaultLink database schema {version}; this build accepts only fresh schema {SCHEMA_VERSION}"
+            "unsupported VaultLink database schema {version}; this build accepts schemas 1 and {SCHEMA_VERSION}"
         ))),
     }
 }
@@ -27,7 +34,7 @@ fn initialize_empty_database(conn: &mut Connection) -> rusqlite::Result<()> {
         ));
     }
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
         r#"
 CREATE TABLE vaultlink_schema(
@@ -35,7 +42,12 @@ CREATE TABLE vaultlink_schema(
     fingerprint TEXT NOT NULL
 );
 INSERT INTO vaultlink_schema(singleton,fingerprint)
-VALUES(1,'vaultlink-schema-1-encrypted-secrets-2026-07-17');
+VALUES(1,'vaultlink-schema-2-migration-history-2026-07-17');
+
+CREATE TABLE vaultlink_schema_migrations(
+    target_version INTEGER PRIMARY KEY CHECK(target_version > 0),
+    applied_at TEXT NOT NULL
+);
 
 CREATE TABLE admins(
     id INTEGER PRIMARY KEY,
@@ -210,11 +222,81 @@ CREATE INDEX idx_upload_reservations_share_epoch
         "INSERT INTO transfer_statistics(singleton,started_at) VALUES(1,?1)",
         [Utc::now().to_rfc3339()],
     )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(2,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    validate_schema_2(&tx)?;
+    validate_database(&tx)?;
     tx.commit()
 }
 
-fn validate_schema(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate_schema_1_to_2(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_schema_1(&tx)?;
+    validate_database(&tx)?;
+    tx.execute_batch(
+        "CREATE TABLE vaultlink_schema_migrations(
+             target_version INTEGER PRIMARY KEY CHECK(target_version > 0),
+             applied_at TEXT NOT NULL
+         );",
+    )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(2,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+        [SCHEMA_2_FINGERPRINT],
+    )?;
+
+    #[cfg(test)]
+    if FAIL_NEXT_SCHEMA_1_TO_2_MIGRATION.with(|flag| flag.replace(false)) {
+        return Err(schema_error("injected schema 1 to 2 migration failure"));
+    }
+
+    // Keep this as the final mutation so a rollback always leaves a schema-1
+    // database with its matching fingerprint and no migration table.
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    validate_schema_2(&tx)?;
+    validate_database(&tx)?;
+    tx.commit()
+}
+
+fn validate_schema_1(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_1_FINGERPRINT)?;
+    let migration_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='vaultlink_schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if migration_table {
+        return Err(schema_error(
+            "schema 1 unexpectedly contains the schema migration table",
+        ));
+    }
+    validate_encrypted_shape(conn)
+}
+
+fn validate_schema_2(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_2_FINGERPRINT)?;
+    let migration_record = conn
+        .query_row(
+            "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=2",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if migration_record.as_deref().is_none_or(str::is_empty) {
+        return Err(schema_error(
+            "schema 2 migration record is missing or invalid",
+        ));
+    }
+    validate_encrypted_shape(conn)
+}
+
+fn validate_fingerprint(conn: &Connection, expected: &str) -> rusqlite::Result<()> {
     let fingerprint = conn
         .query_row(
             "SELECT fingerprint FROM vaultlink_schema WHERE singleton=1",
@@ -222,11 +304,15 @@ fn validate_schema(conn: &Connection) -> rusqlite::Result<()> {
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    if fingerprint.as_deref() != Some(SCHEMA_FINGERPRINT) {
+    if fingerprint.as_deref() != Some(expected) {
         return Err(schema_error(
             "database schema fingerprint is missing or does not match this build",
         ));
     }
+    Ok(())
+}
+
+fn validate_encrypted_shape(conn: &Connection) -> rusqlite::Result<()> {
     for (table, forbidden) in [
         ("shares", "token"),
         ("admins", "totp_secret"),
@@ -244,13 +330,28 @@ fn validate_schema(conn: &Connection) -> rusqlite::Result<()> {
             )));
         }
     }
-    let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    Ok(())
+}
+
+fn validate_database(conn: &Connection) -> rusqlite::Result<()> {
+    let foreign_key_violation = conn
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+        .optional()?;
+    if foreign_key_violation.is_some() {
+        return Err(schema_error("database foreign-key validation failed"));
+    }
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(schema_error(format!(
-            "database quick_check failed: {integrity}"
+            "database integrity_check failed: {integrity}"
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_schema_1_to_2_migration() {
+    FAIL_NEXT_SCHEMA_1_TO_2_MIGRATION.with(|flag| flag.set(true));
 }
 
 #[derive(Debug)]

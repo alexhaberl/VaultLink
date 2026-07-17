@@ -267,6 +267,18 @@ impl Database {
                 row.get(0)
             })
     }
+    pub fn active_admin_usernames(&self) -> rusqlite::Result<Vec<String>> {
+        let connection = self.try_conn()?;
+        let mut statement =
+            connection.prepare("SELECT username FROM admins WHERE active=1 ORDER BY id ASC")?;
+        let usernames = statement
+            .query_map([], |row| {
+                row.get::<_, String>(0)
+                    .map(|username| username.to_ascii_lowercase())
+            })?
+            .collect();
+        usernames
+    }
     pub fn list_admins(&self) -> rusqlite::Result<Vec<AdminSummary>> {
         let c = self.try_conn()?;
         let mut statement =

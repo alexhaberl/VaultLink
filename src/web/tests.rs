@@ -106,7 +106,7 @@ fn request(method: Method, uri: &str, body: &str) -> Request {
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(header::COOKIE, "vaultlink_locale=de")
         .body(Body::from(body.to_string()))
         .unwrap();
     request.extensions_mut().insert(ConnectInfo(
@@ -1283,7 +1283,7 @@ fn multipart_request_with_options(
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(uri)
-        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(header::COOKIE, "vaultlink_locale=de")
         .header(
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
@@ -1315,7 +1315,7 @@ fn multipart_request_with_late_overwrite(uri: &str, name: &str, content: &[u8]) 
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(uri)
-        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(header::COOKIE, "vaultlink_locale=de")
         .header(
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
@@ -1342,7 +1342,7 @@ fn raw_multipart_request(uri: &str, boundary: &str, body: Vec<u8>) -> Request {
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(uri)
-        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(header::COOKIE, "vaultlink_locale=de")
         .header(
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
@@ -1390,7 +1390,7 @@ fn controlled_multipart_request(
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(uri)
-        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(header::COOKIE, "vaultlink_locale=de")
         .header(
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={CONTROLLED_UPLOAD_BOUNDARY}"),
@@ -1510,7 +1510,7 @@ fn public_multipart_request_with_csrf(
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(uri)
-        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(header::COOKIE, "vaultlink_locale=de")
         .header(
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
@@ -1560,7 +1560,7 @@ fn admin_multipart_request(
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(uri)
-        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(header::COOKIE, "vaultlink_locale=de")
         .header(
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
@@ -1619,7 +1619,7 @@ fn folder_upload_request(
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(uri)
-        .header(header::ACCEPT_LANGUAGE, "de")
+        .header(header::COOKIE, "vaultlink_locale=de")
         .header(
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
@@ -2056,7 +2056,7 @@ async fn locale_route_sets_hardened_cookie_and_rejects_external_return_targets()
 }
 
 #[tokio::test]
-async fn http_locale_resolution_uses_accept_language_then_english_fallback() {
+async fn http_locale_resolution_defaults_to_english_and_cookie_overrides_it() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let app = router(test_state(root.path(), data.path()));
@@ -2072,17 +2072,18 @@ async fn http_locale_resolution_uses_accept_language_then_english_fallback() {
     );
     assert!(response_text(response).await.contains("Admin sign in"));
 
-    let mut german = request(Method::GET, "/login", "");
-    german.headers_mut().insert(
+    let mut german_header = request(Method::GET, "/login", "");
+    german_header.headers_mut().remove(header::COOKIE);
+    german_header.headers_mut().insert(
         header::ACCEPT_LANGUAGE,
         HeaderValue::from_static("de-AT,de;q=0.9"),
     );
-    let response = app.clone().oneshot(german).await.unwrap();
+    let response = app.clone().oneshot(german_header).await.unwrap();
     assert_eq!(
         response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
-        "de"
+        "en"
     );
-    assert!(response_text(response).await.contains("Admin Login"));
+    assert!(response_text(response).await.contains("Admin sign in"));
 
     let mut cookie_override = request(Method::GET, "/login", "");
     cookie_override.headers_mut().insert(
@@ -2093,10 +2094,25 @@ async fn http_locale_resolution_uses_accept_language_then_english_fallback() {
         header::COOKIE,
         HeaderValue::from_static("vaultlink_locale=de"),
     );
-    let response = app.oneshot(cookie_override).await.unwrap();
+    let response = app.clone().oneshot(cookie_override).await.unwrap();
     assert_eq!(
         response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
         "de"
+    );
+
+    let mut english_cookie = request(Method::GET, "/login", "");
+    english_cookie.headers_mut().insert(
+        header::ACCEPT_LANGUAGE,
+        HeaderValue::from_static("de-AT,de;q=0.9"),
+    );
+    english_cookie.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_locale=en"),
+    );
+    let response = app.oneshot(english_cookie).await.unwrap();
+    assert_eq!(
+        response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+        "en"
     );
 }
 
@@ -2886,7 +2902,7 @@ async fn share_creation_page_uses_browser_selected_path() {
         .unwrap();
     state.db.verify_mfa("session-token").unwrap();
     let app = router(state.clone());
-    let cookie = HeaderValue::from_static("vaultlink_session=session-token");
+    let cookie = HeaderValue::from_static("vaultlink_locale=de; vaultlink_session=session-token");
 
     let javascript = response_text(
         app.clone()
@@ -3119,7 +3135,7 @@ async fn share_creation_page_uses_browser_selected_path() {
     let mut shares_request = request(Method::GET, "/admin/shares", "");
     shares_request.headers_mut().insert(
         header::COOKIE,
-        HeaderValue::from_static("vaultlink_session=session-token"),
+        HeaderValue::from_static("vaultlink_locale=de; vaultlink_session=session-token"),
     );
     let shares_page = response_text(app.clone().oneshot(shares_request).await.unwrap()).await;
     assert!(shares_page.contains("Kumulatives Uploadlimit in GB"));
@@ -3999,7 +4015,8 @@ async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compa
         .unwrap();
     state.db.verify_mfa("account-security-session").unwrap();
     let app = router(state.clone());
-    let cookie = HeaderValue::from_static("vaultlink_session=account-security-session");
+    let cookie =
+        HeaderValue::from_static("vaultlink_locale=de; vaultlink_session=account-security-session");
 
     let mut before_keys = request(Method::GET, "/admin/account", "");
     before_keys
@@ -4168,7 +4185,8 @@ async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
         .unwrap();
     state.db.verify_mfa("account-session").unwrap();
     let app = router(state.clone());
-    let account_cookie = HeaderValue::from_static("vaultlink_session=account-session");
+    let account_cookie =
+        HeaderValue::from_static("vaultlink_locale=de; vaultlink_session=account-session");
 
     let mut account_request = request(Method::GET, "/admin/account", "");
     account_request
@@ -4238,7 +4256,8 @@ async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
         )
         .unwrap();
     state.db.verify_mfa("account-mfa-session").unwrap();
-    let mfa_cookie = HeaderValue::from_static("vaultlink_session=account-mfa-session");
+    let mfa_cookie =
+        HeaderValue::from_static("vaultlink_locale=de; vaultlink_session=account-mfa-session");
 
     let mut rejected_start = request(
         Method::POST,
@@ -4395,7 +4414,7 @@ async fn admin_ui_creates_admin_and_updates_runtime_settings() {
         .unwrap();
     state.db.verify_mfa("session-token").unwrap();
     let app = router(state.clone());
-    let cookie = HeaderValue::from_static("vaultlink_session=session-token");
+    let cookie = HeaderValue::from_static("vaultlink_locale=de; vaultlink_session=session-token");
 
     let login_page = response_text(
         app.clone()

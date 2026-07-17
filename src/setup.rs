@@ -1809,7 +1809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setup_http_locale_uses_cookie_then_accept_language_then_english() {
+    async fn setup_http_locale_defaults_to_english_and_cookie_overrides_it() {
         let config_dir = tempfile::tempdir().unwrap();
         let app = setup_router(test_setup_state(config_dir.path().join("config.toml")));
 
@@ -1839,12 +1839,21 @@ mod tests {
         }
         assert!(!english.contains("<vl-i18n"));
 
-        let mut german = authorized_request(Method::GET, "/", "");
-        german.headers_mut().insert(
+        let mut german_header = authorized_request(Method::GET, "/", "");
+        german_header.headers_mut().insert(
             header::ACCEPT_LANGUAGE,
             HeaderValue::from_static("de-AT,de;q=0.9"),
         );
-        let response = app.clone().oneshot(german).await.unwrap();
+        let response = app.clone().oneshot(german_header).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "en");
+        assert!(response_text(response).await.contains("Initial setup"));
+
+        let mut german_cookie = authorized_request(Method::GET, "/", "");
+        german_cookie.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_setup=token; vaultlink_locale=de"),
+        );
+        let response = app.clone().oneshot(german_cookie).await.unwrap();
         assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "de");
         let german = response_text(response).await;
         assert!(german.contains(r#"<html lang="de">"#));
@@ -1988,9 +1997,10 @@ mod tests {
         assert!(!english.contains("<vl-i18n"));
 
         let mut german = request(Method::GET, "/assets/setup.js", "");
-        german
-            .headers_mut()
-            .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("de"));
+        german.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_locale=de"),
+        );
         let response = app.oneshot(german).await.unwrap();
         assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "de");
         let german = response_text(response).await;

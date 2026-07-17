@@ -152,14 +152,15 @@ pub(super) async fn create_admin_ui(
     let (prepared, password) = validated.into_hash_input();
     let hash = hash_password_admitted(&state, password).await?;
     let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
-    let create_result = required_database(state.db.clone(), move |_| {
-        service
+    let create_result = required_database(state.db.clone(), move |database| {
+        let created = service
             .create(&prepared, &hash, &audit_context)
-            .map_err(admin_database_error)
+            .map_err(admin_database_error)?;
+        Ok((created, database.active_admin_usernames()?))
     })
     .await;
-    let created = match create_result {
-        Ok(created) => created,
+    let (created, active_admins) = match create_result {
+        Ok(result) => result,
         Err(error) if error.status == StatusCode::SERVICE_UNAVAILABLE => {
             return Err(error.into());
         }
@@ -170,6 +171,9 @@ pub(super) async fn create_admin_ui(
             ));
         }
     };
+    state
+        .admin_login_limiter
+        .replace_active_admins(active_admins);
     let username = created.summary.username;
     let response_secret = created.totp_secret;
     let otpauth = otpauth_url(&username, response_secret.expose_secret());
@@ -285,12 +289,16 @@ pub(super) async fn deactivate_admin(
     }
     let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
     let service = AdminService::new(state.db.clone());
-    let outcome = required_database(state.db.clone(), move |_| {
-        service
+    let (outcome, active_admins) = required_database(state.db.clone(), move |database| {
+        let outcome = service
             .set_active(id, false, &audit_context)
-            .map_err(admin_database_error)
+            .map_err(admin_database_error)?;
+        Ok((outcome, database.active_admin_usernames()?))
     })
     .await?;
+    state
+        .admin_login_limiter
+        .replace_active_admins(active_admins);
     match outcome {
         AdminActivationResult::Deactivation(outcome) => match outcome {
             AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive => {}
@@ -322,12 +330,16 @@ pub(super) async fn activate_admin(
     csrf(&session, &form.csrf)?;
     let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
     let service = AdminService::new(state.db.clone());
-    let outcome = required_database(state.db.clone(), move |_| {
-        service
+    let (outcome, active_admins) = required_database(state.db.clone(), move |database| {
+        let outcome = service
             .set_active(id, true, &audit_context)
-            .map_err(admin_database_error)
+            .map_err(admin_database_error)?;
+        Ok((outcome, database.active_admin_usernames()?))
     })
     .await?;
+    state
+        .admin_login_limiter
+        .replace_active_admins(active_admins);
     if outcome == AdminActivationResult::NotFound {
         return Err(AppError(StatusCode::NOT_FOUND, "Admin nicht gefunden"));
     }

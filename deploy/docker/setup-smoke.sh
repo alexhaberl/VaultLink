@@ -68,7 +68,6 @@ wait_http "http://$PROXY_ADDR/" "200"
 
 curl -sS -f -X POST "http://$PROXY_ADDR/" \
     -b "$COOKIE_JAR" \
-    -H "Accept-Language: de" \
     --data-urlencode "server_mode=development" \
     --data-urlencode "listen_address=$INTERNAL_ADDR" \
     --data-urlencode "public_base_url=http://localhost:18081" \
@@ -99,12 +98,11 @@ curl -sS -f -X POST "http://$PROXY_ADDR/" \
     --data-urlencode "admin_username=admin" \
     --data-urlencode "admin_password=$ADMIN_PASSWORD" \
     --data-urlencode "admin_password_confirm=$ADMIN_PASSWORD" \
-    | grep -q "Setup abgeschlossen"
+    | grep -q "Setup complete"
 
 curl -sS -f -X POST "http://$PROXY_ADDR/complete" \
     -b "$COOKIE_JAR" \
-    -H "Accept-Language: de" \
-    | grep -q "Setup best"
+    | grep -q "Setup confirmed"
 
 test -s "$CONFIG_PATH"
 test -s "$DATA_DIR/data.sqlite"
@@ -133,8 +131,7 @@ done
 
 curl -sS -f -X POST "http://$PROXY_ADDR/start" \
     -b "$COOKIE_JAR" \
-    -H "Accept-Language: de" \
-    | grep -q "VaultLink wird gestartet"
+    | grep -q "VaultLink is starting"
 
 wait_http "http://$PROXY_ADDR/login" "200"
 wait_http "http://$PROXY_ADDR/api/v1/health" "200"

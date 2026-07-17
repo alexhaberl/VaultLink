@@ -4,6 +4,10 @@
 
 This work was developed under the internal `0.4.9` hardening candidate. That candidate is not published or tagged; the first releasable artifact containing these changes is 0.5.0.
 
+- Added a forward-only, transactional schema 1 to schema 2 migration with durable migration history, fingerprint validation, and complete binary/config/database/keyring rollback requirements.
+- Partitioned administrator password-login limits so active accounts use isolated exact counters while unknown or invalid usernames remain in fixed process-local buckets.
+- Made English the default UI language unless an explicit locale cookie exists, and made every `/api/v1` error message English-only.
+- Documented the SQLite/keyring, backup, host-log, audit, and network-rate-limit trust boundaries.
 - Removed the privileged load-fixture staging race by moving every storage mutation to the unprivileged `vaultlink` account and adding no-clobber adversarial smoke coverage.
 - Revalidated live MFA authorization at admin-upload publication and serialized public overwrite policy changes with quota commit and filesystem publication.
 - Replaced unbounded tombstone retry tasks with one coalescing, lifecycle-managed cleanup coordinator.
@@ -41,7 +45,7 @@ This work was developed under the internal `0.4.9` hardening candidate. That can
 - Moved uploads into protected flat staging with cross-directory atomic no-replace publication, rustix-backed `openat2`/`renameat2` operations and startup mutation probes.
 - Made deletion recovery crash-safe by separating uncommitted pending entries from committed cleanup tombstones; rollback conflicts preserve both objects for operator recovery.
 - Added architecture-specific archives, binaries, SBOMs, checksums and Minisign signatures for Debian 13 amd64 and arm64 releases.
-- Upgrades and rollbacks now validate, back up, activate, restore and health-check matching Binary/Config/SQLite triples under a shared maintenance lock.
+- Upgrades and rollbacks now validate, back up, activate, restore and health-check matching binary/config/SQLite/keyring units under a shared maintenance lock.
 
 ## 0.4.0 — 2026-07-11
 
