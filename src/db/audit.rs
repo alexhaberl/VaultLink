@@ -112,6 +112,7 @@ impl Database {
         Ok(deleted_total)
     }
 
+    #[cfg(test)]
     pub fn audit(
         &self,
         actor: &str,
@@ -148,6 +149,7 @@ impl Database {
         )
     }
 
+    #[cfg(test)]
     pub fn delete_audit_client_ips_if_disabled(
         &self,
         fallback_logging_enabled: bool,

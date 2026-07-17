@@ -6,6 +6,9 @@ use std::{
     task::{Context, Poll},
 };
 
+#[derive(Clone, Copy)]
+struct ValidatedClientIp(Option<IpAddr>);
+
 use axum::{
     body::{Body, Bytes, HttpBody},
     extract::{ConnectInfo, Request, State},
@@ -230,14 +233,9 @@ pub(super) async fn response_admission(
     let head_request = request.method() == Method::HEAD;
     let peer = request
         .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(peer)| {
-            proxy::client_limit_key(proxy::effective_client_ip(
-                peer.ip(),
-                request.headers(),
-                &state.config,
-            ))
-        })
+        .get::<ValidatedClientIp>()
+        .and_then(|client_ip| client_ip.0)
+        .map(proxy::client_limit_key)
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     let (body_permit, body_peer_permit) = if streaming {
         let global = match state.stream_admission.clone().try_acquire_owned() {
@@ -441,7 +439,7 @@ pub(super) fn locale_return_to(method: &Method, uri: &Uri) -> String {
 
 pub(super) async fn audit_client_ip_context(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let client_ip = match req.extensions().get::<ConnectInfo<SocketAddr>>() {
@@ -453,6 +451,7 @@ pub(super) async fn audit_client_ip_context(
         }
         None => None,
     };
+    req.extensions_mut().insert(ValidatedClientIp(client_ip));
     with_audit_client_ip(client_ip, next.run(req)).await
 }
 

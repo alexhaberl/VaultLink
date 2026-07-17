@@ -403,6 +403,31 @@ async fn response_admission_releases_handlers_but_bounds_stream_bodies() {
 }
 
 #[tokio::test]
+async fn malformed_trusted_forwarding_is_rejected_before_admission_with_security_headers() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut state = test_state(root.path(), data.path());
+    let mut config = (*state.config).clone();
+    config.server.mode = ServerMode::ReverseProxy;
+    config.reverse_proxy.enabled = true;
+    config.reverse_proxy.trust_x_forwarded_headers = true;
+    config.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    state.config = Arc::new(config);
+    state.response_admission = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut forwarded = request(Method::GET, "/assets/vaultlink.css", "");
+    forwarded
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+
+    let response = router(state).oneshot(forwarded).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+}
+
+#[tokio::test]
 async fn absolute_body_deadline_stops_a_body_that_never_yields() {
     let inner = Body::from_stream(futures_util::stream::pending::<io::Result<Bytes>>());
     let body = Body::new(AbsoluteDeadlineBody {
@@ -844,7 +869,13 @@ async fn public_transfer_completion_uses_the_validated_audit_ip_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("snapshot.txt"), b"snapshot").unwrap();
-    let state = test_state(root.path(), data.path());
+    let mut state = test_state(root.path(), data.path());
+    let mut config = (*state.config).clone();
+    config.server.mode = ServerMode::ReverseProxy;
+    config.reverse_proxy.enabled = true;
+    config.reverse_proxy.trust_x_forwarded_headers = true;
+    config.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    state.config = Arc::new(config);
     state.db.create_admin("admin", "hash", "secret").unwrap();
     state
         .db
@@ -863,11 +894,17 @@ async fn public_transfer_completion_uses_the_validated_audit_ip_snapshot() {
         )
         .unwrap();
     state.runtime.write().unwrap().audit_client_ip_enabled = true;
-    let response = router(state.clone())
-        .oneshot(request(Method::GET, "/v/snapshot-transfer/download", ""))
-        .await
-        .unwrap();
+    let mut download = request(Method::GET, "/v/snapshot-transfer/download", "");
+    download
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+    let response = router(state.clone()).oneshot(download).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(state
+        .stream_peer_admission
+        .lock()
+        .unwrap()
+        .contains_key(&"203.0.113.10".parse().unwrap()));
 
     let runtime = state.runtime.clone();
     assert!(std::thread::spawn(move || {
@@ -881,7 +918,7 @@ async fn public_transfer_completion_uses_the_validated_audit_ip_snapshot() {
     assert_eq!(response_text(response).await, "snapshot");
     let events = state.db.list_audit(Some("download"), 10, 0).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].client_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(events[0].client_ip.as_deref(), Some("203.0.113.10"));
 }
 
 #[tokio::test]
@@ -3191,6 +3228,49 @@ async fn web_share_creation_ignores_hidden_upload_fields_and_rejects_blank_prote
         StatusCode::BAD_REQUEST
     );
     assert_eq!(state.db.list_shares().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn web_hashes_share_password_before_waiting_for_storage_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("documents")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "session-token",
+            1,
+            "csrf-token",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("session-token").unwrap();
+    let app = router(state.clone());
+    let _storage_guard = state.storage_mutation.lock().await;
+    let _argon2_capacity = state
+        .argon2_admission
+        .clone()
+        .acquire_many_owned(crate::MAX_CONCURRENT_ARGON2_OPERATIONS as u32)
+        .await
+        .unwrap();
+    let mut create = request(
+        Method::POST,
+        "/admin/shares",
+        "csrf=csrf-token&path=documents&permission=download_only&password_enabled=1&password=very+strong+share+password&password_confirm=very+strong+share+password",
+    );
+    create.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=session-token"),
+    );
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(create))
+        .await
+        .expect("Argon2 admission must run before the held storage lock")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(state.db.list_shares().unwrap().is_empty());
 }
 
 #[tokio::test]

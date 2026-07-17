@@ -307,14 +307,20 @@ fn validate_file_operation(operation: &DurableFileOperation) -> io::Result<()> {
     Ok(())
 }
 
+fn snapshot_directory_names(directory: &File) -> io::Result<Vec<OsString>> {
+    use std::os::fd::AsRawFd;
+
+    let proc_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
+    std::fs::read_dir(proc_path)?
+        .map(|item| item.map(|entry| entry.file_name()))
+        .collect()
+}
+
 impl SecureRoot {
     pub(super) fn remove_incomplete_file_operation_writes(&self) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-
-        let proc_path = format!("/proc/self/fd/{}", self.tombstones.as_ref().as_raw_fd());
+        let names = snapshot_directory_names(self.tombstones.as_ref())?;
         let mut removed = false;
-        for item in std::fs::read_dir(proc_path)? {
-            let name = item?.file_name();
+        for name in names {
             let should_remove = if is_file_operation_temporary_name(&name) {
                 true
             } else if let Some(pending_name) = deletion_pending_from_manifest_name(&name) {
@@ -341,8 +347,6 @@ impl SecureRoot {
         &self,
         pending_operations: &[PendingFileOperation],
     ) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-
         let journaled_pending: HashSet<&str> = pending_operations
             .iter()
             .filter_map(|pending| match &pending.operation {
@@ -350,10 +354,8 @@ impl SecureRoot {
                 DurableFileOperation::Rename { .. } => None,
             })
             .collect();
-        let proc_path = format!("/proc/self/fd/{}", self.tombstones.as_ref().as_raw_fd());
-        for item in std::fs::read_dir(proc_path)? {
-            let item = item?;
-            let pending_name = item.file_name();
+        let names = snapshot_directory_names(self.tombstones.as_ref())?;
+        for pending_name in names {
             if !is_deletion_pending_name(&pending_name) {
                 continue;
             }

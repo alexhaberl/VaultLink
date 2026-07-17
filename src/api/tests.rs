@@ -4,6 +4,7 @@ use axum::{
     body::{to_bytes, Body},
     http::{Method, Request},
 };
+use chrono::{Duration, Utc};
 use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -589,6 +590,46 @@ async fn api_creates_share_and_hides_secrets() {
         app.oneshot(missing_delete).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn api_hashes_share_password_before_waiting_for_storage_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "session-token",
+            1,
+            "csrf-token",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("session-token").unwrap();
+    let app = crate::web::router(state.clone());
+    let _storage_guard = state.storage_mutation.lock().await;
+    let _argon2_capacity = state
+        .argon2_admission
+        .clone()
+        .acquire_many_owned(crate::MAX_CONCURRENT_ARGON2_OPERATIONS as u32)
+        .await
+        .unwrap();
+    let mut create = json_request(
+        Method::POST,
+        "/api/v1/shares",
+        r#"{"path":"docs","permission":"download_only","password":"very strong share password"}"#,
+    );
+    authorize_mutation(&mut create, "vaultlink_session=session-token", "csrf-token");
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(create))
+        .await
+        .expect("Argon2 admission must run before the held storage lock")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(state.db.list_shares().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ impl Database {
             .collect();
         settings
     }
+    #[cfg(test)]
     pub fn replace_runtime_settings(
         &self,
         settings: &[(&str, String)],

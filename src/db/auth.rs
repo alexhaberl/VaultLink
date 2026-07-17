@@ -1,10 +1,11 @@
+#[cfg(test)]
+use super::AdminMfaEnrollmentStartOutcome;
 use super::{
     insert_required_audits, token_hash, trace_required_audits, Admin, AdminDeactivationOutcome,
-    AdminMfaEnrollmentActivationOutcome, AdminMfaEnrollmentStartOutcome,
-    AdminPasswordChangeOutcome, AdminRecoveryOutcome, AdminSummary, AdminTotpSettingOutcome,
-    AdminWebauthnCredential, AdminWebauthnCredentialDeletionOutcome,
-    AdminWebauthnCredentialRegistrationOutcome, AuditContext,
-    AuditedAdminMfaEnrollmentStartOutcome, Database, InitialAdminOutcome,
+    AdminMfaEnrollmentActivationOutcome, AdminPasswordChangeOutcome, AdminRecoveryOutcome,
+    AdminSummary, AdminTotpSettingOutcome, AdminWebauthnCredential,
+    AdminWebauthnCredentialDeletionOutcome, AdminWebauthnCredentialRegistrationOutcome,
+    AuditContext, AuditedAdminMfaEnrollmentStartOutcome, Database, InitialAdminOutcome,
     PasswordSessionCreationOutcome, PendingAdminMfaEnrollment, RequiredAuditEvent, Session,
     ADMIN_MFA_ENROLLMENT_TTL_SECONDS,
 };
@@ -123,6 +124,7 @@ impl Database {
             })
     }
 
+    #[cfg(test)]
     pub fn create_initial_admin(
         &self,
         username: &str,
@@ -180,6 +182,7 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
     pub fn create_admin(
         &self,
         username: &str,
@@ -280,6 +283,7 @@ impl Database {
             .collect();
         admins
     }
+    #[cfg(test)]
     pub fn activate_admin(&self, id: i64) -> rusqlite::Result<bool> {
         Ok(self
             .try_conn()?
@@ -302,6 +306,7 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
     pub fn deactivate_admin(&self, id: i64) -> rusqlite::Result<AdminDeactivationOutcome> {
         self.deactivate_admin_internal(id, None)
     }
@@ -518,6 +523,7 @@ impl Database {
     }
 
     /// Starts or replaces one short-lived enrollment. Only a hash of `token` is persisted.
+    #[cfg(test)]
     pub fn start_admin_mfa_enrollment(
         &self,
         admin_id: i64,
@@ -769,6 +775,7 @@ impl Database {
         )
     }
 
+    #[cfg(test)]
     pub fn reset_admin_password(&self, id: i64, password_hash: &str) -> rusqlite::Result<bool> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -806,6 +813,7 @@ impl Database {
             Ok((changed, events))
         })
     }
+    #[cfg(test)]
     pub fn reset_admin_totp(&self, id: i64, totp_secret: &str) -> rusqlite::Result<Option<String>> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1002,6 +1010,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn complete_webauthn_mfa(
         &self,
         old_session_token: &str,
@@ -1348,6 +1357,7 @@ impl Database {
         trace_required_audits(&audit_context, &audit_events);
         Ok(AdminTotpSettingOutcome::Updated)
     }
+    #[cfg(test)]
     pub fn create_session(
         &self,
         token: &str,
@@ -1369,6 +1379,7 @@ impl Database {
 
     /// Creates a pre-MFA session only while the password hash verified by the caller is current.
     /// The active/hash predicate and insertion intentionally share one SQL statement.
+    #[cfg(test)]
     pub fn create_session_for_verified_password(
         &self,
         token: &str,
@@ -1519,6 +1530,7 @@ impl Database {
 
     /// Consumes a TOTP counter and verifies exactly the bound, unexpired session.
     /// Both writes share an IMMEDIATE transaction so one code cannot unlock two sessions.
+    #[cfg(test)]
     pub fn verify_mfa_with_totp_step(
         &self,
         old_token: &str,
@@ -1611,6 +1623,7 @@ impl Database {
     }
 
     /// Consumes one TOTP counter for a sensitive authenticated operation.
+    #[cfg(test)]
     pub fn consume_admin_totp_step(&self, admin_id: i64, step: u64) -> rusqlite::Result<bool> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1626,6 +1639,7 @@ impl Database {
             params![token_hash(token), Utc::now().to_rfc3339()],
         )? == 1)
     }
+    #[cfg(test)]
     pub fn delete_session(&self, token: &str) -> rusqlite::Result<()> {
         self.try_conn()?.execute(
             "DELETE FROM sessions WHERE token_hash=?1",

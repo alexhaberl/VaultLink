@@ -89,6 +89,9 @@ impl ApiError {
     fn not_found(message: &'static str) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
+    fn conflict(message: &'static str) -> Self {
+        Self::new(StatusCode::CONFLICT, "conflict", message)
+    }
     fn internal<T>(_: T) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

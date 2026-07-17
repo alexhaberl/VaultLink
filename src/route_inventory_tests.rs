@@ -366,10 +366,10 @@ fn nesting_layer_order_and_original_uri_contract_remain_visible() {
             ".layer(SetRequestIdLayer::new(",
             ".layer(TraceLayer::new_for_http()",
             ".layer(CatchPanicLayer::new())",
+            ".layer(middleware::from_fn_with_state(state.clone(),admission::response_admission))",
+            ".layer(middleware::from_fn(admission::locale_context))",
             ".layer(middleware::from_fn_with_state(state.clone(),admission::audit_client_ip_context))",
             ".layer(middleware::from_fn_with_state(state.clone(),admission::security_headers))",
-            ".layer(middleware::from_fn(admission::locale_context))",
-            ".layer(middleware::from_fn_with_state(state.clone(),admission::response_admission))",
             ".with_state(state)",
         ],
     );

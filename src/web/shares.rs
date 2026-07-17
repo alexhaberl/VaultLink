@@ -506,11 +506,6 @@ pub(super) async fn create_share(
     } else {
         SharePasswordInput::None
     };
-    let storage_guard = state.storage_mutation.clone().lock_owned().await;
-    let storage_guard = file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
-        .await
-        .map_err(storage_recovery_app_error)?;
-    let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
     let secure_root = state.secure_root.clone();
     let metadata_path = rel.clone();
     let target_metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
@@ -569,6 +564,7 @@ pub(super) async fn create_share(
             (None, None, None)
         };
     let overwrite_allowed = permission.can_upload() && f.overwrite_allowed.as_deref() == Some("1");
+    let revalidation_path = rel.clone();
     let validated = service
         .prepare_create(CreateShareCommand {
             token,
@@ -591,6 +587,39 @@ pub(super) async fn create_share(
         Some(password) => Some(hash_password_admitted(&state, password).await?),
         None => None,
     };
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let storage_guard = file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
+        .await
+        .map_err(storage_recovery_app_error)?;
+    let secure_root = state.secure_root.clone();
+    let metadata_path = revalidation_path;
+    let current_metadata =
+        tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
+            .await
+            .map_err(internal)?
+            .map_err(|_| {
+                AppError(
+                    StatusCode::CONFLICT,
+                    "Ziel wurde während der Verarbeitung geändert",
+                )
+            })?;
+    let current_target = if current_metadata.is_dir() {
+        ShareTarget::Directory
+    } else if current_metadata.is_file() {
+        ShareTarget::File
+    } else {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "Ziel wurde während der Verarbeitung geändert",
+        ));
+    };
+    if current_target != target {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "Ziel wurde während der Verarbeitung geändert",
+        ));
+    }
+    let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
     let username = s.username;
     let audit_client_ip = settings
         .audit_client_ip_enabled

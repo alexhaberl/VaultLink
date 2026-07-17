@@ -12,6 +12,7 @@ impl Database {
     /// the caller is still current. Password hashing happens outside SQLite, so
     /// the hash and epoch predicates close the reset/policy-change race between
     /// verification and session creation.
+    #[cfg(test)]
     pub fn create_unlock_session_for_verified_password(
         &self,
         token: &str,
