@@ -583,6 +583,10 @@ if ! grep -E -q '^[[:space:]]+FUZZ_JOBS:[[:space:]]+4$' .github/workflows/fuzz.y
     report "fuzz workflow must run all nine targets across four workers"
 fi
 
+if ! grep -E -q '^[[:space:]]+CARGO_BUILD_JOBS:[[:space:]]+2$' .github/workflows/fuzz.yml; then
+    report "fuzz workflow must bound memory-intensive instrumented builds to two jobs"
+fi
+
 if ! grep -E -q '^[[:space:]]+timeout-minutes:[[:space:]]+60$' .github/workflows/fuzz.yml; then
     report "fuzz workflow must allow one hour for instrumented builds and three target waves"
 fi
