@@ -192,14 +192,14 @@ fn admin_sort_header_view(
 }
 
 fn admin_file_row_view(
-    path: String,
+    path: &str,
     name: String,
     is_directory: bool,
     size: u64,
     modified: Option<std::time::SystemTime>,
     settings: &crate::runtime::RuntimeSettings,
 ) -> AdminFileRowView {
-    let target = encoded(&path);
+    let target = encoded(path);
     let modified = modified.map(admin_file_time);
     let (modified_datetime, modified_label) = if let Some((datetime, label)) = modified {
         (Some(datetime), label)
@@ -207,7 +207,7 @@ fn admin_file_row_view(
         (None, "—".into())
     };
     AdminFileRowView {
-        path: path.clone(),
+        path: path.to_string(),
         name,
         icon: super::templates::TrustedMarkup::static_icon(if is_directory {
             crate::ui::Icon::Folder
@@ -231,7 +231,7 @@ fn admin_file_row_view(
         modified_datetime,
         modified_label,
         open_url: is_directory.then(|| format!("/admin?path={target}")),
-        preview_url: (!is_directory && preview_allowed(&path, settings))
+        preview_url: (!is_directory && preview_allowed(path, settings))
             .then(|| format!("/admin/preview?path={target}")),
         share_url: format!("/admin/shares/new?path={target}"),
         download_url: (!is_directory).then(|| format!("/admin/files/download?path={target}")),
@@ -1085,8 +1085,8 @@ pub(super) async fn admin_browser(
         sort_search_hits(&mut hits, sort_column, sort_direction);
         for hit in hits {
             rows.push(admin_file_row_view(
+                &hit.relative_path,
                 hit.relative_path.clone(),
-                hit.relative_path,
                 hit.entry.is_dir,
                 hit.entry.len,
                 hit.entry.modified,
@@ -1123,7 +1123,7 @@ pub(super) async fn admin_browser(
         for entry in listing_page.entries {
             let child = join_display(&rel, &entry.name);
             rows.push(admin_file_row_view(
-                child,
+                &child,
                 entry.name,
                 entry.is_dir,
                 entry.len,
