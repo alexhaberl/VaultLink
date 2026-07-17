@@ -285,16 +285,16 @@ pub fn router(state: AppState) -> Router {
     router
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            admission::response_admission,
+        ))
+        .layer(middleware::from_fn(admission::locale_context))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             admission::audit_client_ip_context,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admission::security_headers,
-        ))
-        .layer(middleware::from_fn(admission::locale_context))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            admission::response_admission,
         ))
         .with_state(state)
 }

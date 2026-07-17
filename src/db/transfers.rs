@@ -359,6 +359,7 @@ impl Database {
         Ok(UploadReservationExtendOutcome::Extended)
     }
 
+    #[cfg(test)]
     pub fn commit_upload_reservation(
         &self,
         token: &str,
@@ -476,6 +477,7 @@ impl Database {
             |row| row.get(0),
         )
     }
+    #[cfg(test)]
     pub fn count_download(&self, id: i64) -> rusqlite::Result<bool> {
         let now = Utc::now().to_rfc3339();
         Ok(self.try_conn()?.execute(
@@ -616,6 +618,7 @@ impl Database {
 
     /// Completes one request lease. The first successful request for a pending
     /// grant increments the share counter; later requests for that grant do not.
+    #[cfg(test)]
     pub fn complete_transfer_lease(
         &self,
         lease_token: &str,
@@ -754,6 +757,7 @@ impl Database {
         Ok(TransferLeaseCancelOutcome::Cancelled)
     }
 
+    #[cfg(test)]
     pub fn heartbeat_transfer_lease(
         &self,
         lease_token: &str,

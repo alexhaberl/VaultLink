@@ -2046,6 +2046,63 @@ mod tests {
     }
 
     #[test]
+    fn restart_restores_every_unjournaled_delete_and_preserves_journaled_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let mut staged_deletes = Vec::new();
+        for index in 0..32 {
+            let path = format!("restore-{index}.txt");
+            std::fs::write(directory.path().join(&path), path.as_bytes()).unwrap();
+            staged_deletes.push((path.clone(), root.stage_delete(&path).unwrap()));
+        }
+        std::fs::write(directory.path().join("forward.txt"), b"forward").unwrap();
+        let forward = root.stage_delete("forward.txt").unwrap();
+        let forward_operation = DurableFileOperation::Delete {
+            original_path: forward.original_path.clone(),
+            kind: forward.status.kind.into(),
+            device: forward.source_identity.0,
+            inode: forward.source_identity.1,
+            pending_name: forward.tombstone_name.clone(),
+            tombstone_name: deletion_tombstone_name(),
+            allow_recursive: false,
+            phase: DurableDeletePhase::Moved,
+        };
+        write_file_operation(root.tombstones.as_ref(), &forward_operation).unwrap();
+
+        for (_, staged) in staged_deletes.iter() {
+            unregister_upload_fragment(staged.active_key.as_ref().unwrap());
+        }
+        unregister_upload_fragment(forward.active_key.as_ref().unwrap());
+        for (_, staged) in staged_deletes {
+            std::mem::forget(staged);
+        }
+        std::mem::forget(forward);
+        drop(root);
+
+        let reopened = SecureRoot::open(directory.path()).unwrap();
+        for index in 0..32 {
+            let path = format!("restore-{index}.txt");
+            assert_eq!(
+                std::fs::read(directory.path().join(&path)).unwrap(),
+                path.as_bytes()
+            );
+        }
+        assert!(!directory.path().join("forward.txt").exists());
+        let pending = reopened.pending_file_operations().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            reopened.recover_file_operation(&pending[0]).unwrap(),
+            FileOperationRecovery::Delete {
+                original_path: "forward.txt".into(),
+                is_directory: false,
+                tombstone_path: None,
+            }
+        );
+        reopened.complete_file_operation(&pending[0]).unwrap();
+        assert!(reopened.pending_file_operations().unwrap().is_empty());
+    }
+
+    #[test]
     fn restart_refuses_unjournaled_pending_delete_when_original_was_reused() {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
@@ -2123,20 +2180,31 @@ mod tests {
             .path()
             .join(INTERNAL_DIRECTORY_NAME)
             .join(TOMBSTONE_STAGING_DIRECTORY_NAME);
-        let operation_name = file_operation_name();
-        let temporary_name = format!("{operation_name}.pending");
-        let unknown_name = format!("{operation_name}.pending.backup");
-        let orphan_manifest = deletion_manifest_name(&deletion_pending_name());
+        let temporary_names = (0..32)
+            .map(|_| format!("{}.pending", file_operation_name()))
+            .collect::<Vec<_>>();
+        let unknown_name = format!("{}.pending.backup", file_operation_name());
+        let orphan_manifests = (0..32)
+            .map(|_| deletion_manifest_name(&deletion_pending_name()))
+            .collect::<Vec<_>>();
         let unknown_manifest = format!("not-a-delete{DELETION_MANIFEST_SUFFIX}");
-        std::fs::write(tombstones.join(&temporary_name), b"partial").unwrap();
+        for temporary_name in &temporary_names {
+            std::fs::write(tombstones.join(temporary_name), b"partial").unwrap();
+        }
         std::fs::write(tombstones.join(&unknown_name), b"preserve").unwrap();
-        std::fs::write(tombstones.join(&orphan_manifest), b"orphan").unwrap();
+        for orphan_manifest in &orphan_manifests {
+            std::fs::write(tombstones.join(orphan_manifest), b"orphan").unwrap();
+        }
         std::fs::write(tombstones.join(&unknown_manifest), b"preserve manifest").unwrap();
         drop(root);
 
         let reopened = SecureRoot::open(directory.path()).unwrap();
-        assert!(!tombstones.join(temporary_name).exists());
-        assert!(!tombstones.join(orphan_manifest).exists());
+        assert!(temporary_names
+            .iter()
+            .all(|temporary_name| !tombstones.join(temporary_name).exists()));
+        assert!(orphan_manifests
+            .iter()
+            .all(|orphan_manifest| !tombstones.join(orphan_manifest).exists()));
         assert_eq!(
             std::fs::read(tombstones.join(unknown_name)).unwrap(),
             b"preserve"

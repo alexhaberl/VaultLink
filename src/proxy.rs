@@ -46,10 +46,6 @@ pub fn client_limit_key(address: IpAddr) -> IpAddr {
     }
 }
 
-pub fn effective_client_ip(peer: IpAddr, headers: &HeaderMap, config: &Config) -> IpAddr {
-    validated_effective_client_ip(peer, headers, config).unwrap_or_else(|_| canonical_peer_ip(peer))
-}
-
 pub fn validated_effective_client_ip(
     peer: IpAddr,
     headers: &HeaderMap,
@@ -132,7 +128,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         assert_eq!(
-            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &cfg()),
+            validated_effective_client_ip("127.0.0.1".parse().unwrap(), &h, &cfg()).unwrap(),
             "127.0.0.1".parse::<IpAddr>().unwrap()
         );
     }
@@ -143,12 +139,24 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         assert_eq!(
-            effective_client_ip("10.0.0.2".parse().unwrap(), &h, &c),
+            validated_effective_client_ip("10.0.0.2".parse().unwrap(), &h, &c).unwrap(),
             "10.0.0.2".parse::<IpAddr>().unwrap()
         );
         assert_eq!(
-            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
+            validated_effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c).unwrap(),
             "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn ignores_malformed_forwarding_from_an_untrusted_peer() {
+        let mut c = cfg();
+        c.server.mode = ServerMode::ReverseProxy;
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        assert_eq!(
+            validated_effective_client_ip("10.0.0.2".parse().unwrap(), &h, &c).unwrap(),
+            "10.0.0.2".parse::<IpAddr>().unwrap()
         );
     }
 
@@ -162,7 +170,7 @@ mod tests {
             "198.51.100.200, 203.0.113.7".parse().unwrap(),
         );
         assert_eq!(
-            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
+            validated_effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c).unwrap(),
             "203.0.113.7".parse::<IpAddr>().unwrap()
         );
     }
@@ -177,7 +185,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "203.0.113.7, 10.0.0.2".parse().unwrap());
         assert_eq!(
-            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
+            validated_effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c).unwrap(),
             "203.0.113.7".parse::<IpAddr>().unwrap()
         );
     }
@@ -189,7 +197,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "not-an-ip, 203.0.113.7".parse().unwrap());
         assert_eq!(
-            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
+            validated_effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c).unwrap(),
             "203.0.113.7".parse::<IpAddr>().unwrap()
         );
     }
@@ -242,7 +250,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
         assert_eq!(
-            effective_client_ip("::ffff:127.0.0.1".parse().unwrap(), &h, &c),
+            validated_effective_client_ip("::ffff:127.0.0.1".parse().unwrap(), &h, &c).unwrap(),
             "203.0.113.7".parse::<IpAddr>().unwrap()
         );
     }

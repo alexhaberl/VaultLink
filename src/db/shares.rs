@@ -1,8 +1,10 @@
 use super::{
     insert_required_audits, token_hash, trace_required_audits, AuditContext, Database, Permission,
     RequiredAuditEvent, Share, ShareControlsUpdateOutcome, UploadConflictStrategy,
-    DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE, MAX_SQLITE_UNSIGNED,
+    MAX_SQLITE_UNSIGNED,
 };
+#[cfg(test)]
+use super::{DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
@@ -46,6 +48,7 @@ fn path_globs(path: &str) -> (String, String) {
 }
 
 impl Database {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn create_share(
         &self,
@@ -86,6 +89,7 @@ impl Database {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn create_share_with_upload_limits(
         &self,
@@ -330,6 +334,7 @@ impl Database {
             |row| row.get(0),
         )
     }
+    #[cfg(test)]
     pub fn rename_share_paths(
         &self,
         old_path: &str,
@@ -391,6 +396,7 @@ impl Database {
         }
         Ok(updated)
     }
+    #[cfg(test)]
     pub fn deactivate_shares_for_path(
         &self,
         path: &str,
@@ -454,6 +460,7 @@ impl Database {
         }
         Ok(deactivated)
     }
+    #[cfg(test)]
     pub fn set_share_active(&self, id: i64, active: bool) -> rusqlite::Result<bool> {
         Ok(self.try_conn()?.execute(
             "UPDATE shares
@@ -488,6 +495,7 @@ impl Database {
             Ok((changed, events))
         })
     }
+    #[cfg(test)]
     pub fn update_share_controls(
         &self,
         id: i64,
@@ -623,6 +631,7 @@ impl Database {
         Ok(ShareControlsUpdateOutcome::Updated)
     }
 
+    #[cfg(test)]
     pub fn delete_share(&self, id: i64) -> rusqlite::Result<bool> {
         Ok(self
             .try_conn()?
@@ -645,6 +654,7 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
     pub fn set_share_password(&self, id: i64, hash: Option<&str>) -> rusqlite::Result<bool> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction()?;

@@ -130,14 +130,11 @@ pub(super) async fn create_share(
     let rel = service
         .normalize_target_path(&request.path)
         .map_err(share_validation_error)?;
-    let storage_guard = state.storage_mutation.clone().lock_owned().await;
-    let storage_guard = file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
+    let secure_root = state.secure_root.clone();
+    let metadata_path = rel.clone();
+    let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
         .await
-        .map_err(storage_recovery_api_error)?;
-    let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
-    let metadata = state
-        .secure_root
-        .metadata(&rel)
+        .map_err(ApiError::internal)?
         .map_err(|_| ApiError::not_found("Ziel nicht gefunden"))?;
     if !metadata.is_file() && !metadata.is_dir() {
         return Err(ApiError::bad_request(
@@ -154,6 +151,7 @@ pub(super) async fn create_share(
         .password
         .map(SharePasswordInput::Direct)
         .unwrap_or(SharePasswordInput::None);
+    let revalidation_path = rel.clone();
     let validated = service
         .prepare_create(CreateShareCommand {
             token: token.clone(),
@@ -176,6 +174,32 @@ pub(super) async fn create_share(
         Some(password) => Some(hash_password_admitted(&state, password).await?),
         None => None,
     };
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let storage_guard = file_ops::recover_pending_file_operations_with_guard(&state, storage_guard)
+        .await
+        .map_err(storage_recovery_api_error)?;
+    let secure_root = state.secure_root.clone();
+    let metadata_path = revalidation_path;
+    let current_metadata =
+        tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(|_| ApiError::conflict("Ziel wurde während der Verarbeitung geändert"))?;
+    let current_target = if current_metadata.is_dir() {
+        ShareTarget::Directory
+    } else if current_metadata.is_file() {
+        ShareTarget::File
+    } else {
+        return Err(ApiError::conflict(
+            "Ziel wurde während der Verarbeitung geändert",
+        ));
+    };
+    if current_target != target {
+        return Err(ApiError::conflict(
+            "Ziel wurde während der Verarbeitung geändert",
+        ));
+    }
+    let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
     let username = session_data.username;
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
