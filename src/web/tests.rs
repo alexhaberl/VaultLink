@@ -29,6 +29,7 @@ use crate::{
     i18n::{self, Locale},
     proxy, AppState,
 };
+use askama::Template as _;
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, Query, Request},
@@ -2494,7 +2495,9 @@ async fn settings_form_uses_decimal_whole_preview_defaults() {
     let html = i18n::scope(Locale::De, "/admin/settings".into(), async {
         i18n::render_markers(
             Locale::De,
-            &settings_form(&session, &settings, 0, "", false),
+            &settings_form_template(&session, &settings, 0, "", false)
+                .render()
+                .unwrap(),
         )
     })
     .await;
