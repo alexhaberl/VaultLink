@@ -1,0 +1,6 @@
+[advisories]
+# webauthn_rp 0.3.0 depends on rsa 0.9 unconditionally and no patched rsa
+# release exists for RUSTSEC-2023-0071. VaultLink never advertises RS256 and,
+# with its fresh-only schema, cannot contain a legacy RSA credential. A unit
+# test pins that compensating control until the dependency can be removed.
+ignore = ["RUSTSEC-2023-0071"]

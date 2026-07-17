@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{borrow::Cow, collections::HashMap, future::Future, sync::OnceLock};
 
 use axum::http::{header, HeaderMap};
 
@@ -746,9 +746,8 @@ catalog! {
 }
 
 pub fn text(locale: Locale, key: MessageKey) -> &'static str {
-    let entry = CATALOG
-        .iter()
-        .find(|entry| entry.key == key)
+    let entry = catalog_by_key()
+        .get(key.id())
         .unwrap_or_else(|| panic!("unknown translation key: {}", key.id()));
     match locale {
         Locale::De => entry.de,
@@ -756,16 +755,29 @@ pub fn text(locale: Locale, key: MessageKey) -> &'static str {
     }
 }
 
-pub fn text_from_german(locale: Locale, source: &str) -> String {
-    CATALOG
-        .iter()
-        .find(|entry| entry.de == source)
+pub fn text_from_german<'a>(locale: Locale, source: &'a str) -> Cow<'a, str> {
+    catalog_by_german()
+        .get(source)
         .map(|entry| match locale {
-            Locale::De => entry.de,
-            Locale::En => entry.en,
+            Locale::De => Cow::Borrowed(entry.de),
+            Locale::En => Cow::Borrowed(entry.en),
         })
-        .unwrap_or(source)
-        .to_string()
+        .unwrap_or_else(|| Cow::Borrowed(source))
+}
+
+fn catalog_by_key() -> &'static HashMap<&'static str, &'static CatalogEntry> {
+    static INDEX: OnceLock<HashMap<&'static str, &'static CatalogEntry>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        CATALOG
+            .iter()
+            .map(|entry| (entry.key.id(), entry))
+            .collect()
+    })
+}
+
+fn catalog_by_german() -> &'static HashMap<&'static str, &'static CatalogEntry> {
+    static INDEX: OnceLock<HashMap<&'static str, &'static CatalogEntry>> = OnceLock::new();
+    INDEX.get_or_init(|| CATALOG.iter().map(|entry| (entry.de, entry)).collect())
 }
 
 /// Replace only explicit internal translation markers. Dynamic values must be
@@ -785,9 +797,8 @@ pub fn render_markers(locale: Locale, source: &str) -> String {
             return rendered;
         };
         let key = &key_and_rest[..end];
-        let entry = CATALOG
-            .iter()
-            .find(|entry| entry.key.id() == key)
+        let entry = catalog_by_key()
+            .get(key)
             .unwrap_or_else(|| panic!("unknown translation marker: {key}"));
         rendered.push_str(match locale {
             Locale::De => entry.de,

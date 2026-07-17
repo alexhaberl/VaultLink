@@ -13,6 +13,7 @@ RUN cargo install --locked cargo-cyclonedx --version 0.5.9 \
 
 WORKDIR /work
 COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile .dockerignore ./
+COPY .cargo ./.cargo
 COPY README.md SECURITY.md CHANGELOG.md ./
 COPY .github ./.github
 COPY src ./src

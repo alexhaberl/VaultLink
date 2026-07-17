@@ -136,7 +136,7 @@ pub(super) async fn start_security_key_registration(
 pub(super) struct SecurityKeyRegistrationFinish {
     csrf: String,
     label: String,
-    credential: webauthn_rs::prelude::RegisterPublicKeyCredential,
+    credential: serde_json::Value,
 }
 
 pub(super) async fn finish_security_key_registration(
@@ -163,8 +163,9 @@ pub(super) async fn finish_security_key_registration(
                 "Ungültige Sicherheitsschlüssel-Antwort",
             )
         })?;
-    let credential_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.cred_id());
-    let credential_json = serde_json::to_string(&key).map_err(internal)?;
+    let credential_id =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.credential_id());
+    let credential_blob = key.to_blob().map_err(internal)?;
     let admin_id = session.admin_id;
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
@@ -180,7 +181,7 @@ pub(super) async fn finish_security_key_registration(
             admin_id,
             &label,
             &credential_id,
-            &credential_json,
+            &credential_blob,
             audit_client_ip.as_deref(),
         )
     })
@@ -228,6 +229,7 @@ pub(super) async fn delete_security_key(
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
     let expected_password_hash = admin.password_hash;
     let expected_totp_secret = admin.totp_secret;
+    let expected_totp_generation = admin.totp_generation;
     let totp_enabled = admin.totp_enabled;
     let password = form.current_password;
     if password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
@@ -282,7 +284,7 @@ pub(super) async fn delete_security_key(
                 id,
                 admin_id,
                 &expected_password_hash,
-                expected_totp_secret.expose_secret(),
+                expected_totp_generation,
                 totp_step.expect("enabled TOTP was validated before the database task"),
                 audit_client_ip.as_deref(),
             )
@@ -391,6 +393,7 @@ pub(super) async fn set_account_totp(
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Anmeldung erforderlich"))?;
     let expected_password_hash = admin.password_hash;
     let expected_totp_secret = admin.totp_secret;
+    let expected_totp_generation = admin.totp_generation;
     let password = form.current_password;
     if password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
         return Err(AppError(StatusCode::UNAUTHORIZED, "Ungültige Zugangsdaten"));
@@ -436,7 +439,7 @@ pub(super) async fn set_account_totp(
             &token,
             admin_id,
             &expected_password_hash,
-            expected_totp_secret.expose_secret(),
+            expected_totp_generation,
             enabled,
             totp_step,
             audit_client_ip.as_deref(),
@@ -541,7 +544,7 @@ pub(super) async fn change_account_password(
     match outcome {
         AdminPasswordChangeOutcome::Changed => Ok(redirect_with_cookie(
             "/login",
-            clear_session_cookie(&state),
+            &clear_session_cookie(&state),
         )?),
         AdminPasswordChangeOutcome::StalePassword => Err(AppError(
             StatusCode::CONFLICT,
@@ -712,7 +715,7 @@ pub(super) async fn confirm_account_mfa(
             state.limiter.success(&limiter_key);
             Ok(redirect_with_cookie(
                 "/login",
-                clear_session_cookie(&state),
+                &clear_session_cookie(&state),
             )?)
         }
         AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired => Err(AppError(

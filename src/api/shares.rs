@@ -189,7 +189,7 @@ pub(super) async fn create_share(
             // mutation retains the storage lock so rename/delete cannot interleave
             // after the target metadata check and create a share for a stale path.
             service
-                .create(prepared, password_hash, &audit_context)
+                .create(prepared, password_hash.as_deref(), &audit_context)
                 .map(drop)
                 .map_err(share_database_error)
         })

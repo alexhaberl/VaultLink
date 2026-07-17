@@ -61,7 +61,7 @@ pub(super) fn public_back_link(
 }
 
 pub(super) fn add_public_preview_actions(
-    body: String,
+    body: &str,
     back_link: &str,
     download_link: Option<&str>,
 ) -> String {
@@ -77,7 +77,7 @@ pub(super) fn add_public_preview_actions(
     let content = body
         .strip_prefix(PREFIX)
         .and_then(|body| body.strip_suffix("</section>"))
-        .unwrap_or(&body);
+        .unwrap_or(body);
     format!(
         r#"<section class="vl-panel"><h1><vl-i18n key="files.preview"/></h1><p class="vl-inline-actions"><a class="vl-button vl-button--secondary" href="{}"><vl-i18n key="share.back"/></a>{}</p>{}</section>"#,
         esc(back_link),
@@ -190,7 +190,7 @@ pub(crate) async fn public_preview(
     let content = if sh.is_directory {
         let scope = preview_scope.expect("directory preview scope is bound");
         let requested = requested_path.clone();
-        tokio::task::spawn_blocking(move || read_preview(scope, &requested, &settings)).await
+        tokio::task::spawn_blocking(move || read_preview(&scope, &requested, &settings)).await
     } else {
         let file = preview_file.expect("file preview is bound");
         tokio::task::spawn_blocking(move || {
@@ -199,7 +199,7 @@ pub(crate) async fn public_preview(
         .await
     }
     .map_err(internal)?
-    .map_err(public_preview_error)?;
+    .map_err(|error| public_preview_error(&error))?;
     let content = match content {
         PreviewContent::Text(text)
             if escaped_html_len(&text)
@@ -230,7 +230,7 @@ pub(crate) async fn public_preview(
             Some(&download_link),
         );
         let body = add_public_preview_actions(
-            body,
+            &body,
             &public_back_link(&public_route, &share_rel, sh.is_directory),
             Some(&download_link),
         );
@@ -334,7 +334,7 @@ pub(crate) async fn public_preview(
                 viewer
             );
             let body = add_public_preview_actions(
-                body,
+                &body,
                 &public_back_link(&public_route, &share_rel, sh.is_directory),
                 Some(&download_link),
             );

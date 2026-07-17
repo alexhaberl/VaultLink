@@ -7,6 +7,11 @@ pub fn parse_byte_range(value: &str, length: u64) -> Result<(u64, u64), RangeErr
         return Err(RangeError);
     }
     let (start, end) = value[6..].split_once('-').ok_or(RangeError)?;
+    if (!start.is_empty() && !start.bytes().all(|byte| byte.is_ascii_digit()))
+        || (!end.is_empty() && !end.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(RangeError);
+    }
     let (start, end) = if start.is_empty() {
         let suffix = end.parse::<u64>().map_err(|_| RangeError)?;
         if suffix == 0 {
@@ -39,5 +44,6 @@ mod tests {
         assert_eq!(parse_byte_range("bytes=-10", 100), Ok((90, 99)));
         assert!(parse_byte_range("bytes=100-101", 100).is_err());
         assert!(parse_byte_range("bytes=0-1,3-4", 100).is_err());
+        assert!(parse_byte_range("bytes=١-٢", 100).is_err());
     }
 }

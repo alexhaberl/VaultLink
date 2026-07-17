@@ -13,10 +13,8 @@ use crate::{
 use super::{ApiError, ApiResult};
 
 pub(super) async fn find_share_by_id(state: &AppState, id: i64) -> ApiResult<Share> {
-    database(state.db.clone(), move |db| db.list_shares())
+    database(state.db.clone(), move |db| db.share_by_id(id))
         .await?
-        .into_iter()
-        .find(|share| share.id == id)
         .ok_or_else(|| ApiError::not_found("Freigabe nicht gefunden"))
 }
 

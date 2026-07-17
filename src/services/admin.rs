@@ -94,8 +94,8 @@ impl AdminService {
 
     pub(crate) fn create(
         &self,
-        prepared: PreparedAdminCreate,
-        password_hash: String,
+        prepared: &PreparedAdminCreate,
+        password_hash: &str,
         context: &AuditContext,
     ) -> Result<CreatedAdmin, AdminServiceError> {
         let secret = auth::new_totp_secret_value();
@@ -104,7 +104,7 @@ impl AdminService {
             .database
             .create_admin_and_audit(
                 &prepared.username,
-                &password_hash,
+                password_hash,
                 secret.expose_secret(),
                 context,
             )

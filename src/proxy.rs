@@ -2,6 +2,9 @@ use crate::config::{Config, ServerMode};
 use http::HeaderMap;
 use std::net::{IpAddr, Ipv6Addr};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidForwardedFor;
+
 /// Canonicalizes a TCP peer without widening the configured trust boundary.
 ///
 /// Dual-stack listeners can report an IPv4 peer as an IPv4-mapped IPv6
@@ -44,34 +47,35 @@ pub fn client_limit_key(address: IpAddr) -> IpAddr {
 }
 
 pub fn effective_client_ip(peer: IpAddr, headers: &HeaderMap, config: &Config) -> IpAddr {
+    validated_effective_client_ip(peer, headers, config).unwrap_or_else(|_| canonical_peer_ip(peer))
+}
+
+pub fn validated_effective_client_ip(
+    peer: IpAddr,
+    headers: &HeaderMap,
+    config: &Config,
+) -> Result<IpAddr, InvalidForwardedFor> {
     let peer = canonical_peer_ip(peer);
     if config.server.mode != ServerMode::ReverseProxy
         || !config.reverse_proxy.enabled
         || !config.reverse_proxy.trust_x_forwarded_headers
         || !is_trusted_proxy_peer(peer, &config.reverse_proxy.trusted_proxies)
     {
-        return peer;
-    }
-
-    let mut forwarded = Vec::new();
-    for value in headers.get_all("x-forwarded-for") {
-        let Ok(value) = value.to_str() else {
-            return peer;
-        };
-        forwarded.extend(value.split(',').map(str::trim));
+        return Ok(peer);
     }
 
     let mut current = peer;
-    for candidate in forwarded.into_iter().rev() {
-        if !is_trusted_proxy_peer(current, &config.reverse_proxy.trusted_proxies) {
-            break;
+    let values = headers.get_all("x-forwarded-for");
+    for value in values.iter().rev() {
+        let value = value.to_str().map_err(|_| InvalidForwardedFor)?;
+        for candidate in value.rsplit(',').map(str::trim) {
+            if !is_trusted_proxy_peer(current, &config.reverse_proxy.trusted_proxies) {
+                return Ok(current);
+            }
+            current = canonical_peer_ip(candidate.parse().map_err(|_| InvalidForwardedFor)?);
         }
-        let Ok(candidate) = candidate.parse() else {
-            return peer;
-        };
-        current = canonical_peer_ip(candidate);
     }
-    current
+    Ok(current)
 }
 #[cfg(test)]
 mod tests {
@@ -191,14 +195,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_relevant_forwarded_hop_falls_back_to_peer() {
+    fn malformed_relevant_forwarded_hop_is_rejected() {
         let mut c = cfg();
         c.server.mode = ServerMode::ReverseProxy;
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
         assert_eq!(
-            effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
-            "127.0.0.1".parse::<IpAddr>().unwrap()
+            validated_effective_client_ip("127.0.0.1".parse().unwrap(), &h, &c),
+            Err(InvalidForwardedFor)
         );
     }
 

@@ -1,5 +1,6 @@
 mod audit;
 mod auth;
+mod keyring;
 mod public_sessions;
 mod required_audit;
 mod runtime_settings;
@@ -9,6 +10,7 @@ mod transfers;
 
 use required_audit::{insert_required_audits, trace_required_audits};
 pub use required_audit::{is_audit_unavailable, AuditContext, RequiredAuditEvent};
+#[cfg(any(test, feature = "fuzzing"))]
 pub use shares::rewrite_share_path;
 
 #[cfg(test)]
@@ -19,11 +21,12 @@ use transfers::current_utc_month;
 #[cfg(test)]
 use chrono::Duration;
 use chrono::{DateTime, Utc};
+use r2d2_sqlite::SqliteConnectionManager;
 #[cfg(test)]
 use rusqlite::{params, TransactionBehavior};
 use rusqlite::{Connection, OpenFlags};
 #[cfg(test)]
-use schema::{migrate, SCHEMA_VERSION};
+use schema::SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -32,7 +35,7 @@ use std::{
     os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 pub(crate) const MAX_SQLITE_UNSIGNED: u64 = i64::MAX as u64;
@@ -55,13 +58,63 @@ pub const ADMIN_MFA_ENROLLMENT_TTL_SECONDS: i64 = 10 * 60;
 pub struct Database(Arc<DatabaseInner>);
 
 struct DatabaseInner {
-    connection: Mutex<Connection>,
-    #[cfg(test)]
-    fail_next_poison_rollback: std::sync::atomic::AtomicBool,
+    pool: r2d2::Pool<SqliteConnectionManager>,
+    keyring: keyring::Keyring,
     // Keep the descriptor behind /proc/self/fd alive for the whole connection
     // so the validated directory capability cannot be rebound through file-
     // descriptor reuse while SQLite uses the supplied path.
     _directory_capability: Option<File>,
+}
+
+pub type DatabaseResult<T> = std::result::Result<T, DatabaseError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum DatabaseError {
+    #[error("database connection pool unavailable: {0}")]
+    Pool(#[source] r2d2::Error),
+    #[error("database is busy: {0}")]
+    Busy(#[source] rusqlite::Error),
+    #[error("database invariant violated: {0}")]
+    Invariant(#[source] rusqlite::Error),
+    #[error("database schema rejected: {0}")]
+    Schema(#[source] rusqlite::Error),
+    #[error("database secret cryptography failed: {0}")]
+    Cryptography(#[source] rusqlite::Error),
+    #[error("database is corrupt: {0}")]
+    Corruption(#[source] rusqlite::Error),
+    #[error("database operation failed: {0}")]
+    Sqlite(#[source] rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for DatabaseError {
+    fn from(error: rusqlite::Error) -> Self {
+        if schema::is_schema_error(&error) {
+            return Self::Schema(error);
+        }
+        if keyring::is_crypto_error(&error) {
+            return Self::Cryptography(error);
+        }
+        if let rusqlite::Error::SqliteFailure(sqlite, _) = &error {
+            let primary = sqlite.extended_code & 0xff;
+            if primary == rusqlite::ffi::SQLITE_BUSY || primary == rusqlite::ffi::SQLITE_LOCKED {
+                return Self::Busy(error);
+            }
+            if primary == rusqlite::ffi::SQLITE_CORRUPT || primary == rusqlite::ffi::SQLITE_NOTADB {
+                return Self::Corruption(error);
+            }
+        }
+        if matches!(
+            error,
+            rusqlite::Error::InvalidQuery
+                | rusqlite::Error::QueryReturnedNoRows
+                | rusqlite::Error::InvalidParameterName(_)
+                | rusqlite::Error::FromSqlConversionFailure(..)
+                | rusqlite::Error::IntegralValueOutOfRange(..)
+        ) {
+            return Self::Invariant(error);
+        }
+        Self::Sqlite(error)
+    }
 }
 
 #[derive(Debug)]
@@ -70,6 +123,7 @@ pub struct Admin {
     pub username: String,
     pub password_hash: String,
     pub(crate) totp_secret: crate::sensitive::SecretString,
+    pub(crate) totp_generation: u64,
     pub totp_enabled: bool,
     pub active: bool,
 }
@@ -102,7 +156,7 @@ pub struct AdminWebauthnCredential {
     pub id: i64,
     pub label: String,
     pub credential_id: String,
-    pub credential_json: String,
+    pub credential_blob: Vec<u8>,
     pub created_at: String,
     pub last_used_at: Option<String>,
 }
@@ -286,7 +340,7 @@ pub enum TransferLeaseHeartbeatOutcome {
     NotFound,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
     DownloadOnly,
@@ -383,39 +437,38 @@ pub struct TransferMonthlyCounts {
     pub preview: u64,
 }
 
-impl TransferMonthlyCounts {
-    pub fn total(&self) -> u64 {
-        self.download
-            .saturating_add(self.zip_download)
-            .saturating_add(self.preview)
-    }
-}
-
 fn token_hash(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     data_encoding::HEXLOWER.encode(digest.as_ref())
 }
 
 impl Database {
-    pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+    pub fn rotate_secrets(path: impl AsRef<Path>) -> DatabaseResult<()> {
+        keyring::rotate_database(path.as_ref()).map_err(Into::into)
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> DatabaseResult<Self> {
         Self::open_inner(path.as_ref(), None)
     }
 
     #[doc(hidden)]
-    pub fn open_in_directory(directory: File) -> rusqlite::Result<Self> {
-        let metadata = directory.metadata().map_err(database_io_error)?;
+    pub fn open_in_directory(directory: File) -> DatabaseResult<Self> {
+        let metadata = directory
+            .metadata()
+            .map_err(database_io_error)
+            .map_err(DatabaseError::from)?;
         if !metadata.is_dir() {
-            return Err(database_io_error(io::Error::new(
+            return Err(DatabaseError::from(database_io_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "validated database directory capability is not a directory",
-            )));
+            ))));
         }
         let effective_uid = rustix::process::geteuid().as_raw();
         if metadata.uid() != effective_uid || metadata.mode() & 0o022 != 0 {
-            return Err(database_io_error(io::Error::new(
+            return Err(DatabaseError::from(database_io_error(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "database directory capability must be service-owned and not writable by group or other users",
-            )));
+            ))));
         }
         let path = PathBuf::from(format!(
             "/proc/self/fd/{}/data.sqlite",
@@ -424,45 +477,143 @@ impl Database {
         Self::open_inner(&path, Some(directory))
     }
 
-    fn open_inner(path: &Path, directory_capability: Option<File>) -> rusqlite::Result<Self> {
+    fn open_inner(path: &Path, directory_capability: Option<File>) -> DatabaseResult<Self> {
         let persistent = path != Path::new(":memory:");
         if persistent {
             match std::fs::symlink_metadata(path) {
                 Ok(metadata) => validate_database_metadata(path, &metadata, false)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(database_io_error(error)),
+                Err(error) => return Err(DatabaseError::from(database_io_error(error))),
             }
         }
-        let mut conn = if persistent {
+        let flags = if persistent {
             // SQLite's NOFOLLOW mode rejects the intentional /proc/self/fd
             // magic-link used for a validated directory capability. Those
             // opens are already anchored to a service-owned directory FD and
             // receive the same pre/post final-file metadata checks below.
-            let flags = if directory_capability.is_some() {
+            if directory_capability.is_some() {
                 OpenFlags::default()
             } else {
                 OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW
-            };
-            Connection::open_with_flags(path, flags)?
+            }
         } else {
-            Connection::open(path)?
+            OpenFlags::default()
         };
+        let manager = if persistent {
+            SqliteConnectionManager::file(path).with_flags(flags)
+        } else {
+            SqliteConnectionManager::memory()
+        }
+        .with_init(configure_connection);
+        let pool = r2d2::Pool::builder()
+            .max_size(if persistent { 4 } else { 1 })
+            .build(manager)
+            .map_err(DatabaseError::Pool)?;
+        let mut conn = pool.get().map_err(DatabaseError::Pool)?;
         if persistent {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .map_err(database_io_error)?;
             let metadata = std::fs::symlink_metadata(path).map_err(database_io_error)?;
             validate_database_metadata(path, &metadata, true)?;
         }
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        schema::migrate(&mut conn)?;
+        let initialize_keyring = if persistent {
+            let schema_version: i64 =
+                conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            let object_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )?;
+            schema_version == 0 && object_count == 0
+        } else {
+            false
+        };
+        let keyring = if initialize_keyring {
+            let keyring = keyring::Keyring::open(path, persistent, true)?;
+            schema::migrate(&mut conn)?;
+            keyring
+        } else {
+            // Existing databases are schema-validated before consulting the
+            // keyring so operators receive the fail-closed schema diagnosis
+            // for legacy or unexpected layouts even when no keyring exists.
+            schema::migrate(&mut conn)?;
+            keyring::Keyring::open(path, persistent, false)?
+        };
+        validate_encrypted_secrets(&conn, &keyring)?;
+        drop(conn);
         Ok(Self(Arc::new(DatabaseInner {
-            connection: Mutex::new(conn),
-            #[cfg(test)]
-            fail_next_poison_rollback: std::sync::atomic::AtomicBool::new(false),
+            pool,
+            keyring,
             _directory_capability: directory_capability,
         })))
     }
+
+    fn encrypt_secret(&self, plaintext: &[u8], aad: &[u8]) -> rusqlite::Result<(u64, Vec<u8>)> {
+        self.0.keyring.encrypt(plaintext, aad)
+    }
+
+    fn decrypt_secret(
+        &self,
+        key_id: u64,
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> rusqlite::Result<Vec<u8>> {
+        self.0.keyring.decrypt(key_id, ciphertext, aad)
+    }
+}
+
+fn configure_connection(connection: &mut Connection) -> rusqlite::Result<()> {
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.set_prepared_statement_cache_capacity(128);
+    Ok(())
+}
+
+fn pool_error(error: &r2d2::Error) -> rusqlite::Error {
+    database_io_error(io::Error::other(format!(
+        "database connection pool unavailable: {error}"
+    )))
+}
+
+fn validate_encrypted_secrets(
+    connection: &Connection,
+    keyring: &keyring::Keyring,
+) -> rusqlite::Result<()> {
+    for (stable_id, key_id, ciphertext) in connection
+        .prepare("SELECT token_hash,token_key_id,token_ciphertext FROM shares")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, u64, Vec<u8>)>>>()?
+    {
+        let aad = format!("shares.token:{stable_id}");
+        let _plaintext =
+            zeroize::Zeroizing::new(keyring.decrypt(key_id, &ciphertext, aad.as_bytes())?);
+    }
+    for (username, key_id, ciphertext) in connection
+        .prepare("SELECT username,totp_key_id,totp_ciphertext FROM admins")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, u64, Vec<u8>)>>>()?
+    {
+        let aad = format!("admins.totp:{}", username.to_lowercase());
+        let _plaintext =
+            zeroize::Zeroizing::new(keyring.decrypt(key_id, &ciphertext, aad.as_bytes())?);
+    }
+    for (stable_id, key_id, ciphertext) in connection
+        .prepare("SELECT token_hash,totp_key_id,totp_ciphertext FROM admin_mfa_enrollments")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, u64, Vec<u8>)>>>()?
+    {
+        let aad = format!("admin_mfa_enrollments.totp:{stable_id}");
+        let _plaintext =
+            zeroize::Zeroizing::new(keyring.decrypt(key_id, &ciphertext, aad.as_bytes())?);
+    }
+    Ok(())
 }
 
 fn database_io_error(error: io::Error) -> rusqlite::Error {
@@ -506,55 +657,12 @@ fn validate_database_metadata(
 }
 
 impl Database {
-    fn try_conn(&self) -> rusqlite::Result<std::sync::MutexGuard<'_, Connection>> {
-        match self.0.connection.lock() {
-            Ok(connection) => Ok(connection),
-            Err(poisoned) => {
-                tracing::error!("recovering poisoned database mutex");
-                let connection = poisoned.into_inner();
-                if !connection.is_autocommit() {
-                    #[cfg(test)]
-                    if self
-                        .0
-                        .fail_next_poison_rollback
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                    {
-                        tracing::error!("injected database poison rollback failure");
-                        return Err(rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                            Some("injected database poison rollback failure".into()),
-                        ));
-                    }
-                    if let Err(error) = connection.execute_batch("ROLLBACK") {
-                        tracing::error!(%error, "could not roll back database transaction after lock poisoning");
-                        // Keep the poison marker so a later acquisition retries
-                        // normalization. Most importantly, never expose a
-                        // connection whose transaction boundary is unknown.
-                        return Err(rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                            Some(format!(
-                                "database unavailable after failed poison recovery: {error}"
-                            )),
-                        ));
-                    }
-                    if !connection.is_autocommit() {
-                        tracing::error!(
-                            "database remained inside a transaction after poison recovery"
-                        );
-                        return Err(rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                            Some("database unavailable after incomplete poison recovery".into()),
-                        ));
-                    }
-                }
-                self.0.connection.clear_poison();
-                Ok(connection)
-            }
-        }
+    fn try_conn(&self) -> rusqlite::Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        self.0.pool.get().map_err(|error| pool_error(&error))
     }
 
     #[cfg(test)]
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    fn conn(&self) -> r2d2::PooledConnection<SqliteConnectionManager> {
         self.try_conn().expect("database connection unavailable")
     }
 

@@ -832,9 +832,19 @@ pub(super) async fn complete_transfer_without_body(
 ) -> Result<()> {
     let (lease_token, heartbeat_stop, client_ip) = transfer.into_stream_parts();
     drop(heartbeat_stop);
-    transfer_complete_future(state.db.clone(), lease_token, action, share_id, client_ip)
-        .await
-        .map_err(internal)
+    // Keep the durable completion owned by a detached task. If the HTTP
+    // request is cancelled while awaiting it, dropping this JoinHandle does
+    // not abort the database completion.
+    tokio::spawn(transfer_complete_future(
+        state.db.clone(),
+        lease_token,
+        action,
+        share_id,
+        client_ip,
+    ))
+    .await
+    .map_err(internal)?
+    .map_err(internal)
 }
 
 pub(super) fn set_transfer_cookie(response: &mut Response, cookie: &str) -> Result<()> {

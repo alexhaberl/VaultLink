@@ -17,10 +17,10 @@ impl DirectoryScanItem {
     }
 }
 
-fn visible_entry(name: OsString, metadata: std::fs::Metadata) -> DirectoryScanItem {
-    if path_security::is_internal_storage_name(&name)
-        || is_upload_fragment_name(&name)
-        || is_deletion_tombstone_name(&name)
+fn visible_entry(name: &OsString, metadata: &std::fs::Metadata) -> DirectoryScanItem {
+    if path_security::is_internal_storage_name(name)
+        || is_upload_fragment_name(name)
+        || is_deletion_tombstone_name(name)
     {
         return DirectoryScanItem::Filtered;
     }
@@ -63,7 +63,7 @@ impl Iterator for DirectoryScan {
             Ok(metadata) => metadata,
             Err(_) => return Some(DirectoryScanItem::Filtered),
         };
-        Some(visible_entry(name, metadata))
+        Some(visible_entry(&name, &metadata))
     }
 }
 

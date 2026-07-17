@@ -87,9 +87,9 @@ impl CifsProvisionOptions {
     }
 }
 
-pub fn run(options: CifsProvisionOptions) -> Result<(), CifsProvisionError> {
+pub fn run(options: &CifsProvisionOptions) -> Result<(), CifsProvisionError> {
     options.validate()?;
-    preflight()?;
+    let identity = preflight()?;
     let password = Zeroizing::new(rpassword::prompt_password("SMB password: ").map_err(
         |cause| {
             error(format!(
@@ -98,7 +98,7 @@ pub fn run(options: CifsProvisionOptions) -> Result<(), CifsProvisionError> {
         },
     )?);
     validate_password(password.as_str())?;
-    provision(&options, password.as_str())?;
+    provision(options, password.as_str(), identity)?;
     println!(
         "CIFS mount provisioned and active.\n\
          Mount source: {}\n\
@@ -112,7 +112,7 @@ pub fn run(options: CifsProvisionOptions) -> Result<(), CifsProvisionError> {
     Ok(())
 }
 
-fn preflight() -> Result<(), CifsProvisionError> {
+fn preflight() -> Result<(u32, u32), CifsProvisionError> {
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(error(
             "provision-cifs must run as root (use sudo); the browser setup must remain unprivileged",
@@ -123,9 +123,8 @@ fn preflight() -> Result<(), CifsProvisionError> {
             "mount.cifs is missing; install the cifs-utils package first",
         ));
     }
-    command_unsigned_id("-u")?;
-    command_unsigned_id("-g")?;
-    let installed_service = Command::new("systemctl")
+    let identity = vaultlink_service_identity()?;
+    let installed_service = Command::new("/usr/bin/systemctl")
         .args(["cat", "vaultlink.service"])
         .output()
         .map_err(|cause| error(format!("cannot inspect vaultlink.service: {cause}")))?;
@@ -134,7 +133,7 @@ fn preflight() -> Result<(), CifsProvisionError> {
             "vaultlink.service is not installed; install the shipped service unit before provisioning storage",
         ));
     }
-    let vaultlink_status = Command::new("systemctl")
+    let vaultlink_status = Command::new("/usr/bin/systemctl")
         .args(["--quiet", "is-active", "vaultlink.service"])
         .status()
         .map_err(|cause| error(format!("cannot query vaultlink.service: {cause}")))?;
@@ -158,12 +157,14 @@ fn preflight() -> Result<(), CifsProvisionError> {
             )));
         }
     }
-    Ok(())
+    Ok(identity)
 }
 
-fn provision(options: &CifsProvisionOptions, password: &str) -> Result<(), CifsProvisionError> {
-    let uid = command_unsigned_id("-u")?;
-    let gid = command_unsigned_id("-g")?;
+fn provision(
+    options: &CifsProvisionOptions,
+    password: &str,
+    (uid, gid): (u32, u32),
+) -> Result<(), CifsProvisionError> {
     ensure_root_directory(Path::new("/etc/vaultlink"), 0o750)?;
     ensure_root_directory(Path::new(SERVICE_DROP_IN_DIRECTORY), 0o755)?;
     ensure_root_directory(Path::new(MOUNT_POINT), 0o755)?;
@@ -366,9 +367,9 @@ fn sync_parent(path: &Path) -> Result<(), CifsProvisionError> {
         })
 }
 
-fn command_unsigned_id(option: &str) -> Result<u32, CifsProvisionError> {
-    let output = Command::new("id")
-        .args([option, "vaultlink"])
+fn vaultlink_service_identity() -> Result<(u32, u32), CifsProvisionError> {
+    let output = Command::new("/usr/bin/id")
+        .arg("vaultlink")
         .output()
         .map_err(|cause| {
             error(format!(
@@ -376,16 +377,26 @@ fn command_unsigned_id(option: &str) -> Result<u32, CifsProvisionError> {
             ))
         })?;
     if !output.status.success() {
-        return Err(command_error("id", &[option, "vaultlink"], &output));
+        return Err(command_error("id", &["vaultlink"], &output));
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| error("id returned an invalid numeric vaultlink service identity"))
+    let output = String::from_utf8_lossy(&output.stdout);
+    let parse = |prefix: &str| {
+        output
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix(prefix))
+            .and_then(|value| {
+                value
+                    .split_once('(')
+                    .map_or(Some(value), |(number, _)| Some(number))
+            })
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| error("id returned an invalid numeric vaultlink service identity"))
+    };
+    Ok((parse("uid=")?, parse("gid=")?))
 }
 
 fn run_systemctl(arguments: &[&str]) -> Result<(), CifsProvisionError> {
-    let output = Command::new("systemctl")
+    let output = Command::new("/usr/bin/systemctl")
         .args(arguments)
         .output()
         .map_err(|cause| error(format!("cannot run systemctl: {cause}")))?;
@@ -453,10 +464,10 @@ fn verify_preprovisioned_layout() -> Result<(), CifsProvisionError> {
 }
 
 fn rollback(created_files: &[PathBuf]) {
-    let _ = Command::new("systemctl")
+    let _ = Command::new("/usr/bin/systemctl")
         .args(["stop", MOUNT_UNIT_NAME])
         .status();
-    let _ = Command::new("systemctl")
+    let _ = Command::new("/usr/bin/systemctl")
         .args(["disable", MOUNT_UNIT_NAME])
         .status();
     for path in created_files.iter().rev() {
@@ -466,7 +477,9 @@ fn rollback(created_files: &[PathBuf]) {
             .and_then(|parent| fs::File::open(parent).ok())
             .and_then(|directory| directory.sync_all().ok());
     }
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
+    let _ = Command::new("/usr/bin/systemctl")
+        .arg("daemon-reload")
+        .status();
 }
 
 fn error(message: impl Into<String>) -> CifsProvisionError {

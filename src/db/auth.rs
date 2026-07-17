@@ -57,12 +57,79 @@ fn revoke_admin_auth_state(transaction: &Transaction<'_>, admin_id: i64) -> rusq
 }
 
 impl Database {
+    fn encrypt_admin_totp(
+        &self,
+        username: &str,
+        totp_secret: &str,
+    ) -> rusqlite::Result<(u64, Vec<u8>)> {
+        self.encrypt_secret(
+            totp_secret.as_bytes(),
+            format!("admins.totp:{}", username.to_lowercase()).as_bytes(),
+        )
+    }
+
+    fn decrypt_admin_totp(
+        &self,
+        username: &str,
+        key_id: u64,
+        ciphertext: &[u8],
+    ) -> rusqlite::Result<SecretString> {
+        let plaintext = self.decrypt_secret(
+            key_id,
+            ciphertext,
+            format!("admins.totp:{}", username.to_lowercase()).as_bytes(),
+        )?;
+        String::from_utf8(plaintext)
+            .map(SecretString::from)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    Box::new(error),
+                )
+            })
+    }
+
+    fn encrypt_enrollment_totp(
+        &self,
+        enrollment_token_hash: &str,
+        totp_secret: &str,
+    ) -> rusqlite::Result<(u64, Vec<u8>)> {
+        self.encrypt_secret(
+            totp_secret.as_bytes(),
+            format!("admin_mfa_enrollments.totp:{enrollment_token_hash}").as_bytes(),
+        )
+    }
+
+    fn decrypt_enrollment_totp(
+        &self,
+        enrollment_token_hash: &str,
+        key_id: u64,
+        ciphertext: &[u8],
+    ) -> rusqlite::Result<SecretString> {
+        let plaintext = self.decrypt_secret(
+            key_id,
+            ciphertext,
+            format!("admin_mfa_enrollments.totp:{enrollment_token_hash}").as_bytes(),
+        )?;
+        String::from_utf8(plaintext)
+            .map(SecretString::from)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    Box::new(error),
+                )
+            })
+    }
+
     pub fn create_initial_admin(
         &self,
         username: &str,
         password_hash: &str,
         totp_secret: &str,
     ) -> rusqlite::Result<InitialAdminOutcome> {
+        let (totp_key_id, totp_ciphertext) = self.encrypt_admin_totp(username, totp_secret)?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let initialized: bool =
@@ -71,8 +138,8 @@ impl Database {
             InitialAdminOutcome::AlreadyInitialized
         } else {
             transaction.execute(
-                "INSERT INTO admins(username,password_hash,totp_secret,created_at,active) VALUES(?1,?2,?3,?4,1)",
-                params![username, password_hash, totp_secret, Utc::now().to_rfc3339()],
+                "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active) VALUES(?1,?2,?3,?4,?5,1)",
+                params![username, password_hash, totp_key_id, totp_ciphertext, Utc::now().to_rfc3339()],
             )?;
             InitialAdminOutcome::Created
         };
@@ -87,6 +154,7 @@ impl Database {
         totp_secret: &str,
         context: &AuditContext,
     ) -> rusqlite::Result<InitialAdminOutcome> {
+        let (totp_key_id, totp_ciphertext) = self.encrypt_admin_totp(username, totp_secret)?;
         self.required_transaction(context, |transaction| {
             let initialized: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM admins)",
@@ -97,8 +165,8 @@ impl Database {
                 return Ok((InitialAdminOutcome::AlreadyInitialized, Vec::new()));
             }
             transaction.execute(
-                "INSERT INTO admins(username,password_hash,totp_secret,created_at,active) VALUES(?1,?2,?3,?4,1)",
-                params![username, password_hash, totp_secret, Utc::now().to_rfc3339()],
+                "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active) VALUES(?1,?2,?3,?4,?5,1)",
+                params![username, password_hash, totp_key_id, totp_ciphertext, Utc::now().to_rfc3339()],
             )?;
             let admin_id = transaction.last_insert_rowid();
             Ok((
@@ -118,12 +186,14 @@ impl Database {
         password_hash: &str,
         totp_secret: &str,
     ) -> rusqlite::Result<()> {
+        let (totp_key_id, totp_ciphertext) = self.encrypt_admin_totp(username, totp_secret)?;
         self.try_conn()?.execute(
-            "INSERT INTO admins(username,password_hash,totp_secret,created_at,active) VALUES(?1,?2,?3,?4,1)",
+            "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active) VALUES(?1,?2,?3,?4,?5,1)",
             params![
                 username,
                 password_hash,
-                totp_secret,
+                totp_key_id,
+                totp_ciphertext,
                 Utc::now().to_rfc3339()
             ],
         )?;
@@ -137,12 +207,13 @@ impl Database {
         totp_secret: &str,
         context: &AuditContext,
     ) -> rusqlite::Result<AdminSummary> {
+        let (totp_key_id, totp_ciphertext) = self.encrypt_admin_totp(username, totp_secret)?;
         self.required_transaction(context, |transaction| {
             let created_at = Utc::now().to_rfc3339();
             transaction.execute(
-                "INSERT INTO admins(username,password_hash,totp_secret,created_at,active)
-                 VALUES(?1,?2,?3,?4,1)",
-                params![username, password_hash, totp_secret, &created_at],
+                "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active)
+                 VALUES(?1,?2,?3,?4,?5,1)",
+                params![username, password_hash, totp_key_id, totp_ciphertext, &created_at],
             )?;
             let id = transaction.last_insert_rowid();
             let admin = AdminSummary {
@@ -164,16 +235,20 @@ impl Database {
     pub fn admin(&self, username: &str) -> rusqlite::Result<Option<Admin>> {
         self.try_conn()?
             .query_row(
-                "SELECT id,username,password_hash,totp_secret,totp_enabled,active FROM admins WHERE username=?1 AND active=1",
+                "SELECT id,username,password_hash,totp_key_id,totp_ciphertext,totp_generation,totp_enabled,active FROM admins WHERE username=?1 AND active=1",
                 [username],
                 |r| {
+                    let canonical_username: String = r.get(1)?;
+                    let key_id = r.get(3)?;
+                    let ciphertext: Vec<u8> = r.get(4)?;
                     Ok(Admin {
                         id: r.get(0)?,
-                        username: r.get(1)?,
+                        username: canonical_username.clone(),
                         password_hash: r.get(2)?,
-                        totp_secret: SecretString::from(r.get::<_, String>(3)?),
-                        totp_enabled: r.get::<_, i64>(4)? != 0,
-                        active: r.get::<_, i64>(5)? != 0,
+                        totp_secret: self.decrypt_admin_totp(&canonical_username, key_id, &ciphertext)?,
+                        totp_generation: r.get(5)?,
+                        totp_enabled: r.get::<_, i64>(6)? != 0,
+                        active: r.get::<_, i64>(7)? != 0,
                     })
                 },
             )
@@ -328,13 +403,20 @@ impl Database {
             transaction.commit()?;
             return Ok(AdminRecoveryOutcome::NotFound);
         };
+        let encrypted_totp = totp_secret
+            .map(|secret| self.encrypt_admin_totp(&canonical_username, secret))
+            .transpose()?;
+        let totp_key_id = encrypted_totp.as_ref().map(|value| value.0);
+        let totp_ciphertext = encrypted_totp.as_ref().map(|value| value.1.as_slice());
         transaction.execute(
             "UPDATE admins
              SET password_hash=COALESCE(?2,password_hash),
-                 totp_secret=COALESCE(?3,totp_secret),
+                 totp_key_id=COALESCE(?3,totp_key_id),
+                 totp_ciphertext=COALESCE(?4,totp_ciphertext),
+                 totp_generation=totp_generation+CASE WHEN ?3 IS NULL THEN 0 ELSE 1 END,
                  totp_enabled=CASE WHEN ?3 IS NULL THEN totp_enabled ELSE 1 END
              WHERE id=?1",
-            params![admin_id, password_hash, totp_secret],
+            params![admin_id, password_hash, totp_key_id, totp_ciphertext],
         )?;
         if totp_secret.is_some() {
             transaction.execute(
@@ -426,7 +508,7 @@ impl Database {
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
             "account_password_changed",
-            Some(object_id.clone()),
+            Some(object_id),
             None,
         )];
         insert_required_audits(&transaction, &audit_context, &audit_events)?;
@@ -446,6 +528,8 @@ impl Database {
         let now_string = now.to_rfc3339();
         let expires_at = (now + Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS)).to_rfc3339();
         let enrollment_token_hash = token_hash(token);
+        let (totp_key_id, totp_ciphertext) =
+            self.encrypt_enrollment_totp(&enrollment_token_hash, totp_secret)?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_admin_mfa_enrollments(&transaction, &now_string)?;
@@ -467,17 +551,19 @@ impl Database {
         }
         transaction.execute(
             "INSERT INTO admin_mfa_enrollments(
-                 admin_id,token_hash,totp_secret,created_at,expires_at
-             ) VALUES(?1,?2,?3,?4,?5)
+                 admin_id,token_hash,totp_key_id,totp_ciphertext,created_at,expires_at
+             ) VALUES(?1,?2,?3,?4,?5,?6)
              ON CONFLICT(admin_id) DO UPDATE SET
                  token_hash=excluded.token_hash,
-                 totp_secret=excluded.totp_secret,
+                 totp_key_id=excluded.totp_key_id,
+                 totp_ciphertext=excluded.totp_ciphertext,
                  created_at=excluded.created_at,
                  expires_at=excluded.expires_at",
             params![
                 admin_id,
                 enrollment_token_hash,
-                totp_secret,
+                totp_key_id,
+                totp_ciphertext,
                 now_string,
                 expires_at
             ],
@@ -501,6 +587,8 @@ impl Database {
         let now_string = now.to_rfc3339();
         let expires_at = (now + Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS)).to_rfc3339();
         let enrollment_token_hash = token_hash(token);
+        let (totp_key_id, totp_ciphertext) =
+            self.encrypt_enrollment_totp(&enrollment_token_hash, totp_secret)?;
         self.required_transaction(context, |transaction| {
             cleanup_admin_mfa_enrollments(transaction, &now_string)?;
             let active = transaction
@@ -531,17 +619,19 @@ impl Database {
             }
             transaction.execute(
                 "INSERT INTO admin_mfa_enrollments(
-                     admin_id,token_hash,totp_secret,created_at,expires_at
-                 ) VALUES(?1,?2,?3,?4,?5)
+                     admin_id,token_hash,totp_key_id,totp_ciphertext,created_at,expires_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6)
                  ON CONFLICT(admin_id) DO UPDATE SET
                      token_hash=excluded.token_hash,
-                     totp_secret=excluded.totp_secret,
+                     totp_key_id=excluded.totp_key_id,
+                     totp_ciphertext=excluded.totp_ciphertext,
                      created_at=excluded.created_at,
                      expires_at=excluded.expires_at",
                 params![
                     admin_id,
                     enrollment_token_hash,
-                    totp_secret,
+                    totp_key_id,
+                    totp_ciphertext,
                     now_string,
                     expires_at
                 ],
@@ -571,7 +661,8 @@ impl Database {
         let enrollment = transaction
             .query_row(
                 "SELECT admin_mfa_enrollments.admin_id,
-                        admin_mfa_enrollments.totp_secret,
+                        admin_mfa_enrollments.totp_key_id,
+                        admin_mfa_enrollments.totp_ciphertext,
                         admin_mfa_enrollments.expires_at
                  FROM admin_mfa_enrollments
                  JOIN admins ON admins.id=admin_mfa_enrollments.admin_id
@@ -583,8 +674,12 @@ impl Database {
                 |row| {
                     Ok(PendingAdminMfaEnrollment {
                         admin_id: row.get(0)?,
-                        totp_secret: SecretString::from(row.get::<_, String>(1)?),
-                        expires_at: row.get(2)?,
+                        totp_secret: self.decrypt_enrollment_totp(
+                            &enrollment_token_hash,
+                            row.get(1)?,
+                            &row.get::<_, Vec<u8>>(2)?,
+                        )?,
+                        expires_at: row.get(3)?,
                     })
                 },
             )
@@ -614,7 +709,8 @@ impl Database {
         cleanup_admin_mfa_enrollments(&transaction, &now)?;
         let enrollment = transaction
             .query_row(
-                "SELECT admins.username,admin_mfa_enrollments.totp_secret
+                "SELECT admins.username,admin_mfa_enrollments.totp_key_id,
+                        admin_mfa_enrollments.totp_ciphertext
                  FROM admin_mfa_enrollments
                  JOIN admins ON admins.id=admin_mfa_enrollments.admin_id
                  WHERE admin_mfa_enrollments.admin_id=?1
@@ -625,18 +721,27 @@ impl Database {
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        SecretString::from(row.get::<_, String>(1)?),
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((username, totp_secret)) = enrollment else {
+        let Some((username, enrollment_key_id, enrollment_ciphertext)) = enrollment else {
             transaction.commit()?;
             return Ok(AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired);
         };
+        let totp_secret = self.decrypt_enrollment_totp(
+            &enrollment_token_hash,
+            enrollment_key_id,
+            &enrollment_ciphertext,
+        )?;
+        let (totp_key_id, totp_ciphertext) =
+            self.encrypt_admin_totp(&username, totp_secret.expose_secret())?;
         transaction.execute(
-            "UPDATE admins SET totp_secret=?2,totp_enabled=1 WHERE id=?1",
-            params![admin_id, totp_secret.expose_secret()],
+            "UPDATE admins SET totp_key_id=?2,totp_ciphertext=?3,
+                 totp_generation=totp_generation+1,totp_enabled=1 WHERE id=?1",
+            params![admin_id, totp_key_id, totp_ciphertext],
         )?;
         transaction.execute(
             "INSERT INTO admin_totp_replay(admin_id,last_step) VALUES(?1,?2)
@@ -648,7 +753,7 @@ impl Database {
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
             "account_mfa_changed",
-            Some(object_id.clone()),
+            Some(object_id),
             None,
         )];
         insert_required_audits(&transaction, &audit_context, &audit_events)?;
@@ -709,10 +814,12 @@ impl Database {
                 row.get::<_, String>(0)
             })
             .optional()?;
-        if username.is_some() {
+        if let Some(username) = username.as_deref() {
+            let (totp_key_id, totp_ciphertext) = self.encrypt_admin_totp(username, totp_secret)?;
             transaction.execute(
-                "UPDATE admins SET totp_secret=?2,totp_enabled=1 WHERE id=?1",
-                params![id, totp_secret],
+                "UPDATE admins SET totp_key_id=?2,totp_ciphertext=?3,
+                     totp_generation=totp_generation+1,totp_enabled=1 WHERE id=?1",
+                params![id, totp_key_id, totp_ciphertext],
             )?;
             transaction.execute(
                 "DELETE FROM admin_webauthn_credentials WHERE admin_id=?1",
@@ -731,16 +838,22 @@ impl Database {
         totp_secret: &str,
         context: &AuditContext,
     ) -> rusqlite::Result<Option<String>> {
+        let username = self
+            .try_conn()?
+            .query_row("SELECT username FROM admins WHERE id=?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        let encrypted = username
+            .as_deref()
+            .map(|username| self.encrypt_admin_totp(username, totp_secret))
+            .transpose()?;
         self.required_transaction(context, |transaction| {
-            let username = transaction
-                .query_row("SELECT username FROM admins WHERE id=?1", [id], |row| {
-                    row.get::<_, String>(0)
-                })
-                .optional()?;
-            if username.is_some() {
+            if let Some((totp_key_id, totp_ciphertext)) = encrypted.as_ref() {
                 transaction.execute(
-                    "UPDATE admins SET totp_secret=?2,totp_enabled=1 WHERE id=?1",
-                    params![id, totp_secret],
+                    "UPDATE admins SET totp_key_id=?2,totp_ciphertext=?3,
+                         totp_generation=totp_generation+1,totp_enabled=1 WHERE id=?1",
+                    params![id, totp_key_id, totp_ciphertext],
                 )?;
                 transaction.execute(
                     "DELETE FROM admin_webauthn_credentials WHERE admin_id=?1",
@@ -763,7 +876,7 @@ impl Database {
     ) -> rusqlite::Result<Vec<AdminWebauthnCredential>> {
         let connection = self.try_conn()?;
         let mut statement = connection.prepare(
-            "SELECT id,label,credential_id,credential_json,created_at,last_used_at
+            "SELECT id,label,credential_id,credential_blob,created_at,last_used_at
              FROM admin_webauthn_credentials WHERE admin_id=?1 ORDER BY id",
         )?;
         let rows = statement
@@ -772,7 +885,7 @@ impl Database {
                     id: row.get(0)?,
                     label: row.get(1)?,
                     credential_id: row.get(2)?,
-                    credential_json: row.get(3)?,
+                    credential_blob: row.get(3)?,
                     created_at: row.get(4)?,
                     last_used_at: row.get(5)?,
                 })
@@ -787,18 +900,18 @@ impl Database {
         admin_id: i64,
         label: &str,
         credential_id: &str,
-        credential_json: &str,
+        credential_blob: &(impl AsRef<[u8]> + ?Sized),
     ) -> rusqlite::Result<i64> {
         let connection = self.try_conn()?;
         connection.execute(
             "INSERT INTO admin_webauthn_credentials(
-                 admin_id,label,credential_id,credential_json,created_at
+                 admin_id,label,credential_id,credential_blob,created_at
              ) VALUES(?1,?2,?3,?4,?5)",
             params![
                 admin_id,
                 label,
                 credential_id,
-                credential_json,
+                credential_blob.as_ref(),
                 Utc::now().to_rfc3339()
             ],
         )?;
@@ -817,7 +930,7 @@ impl Database {
         admin_id: i64,
         label: &str,
         credential_id: &str,
-        credential_json: &str,
+        credential_blob: &(impl AsRef<[u8]> + ?Sized),
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminWebauthnCredentialRegistrationOutcome> {
         let now = Utc::now().to_rfc3339();
@@ -844,9 +957,15 @@ impl Database {
         };
         transaction.execute(
             "INSERT INTO admin_webauthn_credentials(
-                 admin_id,label,credential_id,credential_json,created_at
+                 admin_id,label,credential_id,credential_blob,created_at
              ) VALUES(?1,?2,?3,?4,?5)",
-            params![admin_id, label, credential_id, credential_json, now],
+            params![
+                admin_id,
+                label,
+                credential_id,
+                credential_blob.as_ref(),
+                now
+            ],
         )?;
         let credential_row_id = transaction.last_insert_rowid();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
@@ -867,13 +986,18 @@ impl Database {
         &self,
         id: i64,
         admin_id: i64,
-        credential_json: &str,
+        credential_blob: &(impl AsRef<[u8]> + ?Sized),
     ) -> rusqlite::Result<bool> {
         Ok(self.try_conn()?.execute(
             "UPDATE admin_webauthn_credentials
-             SET credential_json=?3,last_used_at=?4
+             SET credential_blob=?3,last_used_at=?4
              WHERE id=?1 AND admin_id=?2",
-            params![id, admin_id, credential_json, Utc::now().to_rfc3339()],
+            params![
+                id,
+                admin_id,
+                credential_blob.as_ref(),
+                Utc::now().to_rfc3339()
+            ],
         )? == 1)
     }
 
@@ -885,8 +1009,8 @@ impl Database {
         new_csrf_token: &str,
         credential_id: i64,
         admin_id: i64,
-        expected_credential_json: &str,
-        updated_credential_json: &str,
+        expected_credential_blob: &[u8],
+        updated_credential_blob: &[u8],
     ) -> rusqlite::Result<bool> {
         self.complete_webauthn_mfa_internal(
             old_session_token,
@@ -894,8 +1018,8 @@ impl Database {
             new_csrf_token,
             credential_id,
             admin_id,
-            expected_credential_json,
-            updated_credential_json,
+            expected_credential_blob,
+            updated_credential_blob,
             None,
         )
     }
@@ -908,8 +1032,8 @@ impl Database {
         new_csrf_token: &str,
         credential_id: i64,
         admin_id: i64,
-        expected_credential_json: &str,
-        updated_credential_json: &str,
+        expected_credential_blob: &[u8],
+        updated_credential_blob: &[u8],
         context: &AuditContext,
     ) -> rusqlite::Result<bool> {
         self.complete_webauthn_mfa_internal(
@@ -918,8 +1042,8 @@ impl Database {
             new_csrf_token,
             credential_id,
             admin_id,
-            expected_credential_json,
-            updated_credential_json,
+            expected_credential_blob,
+            updated_credential_blob,
             Some(context),
         )
     }
@@ -932,16 +1056,16 @@ impl Database {
         new_csrf_token: &str,
         credential_id: i64,
         admin_id: i64,
-        expected_credential_json: &str,
-        updated_credential_json: &str,
+        expected_credential_blob: &[u8],
+        updated_credential_blob: &[u8],
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<bool> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let credential_updated = transaction.execute(
             "UPDATE admin_webauthn_credentials
-             SET credential_json=?5,last_used_at=?6
-             WHERE id=?1 AND admin_id=?2 AND credential_json=?3
+             SET credential_blob=?5,last_used_at=?6
+             WHERE id=?1 AND admin_id=?2 AND credential_blob=?3
                AND EXISTS(
                    SELECT 1 FROM sessions
                    WHERE token_hash=?4 AND admin_id=?2 AND mfa_verified=0 AND expires_at>?6
@@ -949,9 +1073,9 @@ impl Database {
             params![
                 credential_id,
                 admin_id,
-                expected_credential_json,
+                expected_credential_blob,
                 token_hash(old_session_token),
-                updated_credential_json,
+                updated_credential_blob,
                 Utc::now().to_rfc3339()
             ],
         )? == 1;
@@ -1022,7 +1146,7 @@ impl Database {
         id: i64,
         admin_id: i64,
         expected_password_hash: &str,
-        expected_totp_secret: &str,
+        expected_totp_generation: u64,
         totp_step: u64,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminWebauthnCredentialDeletionOutcome> {
@@ -1039,13 +1163,13 @@ impl Database {
                    AND sessions.expires_at>?3
                    AND admins.active=1
                    AND admins.password_hash=?4
-                   AND admins.totp_secret=?5",
+                   AND admins.totp_generation=?5",
                 params![
                     token_hash(session_token),
                     admin_id,
                     Utc::now().to_rfc3339(),
                     expected_password_hash,
-                    expected_totp_secret,
+                    expected_totp_generation,
                 ],
                 |row| row.get::<_, String>(0),
             )
@@ -1072,7 +1196,7 @@ impl Database {
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
             "webauthn_credential_deleted",
-            Some(object_id.clone()),
+            Some(object_id),
             None,
         )];
         insert_required_audits(&transaction, &audit_context, &audit_events)?;
@@ -1145,7 +1269,7 @@ impl Database {
         session_token: &str,
         admin_id: i64,
         expected_password_hash: &str,
-        expected_totp_secret: &str,
+        expected_totp_generation: u64,
         enabled: bool,
         totp_step: Option<u64>,
         client_ip: Option<&str>,
@@ -1163,13 +1287,13 @@ impl Database {
                    AND sessions.expires_at>?3
                    AND admins.active=1
                    AND admins.password_hash=?4
-                   AND admins.totp_secret=?5",
+                   AND admins.totp_generation=?5",
                 params![
                     token_hash(session_token),
                     admin_id,
                     Utc::now().to_rfc3339(),
                     expected_password_hash,
-                    expected_totp_secret,
+                    expected_totp_generation,
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
             )

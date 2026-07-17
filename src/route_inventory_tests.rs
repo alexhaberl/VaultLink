@@ -398,11 +398,11 @@ fn nesting_layer_order_and_original_uri_contract_remain_visible() {
 }
 
 #[test]
-fn release_profile_aborts_instead_of_continuing_after_panics() {
+fn release_profile_unwinds_for_catch_panic_layer() {
     let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml")).unwrap();
     assert_eq!(
         manifest["profile"]["release"]["panic"].as_str(),
-        Some("abort")
+        Some("unwind")
     );
     assert!(WEB_SOURCE.contains("#[cfg(panic = \"unwind\")]"));
 }

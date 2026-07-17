@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth,
     http_auth::{
-        audit_observation, clear_session_cookie, csrf_header, enabled_audit_client_ip,
-        make_session_cookie, password_login_admitted, required_database, session, MissingSession,
+        audit_observation, clear_session_cookie, csrf_header, current_client_limit_key,
+        enabled_audit_client_ip, make_session_cookie, password_login_admitted, required_database,
+        session, MissingSession,
     },
-    proxy,
     sensitive::SecretString,
     services::auth::{
         AuthService, PasswordLoginCommand, PasswordLoginOutcome, TotpLoginCommand, TotpLoginOutcome,
@@ -42,15 +42,11 @@ struct LoginResponse {
 
 pub(super) async fn login(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    _headers: HeaderMap,
     Json(form): Json<LoginRequest>,
 ) -> ApiResult<Response> {
-    let ip = proxy::client_limit_key(proxy::effective_client_ip(
-        peer.ip(),
-        &headers,
-        &state.config,
-    ));
+    let ip = current_client_limit_key();
     let ip_key = format!("ip:{ip}");
     if !auth::valid_admin_username(&form.username) {
         if !state.limiter.check_and_record_attempt(&ip_key) {
@@ -66,8 +62,12 @@ pub(super) async fn login(
             "Ungültige Zugangsdaten",
         ));
     }
-    let key = format!("{}:{}", ip, form.username.to_lowercase());
-    if !state.limiter.check_and_record_attempts(&[&key, &ip_key]) {
+    let normalized_username = form.username.to_lowercase();
+    let key = format!("{ip}:{normalized_username}");
+    let account_key = format!("account:{normalized_username}");
+    if !state.limiter.check_and_record_attempts(&[&key, &ip_key])
+        || !state.account_limiter.check_and_record_attempt(&account_key)
+    {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -131,6 +131,13 @@ pub(super) async fn mfa(
 ) -> ApiResult<Response> {
     let (token, session_data) =
         session(&state, &headers, false, MissingSession::Unauthorized).await?;
+    if session_data.mfa_verified {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "mfa_already_verified",
+            "MFA wurde bereits bestätigt",
+        ));
+    }
     csrf_header(&session_data, &headers)?;
     let key = format!("mfa:{}", session_data.username.to_lowercase());
     if !state.limiter.check_and_record_attempt(&key) {

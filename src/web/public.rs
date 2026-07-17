@@ -20,7 +20,6 @@ use crate::{
     },
     i18n, path_security,
     policy::{self, ShareAvailability},
-    proxy,
     sensitive::SecretString,
     AppState,
 };
@@ -81,8 +80,8 @@ pub(super) struct UnlockForm {
 
 pub(super) async fn unlock_share(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    _headers: HeaderMap,
     AxPath(token): AxPath<String>,
     Form(form): Form<UnlockForm>,
 ) -> Result<Response> {
@@ -92,13 +91,13 @@ pub(super) async fn unlock_share(
     };
     let expected_password_hash = password_hash.clone();
     let expected_upload_policy_epoch = share.upload_policy_epoch;
-    let ip = proxy::client_limit_key(proxy::effective_client_ip(
-        peer.ip(),
-        &headers,
-        &state.config,
-    ));
-    let key = format!("share:{}:{ip}", share.id);
-    if !state.share_limiter.check_and_record_attempt(&key) {
+    let ip = current_client_limit_key();
+    let global_key = format!("share-unlock-ip:{ip}");
+    let share_key = format!("share-unlock:{}:{ip}", share.id);
+    if !state
+        .share_limiter
+        .check_and_record_attempts(&[&global_key, &share_key])
+    {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Zu viele Passwortversuche",
@@ -162,7 +161,7 @@ pub(super) async fn unlock_share(
     }
     Ok(redirect_with_cookie(
         &format!("/v/{token}"),
-        make_unlock_cookie(&state, &share, &unlock_token, UnlockCookieScope::Web),
+        &make_unlock_cookie(&state, &share, &unlock_token, UnlockCookieScope::Web),
     )?)
 }
 
@@ -301,7 +300,6 @@ pub(super) async fn public_page(
             current_client_limit_key(),
             crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
         )
-        .map_err(internal)?
         .ok_or(AppError(
             StatusCode::SERVICE_UNAVAILABLE,
             "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
@@ -337,7 +335,7 @@ pub(super) async fn public_page(
         if let Some(search) = search.clone() {
             let search_settings = settings.clone();
             let mut hits = tokio::task::spawn_blocking(move || {
-                search_tree(secure_root, &relative_dir, &search, &search_settings)
+                search_tree(&secure_root, &relative_dir, &search, &search_settings)
             })
             .await
             .map_err(internal)?
@@ -602,15 +600,11 @@ fn joined_relative(base: &str, child: &str) -> Result<String> {
 
 pub(super) async fn short_redirect(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    _headers: HeaderMap,
     AxPath(alias): AxPath<String>,
 ) -> Result<Redirect> {
-    let ip = proxy::client_limit_key(proxy::effective_client_ip(
-        peer.ip(),
-        &headers,
-        &state.config,
-    ));
+    let ip = current_client_limit_key();
     if !state
         .alias_limiter
         .check_and_record_attempt(&format!("alias:{ip}"))

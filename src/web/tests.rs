@@ -31,7 +31,7 @@ use crate::{
 };
 use axum::{
     body::{Body, Bytes},
-    extract::{ConnectInfo, Request},
+    extract::{ConnectInfo, Query, Request},
     http::{header, HeaderValue, Method, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
@@ -160,6 +160,7 @@ fn every_zip_archive_uses_full_zip64_records() {
         source_path: "tiny.bin".into(),
         archive_name: "tiny.bin".into(),
         scanned_len: 3,
+        is_directory: false,
     }];
     let plan = ZipPlan {
         estimated_archive_size: estimate_zip_archive_size(&files).unwrap(),
@@ -245,6 +246,7 @@ fn every_central_entry_uses_zip64_sizes_and_offset() {
             crc: 7,
             size: 9,
             local_offset: 11,
+            is_directory: false,
         },
     )
     .unwrap();
@@ -300,6 +302,7 @@ fn always_zip64_estimate_is_fixed_and_rejects_u64_overflow() {
         source_path: "tiny.bin".into(),
         archive_name: "tiny.bin".into(),
         scanned_len: 3,
+        is_directory: false,
     };
     assert_eq!(estimate_zip_archive_size(&[tiny_file]).unwrap(), 265);
 
@@ -308,11 +311,13 @@ fn always_zip64_estimate_is_fixed_and_rejects_u64_overflow() {
             source_path: "first".into(),
             archive_name: "x".into(),
             scanned_len: 0,
+            is_directory: false,
         },
         ZipFilePlan {
             source_path: "second".into(),
             archive_name: "long".into(),
             scanned_len: 10,
+            is_directory: false,
         },
     ];
     assert_eq!(estimate_zip_archive_size(&multiple_files).unwrap(), 414);
@@ -321,6 +326,7 @@ fn always_zip64_estimate_is_fixed_and_rejects_u64_overflow() {
         source_path: "overflow.bin".into(),
         archive_name: "overflow.bin".into(),
         scanned_len: u64::MAX,
+        is_directory: false,
     };
     assert!(matches!(
         estimate_zip_archive_size(&[overflowing_file]),
@@ -723,7 +729,7 @@ fn reservation_drop_schedules_blocking_cleanup_before_immediate_runtime_shutdown
             &UploadConflictStrategy::Reject,
         )
         .unwrap();
-    let database = state.db.clone();
+    let database = state.db;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -941,9 +947,7 @@ async fn response_body_wrappers_chunk_buffered_data_and_deadline_streams() {
     let peer = "192.0.2.1".parse().unwrap();
     let buffered_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let buffered_permit = buffered_slots.clone().try_acquire_owned().unwrap();
-    let buffered_peer = try_acquire_client_activity(counts.clone(), peer, 1)
-        .unwrap()
-        .unwrap();
+    let buffered_peer = try_acquire_client_activity(counts.clone(), peer, 1).unwrap();
     let input = vec![7u8; BUFFERED_RESPONSE_CHUNK_BYTES * 2 + 17];
     let body = Body::new(BufferedAdmissionBody {
         inner: Body::from(input.clone()),
@@ -967,9 +971,7 @@ async fn response_body_wrappers_chunk_buffered_data_and_deadline_streams() {
 
     let stream_slots = Arc::new(tokio::sync::Semaphore::new(1));
     let stream_permit = stream_slots.clone().try_acquire_owned().unwrap();
-    let stream_peer = try_acquire_client_activity(counts.clone(), peer, 1)
-        .unwrap()
-        .unwrap();
+    let stream_peer = try_acquire_client_activity(counts.clone(), peer, 1).unwrap();
     let body = Body::new(StreamAdmissionBody {
         inner: Body::from_stream(futures_util::stream::pending::<io::Result<Bytes>>()),
         _permit: stream_permit,
@@ -992,19 +994,11 @@ fn client_activity_limits_group_ipv6_prefixes_and_release_on_drop() {
     let rotated = proxy::client_limit_key("2001:db8:1:2:ffff::99".parse().unwrap());
     let other_prefix = proxy::client_limit_key("2001:db8:1:3::1".parse().unwrap());
     assert_eq!(first, rotated);
-    let permit = try_acquire_client_activity(counts.clone(), first, 1)
-        .unwrap()
-        .unwrap();
-    assert!(try_acquire_client_activity(counts.clone(), rotated, 1)
-        .unwrap()
-        .is_none());
-    let other = try_acquire_client_activity(counts.clone(), other_prefix, 1)
-        .unwrap()
-        .unwrap();
+    let permit = try_acquire_client_activity(counts.clone(), first, 1).unwrap();
+    assert!(try_acquire_client_activity(counts.clone(), rotated, 1).is_none());
+    let other = try_acquire_client_activity(counts.clone(), other_prefix, 1).unwrap();
     drop(permit);
-    assert!(try_acquire_client_activity(counts.clone(), first, 1)
-        .unwrap()
-        .is_some());
+    assert!(try_acquire_client_activity(counts, first, 1).is_some());
     drop(other);
 }
 
@@ -1197,7 +1191,7 @@ fn filtered_directory_items_consume_listing_search_and_zip_budgets() {
     let (entries, truncated) = list_directory_page(&scope, "", 0, 1).unwrap();
     assert!(entries.is_empty());
     assert!(truncated);
-    assert!(search_tree(scope.clone(), "", "missing", &settings)
+    assert!(search_tree(&scope, "", "missing", &settings)
         .unwrap()
         .is_empty());
     assert!(matches!(
@@ -1760,7 +1754,6 @@ fn text_preview_budget_tracks_the_retained_input_buffer() {
         })
         .collect::<Vec<_>>();
     assert!(semaphore
-        .clone()
         .try_acquire_many_owned(text_preview_render_permits(1_000_000))
         .is_err());
     drop(held);
@@ -1927,7 +1920,7 @@ fn text_preview_detects_growth_after_the_initial_metadata_check() {
     let mut settings = runtime_settings(&test_state(root.path(), data.path()));
     settings.max_preview_size = 4;
 
-    match read_preview_opened(file, metadata, "content.txt", &settings).unwrap() {
+    match read_preview_opened(file, &metadata, "content.txt", &settings).unwrap() {
         PreviewContent::TooLarge { size } => assert_eq!(size, 5),
         _ => panic!("grown preview must be rejected as too large"),
     }
@@ -1967,15 +1960,16 @@ async fn locale_route_sets_hardened_cookie_and_rejects_external_return_targets()
     let data = tempfile::tempdir().unwrap();
     let app = router(test_state(root.path(), data.path()));
 
-    let response = app
-        .clone()
-        .oneshot(request(
-            Method::POST,
-            "/locale",
-            "locale=en&return_to=%2Flogin%3Ffrom%3Dswitch",
-        ))
-        .await
-        .unwrap();
+    let mut locale_request = request(
+        Method::POST,
+        "/locale",
+        "locale=en&return_to=%2Flogin%3Ffrom%3Dswitch",
+    );
+    locale_request.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://localhost:8080"),
+    );
+    let response = app.clone().oneshot(locale_request).await.unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         response.headers().get(header::LOCATION).unwrap(),
@@ -1993,28 +1987,28 @@ async fn locale_route_sets_hardened_cookie_and_rejects_external_return_targets()
     assert!(cookie.contains("Path=/"));
     assert!(!cookie.contains(" Secure;"));
 
-    let response = app
-        .oneshot(request(
-            Method::POST,
-            "/locale",
-            "locale=de&return_to=https%3A%2F%2Fevil.example",
-        ))
-        .await
-        .unwrap();
+    let mut external_request = request(
+        Method::POST,
+        "/locale",
+        "locale=de&return_to=https%3A%2F%2Fevil.example",
+    );
+    external_request.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://localhost:8080"),
+    );
+    let response = app.oneshot(external_request).await.unwrap();
     assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/");
 
     let mut secure_state = test_state(root.path(), data.path());
     Arc::make_mut(&mut secure_state.config)
         .security
         .secure_cookie = true;
-    let secure_response = router(secure_state)
-        .oneshot(request(
-            Method::POST,
-            "/locale",
-            "locale=en&return_to=%2Flogin",
-        ))
-        .await
-        .unwrap();
+    let mut secure_request = request(Method::POST, "/locale", "locale=en&return_to=%2Flogin");
+    secure_request.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://localhost:8080"),
+    );
+    let secure_response = router(secure_state).oneshot(secure_request).await.unwrap();
     assert!(secure_response
         .headers()
         .get(header::SET_COOKIE)
@@ -2446,7 +2440,9 @@ fn custom_datetime_picker_replaces_native_browser_picker() {
 
 #[tokio::test]
 async fn png_favicon_is_an_actual_32_by_32_image() {
-    let response = favicon_png().await.into_response();
+    let response = favicon_png(Query(AssetQuery::default()))
+        .await
+        .into_response();
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE),
         Some(&HeaderValue::from_static("image/png"))
@@ -2458,6 +2454,35 @@ async fn png_favicon_is_an_actual_32_by_32_image() {
     assert_eq!(&bytes[12..16], b"IHDR");
     assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 32);
     assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 32);
+}
+
+#[tokio::test]
+async fn versioned_assets_are_immutable_and_app_javascript_is_cached_per_locale() {
+    let unversioned = app_js(Query(AssetQuery::default())).await;
+    assert_eq!(
+        unversioned.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+
+    let german = app_js(Query(AssetQuery {
+        v: Some(ASSET_VERSION.into()),
+        lang: Some("de".into()),
+    }))
+    .await;
+    assert_eq!(
+        german.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static(
+            "public, max-age=31536000, immutable"
+        ))
+    );
+    assert!(response_text(german).await.contains("Kopiert"));
+
+    let english = app_js(Query(AssetQuery {
+        v: Some(ASSET_VERSION.into()),
+        lang: Some("en".into()),
+    }))
+    .await;
+    assert!(response_text(english).await.contains("Copied"));
 }
 
 #[tokio::test]
@@ -2525,7 +2550,7 @@ fn public_preview_actions_are_rendered_above_content() {
                 .to_string();
     let html = i18n::render_markers(
         Locale::De,
-        &add_public_preview_actions(body, "/v/token", Some("/v/token/download")),
+        &add_public_preview_actions(&body, "/v/token", Some("/v/token/download")),
     );
     let actions = html.find("Zurück zur Freigabe").unwrap();
     let content = html.find("<pre>long text</pre>").unwrap();
@@ -2533,10 +2558,13 @@ fn public_preview_actions_are_rendered_above_content() {
     assert!(html.contains("Herunterladen"));
 }
 
-#[test]
-fn disk_stats_uses_target_path() {
+#[tokio::test]
+async fn disk_stats_uses_target_path() {
     let root = tempfile::tempdir().unwrap();
-    let stats = disk_stats(root.path()).expect("statvfs must work for tempdir");
+    let stats = crate::disk_stats::DiskStatsCache::new()
+        .get(root.path())
+        .await
+        .expect("statvfs must work for tempdir");
     assert!(stats.total > 0);
     assert!(stats.free > 0);
 }

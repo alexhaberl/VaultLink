@@ -84,6 +84,31 @@ fn cleanup_transfer_state(transaction: &Transaction<'_>, now: &str) -> rusqlite:
     Ok(())
 }
 
+fn cleanup_transfer_state_before_heartbeat(
+    transaction: &Transaction<'_>,
+    now: &str,
+    current_lease_hash: &str,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "DELETE FROM public_transfer_leases
+         WHERE expires_at<=?1 AND token_hash<>?2",
+        params![now, current_lease_hash],
+    )?;
+    transaction.execute(
+        "DELETE FROM public_transfer_grants
+         WHERE id NOT IN(
+                 SELECT grant_id FROM public_transfer_leases WHERE token_hash=?2
+               )
+           AND (expires_at<=?1
+                OR (counted=0 AND NOT EXISTS(
+                    SELECT 1 FROM public_transfer_leases leases
+                    WHERE leases.grant_id=public_transfer_grants.id AND leases.expires_at>?1
+                )))",
+        params![now, current_lease_hash],
+    )?;
+    Ok(())
+}
+
 fn available_upload_share_total_limit(
     transaction: &Transaction<'_>,
     share_id: i64,
@@ -755,6 +780,7 @@ impl Database {
         let lease_token_hash = token_hash(lease_token);
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_transfer_state_before_heartbeat(&transaction, &now, &lease_token_hash)?;
         let grant = transaction
             .query_row(
                 "SELECT leases.grant_id,grants.share_id,grants.counted,grants.action,
@@ -852,7 +878,6 @@ impl Database {
             transaction.commit()?;
             return Ok(TransferLeaseHeartbeatOutcome::NotFound);
         }
-        cleanup_transfer_state(&transaction, &now)?;
         let expires = std::cmp::min(rolling_expiry, absolute_expiry).to_rfc3339();
         transaction.execute(
             "UPDATE public_transfer_leases

@@ -7,6 +7,7 @@ use crate::{http_auth::runtime_settings, i18n, AppState};
 
 #[derive(Clone)]
 pub(super) struct PublicShell {
+    pub(super) asset_version: &'static str,
     pub(super) locale_code: &'static str,
     pub(super) title: String,
     pub(super) skip_to_content: &'static str,
@@ -37,8 +38,9 @@ struct PublicPageTemplate<'a> {
 pub(super) fn public_shell(title: &str) -> PublicShell {
     let locale = i18n::current_locale();
     PublicShell {
+        asset_version: super::rendering::ASSET_VERSION,
         locale_code: locale.code(),
-        title: i18n::text_from_german(locale, title),
+        title: i18n::text_from_german(locale, title).into_owned(),
         skip_to_content: i18n::text(locale, i18n::SKIP_TO_CONTENT),
         brand_html: crate::ui::brand_lockup(i18n::text(locale, i18n::BRAND_TAGLINE)),
         language_label: i18n::text(locale, i18n::LANGUAGE),
@@ -58,6 +60,7 @@ pub(super) struct AdminNavItem {
 
 #[derive(Clone)]
 pub(super) struct AdminShell {
+    pub(super) asset_version: &'static str,
     pub(super) locale_code: &'static str,
     pub(super) title: &'static str,
     pub(super) skip_to_content: &'static str,
@@ -141,8 +144,11 @@ pub(super) fn admin_shell(
         active: active == Some(section),
     })
     .collect();
-    let disk = super::rendering::disk_stats(state.secure_root.display_root());
+    let disk = state
+        .disk_stats_cache
+        .peek_and_refresh(state.secure_root.display_root());
     AdminShell {
+        asset_version: super::rendering::ASSET_VERSION,
         locale_code: locale.code(),
         title: i18n::text(locale, page.title()),
         skip_to_content: i18n::text(locale, i18n::SKIP_TO_CONTENT),

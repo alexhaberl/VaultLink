@@ -21,11 +21,12 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     policy::PreviewKind, range::parse_byte_range, runtime::RuntimeSettings, secure_fs::SecureFile,
+    AppState,
 };
 
 use super::{
     common::{internal, join_display, preview_kind, DirectoryAccess},
-    rendering::{disk_stats, storage_full_error},
+    rendering::storage_full_error,
     AppError, Result,
 };
 
@@ -55,27 +56,34 @@ pub(super) struct ZipTempReservation {
 }
 
 impl ZipTempReservation {
-    pub(super) fn acquire(estimated_bytes: u64) -> Option<Self> {
+    pub(super) async fn acquire(
+        state: &AppState,
+        estimated_bytes: u64,
+    ) -> io::Result<Option<Self>> {
         let safety = ZIP_TEMP_MIN_RESERVE.max(estimated_bytes / 10);
-        let required = estimated_bytes.checked_add(safety)?;
-        let available = disk_stats(&std::env::temp_dir()).map(|stats| stats.free);
+        let Some(required) = estimated_bytes.checked_add(safety) else {
+            return Ok(None);
+        };
+        let available = state
+            .disk_stats_cache
+            .get(&std::env::temp_dir())
+            .await?
+            .free;
         loop {
             let reserved = ZIP_TEMP_RESERVED.load(Ordering::Acquire);
-            if available.is_some_and(|free| free.saturating_sub(reserved) < required) {
-                return None;
+            if available.saturating_sub(reserved) < required {
+                return Ok(None);
             }
+            let Some(next) = reserved.checked_add(estimated_bytes) else {
+                return Ok(None);
+            };
             if ZIP_TEMP_RESERVED
-                .compare_exchange_weak(
-                    reserved,
-                    reserved.checked_add(estimated_bytes)?,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange_weak(reserved, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(Self {
+                return Ok(Some(Self {
                     bytes: estimated_bytes,
-                });
+                }));
             }
         }
     }
@@ -125,6 +133,7 @@ pub(super) struct ZipFilePlan {
     pub(super) source_path: String,
     pub(super) archive_name: String,
     pub(super) scanned_len: u64,
+    pub(super) is_directory: bool,
 }
 
 #[derive(Clone)]
@@ -160,6 +169,7 @@ pub(super) fn plan_zip<D: DirectoryAccess>(
 ) -> std::result::Result<ZipPlan, ZipBuildError> {
     let mut queue = VecDeque::from([(root_path.to_string(), String::new())]);
     let mut files = Vec::new();
+    let mut regular_file_count = 0usize;
     let mut scanned_entries = 0usize;
     let mut total_data = 0u64;
     while let Some((current_directory, archive_prefix)) = queue.pop_front() {
@@ -183,6 +193,16 @@ pub(super) fn plan_zip<D: DirectoryAccess>(
                 let source_path = join_display(&current_directory, &entry.name);
                 let archive_name = join_display(&archive_prefix, &entry.name);
                 if entry.is_dir {
+                    let directory_name = format!("{archive_name}/");
+                    if directory_name.len() > u16::MAX as usize {
+                        return Err(ZipBuildError::Limit("zip entry name is too long"));
+                    }
+                    files.push(ZipFilePlan {
+                        source_path: source_path.clone(),
+                        archive_name: directory_name,
+                        scanned_len: 0,
+                        is_directory: true,
+                    });
                     queue.push_back((source_path, archive_name));
                     continue;
                 }
@@ -193,8 +213,10 @@ pub(super) fn plan_zip<D: DirectoryAccess>(
                     source_path,
                     archive_name: archive_name.clone(),
                     scanned_len: entry.len,
+                    is_directory: false,
                 });
-                if settings.max_zip_files != 0 && files.len() > settings.max_zip_files {
+                regular_file_count = regular_file_count.saturating_add(1);
+                if settings.max_zip_files != 0 && regular_file_count > settings.max_zip_files {
                     return Err(ZipBuildError::Limit("zip file count limit exceeded"));
                 }
                 total_data = total_data
@@ -252,6 +274,7 @@ pub(super) struct StreamingZipEntry {
     pub(super) crc: u32,
     pub(super) size: u64,
     pub(super) local_offset: u64,
+    pub(super) is_directory: bool,
 }
 
 fn write_zip_u16(writer: &mut impl Write, value: u16) -> io::Result<()> {
@@ -314,7 +337,7 @@ pub(super) fn write_streaming_central_entry(
     write_zip_u16(writer, 0)?;
     write_zip_u16(writer, 0)?;
     write_zip_u16(writer, 0)?;
-    write_zip_u32(writer, 0)?;
+    write_zip_u32(writer, if entry.is_directory { 0x10 } else { 0 })?;
     write_zip_u32(writer, u32::MAX)?;
     writer.write_all(name)?;
     write_zip_u16(writer, 0x0001)?;
@@ -364,17 +387,6 @@ pub(super) fn write_streaming_zip64_locator(
     write_zip_u32(writer, 1)
 }
 
-fn update_crc32(mut crc: u32, bytes: &[u8]) -> u32 {
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    crc
-}
-
 pub(super) fn write_zip_archive<D: DirectoryAccess, W: Write>(
     directory: &D,
     plan: &ZipPlan,
@@ -388,12 +400,23 @@ pub(super) fn write_zip_archive<D: DirectoryAccess, W: Write>(
         let local_offset = writer.written;
         write_streaming_local_header(&mut writer, planned.archive_name.as_bytes())
             .map_err(ZipBuildError::Output)?;
+        if planned.is_directory {
+            write_streaming_descriptor(&mut writer, 0, 0).map_err(ZipBuildError::Output)?;
+            central_entries.push(StreamingZipEntry {
+                name: planned.archive_name.clone(),
+                crc: 0,
+                size: 0,
+                local_offset,
+                is_directory: true,
+            });
+            continue;
+        }
         let mut source = directory
             .open_regular_file(&planned.source_path)
             .map_err(ZipBuildError::Source)?;
         let mut remaining = planned.scanned_len;
         let mut size = 0u64;
-        let mut crc = 0xffff_ffffu32;
+        let mut crc = crc32fast::Hasher::new();
         while remaining > 0 {
             let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
             let read = source
@@ -412,18 +435,19 @@ pub(super) fn write_zip_archive<D: DirectoryAccess, W: Write>(
             if plan.max_data_size != 0 && total_data > plan.max_data_size {
                 return Err(ZipBuildError::Limit("zip size limit exceeded"));
             }
-            crc = update_crc32(crc, &buffer[..read]);
+            crc.update(&buffer[..read]);
             writer
                 .write_all(&buffer[..read])
                 .map_err(ZipBuildError::Output)?;
         }
-        let crc = !crc;
+        let crc = crc.finalize();
         write_streaming_descriptor(&mut writer, crc, size).map_err(ZipBuildError::Output)?;
         central_entries.push(StreamingZipEntry {
             name: planned.archive_name.clone(),
             crc,
             size,
             local_offset,
+            is_directory: false,
         });
     }
     let central_offset = writer.written;
@@ -552,7 +576,7 @@ impl Stream for ReservedZipStream {
     }
 }
 
-pub(super) fn zip_error(error: ZipBuildError) -> AppError {
+pub(super) fn zip_error(error: &ZipBuildError) -> AppError {
     match error {
         ZipBuildError::Limit(_) => AppError(StatusCode::PAYLOAD_TOO_LARGE, "ZIP-Limit erreicht"),
         ZipBuildError::Source(_) => AppError(StatusCode::NOT_FOUND, "ZIP-Quelle nicht verfügbar"),
@@ -628,13 +652,13 @@ fn block_text_preview_read_for_test(path: &str) {
 }
 
 pub(super) fn read_preview<D: DirectoryAccess>(
-    secure_root: D,
+    secure_root: &D,
     path: &str,
     settings: &RuntimeSettings,
 ) -> std::io::Result<PreviewContent> {
     let metadata = secure_root.entry_metadata(path)?;
     let file = secure_root.open_regular_file(path)?;
-    read_preview_opened(file, metadata, path, settings)
+    read_preview_opened(file, &metadata, path, settings)
 }
 
 pub(super) fn read_preview_secure_file(
@@ -643,12 +667,12 @@ pub(super) fn read_preview_secure_file(
     settings: &RuntimeSettings,
 ) -> std::io::Result<PreviewContent> {
     let metadata = file.metadata()?;
-    read_preview_opened(file.into_file(), metadata, path, settings)
+    read_preview_opened(file.into_file(), &metadata, path, settings)
 }
 
 pub(super) fn read_preview_opened(
     file: std::fs::File,
-    metadata: std::fs::Metadata,
+    metadata: &std::fs::Metadata,
     path: &str,
     settings: &RuntimeSettings,
 ) -> std::io::Result<PreviewContent> {

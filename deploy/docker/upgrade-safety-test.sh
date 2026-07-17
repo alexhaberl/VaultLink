@@ -15,13 +15,12 @@ HEALTH_PORT=18082
 HEALTH_URL="http://127.0.0.1:$HEALTH_PORT/api/v1/health"
 REAL_SQLITE3="$(command -v sqlite3)"
 REAL_CURL="$(command -v curl)"
-REAL_OD="$(command -v od)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 UPGRADE="$REPO_ROOT/deploy/vaultlink-upgrade.sh"
 ROLLBACK="$REPO_ROOT/deploy/vaultlink-rollback.sh"
 
-export MOCK_STATE_DIR REAL_SQLITE3 REAL_OD
+export MOCK_STATE_DIR REAL_SQLITE3
 export VAULTLINK_READINESS_ATTEMPTS=4
 export VAULTLINK_READINESS_INTERVAL_SECONDS=0
 export VAULTLINK_READINESS_CONNECT_TIMEOUT_SECONDS=1
@@ -143,19 +142,7 @@ fi
 exec "$REAL_SQLITE3" "$@"
 SH
 
-    cat >"$MOCK_BIN/od" <<'SH'
-#!/bin/sh
-set -eu
-
-if [ -f "$MOCK_STATE_DIR/alias-suffix" ]; then
-    printf ' %s\n' "$(cat "$MOCK_STATE_DIR/alias-suffix")"
-    exit 0
-fi
-
-exec "$REAL_OD" "$@"
-SH
-
-    chmod 0755 "$MOCK_BIN/systemctl" "$MOCK_BIN/sqlite3" "$MOCK_BIN/od"
+    chmod 0755 "$MOCK_BIN/systemctl" "$MOCK_BIN/sqlite3"
     : >"$MOCK_STATE_DIR/systemctl.log"
     install -d -o root -g vaultlink -m 0750 "$(dirname "$CONFIG_PATH")"
     write_config "$CONFIG_PATH" original
@@ -355,16 +342,18 @@ initialize_live() {
     write_binary /opt/vaultlink/vaultlink "$binary_marker"
     "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
         "CREATE TABLE marker(value TEXT NOT NULL);
-         INSERT INTO marker VALUES('$database_marker');
-         CREATE TABLE shares(id INTEGER PRIMARY KEY, alias TEXT UNIQUE);"
+         INSERT INTO marker VALUES('$database_marker');"
     chown vaultlink:vaultlink /var/lib/vaultlink/data.sqlite
     chmod 0600 /var/lib/vaultlink/data.sqlite
+    printf '%s\n' '{"version":1,"active_key_id":1,"keys":[{"id":1,"key":"test-keyring-fixture"}]}' \
+        >/var/lib/vaultlink/secrets.keyring
+    chown vaultlink:vaultlink /var/lib/vaultlink/secrets.keyring
+    chmod 0600 /var/lib/vaultlink/secrets.keyring
     write_config "$CONFIG_PATH" "$binary_marker"
     printf '%s\n' active >"$MOCK_STATE_DIR/service.state"
     printf '%s\n' 0 >"$MOCK_STATE_DIR/stop.count"
     : >"$MOCK_STATE_DIR/systemctl.log"
     rm -f "$MOCK_STATE_DIR"/fail-*-once \
-        "$MOCK_STATE_DIR/alias-suffix" \
         "$MOCK_STATE_DIR/delayed-active-checks" \
         "$MOCK_STATE_DIR/active-checks-remaining"
     set_health_mode success
@@ -382,6 +371,7 @@ make_source_backup() {
     install -m 0755 /opt/vaultlink/vaultlink "$source_backup/vaultlink"
     install -m 0640 "$CONFIG_PATH" "$source_backup/config.toml"
     "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite ".backup '$source_backup/data.sqlite'"
+    install -m 0600 /var/lib/vaultlink/secrets.keyring "$source_backup/secrets.keyring"
     printf '%s\n' "$source_backup"
 }
 
@@ -403,7 +393,7 @@ assert_config() {
         || fail "expected $expected configuration"
 }
 
-assert_backup_triple() {
+assert_backup_unit() {
     backup_dir=$1
     expected=$2
     grep -q "binary-marker:$expected" "$backup_dir/vaultlink" \
@@ -413,6 +403,8 @@ assert_backup_triple() {
     backup_marker=$("$REAL_SQLITE3" "$backup_dir/data.sqlite" "SELECT value FROM marker")
     [[ "$backup_marker" == "$expected" ]] \
         || fail "backup database was not $expected"
+    [[ -s "$backup_dir/secrets.keyring" ]] \
+        || fail "backup secrets keyring was missing or empty"
     [[ "$(stat -c '%U:%G:%a' "$backup_dir")" == root:root:700 ]] \
         || fail "backup directory owner or mode was not root:root 0700"
     [[ "$(stat -c '%U:%G:%a' "$backup_dir/vaultlink")" == root:root:700 ]] \
@@ -421,6 +413,8 @@ assert_backup_triple() {
         || fail "backup configuration owner or mode was not root:root 0600"
     [[ "$(stat -c '%U:%G:%a' "$backup_dir/data.sqlite")" == root:root:600 ]] \
         || fail "backup database owner or mode was not root:root 0600"
+    [[ "$(stat -c '%U:%G:%a' "$backup_dir/secrets.keyring")" == root:root:600 ]] \
+        || fail "backup secrets keyring owner or mode was not root:root 0600"
 }
 
 assert_service_active() {
@@ -463,7 +457,7 @@ assert_automatic_upgrade_restore() {
     backup_dir=$(find /var/lib/vaultlink-backups -mindepth 1 -maxdepth 1 -type d \
         ! -name '*.incomplete.*' -print -quit)
     [[ -n "$backup_dir" ]] || fail "$log_name did not keep its verified backup"
-    assert_backup_triple "$backup_dir" original
+    assert_backup_unit "$backup_dir" original
 }
 
 expect_failure() {
@@ -483,7 +477,7 @@ test_upgrade_success() {
     make_candidate
     backup_dir=$("$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml")
     [[ -d "$backup_dir" ]] || fail "upgrade did not return a backup directory"
-    assert_backup_triple "$backup_dir" original
+    assert_backup_unit "$backup_dir" original
     assert_binary candidate
     assert_config candidate
     assert_database original
@@ -491,94 +485,6 @@ test_upgrade_success() {
     assert_no_incomplete_backup
     assert_health_requests 1
     echo "upgrade success case passed"
-}
-
-test_upgrade_migrates_short_share_aliases_and_protects_mapping() {
-    initialize_live original original
-    make_candidate
-    "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
-        "INSERT INTO shares(id, alias) VALUES
-            (1, 'a'),
-            (2, 'legacy_1234'),
-            (3, 'alreadyLong12'),
-            (4, NULL);"
-
-    backup_dir=$("$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml")
-    mapping="$backup_dir/share-alias-migration.tsv"
-    [[ -f "$mapping" ]] || fail "short-alias upgrade did not publish its protected mapping"
-    [[ "$(stat -c '%U:%G:%a' "$mapping")" == root:root:600 ]] \
-        || fail "short-alias mapping owner or mode was not root:root 0600"
-    [[ "$(wc -l <"$mapping")" -eq 3 ]] \
-        || fail "short-alias mapping did not contain exactly two migrated rows"
-
-    for id in 1 2; do
-        old_alias=$(awk -F '\t' -v id="$id" '$1 == id { print $2 }' "$mapping")
-        new_alias=$(awk -F '\t' -v id="$id" '$1 == id { print $3 }' "$mapping")
-        [[ -n "$old_alias" && -n "$new_alias" ]] \
-            || fail "short-alias mapping omitted share $id"
-        [[ "$new_alias" == "$old_alias"* ]] \
-            || fail "migrated alias did not retain its legacy prefix"
-        [[ ${#new_alias} -ge 12 && ${#new_alias} -le 32 ]] \
-            || fail "migrated alias length was outside the production policy"
-        [[ "$new_alias" != *[!A-Za-z0-9_-]* ]] \
-            || fail "migrated alias contained non-URL-safe characters"
-        database_alias=$("$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
-            "SELECT alias FROM shares WHERE id=$id")
-        [[ "$database_alias" == "$new_alias" ]] \
-            || fail "protected mapping did not match the migrated database alias"
-    done
-    [[ "$("$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
-        "SELECT alias FROM shares WHERE id=3")" == alreadyLong12 ]] \
-        || fail "upgrade changed an alias that already met the policy"
-    [[ "$("$REAL_SQLITE3" "$backup_dir/data.sqlite" \
-        "SELECT group_concat(alias, ',') FROM (SELECT alias FROM shares WHERE alias IS NOT NULL ORDER BY id)")" \
-        == "a,legacy_1234,alreadyLong12" ]] \
-        || fail "alias migration did not occur after the consistent database backup"
-    [[ "$("$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
-        "SELECT count(*) FROM shares WHERE alias IS NOT NULL AND length(CAST(alias AS BLOB)) < 12")" -eq 0 ]] \
-        || fail "upgrade left a short share alias behind"
-    assert_binary candidate
-    assert_config candidate
-    assert_service_active
-    echo "short share-alias migration and protected operator mapping passed"
-}
-
-test_upgrade_alias_collision_is_atomic_and_restores_backup() {
-    initialize_live original original
-    make_candidate
-    fixed_suffix=0123456789abcdefabcd
-    printf '%s\n' "$fixed_suffix" >"$MOCK_STATE_DIR/alias-suffix"
-    "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
-        "INSERT INTO shares(id, alias) VALUES
-            (1, 'first'),
-            (2, 'second'),
-            (3, 'second${fixed_suffix}');"
-
-    expect_failure upgrade-alias-collision \
-        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
-    grep -q 'share alias migration failed; refusing to activate the candidate' \
-        "$TEST_ROOT/upgrade-alias-collision.log" \
-        || fail "alias collision did not report a fail-closed migration"
-    [[ "$("$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
-        "SELECT group_concat(alias, ',') FROM (SELECT alias FROM shares ORDER BY id)")" \
-        == "first,second,second${fixed_suffix}" ]] \
-        || fail "alias collision did not restore the original database aliases"
-    assert_binary original
-    assert_config original
-    assert_database original
-    assert_service_active
-    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 2 ]] \
-        || fail "alias collision did not stop for migration and verified restore"
-    [[ "$(grep -c '^start vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 1 ]] \
-        || fail "alias collision did not restart exactly the restored service"
-    backup_dir=$(find /var/lib/vaultlink-backups -mindepth 1 -maxdepth 1 -type d \
-        ! -name '*.incomplete.*' -print -quit)
-    [[ -n "$backup_dir" ]] || fail "alias collision did not retain its verified backup"
-    [[ ! -e "$backup_dir/share-alias-migration.tsv" ]] \
-        || fail "rolled-back alias collision left a stale operator mapping"
-    assert_backup_triple "$backup_dir" original
-    assert_no_incomplete_backup
-    echo "share-alias UNIQUE collision rollback passed"
 }
 
 test_upgrade_rejects_mismatched_binary_configuration_pair_before_stop() {
@@ -612,31 +518,6 @@ test_upgrade_maintenance_lock_fails_before_stop() {
     [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
         || fail "maintenance lock contention stopped the service"
     echo "upgrade and rollback shared maintenance lock passed"
-}
-
-test_storage_layout_upgrade_requires_an_inactive_service() {
-    for installed_version in 0.3.9 0.4.0; do
-        for candidate_version in 0.4.1 0.4.2; do
-            initialize_live original original
-            write_binary /opt/vaultlink/vaultlink original "$HEALTH_URL" - 0 "$installed_version"
-            write_binary "$TEST_ROOT/candidate" candidate "$HEALTH_URL" - 0 "$candidate_version"
-            write_config "$TEST_ROOT/candidate.toml" candidate
-            log_name="upgrade-${installed_version//./}-${candidate_version//./}-active"
-
-            expect_failure "$log_name" \
-                "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
-            grep -q 'upgrade across the pre-0.4.1 storage-layout boundary requires vaultlink.service to be stopped' \
-                "$TEST_ROOT/$log_name.log" \
-                || fail "active migration from $installed_version to $candidate_version did not explain the quiesce gate"
-            assert_binary original
-            assert_config original
-            assert_database original
-            assert_service_active
-            [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
-                || fail "active $installed_version to $candidate_version migration stopped the service itself"
-        done
-    done
-    echo "semantic storage-layout upgrade gates passed"
 }
 
 test_upgrade_rejects_semantic_downgrades_before_stop() {
@@ -727,8 +608,6 @@ test_upgrade_backup_failure() {
 test_upgrade_start_failure() {
     initialize_live original original
     make_candidate
-    "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
-        "INSERT INTO shares(id, alias) VALUES(1, 'old')"
     touch "$MOCK_STATE_DIR/fail-start-once"
     expect_failure upgrade-start-failure "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
     assert_binary original
@@ -736,13 +615,6 @@ test_upgrade_start_failure() {
     assert_database original
     assert_service_active
     assert_no_incomplete_backup
-    [[ "$("$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite \
-        "SELECT alias FROM shares WHERE id=1")" == old ]] \
-        || fail "candidate startup failure did not restore the pre-migration alias"
-    backup_dir=$(find /var/lib/vaultlink-backups -mindepth 1 -maxdepth 1 -type d \
-        ! -name '*.incomplete.*' -print -quit)
-    [[ -n "$backup_dir" && ! -e "$backup_dir/share-alias-migration.tsv" ]] \
-        || fail "candidate startup rollback retained a stale alias mapping"
     echo "upgrade start-failure rollback passed"
 }
 
@@ -988,7 +860,7 @@ test_upgrade_recovery_stop_failure_requires_manual_recovery() {
     backup_dir=$(find /var/lib/vaultlink-backups -mindepth 1 -maxdepth 1 -type d \
         ! -name '*.incomplete.*' -print -quit)
     [[ -n "$backup_dir" ]] || fail "recovery stop failure did not keep its verified backup"
-    assert_backup_triple "$backup_dir" original
+    assert_backup_unit "$backup_dir" original
 
     echo "upgrade recovery stop failure preserved candidate state for manual recovery"
 }
@@ -1014,7 +886,7 @@ test_rollback_success() {
     assert_no_incomplete_backup
     emergency_dir=${output##*pre-rollback backup: }
     [[ -d "$emergency_dir" ]] || fail "rollback emergency backup path was invalid"
-    assert_backup_triple "$emergency_dir" candidate
+    assert_backup_unit "$emergency_dir" candidate
     echo "rollback success case passed"
 }
 
@@ -1040,7 +912,7 @@ test_rollback_rejects_incomplete_backup_before_stop() {
     assert_service_active
     [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
         || fail "incomplete rollback backup stopped the service"
-    echo "rollback incomplete triple preflight passed"
+    echo "rollback incomplete backup-unit preflight passed"
 }
 
 test_rollback_rejects_mismatched_pair_before_stop() {
@@ -1054,32 +926,6 @@ test_rollback_rejects_mismatched_pair_before_stop() {
     [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
         || fail "mismatched rollback pair stopped the service"
     echo "rollback binary/configuration pairing preflight passed"
-}
-
-test_rollback_across_storage_layout_requires_an_inactive_service() {
-    for requested_version in 0.3.9 0.4.0; do
-        for current_version in 0.4.1 0.4.2; do
-            initialize_live original original
-            source_backup=$(make_source_backup)
-            write_binary "$source_backup/vaultlink" original "$HEALTH_URL" - 0 "$requested_version"
-            write_binary /opt/vaultlink/vaultlink candidate "$HEALTH_URL" - 0 "$current_version"
-            write_config "$CONFIG_PATH" candidate
-            "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite "UPDATE marker SET value='candidate'"
-            log_name="rollback-${current_version//./}-${requested_version//./}-active"
-
-            expect_failure "$log_name" "$ROLLBACK" "$source_backup"
-            grep -q 'rollback across the pre-0.4.1 storage-layout boundary requires vaultlink.service to be stopped and the matching storage layout to be restored first' \
-                "$TEST_ROOT/$log_name.log" \
-                || fail "rollback from $current_version to $requested_version did not explain the storage-layout prerequisite"
-            assert_binary candidate
-            assert_config candidate
-            assert_database candidate
-            assert_service_active
-            [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
-                || fail "unsafe rollback from $current_version to $requested_version stopped the service before rejection"
-        done
-    done
-    echo "semantic rollback storage-layout gates passed"
 }
 
 test_rollback_rejects_semantic_roll_forward_before_stop() {
@@ -1125,11 +971,8 @@ export PATH="$MOCK_BIN:$PATH"
 start_health_server
 
 test_upgrade_success
-test_upgrade_migrates_short_share_aliases_and_protects_mapping
-test_upgrade_alias_collision_is_atomic_and_restores_backup
 test_upgrade_rejects_mismatched_binary_configuration_pair_before_stop
 test_upgrade_maintenance_lock_fails_before_stop
-test_storage_layout_upgrade_requires_an_inactive_service
 test_upgrade_rejects_semantic_downgrades_before_stop
 test_semver_prerelease_build_and_validation_rules
 test_upgrade_backup_failure
@@ -1147,7 +990,6 @@ test_rollback_success
 test_rollback_start_failure
 test_rollback_rejects_incomplete_backup_before_stop
 test_rollback_rejects_mismatched_pair_before_stop
-test_rollback_across_storage_layout_requires_an_inactive_service
 test_rollback_rejects_semantic_roll_forward_before_stop
 test_rollback_recovery_stop_failure_stays_fail_closed
 

@@ -1,16 +1,20 @@
 # Stable WebAuthn/passkey dependencies still span the pre-1.0 and current utility
-# stacks. Re-evaluate when webauthn-rs has a newer stable release (not -dev/-rc).
-base64
+# stacks. Re-evaluate when webauthn_rp and the crypto stack converge.
+const-oid
 getrandom
 rand
 rand_core
 
-# Argon2/password hashing and WebAuthn currently pull compatible, but distinct,
-# digest generations. Re-evaluate after stable argon2 and webauthn-rs upgrades.
+# Argon2/password hashing, TOTP, XChaCha and WebAuthn currently pull compatible,
+# but distinct crypto generations. Re-evaluate after their stable upgrades.
 block-buffer
+chacha20
 cpufeatures
 crypto-common
 digest
+hmac
+rand-chacha
+sha2
 
 # Stable dependency branches currently use both thiserror major versions. Remove
 # these entries as soon as all direct parents have converged on one major.

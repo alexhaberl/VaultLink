@@ -13,10 +13,10 @@ use crate::{
     auth,
     db::{AuditContext, Permission},
     http_auth::{
-        audit_observation, enabled_audit_client_ip, make_unlock_cookie, required_database,
-        runtime_settings, share_is_unlocked, verify_password_admitted, UnlockCookieScope,
+        audit_observation, current_client_limit_key, enabled_audit_client_ip, make_unlock_cookie,
+        required_database, runtime_settings, share_is_unlocked, verify_password_admitted,
+        UnlockCookieScope,
     },
-    proxy,
     sensitive::SecretString,
     AppState,
 };
@@ -115,8 +115,8 @@ struct UnlockResponse {
 
 pub(super) async fn unlock_share(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    _headers: HeaderMap,
     AxPath(token): AxPath<String>,
     Json(request): Json<UnlockRequest>,
 ) -> ApiResult<Response> {
@@ -130,13 +130,13 @@ pub(super) async fn unlock_share(
     };
     let expected_password_hash = hash.clone();
     let expected_upload_policy_epoch = share.upload_policy_epoch;
-    let ip = proxy::client_limit_key(proxy::effective_client_ip(
-        peer.ip(),
-        &headers,
-        &state.config,
-    ));
-    let key = format!("share:{}:{ip}", share.id);
-    if !state.share_limiter.check_and_record_attempt(&key) {
+    let ip = current_client_limit_key();
+    let global_key = format!("share-unlock-ip:{ip}");
+    let share_key = format!("share-unlock:{}:{ip}", share.id);
+    if !state
+        .share_limiter
+        .check_and_record_attempts(&[&global_key, &share_key])
+    {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",

@@ -1088,7 +1088,6 @@ async fn api_file_search_filters_before_pagination() {
                 crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
             )
             .unwrap()
-            .unwrap()
         })
         .collect::<Vec<_>>();
     let mut request = json_request(Method::GET, "/api/v1/files?path=", "");
@@ -1124,11 +1123,11 @@ fn api_file_pages_count_filtered_raw_directory_items() {
         .unwrap();
     }
     let state = test_state(root.path(), data.path());
-    let (entries, truncated) = list_file_page(state.secure_root.clone(), "", 0, None, 1).unwrap();
+    let (entries, truncated) = list_file_page(&state.secure_root, "", 0, None, 1).unwrap();
     assert!(entries.is_empty());
     assert!(truncated);
     let (entries, truncated) =
-        list_file_page(state.secure_root, "", 0, Some("missing"), 1).unwrap();
+        list_file_page(&state.secure_root, "", 0, Some("missing"), 1).unwrap();
     assert!(entries.is_empty());
     assert!(truncated);
 }

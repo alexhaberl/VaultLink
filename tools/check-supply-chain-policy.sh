@@ -25,14 +25,14 @@ fi
 if ! awk '
     $0 == "[profile.release]" { release_profile = 1; profiles++; next }
     /^\[/ { release_profile = 0 }
-    release_profile && $0 == "panic = \"abort\"" { abort_settings++ }
-    END { exit !(profiles == 1 && abort_settings == 1) }
+    release_profile && $0 == "panic = \"unwind\"" { unwind_settings++ }
+    END { exit !(profiles == 1 && unwind_settings == 1) }
 ' Cargo.toml \
     || [ "$(grep -F -c '#[cfg(panic = "unwind")]' src/web.rs || true)" -ne 2 ] \
     || [ "$(grep -F -c 'CatchPanicLayer' src/web.rs || true)" -ne 2 ] \
     || ! grep -F -q 'use tower_http::catch_panic::CatchPanicLayer;' src/web.rs \
     || ! grep -F -q 'let router = router.layer(CatchPanicLayer::new());' src/web.rs; then
-    report "release builds must use panic=abort and CatchPanicLayer must be unwind-only"
+    report "release builds must use panic=unwind and keep CatchPanicLayer active"
 fi
 if ! grep -F -q 'sh tools/check-version-consistency.sh --binary target/debug/vaultlink' .github/workflows/ci.yml \
     || ! grep -F -q -- '--release-candidate' .github/workflows/release.yml \
@@ -136,6 +136,7 @@ for tool in 'cargo-cyclonedx --version 0.5.9' 'cargo-audit --version 0.22.2'; do
 done
 
 if ! grep -E -q '^COPY Cargo\.toml Cargo\.lock rust-toolchain\.toml Makefile \.dockerignore \./$' "$smoke_dockerfile" \
+    || ! grep -F -x -q 'COPY .cargo ./.cargo' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY .github ./.github' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY deploy ./deploy' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY tools ./tools' "$smoke_dockerfile"; then

@@ -61,62 +61,13 @@ fn live_mfa_session_operation_linearizes_with_session_revocation() {
 }
 
 #[test]
-fn poisoned_database_lock_rolls_back_before_reuse() {
-    let db = Database::open(":memory:").unwrap();
-    db.create_admin("admin", "old-hash", "secret").unwrap();
-    let poisoned = db.clone();
-    let panic = std::panic::catch_unwind(move || {
-        let connection = poisoned.0.connection.lock().unwrap();
-        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
-        connection
-            .execute(
-                "UPDATE admins SET password_hash='uncommitted' WHERE id=1",
-                [],
-            )
-            .unwrap();
-        panic!("inject database lock poisoning");
-    });
-    assert!(panic.is_err());
-    assert!(db.0.connection.is_poisoned());
+fn persistent_database_uses_four_connections_and_memory_uses_one() {
+    let memory = Database::open(":memory:").unwrap();
+    assert_eq!(memory.0.pool.max_size(), 1);
 
-    assert_eq!(
-        db.admin("admin").unwrap().unwrap().password_hash,
-        "old-hash"
-    );
-    assert!(!db.0.connection.is_poisoned());
-}
-
-#[test]
-fn failed_poison_rollback_is_fail_closed_and_retried() {
-    let db = Database::open(":memory:").unwrap();
-    db.create_admin("admin", "old-hash", "secret").unwrap();
-    let poisoned = db.clone();
-    let panic = std::panic::catch_unwind(move || {
-        let connection = poisoned.0.connection.lock().unwrap();
-        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
-        connection
-            .execute(
-                "UPDATE admins SET password_hash='uncommitted' WHERE id=1",
-                [],
-            )
-            .unwrap();
-        panic!("inject database lock poisoning");
-    });
-    assert!(panic.is_err());
-    db.0.fail_next_poison_rollback
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-
-    let error = db
-        .admin("admin")
-        .expect_err("failed normalization must not expose the connection");
-    assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
-    assert!(db.0.connection.is_poisoned());
-
-    assert_eq!(
-        db.admin("admin").unwrap().unwrap().password_hash,
-        "old-hash"
-    );
-    assert!(!db.0.connection.is_poisoned());
+    let directory = tempfile::tempdir().unwrap();
+    let persistent = Database::open(directory.path().join("data.sqlite")).unwrap();
+    assert_eq!(persistent.0.pool.max_size(), 4);
 }
 
 #[test]
@@ -1429,8 +1380,8 @@ fn deactivation_removes_pending_mfa_and_blocks_inactive_account_operations() {
         .conn()
         .execute(
             "INSERT INTO admin_mfa_enrollments(
-                    admin_id,token_hash,totp_secret,created_at,expires_at
-                 ) VALUES(1,?1,'injected-secret',?2,?3)",
+                    admin_id,token_hash,totp_key_id,totp_ciphertext,created_at,expires_at
+                 ) VALUES(1,?1,1,X'00',?2,?3)",
             params![
                 token_hash("injected-token"),
                 Utc::now().to_rfc3339(),
@@ -1450,13 +1401,13 @@ fn deactivation_removes_pending_mfa_and_blocks_inactive_account_operations() {
     );
     let inactive = database
         .conn()
-        .query_row::<(String, String), _, _>(
-            "SELECT password_hash,totp_secret FROM admins WHERE id=1",
+        .query_row::<(String, u64), _, _>(
+            "SELECT password_hash,totp_generation FROM admins WHERE id=1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(inactive, ("one-hash".into(), "one-secret".into()));
+    assert_eq!(inactive, ("one-hash".into(), 1));
 }
 
 #[test]
@@ -1594,50 +1545,6 @@ fn malformed_share_expiry_fails_individual_and_list_queries() {
 }
 
 #[test]
-fn migrates_unversioned_installation_without_losing_data() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("old_schema.sqlite");
-    {
-        let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(r#"
-CREATE TABLE admins(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, totp_secret TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE sessions(token_hash TEXT PRIMARY KEY, admin_id INTEGER NOT NULL REFERENCES admins(id), csrf_token TEXT NOT NULL, mfa_verified INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL);
-CREATE TABLE shares(id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, token TEXT NOT NULL, alias TEXT UNIQUE, relative_path TEXT NOT NULL, is_directory INTEGER NOT NULL, permission TEXT NOT NULL, expires_at TEXT, max_downloads INTEGER, download_count INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_by INTEGER NOT NULL REFERENCES admins(id), created_at TEXT NOT NULL);
-CREATE TABLE audit(id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object_id TEXT, detail TEXT);
-INSERT INTO admins VALUES(1,'admin','hash','secret','2026-01-01T00:00:00Z');
-INSERT INTO sessions VALUES('session-hash',1,'csrf',1,'2099-01-01T00:00:00Z');
-INSERT INTO audit VALUES(1,'2026-01-01T00:00:00Z','admin','share_created','1','download_only');
-"#).unwrap();
-        connection.execute("INSERT INTO shares VALUES(1,?1,'share-token','alias','folder',1,'download_only',NULL,7,3,1,1,'2026-01-01T00:00:00Z')", [token_hash("share-token")]).unwrap();
-    }
-    let database = Database::open(&path).unwrap();
-    assert_eq!(
-        database
-            .conn()
-            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
-            .unwrap(),
-        SCHEMA_VERSION
-    );
-    let share = database.share_by_token("share-token").unwrap().unwrap();
-    assert_eq!(share.download_count, 3);
-    assert_eq!(share.max_downloads, Some(7));
-    assert_eq!(share.created_at, "2026-01-01T00:00:00Z");
-    assert!(share.password_hash.is_none());
-    assert_eq!(
-        share.upload_conflict_strategy,
-        UploadConflictStrategy::Reject
-    );
-    assert_eq!(
-        database
-            .conn()
-            .query_row::<i64, _, _>("SELECT COUNT(*) FROM audit", [], |row| row.get(0))
-            .unwrap(),
-        1
-    );
-    assert!(database.admin("admin").unwrap().unwrap().totp_enabled);
-}
-
-#[test]
 fn rejects_unknown_newer_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("future.sqlite");
@@ -1646,207 +1553,234 @@ fn rejects_unknown_newer_schema() {
         .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
         .unwrap();
     drop(connection);
-    assert!(Database::open(path).is_err());
+    assert!(matches!(
+        Database::open(path),
+        Err(DatabaseError::Schema(_))
+    ));
 }
 
 #[test]
-fn migrates_legacy_password_max_runtime_key_to_the_canonical_name() {
-    let mut connection = Connection::open_in_memory().unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE runtime_settings(
-                     key TEXT PRIMARY KEY,
-                     value TEXT NOT NULL
-                 );
-                 INSERT INTO runtime_settings VALUES('share_password_max_bytes','128');
-                 PRAGMA user_version=11;",
-        )
-        .unwrap();
-
-    migrate(&mut connection).unwrap();
-
-    assert_eq!(
-        connection
-            .query_row::<String, _, _>(
-                "SELECT value FROM runtime_settings
-                     WHERE key='share_password_max_length'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        "128"
-    );
-    assert_eq!(
-        connection
-            .query_row::<i64, _, _>(
-                "SELECT COUNT(*) FROM runtime_settings
-                     WHERE key='share_password_max_bytes'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        connection
-            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
-            .unwrap(),
-        SCHEMA_VERSION
-    );
-}
-
-#[test]
-fn canonical_runtime_key_wins_if_both_password_max_names_exist() {
-    let mut connection = Connection::open_in_memory().unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE runtime_settings(
-                     key TEXT PRIMARY KEY,
-                     value TEXT NOT NULL
-                 );
-                 INSERT INTO runtime_settings VALUES('share_password_max_bytes','128');
-                 INSERT INTO runtime_settings VALUES('share_password_max_length','256');
-                 PRAGMA user_version=11;",
-        )
-        .unwrap();
-
-    migrate(&mut connection).unwrap();
-
-    assert_eq!(
-        connection
-            .query_row::<String, _, _>(
-                "SELECT value FROM runtime_settings
-                     WHERE key='share_password_max_length'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        "256"
-    );
-    assert_eq!(
-        connection
-            .query_row::<i64, _, _>("SELECT COUNT(*) FROM runtime_settings", [], |row| {
-                row.get(0)
-            })
-            .unwrap(),
-        1
-    );
-}
-
-#[test]
-fn migrates_v6_database_to_transfer_grants_without_losing_shares() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("v6.sqlite");
-    {
-        let connection = Connection::open(&path).unwrap();
-        connection
-                .execute_batch(
-                    "CREATE TABLE shares(id INTEGER PRIMARY KEY, marker TEXT NOT NULL);
-                     CREATE TABLE audit(id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object_id TEXT, detail TEXT);
-                     INSERT INTO shares VALUES(7, 'preserved');
-                     PRAGMA user_version=6;",
-                )
-                .unwrap();
-    }
-    let database = Database::open(&path).unwrap();
+fn fresh_database_is_exactly_schema_one_without_plaintext_secret_columns() {
+    let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
     assert_eq!(
         connection
             .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        SCHEMA_VERSION
+        1
     );
-    assert_eq!(
-        connection
-            .query_row::<String, _, _>("SELECT marker FROM shares WHERE id=7", [], |row| {
-                row.get(0)
-            })
-            .unwrap(),
-        "preserved"
-    );
-    assert_eq!(
-            connection
-                .query_row::<i64, _, _>(
-                    "SELECT COUNT(*) FROM sqlite_master
-                     WHERE type='table' AND name IN ('public_transfer_grants','public_transfer_leases')",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap(),
-            2
-        );
+    for (table, forbidden) in [
+        ("shares", "token"),
+        ("admins", "totp_secret"),
+        ("admin_mfa_enrollments", "totp_secret"),
+        ("admin_webauthn_credentials", "credential_json"),
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1");
+        let count: i64 = connection
+            .query_row(&sql, [forbidden], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "legacy column {table}.{forbidden} exists");
+    }
+    for (table, encrypted_columns) in [
+        ("shares", &["token_key_id", "token_ciphertext"][..]),
+        ("admins", &["totp_key_id", "totp_ciphertext"][..]),
+        (
+            "admin_mfa_enrollments",
+            &["totp_key_id", "totp_ciphertext"][..],
+        ),
+        ("admin_webauthn_credentials", &["credential_blob"][..]),
+    ] {
+        for column in encrypted_columns {
+            let sql = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1");
+            let count: i64 = connection
+                .query_row(&sql, [column], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "encrypted column {table}.{column} missing");
+        }
+    }
 }
 
 #[test]
-fn migrates_v7_audit_and_initializes_persistent_transfer_statistics() {
+fn persistent_secrets_survive_restart_and_key_rotation_without_plaintext_columns() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("v7.sqlite");
-    {
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE audit(
-                        id INTEGER PRIMARY KEY,
-                        occurred_at TEXT NOT NULL,
-                        actor TEXT NOT NULL,
-                        action TEXT NOT NULL,
-                        object_id TEXT,
-                        detail TEXT
-                     );
-                     INSERT INTO audit VALUES(
-                        1,'2026-01-01T00:00:00Z','admin','share_created','1','download_only'
-                     );
-                     PRAGMA user_version=7;",
-            )
-            .unwrap();
-    }
-
+    let path = directory.path().join("data.sqlite");
     let database = Database::open(&path).unwrap();
-    assert_eq!(
-        database
-            .conn()
-            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
-            .unwrap(),
-        SCHEMA_VERSION
-    );
-    let event = database.list_audit(None, 10, 0).unwrap().remove(0);
-    assert_eq!(event.action, "share_created");
-    assert!(event.client_ip.is_none());
-    let started_at = database.transfer_statistics_started_at().unwrap();
-    DateTime::parse_from_rfc3339(&started_at).unwrap();
-    assert_eq!(
-            database
-                .conn()
-                .query_row::<i64, _, _>(
-                    "SELECT COUNT(*) FROM sqlite_master
-                     WHERE type='table' AND name IN ('transfer_monthly_counts','transfer_statistics')",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap(),
-            2
-        );
-    assert!(database
-            .conn()
-            .execute(
-                "INSERT INTO transfer_monthly_counts(month,action,count) VALUES('2026-13','download',1)",
-                [],
-            )
-            .is_err());
-    assert!(database
-        .conn()
-        .execute(
-            "INSERT INTO transfer_monthly_counts(month,action,count) VALUES('2026-07','upload',1)",
-            [],
+    database
+        .create_admin("admin", "password-hash", "TOTP-SECRET")
+        .unwrap();
+    database
+        .create_share(
+            "share-token",
+            None,
+            "file.txt",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
         )
-        .is_err());
+        .unwrap();
+    let before: (u64, Vec<u8>, u64, Vec<u8>) = database
+        .conn()
+        .query_row(
+            "SELECT shares.token_key_id,shares.token_ciphertext,
+                    admins.totp_key_id,admins.totp_ciphertext
+             FROM shares JOIN admins ON admins.id=shares.created_by",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
     drop(database);
 
+    Database::rotate_secrets(&path).unwrap();
     let reopened = Database::open(&path).unwrap();
     assert_eq!(
-        reopened.transfer_statistics_started_at().unwrap(),
-        started_at
+        reopened
+            .share_by_token("share-token")
+            .unwrap()
+            .unwrap()
+            .token,
+        "share-token"
     );
+    assert_eq!(
+        reopened
+            .admin("admin")
+            .unwrap()
+            .unwrap()
+            .totp_secret
+            .expose_secret(),
+        "TOTP-SECRET"
+    );
+    let after: (u64, Vec<u8>, u64, Vec<u8>) = reopened
+        .conn()
+        .query_row(
+            "SELECT shares.token_key_id,shares.token_ciphertext,
+                    admins.totp_key_id,admins.totp_ciphertext
+             FROM shares JOIN admins ON admins.id=shares.created_by",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert!(after.0 > before.0);
+    assert!(after.2 > before.2);
+    assert_ne!(after.1, before.1);
+    assert_ne!(after.3, before.3);
+    assert_eq!(
+        std::fs::metadata(directory.path().join("secrets.keyring"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+}
+
+#[test]
+fn initialized_database_rejects_missing_or_unrelated_keyring_at_startup() {
+    let missing_directory = tempfile::tempdir().unwrap();
+    let missing_path = missing_directory.path().join("data.sqlite");
+    let database = Database::open(&missing_path).unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    drop(database);
+    std::fs::remove_file(missing_directory.path().join("secrets.keyring")).unwrap();
+    assert!(matches!(
+        Database::open(&missing_path),
+        Err(DatabaseError::Cryptography(_))
+    ));
+
+    let first_directory = tempfile::tempdir().unwrap();
+    let first_path = first_directory.path().join("data.sqlite");
+    let first = Database::open(&first_path).unwrap();
+    first.create_admin("admin", "hash", "secret").unwrap();
+    drop(first);
+
+    let second_directory = tempfile::tempdir().unwrap();
+    let second_path = second_directory.path().join("data.sqlite");
+    drop(Database::open(&second_path).unwrap());
+    std::fs::copy(
+        second_directory.path().join("secrets.keyring"),
+        first_directory.path().join("secrets.keyring"),
+    )
+    .unwrap();
+    assert!(matches!(
+        Database::open(&first_path),
+        Err(DatabaseError::Cryptography(_))
+    ));
+}
+
+#[test]
+fn startup_rejects_ciphertext_nonce_and_aad_manipulation() {
+    for manipulation in ["ciphertext", "nonce", "aad"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data.sqlite");
+        let database = Database::open(&path).unwrap();
+        database.create_admin("admin", "hash", "secret").unwrap();
+        database
+            .create_share(
+                "share-token",
+                None,
+                "file.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        if manipulation == "aad" {
+            database
+                .conn()
+                .execute("UPDATE shares SET token_hash=?1", ["0".repeat(64)])
+                .unwrap();
+        } else {
+            let mut ciphertext: Vec<u8> = database
+                .conn()
+                .query_row("SELECT token_ciphertext FROM shares", [], |row| row.get(0))
+                .unwrap();
+            let index = if manipulation == "nonce" {
+                0
+            } else {
+                ciphertext.len() - 1
+            };
+            ciphertext[index] ^= 0x80;
+            database
+                .conn()
+                .execute("UPDATE shares SET token_ciphertext=?1", [ciphertext])
+                .unwrap();
+        }
+        drop(database);
+        assert!(Database::open(&path).is_err(), "{manipulation}");
+    }
+}
+
+#[test]
+fn rejects_unversioned_legacy_and_wrong_schema_one_shape() {
+    for (version, sql) in [
+        (
+            0,
+            "CREATE TABLE shares(id INTEGER PRIMARY KEY, token TEXT NOT NULL);",
+        ),
+        (
+            1,
+            "CREATE TABLE shares(id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL);",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("legacy-{version}.sqlite"));
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(sql).unwrap();
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(connection);
+        assert!(Database::open(path).is_err());
+    }
 }
 
 #[test]
@@ -1948,162 +1882,6 @@ fn unlock_sessions_are_hashed_and_cascade_with_share() {
             })
             .unwrap(),
         0
-    );
-}
-
-#[test]
-fn migrates_v12_upload_shares_with_finite_quotas_and_read_only_unlocks() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("v12.sqlite");
-    {
-        let connection = Connection::open(&path).unwrap();
-        connection
-                .execute_batch(
-                    "CREATE TABLE admins(
-                         id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE,
-                         password_hash TEXT NOT NULL,totp_secret TEXT NOT NULL,
-                         created_at TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1
-                     );
-                     CREATE TABLE shares(
-                         id INTEGER PRIMARY KEY,token_hash TEXT NOT NULL UNIQUE,token TEXT NOT NULL,
-                         alias TEXT UNIQUE,relative_path TEXT NOT NULL,is_directory INTEGER NOT NULL,
-                         permission TEXT NOT NULL,expires_at TEXT,max_downloads INTEGER,
-                         max_upload_size INTEGER,download_count INTEGER NOT NULL DEFAULT 0,
-                         active INTEGER NOT NULL DEFAULT 1,created_by INTEGER NOT NULL,
-                         created_at TEXT NOT NULL,password_hash TEXT,
-                         upload_conflict_strategy TEXT NOT NULL DEFAULT 'reject'
-                     );
-                     CREATE TABLE public_unlock_sessions(
-                         token_hash TEXT PRIMARY KEY,share_id INTEGER NOT NULL,
-                         expires_at TEXT NOT NULL
-                     );
-                     INSERT INTO admins VALUES(1,'admin','hash','secret','now',1);
-                     INSERT INTO shares VALUES(
-                         1,'hash','token',NULL,'folder',1,'upload_only',NULL,NULL,
-                         150000000000,0,1,1,'now','password-hash','reject'
-                     );
-                     INSERT INTO public_unlock_sessions VALUES(
-                         'legacy-hash',1,'2999-01-01T00:00:00Z'
-                     );
-                     PRAGMA user_version=12;",
-                )
-                .unwrap();
-    }
-    let database = Database::open(&path).unwrap();
-    let share = database.list_shares().unwrap().remove(0);
-    assert_eq!(share.max_upload_total_size, Some(150_000_000_000));
-    assert_eq!(
-        share.max_upload_files,
-        Some(DEFAULT_SHARE_UPLOAD_FILE_COUNT)
-    );
-    let migrated_unlocks: u64 = database
-        .conn()
-        .query_row("SELECT COUNT(*) FROM public_unlock_sessions", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(migrated_unlocks, 0);
-    assert!(database
-        .unlock_session_csrf("unavailable-plaintext-token", 1)
-        .unwrap()
-        .is_none());
-}
-
-#[test]
-fn migrates_v13_preview_sessions_with_bounded_lookup_index() {
-    let mut connection = Connection::open_in_memory().unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE public_preview_sessions(
-                     token_hash TEXT PRIMARY KEY,
-                     share_id INTEGER NOT NULL,
-                     relative_path TEXT NOT NULL,
-                     expires_at TEXT NOT NULL
-                 );
-                 PRAGMA user_version=13;",
-        )
-        .unwrap();
-
-    migrate(&mut connection).unwrap();
-
-    let index_exists: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-                     SELECT 1 FROM sqlite_schema
-                     WHERE type='index' AND name='idx_preview_share_path_owner'
-                 )",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(index_exists);
-    let owner_column_exists: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-                     SELECT 1 FROM pragma_table_info('public_preview_sessions')
-                     WHERE name='owner_key_hash' AND \"notnull\"=1
-                 )",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(owner_column_exists);
-    assert_eq!(
-        connection
-            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
-            .unwrap(),
-        SCHEMA_VERSION
-    );
-}
-
-#[test]
-fn migrates_v14_upload_reservations_with_policy_epoch_fail_closed() {
-    let mut connection = Connection::open_in_memory().unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE shares(id INTEGER PRIMARY KEY);
-                 CREATE TABLE public_upload_reservations(
-                     token_hash TEXT PRIMARY KEY,
-                     share_id INTEGER NOT NULL,
-                     reserved_bytes INTEGER NOT NULL,
-                     created_at TEXT NOT NULL,
-                     expires_at TEXT NOT NULL
-                 );
-                 INSERT INTO shares VALUES(1);
-                 INSERT INTO public_upload_reservations
-                     VALUES('legacy-reservation',1,42,'now','later');
-                 PRAGMA user_version=14;",
-        )
-        .unwrap();
-
-    migrate(&mut connection).unwrap();
-
-    for table in ["shares", "public_upload_reservations"] {
-        let epoch_column_exists: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                         SELECT 1 FROM pragma_table_info(?1)
-                         WHERE name='upload_policy_epoch' AND \"notnull\"=1
-                     )",
-                [table],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(epoch_column_exists, "missing epoch column on {table}");
-    }
-    let legacy_reservations: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM public_upload_reservations",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(legacy_reservations, 0);
-    assert_eq!(
-        connection
-            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
-            .unwrap(),
-        SCHEMA_VERSION
     );
 }
 
@@ -2765,13 +2543,14 @@ fn preview_sessions_are_expiry_cleaned_and_bounded_per_share_path() {
         .conn()
         .execute(
             "INSERT INTO public_preview_sessions(
-                     token_hash,share_id,relative_path,expires_at
-                 ) VALUES(?1,?2,?3,?4)",
+                     token_hash,share_id,relative_path,expires_at,owner_key_hash
+                 ) VALUES(?1,?2,?3,?4,?5)",
             params![
                 token_hash("expired-preview"),
                 share_id,
                 "folder/expired.png",
-                (Utc::now() - Duration::minutes(1)).to_rfc3339()
+                (Utc::now() - Duration::minutes(1)).to_rfc3339(),
+                token_hash("owner-a")
             ],
         )
         .unwrap();
@@ -3168,7 +2947,10 @@ fn transfer_grant_reserves_and_counts_once_across_request_leases() {
         .unwrap();
 
     assert_eq!(
-        database.current_transfer_monthly_counts().unwrap().total(),
+        {
+            let counts = database.current_transfer_monthly_counts().unwrap();
+            counts.download + counts.zip_download + counts.preview
+        },
         0
     );
 
@@ -3416,9 +3198,12 @@ fn completed_transfers_increment_each_supported_monthly_action() {
     assert_eq!(counts.download, 1);
     assert_eq!(counts.zip_download, 1);
     assert_eq!(counts.preview, 1);
-    assert_eq!(counts.total(), 3);
+    assert_eq!(counts.download + counts.zip_download + counts.preview, 3);
     assert_eq!(
-        database.transfer_monthly_counts("2000-01").unwrap().total(),
+        {
+            let counts = database.transfer_monthly_counts("2000-01").unwrap();
+            counts.download + counts.zip_download + counts.preview
+        },
         0
     );
     assert!(database.transfer_monthly_counts("2026-00").is_err());
@@ -3517,7 +3302,10 @@ fn transfer_cancel_releases_only_the_final_pending_lease() {
         TransferLeaseBeginOutcome::NewLease
     );
     assert_eq!(
-        database.current_transfer_monthly_counts().unwrap().total(),
+        {
+            let counts = database.current_transfer_monthly_counts().unwrap();
+            counts.download + counts.zip_download + counts.preview
+        },
         0
     );
 }
@@ -3804,7 +3592,7 @@ fn webauthn_credentials_are_scoped_unique_and_mutable() {
         .update_admin_webauthn_credential(id, 1, "{\"v\":2}")
         .unwrap());
     let rows = database.admin_webauthn_credentials(1).unwrap();
-    assert_eq!(rows[0].credential_json, "{\"v\":2}");
+    assert_eq!(rows[0].credential_blob, b"{\"v\":2}");
     assert!(rows[0].last_used_at.is_some());
 
     assert!(!database.delete_admin_webauthn_credential(id, 2).unwrap());
@@ -3862,7 +3650,7 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
             credential_id,
             1,
             "hash",
-            "secret",
+            1,
             step,
             client_ip,
         )
@@ -3957,7 +3745,7 @@ fn security_mutation_webauthn_deletion_rejects_stale_credentials_and_session() {
                 first,
                 1,
                 "wrong-hash",
-                "original-secret",
+                1,
                 42,
                 None,
             )
@@ -3971,7 +3759,7 @@ fn security_mutation_webauthn_deletion_rejects_stale_credentials_and_session() {
                 first,
                 1,
                 "original-hash",
-                "wrong-secret",
+                2,
                 42,
                 None,
             )
@@ -3989,7 +3777,7 @@ fn security_mutation_webauthn_deletion_rejects_stale_credentials_and_session() {
                 first,
                 1,
                 "original-hash",
-                "original-secret",
+                1,
                 42,
                 None,
             )
@@ -4020,7 +3808,7 @@ fn security_mutation_webauthn_deletion_rejects_stale_credentials_and_session() {
                 first,
                 1,
                 "replacement-hash",
-                "original-secret",
+                1,
                 42,
                 None,
             )
@@ -4052,7 +3840,7 @@ fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
                 "authorized-session",
                 1,
                 "password-hash",
-                "totp-secret",
+                1,
                 false,
                 Some(41),
                 None,
@@ -4073,7 +3861,7 @@ fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
                 "authorized-session",
                 1,
                 "password-hash",
-                "totp-secret",
+                1,
                 false,
                 None,
                 None,
@@ -4087,7 +3875,7 @@ fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
                 "authorized-session",
                 1,
                 "password-hash",
-                "totp-secret",
+                1,
                 false,
                 Some(42),
                 Some("203.0.113.60"),
@@ -4136,7 +3924,7 @@ fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
                 "authorized-session",
                 1,
                 "password-hash",
-                "totp-secret",
+                1,
                 true,
                 None,
                 None,

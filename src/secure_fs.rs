@@ -1440,7 +1440,7 @@ mod tests {
         std::fs::write(&source, b"authorized").unwrap();
         let hook_source = source.clone();
         let hook_external = externally_moved.clone();
-        let hook_replacement = source.clone();
+        let hook_replacement = source;
         root.before_next_rename(move || {
             std::fs::rename(hook_source, hook_external).unwrap();
             std::fs::write(hook_replacement, b"replacement").unwrap();

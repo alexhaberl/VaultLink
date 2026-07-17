@@ -11,6 +11,7 @@ CONFIG_PATH="$WORK_DIR/config.toml"
 ROOT_DIR="$WORK_DIR/root"
 DATA_DIR="$WORK_DIR/data"
 CONTAINER_LOG="$WORK_DIR/container.log"
+COOKIE_JAR="$WORK_DIR/setup.cookies"
 ADMIN_PASSWORD="VaultLink setup smoke password 123!"
 
 cleanup() {
@@ -26,7 +27,11 @@ wait_http() {
     local expected="$2"
     for _ in $(seq 1 80); do
         local status
-        status="$(curl -sS -o /dev/null -w '%{http_code}' "$url" || true)"
+        if [[ -f "$COOKIE_JAR" ]]; then
+            status="$(curl -sS -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' "$url" || true)"
+        else
+            status="$(curl -sS -o /dev/null -w '%{http_code}' "$url" || true)"
+        fi
         if [[ "$status" == "$expected" ]]; then
             return 0
         fi
@@ -48,17 +53,22 @@ VAULTLINK_CONTAINER_ADDR="$PROXY_ADDR" \
 CONTAINER_PID="$!"
 
 wait_http "http://$PROXY_ADDR/" "401"
-TOKEN="$(sed -n 's#^http://[^?]*?token=##p' "$CONTAINER_LOG" | tail -n 1)"
+TOKEN="$(sed -n 's|^http://[^#]*#token=||p' "$CONTAINER_LOG" | tail -n 1)"
 if [[ -z "$TOKEN" ]]; then
     echo "Setup token was not printed" >&2
     cat "$CONTAINER_LOG" >&2
     exit 1
 fi
-wait_http "http://$PROXY_ADDR/?token=$TOKEN" "200"
+curl -sS -o /dev/null -w '%{http_code}' \
+    -c "$COOKIE_JAR" \
+    -H 'Content-Type: application/json' \
+    --data-binary "{\"token\":\"$TOKEN\"}" \
+    "http://$PROXY_ADDR/bootstrap" | grep -qx 204
+wait_http "http://$PROXY_ADDR/" "200"
 
 curl -sS -f -X POST "http://$PROXY_ADDR/" \
+    -b "$COOKIE_JAR" \
     -H "Accept-Language: de" \
-    --data-urlencode "token=$TOKEN" \
     --data-urlencode "server_mode=development" \
     --data-urlencode "listen_address=$INTERNAL_ADDR" \
     --data-urlencode "public_base_url=http://localhost:18081" \
@@ -92,8 +102,8 @@ curl -sS -f -X POST "http://$PROXY_ADDR/" \
     | grep -q "Setup abgeschlossen"
 
 curl -sS -f -X POST "http://$PROXY_ADDR/complete" \
+    -b "$COOKIE_JAR" \
     -H "Accept-Language: de" \
-    --data-urlencode "token=$TOKEN" \
     | grep -q "Setup best"
 
 test -s "$CONFIG_PATH"
@@ -122,8 +132,8 @@ for required_storage_field in internal_directory require_mount external_writers 
 done
 
 curl -sS -f -X POST "http://$PROXY_ADDR/start" \
+    -b "$COOKIE_JAR" \
     -H "Accept-Language: de" \
-    --data-urlencode "token=$TOKEN" \
     | grep -q "VaultLink wird gestartet"
 
 wait_http "http://$PROXY_ADDR/login" "200"

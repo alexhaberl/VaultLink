@@ -198,6 +198,8 @@ pub struct Security {
     pub session_hours: i64,
     #[serde(default = "default_attempts")]
     pub login_attempts: usize,
+    #[serde(default = "default_account_login_attempts")]
+    pub account_login_attempts: usize,
     #[serde(default = "default_window")]
     pub login_window_seconds: u64,
     #[serde(default = "yes")]
@@ -218,6 +220,7 @@ impl Default for Security {
         Self {
             session_hours: default_session_hours(),
             login_attempts: default_attempts(),
+            account_login_attempts: default_account_login_attempts(),
             login_window_seconds: default_window(),
             secure_cookie: true,
             share_password_min_length: default_share_password_min(),
@@ -233,6 +236,9 @@ fn default_session_hours() -> i64 {
 }
 fn default_attempts() -> usize {
     5
+}
+fn default_account_login_attempts() -> usize {
+    25
 }
 fn default_window() -> u64 {
     300
@@ -394,6 +400,11 @@ impl Config {
                         "development public_base_url must use http".into(),
                     ));
                 }
+                if self.tls.enabled {
+                    return Err(ConfigError::Invalid(
+                        "development mode must not enable application TLS".into(),
+                    ));
+                }
             }
             ServerMode::ReverseProxy => {
                 if !self.server.production_mode || url.scheme() != "https" {
@@ -405,6 +416,11 @@ impl Config {
                 if !self.reverse_proxy.enabled || self.reverse_proxy.trusted_proxies.is_empty() {
                     return Err(ConfigError::Invalid(
                         "reverse_proxy mode requires enabled=true and trusted_proxies".into(),
+                    ));
+                }
+                if !self.reverse_proxy.trust_x_forwarded_headers {
+                    return Err(ConfigError::Invalid(
+                        "reverse_proxy mode requires trust_x_forwarded_headers=true".into(),
                     ));
                 }
                 if !listen.ip().is_loopback() && !self.reverse_proxy.allow_non_loopback {
@@ -566,6 +582,11 @@ impl Config {
         if !(1..=MAX_AUTH_ATTEMPTS).contains(&self.security.login_attempts) {
             return Err(ConfigError::Invalid(format!(
                 "login_attempts must be between 1 and {MAX_AUTH_ATTEMPTS}"
+            )));
+        }
+        if !(1..=MAX_AUTH_ATTEMPTS).contains(&self.security.account_login_attempts) {
+            return Err(ConfigError::Invalid(format!(
+                "account_login_attempts must be between 1 and {MAX_AUTH_ATTEMPTS}"
             )));
         }
         if !(1..=MAX_LOGIN_WINDOW_SECONDS).contains(&self.security.login_window_seconds) {
@@ -1069,6 +1090,7 @@ mod tests {
         config.server.public_base_url = "https://vaultlink.example".into();
         config.security.secure_cookie = true;
         config.reverse_proxy.enabled = true;
+        config.reverse_proxy.trust_x_forwarded_headers = true;
         config.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
 
         let error = config.validate().unwrap_err().to_string();
@@ -1231,6 +1253,7 @@ mod tests {
         c.server.public_base_url = "https://vaultlink.example".into();
         c.security.secure_cookie = true;
         c.reverse_proxy.enabled = true;
+        c.reverse_proxy.trust_x_forwarded_headers = true;
         c.reverse_proxy.trusted_proxies = vec!["192.0.2.10".parse().unwrap()];
         assert!(c.validate().is_err());
         c.reverse_proxy.allow_non_loopback = true;
@@ -1252,6 +1275,7 @@ mod tests {
         c.server.public_base_url = "https://vaultlink.example".into();
         c.security.secure_cookie = true;
         c.reverse_proxy.enabled = true;
+        c.reverse_proxy.trust_x_forwarded_headers = true;
         c.reverse_proxy.allow_non_loopback = true;
         c.reverse_proxy.trusted_proxies = vec![
             "192.0.2.10".parse().unwrap(),
@@ -1405,6 +1429,7 @@ mod tests {
         c.server.public_base_url = "https://vaultlink.example".into();
         c.security.secure_cookie = true;
         c.reverse_proxy.enabled = true;
+        c.reverse_proxy.trust_x_forwarded_headers = true;
         c.reverse_proxy.allow_non_loopback = true;
         c.reverse_proxy.trusted_proxies =
             vec!["192.0.2.10".parse().unwrap(), "127.0.0.1".parse().unwrap()];

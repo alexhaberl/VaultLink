@@ -51,7 +51,7 @@ pub(super) struct FilesResponse {
 }
 
 pub(super) fn list_file_page(
-    secure_root: crate::secure_fs::SecureRoot,
+    secure_root: &crate::secure_fs::SecureRoot,
     relative: &str,
     page: usize,
     query: Option<&str>,
@@ -117,7 +117,6 @@ pub(super) async fn files(
             current_client_limit_key(),
             crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
         )
-        .map_err(ApiError::internal)?
         .ok_or_else(|| {
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -148,7 +147,7 @@ pub(super) async fn files(
         // create unbounded detached search work.
         let _scan_peer_permit = scan_peer_permit;
         let _scan_permit = scan_permit;
-        list_file_page(secure_root, &rel, page, search.as_deref(), scan_limit)
+        list_file_page(&secure_root, &rel, page, search.as_deref(), scan_limit)
     })
     .await
     .map_err(ApiError::internal)?

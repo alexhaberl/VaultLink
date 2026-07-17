@@ -5,6 +5,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
+use chrono::Utc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -22,10 +23,10 @@ use super::{
     preview_zip::{raw_preview_response, read_preview, PreviewContent},
     public_preview::text_preview_render_permits,
     rendering::{
-        admin_page, disk_stats, esc, escaped_html_len, storage_has_room, PageId,
+        admin_page, esc, escaped_html_len, storage_has_room, PageId, StorageReservationError,
         UploadChunkReservation,
     },
-    shares::{share_is_available, ShareQuery},
+    shares::ShareQuery,
     storage_recovery_app_error,
     transfer_runtime::{
         escaped_text_page_stream, limited_multipart_text, upload_io_error, PendingUploadFileError,
@@ -329,13 +330,20 @@ pub(super) async fn stage_admin_upload(
                 "Upload ist zu groß",
             ));
         };
-        let Some(_reservation) =
-            UploadChunkReservation::acquire(state.secure_root.display_root(), chunk.len() as u64)
-        else {
-            return Err(AppError(
-                StatusCode::INSUFFICIENT_STORAGE,
-                "Nicht genug freier Speicher",
-            ));
+        let _reservation = match UploadChunkReservation::acquire(state, chunk.len() as u64).await {
+            Ok(reservation) => reservation,
+            Err(StorageReservationError::CapacityUnavailable) => {
+                return Err(AppError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Speicherkapazität nicht ermittelbar",
+                ))
+            }
+            Err(StorageReservationError::InsufficientStorage) => {
+                return Err(AppError(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "Nicht genug freier Speicher",
+                ))
+            }
         };
         total = new_total;
         output.write_all(&chunk).await.map_err(upload_io_error)?;
@@ -421,22 +429,31 @@ pub(super) async fn process_admin_upload(
         current_client_limit_key(),
         crate::MAX_IN_FLIGHT_UPLOADS_PER_CLIENT,
     )
-    .map_err(internal)?
     .ok_or(AppError(
         StatusCode::SERVICE_UNAVAILABLE,
         "Zu viele gleichzeitige Uploads dieses Clients",
     ))?;
     let settings = runtime_settings(state);
-    if headers
+    if let Some(length) = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|length| !storage_has_room(state.secure_root.display_root(), length))
     {
-        return Err(AppError(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "Nicht genug freier Speicher",
-        ));
+        match storage_has_room(state, length).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(AppError(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "Nicht genug freier Speicher",
+                ))
+            }
+            Err(_) => {
+                return Err(AppError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Speicherkapazität nicht ermittelbar",
+                ))
+            }
+        }
     }
 
     let mut directory: Option<String> = None;
@@ -858,7 +875,11 @@ pub(super) async fn admin_browser(
 ) -> Result<Html<String>> {
     let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let settings = runtime_settings(&state);
-    let disk = disk_stats(state.secure_root.display_root());
+    let disk = state
+        .disk_stats_cache
+        .get(state.secure_root.display_root())
+        .await
+        .ok();
     let used_storage = disk
         .as_ref()
         .map(|stats| stats.total.saturating_sub(stats.free))
@@ -868,11 +889,10 @@ pub(super) async fn admin_browser(
         .as_ref()
         .map(|stats| human(stats.free))
         .unwrap_or_else(|| "n/v".into());
-    let active_links = database(state.db.clone(), |database| database.list_shares())
-        .await?
-        .into_iter()
-        .filter(share_is_available)
-        .count();
+    let active_links = database(state.db.clone(), |database| {
+        database.count_available_shares(Utc::now())
+    })
+    .await?;
     let sort_column = file_sort_column(q.sort.as_deref());
     let sort_direction = file_sort_direction(q.direction.as_deref());
     let raw = q.path.unwrap_or_default();
@@ -896,7 +916,6 @@ pub(super) async fn admin_browser(
         current_client_limit_key(),
         crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
     )
-    .map_err(internal)?
     .ok_or(AppError(
         StatusCode::SERVICE_UNAVAILABLE,
         "Zu viele gleichzeitige aufwendige Vorgänge dieses Clients",
@@ -917,7 +936,7 @@ pub(super) async fn admin_browser(
         let base = rel.clone();
         let search_settings = settings.clone();
         let mut hits = tokio::task::spawn_blocking(move || {
-            search_tree(secure_root, &base, &search, &search_settings)
+            search_tree(&secure_root, &base, &search, &search_settings)
         })
         .await
         .map_err(internal)?
@@ -1268,7 +1287,7 @@ pub(super) async fn admin_preview(
     let secure_root = state.secure_root.clone();
     let preview_path = rel.clone();
     let content =
-        tokio::task::spawn_blocking(move || read_preview(secure_root, &preview_path, &settings))
+        tokio::task::spawn_blocking(move || read_preview(&secure_root, &preview_path, &settings))
             .await
             .map_err(internal)?
             .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Vorschau nicht erlaubt"))?;

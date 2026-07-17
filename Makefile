@@ -22,7 +22,7 @@ security-test:
 	cargo test path_security
 	cargo test secure_fs
 	cargo test range
-	cargo test db::tests::migrates_unversioned_installation_without_losing_data
+	cargo test db::tests::fresh_database_is_exactly_schema_one_without_plaintext_secret_columns
 	cargo test proxy
 	cargo test auth
 	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh; else echo "shellcheck nicht installiert; Script-Prüfung übersprungen"; fi

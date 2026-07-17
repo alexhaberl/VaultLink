@@ -92,7 +92,7 @@ impl UploadFragmentCleanup {
                             Err(_) => batch.failed += 1,
                         }
                     } else if completed.removed_in_pass {
-                        match cleanup_directory_from_file(completed.directory, completed.policy) {
+                        match cleanup_directory_from_file(&completed.directory, completed.policy) {
                             Ok(directory) => self.directories.push(directory),
                             Err(_) => batch.failed += 1,
                         }
@@ -175,7 +175,7 @@ impl UploadFragmentCleanup {
                         self.visited.insert(identity);
                         let starts_deletion_root = current.policy == CleanupPolicy::TombstoneRoot;
                         let inherited_deletion_root = current.deletion_root.clone();
-                        match cleanup_directory_from_file(child, child_policy) {
+                        match cleanup_directory_from_file(&child, child_policy) {
                             Ok(mut directory) => {
                                 directory.remove_from =
                                     Some((current.directory.try_clone()?, name.clone()));
@@ -446,8 +446,8 @@ impl SecureRoot {
         let tombstone_identity = tombstones.metadata()?;
         Ok(UploadFragmentCleanup {
             directories: vec![
-                cleanup_directory_from_file(tombstones, CleanupPolicy::TombstoneRoot)?,
-                cleanup_directory_from_file(uploads, CleanupPolicy::UploadFragments)?,
+                cleanup_directory_from_file(&tombstones, CleanupPolicy::TombstoneRoot)?,
+                cleanup_directory_from_file(&uploads, CleanupPolicy::UploadFragments)?,
             ],
             visited: HashSet::from([
                 (upload_identity.dev(), upload_identity.ino()),
@@ -504,7 +504,7 @@ impl SecureRoot {
         )?;
         let metadata = directory.metadata()?;
         let deletion_root = Arc::new(directory.try_clone()?);
-        let mut cleanup = cleanup_directory_from_file(directory, CleanupPolicy::DeleteAll)?;
+        let mut cleanup = cleanup_directory_from_file(&directory, CleanupPolicy::DeleteAll)?;
         cleanup.remove_from = Some((
             self.tombstones.as_ref().try_clone()?,
             OsString::from(tombstone_name),
@@ -1025,7 +1025,7 @@ impl SecureDirectory {
 }
 
 fn cleanup_directory_from_file(
-    directory: File,
+    directory: &File,
     policy: CleanupPolicy,
 ) -> io::Result<CleanupDirectory> {
     use std::os::fd::AsRawFd;
@@ -1035,7 +1035,7 @@ fn cleanup_directory_from_file(
     // to O_RDONLY: unlinkat/openat still stay descriptor-relative, while fsync
     // during depth segmentation now works instead of failing with EBADF.
     let directory = linux::openat2_scoped(
-        &directory,
+        directory,
         ".",
         linux::O_RDONLY | linux::O_DIRECTORY | linux::O_NOFOLLOW,
         true,
@@ -1180,7 +1180,7 @@ pub(super) fn start_cleanup_from_directory(
 
     let root = root.try_clone()?;
     let metadata = root.metadata()?;
-    let directory = cleanup_directory_from_file(root, policy)?;
+    let directory = cleanup_directory_from_file(&root, policy)?;
     Ok(UploadFragmentCleanup {
         directories: vec![directory],
         visited: HashSet::from([(metadata.dev(), metadata.ino())]),

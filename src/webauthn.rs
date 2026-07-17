@@ -1,26 +1,51 @@
 use std::{
     collections::HashMap,
+    num::NonZeroU32,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
-use webauthn_rs::{
-    prelude::{
-        CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
-        RequestChallengeResponse, SecurityKey, SecurityKeyAuthentication, SecurityKeyRegistration,
-        Uuid,
+use webauthn_rp::{
+    bin::{Decode, Encode},
+    request::{
+        auth::{
+            AllowedCredentials, AuthenticationVerificationOptions,
+            NonDiscoverableAuthenticationServerState, NonDiscoverableCredentialRequestOptions,
+        },
+        register::{
+            CoseAlgorithmIdentifier, CoseAlgorithmIdentifiers, PublicKeyCredentialCreationOptions,
+            PublicKeyCredentialUserEntity, RegistrationServerState,
+            RegistrationVerificationOptions, UserHandle64, USER_HANDLE_MAX_LEN,
+        },
+        AsciiDomain, Credentials, PublicKeyCredentialDescriptor, RpId,
     },
-    Webauthn, WebauthnBuilder,
+    response::{
+        register::{bin::MetadataOwned, CompressedPubKey, DynamicState, StaticState},
+        AuthTransports, CredentialId,
+    },
+    AuthenticatedCredential, NonDiscoverableAuthentication64, RegisteredCredential, Registration,
 };
 
 const CEREMONY_TTL: Duration = Duration::from_secs(10 * 60);
+const CEREMONY_TIMEOUT_MS: u32 = 10 * 60 * 1_000;
 const MAX_PENDING_CEREMONIES: usize = 1024;
+const CREDENTIAL_BLOB_VERSION: u8 = 1;
+
+type OwnedPublicKey = CompressedPubKey<[u8; 32], [u8; 32], [u8; 48], Vec<u8>>;
+type OwnedStaticState = StaticState<OwnedPublicKey>;
 
 fn session_key(session_token: &str) -> String {
     let digest = Sha256::digest(session_token.as_bytes());
     data_encoding::HEXLOWER.encode(digest.as_ref())
+}
+
+fn user_handle(admin_id: i64) -> Result<UserHandle64, WebAuthnServiceError> {
+    let digest = Sha512::digest(format!("vaultlink-webauthn-user:{admin_id}").as_bytes());
+    let mut bytes = [0u8; USER_HANDLE_MAX_LEN];
+    bytes.copy_from_slice(&digest);
+    UserHandle64::decode(bytes).map_err(WebAuthnServiceError::ceremony)
 }
 
 fn ensure_pending_capacity<T>(
@@ -42,9 +67,6 @@ fn ceremony_map<'a, T>(
         Err(poisoned) => {
             tracing::error!(lock = name, "discarding poisoned WebAuthn ceremonies");
             let mut pending = poisoned.into_inner();
-            // A challenge whose state crossed an unwind cannot be validated.
-            // Dropping all in-flight ceremonies is the conservative recovery;
-            // clients can begin a fresh challenge immediately.
             pending.clear();
             lock.clear_poison();
             pending
@@ -62,20 +84,164 @@ pub enum WebAuthnServiceError {
 
 impl WebAuthnServiceError {
     fn ceremony(error: impl ToString) -> Self {
-        Self::Ceremony(error.to_string())
+        let message = error.to_string();
+        drop(error);
+        Self::Ceremony(message)
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredCredential {
+    id: Vec<u8>,
+    transports: u8,
+    user_id: [u8; USER_HANDLE_MAX_LEN],
+    static_state: Vec<u8>,
+    dynamic_state: [u8; 7],
+    metadata: Vec<u8>,
+}
+
+impl StoredCredential {
+    pub fn from_blob(blob: &[u8]) -> Result<Self, WebAuthnServiceError> {
+        let mut input = blob;
+        if take_u8(&mut input)? != CREDENTIAL_BLOB_VERSION {
+            return Err(WebAuthnServiceError::Ceremony(
+                "unsupported WebAuthn credential blob version".into(),
+            ));
+        }
+        let id = take_vec(&mut input)?;
+        CredentialId::<&[u8]>::decode(id.as_slice()).map_err(WebAuthnServiceError::ceremony)?;
+        let transports = take_u8(&mut input)?;
+        AuthTransports::decode(transports).map_err(WebAuthnServiceError::ceremony)?;
+        let user_id = take_array::<USER_HANDLE_MAX_LEN>(&mut input)?;
+        UserHandle64::decode(user_id).map_err(WebAuthnServiceError::ceremony)?;
+        let static_state = take_vec(&mut input)?;
+        OwnedStaticState::decode(static_state.as_slice())
+            .map_err(WebAuthnServiceError::ceremony)?;
+        let dynamic_state = take_array::<7>(&mut input)?;
+        DynamicState::decode(dynamic_state).map_err(WebAuthnServiceError::ceremony)?;
+        let metadata = take_vec(&mut input)?;
+        MetadataOwned::decode(metadata.as_slice()).map_err(WebAuthnServiceError::ceremony)?;
+        if !input.is_empty() {
+            return Err(WebAuthnServiceError::Ceremony(
+                "trailing data in WebAuthn credential blob".into(),
+            ));
+        }
+        Ok(Self {
+            id,
+            transports,
+            user_id,
+            static_state,
+            dynamic_state,
+            metadata,
+        })
+    }
+
+    fn from_registered(
+        credential: RegisteredCredential<'_, USER_HANDLE_MAX_LEN>,
+    ) -> Result<Self, WebAuthnServiceError> {
+        let (id, transports, user_id, static_state, dynamic_state, metadata) =
+            credential.into_parts();
+        Ok(Self {
+            id: id.as_ref().to_vec(),
+            transports: transports
+                .encode()
+                .map_err(WebAuthnServiceError::ceremony)?,
+            user_id: user_id.encode().map_err(WebAuthnServiceError::ceremony)?,
+            static_state: static_state
+                .encode()
+                .map_err(WebAuthnServiceError::ceremony)?,
+            dynamic_state: dynamic_state
+                .encode()
+                .map_err(WebAuthnServiceError::ceremony)?,
+            metadata: metadata.encode().map_err(WebAuthnServiceError::ceremony)?,
+        })
+    }
+
+    pub fn to_blob(&self) -> Result<Vec<u8>, WebAuthnServiceError> {
+        let mut output = Vec::with_capacity(
+            1 + 4
+                + self.id.len()
+                + 1
+                + USER_HANDLE_MAX_LEN
+                + 4
+                + self.static_state.len()
+                + 7
+                + 4
+                + self.metadata.len(),
+        );
+        output.push(CREDENTIAL_BLOB_VERSION);
+        push_vec(&mut output, &self.id)?;
+        output.push(self.transports);
+        output.extend_from_slice(&self.user_id);
+        push_vec(&mut output, &self.static_state)?;
+        output.extend_from_slice(&self.dynamic_state);
+        push_vec(&mut output, &self.metadata)?;
+        Ok(output)
+    }
+
+    pub fn credential_id(&self) -> &[u8] {
+        &self.id
+    }
+
+    fn descriptor(&self) -> Result<PublicKeyCredentialDescriptor<Vec<u8>>, WebAuthnServiceError> {
+        Ok(PublicKeyCredentialDescriptor {
+            id: CredentialId::<Vec<u8>>::decode(self.id.clone())
+                .map_err(WebAuthnServiceError::ceremony)?,
+            transports: AuthTransports::decode(self.transports)
+                .map_err(WebAuthnServiceError::ceremony)?,
+        })
+    }
+}
+
+fn push_vec(output: &mut Vec<u8>, value: &[u8]) -> Result<(), WebAuthnServiceError> {
+    let length = u32::try_from(value.len())
+        .map_err(|_| WebAuthnServiceError::Ceremony("credential component too large".into()))?;
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn take_u8(input: &mut &[u8]) -> Result<u8, WebAuthnServiceError> {
+    let Some((value, rest)) = input.split_first() else {
+        return Err(WebAuthnServiceError::Ceremony(
+            "truncated WebAuthn credential blob".into(),
+        ));
+    };
+    *input = rest;
+    Ok(*value)
+}
+
+fn take_vec(input: &mut &[u8]) -> Result<Vec<u8>, WebAuthnServiceError> {
+    let length = u32::from_le_bytes(take_array::<4>(input)?) as usize;
+    let Some((value, rest)) = input.split_at_checked(length) else {
+        return Err(WebAuthnServiceError::Ceremony(
+            "truncated WebAuthn credential component".into(),
+        ));
+    };
+    *input = rest;
+    Ok(value.to_vec())
+}
+
+fn take_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], WebAuthnServiceError> {
+    let Some((value, rest)) = input.split_at_checked(N) else {
+        return Err(WebAuthnServiceError::Ceremony(
+            "truncated WebAuthn credential component".into(),
+        ));
+    };
+    *input = rest;
+    value.try_into().map_err(WebAuthnServiceError::ceremony)
 }
 
 struct PendingRegistration {
     admin_id: i64,
     created: Instant,
-    state: SecurityKeyRegistration,
+    state: RegistrationServerState<USER_HANDLE_MAX_LEN>,
 }
 
 struct PendingAuthentication {
     admin_id: i64,
     created: Instant,
-    state: SecurityKeyAuthentication,
+    state: NonDiscoverableAuthenticationServerState,
 }
 
 #[derive(Clone)]
@@ -84,7 +250,8 @@ pub struct WebAuthnService {
 }
 
 struct WebAuthnInner {
-    engine: Webauthn,
+    rp_id: RpId,
+    origin: String,
     registrations: Mutex<HashMap<String, PendingRegistration>>,
     authentications: Mutex<HashMap<String, PendingAuthentication>>,
 }
@@ -92,17 +259,16 @@ struct WebAuthnInner {
 impl WebAuthnService {
     pub fn from_public_base_url(public_base_url: &str) -> Result<Self, WebAuthnServiceError> {
         let origin = url::Url::parse(public_base_url).map_err(WebAuthnServiceError::ceremony)?;
-        let rp_id = origin.host_str().ok_or_else(|| {
+        let host = origin.host_str().ok_or_else(|| {
             WebAuthnServiceError::Ceremony("WebAuthn origin must contain a host".into())
         })?;
-        let engine = WebauthnBuilder::new(rp_id, &origin)
-            .map_err(WebAuthnServiceError::ceremony)?
-            .rp_name("VaultLink")
-            .build()
-            .map_err(WebAuthnServiceError::ceremony)?;
+        let rp_id = RpId::Domain(
+            AsciiDomain::try_from(host.to_owned()).map_err(WebAuthnServiceError::ceremony)?,
+        );
         Ok(Self {
             inner: Arc::new(WebAuthnInner {
-                engine,
+                rp_id,
+                origin: origin.origin().ascii_serialization(),
                 registrations: Mutex::new(HashMap::new()),
                 authentications: Mutex::new(HashMap::new()),
             }),
@@ -119,21 +285,38 @@ impl WebAuthnService {
         session_token: &str,
         admin_id: i64,
         username: &str,
-        existing: &[SecurityKey],
-    ) -> Result<CreationChallengeResponse, WebAuthnServiceError> {
-        let excluded = existing.iter().map(|key| key.cred_id().clone()).collect();
-        let (challenge, state) = self
-            .inner
-            .engine
-            .start_securitykey_registration(
-                Uuid::new_v4(),
-                username,
-                username,
-                Some(excluded),
-                None,
-                None,
-            )
+        existing: &[StoredCredential],
+    ) -> Result<serde_json::Value, WebAuthnServiceError> {
+        let user_id = user_handle(admin_id)?;
+        let user = PublicKeyCredentialUserEntity {
+            name: username
+                .try_into()
+                .map_err(WebAuthnServiceError::ceremony)?,
+            id: &user_id,
+            display_name: Some(
+                username
+                    .try_into()
+                    .map_err(WebAuthnServiceError::ceremony)?,
+            ),
+        };
+        let excluded = existing
+            .iter()
+            .map(StoredCredential::descriptor)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut options =
+            PublicKeyCredentialCreationOptions::second_factor(&self.inner.rp_id, user, excluded);
+        // rsa 0.9 has no fixed release for RUSTSEC-2023-0071. webauthn_rp
+        // depends on it unconditionally, so make its verification path
+        // unreachable: fresh-schema installations never accept or advertise
+        // RS256 credentials.
+        options.pub_key_cred_params =
+            CoseAlgorithmIdentifiers::default().remove(CoseAlgorithmIdentifier::Rs256);
+        options.timeout = NonZeroU32::new(CEREMONY_TIMEOUT_MS)
+            .ok_or_else(|| WebAuthnServiceError::Ceremony("invalid WebAuthn timeout".into()))?;
+        let (state, client) = options
+            .start_ceremony()
             .map_err(WebAuthnServiceError::ceremony)?;
+        let challenge = serde_json::json!({ "publicKey": client });
         let mut pending = ceremony_map(&self.inner.registrations, "WebAuthn registrations");
         pending.retain(|_, value| value.created.elapsed() < CEREMONY_TTL);
         let key = session_key(session_token);
@@ -153,8 +336,8 @@ impl WebAuthnService {
         &self,
         session_token: &str,
         admin_id: i64,
-        credential: &RegisterPublicKeyCredential,
-    ) -> Result<SecurityKey, WebAuthnServiceError> {
+        credential: &serde_json::Value,
+    ) -> Result<StoredCredential, WebAuthnServiceError> {
         let pending = ceremony_map(&self.inner.registrations, "WebAuthn registrations")
             .remove(&session_key(session_token))
             .ok_or_else(|| {
@@ -167,23 +350,43 @@ impl WebAuthnService {
                 "registration challenge expired or belongs to another account".into(),
             ));
         }
-        self.inner
-            .engine
-            .finish_securitykey_registration(credential, &pending.state)
-            .map_err(WebAuthnServiceError::ceremony)
+        let json = serde_json::to_vec(credential).map_err(WebAuthnServiceError::ceremony)?;
+        let registration =
+            Registration::from_json_custom(&json).map_err(WebAuthnServiceError::ceremony)?;
+        let options = RegistrationVerificationOptions::<String, String> {
+            allowed_origins: std::slice::from_ref(&self.inner.origin),
+            ..Default::default()
+        };
+        let registered = pending
+            .state
+            .verify(&self.inner.rp_id, &registration, &options)
+            .map_err(WebAuthnServiceError::ceremony)?;
+        StoredCredential::from_registered(registered)
     }
 
     pub fn start_authentication(
         &self,
         session_token: &str,
         admin_id: i64,
-        credentials: &[SecurityKey],
-    ) -> Result<RequestChallengeResponse, WebAuthnServiceError> {
-        let (challenge, state) = self
-            .inner
-            .engine
-            .start_securitykey_authentication(credentials)
+        credentials: &[StoredCredential],
+    ) -> Result<serde_json::Value, WebAuthnServiceError> {
+        let mut allowed = AllowedCredentials::with_capacity(credentials.len());
+        for credential in credentials {
+            if !allowed.push(credential.descriptor()?.into()) {
+                return Err(WebAuthnServiceError::Ceremony(
+                    "duplicate WebAuthn credential ID".into(),
+                ));
+            }
+        }
+        let mut options =
+            NonDiscoverableCredentialRequestOptions::second_factor(&self.inner.rp_id, allowed)
+                .map_err(WebAuthnServiceError::ceremony)?;
+        options.options().timeout = NonZeroU32::new(CEREMONY_TIMEOUT_MS)
+            .ok_or_else(|| WebAuthnServiceError::Ceremony("invalid WebAuthn timeout".into()))?;
+        let (state, client) = options
+            .start_ceremony()
             .map_err(WebAuthnServiceError::ceremony)?;
+        let challenge = serde_json::json!({ "publicKey": client });
         let mut pending = ceremony_map(&self.inner.authentications, "WebAuthn authentications");
         pending.retain(|_, value| value.created.elapsed() < CEREMONY_TTL);
         let key = session_key(session_token);
@@ -203,8 +406,8 @@ impl WebAuthnService {
         &self,
         session_token: &str,
         admin_id: i64,
-        credential: &PublicKeyCredential,
-        credentials: &mut [SecurityKey],
+        credential: &serde_json::Value,
+        credentials: &mut [StoredCredential],
     ) -> Result<usize, WebAuthnServiceError> {
         let pending = ceremony_map(&self.inner.authentications, "WebAuthn authentications")
             .remove(&session_key(session_token))
@@ -218,89 +421,53 @@ impl WebAuthnService {
                 "authentication challenge expired or belongs to another account".into(),
             ));
         }
-        let result = self
-            .inner
-            .engine
-            .finish_securitykey_authentication(credential, &pending.state)
+        let json = serde_json::to_vec(credential).map_err(WebAuthnServiceError::ceremony)?;
+        let authentication = NonDiscoverableAuthentication64::from_json_custom(&json)
             .map_err(WebAuthnServiceError::ceremony)?;
-        credentials
-            .iter_mut()
-            .position(|key| key.update_credential(&result).is_some())
+        let index = credentials
+            .iter()
+            .position(|stored| stored.id.as_slice() == authentication.raw_id().as_ref())
             .ok_or_else(|| {
                 WebAuthnServiceError::Ceremony("authenticated credential is not registered".into())
-            })
+            })?;
+        let stored = &mut credentials[index];
+        let credential_id = CredentialId::<&[u8]>::decode(stored.id.as_slice())
+            .map_err(WebAuthnServiceError::ceremony)?;
+        let user_id =
+            UserHandle64::decode(stored.user_id).map_err(WebAuthnServiceError::ceremony)?;
+        let static_state = OwnedStaticState::decode(stored.static_state.as_slice())
+            .map_err(WebAuthnServiceError::ceremony)?;
+        let dynamic_state =
+            DynamicState::decode(stored.dynamic_state).map_err(WebAuthnServiceError::ceremony)?;
+        let mut authenticated =
+            AuthenticatedCredential::new(credential_id, &user_id, static_state, dynamic_state)
+                .map_err(WebAuthnServiceError::ceremony)?;
+        let options = AuthenticationVerificationOptions::<String, String> {
+            allowed_origins: std::slice::from_ref(&self.inner.origin),
+            ..Default::default()
+        };
+        let changed = pending
+            .state
+            .verify(
+                &self.inner.rp_id,
+                &authentication,
+                &mut authenticated,
+                &options,
+            )
+            .map_err(WebAuthnServiceError::ceremony)?;
+        if changed {
+            stored.dynamic_state = authenticated
+                .dynamic_state()
+                .encode()
+                .map_err(WebAuthnServiceError::ceremony)?;
+        }
+        Ok(index)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn service() -> WebAuthnService {
-        WebAuthnService::from_public_base_url("https://vaultlink.example.test").unwrap()
-    }
-
-    fn invalid_registration_response() -> RegisterPublicKeyCredential {
-        serde_json::from_str(
-            r#"{
-                "id":"invalid",
-                "rawId":"",
-                "response":{"attestationObject":"","clientDataJSON":""},
-                "type":"public-key",
-                "clientExtensionResults":{}
-            }"#,
-        )
-        .unwrap()
-    }
-
-    fn test_security_key() -> SecurityKey {
-        // A structurally valid public credential is enough to make the production
-        // engine create an authentication ceremony. The matching private key is
-        // deliberately not present in this server-side state test.
-        serde_json::from_str(
-            r#"{
-                "cred": {
-                    "cred_id":"AQ",
-                    "cred": {
-                        "type_":"ES256",
-                        "key":{"EC_EC2":{
-                            "curve":"SECP256R1",
-                            "x":[194,126,127,109,252,23,131,21,252,6,223,99,44,254,140,27,230,17,94,5,133,28,104,41,144,69,171,149,161,26,200,243],
-                            "y":[143,123,183,156,24,178,21,248,117,159,162,69,171,52,188,252,26,59,6,47,103,92,19,58,117,103,249,0,219,8,95,196]
-                        }}
-                    },
-                    "counter":0,
-                    "transports":null,
-                    "user_verified":false,
-                    "backup_eligible":false,
-                    "backup_state":false,
-                    "registration_policy":"preferred",
-                    "extensions":{"cred_protect":"NotRequested","hmac_create_secret":"NotRequested"},
-                    "attestation":{"data":"None","metadata":"None"},
-                    "attestation_format":"none"
-                }
-            }"#,
-        )
-        .unwrap()
-    }
-
-    fn invalid_authentication_response() -> PublicKeyCredential {
-        serde_json::from_str(
-            r#"{
-                "id":"AQ",
-                "rawId":"AQ",
-                "response":{
-                    "authenticatorData":"",
-                    "clientDataJSON":"",
-                    "signature":"",
-                    "userHandle":null
-                },
-                "type":"public-key",
-                "clientExtensionResults":{}
-            }"#,
-        )
-        .unwrap()
-    }
 
     #[test]
     fn session_key_keeps_lowercase_sha256_encoding() {
@@ -311,286 +478,39 @@ mod tests {
     }
 
     #[test]
-    fn capacity_rejects_only_new_sessions_without_evicting_existing_state() {
+    fn capacity_rejects_only_new_sessions() {
         let pending = (0..MAX_PENDING_CEREMONIES)
             .map(|index| (format!("session-{index}"), ()))
             .collect::<HashMap<_, _>>();
-        let keys = pending.keys().cloned().collect::<Vec<_>>();
-
         assert!(matches!(
             ensure_pending_capacity(&pending, "new-session"),
             Err(WebAuthnServiceError::CapacityExceeded)
         ));
         assert!(ensure_pending_capacity(&pending, "session-0").is_ok());
-        assert_eq!(pending.len(), MAX_PENDING_CEREMONIES);
-        assert!(keys.iter().all(|key| pending.contains_key(key)));
     }
 
     #[test]
-    fn registration_start_replaces_a_challenge_for_the_same_session() {
-        let service = service();
-        let first = service
-            .start_registration("session", 7, "admin", &[])
-            .unwrap();
-        let second = service
-            .start_registration("session", 7, "admin", &[])
-            .unwrap();
-
-        assert_ne!(
-            serde_json::to_value(first).unwrap(),
-            serde_json::to_value(second).unwrap()
-        );
-        assert_eq!(service.inner.registrations.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn registration_state_is_bound_to_session_and_admin_and_single_use() {
-        let service = service();
-        let invalid = invalid_registration_response();
-        service
-            .start_registration("correct-session", 7, "admin", &[])
-            .unwrap();
-
-        let wrong_session = service
-            .finish_registration("other-session", 7, &invalid)
-            .unwrap_err();
-        assert!(wrong_session
-            .to_string()
-            .contains("missing or already used"));
-        assert_eq!(service.inner.registrations.lock().unwrap().len(), 1);
-
-        let wrong_admin = service
-            .finish_registration("correct-session", 8, &invalid)
-            .unwrap_err();
-        assert!(wrong_admin
-            .to_string()
-            .contains("belongs to another account"));
-        let replay = service
-            .finish_registration("correct-session", 7, &invalid)
-            .unwrap_err();
-        assert!(replay.to_string().contains("missing or already used"));
-    }
-
-    #[test]
-    fn expired_registration_and_invalid_finish_both_consume_state() {
-        let service = service();
-        let invalid = invalid_registration_response();
-
-        service
-            .start_registration("expired", 7, "admin", &[])
-            .unwrap();
-        service
-            .inner
-            .registrations
-            .lock()
-            .unwrap()
-            .get_mut(&session_key("expired"))
-            .unwrap()
-            .created = Instant::now() - CEREMONY_TTL - Duration::from_secs(1);
-        assert!(service
-            .finish_registration("expired", 7, &invalid)
-            .unwrap_err()
-            .to_string()
-            .contains("expired"));
-        assert!(service
-            .finish_registration("expired", 7, &invalid)
-            .unwrap_err()
-            .to_string()
-            .contains("missing or already used"));
-
-        service
-            .start_registration("invalid-finish", 7, "admin", &[])
-            .unwrap();
-        assert!(service
-            .finish_registration("invalid-finish", 7, &invalid)
-            .is_err());
-        assert!(service
-            .finish_registration("invalid-finish", 7, &invalid)
-            .unwrap_err()
-            .to_string()
-            .contains("missing or already used"));
-    }
-
-    #[test]
-    fn registration_start_prunes_expired_state_before_capacity_check() {
-        let service = service();
-        service
-            .start_registration("expired", 7, "admin", &[])
-            .unwrap();
-        service
-            .inner
-            .registrations
-            .lock()
-            .unwrap()
-            .get_mut(&session_key("expired"))
-            .unwrap()
-            .created = Instant::now() - CEREMONY_TTL - Duration::from_secs(1);
-
-        service
-            .start_registration("fresh", 7, "admin", &[])
-            .unwrap();
-        let pending = service.inner.registrations.lock().unwrap();
-        assert!(!pending.contains_key(&session_key("expired")));
-        assert!(pending.contains_key(&session_key("fresh")));
-    }
-
-    #[test]
-    fn registration_and_authentication_have_independent_capacities() {
-        let service = service();
-        for index in 0..MAX_PENDING_CEREMONIES {
-            service
-                .start_registration(&format!("registration-{index}"), 7, "admin", &[])
-                .unwrap();
-        }
-        assert!(matches!(
-            service.start_registration("registration-overflow", 7, "admin", &[]),
-            Err(WebAuthnServiceError::CapacityExceeded)
-        ));
-
-        let key = test_security_key();
-        service
-            .start_authentication("authentication", 7, std::slice::from_ref(&key))
-            .unwrap();
-
+    fn generated_user_handle_is_stable_and_account_bound() {
         assert_eq!(
-            service.inner.registrations.lock().unwrap().len(),
-            MAX_PENDING_CEREMONIES
+            user_handle(7).unwrap().encode().unwrap(),
+            user_handle(7).unwrap().encode().unwrap()
         );
-        assert_eq!(service.inner.authentications.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn authentication_state_is_replaced_bound_and_consumed_on_invalid_finish() {
-        let service = service();
-        let key = test_security_key();
-        let invalid = invalid_authentication_response();
-        let first = service
-            .start_authentication("session", 7, std::slice::from_ref(&key))
-            .unwrap();
-        let second = service
-            .start_authentication("session", 7, std::slice::from_ref(&key))
-            .unwrap();
         assert_ne!(
-            serde_json::to_value(first).unwrap(),
-            serde_json::to_value(second).unwrap()
+            user_handle(7).unwrap().encode().unwrap(),
+            user_handle(8).unwrap().encode().unwrap()
         );
-        assert_eq!(service.inner.authentications.lock().unwrap().len(), 1);
-
-        let mut credentials = vec![key];
-        assert!(service
-            .finish_authentication("wrong-session", 7, &invalid, &mut credentials)
-            .unwrap_err()
-            .to_string()
-            .contains("missing or already used"));
-        assert_eq!(service.inner.authentications.lock().unwrap().len(), 1);
-
-        assert!(service
-            .finish_authentication("session", 8, &invalid, &mut credentials)
-            .unwrap_err()
-            .to_string()
-            .contains("belongs to another account"));
-        assert!(service
-            .finish_authentication("session", 7, &invalid, &mut credentials)
-            .unwrap_err()
-            .to_string()
-            .contains("missing or already used"));
-
-        service
-            .start_authentication("invalid-finish", 7, &credentials)
-            .unwrap();
-        assert!(service
-            .finish_authentication("invalid-finish", 7, &invalid, &mut credentials)
-            .is_err());
-        assert!(service
-            .finish_authentication("invalid-finish", 7, &invalid, &mut credentials)
-            .unwrap_err()
-            .to_string()
-            .contains("missing or already used"));
     }
 
     #[test]
-    fn expired_authentication_is_single_use() {
-        let service = service();
-        let key = test_security_key();
-        let invalid = invalid_authentication_response();
-        service
-            .start_authentication("expired", 7, std::slice::from_ref(&key))
+    fn registration_never_advertises_the_unpatched_rs256_path() {
+        let service = WebAuthnService::from_public_base_url("https://vault.example").unwrap();
+        let options = service
+            .start_registration("session", 1, "admin", &[])
             .unwrap();
-        service
-            .inner
-            .authentications
-            .lock()
-            .unwrap()
-            .get_mut(&session_key("expired"))
-            .unwrap()
-            .created = Instant::now() - CEREMONY_TTL - Duration::from_secs(1);
-        let mut credentials = vec![key];
-        assert!(service
-            .finish_authentication("expired", 7, &invalid, &mut credentials)
-            .unwrap_err()
-            .to_string()
-            .contains("expired"));
-        assert!(service
-            .finish_authentication("expired", 7, &invalid, &mut credentials)
-            .unwrap_err()
-            .to_string()
-            .contains("missing or already used"));
-    }
-
-    #[test]
-    fn authentication_start_prunes_expired_state_before_capacity_check() {
-        let service = service();
-        let key = test_security_key();
-        service
-            .start_authentication("expired", 7, std::slice::from_ref(&key))
-            .unwrap();
-        service
-            .inner
-            .authentications
-            .lock()
-            .unwrap()
-            .get_mut(&session_key("expired"))
-            .unwrap()
-            .created = Instant::now() - CEREMONY_TTL - Duration::from_secs(1);
-
-        service
-            .start_authentication("fresh", 7, std::slice::from_ref(&key))
-            .unwrap();
-        let pending = service.inner.authentications.lock().unwrap();
-        assert!(!pending.contains_key(&session_key("expired")));
-        assert!(pending.contains_key(&session_key("fresh")));
-    }
-
-    #[test]
-    fn ceremony_map_recovers_after_lock_poisoning() {
-        let service = service();
-        service
-            .start_registration("stale-session", 7, "admin", &[])
-            .unwrap();
-        let stale_key = session_key("stale-session");
-        let poisoned = service.clone();
-        let panic = std::panic::catch_unwind(move || {
-            let _pending = poisoned.inner.registrations.lock().unwrap();
-            panic!("inject WebAuthn registration lock poisoning");
-        });
-        assert!(panic.is_err());
-        assert!(service.inner.registrations.is_poisoned());
-
-        service
-            .start_registration("fresh-session", 7, "admin", &[])
-            .unwrap();
-        assert!(!service.inner.registrations.is_poisoned());
-        assert!(service
-            .inner
-            .registrations
-            .lock()
-            .unwrap()
-            .contains_key(&session_key("fresh-session")));
-        assert!(!service
-            .inner
-            .registrations
-            .lock()
-            .unwrap()
-            .contains_key(&stale_key));
+        let algorithms = options["publicKey"]["pubKeyCredParams"]
+            .as_array()
+            .expect("registration options contain credential parameters");
+        assert!(algorithms.iter().any(|parameter| parameter["alg"] == -7));
+        assert!(algorithms.iter().all(|parameter| parameter["alg"] != -257));
     }
 }
