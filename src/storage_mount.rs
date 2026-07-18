@@ -336,6 +336,36 @@ pub fn validate_and_open(storage: &Storage) -> Result<ValidatedStorage, StorageM
     Ok(validated)
 }
 
+#[cfg(test)]
+pub(crate) fn validate_and_open_without_mount_policy(
+    storage: &Storage,
+) -> Result<ValidatedStorage, StorageMountError> {
+    let root = ValidatedDirectory::open(&storage.root_mount_path, "test root_mount_path")?;
+    let data = ValidatedDirectory::open(&storage.data_directory, "test data_directory")?;
+    let internal_path = storage
+        .internal_directory
+        .as_deref()
+        .ok_or_else(|| mount_error("internal_directory is missing"))?;
+    let internal = ValidatedDirectory::open(internal_path, "test internal_directory")?;
+    validate_canonical_relationships(
+        &root.canonical_path,
+        &internal.canonical_path,
+        &data.canonical_path,
+        storage.internal_directory_is_nested(),
+    )?;
+    validate_service_owned_directory_capability(&root, "root_mount_path")?;
+    validate_service_owned_directory_capability(&internal, "internal_directory")?;
+    validate_service_owned_directory_capability(&data, "data_directory")?;
+
+    let validated = ValidatedStorage {
+        root,
+        internal: Some(internal),
+        data,
+    };
+    validated.verify_path_bindings(storage)?;
+    Ok(validated)
+}
+
 fn reject_unconfigured_remote_storage(
     storage: &Storage,
 ) -> Result<ValidatedStorage, StorageMountError> {
