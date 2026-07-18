@@ -5,6 +5,7 @@ pub mod api;
 pub mod auth;
 pub mod cifs_provision;
 pub mod config;
+pub mod container_proxy;
 pub mod db;
 mod disk_stats;
 pub mod file_ops;
