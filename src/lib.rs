@@ -19,6 +19,7 @@ pub mod path_security;
 pub mod policy;
 pub mod proxy;
 pub mod range;
+mod readiness;
 #[cfg(test)]
 mod route_inventory_tests;
 pub mod runtime;
@@ -91,6 +92,7 @@ pub struct AppState {
     pub buffered_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
     pub expensive_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
     pub(crate) disk_stats_cache: disk_stats::DiskStatsCache,
+    pub(crate) readiness: readiness::ReadinessProbe,
     // The descriptor owns the kernel lock. Keeping it in every AppState clone
     // prevents another serving process from entering storage recovery or
     // cleanup for this private storage domain.
@@ -165,6 +167,7 @@ impl AppState {
         })?;
         validated_storage.verify_path_bindings(&config.storage)?;
         let db = Database::open_in_directory(validated_storage.data_file()?)?;
+        db.configure_session_idle_timeout(config.security.session_idle_minutes);
         let active_admin_usernames = db.active_admin_usernames()?;
         let persisted_runtime = db.runtime_settings()?;
         let runtime = runtime_settings_from_persisted(&config, &persisted_runtime)
@@ -221,6 +224,7 @@ impl AppState {
             buffered_peer_admission: Arc::new(Mutex::new(HashMap::new())),
             expensive_peer_admission: Arc::new(Mutex::new(HashMap::new())),
             disk_stats_cache: disk_stats::DiskStatsCache::new(),
+            readiness: readiness::ReadinessProbe::new(),
             _storage_instance_lock: storage_instance_lock,
             #[cfg(test)]
             upload_directory_sync_failure: Arc::new(std::sync::Mutex::new(None)),

@@ -16,7 +16,7 @@ Application-owned password, TOTP, and Share-secret buffers use a zeroizing wrapp
 - Relative user paths are validated after exactly one HTTP decode and reject absolute paths, `..`, backslashes, and NUL. Upload names also follow a cross-platform policy so Windows prefixes and reserved names cannot escape the target directory.
 - Uploads are written to random `0600` temporary files in protected internal staging, flushed and synced, then atomically published with `renameat2(RENAME_NOREPLACE)`. With `external_writers = true`, overwrite remains disabled by default in the UI, API, and upload path. The separate `allow_external_writer_replace = true` opt-in accepts last-writer-wins behavior and its risk of losing a newer parallel SMB change.
 - Abandoned upload fragments and only committed delete tombstones are removed in resumable background batches. Uncommitted deletes and rollback conflicts remain recovery entries instead of risking data loss at restart.
-- Administrator passwords use Argon2id. Password verification is followed by TOTP or a registered WebAuthn/FIDO2 security key such as a YubiKey. Sessions are random server-side bearer tokens whose hashes are stored in SQLite.
+- Administrator passwords use Argon2id. Password verification is followed by TOTP or a registered WebAuthn/FIDO2 security key such as a YubiKey. Sessions are random server-side bearer tokens whose hashes are stored in SQLite; `session_hours` is the absolute cap and `session_idle_minutes` defaults to a 30-minute inactivity limit.
 - Cookies are `HttpOnly`, `SameSite=Strict`, and `Secure` in production.
 - Mutating administrator actions require CSRF. Login and Share unlock are rate-limited. Login counters are process-local; reverse-proxy or network limits are still required for volumetric attacks.
 - In reverse-proxy mode, `trusted_proxies` is an exact TCP-peer allowlist. Forwarded headers are evaluated only for those peers.
@@ -70,7 +70,7 @@ SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and
 
 `shares.max_upload_size` is the optional per-file limit; `NULL` uses the global runtime limit. Upload shares also have cumulative `max_upload_total_size` and `max_upload_files` limits, with baseline defaults of 100,000,000,000 bytes and 1,000 fail-closed accounted files. Byte and file usage is recorded atomically before visible publication; if publication later fails, quota use deliberately remains so a visible file can never be unaccounted.
 
-Fresh installations create schema 3 and version-2/version-3 migration records. Valid schema-1 and schema-2 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
+Fresh installations create schema 4 and version-2/version-3/version-4 migration records. Valid schema-1, schema-2 and schema-3 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes and schema 4 adds administrator-session activity tracking while revoking pre-migration sessions. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
 
 The database defaults to `/var/lib/vaultlink/data.sqlite`; its required matching keyring is `/var/lib/vaultlink/secrets.keyring`. Both must be owned by `vaultlink:vaultlink` with mode `0600`. The database contains encrypted secrets, but the matching keyring can decrypt them, so the pair and every complete backup are production credentials.
 
@@ -178,7 +178,9 @@ Important API routes:
 
 | Route | Method | Purpose |
 |---|---:|---|
-| `/api/v2/health` | GET | health/version |
+| `/api/v2/health` | GET | compatible process/version liveness alias |
+| `/api/v2/health/live` | GET | cheap process/version liveness |
+| `/api/v2/health/ready` | GET | database and descriptor-bound storage readiness |
 | `/api/v2/session/login`, `/mfa`, `/logout`, `/me` | GET/POST | session lifecycle |
 | `/api/v2/files` | GET/PATCH/DELETE | JSON file browser and mutations |
 | `/api/v2/shares`, `/api/v2/shares/:id` | GET/POST/PATCH/DELETE | Share lifecycle |
@@ -205,6 +207,8 @@ JSON errors have this envelope:
 ```
 
 Internal absolute paths, password hashes, session/unlock/preview/transfer hashes, and TOTP secrets are not returned. TOTP secrets are shown once after administrator creation or MFA reset.
+
+All three health routes are unauthenticated. Liveness does not touch SQLite or storage. Readiness returns `503` with `{"ok":false,"version":"..."}` when either dependency is unavailable, while details are written only to structured logs. Operators and orchestrators should use `/health/live` for liveness and `/health/ready` for traffic admission and upgrade checks.
 
 ## 6. UI and UX
 

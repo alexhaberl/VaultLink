@@ -36,13 +36,18 @@ const CREDENTIAL_BLOB_VERSION: u8 = 1;
 type OwnedPublicKey = CompressedPubKey<[u8; 32], [u8; 32], [u8; 48], Vec<u8>>;
 type OwnedStaticState = StaticState<OwnedPublicKey>;
 
-fn decode_supported_static_state(data: &[u8]) -> Result<OwnedStaticState, WebAuthnServiceError> {
-    let state = OwnedStaticState::decode(data).map_err(WebAuthnServiceError::ceremony)?;
+fn ensure_supported_static_state(state: &OwnedStaticState) -> Result<(), WebAuthnServiceError> {
     if matches!(state.credential_public_key, CompressedPubKey::Rsa(_)) {
         return Err(WebAuthnServiceError::Ceremony(
             "RS256 WebAuthn credentials are not supported".into(),
         ));
     }
+    Ok(())
+}
+
+fn decode_supported_static_state(data: &[u8]) -> Result<OwnedStaticState, WebAuthnServiceError> {
+    let state = OwnedStaticState::decode(data).map_err(WebAuthnServiceError::ceremony)?;
+    ensure_supported_static_state(&state)?;
     Ok(state)
 }
 
@@ -150,15 +155,17 @@ impl StoredCredential {
     ) -> Result<Self, WebAuthnServiceError> {
         let (id, transports, user_id, static_state, dynamic_state, metadata) =
             credential.into_parts();
+        let static_state = static_state
+            .encode()
+            .map_err(WebAuthnServiceError::ceremony)?;
+        decode_supported_static_state(&static_state)?;
         Ok(Self {
             id: id.as_ref().to_vec(),
             transports: transports
                 .encode()
                 .map_err(WebAuthnServiceError::ceremony)?,
             user_id: user_id.encode().map_err(WebAuthnServiceError::ceremony)?,
-            static_state: static_state
-                .encode()
-                .map_err(WebAuthnServiceError::ceremony)?,
+            static_state,
             dynamic_state: dynamic_state
                 .encode()
                 .map_err(WebAuthnServiceError::ceremony)?,
@@ -199,6 +206,10 @@ impl StoredCredential {
             transports: AuthTransports::decode(self.transports)
                 .map_err(WebAuthnServiceError::ceremony)?,
         })
+    }
+
+    fn ensure_supported(&self) -> Result<(), WebAuthnServiceError> {
+        decode_supported_static_state(&self.static_state).map(drop)
     }
 }
 
@@ -381,6 +392,7 @@ impl WebAuthnService {
     ) -> Result<serde_json::Value, WebAuthnServiceError> {
         let mut allowed = AllowedCredentials::with_capacity(credentials.len());
         for credential in credentials {
+            credential.ensure_supported()?;
             if !allowed.push(credential.descriptor()?.into()) {
                 return Err(WebAuthnServiceError::Ceremony(
                     "duplicate WebAuthn credential ID".into(),
@@ -418,6 +430,9 @@ impl WebAuthnService {
         credential: &serde_json::Value,
         credentials: &mut [StoredCredential],
     ) -> Result<usize, WebAuthnServiceError> {
+        for stored in credentials.iter() {
+            stored.ensure_supported()?;
+        }
         let pending = ceremony_map(&self.inner.authentications, "WebAuthn authentications")
             .remove(&session_key(session_token))
             .ok_or_else(|| {
@@ -444,8 +459,7 @@ impl WebAuthnService {
             .map_err(WebAuthnServiceError::ceremony)?;
         let user_id =
             UserHandle64::decode(stored.user_id).map_err(WebAuthnServiceError::ceremony)?;
-        let static_state = OwnedStaticState::decode(stored.static_state.as_slice())
-            .map_err(WebAuthnServiceError::ceremony)?;
+        let static_state = decode_supported_static_state(stored.static_state.as_slice())?;
         let dynamic_state =
             DynamicState::decode(stored.dynamic_state).map_err(WebAuthnServiceError::ceremony)?;
         let mut authenticated =
@@ -531,6 +545,48 @@ mod tests {
         encoded_static_state.extend_from_slice(&[0, 0]);
         assert!(matches!(
             decode_supported_static_state(&encoded_static_state),
+            Err(WebAuthnServiceError::Ceremony(message))
+                if message == "RS256 WebAuthn credentials are not supported"
+        ));
+
+        let credential = StoredCredential {
+            id: vec![],
+            transports: 0,
+            user_id: [0; USER_HANDLE_MAX_LEN],
+            static_state: encoded_static_state.clone(),
+            dynamic_state: [0; 7],
+            metadata: vec![],
+        };
+        assert!(matches!(
+            credential.ensure_supported(),
+            Err(WebAuthnServiceError::Ceremony(message))
+                if message == "RS256 WebAuthn credentials are not supported"
+        ));
+        let service = WebAuthnService::from_public_base_url("https://vault.example").unwrap();
+        assert!(matches!(
+            service.start_authentication("rsa-start", 1, std::slice::from_ref(&credential)),
+            Err(WebAuthnServiceError::Ceremony(message))
+                if message == "RS256 WebAuthn credentials are not supported"
+        ));
+        let mut credentials = [credential];
+        assert!(matches!(
+            service.finish_authentication(
+                "rsa-finish",
+                1,
+                &serde_json::json!({}),
+                &mut credentials,
+            ),
+            Err(WebAuthnServiceError::Ceremony(message))
+                if message == "RS256 WebAuthn credentials are not supported"
+        ));
+
+        let mut blob = vec![CREDENTIAL_BLOB_VERSION];
+        push_vec(&mut blob, &[1; 16]).unwrap();
+        blob.push(0);
+        blob.extend_from_slice(&user_handle(1).unwrap().encode().unwrap());
+        push_vec(&mut blob, &encoded_static_state).unwrap();
+        assert!(matches!(
+            StoredCredential::from_blob(&blob),
             Err(WebAuthnServiceError::Ceremony(message))
                 if message == "RS256 WebAuthn credentials are not supported"
         ));

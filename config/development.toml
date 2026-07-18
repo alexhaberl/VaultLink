@@ -27,6 +27,7 @@ blocked_extensions = ["exe", "dll", "com", "bat", "cmd", "ps1", "sh"]
 
 [security]
 session_hours = 12
+session_idle_minutes = 30
 login_attempts = 5
 login_window_seconds = 300
 secure_cookie = false

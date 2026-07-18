@@ -141,16 +141,113 @@ async fn health_reports_the_exact_package_version() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let app = crate::web::router(test_state(root.path(), data.path()));
-    let response = app
-        .oneshot(json_request(Method::GET, "/api/v2/health", ""))
+    for path in [
+        "/api/v2/health",
+        "/api/v2/health/live",
+        "/api/v2/health/ready",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::GET, path, ""))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            response_text(response).await,
+            format!(r#"{{"ok":true,"version":"{}"}}"#, env!("CARGO_PKG_VERSION")),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn liveness_stays_up_when_readiness_dependencies_fail() {
+    for component in ["database", "storage"] {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut state = test_state(root.path(), data.path());
+        let (probe, calls) =
+            crate::readiness::ReadinessProbe::for_test(std::time::Duration::ZERO, Some(component));
+        state.readiness = probe;
+        let app = crate::web::router(state);
+
+        let ready = app
+            .clone()
+            .oneshot(json_request(Method::GET, "/api/v2/health/ready", ""))
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_text(ready).await,
+            format!(
+                r#"{{"ok":false,"version":"{}"}}"#,
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(json_request(Method::GET, "/api/v2/health/ready", "",))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        for path in ["/api/v2/health", "/api/v2/health/live"] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(json_request(Method::GET, path, ""))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn readiness_is_single_flight_cached_and_times_out() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut state = test_state(root.path(), data.path());
+    let (probe, calls) =
+        crate::readiness::ReadinessProbe::for_test(std::time::Duration::from_millis(100), None);
+    state.readiness = probe;
+    let app = crate::web::router(state);
+    let responses = futures_util::future::join_all((0..8).map(|_| {
+        app.clone()
+            .oneshot(json_request(Method::GET, "/api/v2/health/ready", ""))
+    }))
+    .await;
+    assert!(responses
+        .into_iter()
+        .all(|response| response.unwrap().status() == StatusCode::OK));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert_eq!(
+        app.oneshot(json_request(Method::GET, "/api/v2/health/ready", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut state = test_state(root.path(), data.path());
+    let (probe, timeout_calls) =
+        crate::readiness::ReadinessProbe::for_test(std::time::Duration::from_millis(2_100), None);
+    state.readiness = probe;
+    let response = crate::web::router(state)
+        .oneshot(json_request(Method::GET, "/api/v2/health/ready", ""))
         .await
         .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response_text(response).await,
-        format!(r#"{{"ok":true,"version":"{}"}}"#, env!("CARGO_PKG_VERSION"))
-    );
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(timeout_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

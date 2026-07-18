@@ -35,7 +35,10 @@ use std::{
     os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
 };
 
 pub(crate) const MAX_SQLITE_UNSIGNED: u64 = i64::MAX as u64;
@@ -60,6 +63,7 @@ pub struct Database(Arc<DatabaseInner>);
 struct DatabaseInner {
     pool: r2d2::Pool<SqliteConnectionManager>,
     keyring: keyring::Keyring,
+    session_idle_minutes: AtomicI64,
     // Keep the descriptor behind /proc/self/fd alive for the whole connection
     // so the validated directory capability cannot be rebound through file-
     // descriptor reuse while SQLite uses the supplied path.
@@ -619,6 +623,7 @@ impl Database {
         Ok(Self(Arc::new(DatabaseInner {
             pool,
             keyring,
+            session_idle_minutes: AtomicI64::new(30),
             _directory_capability: directory_capability,
         })))
     }
@@ -732,6 +737,31 @@ fn validate_database_metadata(
 }
 
 impl Database {
+    pub(crate) fn configure_session_idle_timeout(&self, minutes: i64) {
+        self.0
+            .session_idle_minutes
+            .store(minutes, Ordering::Relaxed);
+    }
+
+    fn session_idle_minutes(&self) -> i64 {
+        self.0.session_idle_minutes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn readiness_check(&self) -> Result<(), String> {
+        let connection = self
+            .0
+            .pool
+            .try_get()
+            .ok_or_else(|| "database connection pool is exhausted".to_string())?;
+        let value = connection
+            .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            .map_err(|error| error.to_string())?;
+        if value != 1 {
+            return Err("database readiness query returned an invalid value".into());
+        }
+        Ok(())
+    }
+
     fn try_conn(&self) -> rusqlite::Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.0.pool.get().map_err(|error| pool_error(&error))
     }

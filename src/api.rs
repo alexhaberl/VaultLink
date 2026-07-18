@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Request},
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -177,6 +177,8 @@ impl IntoResponse for ApiError {
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
+        .route("/health/live", get(health))
+        .route("/health/ready", get(readiness))
         .route("/session/login", post(login))
         .route("/session/mfa", post(mfa))
         .route("/session/logout", post(logout))
@@ -300,6 +302,24 @@ async fn health() -> Json<HealthResponse> {
         ok: true,
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
+    let ready = state
+        .readiness
+        .check(state.db.clone(), state.secure_root.clone())
+        .await;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(HealthResponse {
+            ok: ready,
+            version: env!("CARGO_PKG_VERSION"),
+        }),
+    )
 }
 
 #[derive(Serialize)]

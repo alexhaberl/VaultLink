@@ -1,15 +1,17 @@
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub(super) const SCHEMA_VERSION: i64 = 3;
+pub(super) const SCHEMA_VERSION: i64 = 4;
 pub(super) const SCHEMA_1_FINGERPRINT: &str = "vaultlink-schema-1-encrypted-secrets-2026-07-17";
 pub(super) const SCHEMA_2_FINGERPRINT: &str = "vaultlink-schema-2-migration-history-2026-07-17";
-const SCHEMA_3_FINGERPRINT: &str = "vaultlink-schema-3-share-indexes-2026-07-17";
+pub(super) const SCHEMA_3_FINGERPRINT: &str = "vaultlink-schema-3-share-indexes-2026-07-17";
+const SCHEMA_4_FINGERPRINT: &str = "vaultlink-schema-4-admin-session-activity-2026-07-18";
 
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_SCHEMA_1_TO_2_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_SCHEMA_2_TO_3_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_SCHEMA_3_TO_4_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -18,12 +20,17 @@ pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         0 => initialize_empty_database(conn),
         1 => {
             migrate_schema_1_to_2(conn)?;
-            migrate_schema_2_to_3(conn)
+            migrate_schema_2_to_3(conn)?;
+            migrate_schema_3_to_4(conn)
         }
-        2 => migrate_schema_2_to_3(conn),
-        SCHEMA_VERSION => validate_schema_3(conn).and_then(|()| validate_database(conn)),
+        2 => {
+            migrate_schema_2_to_3(conn)?;
+            migrate_schema_3_to_4(conn)
+        }
+        3 => migrate_schema_3_to_4(conn),
+        SCHEMA_VERSION => validate_schema_4(conn).and_then(|()| validate_database(conn)),
         _ => Err(schema_error(format!(
-            "unsupported VaultLink database schema {version}; this build accepts schemas 1, 2, and {SCHEMA_VERSION}"
+            "unsupported VaultLink database schema {version}; this build accepts schemas 1, 2, 3, and {SCHEMA_VERSION}"
         ))),
     }
 }
@@ -48,7 +55,7 @@ CREATE TABLE vaultlink_schema(
     fingerprint TEXT NOT NULL
 );
 INSERT INTO vaultlink_schema(singleton,fingerprint)
-VALUES(1,'vaultlink-schema-3-share-indexes-2026-07-17');
+VALUES(1,'vaultlink-schema-4-admin-session-activity-2026-07-18');
 
 CREATE TABLE vaultlink_schema_migrations(
     target_version INTEGER PRIMARY KEY CHECK(target_version > 0),
@@ -72,7 +79,8 @@ CREATE TABLE sessions(
     admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
     csrf_token TEXT NOT NULL,
     mfa_verified INTEGER NOT NULL DEFAULT 0 CHECK(mfa_verified IN (0,1)),
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    last_activity_at TEXT NOT NULL
 );
 CREATE INDEX idx_sessions_exp ON sessions(expires_at);
 CREATE INDEX idx_sessions_admin ON sessions(admin_id);
@@ -238,8 +246,12 @@ CREATE INDEX idx_upload_reservations_share_epoch
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(3,?1)",
         [Utc::now().to_rfc3339()],
     )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(4,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    validate_schema_3(&tx)?;
+    validate_schema_4(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }
@@ -298,8 +310,48 @@ fn migrate_schema_2_to_3(conn: &mut Connection) -> rusqlite::Result<()> {
         return Err(schema_error("injected schema 2 to 3 migration failure"));
     }
 
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", 3)?;
     validate_schema_3(&tx)?;
+    validate_database(&tx)?;
+    tx.commit()
+}
+
+fn migrate_schema_3_to_4(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_schema_3(&tx)?;
+    validate_database(&tx)?;
+    tx.execute_batch(
+        "ALTER TABLE sessions RENAME TO sessions_schema_3;
+         DROP INDEX idx_sessions_exp;
+         DROP INDEX idx_sessions_admin;
+         CREATE TABLE sessions(
+             token_hash TEXT PRIMARY KEY,
+             admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+             csrf_token TEXT NOT NULL,
+             mfa_verified INTEGER NOT NULL DEFAULT 0 CHECK(mfa_verified IN (0,1)),
+             expires_at TEXT NOT NULL,
+             last_activity_at TEXT NOT NULL
+         );
+         CREATE INDEX idx_sessions_exp ON sessions(expires_at);
+         CREATE INDEX idx_sessions_admin ON sessions(admin_id);
+         DROP TABLE sessions_schema_3;",
+    )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(4,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+        [SCHEMA_4_FINGERPRINT],
+    )?;
+
+    #[cfg(test)]
+    if FAIL_NEXT_SCHEMA_3_TO_4_MIGRATION.with(|flag| flag.replace(false)) {
+        return Err(schema_error("injected schema 3 to 4 migration failure"));
+    }
+
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    validate_schema_4(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }
@@ -365,6 +417,37 @@ fn validate_schema_3(conn: &Connection) -> rusqlite::Result<()> {
     validate_encrypted_shape(conn)
 }
 
+fn validate_schema_4(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_4_FINGERPRINT)?;
+    for target_version in [2, 3, 4] {
+        let migration_record = conn
+            .query_row(
+                "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=?1",
+                [target_version],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if migration_record.as_deref().is_none_or(str::is_empty) {
+            return Err(schema_error(format!(
+                "schema {target_version} migration record is missing or invalid"
+            )));
+        }
+    }
+    let last_activity_not_null: Option<i64> = conn
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('sessions') WHERE name='last_activity_at'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if last_activity_not_null != Some(1) {
+        return Err(schema_error(
+            "schema 4 sessions.last_activity_at is missing or nullable",
+        ));
+    }
+    validate_encrypted_shape(conn)
+}
+
 fn validate_fingerprint(conn: &Connection, expected: &str) -> rusqlite::Result<()> {
     let fingerprint = conn
         .query_row(
@@ -426,6 +509,11 @@ pub(super) fn fail_next_schema_1_to_2_migration() {
 #[cfg(test)]
 pub(super) fn fail_next_schema_2_to_3_migration() {
     FAIL_NEXT_SCHEMA_2_TO_3_MIGRATION.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_schema_3_to_4_migration() {
+    FAIL_NEXT_SCHEMA_3_TO_4_MIGRATION.with(|flag| flag.set(true));
 }
 
 #[derive(Debug)]

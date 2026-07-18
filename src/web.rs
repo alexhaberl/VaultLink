@@ -48,6 +48,35 @@ const MAX_UPLOAD_MULTIPART_FIELDS: usize = 5;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const BUFFERED_RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
 const BUFFERED_RESPONSE_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const REQUEST_ID_HEADER: header::HeaderName = header::HeaderName::from_static("x-request-id");
+
+#[derive(Clone, Debug)]
+struct ServerRequestId(String);
+
+impl ServerRequestId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+async fn discard_client_request_id(mut request: Request, next: middleware::Next) -> Response {
+    request.headers_mut().remove(REQUEST_ID_HEADER);
+    next.run(request).await
+}
+
+fn server_request_id(request: &Request) -> &str {
+    request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<missing>")
+}
+
+async fn attach_server_request_id(mut request: Request, next: middleware::Next) -> Response {
+    let request_id = server_request_id(&request).to_owned();
+    request.extensions_mut().insert(ServerRequestId(request_id));
+    next.run(request).await
+}
 const REQUEST_BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const DEFAULT_REQUEST_BODY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 const UPLOAD_REQUEST_BODY_DEADLINE: std::time::Duration =
@@ -275,10 +304,6 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_IDLE_TIMEOUT))
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(SetRequestIdLayer::new(
-            header::HeaderName::from_static("x-request-id"),
-            MakeRequestUuid,
-        ))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request| {
                 let matched_path = request
@@ -290,10 +315,18 @@ pub fn router(state: AppState) -> Router {
                     "http_request",
                     method = %request.method(),
                     route = matched_path,
-                    version = ?request.version()
+                    version = ?request.version(),
+                    request_id = %request
+                        .extensions()
+                        .get::<ServerRequestId>()
+                        .map(ServerRequestId::as_str)
+                        .unwrap_or("<missing>")
                 )
             }),
-        );
+        )
+        .layer(middleware::from_fn(attach_server_request_id))
+        .layer(SetRequestIdLayer::new(REQUEST_ID_HEADER, MakeRequestUuid))
+        .layer(middleware::from_fn(discard_client_request_id));
     #[cfg(panic = "unwind")]
     let router = router.layer(CatchPanicLayer::new());
     router

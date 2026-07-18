@@ -12,7 +12,7 @@ MOCK_BIN="$TEST_ROOT/bin"
 MOCK_STATE_DIR="$TEST_ROOT/state"
 CONFIG_PATH=/etc/vaultlink/config.toml
 HEALTH_PORT=18082
-HEALTH_URL="http://127.0.0.1:$HEALTH_PORT/api/v2/health"
+HEALTH_URL="http://127.0.0.1:$HEALTH_PORT/api/v2/health/ready"
 REAL_SQLITE3="$(command -v sqlite3)"
 REAL_CURL="$(command -v curl)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -252,7 +252,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        if self.path != "/api/v2/health":
+        if self.path != "/api/v2/health/ready":
             self.respond(404, '{"ok":false}')
             return
 
@@ -652,7 +652,7 @@ test_upgrade_delayed_start_and_health() {
 
 test_upgrade_standalone_tls_curl_arguments() {
     initialize_live original original
-    tls_health_url=https://files.example.test/api/v2/health
+    tls_health_url=https://files.example.test/api/v2/health/ready
     tls_connect_to=files.example.test:443:127.0.0.1:443
     write_binary "$TEST_ROOT/candidate" candidate "$tls_health_url" "$tls_connect_to" 1
     write_config "$TEST_ROOT/candidate.toml" candidate
@@ -727,7 +727,7 @@ VAULTLINK_HTTP_STATUS:%{http_code}
 files.example.test:443:127.0.0.1:443
 --insecure
 --
-https://files.example.test/api/v2/health
+https://files.example.test/api/v2/health/ready
 ARGS
 )
     if [[ "$tls_curl_args" != "$expected_tls_curl_args" ]]; then
