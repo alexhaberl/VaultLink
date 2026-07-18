@@ -20,8 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::{
-    policy::PreviewKind, range::parse_byte_range, runtime::RuntimeSettings, secure_fs::SecureFile,
-    AppState,
+    path_security::safe_filename, policy::PreviewKind, range::parse_byte_range,
+    runtime::RuntimeSettings, secure_fs::SecureFile, AppState,
 };
 
 use super::{
@@ -190,6 +190,14 @@ pub(super) fn plan_zip<D: DirectoryAccess>(
                 .map_err(ZipBuildError::Source)?;
             scanned_entries = scanned_entries.saturating_add(batch.scanned);
             for entry in batch.entries {
+                // Storage may also be written by external processes, so do not
+                // trust filesystem names to be safe ZIP path components.
+                safe_filename(&entry.name).map_err(|_| {
+                    ZipBuildError::Source(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsafe ZIP entry name",
+                    ))
+                })?;
                 let source_path = join_display(&current_directory, &entry.name);
                 let archive_name = join_display(&archive_prefix, &entry.name);
                 if entry.is_dir {
