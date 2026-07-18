@@ -241,17 +241,7 @@ fn acquire_storage_instance_lock(
             path: display_root.clone(),
             source,
         })?;
-    let internal_path = if storage.require_mount {
-        display_root
-            .parent()
-            .map(|parent| parent.join(DEFAULT_INTERNAL_DIRECTORY_NAME))
-            .ok_or_else(|| StorageInstanceLockError::Unsafe {
-                path: display_root.clone(),
-                reason: "canonical storage root has no parent lock domain".into(),
-            })?
-    } else {
-        display_root.join(DEFAULT_INTERNAL_DIRECTORY_NAME)
-    };
+    let internal_path = canonical_storage_lock_domain(storage, &display_root)?;
     let internal = if storage.require_mount {
         let validated_internal_path =
             validated_storage
@@ -399,6 +389,23 @@ fn acquire_storage_instance_lock(
     })
 }
 
+fn canonical_storage_lock_domain(
+    storage: &Storage,
+    display_root: &Path,
+) -> Result<PathBuf, StorageInstanceLockError> {
+    if !storage.require_mount || storage.internal_directory_is_nested() {
+        return Ok(display_root.join(DEFAULT_INTERNAL_DIRECTORY_NAME));
+    }
+
+    display_root
+        .parent()
+        .map(|parent| parent.join(DEFAULT_INTERNAL_DIRECTORY_NAME))
+        .ok_or_else(|| StorageInstanceLockError::Unsafe {
+            path: display_root.to_path_buf(),
+            reason: "canonical storage root has no parent lock domain".into(),
+        })
+}
+
 fn open_storage_lock_file(
     internal: &File,
     lock_path: &Path,
@@ -544,6 +551,42 @@ mod tests {
         let validated = storage_mount::validate_and_open(storage)
             .expect("test storage paths must produce validated capabilities");
         acquire_storage_instance_lock(storage, &validated)
+    }
+
+    #[test]
+    fn nested_cifs_internal_directory_acquires_the_root_lock_domain() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("storage");
+        let data = parent.path().join("data");
+        let internal = root.join(DEFAULT_INTERNAL_DIRECTORY_NAME);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&internal).unwrap();
+        std::fs::set_permissions(&internal, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut storage = config(&root, &data).storage;
+        storage.require_mount = true;
+        storage.internal_directory = Some(internal.clone());
+        storage.expected_filesystem_type = Some("cifs".into());
+        storage.expected_mount_source = Some("//nas.example/vault".into());
+
+        let validated = storage_mount::validate_and_open_without_mount_policy(&storage).unwrap();
+        let lock = acquire_storage_instance_lock(&storage, &validated).unwrap();
+        let lock_path = internal.join(STORAGE_INSTANCE_LOCK_NAME);
+        assert!(lock_path.is_file());
+
+        let contender = storage_mount::validate_and_open_without_mount_policy(&storage).unwrap();
+        assert!(matches!(
+            acquire_storage_instance_lock(&storage, &contender),
+            Err(StorageInstanceLockError::Contended { path }) if path == lock_path
+        ));
+
+        drop(lock);
+        let released = storage_mount::validate_and_open_without_mount_policy(&storage).unwrap();
+        acquire_storage_instance_lock(&storage, &released)
+            .expect("dropping the nested CIFS lock must release its domain");
     }
 
     #[test]
