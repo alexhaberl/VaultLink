@@ -1212,6 +1212,26 @@ fn zip_planning_bounds_empty_directory_scans() {
 }
 
 #[test]
+fn zip_planning_rejects_unsafe_external_writer_filenames() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    let unsafe_name = "C:escape.txt";
+    std::fs::write(root.path().join("docs").join(unsafe_name), b"malicious").unwrap();
+    let state = test_state(root.path(), data.path());
+    let scope = state.secure_root.bind_directory("docs").unwrap();
+    let settings = runtime_settings(&state);
+
+    let visible_entries = scope.list("", 0, 10).unwrap();
+    assert_eq!(visible_entries.len(), 1);
+    assert_eq!(visible_entries[0].name, unsafe_name);
+    assert!(matches!(
+        plan_zip(&scope, "", &settings),
+        Err(ZipBuildError::Source(error)) if error.kind() == io::ErrorKind::InvalidData
+    ));
+}
+
+#[test]
 fn filtered_directory_items_consume_listing_search_and_zip_budgets() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
