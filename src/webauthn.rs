@@ -568,7 +568,7 @@ mod tests {
             Err(WebAuthnServiceError::Ceremony(message))
                 if message == "RS256 WebAuthn credentials are not supported"
         ));
-        let mut credentials = [credential.clone()];
+        let mut credentials = [credential];
         assert!(matches!(
             service.finish_authentication(
                 "rsa-finish",
