@@ -205,7 +205,7 @@ pub(super) async fn delete_security_key(
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
     Form(form): Form<DeleteSecurityKeyForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let (token, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
     let limiter_key = format!("security-key-delete:{}", session.admin_id);
@@ -292,7 +292,10 @@ pub(super) async fn delete_security_key(
     })
     .await?;
     match outcome {
-        AdminWebauthnCredentialDeletionOutcome::Deleted => Ok(Redirect::to("/admin/account")),
+        AdminWebauthnCredentialDeletionOutcome::Deleted => Ok(redirect_with_cookie(
+            "/login",
+            &clear_session_cookie(&state),
+        )?),
         AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected
         | AdminWebauthnCredentialDeletionOutcome::TotpRejected => {
             audit_observation(

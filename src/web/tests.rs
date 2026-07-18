@@ -4227,19 +4227,45 @@ async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compa
         &format!("/admin/account/security-keys/{first}/delete"),
         &format!("csrf=account-security-csrf&current_password={password}"),
     );
-    delete.headers_mut().insert(header::COOKIE, cookie.clone());
-    assert_eq!(
-        app.clone().oneshot(delete).await.unwrap().status(),
-        StatusCode::SEE_OTHER
-    );
+    delete.headers_mut().insert(header::COOKIE, cookie);
+    let deleted = app.clone().oneshot(delete).await.unwrap();
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert_eq!(deleted.headers().get(header::LOCATION).unwrap(), "/login");
+    assert!(deleted
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
     assert_eq!(state.db.admin_webauthn_credentials(1).unwrap().len(), 2);
+    assert!(state
+        .db
+        .session("account-security-session")
+        .unwrap()
+        .is_none());
+    assert!(state.db.session("key-only-mfa-session").unwrap().is_none());
+
+    state
+        .db
+        .create_session(
+            "post-key-delete-session",
+            1,
+            "post-key-delete-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(state.db.verify_mfa("post-key-delete-session").unwrap());
 
     let mut enable = request(
         Method::POST,
         "/admin/account/totp",
-        &format!("csrf=account-security-csrf&current_password={password}&enabled=true"),
+        &format!("csrf=post-key-delete-csrf&current_password={password}&enabled=true"),
     );
-    enable.headers_mut().insert(header::COOKIE, cookie);
+    enable.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=post-key-delete-session"),
+    );
     assert_eq!(
         app.oneshot(enable).await.unwrap().status(),
         StatusCode::SEE_OTHER
