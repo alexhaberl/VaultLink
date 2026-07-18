@@ -530,7 +530,7 @@ fn start_audit_retention_worker(database: Database) {
                 .await
             {
                 Ok(Ok(deleted)) if deleted > 0 => {
-                    tracing::info!(deleted, "expired audit events removed")
+                    tracing::info!(deleted, "excess audit events removed")
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => tracing::error!(%error, "audit retention cleanup failed"),

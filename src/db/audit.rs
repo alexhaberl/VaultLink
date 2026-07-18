@@ -80,7 +80,6 @@ fn persisted_audit_client_ip_enabled(
 impl Database {
     pub fn cleanup_audit_retention(&self) -> rusqlite::Result<usize> {
         const BATCH_SIZE: i64 = 1_000;
-        let cutoff = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
         let mut deleted_total = 0usize;
         loop {
             let mut connection = self.try_conn()?;
@@ -97,11 +96,10 @@ impl Database {
             let deleted = transaction.execute(
                 "DELETE FROM audit WHERE id IN (
                      SELECT id FROM audit
-                     WHERE occurred_at<?1
                      ORDER BY id ASC
-                     LIMIT ?2
+                     LIMIT ?1
                  )",
-                params![cutoff, batch],
+                [batch],
             )?;
             transaction.commit()?;
             deleted_total = deleted_total.saturating_add(deleted);

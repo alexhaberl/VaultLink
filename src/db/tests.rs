@@ -948,6 +948,29 @@ fn audit_retention_keeps_only_the_newest_rows() {
 }
 
 #[test]
+fn audit_retention_caps_recent_events() {
+    let database = Database::open(":memory:").unwrap();
+    let mut connection = database.conn();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    for index in 0..=MAX_AUDIT_ROWS {
+        transaction
+            .execute(
+                "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip)
+                 VALUES(?1,'test',?2,NULL,NULL,NULL)",
+                params![Utc::now().to_rfc3339(), format!("event-{index}")],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+
+    assert_eq!(database.cleanup_audit_retention().unwrap(), 1);
+    assert_eq!(database.count_audit(None).unwrap(), MAX_AUDIT_ROWS as usize);
+}
+
+#[test]
 fn initial_admin_creation_is_atomic() {
     let database = Database::open(":memory:").unwrap();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
