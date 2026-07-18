@@ -47,18 +47,17 @@ use crate::{
 struct PublicUploadTarget {
     share_id: i64,
     upload_policy_epoch: i64,
-    share_scope: SecureDirectory,
+    upload_base_scope: SecureDirectory,
+    expected_destination: Option<SecureDirectory>,
+    upload_base: String,
+    folder_path: String,
     upload_subdir: String,
     file_name: String,
 }
 
 impl PublicUploadTarget {
-    fn destination(&self) -> String {
-        join_display(&self.upload_subdir, &self.file_name)
-    }
-
-    fn destination_exists(&self) -> std::io::Result<bool> {
-        match self.share_scope.metadata(&self.destination()) {
+    fn destination_exists(&self, directory: &SecureDirectory) -> std::io::Result<bool> {
+        match directory.metadata(&self.file_name) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
@@ -152,11 +151,10 @@ impl PublicUploadStaging {
             }
         };
 
-        let secure_root = target.share_scope.clone();
-        let upload_directory = target.upload_subdir.clone();
+        let upload_scope = target.upload_base_scope.clone();
         let pending_file = tokio::task::spawn_blocking(move || {
-            let mut pending = secure_root
-                .begin_upload(&upload_directory)
+            let mut pending = upload_scope
+                .begin_staged_upload()
                 .map_err(|_| PendingUploadFileError::Begin)?;
             let file = pending.take_file().map_err(PendingUploadFileError::Take)?;
             Ok::<_, PendingUploadFileError>((pending, file))
@@ -376,8 +374,9 @@ impl StagedPublicUpload {
 }
 
 /// A prepared public upload cannot exist without its fragment, quota owner,
-/// immutable user intent, and descriptor-bound target. Every terminal method
-/// consumes the owner, guaranteeing one cleanup or one publication transition.
+/// immutable user intent, and descriptor-bound upload base. The final target
+/// is bound only after quota admission. Every terminal method consumes the
+/// owner, guaranteeing one cleanup or one publication transition.
 struct PreparedPublicUpload {
     pending: PendingUpload,
     reservation: UploadQuotaReservation,
@@ -416,16 +415,35 @@ impl PreparedPublicUpload {
         &self.target.upload_subdir
     }
 
+    fn upload_base(&self) -> &str {
+        &self.target.upload_base
+    }
+
+    fn folder_path(&self) -> &str {
+        &self.target.folder_path
+    }
+
+    fn upload_base_matches(&self, current: &SecureDirectory) -> std::io::Result<bool> {
+        self.target.upload_base_scope.same_directory(current)
+    }
+
+    fn expected_destination_matches(
+        &self,
+        current: Option<&SecureDirectory>,
+    ) -> std::io::Result<bool> {
+        match (&self.target.expected_destination, current) {
+            (Some(expected), Some(current)) => expected.same_directory(current),
+            (Some(_), None) => Ok(false),
+            (None, _) => Ok(true),
+        }
+    }
+
     fn overwrite_requested(&self) -> bool {
         self.intent.overwrite_requested
     }
 
-    fn destination_matches(&self, destination: &SecureDirectory) -> std::io::Result<bool> {
-        self.pending.destination_matches(destination)
-    }
-
-    fn destination_exists(&self) -> std::io::Result<bool> {
-        self.target.destination_exists()
+    fn destination_exists(&self, directory: &SecureDirectory) -> std::io::Result<bool> {
+        self.target.destination_exists(directory)
     }
 
     #[cfg(test)]
@@ -491,6 +509,11 @@ impl PreparedPublicUpload {
 }
 
 impl CommittedPublicUpload {
+    fn bind_destination(mut self, destination: &SecureDirectory) -> std::io::Result<Self> {
+        self.pending.bind_destination(destination)?;
+        Ok(self)
+    }
+
     async fn publish(
         self,
         storage_guard: tokio::sync::OwnedMutexGuard<()>,
@@ -534,32 +557,20 @@ struct PublicUploadAdmission {
 }
 
 async fn ensure_public_upload_directory(
-    state: &AppState,
-    token: &str,
-    expected_share_id: i64,
-    base: &str,
+    base_scope: SecureDirectory,
     relative: &str,
-) -> Result<String> {
+) -> Result<(SecureDirectory, Vec<String>)> {
     let relative = crate::path_security::validate_relative(relative)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid folder path"))?
         .to_string_lossy()
         .replace('\\', "/");
     if relative.is_empty() {
-        return Ok(base.to_string());
+        return Ok((base_scope, Vec::new()));
     }
-    let target = join_display(base, &relative);
-    let (share, guard) = get_storage_share(state, token, expected_share_id).await?;
-    if !share.is_directory || !share.permission.can_upload() {
-        return Err(AppError(StatusCode::GONE, "Share changed"));
-    }
-    let secure_root = state.secure_root.clone();
-    let share_path = share.relative_path;
-    let tree = target.clone();
-    let created = tokio::task::spawn_blocking(move || {
-        let _guard = guard;
-        secure_root
-            .bind_directory(&share_path)?
-            .ensure_directory_tree(&tree)
+    tokio::task::spawn_blocking(move || {
+        let created = base_scope.ensure_directory_tree(&relative)?;
+        let destination = base_scope.bind_directory(&relative)?;
+        Ok::<_, std::io::Error>((destination, created))
     })
     .await
     .map_err(internal)?
@@ -571,18 +582,7 @@ async fn ensure_public_upload_directory(
             AppError(StatusCode::CONFLICT, "Upload folder could not be created")
         }
         _ => internal(error),
-    })?;
-    if !created.is_empty() {
-        audit_observation(
-            state,
-            "public".into(),
-            "upload_directories_created",
-            Some(expected_share_id.to_string()),
-            Some(format!("path={target};created={}", created.len())),
-        )
-        .await;
-    }
-    Ok(target)
+    })
 }
 
 struct PublicUploadFinalizer {
@@ -658,10 +658,10 @@ impl PublicUploadFinalizer {
         let allow_replace = state.config.storage.replacements_allowed()
             && current_share.upload_conflict_strategy.can_overwrite()
             && upload.overwrite_requested();
-        let current_destination = match state
+        let current_base = match state
             .secure_root
             .bind_directory(&current_share.relative_path)
-            .and_then(|scope| scope.bind_directory(upload.upload_subdir()))
+            .and_then(|scope| scope.bind_directory(upload.upload_base()))
         {
             Ok(directory) => directory,
             Err(_) => {
@@ -674,13 +674,47 @@ impl PublicUploadFinalizer {
                 ));
             }
         };
-        let destination_matches = match upload.destination_matches(&current_destination) {
+        let upload_base_matches = match upload.upload_base_matches(&current_base) {
             Ok(matches) => matches,
             Err(error) => {
                 upload.cancel().await?;
                 return Err(internal(error));
             }
         };
+        if !upload_base_matches {
+            upload.cancel().await?;
+            return Ok(public_upload_error(
+                &token,
+                &upload_subdir,
+                StatusCode::CONFLICT,
+                "Upload target changed during upload",
+            ));
+        }
+        let current_destination = if upload.folder_path().is_empty() {
+            Some(current_base.clone())
+        } else {
+            match current_base.bind_directory(upload.folder_path()) {
+                Ok(directory) => Some(directory),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => {
+                    upload.cancel().await?;
+                    return Ok(public_upload_error(
+                        &token,
+                        &upload_subdir,
+                        StatusCode::CONFLICT,
+                        "Upload target changed during upload",
+                    ));
+                }
+            }
+        };
+        let destination_matches =
+            match upload.expected_destination_matches(current_destination.as_ref()) {
+                Ok(matches) => matches,
+                Err(error) => {
+                    upload.cancel().await?;
+                    return Err(internal(error));
+                }
+            };
         if !destination_matches {
             upload.cancel().await?;
             return Ok(public_upload_error(
@@ -690,12 +724,16 @@ impl PublicUploadFinalizer {
                 "Upload target changed during upload",
             ));
         }
-        let existed = match upload.destination_exists() {
-            Ok(existed) => existed,
-            Err(error) => {
-                upload.cancel().await?;
-                return Err(internal(error));
+        let existed = if let Some(destination) = current_destination.as_ref() {
+            match upload.destination_exists(destination) {
+                Ok(existed) => existed,
+                Err(error) => {
+                    upload.cancel().await?;
+                    return Err(internal(error));
+                }
             }
+        } else {
+            false
         };
         let replaced = allow_replace && existed;
         if existed && !allow_replace {
@@ -738,6 +776,44 @@ impl PublicUploadFinalizer {
                 ));
             }
         };
+        let destination_was_missing = current_destination.is_none();
+        let (current_destination, created) = match current_destination {
+            Some(destination) => (destination, Vec::new()),
+            None => {
+                ensure_public_upload_directory(current_base, &committed_upload.target.folder_path)
+                    .await?
+            }
+        };
+        if !created.is_empty() {
+            audit_observation(
+                &state,
+                "public".into(),
+                "upload_directories_created",
+                Some(committed_upload.target.share_id.to_string()),
+                Some(format!("path={upload_subdir};created={}", created.len())),
+            )
+            .await;
+        }
+        if destination_was_missing {
+            match committed_upload
+                .target
+                .destination_exists(&current_destination)
+            {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Ok(public_upload_error(
+                        &token,
+                        &upload_subdir,
+                        StatusCode::CONFLICT,
+                        "File already exists.",
+                    ));
+                }
+                Err(error) => return Err(internal(error)),
+            }
+        }
+        let committed_upload = committed_upload
+            .bind_destination(&current_destination)
+            .map_err(internal)?;
         let published_upload = match committed_upload
             .publish(storage_guard)
             .await
@@ -1044,25 +1120,46 @@ impl PublicUploadFormPhase<'_> {
                             ));
                         }
                     };
-                    if let Some(folder_path) = folder_path.as_deref() {
-                        upload_subdir = ensure_public_upload_directory(
-                            state,
-                            token,
-                            share.id,
-                            &upload_subdir,
-                            folder_path,
-                        )
-                        .await
-                        .map_err(PublicUploadPhaseError::App)?;
-                    }
+                    let upload_base = upload_subdir.clone();
+                    let folder_path = folder_path.clone().unwrap_or_default();
+                    let target_subdir = join_display(&upload_base, &folder_path);
+                    let upload_base_scope =
+                        share_scope.bind_directory(&upload_base).map_err(|_| {
+                            public_upload_rejection(
+                                token,
+                                &upload_subdir,
+                                StatusCode::NOT_FOUND,
+                                "Target folder unavailable",
+                            )
+                        })?;
+                    let expected_destination = if folder_path.is_empty() {
+                        Some(upload_base_scope.clone())
+                    } else {
+                        match upload_base_scope.bind_directory(&folder_path) {
+                            Ok(directory) => Some(directory),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(_) => {
+                                return Err(public_upload_rejection(
+                                    token,
+                                    &upload_subdir,
+                                    StatusCode::CONFLICT,
+                                    "Upload target unavailable",
+                                ));
+                            }
+                        }
+                    };
                     let target = PublicUploadTarget {
                         share_id: share.id,
                         upload_policy_epoch: share.upload_policy_epoch,
-                        share_scope: share_scope.clone(),
-                        upload_subdir: upload_subdir.clone(),
+                        upload_base_scope,
+                        expected_destination,
+                        upload_base,
+                        folder_path,
+                        upload_subdir: target_subdir,
                         file_name: name,
                     };
                     let mut staging = PublicUploadStaging::begin(state, token, target).await?;
+                    upload_subdir = staging.target.upload_subdir.clone();
                     #[cfg(test)]
                     upload_phase_test_checkpoint(token, PublicUploadTestPhase::Staging)
                         .await
