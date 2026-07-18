@@ -1213,6 +1213,7 @@ impl Database {
             transaction.rollback()?;
             return Ok(AdminWebauthnCredentialDeletionOutcome::NotDeleted);
         }
+        revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
@@ -1271,6 +1272,7 @@ impl Database {
             transaction.rollback()?;
             return Ok(AdminWebauthnCredentialDeletionOutcome::NotDeleted);
         }
+        revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(

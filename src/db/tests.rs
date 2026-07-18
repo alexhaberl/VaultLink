@@ -3994,6 +3994,10 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
         )
         .unwrap();
     assert!(database.verify_mfa("authorized-session").unwrap());
+    database
+        .create_session("other-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    assert!(database.verify_mfa("other-session").unwrap());
     let first = database
         .add_admin_webauthn_credential(1, "First", "credential-a", "{}")
         .unwrap();
@@ -4003,9 +4007,9 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
     let third = database
         .add_admin_webauthn_credential(1, "Third", "credential-c", "{}")
         .unwrap();
-    let delete = |credential_id, step, client_ip| {
+    let delete = |session_token, credential_id, step, client_ip| {
         database.delete_admin_webauthn_credential_with_totp(
-            "authorized-session",
+            session_token,
             credential_id,
             1,
             "hash",
@@ -4016,9 +4020,11 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
     };
 
     assert_eq!(
-        delete(first, 42, Some("203.0.113.40")).unwrap(),
+        delete("authorized-session", first, 42, Some("203.0.113.40")).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::Deleted
     );
+    assert!(database.session("authorized-session").unwrap().is_none());
+    assert!(database.session("other-session").unwrap().is_none());
     let audit = database
         .list_audit(Some("webauthn_credential_deleted"), 10, 0)
         .unwrap();
@@ -4027,12 +4033,17 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
     assert_eq!(audit[0].object_id.as_deref(), Some(first_object.as_str()));
     assert_eq!(audit[0].client_ip.as_deref(), Some("203.0.113.40"));
 
+    database
+        .create_session("second-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    assert!(database.verify_mfa("second-session").unwrap());
+
     assert_eq!(
-        delete(second, 42, None).unwrap(),
+        delete("second-session", second, 42, None).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::TotpRejected
     );
     assert_eq!(
-        delete(second, 43, None).unwrap(),
+        delete("second-session", second, 43, None).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::NotDeleted
     );
     database
@@ -4040,12 +4051,17 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
         .unwrap();
 
     assert_eq!(
-        delete(second, 43, None).unwrap(),
+        delete("second-session", second, 43, None).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::Deleted
     );
     database
         .add_admin_webauthn_credential(1, "Fifth", "credential-e", "{}")
         .unwrap();
+
+    database
+        .create_session("third-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    assert!(database.verify_mfa("third-session").unwrap());
 
     database
         .conn()
@@ -4058,7 +4074,7 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
                  END;",
         )
         .unwrap();
-    assert!(delete(third, 44, None).is_err());
+    assert!(delete("third-session", third, 44, None).is_err());
     assert_eq!(database.admin_webauthn_credentials(1).unwrap().len(), 3);
     database
         .conn()
@@ -4066,7 +4082,7 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
         .unwrap();
 
     assert_eq!(
-        delete(third, 44, None).unwrap(),
+        delete("third-session", third, 44, None).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::Deleted
     );
     assert_eq!(
@@ -4277,10 +4293,20 @@ fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
         AdminWebauthnCredentialDeletionOutcome::Deleted
     );
 
+    database
+        .create_session(
+            "replacement-session",
+            1,
+            "csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(database.verify_mfa("replacement-session").unwrap());
+
     assert_eq!(
         database
             .set_admin_totp_enabled_with_reauthentication(
-                "authorized-session",
+                "replacement-session",
                 1,
                 "password-hash",
                 1,
