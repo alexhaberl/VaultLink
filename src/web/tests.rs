@@ -12,9 +12,9 @@ use super::{
     transfer::{install_zip_blocking_test_hook, ZipBlockingTestHook, ZipBlockingTestPhase},
     transfer_runtime::*,
     upload::*,
-    AppError, BUFFERED_RESPONSE_CHUNK_BYTES, DEFAULT_REQUEST_BODY_LIMIT, ERROR_CODE_HEADER,
-    MAX_RENDERED_TEXT_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES, MAX_UPLOAD_PATH_FIELD_BYTES,
-    TEXT_PREVIEW_STREAM_MARKER,
+    AppError, ServerRequestId, BUFFERED_RESPONSE_CHUNK_BYTES, DEFAULT_REQUEST_BODY_LIMIT,
+    ERROR_CODE_HEADER, MAX_RENDERED_TEXT_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES,
+    MAX_UPLOAD_PATH_FIELD_BYTES, REQUEST_ID_HEADER, TEXT_PREVIEW_STREAM_MARKER,
 };
 use crate::config::{Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage, Tls};
 use crate::{
@@ -2647,6 +2647,48 @@ async fn full_router_exposes_only_the_v2_api_namespace() {
             .status(),
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn request_ids_are_server_generated_and_propagated() {
+    use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+
+    let app = Router::new()
+        .route(
+            "/",
+            get(|axum::Extension(ServerRequestId(request_id))| async move { request_id }),
+        )
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(middleware::from_fn(super::attach_server_request_id))
+        .layer(SetRequestIdLayer::new(REQUEST_ID_HEADER, MakeRequestUuid))
+        .layer(middleware::from_fn(super::discard_client_request_id));
+    let mut spoofed = request(Method::GET, "/api/v2/health", "");
+    *spoofed.uri_mut() = Uri::from_static("/");
+    spoofed.headers_mut().insert(
+        REQUEST_ID_HEADER,
+        HeaderValue::from_static("client-controlled"),
+    );
+
+    let response = app.oneshot(spoofed).await.unwrap();
+    let request_id = response
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let handler_request_id = response_text(response).await;
+
+    assert_ne!(request_id, "client-controlled");
+    assert_eq!(request_id.len(), 36);
+    assert!(request_id.bytes().enumerate().all(|(index, byte)| {
+        if [8, 13, 18, 23].contains(&index) {
+            byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    }));
+    assert_eq!(handler_request_id, request_id);
 }
 
 #[tokio::test]

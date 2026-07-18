@@ -139,7 +139,7 @@ curl -sS -f -X POST "http://$PROXY_ADDR/start" \
     | grep -q "VaultLink is starting"
 
 wait_http "http://$PROXY_ADDR/login" "200"
-wait_http "http://$PROXY_ADDR/api/v2/health" "200"
+wait_http "http://$PROXY_ADDR/api/v2/health/ready" "200"
 kill -0 "$CONTAINER_PID"
 
 if grep -Fq "$ADMIN_PASSWORD" "$CONTAINER_LOG"; then

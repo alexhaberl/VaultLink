@@ -196,6 +196,8 @@ fn default_letsencrypt_cache_dir() -> PathBuf {
 pub struct Security {
     #[serde(default = "default_session_hours")]
     pub session_hours: i64,
+    #[serde(default = "default_session_idle_minutes")]
+    pub session_idle_minutes: i64,
     #[serde(default = "default_attempts")]
     pub login_attempts: usize,
     #[serde(default = "default_account_login_attempts")]
@@ -219,6 +221,7 @@ impl Default for Security {
     fn default() -> Self {
         Self {
             session_hours: default_session_hours(),
+            session_idle_minutes: default_session_idle_minutes(),
             login_attempts: default_attempts(),
             account_login_attempts: default_account_login_attempts(),
             login_window_seconds: default_window(),
@@ -233,6 +236,9 @@ impl Default for Security {
 }
 fn default_session_hours() -> i64 {
     12
+}
+fn default_session_idle_minutes() -> i64 {
+    30
 }
 fn default_attempts() -> usize {
     5
@@ -257,6 +263,7 @@ fn default_share_unlock_minutes() -> i64 {
 }
 
 const MAX_SESSION_HOURS: i64 = 24 * 365;
+const MIN_SESSION_IDLE_MINUTES: i64 = 5;
 const MAX_AUTH_ATTEMPTS: usize = 100;
 const MAX_LOGIN_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const MAX_SHARE_PASSWORD_LENGTH: usize = 1_024;
@@ -315,7 +322,7 @@ impl Config {
 
         if self.server.mode != ServerMode::StandaloneTls {
             return Ok(LocalReadinessTarget {
-                url: format!("http://{local}/api/v2/health"),
+                url: format!("http://{local}/api/v2/health/ready"),
                 connect_to: None,
                 insecure: false,
             });
@@ -330,7 +337,7 @@ impl Config {
         let public_port = public_url.port_or_known_default().ok_or_else(|| {
             ConfigError::Invalid("public_base_url must contain a known port".into())
         })?;
-        public_url.set_path("/api/v2/health");
+        public_url.set_path("/api/v2/health/ready");
         public_url.set_query(None);
         public_url.set_fragment(None);
 
@@ -577,6 +584,13 @@ impl Config {
         if !(1..=MAX_SESSION_HOURS).contains(&self.security.session_hours) {
             return Err(ConfigError::Invalid(format!(
                 "session_hours must be between 1 and {MAX_SESSION_HOURS}"
+            )));
+        }
+        if !(MIN_SESSION_IDLE_MINUTES..=self.security.session_hours * 60)
+            .contains(&self.security.session_idle_minutes)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "session_idle_minutes must be between {MIN_SESSION_IDLE_MINUTES} and session_hours * 60"
             )));
         }
         if !(1..=MAX_AUTH_ATTEMPTS).contains(&self.security.login_attempts) {
@@ -1153,6 +1167,18 @@ mod tests {
         }
         c.security.session_hours = default_session_hours();
 
+        for invalid in [
+            MIN_SESSION_IDLE_MINUTES - 1,
+            c.security.session_hours * 60 + 1,
+        ] {
+            c.security.session_idle_minutes = invalid;
+            assert!(
+                c.validate().is_err(),
+                "accepted session_idle_minutes={invalid}"
+            );
+        }
+        c.security.session_idle_minutes = default_session_idle_minutes();
+
         for invalid in [0, MAX_AUTH_ATTEMPTS + 1] {
             c.security.login_attempts = invalid;
             assert!(c.validate().is_err(), "accepted login_attempts={invalid}");
@@ -1438,7 +1464,7 @@ mod tests {
         assert_eq!(
             c.local_readiness_target().unwrap(),
             LocalReadinessTarget {
-                url: "http://127.0.0.1:8080/api/v2/health".into(),
+                url: "http://127.0.0.1:8080/api/v2/health/ready".into(),
                 connect_to: None,
                 insecure: false,
             }
@@ -1463,7 +1489,7 @@ mod tests {
         assert_eq!(
             c.local_readiness_target().unwrap(),
             LocalReadinessTarget {
-                url: "https://files.example.test/api/v2/health".into(),
+                url: "https://files.example.test/api/v2/health/ready".into(),
                 connect_to: Some("files.example.test:443:127.0.0.1:443".into()),
                 insecure: true,
             }
@@ -1488,7 +1514,7 @@ mod tests {
         assert_eq!(
             c.local_readiness_target().unwrap(),
             LocalReadinessTarget {
-                url: "https://files.example.test:8443/api/v2/health".into(),
+                url: "https://files.example.test:8443/api/v2/health/ready".into(),
                 connect_to: Some("files.example.test:8443:[::1]:8443".into()),
                 insecure: true,
             }

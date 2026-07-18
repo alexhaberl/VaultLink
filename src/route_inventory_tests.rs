@@ -205,6 +205,8 @@ fn api_route_inventory_is_explicit_and_complete() {
     let router = router_registration_block(API_SOURCE);
     let expected = [
         ("/health", "get(health)"),
+        ("/health/live", "get(health)"),
+        ("/health/ready", "get(readiness)"),
         ("/session/login", "post(login)"),
         ("/session/mfa", "post(mfa)"),
         ("/session/logout", "post(logout)"),
@@ -257,7 +259,7 @@ fn api_route_inventory_is_explicit_and_complete() {
         ),
     ];
 
-    assert_eq!(expected.len(), 27);
+    assert_eq!(expected.len(), 29);
     assert_eq!(occurrences(&router, ".route("), expected.len());
     for (path, methods) in expected {
         assert_route(&router, path, methods);
@@ -274,16 +276,16 @@ fn approved_source_level_registration_counts_include_test_fixtures() {
     let api_router = router_registration_block(API_SOURCE);
 
     assert_eq!(occurrences(&web, ".route("), 53);
-    assert_eq!(occurrences(&web_tests, ".route("), 2);
+    assert_eq!(occurrences(&web_tests, ".route("), 3);
     assert_eq!(
         occurrences(&web, ".route(") + occurrences(&web_tests, ".route("),
-        55
+        56
     );
-    assert_eq!(occurrences(&api, ".route("), 27);
+    assert_eq!(occurrences(&api, ".route("), 29);
     assert_eq!(occurrences(&api_tests, ".route("), 1);
     assert_eq!(
         occurrences(&api, ".route(") + occurrences(&api_tests, ".route("),
-        28
+        30
     );
     assert_eq!(
         occurrences(&web, ".route("),
@@ -363,8 +365,10 @@ fn nesting_layer_order_and_original_uri_contract_remain_visible() {
             ".layer(middleware::from_fn(admission::absolute_request_body_deadline))",
             ".layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_IDLE_TIMEOUT))",
             ".layer(PropagateRequestIdLayer::x_request_id())",
-            ".layer(SetRequestIdLayer::new(",
             ".layer(TraceLayer::new_for_http()",
+            ".layer(middleware::from_fn(attach_server_request_id))",
+            ".layer(SetRequestIdLayer::new(",
+            ".layer(middleware::from_fn(discard_client_request_id))",
             ".layer(CatchPanicLayer::new())",
             ".layer(middleware::from_fn_with_state(state.clone(),admission::response_admission))",
             ".layer(middleware::from_fn(admission::locale_context))",
@@ -373,6 +377,8 @@ fn nesting_layer_order_and_original_uri_contract_remain_visible() {
             ".with_state(state)",
         ],
     );
+    assert!(WEB_SOURCE.contains("request_id = %request"));
+    assert!(WEB_SOURCE.contains(".get::<ServerRequestId>()"));
     assert_fragments_in_order(
         &api_router,
         &[

@@ -98,6 +98,33 @@ impl DirectoryScan {
 }
 
 impl SecureRoot {
+    pub(crate) fn readiness_check(&self) -> io::Result<()> {
+        for (name, directory) in [
+            ("root", self.root.directory.as_ref()),
+            ("uploads", self.root.staging.as_ref()),
+            ("tombstones", self.tombstones.as_ref()),
+        ] {
+            if !directory.metadata()?.is_dir() {
+                return Err(io::Error::other(format!(
+                    "{name} capability is no longer a directory"
+                )));
+            }
+            let filesystem = rustix::fs::fstatvfs(directory)?;
+            if filesystem
+                .f_flag
+                .contains(rustix::fs::StatVfsMountFlags::RDONLY)
+            {
+                return Err(io::Error::other(format!("{name} filesystem is read-only")));
+            }
+            if filesystem.f_bavail == 0 {
+                return Err(io::Error::other(format!(
+                    "{name} filesystem has no available blocks"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn display_root(&self) -> &Path {
         &self.display_root
     }

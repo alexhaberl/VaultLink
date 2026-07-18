@@ -4,7 +4,9 @@
 
 This work was developed under the internal `0.4.9` hardening candidate. That candidate is not published or tagged; the first releasable artifact containing these changes is 0.5.0.
 
-- Added forward-only, transactional schema 1→2→3 migrations with durable migration history, fingerprint validation, share-list indexes, and complete binary/config/database/keyring rollback requirements.
+- Added server-authoritative request IDs, split liveness/readiness probes, a bounded descriptor-based DB/storage readiness check, and a 30-minute default administrator idle-session timeout with schema-4 activity tracking.
+- Centralized WebAuthn RSA rejection at registration, persistence and authentication boundaries and documented the narrowly compensated `RUSTSEC-2023-0071` exception.
+- Added forward-only, transactional schema 1→2→3→4 migrations with durable migration history, fingerprint validation, share-list indexes, deliberate administrator-session revocation at schema 4, and complete binary/config/database/keyring rollback requirements.
 - Added bounded cursor pagination for large directory and historical Share listings, immutable versioned-asset caching, explicit Argon2id parameters, and non-root container smoke execution.
 - Partitioned administrator password-login limits so active accounts use isolated exact counters while unknown or invalid usernames remain in fixed process-local buckets.
 - Made English the default UI language unless an explicit locale cookie exists, made backend/API error messages English-only, and moved the complete JSON API to `/api/v2` without a v1 compatibility router.
