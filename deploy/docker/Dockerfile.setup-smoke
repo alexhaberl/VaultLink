@@ -36,6 +36,7 @@ RUN chmod 0644 deploy/Caddyfile deploy/*.conf deploy/*.example \
         --no-create-home --shell /usr/sbin/nologin vaultlink \
     && shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh \
     && python3 -m py_compile deploy/docker/loopback-proxy.py \
+    && python3 -m unittest deploy/docker/test_loopback_proxy.py \
     && rm -rf deploy/docker/__pycache__ \
     && sh tools/check-supply-chain-policy.sh
 

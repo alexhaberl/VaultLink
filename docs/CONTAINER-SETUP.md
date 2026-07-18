@@ -17,6 +17,12 @@ configuration and transitioned in the same process, it reads only
 `server.listen_address` from that configuration and forwards to the configured
 loopback listener. Non-loopback configured targets are never proxied.
 
+The proxy is HTTP-aware at the container boundary: it removes client-supplied
+`Forwarded` and `X-Forwarded-For` headers and sets `X-Forwarded-For` to the
+address of the peer that connected to the container proxy. This permits a
+loopback listener to trust the proxy without allowing callers to choose their
+own client IP.
+
 The repository's digest-pinned smoke image can exercise this flow locally. It
 is a test image with build tools, not the final minimal runtime image:
 
