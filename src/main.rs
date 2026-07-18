@@ -352,6 +352,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.get(1).is_some_and(|value| value == "container-proxy") {
+        let options = vaultlink::container_proxy::ContainerProxyOptions::parse(&args)
+            .map_err(std::io::Error::other)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .init();
+        return vaultlink::container_proxy::run(options)
+            .await
+            .map_err(Into::into);
+    }
     if args.get(1).is_some_and(|value| value == "recover-admin") {
         let options = RecoverAdminOptions::parse(&args).map_err(std::io::Error::other)?;
         tracing_subscriber::fmt()
