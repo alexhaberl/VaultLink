@@ -261,11 +261,8 @@ impl AdminLoginLimiter {
             .retain(|(username, _), _| active_admins.contains(username));
     }
 
-    /// Records the global account attempt before inspecting origin state.
-    ///
-    /// If the origin check rejects the request, the account attempt remains
-    /// consumed. If the account is already exhausted, no origin entry or bucket
-    /// is created or consumed.
+    /// Atomically checks and records both account-wide and origin-specific
+    /// attempts for an administrator password login.
     pub fn check_and_record_attempt(&self, username: &str, origin: IpAddr) -> bool {
         if self.origin_max == 0 || self.account_max == 0 || self.window.is_zero() {
             return false;
@@ -284,19 +281,38 @@ impl AdminLoginLimiter {
                 LoginLimiter::prune_history(history, now, self.window);
                 !history.attempts.is_empty()
             });
-            let account = state
-                .known_accounts
-                .entry(normalized.clone())
-                .or_insert_with(AttemptHistory::new);
-            if !Self::record(account, self.account_max, now, self.window) {
+            if !Self::can_record(
+                state.known_accounts.get_mut(&normalized),
+                self.account_max,
+                now,
+                self.window,
+            ) {
                 return false;
             }
 
-            let origin_history = state
+            let origin_key = (normalized.clone(), origin);
+            if !Self::can_record(
+                state.known_origins.get_mut(&origin_key),
+                self.origin_max,
+                now,
+                self.window,
+            ) {
+                return false;
+            }
+
+            state
+                .known_accounts
+                .entry(normalized)
+                .or_insert_with(AttemptHistory::new)
+                .attempts
+                .push(now);
+            state
                 .known_origins
-                .entry((normalized, origin))
-                .or_insert_with(AttemptHistory::new);
-            return Self::record(origin_history, self.origin_max, now, self.window);
+                .entry(origin_key)
+                .or_insert_with(AttemptHistory::new)
+                .attempts
+                .push(now);
+            return true;
         }
 
         let account_bucket = (state
@@ -339,6 +355,18 @@ impl AdminLoginLimiter {
         }
         history.attempts.push(now);
         true
+    }
+
+    fn can_record(
+        history: Option<&mut AttemptHistory>,
+        maximum: usize,
+        now: Instant,
+        window: Duration,
+    ) -> bool {
+        history.is_none_or(|history| {
+            LoginLimiter::prune_history(history, now, window);
+            history.attempts.len() < maximum
+        })
     }
 
     #[cfg(test)]
@@ -910,6 +938,7 @@ mod tests {
         assert!(limiter.check_and_record_attempt("admin", first));
         assert!(limiter.check_and_record_attempt("admin", first));
         assert!(!limiter.check_and_record_attempt("admin", first));
+        assert!(limiter.check_and_record_attempt("admin", second));
         assert!(limiter.check_and_record_attempt("admin", second));
         assert!(!limiter.check_and_record_attempt("admin", second));
     }
