@@ -40,7 +40,7 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
 - [x] Every production configuration requires exact fail-closed mount identity; local audited production storage may keep SQLite outside the visible tree on the same supported local mount.
 - [x] Setup and `init-admin` validate root/internal/data mounts and canonical paths before writing config, database, or credentials.
 - [x] Upgrade/rollback backups and recovery always use a validated binary/config/SQLite/keyring unit. Candidate configuration never changes live configuration before downtime.
-- [x] Fresh databases use schema 4; validated schemas 1, 2 and 3 migrate transactionally. Schema 3→4 revokes existing administrator sessions. Forward-only rollback restores the matching full old backup.
+- [x] Fresh databases use schema 6; validated schemas 1 through 5 migrate transactionally. Schema 3→4 revokes existing administrator sessions, and schema 6 reclassifies existing upload-related audits under the centralized priority policy. Forward-only rollback restores the matching full old backup.
 - [x] Small buffered form/JSON body limits; only upload routes receive the large streaming allowance. Multipart preamble, headers, field count, and metadata are bounded.
 - [x] Reverse-proxy mode, standalone TLS, SIGHUP PEM reload, and optional built-in Let's Encrypt `tls-alpn-01` standalone TLS.
 - [x] UI polish with separate auth/public/admin shells, logo/favicon, locale-aware date/time inputs, decimal MB/GB units, and consistent controls.
@@ -118,7 +118,7 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
   - backup contains `vaultlink`, `config.toml`, `data.sqlite`, and matching `secrets.keyring` with restrictive ownership/modes;
   - candidate failure restores the full old unit and verifies its own health endpoint;
   - concurrent upgrade/rollback fails on the maintenance lock before service stop;
-  - real schema-1, schema-2 and schema-3 fixtures migrate once to schema 4; rollback restores the complete pre-migration backup.
+  - real schema-1 through schema-5 fixtures migrate once to schema 6; upload-related legacy audits receive security priority, and rollback restores the complete pre-migration backup.
 - [ ] Password-protected public uploads accept the unlock-bound CSRF value as multipart field or `X-VaultLink-Upload-CSRF` and reject missing/foreign values.
 - [ ] Upload Shares enforce per-file, cumulative byte, and file-count limits under parallel queue uploads and overwrite attempts.
 - [ ] Rollback test stops the service, restores matching binary/config/database/keyring, starts it, verifies exact local health/version, and remains stopped after failed recovery stop or incomplete emergency restore.

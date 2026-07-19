@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth,
-    db::{AuditContext, Permission},
+    db::{AuditAction, AuditContext, Permission},
     http_auth::{
-        audit_security_observation as audit_observation, current_client_limit_key,
-        enabled_audit_client_ip, make_unlock_cookie, required_database, runtime_settings,
-        share_is_unlocked, verify_password_admitted, UnlockCookieScope,
+        audit_observation, current_client_limit_key, enabled_audit_client_ip, make_unlock_cookie,
+        required_database, runtime_settings, share_is_unlocked, verify_password_admitted,
+        UnlockCookieScope,
     },
     sensitive::SecretString,
     AppState,
@@ -148,7 +148,7 @@ pub(super) async fn unlock_share(
         audit_observation(
             &state,
             "public".into(),
-            "share_unlock_failed",
+            AuditAction::ShareUnlockFailed,
             Some(share.id.to_string()),
             None,
         )
@@ -164,7 +164,7 @@ pub(super) async fn unlock_share(
         audit_observation(
             &state,
             "public".into(),
-            "share_unlock_failed",
+            AuditAction::ShareUnlockFailed,
             Some(share.id.to_string()),
             None,
         )
@@ -200,7 +200,7 @@ pub(super) async fn unlock_share(
         audit_observation(
             &state,
             "public".into(),
-            "share_unlock_failed",
+            AuditAction::ShareUnlockFailed,
             Some(share.id.to_string()),
             None,
         )

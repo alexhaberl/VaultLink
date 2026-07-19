@@ -157,13 +157,13 @@ fn required_audit_failure_rolls_back_admin_share_session_and_settings_mutations(
     );
 
     let share_error = db
-        .set_share_active_and_audit(share_id, false, &context, "share_deactivated")
+        .set_share_active_and_audit(share_id, false, &context, AuditAction::ShareDeactivated)
         .unwrap_err();
     assert!(is_audit_unavailable(&share_error));
     assert!(db.share_by_token("existing-share").unwrap().unwrap().active);
 
-    let control_events = [RequiredAuditEvent::routine(
-        "share_controls_updated",
+    let control_events = [RequiredAuditEvent::new(
+        AuditAction::ShareUploadConflictUpdated,
         Some(share_id.to_string()),
         None,
     )];
@@ -190,7 +190,7 @@ fn required_audit_failure_rolls_back_admin_share_session_and_settings_mutations(
             share_id,
             Some("new-share-hash"),
             &context,
-            "share_password_changed",
+            AuditAction::SharePasswordSet,
         )
         .unwrap_err();
     assert!(is_audit_unavailable(&password_error));
@@ -1146,6 +1146,45 @@ fn audit_retention_keeps_only_the_newest_rows() {
 }
 
 #[test]
+fn audit_action_policy_has_unique_names_and_explicit_priorities() {
+    let mut names = std::collections::HashSet::new();
+    assert_eq!(AuditAction::ALL.len(), 52);
+    for action in AuditAction::ALL {
+        assert!(
+            names.insert(action.as_str()),
+            "duplicate action {}",
+            action.as_str()
+        );
+        let expected = match action {
+            AuditAction::AdminDownload
+            | AuditAction::AdminPreview
+            | AuditAction::Download
+            | AuditAction::Preview
+            | AuditAction::UploadQuotaCommitted
+            | AuditAction::ZipDownload => AuditPriority::Routine,
+            _ => AuditPriority::Security,
+        };
+        assert_eq!(action.priority(), expected, "action {}", action.as_str());
+    }
+}
+
+#[test]
+fn typed_audit_writer_persists_policy_priority() {
+    let database = Database::open(":memory:").unwrap();
+    for action in AuditAction::ALL {
+        database
+            .audit_action_with_client_ip(*action, "policy-test", None, None, None)
+            .unwrap();
+    }
+    for action in AuditAction::ALL {
+        assert_eq!(
+            database.audit_priorities(action.as_str()).unwrap(),
+            [action.priority().as_i64()]
+        );
+    }
+}
+
+#[test]
 fn audit_retention_preserves_security_events_during_routine_volume() {
     let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
@@ -1205,11 +1244,20 @@ fn audit_retention_falls_back_to_fifo_for_security_only_volume() {
 #[test]
 fn audit_retention_caps_recent_events() {
     let database = Database::open(":memory:").unwrap();
+    database
+        .audit_action_with_client_ip(
+            AuditAction::Upload,
+            "public",
+            Some("share-1"),
+            Some("file=evidence.txt"),
+            None,
+        )
+        .unwrap();
     let mut connection = database.conn();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
-    for index in 0..=MAX_AUDIT_ROWS {
+    for index in 0..MAX_AUDIT_ROWS {
         transaction
             .execute(
                 "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip)
@@ -1221,8 +1269,44 @@ fn audit_retention_caps_recent_events() {
     transaction.commit().unwrap();
     drop(connection);
 
-    assert_eq!(database.cleanup_audit_retention().unwrap(), 1);
+    assert_eq!(
+        database.cleanup_audit_retention().unwrap(),
+        AuditRetentionOutcome {
+            routine_deleted: 1,
+            security_deleted: 0,
+        }
+    );
     assert_eq!(database.count_audit(None).unwrap(), MAX_AUDIT_ROWS as usize);
+    assert_eq!(database.count_audit(Some("upload")).unwrap(), 1);
+    assert_eq!(database.audit_priorities("upload").unwrap(), [100]);
+}
+
+#[test]
+fn audit_retention_reports_security_eviction_when_only_security_rows_remain() {
+    let database = Database::open(":memory:").unwrap();
+    let mut connection = database.conn();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    for index in 0..=MAX_AUDIT_ROWS {
+        transaction
+            .execute(
+                "INSERT INTO audit(occurred_at,actor,action,priority)
+                 VALUES(?1,'test',?2,100)",
+                params![Utc::now().to_rfc3339(), format!("security-{index}")],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+
+    assert_eq!(
+        database.cleanup_audit_retention().unwrap(),
+        AuditRetentionOutcome {
+            routine_deleted: 0,
+            security_deleted: 1,
+        }
+    );
 }
 
 #[test]
@@ -1914,7 +1998,7 @@ fn rejects_unknown_newer_schema() {
 }
 
 #[test]
-fn fresh_database_is_exactly_schema_five_without_plaintext_secret_columns() {
+fn fresh_database_is_exactly_schema_six_without_plaintext_secret_columns() {
     let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
     assert_eq!(
@@ -1925,12 +2009,12 @@ fn fresh_database_is_exactly_schema_five_without_plaintext_secret_columns() {
     );
     let migration_records: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3,4,5) AND length(applied_at)>0",
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3,4,5,6) AND length(applied_at)>0",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migration_records, 4);
+    assert_eq!(migration_records, 5);
     for index in ["idx_shares_active_id", "idx_shares_active_expires"] {
         let exists: bool = connection
             .query_row(
@@ -1993,7 +2077,7 @@ fn downgrade_audit_to_schema_four(connection: &Connection) {
         .execute_batch(
             "DROP INDEX idx_audit_priority_id;
              ALTER TABLE audit DROP COLUMN priority;
-             DELETE FROM vaultlink_schema_migrations WHERE target_version=5;",
+             DELETE FROM vaultlink_schema_migrations WHERE target_version IN (5,6);",
         )
         .unwrap();
     connection
@@ -2003,6 +2087,50 @@ fn downgrade_audit_to_schema_four(connection: &Connection) {
         )
         .unwrap();
     connection.pragma_update(None, "user_version", 4).unwrap();
+}
+
+fn schema_five_fixture() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("schema-five.sqlite");
+    drop(Database::open(&path).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "DELETE FROM vaultlink_schema_migrations WHERE target_version=6",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+            [schema::SCHEMA_5_FINGERPRINT],
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 5).unwrap();
+    for (index, action) in [
+        "share_toggled",
+        "upload_directories_created",
+        "admin_upload",
+        "admin_upload_replaced",
+        "upload",
+        "upload_replaced",
+        "admin_upload_durability_uncertain",
+        "upload_durability_uncertain",
+        "download",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        connection
+            .execute(
+                "INSERT INTO audit(id,occurred_at,actor,action,object_id,detail,priority)
+                 VALUES(?1,'2026-07-19T00:00:00Z','fixture',?2,?3,'preserved',0)",
+                params![(index + 1) as i64, action, format!("object-{index}")],
+            )
+            .unwrap();
+    }
+    drop(connection);
+    (directory, path)
 }
 
 fn populated_schema_one_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u8>) {
@@ -2212,7 +2340,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let applied_at: Vec<(i64, String)> = connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3,4,5) ORDER BY target_version",
+             WHERE target_version IN (2,3,4,5,6) ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -2227,7 +2355,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let reopened_applied_at: Vec<(i64, String)> = reopened_connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3,4,5) ORDER BY target_version",
+             WHERE target_version IN (2,3,4,5,6) ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -2238,7 +2366,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
 }
 
 #[test]
-fn schema_two_migrates_to_five_with_expected_indexes() {
+fn schema_two_migrates_to_six_with_expected_indexes() {
     let (_directory, path) = schema_two_fixture();
     let database = Database::open(path).unwrap();
     let connection = database.conn();
@@ -2276,6 +2404,35 @@ fn schema_four_migration_backfills_security_priority() {
         priorities,
         [("admin_recovered".into(), 100), ("download".into(), 0)]
     );
+}
+
+#[test]
+fn schema_five_migration_reclassifies_file_mutations_and_preserves_rows() {
+    let (_directory, path) = schema_five_fixture();
+    let database = Database::open(path).unwrap();
+    let connection = database.conn();
+    let rows: Vec<(i64, String, String, String, i64)> = connection
+        .prepare("SELECT id,action,object_id,detail,priority FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows.len(), 9);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.0, (index + 1) as i64);
+        assert_eq!(row.2, format!("object-{index}"));
+        assert_eq!(row.3, "preserved");
+        assert_eq!(row.4, if row.1 == "download" { 0 } else { 100 });
+    }
 }
 
 #[test]
@@ -2469,6 +2626,48 @@ fn failed_schema_four_migration_restores_audit_shape_and_metadata() {
             .unwrap(),
         2
     );
+}
+
+#[test]
+fn failed_schema_five_migration_restores_priorities_and_metadata() {
+    let (_directory, path) = schema_five_fixture();
+    schema::fail_next_schema_5_to_6_migration();
+    assert!(matches!(
+        Database::open(&path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        5
+    );
+    let fingerprint: String = connection
+        .query_row(
+            "SELECT fingerprint FROM vaultlink_schema WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fingerprint, schema::SCHEMA_5_FINGERPRINT);
+    let priorities: Vec<i64> = connection
+        .prepare("SELECT priority FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(priorities, vec![0; 9]);
+    let schema_six_record: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version=6",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema_six_record, 0);
 }
 
 #[test]

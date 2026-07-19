@@ -4005,6 +4005,7 @@ async fn detached_public_upload_finalizer_preserves_the_audit_client_ip() {
     let events = state.db.list_audit(Some("upload"), 10, 0).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].client_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(state.db.audit_priorities("upload").unwrap(), [100]);
 }
 
 #[tokio::test]
@@ -4963,6 +4964,21 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
             .unwrap()
             .len(),
         1
+    );
+    assert_eq!(
+        state.db.audit_priorities("admin_upload").unwrap(),
+        [100, 100]
+    );
+    assert_eq!(
+        state.db.audit_priorities("admin_upload_replaced").unwrap(),
+        [100]
+    );
+    assert_eq!(
+        state
+            .db
+            .audit_priorities("upload_directories_created")
+            .unwrap(),
+        [100]
     );
 
     let mut blocked = admin_multipart_request(
@@ -5930,6 +5946,13 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
         std::fs::read(root.path().join("docs/Fotos/2026/Sommer/bild.txt")).unwrap(),
         b"public folder upload"
     );
+    assert_eq!(
+        state
+            .db
+            .audit_priorities("upload_directories_created")
+            .unwrap(),
+        [100]
+    );
     let traversal = app
         .clone()
         .oneshot(public_folder_upload_request(
@@ -6441,6 +6464,21 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     assert_eq!(
         std::fs::read(root.path().join("uploads/ok.txt")).unwrap(),
         b"new"
+    );
+    assert!(!state.db.audit_priorities("upload").unwrap().is_empty());
+    assert!(state
+        .db
+        .audit_priorities("upload")
+        .unwrap()
+        .iter()
+        .all(|priority| *priority == 100));
+    assert_eq!(state.db.audit_priorities("upload_replaced").unwrap(), [100]);
+    assert_eq!(
+        state
+            .db
+            .audit_priorities("upload_durability_uncertain")
+            .unwrap(),
+        [100]
     );
     let blocked = app
         .clone()
