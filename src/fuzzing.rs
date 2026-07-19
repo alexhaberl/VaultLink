@@ -10,3 +10,7 @@ pub use crate::policy::{
     SharePasswordValidation, ShareUploadPolicyError, UploadFormField, UploadFormState,
     UploadFormStateError,
 };
+
+pub fn is_private_admin_filename(name: &str) -> bool {
+    crate::path_security::is_private_admin_filename(name)
+}
