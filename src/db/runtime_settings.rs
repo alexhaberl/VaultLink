@@ -55,7 +55,7 @@ impl Database {
             required_audit.map_or((None, None), |(context, detail)| {
                 (
                     Some(context),
-                    Some([RequiredAuditEvent::new(
+                    Some([RequiredAuditEvent::security(
                         "settings_updated",
                         None,
                         Some(detail),

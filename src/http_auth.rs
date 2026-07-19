@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::{
     auth,
-    db::{AuditContext, Database, Session, Share},
+    db::{AuditContext, AuditPriority, Database, Session, Share},
     runtime::RuntimeSettings,
     AppState,
 };
@@ -295,8 +295,9 @@ fn required_database_error(error: rusqlite::Error) -> HttpAuthError {
 
 /// Persists a non-transactional observation. Successful security mutations
 /// must use a required audit transaction instead.
-pub async fn audit_observation(
+async fn audit_observation(
     state: &AppState,
+    priority: AuditPriority,
     actor: String,
     action: &'static str,
     object: Option<String>,
@@ -304,7 +305,8 @@ pub async fn audit_observation(
 ) {
     let client_ip = enabled_audit_client_ip(state);
     let result = database(state.db.clone(), move |db| {
-        db.audit_with_client_ip(
+        db.audit_with_priority_and_client_ip(
+            priority,
             &actor,
             action,
             object.as_deref(),
@@ -316,6 +318,34 @@ pub async fn audit_observation(
     if let Err(error) = result {
         tracing::error!(?error, action, "could not persist audit event");
     }
+}
+
+pub async fn audit_routine_observation(
+    state: &AppState,
+    actor: String,
+    action: &'static str,
+    object: Option<String>,
+    detail: Option<String>,
+) {
+    audit_observation(state, AuditPriority::Routine, actor, action, object, detail).await;
+}
+
+pub async fn audit_security_observation(
+    state: &AppState,
+    actor: String,
+    action: &'static str,
+    object: Option<String>,
+    detail: Option<String>,
+) {
+    audit_observation(
+        state,
+        AuditPriority::Security,
+        actor,
+        action,
+        object,
+        detail,
+    )
+    .await;
 }
 
 pub fn runtime_settings(state: &AppState) -> RuntimeSettings {

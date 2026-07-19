@@ -93,7 +93,9 @@ impl Database {
             ],
         )? == 1;
         let audit_events = created
-            .then(|| RequiredAuditEvent::new("share_unlocked", Some(share_id.to_string()), None))
+            .then(|| {
+                RequiredAuditEvent::security("share_unlocked", Some(share_id.to_string()), None)
+            })
             .into_iter()
             .collect::<Vec<_>>();
         if let Some(context) = required_audit {

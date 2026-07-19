@@ -14,9 +14,9 @@ use crate::{
     db::{AuditContext, Permission, Share},
     file_ops,
     http_auth::{
-        audit_observation, current_client_limit_key, database, enabled_audit_client_ip,
-        make_unlock_cookie, redirect_with_cookie, required_database, runtime_settings,
-        share_is_unlocked, share_unlock_csrf, try_acquire_client_activity,
+        audit_security_observation as audit_observation, current_client_limit_key, database,
+        enabled_audit_client_ip, make_unlock_cookie, redirect_with_cookie, required_database,
+        runtime_settings, share_is_unlocked, share_unlock_csrf, try_acquire_client_activity,
         verify_password_admitted, UnlockCookieScope,
     },
     i18n, path_security,
@@ -377,7 +377,7 @@ fn protected_share_page(token: &str) -> Html<String> {
         lock_icon: TrustedMarkup::static_icon(crate::ui::Icon::Lock),
     };
     Html(
-        templates::public_page("Protected share", &body)
+        templates::public_page(i18n::PROTECTED_SHARE_TITLE, &body)
             .expect("the protected-share template writes only to an in-memory string"),
     )
 }
@@ -756,7 +756,7 @@ pub(super) async fn public_page(
         file: file_view,
         upload: upload_view,
     };
-    Ok(Html(templates::public_page("Share", &body)?))
+    Ok(Html(templates::public_page(i18n::SHARE, &body)?))
 }
 fn joined_relative(base: &str, child: &str) -> Result<String> {
     let mut path = path_security::validate_relative(base)

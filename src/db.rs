@@ -44,6 +44,20 @@ use std::{
 pub(crate) const MAX_SQLITE_UNSIGNED: u64 = i64::MAX as u64;
 pub(crate) const MAX_AUDIT_ROWS: i64 = 100_000;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i64)]
+pub(crate) enum AuditPriority {
+    #[default]
+    Routine = 0,
+    Security = 100,
+}
+
+impl AuditPriority {
+    const fn as_i64(self) -> i64 {
+        self as i64
+    }
+}
+
 /// Existing and newly-created upload shares receive finite cumulative defaults.
 /// Administrators can tighten or raise them explicitly through the share API/UI.
 pub const DEFAULT_SHARE_UPLOAD_TOTAL_SIZE: u64 = 100_000_000_000;

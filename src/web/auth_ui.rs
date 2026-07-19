@@ -18,10 +18,11 @@ use crate::{
     auth,
     db::AuditContext,
     http_auth::{
-        admin_login_attempt_admitted, audit_observation, clear_session_cookie, csrf, database,
-        enabled_audit_client_ip, make_session_cookie, password_login_admitted,
-        redirect_with_cookie, required_database, session, MissingSession,
+        admin_login_attempt_admitted, audit_security_observation as audit_observation,
+        clear_session_cookie, csrf, database, enabled_audit_client_ip, make_session_cookie,
+        password_login_admitted, redirect_with_cookie, required_database, session, MissingSession,
     },
+    i18n,
     services::auth::{
         AuthService, PasswordLoginCommand, PasswordLoginOutcome, TotpLoginCommand, TotpLoginOutcome,
     },
@@ -41,7 +42,7 @@ struct MfaTemplate<'a> {
 }
 
 pub(super) async fn login_page() -> Result<Html<String>> {
-    Ok(Html(public_page("Sign in", &LoginTemplate)?))
+    Ok(Html(public_page(i18n::LOGIN_TITLE, &LoginTemplate)?))
 }
 
 #[derive(Deserialize)]
@@ -108,7 +109,7 @@ pub(super) async fn mfa_page(
     })
     .await?;
     Ok(Html(public_page(
-        "MFA",
+        i18n::MFA_TITLE,
         &MfaTemplate {
             csrf: &current_session.csrf_token,
             security_key_enabled: security_key_count >= 2,

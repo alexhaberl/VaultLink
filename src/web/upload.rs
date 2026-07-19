@@ -31,9 +31,10 @@ use crate::{
     },
     file_ops,
     http_auth::{
-        audit_observation, current_audit_client_ip, current_client_limit_key, database,
-        enabled_audit_client_ip, required_database, runtime_settings, share_is_unlocked,
-        share_unlock_csrf, try_acquire_client_activity, with_audit_client_ip, ClientActivityPermit,
+        audit_routine_observation as audit_observation, current_audit_client_ip,
+        current_client_limit_key, database, enabled_audit_client_ip, required_database,
+        runtime_settings, share_is_unlocked, share_unlock_csrf, try_acquire_client_activity,
+        with_audit_client_ip, ClientActivityPermit,
     },
     i18n::{self},
     policy::{

@@ -803,7 +803,7 @@ pub(super) async fn set_share_upload_conflict(
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let audit_events = [RequiredAuditEvent::new(
+    let audit_events = [RequiredAuditEvent::security(
         "share_upload_conflict_updated",
         Some(id.to_string()),
         Some(format!(

@@ -361,7 +361,7 @@ pub(super) async fn update_share(
     let object = id.to_string();
     let mut audit_events = Vec::new();
     if let Some(active) = active {
-        audit_events.push(RequiredAuditEvent::new(
+        audit_events.push(RequiredAuditEvent::security(
             if active {
                 "share_activated"
             } else {
@@ -372,14 +372,14 @@ pub(super) async fn update_share(
         ));
     }
     if strategy.is_some() {
-        audit_events.push(RequiredAuditEvent::new(
+        audit_events.push(RequiredAuditEvent::security(
             "share_upload_conflict_updated",
             Some(object.clone()),
             None,
         ));
     }
     if let Some((total, files)) = upload_limits {
-        audit_events.push(RequiredAuditEvent::new(
+        audit_events.push(RequiredAuditEvent::security(
             "share_upload_limits_updated",
             Some(object),
             Some(format!("bytes={total};files={files}")),

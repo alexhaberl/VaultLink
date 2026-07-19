@@ -226,7 +226,7 @@ impl Database {
             required_audit.map_or((None, None), |(context, detail)| {
                 (
                     Some(context),
-                    Some([RequiredAuditEvent::new(
+                    Some([RequiredAuditEvent::security(
                         "share_created",
                         Some(id.to_string()),
                         detail,
@@ -468,7 +468,7 @@ impl Database {
             params![new_path, old_path, exact, is_directory, subtree],
         )?;
         let audit_events = required_audit.map(|(_, recovery)| {
-            [RequiredAuditEvent::new(
+            [RequiredAuditEvent::security(
                 "path_renamed",
                 Some(new_path.to_string()),
                 Some(format!(
@@ -526,7 +526,7 @@ impl Database {
             params![exact, is_directory, subtree],
         )?;
         let audit_events = required_audit.map(|(_, recovery, cleanup_pending)| {
-            [RequiredAuditEvent::new(
+            [RequiredAuditEvent::security(
                 "path_deleted",
                 Some(path.to_string()),
                 Some(format!(
@@ -579,7 +579,7 @@ impl Database {
                 params![id, active as i64],
             )? == 1;
             let events = changed
-                .then(|| RequiredAuditEvent::new(action, Some(id.to_string()), None))
+                .then(|| RequiredAuditEvent::security(action, Some(id.to_string()), None))
                 .into_iter()
                 .collect();
             Ok((changed, events))
@@ -737,7 +737,7 @@ impl Database {
         self.required_transaction(context, |transaction| {
             let deleted = transaction.execute("DELETE FROM shares WHERE id=?1", [id])? == 1;
             let events = deleted
-                .then(|| RequiredAuditEvent::new("share_deleted", Some(id.to_string()), None))
+                .then(|| RequiredAuditEvent::security("share_deleted", Some(id.to_string()), None))
                 .into_iter()
                 .collect();
             Ok((deleted, events))
@@ -777,7 +777,7 @@ impl Database {
             )? == 1;
             transaction.execute("DELETE FROM public_unlock_sessions WHERE share_id=?1", [id])?;
             let events = changed
-                .then(|| RequiredAuditEvent::new(action, Some(id.to_string()), None))
+                .then(|| RequiredAuditEvent::security(action, Some(id.to_string()), None))
                 .into_iter()
                 .collect();
             Ok((changed, events))
