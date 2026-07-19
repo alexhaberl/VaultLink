@@ -1,7 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use std::ffi::OsStr;
-use vaultlink::{path_security, secure_fs};
+use vaultlink::{fuzzing, path_security};
 
 fuzz_target!(|input: &str| {
     if let Ok(name) = path_security::safe_filename(input) {
@@ -11,8 +10,7 @@ fuzz_target!(|input: &str| {
         assert!(!name.chars().any(char::is_control));
     }
 
-    let private = secure_fs::is_upload_fragment_name(OsStr::new(input))
-        || secure_fs::is_deletion_tombstone_name(OsStr::new(input));
+    let private = fuzzing::is_private_admin_filename(input);
     match path_security::safe_admin_filename(input) {
         Ok(name) => {
             assert!(path_security::safe_filename(name).is_ok());
