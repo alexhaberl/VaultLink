@@ -5,9 +5,9 @@ use super::{
     AdminMfaEnrollmentActivationOutcome, AdminPasswordChangeOutcome, AdminRecoveryOutcome,
     AdminSummary, AdminTotpSettingOutcome, AdminWebauthnCredential,
     AdminWebauthnCredentialDeletionOutcome, AdminWebauthnCredentialRegistrationOutcome,
-    AuditContext, AuditedAdminMfaEnrollmentStartOutcome, Database, InitialAdminOutcome,
-    PasswordSessionCreationOutcome, PendingAdminMfaEnrollment, RequiredAuditEvent, Session,
-    ADMIN_MFA_ENROLLMENT_TTL_SECONDS,
+    AuditAction, AuditContext, AuditedAdminMfaEnrollmentStartOutcome, Database,
+    InitialAdminOutcome, PasswordSessionCreationOutcome, PendingAdminMfaEnrollment,
+    RequiredAuditEvent, Session, ADMIN_MFA_ENROLLMENT_TTL_SECONDS,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -191,8 +191,8 @@ impl Database {
             let admin_id = transaction.last_insert_rowid();
             Ok((
                 InitialAdminOutcome::Created,
-                vec![RequiredAuditEvent::security(
-                    "initial_admin_created",
+                vec![RequiredAuditEvent::new(
+                    AuditAction::InitialAdminCreated,
                     Some(admin_id.to_string()),
                     None,
                 )],
@@ -245,8 +245,8 @@ impl Database {
             };
             Ok((
                 admin,
-                vec![RequiredAuditEvent::security(
-                    "admin_created",
+                vec![RequiredAuditEvent::new(
+                    AuditAction::AdminCreated,
                     Some(id.to_string()),
                     None,
                 )],
@@ -330,7 +330,7 @@ impl Database {
             let changed = transaction.execute("UPDATE admins SET active=1 WHERE id=?1", [id])? == 1;
             let events = changed
                 .then(|| {
-                    RequiredAuditEvent::security("admin_activated", Some(id.to_string()), None)
+                    RequiredAuditEvent::new(AuditAction::AdminActivated, Some(id.to_string()), None)
                 })
                 .into_iter()
                 .collect();
@@ -391,8 +391,8 @@ impl Database {
             AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive
         )
         .then(|| {
-            vec![RequiredAuditEvent::security(
-                "admin_deactivated",
+            vec![RequiredAuditEvent::new(
+                AuditAction::AdminDeactivated,
                 Some(id.to_string()),
                 None,
             )]
@@ -473,8 +473,8 @@ impl Database {
             totp_secret.is_some()
         );
         let audit_context = AuditContext::new("local_recovery", None);
-        let audit_events = [RequiredAuditEvent::security(
-            "admin_recovered",
+        let audit_events = [RequiredAuditEvent::new(
+            AuditAction::AdminRecovered,
             Some(object_id.clone()),
             Some(detail),
         )];
@@ -543,8 +543,8 @@ impl Database {
         revoke_admin_auth_state(&transaction, id)?;
         let object_id = id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::security(
-            "account_password_changed",
+        let audit_events = [RequiredAuditEvent::new(
+            AuditAction::AccountPasswordChanged,
             Some(object_id),
             None,
         )];
@@ -676,8 +676,8 @@ impl Database {
             )?;
             Ok((
                 AuditedAdminMfaEnrollmentStartOutcome::Started { expires_at },
-                vec![RequiredAuditEvent::security(
-                    "account_mfa_enrollment_started",
+                vec![RequiredAuditEvent::new(
+                    AuditAction::AccountMfaEnrollmentStarted,
                     Some(admin_id.to_string()),
                     None,
                 )],
@@ -789,8 +789,8 @@ impl Database {
         revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = admin_id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::security(
-            "account_mfa_changed",
+        let audit_events = [RequiredAuditEvent::new(
+            AuditAction::AccountMfaChanged,
             Some(object_id),
             None,
         )];
@@ -838,7 +838,11 @@ impl Database {
             }
             let events = changed
                 .then(|| {
-                    RequiredAuditEvent::security("admin_password_reset", Some(id.to_string()), None)
+                    RequiredAuditEvent::new(
+                        AuditAction::AdminPasswordReset,
+                        Some(id.to_string()),
+                        None,
+                    )
                 })
                 .into_iter()
                 .collect();
@@ -905,7 +909,7 @@ impl Database {
             let events = username
                 .is_some()
                 .then(|| {
-                    RequiredAuditEvent::security("admin_totp_reset", Some(id.to_string()), None)
+                    RequiredAuditEvent::new(AuditAction::AdminTotpReset, Some(id.to_string()), None)
                 })
                 .into_iter()
                 .collect();
@@ -1012,8 +1016,8 @@ impl Database {
         )?;
         let credential_row_id = transaction.last_insert_rowid();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::security(
-            "webauthn_credential_added",
+        let audit_events = [RequiredAuditEvent::new(
+            AuditAction::WebauthnCredentialAdded,
             None,
             None,
         )];
@@ -1148,8 +1152,8 @@ impl Database {
             transaction.rollback()?;
             return Ok(false);
         }
-        let audit_events = [RequiredAuditEvent::security(
-            "login_success_webauthn",
+        let audit_events = [RequiredAuditEvent::new(
+            AuditAction::LoginSuccessWebauthn,
             None,
             None,
         )];
@@ -1248,8 +1252,8 @@ impl Database {
         revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::security(
-            "webauthn_credential_deleted",
+        let audit_events = [RequiredAuditEvent::new(
+            AuditAction::WebauthnCredentialDeleted,
             Some(object_id),
             None,
         )];
@@ -1310,8 +1314,8 @@ impl Database {
         revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::security(
-            "webauthn_credential_deleted",
+        let audit_events = [RequiredAuditEvent::new(
+            AuditAction::WebauthnCredentialDeleted,
             Some(object_id),
             Some("totp_disabled".into()),
         )];
@@ -1394,12 +1398,12 @@ impl Database {
             return Err(rusqlite::Error::InvalidQuery);
         }
         let action = if enabled {
-            "admin_totp_enabled"
+            AuditAction::AdminTotpEnabled
         } else {
-            "admin_totp_disabled"
+            AuditAction::AdminTotpDisabled
         };
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::security(
+        let audit_events = [RequiredAuditEvent::new(
             action,
             Some(admin_id.to_string()),
             None,
@@ -1528,7 +1532,7 @@ impl Database {
             }
         };
         let audit_events = (outcome == PasswordSessionCreationOutcome::Created)
-            .then(|| RequiredAuditEvent::security("password_verified", None, None))
+            .then(|| RequiredAuditEvent::new(AuditAction::PasswordVerified, None, None))
             .into_iter()
             .collect::<Vec<_>>();
         if let Some(context) = required_audit {
@@ -1733,7 +1737,11 @@ impl Database {
         if changed != 1 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let audit_events = [RequiredAuditEvent::security("login_success", None, None)];
+        let audit_events = [RequiredAuditEvent::new(
+            AuditAction::LoginSuccess,
+            None,
+            None,
+        )];
         if let Some(context) = required_audit {
             insert_required_audits(&transaction, context, &audit_events)?;
         }
@@ -1782,7 +1790,10 @@ impl Database {
                 "DELETE FROM sessions WHERE token_hash=?1",
                 [token_hash(token)],
             )?;
-            Ok(((), vec![RequiredAuditEvent::security("logout", None, None)]))
+            Ok((
+                (),
+                vec![RequiredAuditEvent::new(AuditAction::Logout, None, None)],
+            ))
         })
     }
 }

@@ -1,13 +1,14 @@
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub(super) const SCHEMA_VERSION: i64 = 5;
+pub(super) const SCHEMA_VERSION: i64 = 6;
 pub(super) const SCHEMA_1_FINGERPRINT: &str = "vaultlink-schema-1-encrypted-secrets-2026-07-17";
 pub(super) const SCHEMA_2_FINGERPRINT: &str = "vaultlink-schema-2-migration-history-2026-07-17";
 pub(super) const SCHEMA_3_FINGERPRINT: &str = "vaultlink-schema-3-share-indexes-2026-07-17";
 pub(super) const SCHEMA_4_FINGERPRINT: &str =
     "vaultlink-schema-4-admin-session-activity-2026-07-18";
-const SCHEMA_5_FINGERPRINT: &str = "vaultlink-schema-5-audit-priority-2026-07-19";
+pub(super) const SCHEMA_5_FINGERPRINT: &str = "vaultlink-schema-5-audit-priority-2026-07-19";
+const SCHEMA_6_FINGERPRINT: &str = "vaultlink-schema-6-typed-audit-policy-2026-07-20";
 
 #[cfg(test)]
 thread_local! {
@@ -15,6 +16,7 @@ thread_local! {
     static FAIL_NEXT_SCHEMA_2_TO_3_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_SCHEMA_3_TO_4_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_SCHEMA_4_TO_5_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_SCHEMA_5_TO_6_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -25,21 +27,28 @@ pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             migrate_schema_1_to_2(conn)?;
             migrate_schema_2_to_3(conn)?;
             migrate_schema_3_to_4(conn)?;
-            migrate_schema_4_to_5(conn)
+            migrate_schema_4_to_5(conn)?;
+            migrate_schema_5_to_6(conn)
         }
         2 => {
             migrate_schema_2_to_3(conn)?;
             migrate_schema_3_to_4(conn)?;
-            migrate_schema_4_to_5(conn)
+            migrate_schema_4_to_5(conn)?;
+            migrate_schema_5_to_6(conn)
         }
         3 => {
             migrate_schema_3_to_4(conn)?;
-            migrate_schema_4_to_5(conn)
+            migrate_schema_4_to_5(conn)?;
+            migrate_schema_5_to_6(conn)
         }
-        4 => migrate_schema_4_to_5(conn),
-        SCHEMA_VERSION => validate_schema_5(conn).and_then(|()| validate_database(conn)),
+        4 => {
+            migrate_schema_4_to_5(conn)?;
+            migrate_schema_5_to_6(conn)
+        }
+        5 => migrate_schema_5_to_6(conn),
+        SCHEMA_VERSION => validate_schema_6(conn).and_then(|()| validate_database(conn)),
         _ => Err(schema_error(format!(
-            "unsupported VaultLink database schema {version}; this build accepts schemas 1, 2, 3, 4, and {SCHEMA_VERSION}"
+            "unsupported VaultLink database schema {version}; this build accepts schemas 1, 2, 3, 4, 5, and {SCHEMA_VERSION}"
         ))),
     }
 }
@@ -64,7 +73,7 @@ CREATE TABLE vaultlink_schema(
     fingerprint TEXT NOT NULL
 );
 INSERT INTO vaultlink_schema(singleton,fingerprint)
-VALUES(1,'vaultlink-schema-5-audit-priority-2026-07-19');
+VALUES(1,'vaultlink-schema-6-typed-audit-policy-2026-07-20');
 
 CREATE TABLE vaultlink_schema_migrations(
     target_version INTEGER PRIMARY KEY CHECK(target_version > 0),
@@ -265,8 +274,12 @@ CREATE INDEX idx_upload_reservations_share_epoch
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(5,?1)",
         [Utc::now().to_rfc3339()],
     )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(6,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    validate_schema_5(&tx)?;
+    validate_schema_6(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }
@@ -410,8 +423,41 @@ fn migrate_schema_4_to_5(conn: &mut Connection) -> rusqlite::Result<()> {
         return Err(schema_error("injected schema 4 to 5 migration failure"));
     }
 
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", 5)?;
     validate_schema_5(&tx)?;
+    validate_database(&tx)?;
+    tx.commit()
+}
+
+fn migrate_schema_5_to_6(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_schema_5(&tx)?;
+    validate_database(&tx)?;
+    tx.execute(
+        "UPDATE audit SET priority=100 WHERE action IN (
+             'share_toggled','upload_directories_created',
+             'admin_upload','admin_upload_replaced',
+             'upload','upload_replaced',
+             'admin_upload_durability_uncertain','upload_durability_uncertain'
+         )",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(6,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+        [SCHEMA_6_FINGERPRINT],
+    )?;
+
+    #[cfg(test)]
+    if FAIL_NEXT_SCHEMA_5_TO_6_MIGRATION.with(|flag| flag.replace(false)) {
+        return Err(schema_error("injected schema 5 to 6 migration failure"));
+    }
+
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    validate_schema_6(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }
@@ -547,6 +593,45 @@ fn validate_schema_5(conn: &Connection) -> rusqlite::Result<()> {
     validate_encrypted_shape(conn)
 }
 
+fn validate_schema_6(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_6_FINGERPRINT)?;
+    for target_version in [2, 3, 4, 5, 6] {
+        let migration_record = conn
+            .query_row(
+                "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=?1",
+                [target_version],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if migration_record.as_deref().is_none_or(str::is_empty) {
+            return Err(schema_error(format!(
+                "schema {target_version} migration record is missing or invalid"
+            )));
+        }
+    }
+    let priority_not_null: Option<i64> = conn
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('audit') WHERE name='priority'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if priority_not_null != Some(1) {
+        return Err(schema_error(
+            "schema 6 audit.priority is missing or nullable",
+        ));
+    }
+    let priority_index: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='idx_audit_priority_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !priority_index {
+        return Err(schema_error("schema 6 audit priority index is missing"));
+    }
+    validate_encrypted_shape(conn)
+}
+
 fn validate_fingerprint(conn: &Connection, expected: &str) -> rusqlite::Result<()> {
     let fingerprint = conn
         .query_row(
@@ -618,6 +703,11 @@ pub(super) fn fail_next_schema_3_to_4_migration() {
 #[cfg(test)]
 pub(super) fn fail_next_schema_4_to_5_migration() {
     FAIL_NEXT_SCHEMA_4_TO_5_MIGRATION.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_schema_5_to_6_migration() {
+    FAIL_NEXT_SCHEMA_5_TO_6_MIGRATION.with(|flag| flag.set(true));
 }
 
 #[derive(Debug)]

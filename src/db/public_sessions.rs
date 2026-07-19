@@ -1,5 +1,5 @@
 use super::{
-    insert_required_audits, token_hash, trace_required_audits, AuditContext, Database,
+    insert_required_audits, token_hash, trace_required_audits, AuditAction, AuditContext, Database,
     PreviewSessionCreateOutcome, RequiredAuditEvent, MAX_ACTIVE_PREVIEW_SESSIONS_GLOBAL,
     MAX_ACTIVE_PREVIEW_SESSIONS_PER_OWNER_SHARE, MAX_ACTIVE_PREVIEW_SESSIONS_PER_RESOURCE,
     MAX_ACTIVE_PREVIEW_SESSIONS_PER_SHARE,
@@ -94,7 +94,11 @@ impl Database {
         )? == 1;
         let audit_events = created
             .then(|| {
-                RequiredAuditEvent::security("share_unlocked", Some(share_id.to_string()), None)
+                RequiredAuditEvent::new(
+                    AuditAction::ShareUnlocked,
+                    Some(share_id.to_string()),
+                    None,
+                )
             })
             .into_iter()
             .collect::<Vec<_>>();

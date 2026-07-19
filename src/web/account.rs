@@ -20,13 +20,12 @@ use crate::{
     db::{
         AdminMfaEnrollmentActivationOutcome, AdminPasswordChangeOutcome, AdminTotpSettingOutcome,
         AdminWebauthnCredentialDeletionOutcome, AdminWebauthnCredentialRegistrationOutcome,
-        AuditContext, AuditedAdminMfaEnrollmentStartOutcome,
+        AuditAction, AuditContext, AuditedAdminMfaEnrollmentStartOutcome,
     },
     http_auth::{
-        audit_security_observation as audit_observation, clear_session_cookie, csrf,
-        current_audit_client_ip, database, enabled_audit_client_ip, hash_password_admitted,
-        redirect_with_cookie, required_database, runtime_settings, session,
-        verify_password_admitted, MissingSession,
+        audit_observation, clear_session_cookie, csrf, current_audit_client_ip, database,
+        enabled_audit_client_ip, hash_password_admitted, redirect_with_cookie, required_database,
+        runtime_settings, session, verify_password_admitted, MissingSession,
     },
     sensitive::SecretString,
     AppState,
@@ -97,7 +96,7 @@ pub(super) async fn start_security_key_registration(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             None,
             None,
         )
@@ -110,7 +109,7 @@ pub(super) async fn start_security_key_registration(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             None,
             None,
         )
@@ -229,7 +228,7 @@ pub(super) async fn delete_security_key(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             Some(id.to_string()),
             None,
         )
@@ -242,7 +241,7 @@ pub(super) async fn delete_security_key(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             Some(id.to_string()),
             None,
         )
@@ -260,7 +259,7 @@ pub(super) async fn delete_security_key(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             Some(id.to_string()),
             None,
         )
@@ -302,7 +301,7 @@ pub(super) async fn delete_security_key(
             audit_observation(
                 &state,
                 session.username,
-                "security_key_reauth_failed",
+                AuditAction::SecurityKeyReauthFailed,
                 Some(id.to_string()),
                 None,
             )
@@ -399,7 +398,7 @@ pub(super) async fn set_account_totp(
         audit_observation(
             &state,
             session.username,
-            "account_totp_setting_reauth_failed",
+            AuditAction::AccountTotpSettingReauthFailed,
             None,
             None,
         )
@@ -417,7 +416,7 @@ pub(super) async fn set_account_totp(
         audit_observation(
             &state,
             session.username,
-            "account_totp_setting_reauth_failed",
+            AuditAction::AccountTotpSettingReauthFailed,
             None,
             None,
         )
@@ -454,7 +453,7 @@ pub(super) async fn set_account_totp(
             audit_observation(
                 &state,
                 session.username,
-                "account_totp_setting_reauth_failed",
+                AuditAction::AccountTotpSettingReauthFailed,
                 None,
                 None,
             )

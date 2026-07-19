@@ -26,15 +26,14 @@ use super::{
 use crate::{
     auth,
     db::{
-        AuditContext, Share, UploadReservationBeginOutcome, UploadReservationCommitOutcome,
-        UploadReservationExtendOutcome,
+        AuditAction, AuditContext, Share, UploadReservationBeginOutcome,
+        UploadReservationCommitOutcome, UploadReservationExtendOutcome,
     },
     file_ops,
     http_auth::{
-        audit_routine_observation as audit_observation, current_audit_client_ip,
-        current_client_limit_key, database, enabled_audit_client_ip, required_database,
-        runtime_settings, share_is_unlocked, share_unlock_csrf, try_acquire_client_activity,
-        with_audit_client_ip, ClientActivityPermit,
+        audit_observation, current_audit_client_ip, current_client_limit_key, database,
+        enabled_audit_client_ip, required_database, runtime_settings, share_is_unlocked,
+        share_unlock_csrf, try_acquire_client_activity, with_audit_client_ip, ClientActivityPermit,
     },
     i18n::{self},
     policy::{
@@ -789,7 +788,7 @@ impl PublicUploadFinalizer {
             audit_observation(
                 &state,
                 "public".into(),
-                "upload_directories_created",
+                AuditAction::UploadDirectoriesCreated,
                 Some(committed_upload.target.share_id.to_string()),
                 Some(format!("path={upload_subdir};created={}", created.len())),
             )
@@ -851,7 +850,7 @@ impl PublicUploadFinalizer {
             audit_observation(
                 &state,
                 "public".into(),
-                "upload_durability_uncertain",
+                AuditAction::UploadDurabilityUncertain,
                 Some(target.share_id.to_string()),
                 Some(audit_detail.clone()),
             )
@@ -861,9 +860,9 @@ impl PublicUploadFinalizer {
             &state,
             audit_context,
             if replaced {
-                "upload_replaced"
+                AuditAction::UploadReplaced
             } else {
-                "upload"
+                AuditAction::Upload
             },
             target.share_id.to_string(),
             audit_detail,

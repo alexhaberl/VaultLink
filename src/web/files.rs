@@ -239,13 +239,12 @@ fn admin_file_row_view(
     }
 }
 use crate::{
-    db::AuditContext,
+    db::{AuditAction, AuditContext},
     file_ops,
     http_auth::{
-        audit_routine_observation as audit_observation, clear_session_cookie, csrf,
-        current_audit_client_ip, current_client_limit_key, database, enabled_audit_client_ip,
-        runtime_settings, session, try_acquire_client_activity, with_audit_client_ip,
-        MissingSession,
+        audit_observation, clear_session_cookie, csrf, current_audit_client_ip,
+        current_client_limit_key, database, enabled_audit_client_ip, runtime_settings, session,
+        try_acquire_client_activity, with_audit_client_ip, MissingSession,
     },
     i18n::{self, Locale},
     path_security,
@@ -429,15 +428,14 @@ struct AdminUploadSessionRevoked {
 pub(super) async fn persist_required_file_audit(
     state: &AppState,
     context: AuditContext,
-    action: &'static str,
+    action: AuditAction,
     object: String,
     detail: String,
 ) -> bool {
     let result = database(state.db.clone(), move |database| {
-        database.audit_with_priority_and_client_ip(
-            crate::db::AuditPriority::Routine,
-            &context.actor,
+        database.audit_action_with_client_ip(
             action,
+            &context.actor,
             Some(&object),
             Some(&detail),
             context.client_ip.as_deref(),
@@ -447,7 +445,7 @@ pub(super) async fn persist_required_file_audit(
     if let Err(error) = result {
         tracing::error!(
             ?error,
-            action,
+            action = action.as_str(),
             "filesystem mutation completed but required audit durability is uncertain"
         );
         true
@@ -573,7 +571,7 @@ async fn ensure_admin_upload_directory(
         audit_observation(
             state,
             actor.to_string(),
-            "upload_directories_created",
+            AuditAction::UploadDirectoriesCreated,
             Some(target.clone()),
             Some(format!("created={}", created.len())),
         )
@@ -850,7 +848,7 @@ pub(super) async fn process_admin_upload(
             audit_observation(
                 state,
                 audit_context.actor.clone(),
-                "admin_upload_durability_uncertain",
+                AuditAction::AdminUploadDurabilityUncertain,
                 Some(destination.clone()),
                 Some(detail.clone()),
             )
@@ -860,9 +858,9 @@ pub(super) async fn process_admin_upload(
             state,
             audit_context,
             if replaced {
-                "admin_upload_replaced"
+                AuditAction::AdminUploadReplaced
             } else {
-                "admin_upload"
+                AuditAction::AdminUpload
             },
             destination,
             detail,
@@ -1235,7 +1233,7 @@ pub(super) async fn admin_download(
     audit_observation(
         &state,
         session.username,
-        "admin_download",
+        AuditAction::AdminDownload,
         Some(relative.clone()),
         None,
     )
@@ -1326,7 +1324,7 @@ pub(super) async fn admin_preview(
     audit_observation(
         &state,
         session.username.clone(),
-        "admin_preview",
+        AuditAction::AdminPreview,
         Some(rel.clone()),
         Some(preview_detail),
     )

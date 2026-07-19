@@ -1,5 +1,6 @@
 use super::{
-    insert_required_audits, trace_required_audits, AuditContext, Database, RequiredAuditEvent,
+    insert_required_audits, trace_required_audits, AuditAction, AuditContext, Database,
+    RequiredAuditEvent,
 };
 use chrono::Utc;
 use rusqlite::{params, TransactionBehavior};
@@ -55,8 +56,8 @@ impl Database {
             required_audit.map_or((None, None), |(context, detail)| {
                 (
                     Some(context),
-                    Some([RequiredAuditEvent::security(
-                        "settings_updated",
+                    Some([RequiredAuditEvent::new(
+                        AuditAction::SettingsUpdated,
                         None,
                         Some(detail),
                     )]),

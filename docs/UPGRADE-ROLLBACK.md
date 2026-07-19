@@ -1,6 +1,6 @@
 # Upgrade, backup and rollback
 
-VaultLink currently uses schema 4. Fresh databases are created directly at schema 4. Validated schema-1, schema-2 and schema-3 databases advance through separate `IMMEDIATE` transactions. Schema 3 adds the share indexes `(active,id)` and `(active,expires_at)`; schema 4 adds administrator-session activity tracking. The schema-3-to-4 migration deliberately revokes existing administrator sessions instead of guessing prior activity, while preserving all administrators, credentials, Shares and audit data. Each migration updates the schema fingerprint and changes `PRAGMA user_version` last. Startup rejects future versions, unknown versions, non-empty unversioned databases, fingerprint mismatches and legacy plaintext-secret layouts.
+VaultLink currently uses schema 6. Fresh databases are created directly at schema 6. Validated schema-1 through schema-5 databases advance through separate `IMMEDIATE` transactions. Schema 3 adds the share indexes `(active,id)` and `(active,expires_at)`; schema 4 adds administrator-session activity tracking; schema 5 adds audit retention priority; schema 6 reclassifies existing upload, replacement, upload-directory and durability-warning records as security priority under the centralized audit policy. The schema-3-to-4 migration deliberately revokes existing administrator sessions instead of guessing prior activity, while preserving all administrators, credentials, Shares and audit data. Each migration updates the schema fingerprint and changes `PRAGMA user_version` last. Startup rejects future versions, unknown versions, non-empty unversioned databases, fingerprint mismatches and legacy plaintext-secret layouts.
 
 Schema migrations are forward-only. VaultLink does not migrate legacy plaintext WebAuthn or secret columns and does not perform an in-place schema downgrade. A rollback must restore the old binary, matching configuration, database and keyring from the same backup.
 
@@ -27,7 +27,7 @@ The script takes an exclusive maintenance lock, validates the installed and cand
 
 If activation, startup, readiness or the post-start integrity check fails, the script restores the complete four-file backup. A `CRITICAL` message means automatic recovery failed; keep the service stopped and restore the reported backup directory manually.
 
-The candidate binary performs any supported forward schema migration when it starts. The upgrade script does not edit schemas, aliases, credentials or storage layouts itself. Because startup can advance the database to schema 4, keep the complete pre-upgrade backup until the candidate has been accepted. Advancing from schema 3 signs out all administrators once.
+The candidate binary performs any supported forward schema migration when it starts. The upgrade script does not edit schemas, aliases, credentials or storage layouts itself. Because startup can advance the database to schema 6, keep the complete pre-upgrade backup until the candidate has been accepted. Advancing from schema 3 signs out all administrators once.
 
 ## Rollback
 

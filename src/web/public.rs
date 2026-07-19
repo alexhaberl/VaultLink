@@ -11,12 +11,12 @@ use serde::Deserialize;
 
 use crate::{
     auth,
-    db::{AuditContext, Permission, Share},
+    db::{AuditAction, AuditContext, Permission, Share},
     file_ops,
     http_auth::{
-        audit_security_observation as audit_observation, current_client_limit_key, database,
-        enabled_audit_client_ip, make_unlock_cookie, redirect_with_cookie, required_database,
-        runtime_settings, share_is_unlocked, share_unlock_csrf, try_acquire_client_activity,
+        audit_observation, current_client_limit_key, database, enabled_audit_client_ip,
+        make_unlock_cookie, redirect_with_cookie, required_database, runtime_settings,
+        share_is_unlocked, share_unlock_csrf, try_acquire_client_activity,
         verify_password_admitted, UnlockCookieScope,
     },
     i18n, path_security,
@@ -314,7 +314,7 @@ pub(super) async fn unlock_share(
         audit_observation(
             &state,
             "public".into(),
-            "share_unlock_failed",
+            AuditAction::ShareUnlockFailed,
             Some(share.id.to_string()),
             None,
         )
@@ -326,7 +326,7 @@ pub(super) async fn unlock_share(
         audit_observation(
             &state,
             "public".into(),
-            "share_unlock_failed",
+            AuditAction::ShareUnlockFailed,
             Some(share.id.to_string()),
             None,
         )
@@ -358,7 +358,7 @@ pub(super) async fn unlock_share(
         audit_observation(
             &state,
             "public".into(),
-            "share_unlock_failed",
+            AuditAction::ShareUnlockFailed,
             Some(share.id.to_string()),
             None,
         )

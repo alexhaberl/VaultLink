@@ -20,6 +20,7 @@ This work was developed under the internal `0.4.9` hardening candidate. That can
 - Added immutable Debian package inputs, reproducibility checks, exact-commit soak evidence and version-consistency release policy.
 - Added a fixed-boundary, root-only CIFS provisioner plus token-protected setup discovery that can use the hardened SMB share root directly while reserving an unreachable in-tree `.vaultlink-internal`, without granting the browser setup process mount privileges, with an explicit last-writer-wins opt-in for Replace uploads alongside external SMB clients.
 - Added a container setup entrypoint that preserves VaultLink's loopback-only listener behind a distinct proxy port and carries the same connection across the setup-to-serve transition without a port collision.
+- Centralized audit action names and retention priorities in a typed policy, promoted file uploads, replacements, upload-created directories and durability warnings to security priority, migrated existing rows with schema 6, and made security-priority eviction an explicit operator warning.
 
 ## 0.4.3 — 2026-07-14
 
