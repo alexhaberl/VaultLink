@@ -443,7 +443,7 @@ impl Database {
             "DELETE FROM public_upload_reservations WHERE token_hash=?1",
             [reservation_hash],
         )?;
-        let audit_events = [RequiredAuditEvent::new(
+        let audit_events = [RequiredAuditEvent::routine(
             "upload_quota_committed",
             Some(share_id.to_string()),
             Some(format!("bytes={uploaded_bytes};files=1")),
@@ -698,7 +698,7 @@ impl Database {
         )?;
         let audit_events = match (outcome, required_audit) {
             (TransferLeaseCompleteOutcome::Counted, Some(_)) => {
-                vec![RequiredAuditEvent::new(
+                vec![RequiredAuditEvent::routine(
                     required_transfer_audit_action(&action)?,
                     Some(share_id.to_string()),
                     Some("completed transfer session".into()),
@@ -860,7 +860,7 @@ impl Database {
             cleanup_transfer_state(&transaction, &now)?;
             let audit_events = match (outcome, required_audit) {
                 (TransferLeaseHeartbeatOutcome::CappedAndCounted, Some(_)) => {
-                    vec![RequiredAuditEvent::new(
+                    vec![RequiredAuditEvent::routine(
                         required_transfer_audit_action(&action)?,
                         Some(share_id.to_string()),
                         Some("capped transfer session".into()),

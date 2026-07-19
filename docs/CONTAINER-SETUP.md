@@ -13,10 +13,12 @@ The default topology is:
 - setup and default development listener: `127.0.0.1:8080`
 - host example: `127.0.0.1:18080` published to container port `8081`
 
-The proxy first connects to the setup listener. After setup has committed the
-configuration and transitioned in the same process, it reads only
-`server.listen_address` from that configuration and forwards to the configured
-loopback listener. Non-loopback configured targets are never proxied.
+The proxy first connects to the setup listener. It refreshes a fail-closed
+configuration snapshot every 250 ms on a blocking worker. After setup has
+committed the configuration and transitioned in the same process, new
+connections therefore use `server.listen_address` from that snapshot and are
+forwarded to the configured loopback listener. Non-loopback configured targets
+are never proxied.
 
 The proxy is HTTP-aware at the container boundary and applies one of two trust
 paths to each connection. A direct or otherwise untrusted peer cannot supply

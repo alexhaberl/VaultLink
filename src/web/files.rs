@@ -242,9 +242,10 @@ use crate::{
     db::AuditContext,
     file_ops,
     http_auth::{
-        audit_observation, clear_session_cookie, csrf, current_audit_client_ip,
-        current_client_limit_key, database, enabled_audit_client_ip, runtime_settings, session,
-        try_acquire_client_activity, with_audit_client_ip, MissingSession,
+        audit_routine_observation as audit_observation, clear_session_cookie, csrf,
+        current_audit_client_ip, current_client_limit_key, database, enabled_audit_client_ip,
+        runtime_settings, session, try_acquire_client_activity, with_audit_client_ip,
+        MissingSession,
     },
     i18n::{self, Locale},
     path_security,
@@ -433,7 +434,8 @@ pub(super) async fn persist_required_file_audit(
     detail: String,
 ) -> bool {
     let result = database(state.db.clone(), move |database| {
-        database.audit_with_client_ip(
+        database.audit_with_priority_and_client_ip(
+            crate::db::AuditPriority::Routine,
             &context.actor,
             action,
             Some(&object),
@@ -1365,11 +1367,7 @@ pub(super) async fn admin_preview(
             let body = AdminPreviewTooLargeTemplate {
                 parent_path: encoded(parent_path(&rel).as_deref().unwrap_or("")),
                 path: rel,
-                message: i18n::localized_text(
-                    i18n::current_locale(),
-                    "File exceeds the preview limit.",
-                )
-                .into_owned(),
+                message: i18n::text(i18n::current_locale(), i18n::PREVIEW_TOO_LARGE).into(),
                 size: human(size),
             };
             Ok(Html(super::templates::admin_page(

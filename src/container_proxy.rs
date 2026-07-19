@@ -17,13 +17,17 @@ use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rustix::fs::{Mode, OFlags};
 use serde::Deserialize;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::watch,
+};
 
 use crate::{config::ServerMode, proxy};
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const POLICY_RELOAD_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_ACTIVE_CONNECTIONS: usize = 256;
 const MAX_ACTIVE_CONNECTIONS_PER_PEER: usize = 32;
 
@@ -187,6 +191,35 @@ fn errno_error(error: rustix::io::Errno) -> io::Error {
     io::Error::from_raw_os_error(error.raw_os_error())
 }
 
+async fn reload_proxy_policy(
+    path: PathBuf,
+    sender: watch::Sender<ProxyPolicy>,
+    reload_interval: Duration,
+) {
+    let mut interval = tokio::time::interval(reload_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let path = path.clone();
+        let policy = match tokio::task::spawn_blocking(move || read_proxy_policy(&path)).await {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::error!(%error, "container proxy policy reload task failed");
+                ProxyPolicy::default()
+            }
+        };
+        sender.send_replace(policy);
+    }
+}
+
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Default)]
 struct AdmissionState {
     active: usize,
@@ -268,14 +301,31 @@ pub async fn run(options: ContainerProxyOptions) -> io::Result<()> {
     let listener = TcpListener::bind(options.listen).await?;
     let admission =
         ConnectionAdmission::new(MAX_ACTIVE_CONNECTIONS, MAX_ACTIVE_CONNECTIONS_PER_PEER);
+    let (policy_sender, policy_receiver) = watch::channel(ProxyPolicy::default());
+    let mut policy_worker = AbortTaskOnDrop(tokio::spawn(reload_proxy_policy(
+        options.config_path,
+        policy_sender,
+        POLICY_RELOAD_INTERVAL,
+    )));
     loop {
-        let (stream, address) = listener.accept().await?;
+        let accepted = tokio::select! {
+            result = listener.accept() => result,
+            result = &mut policy_worker.0 => {
+                return Err(io::Error::other(format!(
+                    "container proxy policy worker exited unexpectedly: {result:?}"
+                )));
+            }
+        };
+        let (stream, address) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => return Err(error),
+        };
         if admission.at_capacity() {
             drop(stream);
             continue;
         }
         let peer = proxy::canonical_peer_ip(address.ip());
-        let policy = read_proxy_policy(&options.config_path);
+        let policy = policy_receiver.borrow().clone();
         let Some(lease) = admission.try_acquire(peer, policy.trusts(peer)) else {
             drop(stream);
             continue;
@@ -489,6 +539,65 @@ trust_x_forwarded_headers = true
         assert!(invalid.configured_upstream.is_none());
         assert!(invalid.trusted_proxies.is_empty());
         assert!(!invalid.trust_forwarded_headers);
+    }
+
+    #[tokio::test]
+    async fn policy_reloader_tracks_valid_and_invalid_config_without_accept_path_io() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let (sender, receiver) = watch::channel(ProxyPolicy::default());
+        let worker = tokio::spawn(reload_proxy_policy(
+            path.clone(),
+            sender,
+            Duration::from_millis(10),
+        ));
+
+        std::fs::write(
+            &path,
+            r#"
+[server]
+mode = "reverse_proxy"
+listen_address = "127.0.0.1:8080"
+
+[reverse_proxy]
+enabled = true
+trusted_proxies = ["127.0.0.1"]
+trust_x_forwarded_headers = true
+"#,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let policy = receiver.borrow().clone();
+                if policy.configured_upstream == Some("127.0.0.1:8080".parse().unwrap())
+                    && policy.trusts("127.0.0.1".parse().unwrap())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        std::fs::write(&path, "[server]\nmode = 'not-a-mode'\n").unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let policy = receiver.borrow().clone();
+                if policy.configured_upstream.is_none()
+                    && policy.trusted_proxies.is_empty()
+                    && !policy.trust_forwarded_headers
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
     }
 
     #[test]

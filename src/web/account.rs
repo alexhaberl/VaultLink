@@ -23,9 +23,10 @@ use crate::{
         AuditContext, AuditedAdminMfaEnrollmentStartOutcome,
     },
     http_auth::{
-        audit_observation, clear_session_cookie, csrf, current_audit_client_ip, database,
-        enabled_audit_client_ip, hash_password_admitted, redirect_with_cookie, required_database,
-        runtime_settings, session, verify_password_admitted, MissingSession,
+        audit_security_observation as audit_observation, clear_session_cookie, csrf,
+        current_audit_client_ip, database, enabled_audit_client_ip, hash_password_admitted,
+        redirect_with_cookie, required_database, runtime_settings, session,
+        verify_password_admitted, MissingSession,
     },
     sensitive::SecretString,
     AppState,

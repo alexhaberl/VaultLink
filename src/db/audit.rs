@@ -1,6 +1,7 @@
 use super::{
     insert_required_audits, trace_required_audits, AuditClientIpDeletionOutcome, AuditContext,
-    AuditEvent, AuditSortColumn, AuditSortDirection, Database, RequiredAuditEvent, MAX_AUDIT_ROWS,
+    AuditEvent, AuditPriority, AuditSortColumn, AuditSortDirection, Database, RequiredAuditEvent,
+    MAX_AUDIT_ROWS,
 };
 use chrono::Utc;
 #[cfg(test)]
@@ -19,7 +20,7 @@ pub(super) fn enforce_audit_retention(
         "DELETE FROM audit
          WHERE id IN (
              SELECT id FROM audit
-             ORDER BY id ASC
+             ORDER BY priority ASC,id ASC
              LIMIT MAX((SELECT COUNT(*) FROM audit) - ?1, 0)
          )",
         [maximum_rows],
@@ -28,6 +29,7 @@ pub(super) fn enforce_audit_retention(
 
 pub(super) fn insert_audit_event(
     transaction: &Transaction<'_>,
+    priority: AuditPriority,
     actor: &str,
     action: &str,
     object_id: Option<&str>,
@@ -43,15 +45,16 @@ pub(super) fn insert_audit_event(
         None
     };
     transaction.execute(
-        "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip)
-         VALUES(?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip,priority)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![
             Utc::now().to_rfc3339(),
             actor,
             action,
             object_id,
             detail,
-            client_ip
+            client_ip,
+            priority.as_i64()
         ],
     )?;
     Ok(())
@@ -96,7 +99,7 @@ impl Database {
             let deleted = transaction.execute(
                 "DELETE FROM audit WHERE id IN (
                      SELECT id FROM audit
-                     ORDER BY id ASC
+                     ORDER BY priority ASC,id ASC
                      LIMIT ?1
                  )",
                 [batch],
@@ -118,11 +121,19 @@ impl Database {
         object: Option<&str>,
         detail: Option<&str>,
     ) -> rusqlite::Result<()> {
-        self.audit_with_client_ip(actor, action, object, detail, None)
+        self.audit_with_priority_and_client_ip(
+            AuditPriority::Routine,
+            actor,
+            action,
+            object,
+            detail,
+            None,
+        )
     }
 
-    pub fn audit_with_client_ip(
+    pub(crate) fn audit_with_priority_and_client_ip(
         &self,
+        priority: AuditPriority,
         actor: &str,
         action: &str,
         object: Option<&str>,
@@ -131,12 +142,39 @@ impl Database {
     ) -> rusqlite::Result<()> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        insert_audit_event(&transaction, actor, action, object, detail, client_ip)?;
+        insert_audit_event(
+            &transaction,
+            priority,
+            actor,
+            action,
+            object,
+            detail,
+            client_ip,
+        )?;
         transaction.commit()?;
         drop(connection);
         // Client IP retention is SQLite-only. Never mirror it into tracing/journald.
         tracing::info!(target: "vaultlink::audit", actor, action, object_id = object.unwrap_or(""), detail = detail.unwrap_or(""), "audit event");
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn audit_with_client_ip(
+        &self,
+        actor: &str,
+        action: &str,
+        object: Option<&str>,
+        detail: Option<&str>,
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.audit_with_priority_and_client_ip(
+            AuditPriority::Routine,
+            actor,
+            action,
+            object,
+            detail,
+            client_ip,
+        )
     }
 
     pub fn count_audit_client_ips(&self) -> rusqlite::Result<u64> {
@@ -177,7 +215,7 @@ impl Database {
             "UPDATE audit SET client_ip=NULL WHERE client_ip IS NOT NULL",
             [],
         )?;
-        let audit_events = [RequiredAuditEvent::new(
+        let audit_events = [RequiredAuditEvent::security(
             "audit_client_ips_deleted",
             None,
             Some(format!("deleted={deleted}")),

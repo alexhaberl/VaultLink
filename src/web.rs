@@ -110,7 +110,7 @@ impl IntoResponse for AppError {
         };
         let audit_unavailable = self.0 == StatusCode::SERVICE_UNAVAILABLE
             && self.1 == crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE;
-        let page = templates::public_page("Error", &ErrorTemplate { message: &message });
+        let page = templates::public_page(i18n::ERROR, &ErrorTemplate { message: &message });
         let mut response = match page {
             Ok(page) => (self.0, Html(page)).into_response(),
             Err(_) => (self.0, message).into_response(),

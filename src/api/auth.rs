@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth,
     http_auth::{
-        admin_login_attempt_admitted, audit_observation, clear_session_cookie, csrf_header,
-        enabled_audit_client_ip, make_session_cookie, password_login_admitted, required_database,
-        session, MissingSession,
+        admin_login_attempt_admitted, audit_security_observation as audit_observation,
+        clear_session_cookie, csrf_header, enabled_audit_client_ip, make_session_cookie,
+        password_login_admitted, required_database, session, MissingSession,
     },
     sensitive::SecretString,
     services::auth::{

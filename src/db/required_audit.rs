@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use super::audit::insert_audit_event;
+use super::{audit::insert_audit_event, AuditPriority};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditContext {
@@ -23,18 +23,41 @@ impl AuditContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequiredAuditEvent {
+    pub(crate) priority: AuditPriority,
     pub action: &'static str,
     pub object_id: Option<String>,
     pub detail: Option<String>,
 }
 
 impl RequiredAuditEvent {
-    pub fn new(action: &'static str, object_id: Option<String>, detail: Option<String>) -> Self {
+    fn new(
+        priority: AuditPriority,
+        action: &'static str,
+        object_id: Option<String>,
+        detail: Option<String>,
+    ) -> Self {
         Self {
+            priority,
             action,
             object_id,
             detail,
         }
+    }
+
+    pub(crate) fn routine(
+        action: &'static str,
+        object_id: Option<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::new(AuditPriority::Routine, action, object_id, detail)
+    }
+
+    pub(crate) fn security(
+        action: &'static str,
+        object_id: Option<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self::new(AuditPriority::Security, action, object_id, detail)
     }
 }
 
@@ -69,6 +92,7 @@ pub(super) fn insert_required_audits(
     for event in events {
         insert_audit_event(
             transaction,
+            event.priority,
             &context.actor,
             event.action,
             event.object_id.as_deref(),

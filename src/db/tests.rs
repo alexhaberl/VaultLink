@@ -162,7 +162,7 @@ fn required_audit_failure_rolls_back_admin_share_session_and_settings_mutations(
     assert!(is_audit_unavailable(&share_error));
     assert!(db.share_by_token("existing-share").unwrap().unwrap().active);
 
-    let control_events = [RequiredAuditEvent::new(
+    let control_events = [RequiredAuditEvent::routine(
         "share_controls_updated",
         Some(share_id.to_string()),
         None,
@@ -1146,6 +1146,63 @@ fn audit_retention_keeps_only_the_newest_rows() {
 }
 
 #[test]
+fn audit_retention_preserves_security_events_during_routine_volume() {
+    let database = Database::open(":memory:").unwrap();
+    let connection = database.conn();
+    connection
+        .execute(
+            "INSERT INTO audit(occurred_at,actor,action,priority)
+             VALUES(?1,'local_recovery','admin_recovered',100)",
+            [Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    for index in 0..4 {
+        connection
+            .execute(
+                "INSERT INTO audit(occurred_at,actor,action,priority)
+                 VALUES(?1,'public',?2,0)",
+                params![Utc::now().to_rfc3339(), format!("download-{index}")],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(enforce_audit_retention(&connection, 3).unwrap(), 2);
+    let actions: Vec<String> = connection
+        .prepare("SELECT action FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(actions, ["admin_recovered", "download-2", "download-3"]);
+}
+
+#[test]
+fn audit_retention_falls_back_to_fifo_for_security_only_volume() {
+    let database = Database::open(":memory:").unwrap();
+    let connection = database.conn();
+    for index in 0..5 {
+        connection
+            .execute(
+                "INSERT INTO audit(occurred_at,actor,action,priority)
+                 VALUES(?1,'admin',?2,100)",
+                params![Utc::now().to_rfc3339(), format!("security-{index}")],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(enforce_audit_retention(&connection, 3).unwrap(), 2);
+    let actions: Vec<String> = connection
+        .prepare("SELECT action FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(actions, ["security-2", "security-3", "security-4"]);
+}
+
+#[test]
 fn audit_retention_caps_recent_events() {
     let database = Database::open(":memory:").unwrap();
     let mut connection = database.conn();
@@ -1857,7 +1914,7 @@ fn rejects_unknown_newer_schema() {
 }
 
 #[test]
-fn fresh_database_is_exactly_schema_four_without_plaintext_secret_columns() {
+fn fresh_database_is_exactly_schema_five_without_plaintext_secret_columns() {
     let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
     assert_eq!(
@@ -1868,12 +1925,12 @@ fn fresh_database_is_exactly_schema_four_without_plaintext_secret_columns() {
     );
     let migration_records: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3,4) AND length(applied_at)>0",
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3,4,5) AND length(applied_at)>0",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migration_records, 3);
+    assert_eq!(migration_records, 4);
     for index in ["idx_shares_active_id", "idx_shares_active_expires"] {
         let exists: bool = connection
             .query_row(
@@ -1892,6 +1949,14 @@ fn fresh_database_is_exactly_schema_four_without_plaintext_secret_columns() {
         )
         .unwrap();
     assert_eq!(last_activity_not_null, 1);
+    let priority_not_null: i64 = connection
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('audit') WHERE name='priority'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(priority_not_null, 1);
     for (table, forbidden) in [
         ("shares", "token"),
         ("admins", "totp_secret"),
@@ -1921,6 +1986,23 @@ fn fresh_database_is_exactly_schema_four_without_plaintext_secret_columns() {
             assert_eq!(count, 1, "encrypted column {table}.{column} missing");
         }
     }
+}
+
+fn downgrade_audit_to_schema_four(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP INDEX idx_audit_priority_id;
+             ALTER TABLE audit DROP COLUMN priority;
+             DELETE FROM vaultlink_schema_migrations WHERE target_version=5;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+            [schema::SCHEMA_4_FINGERPRINT],
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 4).unwrap();
 }
 
 fn populated_schema_one_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u8>) {
@@ -1963,6 +2045,7 @@ fn populated_schema_one_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u
     drop(database);
 
     let connection = Connection::open(&path).unwrap();
+    downgrade_audit_to_schema_four(&connection);
     connection
         .execute_batch(
             "DROP TABLE vaultlink_schema_migrations;
@@ -1986,6 +2069,7 @@ fn schema_two_fixture() -> (tempfile::TempDir, PathBuf) {
     let path = directory.path().join("schema-two.sqlite");
     drop(Database::open(&path).unwrap());
     let connection = Connection::open(&path).unwrap();
+    downgrade_audit_to_schema_four(&connection);
     connection
         .execute_batch(
             "DROP INDEX idx_shares_active_id;
@@ -2030,6 +2114,7 @@ fn schema_three_fixture() -> (tempfile::TempDir, PathBuf) {
     drop(database);
 
     let connection = Connection::open(&path).unwrap();
+    downgrade_audit_to_schema_four(&connection);
     connection
         .execute_batch(
             "ALTER TABLE sessions RENAME TO sessions_schema_4;
@@ -2057,6 +2142,24 @@ fn schema_three_fixture() -> (tempfile::TempDir, PathBuf) {
         )
         .unwrap();
     connection.pragma_update(None, "user_version", 3).unwrap();
+    drop(connection);
+    (directory, path)
+}
+
+fn schema_four_fixture() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("schema-four.sqlite");
+    let database = Database::open(&path).unwrap();
+    database
+        .audit("local_recovery", "admin_recovered", Some("1"), None)
+        .unwrap();
+    database
+        .audit("public", "download", Some("2"), None)
+        .unwrap();
+    drop(database);
+
+    let connection = Connection::open(&path).unwrap();
+    downgrade_audit_to_schema_four(&connection);
     drop(connection);
     (directory, path)
 }
@@ -2109,7 +2212,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let applied_at: Vec<(i64, String)> = connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3,4) ORDER BY target_version",
+             WHERE target_version IN (2,3,4,5) ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -2124,7 +2227,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let reopened_applied_at: Vec<(i64, String)> = reopened_connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3,4) ORDER BY target_version",
+             WHERE target_version IN (2,3,4,5) ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -2135,7 +2238,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
 }
 
 #[test]
-fn schema_two_migrates_to_four_with_expected_indexes() {
+fn schema_two_migrates_to_five_with_expected_indexes() {
     let (_directory, path) = schema_two_fixture();
     let database = Database::open(path).unwrap();
     let connection = database.conn();
@@ -2155,6 +2258,24 @@ fn schema_two_migrates_to_four_with_expected_indexes() {
             .unwrap();
         assert!(present);
     }
+}
+
+#[test]
+fn schema_four_migration_backfills_security_priority() {
+    let (_directory, path) = schema_four_fixture();
+    let database = Database::open(path).unwrap();
+    let connection = database.conn();
+    let priorities: Vec<(String, i64)> = connection
+        .prepare("SELECT action,priority FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        priorities,
+        [("admin_recovered".into(), 100), ("download".into(), 0)]
+    );
 }
 
 #[test]
@@ -2308,6 +2429,46 @@ fn failed_schema_three_migration_restores_sessions_and_metadata() {
         )
         .unwrap();
     assert_eq!(last_activity_column, 0);
+}
+
+#[test]
+fn failed_schema_four_migration_restores_audit_shape_and_metadata() {
+    let (_directory, path) = schema_four_fixture();
+    schema::fail_next_schema_4_to_5_migration();
+    assert!(matches!(
+        Database::open(&path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        4
+    );
+    let fingerprint: String = connection
+        .query_row(
+            "SELECT fingerprint FROM vaultlink_schema WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fingerprint, schema::SCHEMA_4_FINGERPRINT);
+    let priority_column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('audit') WHERE name='priority'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(priority_column, 0);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM audit", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
 }
 
 #[test]
