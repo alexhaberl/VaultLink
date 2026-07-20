@@ -16,6 +16,10 @@ hmac
 rand-chacha
 sha2
 
+# Serde and thiserror have moved to syn 3 while the remaining stable proc-macro
+# dependencies still use syn 2. Remove this entry once those parents converge.
+syn
+
 # Stable dependency branches currently use both thiserror major versions. Remove
 # these entries as soon as all direct parents have converged on one major.
 thiserror
