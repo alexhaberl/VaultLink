@@ -8,7 +8,6 @@ rand_core
 # Argon2/password hashing, TOTP, XChaCha and WebAuthn currently pull compatible,
 # but distinct crypto generations. Re-evaluate after their stable upgrades.
 block-buffer
-chacha20
 cpufeatures
 crypto-common
 digest
