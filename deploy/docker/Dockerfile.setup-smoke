@@ -1,5 +1,5 @@
 # Keep this pin aligned with rust-toolchain.toml and the release workflow.
-FROM rust:1.97.1-trixie@sha256:4f9fcd47f7c1126d2c8dd20e594f8ec852492fe429c2c6c11ca56eebfffaf0d9
+FROM rust:1.97.1-trixie@sha256:1bcff4befb740599103a2c7cb51058e14479b2e35e3a34a3f0dc4ede09927488
 
 COPY deploy/docker/debian-snapshot.sources deploy/docker/debian-packages.lock /tmp/vaultlink-debian/
 COPY tools/install-pinned-debian-packages.sh /tmp/vaultlink-debian/install.sh
