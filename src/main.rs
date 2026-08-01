@@ -22,7 +22,9 @@ use tokio::{
 use vaultlink::{
     auth,
     config::{self, CertificateSource, Config, ServerMode},
-    db::{AdminRecoveryOutcome, AuditContext, Database, InitialAdminOutcome},
+    db::{
+        AdminRecoveryOutcome, AuditContext, AuditRetentionOutcome, Database, InitialAdminOutcome,
+    },
     storage_mount, web, AppState,
 };
 use zeroize::Zeroizing;
@@ -352,6 +354,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.get(1).is_some_and(|value| value == "container-proxy") {
+        let options = vaultlink::container_proxy::ContainerProxyOptions::parse(&args)
+            .map_err(std::io::Error::other)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .init();
+        return vaultlink::container_proxy::run(options)
+            .await
+            .map_err(Into::into);
+    }
     if args.get(1).is_some_and(|value| value == "recover-admin") {
         let options = RecoverAdminOptions::parse(&args).map_err(std::io::Error::other)?;
         tracing_subscriber::fmt()
@@ -519,16 +531,28 @@ fn start_audit_retention_worker(database: Database) {
             match tokio::task::spawn_blocking(move || worker_database.cleanup_audit_retention())
                 .await
             {
-                Ok(Ok(deleted)) if deleted > 0 => {
-                    tracing::info!(deleted, "expired audit events removed")
-                }
-                Ok(Ok(_)) => {}
+                Ok(Ok(outcome)) => log_audit_retention_outcome(outcome),
                 Ok(Err(error)) => tracing::error!(%error, "audit retention cleanup failed"),
                 Err(error) => tracing::error!(%error, "audit retention worker failed"),
             }
             tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
         }
     });
+}
+
+fn log_audit_retention_outcome(outcome: AuditRetentionOutcome) {
+    if outcome.security_deleted > 0 {
+        tracing::warn!(
+            routine_deleted = outcome.routine_deleted,
+            security_deleted = outcome.security_deleted,
+            "audit retention removed security-priority events"
+        );
+    } else if outcome.routine_deleted > 0 {
+        tracing::info!(
+            routine_deleted = outcome.routine_deleted,
+            "excess routine audit events removed"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -990,6 +1014,50 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn security_audit_retention_eviction_is_warned_with_counts() {
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_audit_retention_outcome(AuditRetentionOutcome {
+                routine_deleted: 7,
+                security_deleted: 2,
+            });
+        });
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("WARN"));
+        assert!(output.contains("audit retention removed security-priority events"));
+        assert!(output.contains("routine_deleted=7"));
+        assert!(output.contains("security_deleted=2"));
+    }
 
     #[test]
     fn connection_limiter_recovers_after_lock_poisoning() {

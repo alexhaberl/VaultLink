@@ -152,6 +152,7 @@ catalog! {
     TOTP_CHANGE_DISABLED, "account.totp_change_disabled", "TOTP ist deaktiviert. Aktiviere es zuerst im Bereich Sicherheitsschlüssel, um den TOTP-Faktor zu ändern.", "TOTP is disabled. Enable it in the security-key section before changing the TOTP factor.";
 
     LOGIN_TITLE, "auth.login_title", "Login", "Sign in";
+    MFA_TITLE, "auth.mfa_title", "MFA", "MFA";
     ADMIN_LOGIN, "auth.admin_login", "Admin Login", "Admin sign in";
     USERNAME, "auth.username", "Benutzername", "Username";
     PASSWORD, "auth.password", "Passwort", "Password";
@@ -786,13 +787,10 @@ pub fn text(locale: Locale, key: MessageKey) -> &'static str {
 }
 
 pub fn localized_text<'a>(locale: Locale, source: &'a str) -> Cow<'a, str> {
-    catalog_by_english()
+    catalog_by_source()
         .get(source)
-        .or_else(|| catalog_by_german().get(source))
-        .map(|entry| match locale {
-            Locale::De => Cow::Borrowed(entry.de),
-            Locale::En => Cow::Borrowed(entry.en),
-        })
+        .and_then(|entry| entry.for_locale(locale))
+        .map(Cow::Borrowed)
         .unwrap_or_else(|| Cow::Borrowed(source))
 }
 
@@ -812,20 +810,65 @@ fn catalog_by_key() -> &'static HashMap<&'static str, &'static CatalogEntry> {
     })
 }
 
-fn catalog_by_german() -> &'static HashMap<&'static str, &'static CatalogEntry> {
-    static INDEX: OnceLock<HashMap<&'static str, &'static CatalogEntry>> = OnceLock::new();
-    INDEX.get_or_init(|| CATALOG.iter().map(|entry| (entry.de, entry)).collect())
+#[derive(Clone, Copy)]
+enum SourceResolution {
+    Unique(&'static str),
+    Ambiguous,
 }
 
-fn catalog_by_english() -> &'static HashMap<&'static str, &'static CatalogEntry> {
-    static INDEX: OnceLock<HashMap<&'static str, &'static CatalogEntry>> = OnceLock::new();
+impl SourceResolution {
+    fn merge(&mut self, candidate: &'static str) {
+        if matches!(self, Self::Unique(current) if *current != candidate) {
+            *self = Self::Ambiguous;
+        }
+    }
+
+    const fn resolved(self) -> Option<&'static str> {
+        match self {
+            Self::Unique(value) => Some(value),
+            Self::Ambiguous => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SourceTranslations {
+    de: SourceResolution,
+    en: SourceResolution,
+}
+
+impl SourceTranslations {
+    const fn new(entry: &'static CatalogEntry) -> Self {
+        Self {
+            de: SourceResolution::Unique(entry.de),
+            en: SourceResolution::Unique(entry.en),
+        }
+    }
+
+    fn merge(&mut self, entry: &'static CatalogEntry) {
+        self.de.merge(entry.de);
+        self.en.merge(entry.en);
+    }
+
+    const fn for_locale(self, locale: Locale) -> Option<&'static str> {
+        match locale {
+            Locale::De => self.de.resolved(),
+            Locale::En => self.en.resolved(),
+        }
+    }
+}
+
+fn catalog_by_source() -> &'static HashMap<&'static str, SourceTranslations> {
+    static INDEX: OnceLock<HashMap<&'static str, SourceTranslations>> = OnceLock::new();
     INDEX.get_or_init(|| {
         let mut index = HashMap::new();
         for entry in CATALOG {
-            // Some visible labels intentionally share the same English text.
-            // Keep the first, more specific catalog entry instead of allowing
-            // a later generic action label to silently replace it.
-            index.entry(entry.en).or_insert(entry);
+            for source in [entry.de, entry.en] {
+                index
+                    .entry(source)
+                    .and_modify(|translations: &mut SourceTranslations| translations.merge(entry))
+                    .or_insert_with(|| SourceTranslations::new(entry));
+            }
         }
         index
     })
@@ -914,6 +957,21 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), CATALOG.len());
+    }
+
+    #[test]
+    fn literal_lookup_translates_only_unambiguous_sources() {
+        assert_eq!(localized_text(Locale::De, "Preview"), "Vorschau");
+        assert_eq!(
+            localized_text(Locale::En, "Dateien durchsuchen"),
+            "Dateien durchsuchen"
+        );
+        assert_eq!(localized_text(Locale::De, "Sign in"), "Sign in");
+        assert_eq!(localized_text(Locale::De, "Storage"), "Storage");
+        assert_eq!(
+            localized_text(Locale::De, "not a catalog message"),
+            "not a catalog message"
+        );
     }
 
     #[test]

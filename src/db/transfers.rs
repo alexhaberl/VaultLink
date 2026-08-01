@@ -1,6 +1,6 @@
 use super::{
-    insert_required_audits, token_hash, trace_required_audits, AuditContext, Database, Permission,
-    RequiredAuditEvent, TransferAvailabilityOutcome, TransferLeaseBeginOutcome,
+    insert_required_audits, token_hash, trace_required_audits, AuditAction, AuditContext, Database,
+    Permission, RequiredAuditEvent, TransferAvailabilityOutcome, TransferLeaseBeginOutcome,
     TransferLeaseCancelOutcome, TransferLeaseCompleteOutcome, TransferLeaseHeartbeatOutcome,
     TransferMonthlyCounts, UploadReservationBeginOutcome, UploadReservationCommitOutcome,
     UploadReservationExtendOutcome, MAX_SQLITE_UNSIGNED, TRANSFER_LEASE_MAX_LIFETIME_SECONDS,
@@ -58,11 +58,11 @@ fn increment_transfer_monthly_count(
     Ok(())
 }
 
-fn required_transfer_audit_action(action: &str) -> rusqlite::Result<&'static str> {
+fn required_transfer_audit_action(action: &str) -> rusqlite::Result<AuditAction> {
     match action {
-        "download" => Ok("download"),
-        "zip_download" => Ok("zip_download"),
-        "preview" => Ok("preview"),
+        "download" => Ok(AuditAction::Download),
+        "zip_download" => Ok(AuditAction::ZipDownload),
+        "preview" => Ok(AuditAction::Preview),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -444,7 +444,7 @@ impl Database {
             [reservation_hash],
         )?;
         let audit_events = [RequiredAuditEvent::new(
-            "upload_quota_committed",
+            AuditAction::UploadQuotaCommitted,
             Some(share_id.to_string()),
             Some(format!("bytes={uploaded_bytes};files=1")),
         )];

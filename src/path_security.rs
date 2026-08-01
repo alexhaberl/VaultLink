@@ -83,14 +83,16 @@ pub fn safe_filename(name: &str) -> Result<&str, PathError> {
 
 pub fn safe_admin_filename(name: &str) -> Result<&str, PathError> {
     let name = safe_filename(name)?;
-    if private_token_name(name, ".vaultlink-", ".part")
-        || private_token_name(name, ".vaultlink-delete-", ".tombstone")
-        || private_token_name(name, ".vaultlink-delete-pending-", ".pending")
-        || is_internal_storage_name(OsStr::new(name))
-    {
+    if is_private_admin_filename(name) || is_internal_storage_name(OsStr::new(name)) {
         return Err(PathError::Invalid);
     }
     Ok(name)
+}
+
+pub(crate) fn is_private_admin_filename(name: &str) -> bool {
+    private_token_name(name, ".vaultlink-", ".part")
+        || private_token_name(name, ".vaultlink-delete-", ".tombstone")
+        || private_token_name(name, ".vaultlink-delete-pending-", ".pending")
 }
 
 /// Validates the canonical share-alias policy for both creation and lookup.
@@ -166,6 +168,19 @@ mod tests {
             "question?.txt",
         ] {
             assert!(safe_filename(unsafe_name).is_err(), "{unsafe_name}");
+        }
+    }
+
+    #[test]
+    fn admin_filename_rejects_every_private_token_namespace() {
+        for private_name in [
+            ".vaultlink-abcdefghijklmnopqrstuvwx.part",
+            ".vaultlink-delete-abcdefghijklmnopqrstuvwx.tombstone",
+            ".vaultlink-delete-pending-tlink-de_l_-ekn_tagvaunl.pending",
+        ] {
+            assert!(safe_filename(private_name).is_ok(), "{private_name}");
+            assert!(is_private_admin_filename(private_name), "{private_name}");
+            assert!(safe_admin_filename(private_name).is_err(), "{private_name}");
         }
     }
 

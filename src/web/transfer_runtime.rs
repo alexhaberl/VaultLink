@@ -910,7 +910,7 @@ pub(super) fn public_upload_error(
         message,
         back_link: back,
     };
-    let page = super::templates::public_page("Error", &body)
+    let page = super::templates::public_page(i18n::ERROR, &body)
         .expect("the public upload error template writes only to an in-memory string");
     (status, Html(page)).into_response()
 }

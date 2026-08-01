@@ -156,7 +156,7 @@ load_snapshot() {
     binary_sha256=$(sha256sum "/proc/$current_pid/exe" | awk '{print $1}')
     health_body="$work/snapshot-health.json"
     curl --fail --silent --show-error \
-        "${VAULTLINK_HEALTH_URL:-http://127.0.0.1:8080/api/v2/health}" \
+        "${VAULTLINK_HEALTH_URL:-http://127.0.0.1:8080/api/v2/health/ready}" \
         -o "$health_body"
     expected_health="{\"ok\":true,\"version\":\"${SOAK_EXPECTED_VERSION:-0.5.0}\"}"
     [ "$(cat "$health_body")" = "$expected_health" ] || return 1

@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth,
     db::{
-        AuditContext, Permission, RequiredAuditEvent, Share, ShareControlsUpdateOutcome,
-        ShareListOptions, ShareListSort, ShareListStatus, UploadConflictStrategy,
-        MAX_SQLITE_UNSIGNED,
+        AuditAction, AuditContext, Permission, RequiredAuditEvent, Share,
+        ShareControlsUpdateOutcome, ShareListOptions, ShareListSort, ShareListStatus,
+        UploadConflictStrategy, MAX_SQLITE_UNSIGNED,
     },
     file_ops,
     http_auth::{
@@ -363,9 +363,9 @@ pub(super) async fn update_share(
     if let Some(active) = active {
         audit_events.push(RequiredAuditEvent::new(
             if active {
-                "share_activated"
+                AuditAction::ShareActivated
             } else {
-                "share_deactivated"
+                AuditAction::ShareDeactivated
             },
             Some(object.clone()),
             None,
@@ -373,14 +373,14 @@ pub(super) async fn update_share(
     }
     if strategy.is_some() {
         audit_events.push(RequiredAuditEvent::new(
-            "share_upload_conflict_updated",
+            AuditAction::ShareUploadConflictUpdated,
             Some(object.clone()),
             None,
         ));
     }
     if let Some((total, files)) = upload_limits {
         audit_events.push(RequiredAuditEvent::new(
-            "share_upload_limits_updated",
+            AuditAction::ShareUploadLimitsUpdated,
             Some(object),
             Some(format!("bytes={total};files={files}")),
         ));
@@ -454,9 +454,9 @@ async fn set_share_active_api(
                 active,
                 &audit_context,
                 if active {
-                    "share_activated"
+                    AuditAction::ShareActivated
                 } else {
-                    "share_deactivated"
+                    AuditAction::ShareDeactivated
                 },
             )
         })
@@ -519,7 +519,12 @@ pub(super) async fn set_share_password(
     let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
     let changed = authority_mutation
         .commit(move |db| {
-            db.set_share_password_and_audit(id, Some(&hash), &audit_context, "share_password_set")
+            db.set_share_password_and_audit(
+                id,
+                Some(&hash),
+                &audit_context,
+                AuditAction::SharePasswordSet,
+            )
         })
         .await?;
     if !changed {
@@ -592,7 +597,12 @@ pub(super) async fn remove_share_password(
     let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
     let changed = authority_mutation
         .commit(move |db| {
-            db.set_share_password_and_audit(id, None, &audit_context, "share_password_removed")
+            db.set_share_password_and_audit(
+                id,
+                None,
+                &audit_context,
+                AuditAction::SharePasswordRemoved,
+            )
         })
         .await?;
     if !changed {

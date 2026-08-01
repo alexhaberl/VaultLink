@@ -1,7 +1,7 @@
 use super::{
-    insert_required_audits, token_hash, trace_required_audits, AuditContext, Database, Permission,
-    RequiredAuditEvent, Share, ShareControlsUpdateOutcome, ShareListOptions, ShareListSort,
-    SharePage, ShareSummary, UploadConflictStrategy, MAX_SQLITE_UNSIGNED,
+    insert_required_audits, token_hash, trace_required_audits, AuditAction, AuditContext, Database,
+    Permission, RequiredAuditEvent, Share, ShareControlsUpdateOutcome, ShareListOptions,
+    ShareListSort, SharePage, ShareSummary, UploadConflictStrategy, MAX_SQLITE_UNSIGNED,
 };
 #[cfg(test)]
 use super::{DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE};
@@ -227,7 +227,7 @@ impl Database {
                 (
                     Some(context),
                     Some([RequiredAuditEvent::new(
-                        "share_created",
+                        AuditAction::ShareCreated,
                         Some(id.to_string()),
                         detail,
                     )]),
@@ -469,7 +469,7 @@ impl Database {
         )?;
         let audit_events = required_audit.map(|(_, recovery)| {
             [RequiredAuditEvent::new(
-                "path_renamed",
+                AuditAction::PathRenamed,
                 Some(new_path.to_string()),
                 Some(format!(
                     "old_path={old_path};updated_shares={};recovery={recovery}",
@@ -527,7 +527,7 @@ impl Database {
         )?;
         let audit_events = required_audit.map(|(_, recovery, cleanup_pending)| {
             [RequiredAuditEvent::new(
-                "path_deleted",
+                AuditAction::PathDeleted,
                 Some(path.to_string()),
                 Some(format!(
                     "kind={};deactivated_shares={};cleanup={};recovery={recovery}",
@@ -562,12 +562,12 @@ impl Database {
         )? == 1)
     }
 
-    pub fn set_share_active_and_audit(
+    pub(crate) fn set_share_active_and_audit(
         &self,
         id: i64,
         active: bool,
         context: &AuditContext,
-        action: &'static str,
+        action: AuditAction,
     ) -> rusqlite::Result<bool> {
         self.required_transaction(context, |transaction| {
             let changed = transaction.execute(
@@ -737,7 +737,9 @@ impl Database {
         self.required_transaction(context, |transaction| {
             let deleted = transaction.execute("DELETE FROM shares WHERE id=?1", [id])? == 1;
             let events = deleted
-                .then(|| RequiredAuditEvent::new("share_deleted", Some(id.to_string()), None))
+                .then(|| {
+                    RequiredAuditEvent::new(AuditAction::ShareDeleted, Some(id.to_string()), None)
+                })
                 .into_iter()
                 .collect();
             Ok((deleted, events))
@@ -760,12 +762,12 @@ impl Database {
         Ok(changed)
     }
 
-    pub fn set_share_password_and_audit(
+    pub(crate) fn set_share_password_and_audit(
         &self,
         id: i64,
         hash: Option<&str>,
         context: &AuditContext,
-        action: &'static str,
+        action: AuditAction,
     ) -> rusqlite::Result<bool> {
         self.required_transaction(context, |transaction| {
             let changed = transaction.execute(

@@ -4,7 +4,9 @@
 
 This work was developed under the internal `0.4.9` hardening candidate. That candidate is not published or tagged; the first releasable artifact containing these changes is 0.5.0.
 
-- Added forward-only, transactional schema 1→2→3 migrations with durable migration history, fingerprint validation, share-list indexes, and complete binary/config/database/keyring rollback requirements.
+- Added server-authoritative request IDs, split liveness/readiness probes, a bounded descriptor-based DB/storage readiness check, and a 30-minute default administrator idle-session timeout with schema-4 activity tracking.
+- Centralized WebAuthn RSA rejection at registration, persistence and authentication boundaries and documented the narrowly compensated `RUSTSEC-2023-0071` exception.
+- Added forward-only, transactional schema 1→2→3→4 migrations with durable migration history, fingerprint validation, share-list indexes, deliberate administrator-session revocation at schema 4, and complete binary/config/database/keyring rollback requirements.
 - Added bounded cursor pagination for large directory and historical Share listings, immutable versioned-asset caching, explicit Argon2id parameters, and non-root container smoke execution.
 - Partitioned administrator password-login limits so active accounts use isolated exact counters while unknown or invalid usernames remain in fixed process-local buckets.
 - Made English the default UI language unless an explicit locale cookie exists, made backend/API error messages English-only, and moved the complete JSON API to `/api/v2` without a v1 compatibility router.
@@ -18,6 +20,7 @@ This work was developed under the internal `0.4.9` hardening candidate. That can
 - Added immutable Debian package inputs, reproducibility checks, exact-commit soak evidence and version-consistency release policy.
 - Added a fixed-boundary, root-only CIFS provisioner plus token-protected setup discovery that can use the hardened SMB share root directly while reserving an unreachable in-tree `.vaultlink-internal`, without granting the browser setup process mount privileges, with an explicit last-writer-wins opt-in for Replace uploads alongside external SMB clients.
 - Added a container setup entrypoint that preserves VaultLink's loopback-only listener behind a distinct proxy port and carries the same connection across the setup-to-serve transition without a port collision.
+- Centralized audit action names and retention priorities in a typed policy, promoted file uploads, replacements, upload-created directories and durability warnings to security priority, migrated existing rows with schema 6, and made security-priority eviction an explicit operator warning.
 
 ## 0.4.3 — 2026-07-14
 

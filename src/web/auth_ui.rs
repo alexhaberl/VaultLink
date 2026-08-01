@@ -16,12 +16,13 @@ use super::{
 };
 use crate::{
     auth,
-    db::AuditContext,
+    db::{AuditAction, AuditContext},
     http_auth::{
         admin_login_attempt_admitted, audit_observation, clear_session_cookie, csrf, database,
         enabled_audit_client_ip, make_session_cookie, password_login_admitted,
         redirect_with_cookie, required_database, session, MissingSession,
     },
+    i18n,
     services::auth::{
         AuthService, PasswordLoginCommand, PasswordLoginOutcome, TotpLoginCommand, TotpLoginOutcome,
     },
@@ -41,7 +42,7 @@ struct MfaTemplate<'a> {
 }
 
 pub(super) async fn login_page() -> Result<Html<String>> {
-    Ok(Html(public_page("Sign in", &LoginTemplate)?))
+    Ok(Html(public_page(i18n::LOGIN_TITLE, &LoginTemplate)?))
 }
 
 #[derive(Deserialize)]
@@ -79,7 +80,14 @@ pub(super) async fn login(
     )
     .await?;
     if outcome == PasswordLoginOutcome::InvalidCredentials {
-        audit_observation(&state, attempted_username, "login_failed", None, None).await;
+        audit_observation(
+            &state,
+            attempted_username,
+            AuditAction::LoginFailed,
+            None,
+            None,
+        )
+        .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     // Successful password verifications remain in the fixed window as well. This
@@ -108,7 +116,7 @@ pub(super) async fn mfa_page(
     })
     .await?;
     Ok(Html(public_page(
-        "MFA",
+        i18n::MFA_TITLE,
         &MfaTemplate {
             csrf: &current_session.csrf_token,
             security_key_enabled: security_key_count >= 2,
@@ -155,11 +163,11 @@ pub(super) async fn mfa(
     match outcome {
         TotpLoginOutcome::Created => {}
         TotpLoginOutcome::InvalidCode => {
-            audit_observation(&state, s.username, "mfa_failed", None, None).await;
+            audit_observation(&state, s.username, AuditAction::MfaFailed, None, None).await;
             return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid MFA code"));
         }
         TotpLoginOutcome::ReplayedOrStale => {
-            audit_observation(&state, s.username, "mfa_replayed", None, None).await;
+            audit_observation(&state, s.username, AuditAction::MfaReplayed, None, None).await;
             return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid MFA code"));
         }
     }

@@ -21,9 +21,10 @@ use super::{
 use crate::{
     auth,
     db::{
-        AuditContext, Permission, RequiredAuditEvent, Share, ShareControlsUpdateOutcome,
-        ShareListOptions, ShareListSort, ShareListStatus, UploadConflictStrategy,
-        DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE, MAX_SQLITE_UNSIGNED,
+        AuditAction, AuditContext, Permission, RequiredAuditEvent, Share,
+        ShareControlsUpdateOutcome, ShareListOptions, ShareListSort, ShareListStatus,
+        UploadConflictStrategy, DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE,
+        MAX_SQLITE_UNSIGNED,
     },
     file_ops,
     http_auth::{
@@ -701,7 +702,7 @@ pub(super) async fn toggle_share(
     let audit_context = AuditContext::new(username, audit_client_ip);
     let changed = authority_mutation
         .commit(move |db| {
-            db.set_share_active_and_audit(id, active, &audit_context, "share_toggled")
+            db.set_share_active_and_audit(id, active, &audit_context, AuditAction::ShareToggled)
         })
         .await?;
     if !changed {
@@ -804,7 +805,7 @@ pub(super) async fn set_share_upload_conflict(
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
     let audit_events = [RequiredAuditEvent::new(
-        "share_upload_conflict_updated",
+        AuditAction::ShareUploadConflictUpdated,
         Some(id.to_string()),
         Some(format!(
             "strategy={};bytes={total_limit};files={file_limit}",
@@ -883,9 +884,9 @@ pub(super) async fn set_share_password(
         Some(hash_password_admitted(&state, password).await?)
     };
     let action = if remove {
-        "share_password_removed"
+        AuditAction::SharePasswordRemoved
     } else {
-        "share_password_set"
+        AuditAction::SharePasswordSet
     };
     let username = session.username;
     let audit_client_ip = runtime_settings(&state)

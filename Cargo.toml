@@ -22,13 +22,14 @@ axum = { version = "0.8", features = ["multipart"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 crc32fast = "1.5"
 data-encoding = "2.6"
 hmac = "0.13"
 http = "1"
 http-body = "1"
 futures-util = "0.3"
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 mime_guess = "2"
 memchr = "2"
@@ -60,6 +61,7 @@ webauthn_rp = { version = "=0.3.0", default-features = false, features = ["bin",
 zeroize = "1.9"
 
 [dev-dependencies]
+http-body-util = "0.1"
 
 [profile.release]
 lto = "thin"

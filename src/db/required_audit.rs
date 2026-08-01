@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use super::audit::insert_audit_event;
+use super::{audit::insert_audit_event, AuditAction};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditContext {
@@ -23,13 +23,17 @@ impl AuditContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequiredAuditEvent {
-    pub action: &'static str,
+    pub(crate) action: AuditAction,
     pub object_id: Option<String>,
     pub detail: Option<String>,
 }
 
 impl RequiredAuditEvent {
-    pub fn new(action: &'static str, object_id: Option<String>, detail: Option<String>) -> Self {
+    pub(crate) fn new(
+        action: AuditAction,
+        object_id: Option<String>,
+        detail: Option<String>,
+    ) -> Self {
         Self {
             action,
             object_id,
@@ -69,8 +73,8 @@ pub(super) fn insert_required_audits(
     for event in events {
         insert_audit_event(
             transaction,
-            &context.actor,
             event.action,
+            &context.actor,
             event.object_id.as_deref(),
             event.detail.as_deref(),
             context.client_ip.as_deref(),
@@ -88,7 +92,7 @@ pub(super) fn trace_required_audits(context: &AuditContext, events: &[RequiredAu
         tracing::info!(
             target: "vaultlink::audit",
             actor = context.actor,
-            action = event.action,
+            action = event.action.as_str(),
             object_id = event.object_id.as_deref().unwrap_or(""),
             detail = event.detail.as_deref().unwrap_or(""),
             "audit event"

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth,
+    db::AuditAction,
     http_auth::{
         admin_login_attempt_admitted, audit_observation, clear_session_cookie, csrf_header,
         enabled_audit_client_ip, make_session_cookie, password_login_admitted, required_database,
@@ -70,7 +71,14 @@ pub(super) async fn login(
     )
     .await?;
     if outcome == PasswordLoginOutcome::InvalidCredentials {
-        audit_observation(&state, attempted_username, "login_failed", None, None).await;
+        audit_observation(
+            &state,
+            attempted_username,
+            AuditAction::LoginFailed,
+            None,
+            None,
+        )
+        .await;
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_credentials",
@@ -137,7 +145,14 @@ pub(super) async fn mfa(
     match outcome {
         TotpLoginOutcome::Created => {}
         TotpLoginOutcome::InvalidCode => {
-            audit_observation(&state, session_data.username, "mfa_failed", None, None).await;
+            audit_observation(
+                &state,
+                session_data.username,
+                AuditAction::MfaFailed,
+                None,
+                None,
+            )
+            .await;
             return Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "invalid_mfa",
@@ -145,7 +160,14 @@ pub(super) async fn mfa(
             ));
         }
         TotpLoginOutcome::ReplayedOrStale => {
-            audit_observation(&state, session_data.username, "mfa_replayed", None, None).await;
+            audit_observation(
+                &state,
+                session_data.username,
+                AuditAction::MfaReplayed,
+                None,
+                None,
+            )
+            .await;
             return Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "invalid_mfa",

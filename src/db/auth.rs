@@ -5,14 +5,32 @@ use super::{
     AdminMfaEnrollmentActivationOutcome, AdminPasswordChangeOutcome, AdminRecoveryOutcome,
     AdminSummary, AdminTotpSettingOutcome, AdminWebauthnCredential,
     AdminWebauthnCredentialDeletionOutcome, AdminWebauthnCredentialRegistrationOutcome,
-    AuditContext, AuditedAdminMfaEnrollmentStartOutcome, Database, InitialAdminOutcome,
-    PasswordSessionCreationOutcome, PendingAdminMfaEnrollment, RequiredAuditEvent, Session,
-    ADMIN_MFA_ENROLLMENT_TTL_SECONDS,
+    AuditAction, AuditContext, AuditedAdminMfaEnrollmentStartOutcome, Database,
+    InitialAdminOutcome, PasswordSessionCreationOutcome, PendingAdminMfaEnrollment,
+    RequiredAuditEvent, Session, ADMIN_MFA_ENROLLMENT_TTL_SECONDS,
 };
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::sensitive::SecretString;
+
+const SESSION_TOUCH_INTERVAL_SECONDS: i64 = 60;
+
+struct SessionTimes {
+    now: String,
+    idle_cutoff: String,
+    touch_cutoff: String,
+}
+
+impl Database {
+    fn session_times(&self, now: DateTime<Utc>) -> SessionTimes {
+        SessionTimes {
+            now: now.to_rfc3339(),
+            idle_cutoff: (now - Duration::minutes(self.session_idle_minutes())).to_rfc3339(),
+            touch_cutoff: (now - Duration::seconds(SESSION_TOUCH_INTERVAL_SECONDS)).to_rfc3339(),
+        }
+    }
+}
 
 fn consume_admin_totp_step(
     transaction: &Transaction<'_>,
@@ -174,7 +192,7 @@ impl Database {
             Ok((
                 InitialAdminOutcome::Created,
                 vec![RequiredAuditEvent::new(
-                    "initial_admin_created",
+                    AuditAction::InitialAdminCreated,
                     Some(admin_id.to_string()),
                     None,
                 )],
@@ -228,7 +246,7 @@ impl Database {
             Ok((
                 admin,
                 vec![RequiredAuditEvent::new(
-                    "admin_created",
+                    AuditAction::AdminCreated,
                     Some(id.to_string()),
                     None,
                 )],
@@ -311,7 +329,9 @@ impl Database {
         self.required_transaction(context, |transaction| {
             let changed = transaction.execute("UPDATE admins SET active=1 WHERE id=?1", [id])? == 1;
             let events = changed
-                .then(|| RequiredAuditEvent::new("admin_activated", Some(id.to_string()), None))
+                .then(|| {
+                    RequiredAuditEvent::new(AuditAction::AdminActivated, Some(id.to_string()), None)
+                })
                 .into_iter()
                 .collect();
             Ok((changed, events))
@@ -372,7 +392,7 @@ impl Database {
         )
         .then(|| {
             vec![RequiredAuditEvent::new(
-                "admin_deactivated",
+                AuditAction::AdminDeactivated,
                 Some(id.to_string()),
                 None,
             )]
@@ -454,7 +474,7 @@ impl Database {
         );
         let audit_context = AuditContext::new("local_recovery", None);
         let audit_events = [RequiredAuditEvent::new(
-            "admin_recovered",
+            AuditAction::AdminRecovered,
             Some(object_id.clone()),
             Some(detail),
         )];
@@ -524,7 +544,7 @@ impl Database {
         let object_id = id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
-            "account_password_changed",
+            AuditAction::AccountPasswordChanged,
             Some(object_id),
             None,
         )];
@@ -657,7 +677,7 @@ impl Database {
             Ok((
                 AuditedAdminMfaEnrollmentStartOutcome::Started { expires_at },
                 vec![RequiredAuditEvent::new(
-                    "account_mfa_enrollment_started",
+                    AuditAction::AccountMfaEnrollmentStarted,
                     Some(admin_id.to_string()),
                     None,
                 )],
@@ -770,7 +790,7 @@ impl Database {
         let object_id = admin_id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
-            "account_mfa_changed",
+            AuditAction::AccountMfaChanged,
             Some(object_id),
             None,
         )];
@@ -818,7 +838,11 @@ impl Database {
             }
             let events = changed
                 .then(|| {
-                    RequiredAuditEvent::new("admin_password_reset", Some(id.to_string()), None)
+                    RequiredAuditEvent::new(
+                        AuditAction::AdminPasswordReset,
+                        Some(id.to_string()),
+                        None,
+                    )
                 })
                 .into_iter()
                 .collect();
@@ -884,7 +908,9 @@ impl Database {
             }
             let events = username
                 .is_some()
-                .then(|| RequiredAuditEvent::new("admin_totp_reset", Some(id.to_string()), None))
+                .then(|| {
+                    RequiredAuditEvent::new(AuditAction::AdminTotpReset, Some(id.to_string()), None)
+                })
                 .into_iter()
                 .collect();
             Ok((username, events))
@@ -953,7 +979,7 @@ impl Database {
         credential_blob: &(impl AsRef<[u8]> + ?Sized),
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminWebauthnCredentialRegistrationOutcome> {
-        let now = Utc::now().to_rfc3339();
+        let times = self.session_times(Utc::now());
         let session_token_hash = token_hash(session_token);
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -966,8 +992,9 @@ impl Database {
                    AND sessions.admin_id=?2
                    AND sessions.mfa_verified=1
                    AND sessions.expires_at>?3
+                   AND sessions.last_activity_at>?4
                    AND admins.active=1",
-                params![session_token_hash, admin_id, now],
+                params![session_token_hash, admin_id, times.now, times.idle_cutoff,],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -984,13 +1011,13 @@ impl Database {
                 label,
                 credential_id,
                 credential_blob.as_ref(),
-                now
+                times.now
             ],
         )?;
         let credential_row_id = transaction.last_insert_rowid();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
-            "webauthn_credential_added",
+            AuditAction::WebauthnCredentialAdded,
             None,
             None,
         )];
@@ -1081,6 +1108,7 @@ impl Database {
         updated_credential_blob: &[u8],
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<bool> {
+        let times = self.session_times(Utc::now());
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let credential_updated = transaction.execute(
@@ -1089,7 +1117,8 @@ impl Database {
              WHERE id=?1 AND admin_id=?2 AND credential_blob=?3
                AND EXISTS(
                    SELECT 1 FROM sessions
-                   WHERE token_hash=?4 AND admin_id=?2 AND mfa_verified=0 AND expires_at>?6
+                   WHERE token_hash=?4 AND admin_id=?2 AND mfa_verified=0
+                     AND expires_at>?6 AND last_activity_at>?7
                )",
             params![
                 credential_id,
@@ -1097,7 +1126,8 @@ impl Database {
                 expected_credential_blob,
                 token_hash(old_session_token),
                 updated_credential_blob,
-                Utc::now().to_rfc3339()
+                times.now,
+                times.idle_cutoff,
             ],
         )? == 1;
         if !credential_updated {
@@ -1106,14 +1136,16 @@ impl Database {
         }
         let session_updated = transaction.execute(
             "UPDATE sessions
-             SET token_hash=?4,csrf_token=?5,mfa_verified=1
-             WHERE token_hash=?1 AND admin_id=?2 AND mfa_verified=0 AND expires_at>?3",
+             SET token_hash=?4,csrf_token=?5,mfa_verified=1,last_activity_at=?3
+             WHERE token_hash=?1 AND admin_id=?2 AND mfa_verified=0
+               AND expires_at>?3 AND last_activity_at>?6",
             params![
                 token_hash(old_session_token),
                 admin_id,
-                Utc::now().to_rfc3339(),
+                times.now,
                 token_hash(new_session_token),
                 new_csrf_token,
+                times.idle_cutoff,
             ],
         )? == 1;
         if !session_updated {
@@ -1121,7 +1153,7 @@ impl Database {
             return Ok(false);
         }
         let audit_events = [RequiredAuditEvent::new(
-            "login_success_webauthn",
+            AuditAction::LoginSuccessWebauthn,
             None,
             None,
         )];
@@ -1143,6 +1175,7 @@ impl Database {
         )
     }
 
+    #[cfg(test)]
     pub fn delete_admin_webauthn_credential(
         &self,
         id: i64,
@@ -1171,6 +1204,7 @@ impl Database {
         totp_step: u64,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminWebauthnCredentialDeletionOutcome> {
+        let times = self.session_times(Utc::now());
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let username = transaction
@@ -1182,13 +1216,15 @@ impl Database {
                    AND sessions.admin_id=?2
                    AND sessions.mfa_verified=1
                    AND sessions.expires_at>?3
+                   AND sessions.last_activity_at>?4
                    AND admins.active=1
-                   AND admins.password_hash=?4
-                   AND admins.totp_generation=?5",
+                   AND admins.password_hash=?5
+                   AND admins.totp_generation=?6",
                 params![
                     token_hash(session_token),
                     admin_id,
-                    Utc::now().to_rfc3339(),
+                    times.now,
+                    times.idle_cutoff,
                     expected_password_hash,
                     expected_totp_generation,
                 ],
@@ -1213,10 +1249,11 @@ impl Database {
             transaction.rollback()?;
             return Ok(AdminWebauthnCredentialDeletionOutcome::NotDeleted);
         }
+        revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
-            "webauthn_credential_deleted",
+            AuditAction::WebauthnCredentialDeleted,
             Some(object_id),
             None,
         )];
@@ -1234,6 +1271,7 @@ impl Database {
         expected_password_hash: &str,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminWebauthnCredentialDeletionOutcome> {
+        let times = self.session_times(Utc::now());
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let username = transaction
@@ -1245,13 +1283,15 @@ impl Database {
                    AND sessions.admin_id=?2
                    AND sessions.mfa_verified=1
                    AND sessions.expires_at>?3
+                   AND sessions.last_activity_at>?4
                    AND admins.active=1
-                   AND admins.password_hash=?4
+                   AND admins.password_hash=?5
                    AND admins.totp_enabled=0",
                 params![
                     token_hash(session_token),
                     admin_id,
-                    Utc::now().to_rfc3339(),
+                    times.now,
+                    times.idle_cutoff,
                     expected_password_hash,
                 ],
                 |row| row.get::<_, String>(0),
@@ -1271,10 +1311,11 @@ impl Database {
             transaction.rollback()?;
             return Ok(AdminWebauthnCredentialDeletionOutcome::NotDeleted);
         }
+        revoke_admin_auth_state(&transaction, admin_id)?;
         let object_id = id.to_string();
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
-            "webauthn_credential_deleted",
+            AuditAction::WebauthnCredentialDeleted,
             Some(object_id),
             Some("totp_disabled".into()),
         )];
@@ -1295,6 +1336,7 @@ impl Database {
         totp_step: Option<u64>,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminTotpSettingOutcome> {
+        let times = self.session_times(Utc::now());
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = transaction
@@ -1306,13 +1348,15 @@ impl Database {
                    AND sessions.admin_id=?2
                    AND sessions.mfa_verified=1
                    AND sessions.expires_at>?3
+                   AND sessions.last_activity_at>?4
                    AND admins.active=1
-                   AND admins.password_hash=?4
-                   AND admins.totp_generation=?5",
+                   AND admins.password_hash=?5
+                   AND admins.totp_generation=?6",
                 params![
                     token_hash(session_token),
                     admin_id,
-                    Utc::now().to_rfc3339(),
+                    times.now,
+                    times.idle_cutoff,
                     expected_password_hash,
                     expected_totp_generation,
                 ],
@@ -1354,9 +1398,9 @@ impl Database {
             return Err(rusqlite::Error::InvalidQuery);
         }
         let action = if enabled {
-            "admin_totp_enabled"
+            AuditAction::AdminTotpEnabled
         } else {
-            "admin_totp_disabled"
+            AuditAction::AdminTotpDisabled
         };
         let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
         let audit_events = [RequiredAuditEvent::new(
@@ -1377,14 +1421,22 @@ impl Database {
         csrf: &str,
         expires: DateTime<Utc>,
     ) -> rusqlite::Result<()> {
+        let times = self.session_times(Utc::now());
         let c = self.try_conn()?;
         c.execute(
-            "DELETE FROM sessions WHERE expires_at < ?1",
-            [Utc::now().to_rfc3339()],
+            "DELETE FROM sessions WHERE expires_at<=?1 OR last_activity_at<=?2",
+            params![times.now, times.idle_cutoff],
         )?;
         c.execute(
-            "INSERT INTO sessions(token_hash,admin_id,csrf_token,expires_at) VALUES(?1,?2,?3,?4)",
-            params![token_hash(token), admin_id, csrf, expires.to_rfc3339()],
+            "INSERT INTO sessions(token_hash,admin_id,csrf_token,expires_at,last_activity_at)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![
+                token_hash(token),
+                admin_id,
+                csrf,
+                expires.to_rfc3339(),
+                times.now
+            ],
         )?;
         Ok(())
     }
@@ -1438,14 +1490,17 @@ impl Database {
         expires: DateTime<Utc>,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<PasswordSessionCreationOutcome> {
-        let now = Utc::now().to_rfc3339();
+        let times = self.session_times(Utc::now());
         let session_token_hash = token_hash(token);
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("DELETE FROM sessions WHERE expires_at < ?1", [&now])?;
+        transaction.execute(
+            "DELETE FROM sessions WHERE expires_at<=?1 OR last_activity_at<=?2",
+            params![times.now, times.idle_cutoff],
+        )?;
         let created = transaction.execute(
-            "INSERT INTO sessions(token_hash,admin_id,csrf_token,expires_at)
-             SELECT ?1,admins.id,?4,?5
+            "INSERT INTO sessions(token_hash,admin_id,csrf_token,expires_at,last_activity_at)
+             SELECT ?1,admins.id,?4,?5,?6
              FROM admins
              WHERE admins.id=?2 AND admins.password_hash=?3 AND admins.active=1",
             params![
@@ -1453,7 +1508,8 @@ impl Database {
                 admin_id,
                 expected_password_hash,
                 csrf,
-                expires.to_rfc3339()
+                expires.to_rfc3339(),
+                times.now,
             ],
         )?;
         let outcome = if created == 1 {
@@ -1476,7 +1532,7 @@ impl Database {
             }
         };
         let audit_events = (outcome == PasswordSessionCreationOutcome::Created)
-            .then(|| RequiredAuditEvent::new("password_verified", None, None))
+            .then(|| RequiredAuditEvent::new(AuditAction::PasswordVerified, None, None))
             .into_iter()
             .collect::<Vec<_>>();
         if let Some(context) = required_audit {
@@ -1490,7 +1546,60 @@ impl Database {
     }
 
     pub fn session(&self, token: &str) -> rusqlite::Result<Option<Session>> {
-        self.try_conn()?.query_row("SELECT a.id,a.username,s.csrf_token,s.mfa_verified FROM sessions s JOIN admins a ON a.id=s.admin_id WHERE s.token_hash=?1 AND s.expires_at>?2 AND a.active=1",params![token_hash(token),Utc::now().to_rfc3339()],|r|Ok(Session{admin_id:r.get(0)?,username:r.get(1)?,csrf_token:r.get(2)?,mfa_verified:r.get::<_,i64>(3)?!=0})).optional()
+        self.session_at(token, Utc::now())
+    }
+
+    fn session_at(&self, token: &str, now: DateTime<Utc>) -> rusqlite::Result<Option<Session>> {
+        let times = self.session_times(now);
+        let session_token_hash = token_hash(token);
+        let connection = self.try_conn()?;
+        let session = connection
+            .query_row(
+                "SELECT a.id,a.username,s.csrf_token,s.mfa_verified
+                 FROM sessions s
+                 JOIN admins a ON a.id=s.admin_id
+                 WHERE s.token_hash=?1 AND s.expires_at>?2
+                   AND s.last_activity_at>?3 AND a.active=1",
+                params![session_token_hash, times.now, times.idle_cutoff],
+                |row| {
+                    Ok(Session {
+                        admin_id: row.get(0)?,
+                        username: row.get(1)?,
+                        csrf_token: row.get(2)?,
+                        mfa_verified: row.get::<_, i64>(3)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        if session.is_some() {
+            connection.execute(
+                "UPDATE sessions SET last_activity_at=?2
+                 WHERE token_hash=?1 AND last_activity_at<=?3
+                   AND expires_at>?2 AND last_activity_at>?4",
+                params![
+                    session_token_hash,
+                    times.now,
+                    times.touch_cutoff,
+                    times.idle_cutoff,
+                ],
+            )?;
+        } else {
+            connection.execute(
+                "DELETE FROM sessions WHERE token_hash=?1
+                   AND (expires_at<=?2 OR last_activity_at<=?3)",
+                params![session_token_hash, times.now, times.idle_cutoff],
+            )?;
+        }
+        Ok(session)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_at_for_test(
+        &self,
+        token: &str,
+        now: DateTime<Utc>,
+    ) -> rusqlite::Result<Option<Session>> {
+        self.session_at(token, now)
     }
 
     #[cfg(test)]
@@ -1517,6 +1626,7 @@ impl Database {
         admin_id: i64,
         operation: impl FnOnce() -> T,
     ) -> rusqlite::Result<Option<T>> {
+        let times = self.session_times(Utc::now());
         let connection = self.try_conn()?;
         let live = connection.query_row(
             "SELECT EXISTS(
@@ -1527,9 +1637,10 @@ impl Database {
                    AND sessions.admin_id=?2
                    AND sessions.mfa_verified=1
                    AND sessions.expires_at>?3
+                   AND sessions.last_activity_at>?4
                    AND admins.active=1
              )",
-            params![token_hash(token), admin_id, Utc::now().to_rfc3339()],
+            params![token_hash(token), admin_id, times.now, times.idle_cutoff,],
             |row| row.get::<_, bool>(0),
         )?;
         if !live {
@@ -1589,7 +1700,7 @@ impl Database {
         step: u64,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<bool> {
-        let now = Utc::now().to_rfc3339();
+        let times = self.session_times(Utc::now());
         let session_token_hash = token_hash(old_token);
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1599,9 +1710,10 @@ impl Database {
                  JOIN admins ON admins.id=sessions.admin_id
                  WHERE sessions.token_hash=?1 AND sessions.admin_id=?2
                    AND sessions.expires_at>?3 AND sessions.mfa_verified=0
+                   AND sessions.last_activity_at>?4
                    AND admins.active=1 AND admins.totp_enabled=1
              )",
-            params![session_token_hash, admin_id, now],
+            params![session_token_hash, admin_id, times.now, times.idle_cutoff,],
             |row| row.get::<_, bool>(0),
         )?;
         if !valid_session || !consume_admin_totp_step(&transaction, admin_id, step)? {
@@ -1610,20 +1722,26 @@ impl Database {
         }
         let changed = transaction.execute(
             "UPDATE sessions
-             SET token_hash=?4,csrf_token=?5,mfa_verified=1
-             WHERE token_hash=?1 AND admin_id=?2 AND expires_at>?3 AND mfa_verified=0",
+             SET token_hash=?4,csrf_token=?5,mfa_verified=1,last_activity_at=?3
+             WHERE token_hash=?1 AND admin_id=?2 AND expires_at>?3
+               AND last_activity_at>?6 AND mfa_verified=0",
             params![
                 session_token_hash,
                 admin_id,
-                now,
+                times.now,
                 token_hash(new_token),
                 new_csrf_token,
+                times.idle_cutoff,
             ],
         )?;
         if changed != 1 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let audit_events = [RequiredAuditEvent::new("login_success", None, None)];
+        let audit_events = [RequiredAuditEvent::new(
+            AuditAction::LoginSuccess,
+            None,
+            None,
+        )];
         if let Some(context) = required_audit {
             insert_required_audits(&transaction, context, &audit_events)?;
         }
@@ -1646,9 +1764,11 @@ impl Database {
 
     #[cfg(test)]
     pub fn verify_mfa(&self, token: &str) -> rusqlite::Result<bool> {
+        let times = self.session_times(Utc::now());
         Ok(self.try_conn()?.execute(
-            "UPDATE sessions SET mfa_verified=1 WHERE token_hash=?1 AND expires_at>?2",
-            params![token_hash(token), Utc::now().to_rfc3339()],
+            "UPDATE sessions SET mfa_verified=1,last_activity_at=?2
+             WHERE token_hash=?1 AND expires_at>?2 AND last_activity_at>?3",
+            params![token_hash(token), times.now, times.idle_cutoff],
         )? == 1)
     }
     #[cfg(test)]
@@ -1670,7 +1790,10 @@ impl Database {
                 "DELETE FROM sessions WHERE token_hash=?1",
                 [token_hash(token)],
             )?;
-            Ok(((), vec![RequiredAuditEvent::new("logout", None, None)]))
+            Ok((
+                (),
+                vec![RequiredAuditEvent::new(AuditAction::Logout, None, None)],
+            ))
         })
     }
 }

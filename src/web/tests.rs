@@ -12,9 +12,9 @@ use super::{
     transfer::{install_zip_blocking_test_hook, ZipBlockingTestHook, ZipBlockingTestPhase},
     transfer_runtime::*,
     upload::*,
-    AppError, BUFFERED_RESPONSE_CHUNK_BYTES, DEFAULT_REQUEST_BODY_LIMIT, ERROR_CODE_HEADER,
-    MAX_RENDERED_TEXT_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES, MAX_UPLOAD_PATH_FIELD_BYTES,
-    TEXT_PREVIEW_STREAM_MARKER,
+    AppError, ServerRequestId, BUFFERED_RESPONSE_CHUNK_BYTES, DEFAULT_REQUEST_BODY_LIMIT,
+    ERROR_CODE_HEADER, MAX_RENDERED_TEXT_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES,
+    MAX_UPLOAD_PATH_FIELD_BYTES, REQUEST_ID_HEADER, TEXT_PREVIEW_STREAM_MARKER,
 };
 use crate::config::{Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage, Tls};
 use crate::{
@@ -1209,6 +1209,26 @@ fn zip_planning_bounds_empty_directory_scans() {
     ));
     let single = state.secure_root.bind_directory("single").unwrap();
     assert_eq!(plan_zip(&single, "", &settings).unwrap().files.len(), 1);
+}
+
+#[test]
+fn zip_planning_rejects_unsafe_external_writer_filenames() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    let unsafe_name = "C:escape.txt";
+    std::fs::write(root.path().join("docs").join(unsafe_name), b"malicious").unwrap();
+    let state = test_state(root.path(), data.path());
+    let scope = state.secure_root.bind_directory("docs").unwrap();
+    let settings = runtime_settings(&state);
+
+    let visible_entries = scope.list("", 0, 10).unwrap();
+    assert_eq!(visible_entries.len(), 1);
+    assert_eq!(visible_entries[0].name, unsafe_name);
+    assert!(matches!(
+        plan_zip(&scope, "", &settings),
+        Err(ZipBuildError::Source(error)) if error.kind() == io::ErrorKind::InvalidData
+    ));
 }
 
 #[test]
@@ -2630,6 +2650,48 @@ async fn full_router_exposes_only_the_v2_api_namespace() {
 }
 
 #[tokio::test]
+async fn request_ids_are_server_generated_and_propagated() {
+    use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+
+    let app = Router::new()
+        .route(
+            "/",
+            get(|axum::Extension(ServerRequestId(request_id))| async move { request_id }),
+        )
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(middleware::from_fn(super::attach_server_request_id))
+        .layer(SetRequestIdLayer::new(REQUEST_ID_HEADER, MakeRequestUuid))
+        .layer(middleware::from_fn(super::discard_client_request_id));
+    let mut spoofed = request(Method::GET, "/api/v2/health", "");
+    *spoofed.uri_mut() = Uri::from_static("/");
+    spoofed.headers_mut().insert(
+        REQUEST_ID_HEADER,
+        HeaderValue::from_static("client-controlled"),
+    );
+
+    let response = app.oneshot(spoofed).await.unwrap();
+    let request_id = response
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let handler_request_id = response_text(response).await;
+
+    assert_ne!(request_id, "client-controlled");
+    assert_eq!(request_id.len(), 36);
+    assert!(request_id.bytes().enumerate().all(|(index, byte)| {
+        if [8, 13, 18, 23].contains(&index) {
+            byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    }));
+    assert_eq!(handler_request_id, request_id);
+}
+
+#[tokio::test]
 async fn file_time_uses_locale_date_order() {
     let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(60 * 60 * 20 + 32 * 60);
     let utc = chrono::DateTime::<Utc>::from(time);
@@ -3943,6 +4005,7 @@ async fn detached_public_upload_finalizer_preserves_the_audit_client_ip() {
     let events = state.db.list_audit(Some("upload"), 10, 0).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].client_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(state.db.audit_priorities("upload").unwrap(), [100]);
 }
 
 #[tokio::test]
@@ -4227,19 +4290,45 @@ async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compa
         &format!("/admin/account/security-keys/{first}/delete"),
         &format!("csrf=account-security-csrf&current_password={password}"),
     );
-    delete.headers_mut().insert(header::COOKIE, cookie.clone());
-    assert_eq!(
-        app.clone().oneshot(delete).await.unwrap().status(),
-        StatusCode::SEE_OTHER
-    );
+    delete.headers_mut().insert(header::COOKIE, cookie);
+    let deleted = app.clone().oneshot(delete).await.unwrap();
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert_eq!(deleted.headers().get(header::LOCATION).unwrap(), "/login");
+    assert!(deleted
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
     assert_eq!(state.db.admin_webauthn_credentials(1).unwrap().len(), 2);
+    assert!(state
+        .db
+        .session("account-security-session")
+        .unwrap()
+        .is_none());
+    assert!(state.db.session("key-only-mfa-session").unwrap().is_none());
+
+    state
+        .db
+        .create_session(
+            "post-key-delete-session",
+            1,
+            "post-key-delete-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(state.db.verify_mfa("post-key-delete-session").unwrap());
 
     let mut enable = request(
         Method::POST,
         "/admin/account/totp",
-        &format!("csrf=account-security-csrf&current_password={password}&enabled=true"),
+        &format!("csrf=post-key-delete-csrf&current_password={password}&enabled=true"),
     );
-    enable.headers_mut().insert(header::COOKIE, cookie);
+    enable.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=post-key-delete-session"),
+    );
     assert_eq!(
         app.oneshot(enable).await.unwrap().status(),
         StatusCode::SEE_OTHER
@@ -4875,6 +4964,21 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
             .unwrap()
             .len(),
         1
+    );
+    assert_eq!(
+        state.db.audit_priorities("admin_upload").unwrap(),
+        [100, 100]
+    );
+    assert_eq!(
+        state.db.audit_priorities("admin_upload_replaced").unwrap(),
+        [100]
+    );
+    assert_eq!(
+        state
+            .db
+            .audit_priorities("upload_directories_created")
+            .unwrap(),
+        [100]
     );
 
     let mut blocked = admin_multipart_request(
@@ -5842,6 +5946,13 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
         std::fs::read(root.path().join("docs/Fotos/2026/Sommer/bild.txt")).unwrap(),
         b"public folder upload"
     );
+    assert_eq!(
+        state
+            .db
+            .audit_priorities("upload_directories_created")
+            .unwrap(),
+        [100]
+    );
     let traversal = app
         .clone()
         .oneshot(public_folder_upload_request(
@@ -6353,6 +6464,21 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     assert_eq!(
         std::fs::read(root.path().join("uploads/ok.txt")).unwrap(),
         b"new"
+    );
+    assert!(!state.db.audit_priorities("upload").unwrap().is_empty());
+    assert!(state
+        .db
+        .audit_priorities("upload")
+        .unwrap()
+        .iter()
+        .all(|priority| *priority == 100));
+    assert_eq!(state.db.audit_priorities("upload_replaced").unwrap(), [100]);
+    assert_eq!(
+        state
+            .db
+            .audit_priorities("upload_durability_uncertain")
+            .unwrap(),
+        [100]
     );
     let blocked = app
         .clone()
@@ -7209,7 +7335,14 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     );
     assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
 
-    let mut over_quota = multipart_request("/v/protected-upload/upload", "too-large.txt", b"56");
+    let mut over_quota = folder_upload_request(
+        "/v/protected-upload/upload",
+        "",
+        Some(&upload_csrf),
+        "unaccounted/directories",
+        "too-large.txt",
+        b"56",
+    );
     over_quota.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&unlock_cookie).unwrap(),
@@ -7235,6 +7368,7 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
         .unwrap();
     assert_eq!((share.uploaded_bytes, share.uploaded_files), (4, 1));
     assert_eq!(state.db.active_upload_reservations(share_id).unwrap(), 0);
+    assert!(!root.path().join("uploads/unaccounted").exists());
 
     let mut exact_quota = multipart_request("/v/protected-upload/upload", "last.txt", b"5");
     exact_quota.headers_mut().insert(

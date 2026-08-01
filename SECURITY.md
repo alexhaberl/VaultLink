@@ -12,6 +12,14 @@ Release line: `0.5.0` for Linux x86_64 and aarch64. Its hardening work passed th
 - Local `.env`, root `config.toml`, and SQLite files are excluded from the Docker context; the smoke image copies only build inputs and deploy tests explicitly.
 - Debian build packages come exclusively from the checked-in, timestamped Debian snapshot and an exact direct/transitive package lock. The weekly and manually dispatched native reproducibility gate compares two clean binary and archive builds per architecture before release.
 
+### Compensated WebAuthn RSA advisory
+
+`webauthn_rp 0.3.0` unconditionally depends on `rsa 0.9.10`, which is affected by `RUSTSEC-2023-0071`. The advisory concerns timing leakage from RSA private-key operations. VaultLink is a WebAuthn relying party: authenticator private keys never enter the server, and VaultLink performs no RSA private-key operation for WebAuthn credentials.
+
+VaultLink nevertheless makes the affected RS256 path unreachable. Registration options never advertise RS256, and one central runtime invariant rejects RSA credential state after registration, while decoding persisted credentials, and immediately before authentication. Regression tests cover each boundary. `RUSTSEC-2023-0071` is the sole explicit `cargo-audit` exception and must be reviewed for every release.
+
+The exception must be removed or reassessed if `webauthn_rp` drops or updates `rsa`, VaultLink enables RS256, a deserialization path bypasses the central check, or VaultLink begins handling RSA private keys. This statement is limited to VaultLink's current relying-party use and does not claim that the affected crate is generally safe.
+
 ## Reporting a vulnerability
 
 Do not open a public issue. Use GitHub's private vulnerability reporting for this repository or contact the repository owner privately. Include affected version, reproduction steps, impact, and any suggested mitigation. Do not include production credentials, share tokens, TOTP secrets, passwords, or private keys.
@@ -31,6 +39,7 @@ Do not open a public issue. Use GitHub's private vulnerability reporting for thi
 - SQLite stores Share tokens, TOTP seeds and WebAuthn credentials encrypted at rest. The adjacent matching `secrets.keyring` contains the keys needed to decrypt them. A complete database/keyring pair or upgrade/rollback backup is therefore a production credential and must remain restricted to audited root/service access, encrypted storage and protected backup handling.
 - Upgrade and rollback backups are inseparable Binary/Config/SQLite/Keyring units. The live configuration is never rewritten for a candidate before downtime; automatic recovery restores and health-checks the matching old unit.
 - One VaultLink process owns a storage-root/data-directory pair; active-active multi-process operation on the same pair is unsupported.
+- Administrator sessions have both the configured absolute lifetime and a 30-minute inactivity limit by default. Activity updates are coalesced to one SQLite write per minute, so an idle session expires conservatively after 29 to 30 minutes and can never outlive its absolute expiry.
 - Administrator recovery assumes SSH/host access and is performed locally with `recover-admin` as the `vaultlink` service user; VaultLink deliberately exposes no public password-reset endpoint.
 - CIFS provisioning is a separate local root-only command with a fixed `/mnt/storage` boundary. The browser setup remains unprivileged, passwords are read from the terminal rather than arguments, existing system files are never overwritten, and failed activation rolls back files created by that attempt. Server-side SMB ACL provisioning and verification remain an administrator responsibility.
 - Linux kernels must support `openat2(2)`, `renameat2(2)` and statx mount IDs (Linux 5.8 or newer for the hardened external-mount mode); VaultLink refuses to start otherwise.

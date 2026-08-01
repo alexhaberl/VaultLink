@@ -40,7 +40,7 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
 - [x] Every production configuration requires exact fail-closed mount identity; local audited production storage may keep SQLite outside the visible tree on the same supported local mount.
 - [x] Setup and `init-admin` validate root/internal/data mounts and canonical paths before writing config, database, or credentials.
 - [x] Upgrade/rollback backups and recovery always use a validated binary/config/SQLite/keyring unit. Candidate configuration never changes live configuration before downtime.
-- [x] Fresh databases use schema 3; validated schemas 1 and 2 migrate transactionally. Forward-only rollback restores the matching full old backup.
+- [x] Fresh databases use schema 6; validated schemas 1 through 5 migrate transactionally. Schema 3→4 revokes existing administrator sessions, and schema 6 reclassifies existing upload-related audits under the centralized priority policy. Forward-only rollback restores the matching full old backup.
 - [x] Small buffered form/JSON body limits; only upload routes receive the large streaming allowance. Multipart preamble, headers, field count, and metadata are bounded.
 - [x] Reverse-proxy mode, standalone TLS, SIGHUP PEM reload, and optional built-in Let's Encrypt `tls-alpn-01` standalone TLS.
 - [x] UI polish with separate auth/public/admin shells, logo/favicon, locale-aware date/time inputs, decimal MB/GB units, and consistent controls.
@@ -79,7 +79,7 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
 
 - [x] Existing `0.3.0` binary checked on both test systems with identical SHA-256 `d6def1640bf8c93ddb5f30689731c4f3f2efb62d13c949b75a0012bd0cfb2946`.
 - [x] Reverse-proxy system remained active for 10 h 11 min and standalone TLS for 10 h 08 min, both with `NRestarts=0` and no failed systemd units.
-- [x] `PRAGMA integrity_check = ok`, empty WAL files, and successful local/public `/api/v2/health` responses reporting the release version.
+- [x] `PRAGMA integrity_check = ok`, empty WAL files, and successful local/public `/api/v2/health/ready` responses reporting the release version.
 - [x] RSS was 10.5 MiB and 13.0 MiB respectively, with no VaultLink warnings, panics, or errors in the reviewed journal.
 - [ ] This was not a formal soak: neither `soak-monitor.sh` nor the load profile ran. The final 72-hour soak has not yet started.
 
@@ -118,7 +118,7 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
   - backup contains `vaultlink`, `config.toml`, `data.sqlite`, and matching `secrets.keyring` with restrictive ownership/modes;
   - candidate failure restores the full old unit and verifies its own health endpoint;
   - concurrent upgrade/rollback fails on the maintenance lock before service stop;
-  - real schema-1 and schema-2 fixtures migrate once to schema 3; rollback restores the complete pre-migration backup.
+  - real schema-1 through schema-5 fixtures migrate once to schema 6; upload-related legacy audits receive security priority, and rollback restores the complete pre-migration backup.
 - [ ] Password-protected public uploads accept the unlock-bound CSRF value as multipart field or `X-VaultLink-Upload-CSRF` and reject missing/foreign values.
 - [ ] Upload Shares enforce per-file, cumulative byte, and file-count limits under parallel queue uploads and overwrite attempts.
 - [ ] Rollback test stops the service, restores matching binary/config/database/keyring, starts it, verifies exact local health/version, and remains stopped after failed recovery stop or incomplete emergency restore.

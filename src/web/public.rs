@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::{
     auth,
-    db::{AuditContext, Permission, Share},
+    db::{AuditAction, AuditContext, Permission, Share},
     file_ops,
     http_auth::{
         audit_observation, current_client_limit_key, database, enabled_audit_client_ip,
@@ -314,7 +314,7 @@ pub(super) async fn unlock_share(
         audit_observation(
             &state,
             "public".into(),
-            "share_unlock_failed",
+            AuditAction::ShareUnlockFailed,
             Some(share.id.to_string()),
             None,
         )
@@ -326,7 +326,7 @@ pub(super) async fn unlock_share(
         audit_observation(
             &state,
             "public".into(),
-            "share_unlock_failed",
+            AuditAction::ShareUnlockFailed,
             Some(share.id.to_string()),
             None,
         )
@@ -358,7 +358,7 @@ pub(super) async fn unlock_share(
         audit_observation(
             &state,
             "public".into(),
-            "share_unlock_failed",
+            AuditAction::ShareUnlockFailed,
             Some(share.id.to_string()),
             None,
         )
@@ -377,7 +377,7 @@ fn protected_share_page(token: &str) -> Html<String> {
         lock_icon: TrustedMarkup::static_icon(crate::ui::Icon::Lock),
     };
     Html(
-        templates::public_page("Protected share", &body)
+        templates::public_page(i18n::PROTECTED_SHARE_TITLE, &body)
             .expect("the protected-share template writes only to an in-memory string"),
     )
 }
@@ -756,7 +756,7 @@ pub(super) async fn public_page(
         file: file_view,
         upload: upload_view,
     };
-    Ok(Html(templates::public_page("Share", &body)?))
+    Ok(Html(templates::public_page(i18n::SHARE, &body)?))
 }
 fn joined_relative(base: &str, child: &str) -> Result<String> {
     let mut path = path_security::validate_relative(base)

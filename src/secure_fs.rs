@@ -812,6 +812,15 @@ impl SecureRoot {
 }
 
 impl SecureDirectory {
+    /// Compares the inode identity of two already-open directory capabilities.
+    pub fn same_directory(&self, other: &Self) -> io::Result<bool> {
+        let left = self.directory.metadata()?;
+        let right = other.directory.metadata()?;
+        Ok(left.is_dir()
+            && right.is_dir()
+            && (left.dev(), left.ino()) == (right.dev(), right.ino()))
+    }
+
     /// Creates every missing directory component below this descriptor-bound
     /// scope. Existing directories are accepted, while files and symlinks fail
     /// closed when the capability is narrowed to the next component.
@@ -2398,6 +2407,36 @@ mod tests {
         let moved = root.bind_directory("moved-target").unwrap();
         assert!(!upload.destination_matches(&replacement).unwrap());
         assert!(upload.destination_matches(&moved).unwrap());
+    }
+
+    #[test]
+    fn staged_upload_can_bind_its_destination_after_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("target")).unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let mut upload = root.begin_staged_upload().unwrap();
+        let mut file = upload.take_file().unwrap();
+        file.write_all(b"admitted").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert_eq!(
+            upload.publish("deferred.txt").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let destination = root.bind_directory("target").unwrap();
+        upload.bind_destination(&destination).unwrap();
+        assert!(upload.destination_matches(&destination).unwrap());
+        assert_eq!(
+            upload.bind_destination(&destination).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        upload.publish("deferred.txt").unwrap();
+
+        assert_eq!(
+            std::fs::read(directory.path().join("target/deferred.txt")).unwrap(),
+            b"admitted"
+        );
     }
 
     #[test]

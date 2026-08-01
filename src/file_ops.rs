@@ -96,9 +96,9 @@ pub async fn create_directory(
         let path = secure_root
             .create_directory(&parent, &name)
             .map_err(map_io)?;
-        let audit_durability = match database.audit_with_client_ip(
+        let audit_durability = match database.audit_action_with_client_ip(
+            crate::db::AuditAction::DirectoryCreated,
             &audit_context.actor,
-            "directory_created",
             Some(&path),
             None,
             audit_context.client_ip.as_deref(),

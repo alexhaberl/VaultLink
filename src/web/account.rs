@@ -20,7 +20,7 @@ use crate::{
     db::{
         AdminMfaEnrollmentActivationOutcome, AdminPasswordChangeOutcome, AdminTotpSettingOutcome,
         AdminWebauthnCredentialDeletionOutcome, AdminWebauthnCredentialRegistrationOutcome,
-        AuditContext, AuditedAdminMfaEnrollmentStartOutcome,
+        AuditAction, AuditContext, AuditedAdminMfaEnrollmentStartOutcome,
     },
     http_auth::{
         audit_observation, clear_session_cookie, csrf, current_audit_client_ip, database,
@@ -96,7 +96,7 @@ pub(super) async fn start_security_key_registration(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             None,
             None,
         )
@@ -109,7 +109,7 @@ pub(super) async fn start_security_key_registration(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             None,
             None,
         )
@@ -205,7 +205,7 @@ pub(super) async fn delete_security_key(
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
     Form(form): Form<DeleteSecurityKeyForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let (token, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
     let limiter_key = format!("security-key-delete:{}", session.admin_id);
@@ -228,7 +228,7 @@ pub(super) async fn delete_security_key(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             Some(id.to_string()),
             None,
         )
@@ -241,7 +241,7 @@ pub(super) async fn delete_security_key(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             Some(id.to_string()),
             None,
         )
@@ -259,7 +259,7 @@ pub(super) async fn delete_security_key(
         audit_observation(
             &state,
             session.username,
-            "security_key_reauth_failed",
+            AuditAction::SecurityKeyReauthFailed,
             Some(id.to_string()),
             None,
         )
@@ -292,13 +292,16 @@ pub(super) async fn delete_security_key(
     })
     .await?;
     match outcome {
-        AdminWebauthnCredentialDeletionOutcome::Deleted => Ok(Redirect::to("/admin/account")),
+        AdminWebauthnCredentialDeletionOutcome::Deleted => Ok(redirect_with_cookie(
+            "/login",
+            &clear_session_cookie(&state),
+        )?),
         AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected
         | AdminWebauthnCredentialDeletionOutcome::TotpRejected => {
             audit_observation(
                 &state,
                 session.username,
-                "security_key_reauth_failed",
+                AuditAction::SecurityKeyReauthFailed,
                 Some(id.to_string()),
                 None,
             )
@@ -395,7 +398,7 @@ pub(super) async fn set_account_totp(
         audit_observation(
             &state,
             session.username,
-            "account_totp_setting_reauth_failed",
+            AuditAction::AccountTotpSettingReauthFailed,
             None,
             None,
         )
@@ -413,7 +416,7 @@ pub(super) async fn set_account_totp(
         audit_observation(
             &state,
             session.username,
-            "account_totp_setting_reauth_failed",
+            AuditAction::AccountTotpSettingReauthFailed,
             None,
             None,
         )
@@ -450,7 +453,7 @@ pub(super) async fn set_account_totp(
             audit_observation(
                 &state,
                 session.username,
-                "account_totp_setting_reauth_failed",
+                AuditAction::AccountTotpSettingReauthFailed,
                 None,
                 None,
             )

@@ -1,6 +1,7 @@
 use super::{
-    insert_required_audits, trace_required_audits, AuditClientIpDeletionOutcome, AuditContext,
-    AuditEvent, AuditSortColumn, AuditSortDirection, Database, RequiredAuditEvent, MAX_AUDIT_ROWS,
+    insert_required_audits, trace_required_audits, AuditAction, AuditClientIpDeletionOutcome,
+    AuditContext, AuditEvent, AuditPriority, AuditRetentionOutcome, AuditSortColumn,
+    AuditSortDirection, Database, RequiredAuditEvent, MAX_AUDIT_ROWS,
 };
 use chrono::Utc;
 #[cfg(test)]
@@ -15,21 +16,25 @@ pub(super) fn enforce_audit_retention(
     if maximum_rows < 1 {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    connection.execute(
+    let mut statement = connection.prepare(
         "DELETE FROM audit
          WHERE id IN (
              SELECT id FROM audit
-             ORDER BY id ASC
+             ORDER BY priority ASC,id ASC
              LIMIT MAX((SELECT COUNT(*) FROM audit) - ?1, 0)
-         )",
-        [maximum_rows],
-    )
+         )
+         RETURNING priority",
+    )?;
+    let priorities = statement
+        .query_map([maximum_rows], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(priorities.len())
 }
 
 pub(super) fn insert_audit_event(
     transaction: &Transaction<'_>,
+    action: AuditAction,
     actor: &str,
-    action: &str,
     object_id: Option<&str>,
     detail: Option<&str>,
     client_ip: Option<&str>,
@@ -43,15 +48,16 @@ pub(super) fn insert_audit_event(
         None
     };
     transaction.execute(
-        "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip)
-         VALUES(?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip,priority)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![
             Utc::now().to_rfc3339(),
             actor,
-            action,
+            action.as_str(),
             object_id,
             detail,
-            client_ip
+            client_ip,
+            action.priority().as_i64()
         ],
     )?;
     Ok(())
@@ -78,10 +84,9 @@ fn persisted_audit_client_ip_enabled(
 }
 
 impl Database {
-    pub fn cleanup_audit_retention(&self) -> rusqlite::Result<usize> {
+    pub fn cleanup_audit_retention(&self) -> rusqlite::Result<AuditRetentionOutcome> {
         const BATCH_SIZE: i64 = 1_000;
-        let cutoff = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-        let mut deleted_total = 0usize;
+        let mut outcome = AuditRetentionOutcome::default();
         loop {
             let mut connection = self.try_conn()?;
             let transaction =
@@ -94,22 +99,33 @@ impl Database {
                 break;
             }
             let batch = excess.min(BATCH_SIZE);
-            let deleted = transaction.execute(
-                "DELETE FROM audit WHERE id IN (
+            let priorities = {
+                let mut statement = transaction.prepare(
+                    "DELETE FROM audit WHERE id IN (
                      SELECT id FROM audit
-                     WHERE occurred_at<?1
-                     ORDER BY id ASC
-                     LIMIT ?2
-                 )",
-                params![cutoff, batch],
-            )?;
+                     ORDER BY priority ASC,id ASC
+                     LIMIT ?1
+                 )
+                 RETURNING priority",
+                )?;
+                let priorities = statement
+                    .query_map([batch], |row| row.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                priorities
+            };
             transaction.commit()?;
-            deleted_total = deleted_total.saturating_add(deleted);
-            if deleted == 0 {
+            for priority in &priorities {
+                if *priority >= AuditPriority::Security.as_i64() {
+                    outcome.security_deleted = outcome.security_deleted.saturating_add(1);
+                } else {
+                    outcome.routine_deleted = outcome.routine_deleted.saturating_add(1);
+                }
+            }
+            if priorities.is_empty() {
                 break;
             }
         }
-        Ok(deleted_total)
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -120,11 +136,38 @@ impl Database {
         object: Option<&str>,
         detail: Option<&str>,
     ) -> rusqlite::Result<()> {
-        self.audit_with_client_ip(actor, action, object, detail, None)
+        self.audit_test_with_priority_and_client_ip(
+            AuditPriority::Routine,
+            actor,
+            action,
+            object,
+            detail,
+            None,
+        )
     }
 
-    pub fn audit_with_client_ip(
+    pub(crate) fn audit_action_with_client_ip(
         &self,
+        action: AuditAction,
+        actor: &str,
+        object: Option<&str>,
+        detail: Option<&str>,
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let mut connection = self.try_conn()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_audit_event(&transaction, action, actor, object, detail, client_ip)?;
+        transaction.commit()?;
+        drop(connection);
+        // Client IP retention is SQLite-only. Never mirror it into tracing/journald.
+        tracing::info!(target: "vaultlink::audit", actor, action = action.as_str(), object_id = object.unwrap_or(""), detail = detail.unwrap_or(""), "audit event");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn audit_test_with_priority_and_client_ip(
+        &self,
+        priority: AuditPriority,
         actor: &str,
         action: &str,
         object: Option<&str>,
@@ -133,12 +176,45 @@ impl Database {
     ) -> rusqlite::Result<()> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        insert_audit_event(&transaction, actor, action, object, detail, client_ip)?;
+        let client_ip = if persisted_audit_client_ip_enabled(&transaction, client_ip.is_some())? {
+            client_ip
+        } else {
+            None
+        };
+        transaction.execute(
+            "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip,priority)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                Utc::now().to_rfc3339(),
+                actor,
+                action,
+                object,
+                detail,
+                client_ip,
+                priority.as_i64()
+            ],
+        )?;
         transaction.commit()?;
-        drop(connection);
-        // Client IP retention is SQLite-only. Never mirror it into tracing/journald.
-        tracing::info!(target: "vaultlink::audit", actor, action, object_id = object.unwrap_or(""), detail = detail.unwrap_or(""), "audit event");
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn audit_with_client_ip(
+        &self,
+        actor: &str,
+        action: &str,
+        object: Option<&str>,
+        detail: Option<&str>,
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.audit_test_with_priority_and_client_ip(
+            AuditPriority::Routine,
+            actor,
+            action,
+            object,
+            detail,
+            client_ip,
+        )
     }
 
     pub fn count_audit_client_ips(&self) -> rusqlite::Result<u64> {
@@ -147,6 +223,17 @@ impl Database {
             [],
             |row| row.get(0),
         )
+    }
+
+    #[cfg(test)]
+    pub fn audit_priorities(&self, action: &str) -> rusqlite::Result<Vec<i64>> {
+        let connection = self.try_conn()?;
+        let mut statement =
+            connection.prepare("SELECT priority FROM audit WHERE action=?1 ORDER BY id")?;
+        let priorities = statement
+            .query_map([action], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(priorities)
     }
 
     #[cfg(test)]
@@ -180,7 +267,7 @@ impl Database {
             [],
         )?;
         let audit_events = [RequiredAuditEvent::new(
-            "audit_client_ips_deleted",
+            AuditAction::AuditClientIpsDeleted,
             None,
             Some(format!("deleted={deleted}")),
         )];

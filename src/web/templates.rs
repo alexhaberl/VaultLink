@@ -70,12 +70,12 @@ struct PublicPageTemplate<'a> {
     body: &'a RenderedHtml,
 }
 
-pub(super) fn public_shell(title: &str) -> PublicShell {
+pub(super) fn public_shell(title: i18n::MessageKey) -> PublicShell {
     let locale = i18n::current_locale();
     PublicShell {
         asset_version: super::rendering::ASSET_VERSION,
         locale_code: locale.code(),
-        title: i18n::localized_text(locale, title).into_owned(),
+        title: i18n::text(locale, title).into(),
         skip_to_content: i18n::text(locale, i18n::SKIP_TO_CONTENT),
         brand_html: TrustedMarkup::brand(i18n::text(locale, i18n::BRAND_TAGLINE)),
         language_label: i18n::text(locale, i18n::LANGUAGE),
@@ -232,7 +232,7 @@ pub(super) fn render_fragment<T: Template>(template: &T) -> Result<RenderedHtml>
     render(template).map(RenderedHtml)
 }
 
-pub(super) fn public_page<T: Template>(title: &'static str, body: &T) -> Result<String> {
+pub(super) fn public_page<T: Template>(title: i18n::MessageKey, body: &T) -> Result<String> {
     let body = render_fragment(body)?;
     render(&PublicPageTemplate {
         shell: public_shell(title),

@@ -5,6 +5,7 @@ pub mod api;
 pub mod auth;
 pub mod cifs_provision;
 pub mod config;
+pub mod container_proxy;
 pub mod db;
 mod disk_stats;
 pub mod file_ops;
@@ -18,6 +19,7 @@ pub mod path_security;
 pub mod policy;
 pub mod proxy;
 pub mod range;
+mod readiness;
 #[cfg(test)]
 mod route_inventory_tests;
 pub mod runtime;
@@ -90,6 +92,7 @@ pub struct AppState {
     pub buffered_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
     pub expensive_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
     pub(crate) disk_stats_cache: disk_stats::DiskStatsCache,
+    pub(crate) readiness: readiness::ReadinessProbe,
     // The descriptor owns the kernel lock. Keeping it in every AppState clone
     // prevents another serving process from entering storage recovery or
     // cleanup for this private storage domain.
@@ -164,6 +167,7 @@ impl AppState {
         })?;
         validated_storage.verify_path_bindings(&config.storage)?;
         let db = Database::open_in_directory(validated_storage.data_file()?)?;
+        db.configure_session_idle_timeout(config.security.session_idle_minutes);
         let active_admin_usernames = db.active_admin_usernames()?;
         let persisted_runtime = db.runtime_settings()?;
         let runtime = runtime_settings_from_persisted(&config, &persisted_runtime)
@@ -220,6 +224,7 @@ impl AppState {
             buffered_peer_admission: Arc::new(Mutex::new(HashMap::new())),
             expensive_peer_admission: Arc::new(Mutex::new(HashMap::new())),
             disk_stats_cache: disk_stats::DiskStatsCache::new(),
+            readiness: readiness::ReadinessProbe::new(),
             _storage_instance_lock: storage_instance_lock,
             #[cfg(test)]
             upload_directory_sync_failure: Arc::new(std::sync::Mutex::new(None)),
@@ -240,17 +245,7 @@ fn acquire_storage_instance_lock(
             path: display_root.clone(),
             source,
         })?;
-    let internal_path = if storage.require_mount {
-        display_root
-            .parent()
-            .map(|parent| parent.join(DEFAULT_INTERNAL_DIRECTORY_NAME))
-            .ok_or_else(|| StorageInstanceLockError::Unsafe {
-                path: display_root.clone(),
-                reason: "canonical storage root has no parent lock domain".into(),
-            })?
-    } else {
-        display_root.join(DEFAULT_INTERNAL_DIRECTORY_NAME)
-    };
+    let internal_path = canonical_storage_lock_domain(storage, &display_root)?;
     let internal = if storage.require_mount {
         let validated_internal_path =
             validated_storage
@@ -398,6 +393,23 @@ fn acquire_storage_instance_lock(
     })
 }
 
+fn canonical_storage_lock_domain(
+    storage: &Storage,
+    display_root: &Path,
+) -> Result<PathBuf, StorageInstanceLockError> {
+    if !storage.require_mount || storage.internal_directory_is_nested() {
+        return Ok(display_root.join(DEFAULT_INTERNAL_DIRECTORY_NAME));
+    }
+
+    display_root
+        .parent()
+        .map(|parent| parent.join(DEFAULT_INTERNAL_DIRECTORY_NAME))
+        .ok_or_else(|| StorageInstanceLockError::Unsafe {
+            path: display_root.to_path_buf(),
+            reason: "canonical storage root has no parent lock domain".into(),
+        })
+}
+
 fn open_storage_lock_file(
     internal: &File,
     lock_path: &Path,
@@ -543,6 +555,42 @@ mod tests {
         let validated = storage_mount::validate_and_open(storage)
             .expect("test storage paths must produce validated capabilities");
         acquire_storage_instance_lock(storage, &validated)
+    }
+
+    #[test]
+    fn nested_cifs_internal_directory_acquires_the_root_lock_domain() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("storage");
+        let data = parent.path().join("data");
+        let internal = root.join(DEFAULT_INTERNAL_DIRECTORY_NAME);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&internal).unwrap();
+        std::fs::set_permissions(&internal, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut storage = config(&root, &data).storage;
+        storage.require_mount = true;
+        storage.internal_directory = Some(internal.clone());
+        storage.expected_filesystem_type = Some("cifs".into());
+        storage.expected_mount_source = Some("//nas.example/vault".into());
+
+        let validated = storage_mount::validate_and_open_without_mount_policy(&storage).unwrap();
+        let lock = acquire_storage_instance_lock(&storage, &validated).unwrap();
+        let lock_path = internal.join(STORAGE_INSTANCE_LOCK_NAME);
+        assert!(lock_path.is_file());
+
+        let contender = storage_mount::validate_and_open_without_mount_policy(&storage).unwrap();
+        assert!(matches!(
+            acquire_storage_instance_lock(&storage, &contender),
+            Err(StorageInstanceLockError::Contended { path }) if path == lock_path
+        ));
+
+        drop(lock);
+        let released = storage_mount::validate_and_open_without_mount_policy(&storage).unwrap();
+        acquire_storage_instance_lock(&storage, &released)
+            .expect("dropping the nested CIFS lock must release its domain");
     }
 
     #[test]

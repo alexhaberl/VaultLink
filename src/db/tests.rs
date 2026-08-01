@@ -157,13 +157,13 @@ fn required_audit_failure_rolls_back_admin_share_session_and_settings_mutations(
     );
 
     let share_error = db
-        .set_share_active_and_audit(share_id, false, &context, "share_deactivated")
+        .set_share_active_and_audit(share_id, false, &context, AuditAction::ShareDeactivated)
         .unwrap_err();
     assert!(is_audit_unavailable(&share_error));
     assert!(db.share_by_token("existing-share").unwrap().unwrap().active);
 
     let control_events = [RequiredAuditEvent::new(
-        "share_controls_updated",
+        AuditAction::ShareUploadConflictUpdated,
         Some(share_id.to_string()),
         None,
     )];
@@ -190,7 +190,7 @@ fn required_audit_failure_rolls_back_admin_share_session_and_settings_mutations(
             share_id,
             Some("new-share-hash"),
             &context,
-            "share_password_changed",
+            AuditAction::SharePasswordSet,
         )
         .unwrap_err();
     assert!(is_audit_unavailable(&password_error));
@@ -570,6 +570,204 @@ fn session_mfa_and_logout_lifecycle() {
 }
 
 #[test]
+fn admin_session_idle_boundary_touch_coalescing_and_absolute_cap() {
+    let database = Database::open(":memory:").unwrap();
+    database.configure_session_idle_timeout(30);
+    database
+        .create_admin("admin", "password-hash", "JBSWY3DPEHPK3PXP")
+        .unwrap();
+    let base = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    database
+        .create_session("idle-session", 1, "csrf", base + Duration::hours(12))
+        .unwrap();
+    database
+        .conn()
+        .execute(
+            "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
+            params![token_hash("idle-session"), base.to_rfc3339()],
+        )
+        .unwrap();
+
+    assert!(database
+        .session_at_for_test("idle-session", base + Duration::seconds(30))
+        .unwrap()
+        .is_some());
+    let unchanged: String = database
+        .conn()
+        .query_row(
+            "SELECT last_activity_at FROM sessions WHERE token_hash=?1",
+            [token_hash("idle-session")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unchanged, base.to_rfc3339());
+
+    assert!(database
+        .session_at_for_test("idle-session", base + Duration::seconds(61))
+        .unwrap()
+        .is_some());
+    let touched: String = database
+        .conn()
+        .query_row(
+            "SELECT last_activity_at FROM sessions WHERE token_hash=?1",
+            [token_hash("idle-session")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(touched, (base + Duration::seconds(61)).to_rfc3339());
+
+    database
+        .conn()
+        .execute(
+            "UPDATE sessions SET last_activity_at=?2,expires_at=?3 WHERE token_hash=?1",
+            params![
+                token_hash("idle-session"),
+                base.to_rfc3339(),
+                (base + Duration::hours(1)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+    assert!(database
+        .session_at_for_test("idle-session", base + Duration::minutes(30))
+        .unwrap()
+        .is_none());
+
+    database
+        .create_session("absolute-session", 1, "csrf", base + Duration::minutes(10))
+        .unwrap();
+    database
+        .conn()
+        .execute(
+            "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
+            params![token_hash("absolute-session"), base.to_rfc3339()],
+        )
+        .unwrap();
+    assert!(database
+        .session_at_for_test("absolute-session", base + Duration::minutes(9))
+        .unwrap()
+        .is_some());
+    assert!(database
+        .session_at_for_test("absolute-session", base + Duration::minutes(10))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn concurrent_admin_session_checks_coalesce_activity_without_errors() {
+    let database = Database::open(":memory:").unwrap();
+    database.configure_session_idle_timeout(30);
+    database
+        .create_admin("admin", "password-hash", "JBSWY3DPEHPK3PXP")
+        .unwrap();
+    let base = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let touch_at = base + Duration::seconds(61);
+    database
+        .create_session("parallel-session", 1, "csrf", base + Duration::hours(12))
+        .unwrap();
+    database
+        .conn()
+        .execute(
+            "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
+            params![token_hash("parallel-session"), base.to_rfc3339()],
+        )
+        .unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+    let workers = (0..8)
+        .map(|_| {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                database.session_at_for_test("parallel-session", touch_at)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for worker in workers {
+        assert!(worker.join().unwrap().unwrap().is_some());
+    }
+
+    let activity: String = database
+        .conn()
+        .query_row(
+            "SELECT last_activity_at FROM sessions WHERE token_hash=?1",
+            [token_hash("parallel-session")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(activity, touch_at.to_rfc3339());
+}
+
+#[test]
+fn mfa_rotation_refreshes_activity_without_extending_absolute_expiry() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "password-hash", "JBSWY3DPEHPK3PXP")
+        .unwrap();
+    let expires = Utc::now() + Duration::hours(3);
+    let old_activity = Utc::now() - Duration::minutes(10);
+    database
+        .create_session("pre-mfa", 1, "csrf", expires)
+        .unwrap();
+    database
+        .conn()
+        .execute(
+            "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
+            params![token_hash("pre-mfa"), old_activity.to_rfc3339()],
+        )
+        .unwrap();
+
+    assert!(database
+        .verify_mfa_with_totp_step("pre-mfa", "verified", "new-csrf", 1, 42)
+        .unwrap());
+    let (stored_expiry, activity): (String, String) = database
+        .conn()
+        .query_row(
+            "SELECT expires_at,last_activity_at FROM sessions WHERE token_hash=?1",
+            [token_hash("verified")],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_expiry, expires.to_rfc3339());
+    assert!(
+        DateTime::parse_from_rfc3339(&activity).unwrap()
+            > DateTime::parse_from_rfc3339(&old_activity.to_rfc3339()).unwrap()
+    );
+}
+
+#[test]
+fn session_creation_cleans_idle_rows() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .create_admin("admin", "password-hash", "JBSWY3DPEHPK3PXP")
+        .unwrap();
+    database
+        .create_session("idle", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    database
+        .conn()
+        .execute(
+            "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
+            params![
+                token_hash("idle"),
+                (Utc::now() - Duration::minutes(31)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+    database
+        .create_session("fresh", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+
+    assert!(database.session("idle").unwrap().is_none());
+    assert!(database.session("fresh").unwrap().is_some());
+}
+
+#[test]
 fn totp_step_is_consumed_once_across_racing_sessions() {
     let database = Database::open(":memory:").unwrap();
     database.create_admin("admin", "hash", "secret").unwrap();
@@ -944,6 +1142,170 @@ fn audit_retention_keeps_only_the_newest_rows() {
             "event-4".to_string(),
             "event-5".to_string()
         ]
+    );
+}
+
+#[test]
+fn audit_action_policy_has_unique_names_and_explicit_priorities() {
+    let mut names = std::collections::HashSet::new();
+    assert_eq!(AuditAction::ALL.len(), 52);
+    for action in AuditAction::ALL {
+        assert!(
+            names.insert(action.as_str()),
+            "duplicate action {}",
+            action.as_str()
+        );
+        let expected = match action {
+            AuditAction::AdminDownload
+            | AuditAction::AdminPreview
+            | AuditAction::Download
+            | AuditAction::Preview
+            | AuditAction::UploadQuotaCommitted
+            | AuditAction::ZipDownload => AuditPriority::Routine,
+            _ => AuditPriority::Security,
+        };
+        assert_eq!(action.priority(), expected, "action {}", action.as_str());
+    }
+}
+
+#[test]
+fn typed_audit_writer_persists_policy_priority() {
+    let database = Database::open(":memory:").unwrap();
+    for action in AuditAction::ALL {
+        database
+            .audit_action_with_client_ip(*action, "policy-test", None, None, None)
+            .unwrap();
+    }
+    for action in AuditAction::ALL {
+        assert_eq!(
+            database.audit_priorities(action.as_str()).unwrap(),
+            [action.priority().as_i64()]
+        );
+    }
+}
+
+#[test]
+fn audit_retention_preserves_security_events_during_routine_volume() {
+    let database = Database::open(":memory:").unwrap();
+    let connection = database.conn();
+    connection
+        .execute(
+            "INSERT INTO audit(occurred_at,actor,action,priority)
+             VALUES(?1,'local_recovery','admin_recovered',100)",
+            [Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    for index in 0..4 {
+        connection
+            .execute(
+                "INSERT INTO audit(occurred_at,actor,action,priority)
+                 VALUES(?1,'public',?2,0)",
+                params![Utc::now().to_rfc3339(), format!("download-{index}")],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(enforce_audit_retention(&connection, 3).unwrap(), 2);
+    let actions: Vec<String> = connection
+        .prepare("SELECT action FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(actions, ["admin_recovered", "download-2", "download-3"]);
+}
+
+#[test]
+fn audit_retention_falls_back_to_fifo_for_security_only_volume() {
+    let database = Database::open(":memory:").unwrap();
+    let connection = database.conn();
+    for index in 0..5 {
+        connection
+            .execute(
+                "INSERT INTO audit(occurred_at,actor,action,priority)
+                 VALUES(?1,'admin',?2,100)",
+                params![Utc::now().to_rfc3339(), format!("security-{index}")],
+            )
+            .unwrap();
+    }
+
+    assert_eq!(enforce_audit_retention(&connection, 3).unwrap(), 2);
+    let actions: Vec<String> = connection
+        .prepare("SELECT action FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(actions, ["security-2", "security-3", "security-4"]);
+}
+
+#[test]
+fn audit_retention_caps_recent_events() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .audit_action_with_client_ip(
+            AuditAction::Upload,
+            "public",
+            Some("share-1"),
+            Some("file=evidence.txt"),
+            None,
+        )
+        .unwrap();
+    let mut connection = database.conn();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    for index in 0..MAX_AUDIT_ROWS {
+        transaction
+            .execute(
+                "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip)
+                 VALUES(?1,'test',?2,NULL,NULL,NULL)",
+                params![Utc::now().to_rfc3339(), format!("event-{index}")],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+
+    assert_eq!(
+        database.cleanup_audit_retention().unwrap(),
+        AuditRetentionOutcome {
+            routine_deleted: 1,
+            security_deleted: 0,
+        }
+    );
+    assert_eq!(database.count_audit(None).unwrap(), MAX_AUDIT_ROWS as usize);
+    assert_eq!(database.count_audit(Some("upload")).unwrap(), 1);
+    assert_eq!(database.audit_priorities("upload").unwrap(), [100]);
+}
+
+#[test]
+fn audit_retention_reports_security_eviction_when_only_security_rows_remain() {
+    let database = Database::open(":memory:").unwrap();
+    let mut connection = database.conn();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    for index in 0..=MAX_AUDIT_ROWS {
+        transaction
+            .execute(
+                "INSERT INTO audit(occurred_at,actor,action,priority)
+                 VALUES(?1,'test',?2,100)",
+                params![Utc::now().to_rfc3339(), format!("security-{index}")],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+
+    assert_eq!(
+        database.cleanup_audit_retention().unwrap(),
+        AuditRetentionOutcome {
+            routine_deleted: 0,
+            security_deleted: 1,
+        }
     );
 }
 
@@ -1636,7 +1998,7 @@ fn rejects_unknown_newer_schema() {
 }
 
 #[test]
-fn fresh_database_is_exactly_schema_three_without_plaintext_secret_columns() {
+fn fresh_database_is_exactly_schema_six_without_plaintext_secret_columns() {
     let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
     assert_eq!(
@@ -1647,12 +2009,12 @@ fn fresh_database_is_exactly_schema_three_without_plaintext_secret_columns() {
     );
     let migration_records: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3) AND length(applied_at)>0",
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3,4,5,6) AND length(applied_at)>0",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migration_records, 2);
+    assert_eq!(migration_records, 5);
     for index in ["idx_shares_active_id", "idx_shares_active_expires"] {
         let exists: bool = connection
             .query_row(
@@ -1663,6 +2025,22 @@ fn fresh_database_is_exactly_schema_three_without_plaintext_secret_columns() {
             .unwrap();
         assert!(exists, "schema 3 index {index} is missing");
     }
+    let last_activity_not_null: i64 = connection
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('sessions') WHERE name='last_activity_at'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(last_activity_not_null, 1);
+    let priority_not_null: i64 = connection
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('audit') WHERE name='priority'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(priority_not_null, 1);
     for (table, forbidden) in [
         ("shares", "token"),
         ("admins", "totp_secret"),
@@ -1692,6 +2070,67 @@ fn fresh_database_is_exactly_schema_three_without_plaintext_secret_columns() {
             assert_eq!(count, 1, "encrypted column {table}.{column} missing");
         }
     }
+}
+
+fn downgrade_audit_to_schema_four(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP INDEX idx_audit_priority_id;
+             ALTER TABLE audit DROP COLUMN priority;
+             DELETE FROM vaultlink_schema_migrations WHERE target_version IN (5,6);",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+            [schema::SCHEMA_4_FINGERPRINT],
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 4).unwrap();
+}
+
+fn schema_five_fixture() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("schema-five.sqlite");
+    drop(Database::open(&path).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "DELETE FROM vaultlink_schema_migrations WHERE target_version=6",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+            [schema::SCHEMA_5_FINGERPRINT],
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 5).unwrap();
+    for (index, action) in [
+        "share_toggled",
+        "upload_directories_created",
+        "admin_upload",
+        "admin_upload_replaced",
+        "upload",
+        "upload_replaced",
+        "admin_upload_durability_uncertain",
+        "upload_durability_uncertain",
+        "download",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        connection
+            .execute(
+                "INSERT INTO audit(id,occurred_at,actor,action,object_id,detail,priority)
+                 VALUES(?1,'2026-07-19T00:00:00Z','fixture',?2,?3,'preserved',0)",
+                params![(index + 1) as i64, action, format!("object-{index}")],
+            )
+            .unwrap();
+    }
+    drop(connection);
+    (directory, path)
 }
 
 fn populated_schema_one_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u8>) {
@@ -1734,6 +2173,7 @@ fn populated_schema_one_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u
     drop(database);
 
     let connection = Connection::open(&path).unwrap();
+    downgrade_audit_to_schema_four(&connection);
     connection
         .execute_batch(
             "DROP TABLE vaultlink_schema_migrations;
@@ -1757,11 +2197,12 @@ fn schema_two_fixture() -> (tempfile::TempDir, PathBuf) {
     let path = directory.path().join("schema-two.sqlite");
     drop(Database::open(&path).unwrap());
     let connection = Connection::open(&path).unwrap();
+    downgrade_audit_to_schema_four(&connection);
     connection
         .execute_batch(
             "DROP INDEX idx_shares_active_id;
              DROP INDEX idx_shares_active_expires;
-             DELETE FROM vaultlink_schema_migrations WHERE target_version=3;",
+             DELETE FROM vaultlink_schema_migrations WHERE target_version IN (3,4);",
         )
         .unwrap();
     connection
@@ -1771,6 +2212,82 @@ fn schema_two_fixture() -> (tempfile::TempDir, PathBuf) {
         )
         .unwrap();
     connection.pragma_update(None, "user_version", 2).unwrap();
+    drop(connection);
+    (directory, path)
+}
+
+fn schema_three_fixture() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("schema-three.sqlite");
+    let database = Database::open(&path).unwrap();
+    database
+        .create_admin("admin", "password-hash", "TOTP-SECRET")
+        .unwrap();
+    database
+        .create_session(
+            "schema-three-session",
+            1,
+            "csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    database
+        .audit(
+            "admin",
+            "schema_three_fixture",
+            Some("1"),
+            Some("preserved"),
+        )
+        .unwrap();
+    drop(database);
+
+    let connection = Connection::open(&path).unwrap();
+    downgrade_audit_to_schema_four(&connection);
+    connection
+        .execute_batch(
+            "ALTER TABLE sessions RENAME TO sessions_schema_4;
+             DROP INDEX idx_sessions_exp;
+             DROP INDEX idx_sessions_admin;
+             CREATE TABLE sessions(
+                 token_hash TEXT PRIMARY KEY,
+                 admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+                 csrf_token TEXT NOT NULL,
+                 mfa_verified INTEGER NOT NULL DEFAULT 0 CHECK(mfa_verified IN (0,1)),
+                 expires_at TEXT NOT NULL
+             );
+             INSERT INTO sessions(token_hash,admin_id,csrf_token,mfa_verified,expires_at)
+             SELECT token_hash,admin_id,csrf_token,mfa_verified,expires_at FROM sessions_schema_4;
+             CREATE INDEX idx_sessions_exp ON sessions(expires_at);
+             CREATE INDEX idx_sessions_admin ON sessions(admin_id);
+             DROP TABLE sessions_schema_4;
+             DELETE FROM vaultlink_schema_migrations WHERE target_version=4;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+            [schema::SCHEMA_3_FINGERPRINT],
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 3).unwrap();
+    drop(connection);
+    (directory, path)
+}
+
+fn schema_four_fixture() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("schema-four.sqlite");
+    let database = Database::open(&path).unwrap();
+    database
+        .audit("local_recovery", "admin_recovered", Some("1"), None)
+        .unwrap();
+    database
+        .audit("public", "download", Some("2"), None)
+        .unwrap();
+    drop(database);
+
+    let connection = Connection::open(&path).unwrap();
+    downgrade_audit_to_schema_four(&connection);
     drop(connection);
     (directory, path)
 }
@@ -1823,7 +2340,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let applied_at: Vec<(i64, String)> = connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3) ORDER BY target_version",
+             WHERE target_version IN (2,3,4,5,6) ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -1838,7 +2355,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let reopened_applied_at: Vec<(i64, String)> = reopened_connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3) ORDER BY target_version",
+             WHERE target_version IN (2,3,4,5,6) ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -1849,7 +2366,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
 }
 
 #[test]
-fn schema_two_migrates_to_three_with_expected_indexes() {
+fn schema_two_migrates_to_six_with_expected_indexes() {
     let (_directory, path) = schema_two_fixture();
     let database = Database::open(path).unwrap();
     let connection = database.conn();
@@ -1869,6 +2386,80 @@ fn schema_two_migrates_to_three_with_expected_indexes() {
             .unwrap();
         assert!(present);
     }
+}
+
+#[test]
+fn schema_four_migration_backfills_security_priority() {
+    let (_directory, path) = schema_four_fixture();
+    let database = Database::open(path).unwrap();
+    let connection = database.conn();
+    let priorities: Vec<(String, i64)> = connection
+        .prepare("SELECT action,priority FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        priorities,
+        [("admin_recovered".into(), 100), ("download".into(), 0)]
+    );
+}
+
+#[test]
+fn schema_five_migration_reclassifies_file_mutations_and_preserves_rows() {
+    let (_directory, path) = schema_five_fixture();
+    let database = Database::open(path).unwrap();
+    let connection = database.conn();
+    let rows: Vec<(i64, String, String, String, i64)> = connection
+        .prepare("SELECT id,action,object_id,detail,priority FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows.len(), 9);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.0, (index + 1) as i64);
+        assert_eq!(row.2, format!("object-{index}"));
+        assert_eq!(row.3, "preserved");
+        assert_eq!(row.4, if row.1 == "download" { 0 } else { 100 });
+    }
+}
+
+#[test]
+fn schema_three_migration_revokes_sessions_and_preserves_other_data() {
+    let (_directory, path) = schema_three_fixture();
+    let database = Database::open(path).unwrap();
+    assert!(database.session("schema-three-session").unwrap().is_none());
+    assert_eq!(database.active_admin_usernames().unwrap(), ["admin"]);
+    assert_eq!(
+        database.count_audit(Some("schema_three_fixture")).unwrap(),
+        1
+    );
+    let connection = database.conn();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    let session_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='last_activity_at' AND \"notnull\"=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(session_columns, 1);
 }
 
 #[test]
@@ -1957,6 +2548,126 @@ fn failed_schema_two_migration_rolls_back_indexes_and_metadata() {
         )
         .unwrap();
     assert_eq!(schema_three_artifacts, 0);
+}
+
+#[test]
+fn failed_schema_three_migration_restores_sessions_and_metadata() {
+    let (_directory, path) = schema_three_fixture();
+    schema::fail_next_schema_3_to_4_migration();
+    assert!(matches!(
+        Database::open(&path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        3
+    );
+    let fingerprint: String = connection
+        .query_row(
+            "SELECT fingerprint FROM vaultlink_schema WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fingerprint, schema::SCHEMA_3_FINGERPRINT);
+    let session_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(session_count, 1);
+    let last_activity_column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='last_activity_at'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(last_activity_column, 0);
+}
+
+#[test]
+fn failed_schema_four_migration_restores_audit_shape_and_metadata() {
+    let (_directory, path) = schema_four_fixture();
+    schema::fail_next_schema_4_to_5_migration();
+    assert!(matches!(
+        Database::open(&path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        4
+    );
+    let fingerprint: String = connection
+        .query_row(
+            "SELECT fingerprint FROM vaultlink_schema WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fingerprint, schema::SCHEMA_4_FINGERPRINT);
+    let priority_column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('audit') WHERE name='priority'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(priority_column, 0);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM audit", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn failed_schema_five_migration_restores_priorities_and_metadata() {
+    let (_directory, path) = schema_five_fixture();
+    schema::fail_next_schema_5_to_6_migration();
+    assert!(matches!(
+        Database::open(&path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        5
+    );
+    let fingerprint: String = connection
+        .query_row(
+            "SELECT fingerprint FROM vaultlink_schema WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fingerprint, schema::SCHEMA_5_FINGERPRINT);
+    let priorities: Vec<i64> = connection
+        .prepare("SELECT priority FROM audit ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(priorities, vec![0; 9]);
+    let schema_six_record: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version=6",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema_six_record, 0);
 }
 
 #[test]
@@ -3994,6 +4705,10 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
         )
         .unwrap();
     assert!(database.verify_mfa("authorized-session").unwrap());
+    database
+        .create_session("other-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    assert!(database.verify_mfa("other-session").unwrap());
     let first = database
         .add_admin_webauthn_credential(1, "First", "credential-a", "{}")
         .unwrap();
@@ -4003,9 +4718,9 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
     let third = database
         .add_admin_webauthn_credential(1, "Third", "credential-c", "{}")
         .unwrap();
-    let delete = |credential_id, step, client_ip| {
+    let delete = |session_token, credential_id, step, client_ip| {
         database.delete_admin_webauthn_credential_with_totp(
-            "authorized-session",
+            session_token,
             credential_id,
             1,
             "hash",
@@ -4016,9 +4731,11 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
     };
 
     assert_eq!(
-        delete(first, 42, Some("203.0.113.40")).unwrap(),
+        delete("authorized-session", first, 42, Some("203.0.113.40")).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::Deleted
     );
+    assert!(database.session("authorized-session").unwrap().is_none());
+    assert!(database.session("other-session").unwrap().is_none());
     let audit = database
         .list_audit(Some("webauthn_credential_deleted"), 10, 0)
         .unwrap();
@@ -4027,12 +4744,17 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
     assert_eq!(audit[0].object_id.as_deref(), Some(first_object.as_str()));
     assert_eq!(audit[0].client_ip.as_deref(), Some("203.0.113.40"));
 
+    database
+        .create_session("second-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    assert!(database.verify_mfa("second-session").unwrap());
+
     assert_eq!(
-        delete(second, 42, None).unwrap(),
+        delete("second-session", second, 42, None).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::TotpRejected
     );
     assert_eq!(
-        delete(second, 43, None).unwrap(),
+        delete("second-session", second, 43, None).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::NotDeleted
     );
     database
@@ -4040,12 +4762,17 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
         .unwrap();
 
     assert_eq!(
-        delete(second, 43, None).unwrap(),
+        delete("second-session", second, 43, None).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::Deleted
     );
     database
         .add_admin_webauthn_credential(1, "Fifth", "credential-e", "{}")
         .unwrap();
+
+    database
+        .create_session("third-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    assert!(database.verify_mfa("third-session").unwrap());
 
     database
         .conn()
@@ -4058,7 +4785,7 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
                  END;",
         )
         .unwrap();
-    assert!(delete(third, 44, None).is_err());
+    assert!(delete("third-session", third, 44, None).is_err());
     assert_eq!(database.admin_webauthn_credentials(1).unwrap().len(), 3);
     database
         .conn()
@@ -4066,7 +4793,7 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
         .unwrap();
 
     assert_eq!(
-        delete(third, 44, None).unwrap(),
+        delete("third-session", third, 44, None).unwrap(),
         AdminWebauthnCredentialDeletionOutcome::Deleted
     );
     assert_eq!(
@@ -4277,10 +5004,20 @@ fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
         AdminWebauthnCredentialDeletionOutcome::Deleted
     );
 
+    database
+        .create_session(
+            "replacement-session",
+            1,
+            "csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(database.verify_mfa("replacement-session").unwrap());
+
     assert_eq!(
         database
             .set_admin_totp_enabled_with_reauthentication(
-                "authorized-session",
+                "replacement-session",
                 1,
                 "password-hash",
                 1,

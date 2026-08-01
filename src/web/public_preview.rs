@@ -223,14 +223,12 @@ pub(crate) async fn public_preview(
             back_link: public_back_link(&public_route, &share_rel, sh.is_directory),
             download_link,
             path: share_rel,
-            message: i18n::localized_text(
-                i18n::current_locale(),
-                "File exceeds the preview limit.",
-            )
-            .into_owned(),
+            message: i18n::text(i18n::current_locale(), i18n::PREVIEW_TOO_LARGE).into(),
             size: human(*size),
         };
-        return Ok(Html(super::templates::public_page("Preview", &body)?).into_response());
+        return Ok(
+            Html(super::templates::public_page(i18n::TITLE_PREVIEW, &body)?).into_response(),
+        );
     }
     let mut response = match content {
         PreviewContent::TooLarge { .. } => {
@@ -242,7 +240,7 @@ pub(crate) async fn public_preview(
                 back_link: &back_link,
                 download_link: &download_link,
             };
-            let page = super::templates::public_page("Preview", &body)?;
+            let page = super::templates::public_page(i18n::TITLE_PREVIEW, &body)?;
             let (stream, page_length) = escaped_text_page_stream(page, text).map_err(internal)?;
             let transfer = text_transfer
                 .take()
@@ -330,7 +328,10 @@ pub(crate) async fn public_preview(
                 raw_url,
                 image: matches!(kind, PreviewKind::Image(_)),
             };
-            Response::new(Body::from(super::templates::public_page("Preview", &body)?))
+            Response::new(Body::from(super::templates::public_page(
+                i18n::TITLE_PREVIEW,
+                &body,
+            )?))
         }
     };
     response.headers_mut().insert(

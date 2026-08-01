@@ -187,6 +187,14 @@ fi
 if ! printf '%s' "$HEALTH_JSON" | assert_health_json; then
     fail "health endpoint returned an invalid response"
 fi
+for health_path in health/live health/ready; do
+    if ! HEALTH_JSON="$(curl -sS -f "http://$APP_ADDR/api/v2/$health_path")"; then
+        fail "$health_path endpoint did not return HTTP success"
+    fi
+    if ! printf '%s' "$HEALTH_JSON" | assert_health_json; then
+        fail "$health_path endpoint returned an invalid response"
+    fi
+done
 
 LOGIN_JSON="$(
     curl -sS -f -c "$COOKIE_JAR" \

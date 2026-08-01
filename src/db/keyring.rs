@@ -123,9 +123,10 @@ impl Keyring {
             .map_err(|_| keyring_error("active key has invalid length"))?;
         let mut nonce = [0u8; NONCE_BYTES];
         rand::rng().fill(&mut nonce);
+        let nonce = XNonce::from(nonce);
         let encrypted = cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &nonce,
                 Payload {
                     msg: plaintext,
                     aad,
@@ -154,9 +155,11 @@ impl Keyring {
             .ok_or_else(|| keyring_error(format!("secret references missing key {key_id}")))?;
         let cipher = XChaCha20Poly1305::new_from_slice(key)
             .map_err(|_| keyring_error("stored key has invalid length"))?;
+        let nonce = <&XNonce>::try_from(&ciphertext[..NONCE_BYTES])
+            .map_err(|_| keyring_error("encrypted secret has invalid nonce length"))?;
         cipher
             .decrypt(
-                XNonce::from_slice(&ciphertext[..NONCE_BYTES]),
+                nonce,
                 Payload {
                     msg: &ciphertext[NONCE_BYTES..],
                     aad,
