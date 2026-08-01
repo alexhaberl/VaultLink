@@ -37,11 +37,12 @@ this runner.
 
 The CI workflow uses an amd64/arm64 include matrix. Formatting, shell validation,
 supply-chain policy, Clippy, tests, fuzz-crate compilation, Docker smoke tests,
-and release builds run natively on both architectures. The dependency audit and
-coverage report remain single-run gates because they operate on the shared
-lockfile and source tree. Each native job verifies `uname -m` and the Rust host
-triple before compiling. Superseded pull-request runs are cancelled
-automatically.
+and release builds run natively on both architectures. The dependency audit
+runs independently on both native runners as a defense-in-depth check against
+runner-specific advisory database or tooling failures. The coverage report
+remains a single-run arm64 gate because it operates on the shared source tree.
+Each native job verifies `uname -m` and the Rust host triple before compiling.
+Superseded pull-request runs are cancelled automatically.
 
 The weekly and manually dispatched fuzz campaign runs as a native amd64/arm64
 matrix. Each architecture runs all nine targets for ten minutes each across four
