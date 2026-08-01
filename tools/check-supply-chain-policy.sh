@@ -170,13 +170,24 @@ fi
 
 literal_dollar='$'
 release_container_value="${literal_dollar}{{ needs.release_environment.outputs.image }}"
+publish_container_value="${literal_dollar}{{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}"
 toolchain_resolver_reference="channel=${literal_dollar}(sh tools/rust-toolchain-channel.sh)"
 toolchain_output_value="${literal_dollar}{{ steps.rust_toolchain.outputs.channel }}"
 exact_main_tag_reference="test \"${literal_dollar}tag_commit\" = \"${literal_dollar}main_commit\""
 ancestor_tag_reference="git merge-base --is-ancestor \"${literal_dollar}tag_commit\" \"${literal_dollar}main_commit\""
 release_container_count=$(grep -F -c "image: $release_container_value" .github/workflows/release.yml || true)
-if [ "$release_container_count" -ne 3 ]; then
-    report "every release container must consume the validated prebuilt release image"
+if [ "$release_container_count" -ne 2 ]; then
+    report "self-hosted release containers must consume the validated prebuilt release image"
+fi
+publish_job=$(awk '
+    $0 == "  publish:" { publish = 1 }
+    publish && /^  [[:alnum:]_-]+:$/ && $0 != "  publish:" { exit }
+    publish { print }
+' .github/workflows/release.yml)
+if [ "$(printf '%s\n' "$publish_job" | grep -F -c "image: $publish_container_value" || true)" -ne 1 ] \
+    || [ "$(printf '%s\n' "$publish_job" | grep -F -c "RELEASE_BUILDER_IMAGE: $publish_container_value" || true)" -ne 1 ] \
+    || printf '%s\n' "$publish_job" | grep -F -q "$release_container_value"; then
+    report "the secret-bearing publish job must select its image directly from GitHub configuration"
 fi
 repro_container_value="${literal_dollar}{{ needs.release_environment.outputs.image }}"
 if [ "$(grep -F -c "image: $repro_container_value" .github/workflows/reproducibility.yml || true)" -ne 1 ]; then

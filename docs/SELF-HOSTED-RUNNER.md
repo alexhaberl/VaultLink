@@ -78,7 +78,10 @@ short-lived unsigned inputs. The final GitHub-hosted job downloads both immutabl
 workflow artifacts, verifies `SHA256SUMS-amd64` and `SHA256SUMS-arm64`, and only
 then accesses the Minisign secret for a tag release. It receives the job-scoped
 `contents: write` permission only for that tag-only publication job and is
-discarded afterwards.
+discarded afterwards. Its container image is resolved directly from the
+GitHub-managed `VAULTLINK_RELEASE_BUILDER_IMAGE` variable, rather than from a
+self-hosted job output, so a persistent runner cannot select the environment
+that receives the signing key and publication token.
 
 Release asset names identify version, Debian baseline, and architecture, for
 example:

@@ -312,12 +312,14 @@ jobs:
       contents: write
       packages: read
     container:
-      image: ${{ needs.release_environment.outputs.image }}
+      # Resolve the secret-bearing job's image directly from GitHub configuration;
+      # never trust an output produced on a persistent self-hosted runner here.
+      image: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
-      RELEASE_BUILDER_IMAGE: ${{ needs.release_environment.outputs.image }}
+      RELEASE_BUILDER_IMAGE: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
     steps:
       - name: Restore host workspace ownership before checkout
         shell: bash
