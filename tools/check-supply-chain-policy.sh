@@ -259,10 +259,24 @@ for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
     fi
 done
 
-unexpected_hosted_runners=$(grep -R -n -E 'runs[_-]on:.*(ubuntu-|windows-|macos-)' .github/workflows || true)
+hosted_runner_lines=$(grep -R -H -E 'runs[_-]on:.*(ubuntu-|windows-|macos-)' .github/workflows || true)
+allowed_hosted_runner='.github/workflows/release.yml:    runs-on: ubuntu-24.04'
+allowed_hosted_runner_count=$(printf '%s\n' "$hosted_runner_lines" \
+    | grep -F -x -c "$allowed_hosted_runner" || true)
+unexpected_hosted_runners=$(printf '%s\n' "$hosted_runner_lines" \
+    | grep -F -v -x "$allowed_hosted_runner" || true)
+publish_runner=$(awk '
+    $0 == "  publish:" { publish = 1; next }
+    publish && /^  [[:alnum:]_-]+:$/ { exit }
+    publish && /^    runs-on:/ { print; exit }
+' .github/workflows/release.yml)
+if [ "$allowed_hosted_runner_count" -ne 1 ] \
+    || [ "$publish_runner" != '    runs-on: ubuntu-24.04' ]; then
+    report "the tag-only publish job must use the sole approved GitHub-hosted ubuntu-24.04 runner"
+fi
 if [ -n "$unexpected_hosted_runners" ]; then
     printf '%s\n' "$unexpected_hosted_runners" >&2
-    report "workflows must not use GitHub-hosted compute"
+    report "only the tag-only release publish job may use GitHub-hosted compute"
 fi
 
 for architecture in amd64 arm64; do
@@ -587,8 +601,8 @@ if ! grep -F -q 'runs-on: [self-hosted, Linux, ARM64, vaultlink]' .github/workfl
 fi
 
 arm64_release_jobs=$(grep -F -c 'runs-on: [self-hosted, Linux, ARM64, vaultlink]' .github/workflows/release.yml || true)
-if [ "$arm64_release_jobs" -ne 4 ]; then
-    report "architecture-independent release jobs must use the self-hosted arm64 runner"
+if [ "$arm64_release_jobs" -ne 3 ]; then
+    report "architecture-independent release jobs other than tag publication must use the self-hosted arm64 runner"
 fi
 
 if ! grep -F -q 'run: make fuzz-parallel' .github/workflows/fuzz.yml; then

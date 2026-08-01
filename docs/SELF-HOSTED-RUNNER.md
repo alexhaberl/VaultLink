@@ -11,10 +11,12 @@ labelled `[self-hosted, Linux, X64, vaultlink-soak]`. It never accepts pull
 requests and follows the provisioning and evidence procedure in
 [`SOAK-RUNNER.md`](SOAK-RUNNER.md).
 
-No workflow uses GitHub-hosted compute. Jobs that require a native amd64 result
-run on the x64 runner, jobs that require a native arm64 result run on the arm64
-runner, and architecture-independent jobs default to the lower-cost arm64
-runner.
+Jobs that require a native amd64 result run on the x64 runner, jobs that require
+a native arm64 result run on the arm64 runner, and architecture-independent jobs
+default to the lower-cost arm64 runner. The sole exception is the tag-only
+signing and publishing job, which runs on an ephemeral GitHub-hosted
+`ubuntu-24.04` runner so the Minisign private key and `contents: write` token
+never reach a persistent runner that also executes CI.
 
 ## Self-hosted runner baselines
 
@@ -35,21 +37,23 @@ this runner.
 
 The CI workflow uses an amd64/arm64 include matrix. Formatting, shell validation,
 supply-chain policy, Clippy, tests, fuzz-crate compilation, Docker smoke tests,
-and release builds run natively on both architectures. The dependency audit and
-coverage report remain single-run gates because they operate on the shared
-lockfile and source tree. Each native job verifies `uname -m` and the Rust host
-triple before compiling. Superseded pull-request runs are cancelled
-automatically.
+and release builds run natively on both architectures. The dependency audit
+runs independently on both native runners as a defense-in-depth check against
+runner-specific advisory database or tooling failures. The coverage report
+remains a single-run arm64 gate because it operates on the shared source tree.
+Each native job verifies `uname -m` and the Rust host triple before compiling.
+Superseded pull-request runs are cancelled automatically.
 
 The weekly and manually dispatched fuzz campaign runs as a native amd64/arm64
 matrix. Each architecture runs all nine targets for ten minutes each across four
 workers (`FUZZ_JOBS=4`) and publishes its own exact-commit status. Each matrix
 entry has a 120-minute timeout so a cold instrumented Nightly build and all three
 target waves have sufficient headroom. Security auditing, release-environment
-resolution, combined
-artifact verification, signing, publishing, and release dry runs also use the
-arm64 runner because they do not require an amd64 host. The amd64 runner is
-reserved for the native amd64 CI and release-build matrix entries.
+resolution, combined artifact verification, release dry runs, and preflight
+status publication also use the arm64 runner because they do not require an
+amd64 host. The tag-only signing and publishing job is isolated on the ephemeral
+GitHub-hosted runner. The amd64 runner is reserved for the native amd64 CI and
+release-build matrix entries.
 
 The Rust WebAuthn tests cover server-side challenge replacement, account and
 session binding, expiry, single-use state, and invalid finish responses. They do
@@ -70,9 +74,11 @@ mismatch, a mutable tag, or image content that differs from the checked-in
 snapshot and package lock fails before container startup. Private GHCR pulls use
 explicit Actions token credentials and `packages: read`.
 The build jobs have read-only repository permissions and upload separate,
-short-lived unsigned inputs. The final self-hosted arm64 job downloads both
-immutable workflow artifacts, verifies `SHA256SUMS-amd64` and
-`SHA256SUMS-arm64`, and only then accesses the Minisign secret for a tag release.
+short-lived unsigned inputs. The final GitHub-hosted job downloads both immutable
+workflow artifacts, verifies `SHA256SUMS-amd64` and `SHA256SUMS-arm64`, and only
+then accesses the Minisign secret for a tag release. It receives the job-scoped
+`contents: write` permission only for that tag-only publication job and is
+discarded afterwards.
 
 Release asset names identify version, Debian baseline, and architecture, for
 example:

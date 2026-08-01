@@ -59,10 +59,12 @@ cannot affect the pinned jobs.
 ## Multi-architecture assets
 
 Release builds are native: amd64 and arm64 run on their dedicated self-hosted
-runners. Architecture-independent release jobs run on arm64. Both builds use
-the same digest-pinned multi-platform Debian 13/Rust OCI index selected by
-`rust-toolchain.toml` and verify the host
-architecture before compiling.
+runners. Architecture-independent verification and preflight jobs run on arm64.
+The tag-only signing and publishing job runs on an ephemeral GitHub-hosted
+`ubuntu-24.04` runner so release secrets never reach the persistent CI runners.
+Both builds use the same digest-pinned multi-platform Debian 13/Rust OCI index
+selected by `rust-toolchain.toml` and verify the host architecture before
+compiling.
 
 Each architecture produces a versioned archive, standalone binary, CycloneDX
 SBOM, and `SHA256SUMS-ARCH`. The tag workflow signs and verifies the archive,
