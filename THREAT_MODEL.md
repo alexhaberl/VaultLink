@@ -1,0 +1,284 @@
+# VaultLink threat model
+
+| Field | Value |
+| --- | --- |
+| Last reviewed | 2026-08-02 |
+| Baseline commit | `c11c5d2b7e61e4b30b20d4921315fcf31a86390e` |
+| Applies to | Planned VaultLink 0.5.0 on Debian 13 amd64 and arm64 |
+| Companion documents | [Security policy](SECURITY.md), [release checklist](docs/RELEASE-CHECKLIST.md), [runner strategy](docs/SELF-HOSTED-RUNNER.md) |
+
+## Purpose
+
+This document describes what VaultLink protects, which actors and systems are
+trusted, how trust boundaries are crossed, and which residual risks are
+accepted. It is an engineering threat model, not a claim that a deployment is
+secure independently of its host, reverse proxy, storage server, or operating
+procedures.
+
+The model is intentionally organized around security invariants and concrete
+abuse cases. `SECURITY.md` remains authoritative for supported versions,
+operational requirements, the compensated WebAuthn RSA advisory, and private
+vulnerability reporting.
+
+## Scope and security objectives
+
+VaultLink is a single-process, Linux-only service that exposes an existing
+mounted directory through administrator sessions and public bearer links. It
+stores policy and security state in a local SQLite database and protects stored
+application secrets with an adjacent keyring. It supports a service-owned local
+storage mode and a narrowly defined CIFS/SMB external-writer mode.
+
+The security objectives are:
+
+- confine every file operation to the capability and policy assigned to the
+  administrator or public Share;
+- preserve confidentiality and integrity of credentials, Share policy,
+  application-owned secret state, and release signing material;
+- make security-relevant database mutations and their required audit records
+  atomic;
+- bound attacker-controlled CPU, memory, connection, database, and filesystem
+  work;
+- fail closed when storage identity, configuration, key material, release
+  inputs, or required evidence is missing or inconsistent;
+- make accepted operational trust and residual risks explicit.
+
+## Non-goals and trusted foundations
+
+VaultLink does not claim to protect against:
+
+- a malicious or fully compromised host root administrator, kernel, hypervisor,
+  or GitHub control plane;
+- physical access to an unencrypted host, backup, or storage device;
+- an independently compromised reverse proxy or SMB server operating with the
+  authority intentionally assigned to it;
+- unlimited volumetric denial of service without upstream network controls;
+- active-active operation or high availability for one storage-root and
+  data-directory pair;
+- audit immutability when events remain solely on the VaultLink host;
+- direct changes made by an authorized external SMB writer bypassing VaultLink
+  authentication, audit, link policy, and quotas;
+- confidentiality after an administrator or recipient intentionally downloads
+  or shares plaintext content.
+
+The supported deployment trusts Debian 13, the Linux security primitives used
+by VaultLink, the configured TLS endpoint, the audited local filesystem, and
+the operator-managed identities and ACLs described in `SECURITY.md`. Required
+kernel primitives include `openat2(2)`, `renameat2(2)`, and statx mount IDs.
+
+## Protected assets
+
+| Asset | Required property |
+| --- | --- |
+| Visible storage content and names | Access only through the configured root, Share capability, and mutation policy |
+| Administrator credentials and MFA state | Confidentiality, replay resistance, and authenticated lifecycle changes |
+| Sessions, CSRF values, Share tokens, and preview/unlock state | Unpredictability, bounded lifetime, correct binding, and revocation |
+| SQLite policy and accounting state | Transactional integrity, schema authenticity, and bounded resource use |
+| `secrets.keyring` and encrypted database fields | Confidentiality, exact database/keyring pairing, and atomic rotation |
+| Configuration, mount identity, and internal storage | Fail-closed validation and service-only modification |
+| Audit records | Atomicity for required events, bounded retention, and honest trust-boundary documentation |
+| Backups and rollback units | Confidentiality and inseparable binary/config/database/keyring consistency |
+| Source, dependencies, builder image, and workflow definitions | Reviewed immutable inputs and reproducible provenance |
+| Minisign private key and publication token | Exposure only to the isolated tag-only publish job |
+| Release artifacts, SBOMs, checksums, and evidence | Exact-commit integrity, architecture identity, and verified signatures |
+
+## Threat actors and capabilities
+
+| Actor | Assumed capabilities | Not assumed |
+| --- | --- | --- |
+| Unauthenticated network client | Send malformed, slow, parallel, and spoofed requests; guess credentials and bearer links | Host, proxy, or database access |
+| Public Share holder | Exercise every operation permitted by a leaked or intentionally shared bearer link | Administrator privileges or access outside that Share |
+| Malicious uploader | Choose filenames, metadata, multipart framing, sizes, timing, and cancellation behavior | Direct access to protected internal staging |
+| Authenticated administrator | Use all documented administrator operations and see all visible storage | Host root, keyring plaintext, arbitrary audit deletion, or release authority |
+| Compromised administrator browser | Reuse browser-visible responses and submit requests within cookie and CSP constraints | Reading `HttpOnly` cookies without another browser compromise |
+| External SMB writer | Modify visible content with the server-side rights explicitly granted to its SMB identity | Access to `.vaultlink-internal`, local SQLite/keyring, or VaultLink process memory |
+| Reverse proxy | Terminate TLS and, when allowlisted, assert a validated forwarding chain | Application, database, storage, or signing authority |
+| Local unprivileged user | Interact with host resources allowed by Linux permissions | `vaultlink` uid, root, protected files, or Docker-group authority |
+| Host or storage administrator | Control the system or service inside the documented trust boundary | Independence for tamper-resistant audit evidence |
+| Repository contributor or dependency author | Propose source, workflow, lockfile, action, or container changes for review | Release tag authorization or repository-secret access by default |
+| Compromised persistent CI runner | Execute as the runner account and Docker-equivalent root; tamper with work performed on that runner | Selecting the hosted publish container or receiving Minisign secrets |
+| Authorized release maintainer | Change reviewed repository configuration and push the annotated release tag | Permission to bypass exact-commit, evidence, pin, or key checks without changing reviewed controls |
+
+## System and trust boundaries
+
+```mermaid
+flowchart LR
+    Internet["Internet clients"] --> Proxy["TLS / reverse proxy"]
+    Proxy --> App["VaultLink process"]
+    Admin["Administrator browser"] --> Proxy
+    App --> DB["Local SQLite + keyring"]
+    App --> Storage["Mounted visible storage"]
+    SMB["External SMB writers"] --> Storage
+    App --> Journal["journald"]
+    Journal --> WORM["Optional independent WORM sink"]
+
+    Source["Reviewed source and pins"] --> Runners["Persistent native CI runners"]
+    Runners --> Artifacts["Unsigned build artifacts + evidence"]
+    Artifacts --> Publish["Ephemeral GitHub-hosted publish job"]
+    GitHub["GitHub vars, tag authorization, and secrets"] --> Publish
+    Publish --> Release["Signed private GitHub release"]
+```
+
+| Boundary | Security decision |
+| --- | --- |
+| TB-01 Internet to TLS endpoint | The proxy/network layer handles volumetric defense and transport security; VaultLink still validates every application request |
+| TB-02 Reverse proxy to VaultLink | Forwarding headers are trusted only from exact configured TCP peers and only after full chain validation |
+| TB-03 Bearer or administrator state to an operation | Session, Share, CSRF, MFA, expiry, permission, and quota checks are performed before protected work |
+| TB-04 VaultLink to SQLite/keyring | Local permissions, schema checks, keyring pairing, transactions, and required audit protect application state |
+| TB-05 VaultLink to mounted storage | Descriptor-relative capabilities, mount identity, internal namespaces, and atomic publication confine filesystem effects |
+| TB-06 External SMB writer to visible storage | External writers are trusted publishers but remain excluded from internal storage and local security state |
+| TB-07 VaultLink host to external audit sink | The local host is not an independent witness; WORM forwarding is required when tamper resistance matters |
+| TB-08 Reviewed source to persistent CI | Pins, policy checks, native isolation, and reproducibility evidence constrain build inputs; runner compromise remains in scope |
+| TB-09 Persistent CI to secret-bearing publication | Persistent runners provide unsigned artifacts only; an ephemeral hosted job independently selects its pinned image, verifies inputs, signs, and publishes |
+| TB-10 Maintainer authorization to release | An annotated version tag must equal the approved `main` commit and all exact-commit evidence must succeed |
+
+## Security invariants
+
+These properties are intended to remain true across all supported deployments.
+A change that weakens one requires an explicit threat-model review.
+
+| ID | Invariant | Primary enforcement and evidence |
+| --- | --- | --- |
+| INV-01 | A user-controlled path never escapes its assigned storage capability | `src/path_security.rs`, `src/secure_fs/`, path and symlink-race fuzz/smoke tests |
+| INV-02 | Required storage cannot silently fall back to a different or local directory | `src/storage_mount.rs`, exact filesystem/source/mount-ID checks, mount-race tests |
+| INV-03 | Public upload staging is never writable through the visible namespace or an external SMB identity | protected `.vaultlink-internal`, server-side ACL requirements, upload and CIFS gates |
+| INV-04 | Visible publication is atomic and never silently clobbers unless the explicit external-writer replacement risk is enabled | `renameat2` no-replace publication, overwrite policy tests, documented last-writer-wins exception |
+| INV-05 | A required-audit database mutation cannot commit without its audit row | `src/db/required_audit.rs`, transaction rollback tests |
+| INV-06 | A filesystem operation already made visible is never falsely reported as safely retryable after later audit uncertainty | `202 audit_durability_uncertain`, persistent file-operation journal, recovery tests |
+| INV-07 | Stored application secrets require the matching protected keyring and are validated before service operation | `src/db/keyring.rs`, startup decryption probes, rotation and restart tests |
+| INV-08 | Unknown and known administrator usernames consume the same admitted Argon2 resource class | shared Argon2 semaphore and dummy hashing path in `src/http_auth.rs` and `src/services/auth.rs` |
+| INV-09 | An untrusted network peer cannot assert another client identity through forwarding headers | exact trusted-proxy allowlist and right-to-left chain validation |
+| INV-10 | RSA WebAuthn credentials remain unreachable while `RUSTSEC-2023-0071` is excepted | no RS256 advertising, centralized runtime rejection, persistence/authentication regression tests |
+| INV-11 | A release-time image is an exact reviewed multi-architecture digest or the workflow fails before protected work | repository variable equals `deploy/docker/release-builder-image.lock`, builder verification and supply-chain policy |
+| INV-12 | Persistent runners never receive signing secrets or choose the environment that receives them | tag-only GitHub-hosted `publish` job, direct GitHub variable lookup, job-scoped permissions |
+| INV-13 | Signed artifacts correspond to the exact approved commit and verified native/reproducible evidence | release workflow gates, checksums, SBOMs, soak evidence, exact tag-to-`main` equality |
+| INV-14 | Missing Minisign material, builder provisioning, or release evidence blocks publication | fail-closed workflow and unchecked release checklist gates |
+
+## Threat register
+
+Severity here describes the residual risk after the listed controls in a
+correctly operated supported deployment. It is not a vulnerability score.
+Each abuse case identifies the affected asset and operation; the actor and
+boundary definitions above constrain the capabilities under consideration.
+The invariant and verification sections provide the stable enforcement and
+test evidence against which each case is reviewed.
+
+### Authentication, sessions, and request identity
+
+| ID | Abuse case | Controls | Residual risk and review trigger |
+| --- | --- | --- | --- |
+| TM-AUTH-01 | Credential stuffing or brute force against administrators or password-protected Shares | Argon2id, MFA, per-account/per-origin limits, fixed-size unknown-identity buckets, upstream connection limits | Process-local counters reset on restart and are not volumetric defense. Reassess if deployment omits proxy/network limits or restart behavior becomes remotely triggerable. |
+| TM-AUTH-02 | Theft or replay of an administrator session, Share token, unlock cookie, or preview state | Random bearer values, hashed/encrypted persistence, bounded expiry, idle timeout, revocation, `HttpOnly`, `Secure`, `SameSite=Strict` | A bearer value intentionally exposed to a recipient or compromised endpoint can be used until expiry/revocation. Reassess for new token types or browser storage. |
+| TM-AUTH-03 | CSRF or cross-session state substitution | Session-bound CSRF values, Share-unlock CSRF, strict cookies, constant-time comparison, WebAuthn ceremony binding and single use | A fully compromised same-origin browser context remains authoritative. Reassess when adding cross-origin clients or API tokens. |
+| TM-AUTH-04 | Username enumeration or overload differences reveal valid administrators | Equal admission class for known/unknown users, dummy Argon2, bounded limiter state, normalized errors | Network timing cannot be made perfectly identical. Reassess after authentication-flow or Argon2 changes. |
+| TM-AUTH-05 | An RSA WebAuthn path reaches the affected `rsa` implementation | RS256 is not advertised; persisted and runtime credential state is centrally rejected before use | The exception is valid only for the current relying-party behavior. Apply the mandatory triggers in `SECURITY.md`. |
+| TM-NET-01 | Spoofed `Forwarded` or `X-Forwarded-For` changes rate-limit or audit identity | Exact trusted-peer allowlist, right-to-left validation, malformed-chain rejection, direct-peer fallback | A compromised allowlisted proxy can assert the identity it is trusted to provide. Reassess proxy topology and Docker NAT boundaries. |
+| TM-NET-02 | Cleartext traffic, TLS downgrade, or unsafe public binding exposes credentials | Production HTTPS validation, secure cookies, HSTS option, loopback defaults, documented proxy/standalone modes | TLS endpoint operation is outside VaultLink when a proxy terminates TLS. Reassess certificate source, bind mode, or proxy ownership. |
+
+### Filesystem, uploads, and external writers
+
+| ID | Abuse case | Controls | Residual risk and review trigger |
+| --- | --- | --- | --- |
+| TM-FS-01 | Path traversal, symlink, magic-link, encoding, or rename race escapes the root or Share | One decode, strict relative-path policy, descriptor-relative `openat2`, `RESOLVE_BENEATH`, no magic links, no symlinks where required, identity rechecks | Kernel/filesystem correctness is trusted. Reassess for a new filesystem, platform, or path-decoding layer. |
+| TM-FS-02 | A required remote mount disappears and exposes a local fallback directory | Exact active mount source/type/options and mount-ID checks before secret/database access; fail-closed startup and runtime gates | A privileged host administrator can replace trusted state and is in the host boundary. Reassess mount topology. |
+| TM-FS-03 | A malicious upload overwrites content, escapes staging, or survives cancellation unaccounted | Protected random `0600` staging, RAII cleanup, streamed multipart bounds, quota reservation, fsync, atomic publication, no-replace default | Disk exhaustion and authorized overwrite semantics remain possible within configured limits. Reassess upload pipeline or internal layout. |
+| TM-FS-04 | An external SMB writer modifies content outside VaultLink policy or races publication | Dedicated SMB identity, SMB 3.1.1 signing/encryption requirement, strict mount policy, protected internal ACL, no symlink traversal, no-replace default | Direct writer changes intentionally bypass VaultLink audit/quotas. Explicit replacement mode accepts undetectable last-writer-wins loss. Reassess any new external-writer mode. |
+| TM-FS-05 | Recursive delete, crash, or rollback leaves partial or ambiguous filesystem state | Staged tombstones, durable manifests, bounded restartable cleanup, identity checks, forward recovery | Operators may need to resolve fail-closed recovery entries. Reassess journal format or mutation sequencing. |
+| TM-FS-06 | ZIP, search, preview, range, or streaming endpoints exhaust CPU, memory, descriptors, or storage | Global/per-peer semaphores, size/count/depth limits, constant-memory streaming, idle/deadline limits, bounded result sets | Limits protect the application, not upstream bandwidth. Reassess defaults with measured load and new content processors. |
+
+### Database, secrets, audit, and recovery
+
+| ID | Abuse case | Controls | Residual risk and review trigger |
+| --- | --- | --- | --- |
+| TM-DATA-01 | Theft of SQLite, keyring, configuration, or a complete backup exposes credentials and policy | Service-only ownership/modes, local-filesystem requirement, encrypted fields, protected backup procedures | Database plus matching keyring is a production credential. Host/disk encryption and backup custody remain operator responsibilities. |
+| TM-DATA-02 | Power loss or concurrent operation corrupts key rotation or creates mixed secret state | Keyring locking, write-before-reencrypt sequencing, transactional row updates, startup decryption validation, rotation tests | Filesystem durability and host integrity are trusted. Reassess keyring format or rotation algorithm. |
+| TM-DATA-03 | An administrator suppresses or rewrites evidence | Required audit is atomic with protected mutations; events mirror to journald; local retention is bounded and priority-aware | Host/root/log administrators can tamper with local evidence. Independently administered append-only or WORM forwarding is required for stronger assurance. |
+| TM-DATA-04 | An old binary, mismatched configuration, or partial backup is activated after migration | Forward-only schema validation, inseparable four-file backup unit, maintenance lock, transactional upgrade/rollback, exact health/version checks | Manual recovery by a trusted host administrator remains possible and powerful. Reassess schema or deployment tooling changes. |
+| TM-DATA-05 | Unbounded database or audit growth causes denial of service | Bounded audit rows and retention, upload/transfer accounting, connection pool, busy timeout, bounded limiter state | Storage capacity still requires monitoring. Reassess after load tests or schema growth. |
+
+### Build, dependency, and release supply chain
+
+| ID | Abuse case | Controls | Residual risk and review trigger |
+| --- | --- | --- | --- |
+| TM-SC-01 | A mutable action, tool, base image, Debian mirror, or Rust dependency changes without review | Full action SHAs, image digests, exact toolchain/tools, immutable Debian snapshot/package lock, Cargo.lock, policy checks, Dependabot review | Registry, upstream, maintainer, and cryptographic trust are not eliminated. Reassess pinning or package source changes. |
+| TM-SC-02 | A vulnerable or malicious dependency enters the graph | Independent native audits, sole documented RSA exception, SBOMs, duplicate policy, locked builds, fuzz/lint/test gates | Audits detect known advisories, not all malicious behavior. Reassess every exception and security-sensitive dependency update. |
+| TM-SC-03 | A compromised persistent runner exfiltrates the signing key or write token | Signing and publication run only on an ephemeral GitHub-hosted runner; secrets are step-scoped; publication permissions are job-scoped; private key uses a temporary `0600` file | GitHub and an authorized maintainer remain trusted. Reassess runner placement, secret scope, or publication permissions. |
+| TM-SC-04 | A compromised persistent runner selects a malicious publish container | Hosted publish resolves its image directly from the GitHub-managed repository variable, not a runner output; image is digest-pinned and verified against the checked-in lock | A repository administrator can change the variable and is inside the release-authorization boundary. Reassess variable administration or environment protections. |
+| TM-SC-05 | A runner tampers with native artifacts before signing | Separate architecture artifacts, internal checksums, exact-commit status, reproducibility evidence, hosted verification before signing | A coordinated compromise of all evidence producers or GitHub control plane remains outside the guaranteed boundary. Reassess artifact/evidence independence. |
+| TM-SC-06 | A stale, unreviewed, or partial commit is released | Annotated tag must equal current `origin/main`; candidate, reproducibility, soak, and release evidence are commit-bound; publication is tag-only | Maintainer and GitHub tag controls remain trusted. Any post-soak commit invalidates evidence. |
+| TM-SC-07 | Missing builder, public key, private key, or password causes an unsafe fallback | `UNPROVISIONED`, empty/mismatched variables, missing `release/minisign.pub`, absent secrets, or invalid evidence all fail closed | This intentionally blocks release readiness until explicit provisioning; no fallback is supported. |
+
+### Operations and availability
+
+| ID | Abuse case | Controls | Residual risk and review trigger |
+| --- | --- | --- | --- |
+| TM-OPS-01 | Slow, parallel, or expensive requests exhaust the service | Layered connection/stream/upload/Argon2/ZIP/search/preview limits, request deadlines, body bounds, per-peer budgets | Volumetric attacks and shared upstream exhaustion require proxy/network controls. Reassess after the final load profile. |
+| TM-OPS-02 | Repeated process failure resets local defenses or makes the service unavailable | systemd hardening/restart policy, fail-closed startup, soak restart gate, upstream rate limits | VaultLink is single-process and its rate-limit counters are not persistent. A remotely triggerable restart is a security defect requiring immediate review. |
+| TM-OPS-03 | Host service privileges are used to attack the system | Dedicated user, empty capability set by default, restrictive systemd sandbox, narrow standalone capability override | Docker-group CI users and host root are privileged by design and require dedicated systems. Reassess service-unit overrides. |
+| TM-OPS-04 | Operational privacy settings create misleading forensic expectations | Client-IP audit is opt-in, purge is constrained and audited, client IPs never mirror to journald | Privacy-preserving defaults reduce correlation. Operators must choose and document their lawful forensic requirements. |
+
+## Accepted residual risks
+
+The following are explicit design decisions, not undisclosed guarantees:
+
+| ID | Accepted risk | Required condition |
+| --- | --- | --- |
+| RA-01 | Login rate-limit counters reset on process restart | Reverse-proxy/network rate limiting remains deployed; no remotely triggerable restart is accepted |
+| RA-02 | Local audit is not cryptographically chained or immutable | Regulated deployments forward to an independently administered append-only or WORM sink |
+| RA-03 | External SMB writers bypass VaultLink auth, audit, quotas, and link policy | Writers are trusted publishers with separate SMB audit and lifecycle controls |
+| RA-04 | Explicit external-writer replacement can lose a newer concurrent SMB change | `allow_external_writer_replace=true` is a documented operator opt-in |
+| RA-05 | Share URLs and session values are bearer credentials | TLS, bounded expiry, recipient handling, revocation, and browser protections remain mandatory |
+| RA-06 | Framework, Serde, SQLite, allocator, and response copies cannot all be guaranteed to be zeroized | VaultLink minimizes avoidable application-owned copies and protects host/process access |
+| RA-07 | One process owns each storage/data pair and can be an availability bottleneck | Active-active operation is unsupported; backup, monitoring, and recovery are operational controls |
+| RA-08 | `RUSTSEC-2023-0071` remains in the lockfile | All compensating conditions and mandatory re-review triggers in `SECURITY.md` continue to hold |
+| RA-09 | Host root, storage administrators, GitHub administrators, and the GitHub control plane retain powerful trusted roles | Access is restricted, reviewed, and separated where the supported deployment requires it |
+| RA-10 | Release provisioning and final evidence are incomplete before the first supported tag | The workflow remains fail closed and no release is described as supported before every checklist gate succeeds |
+
+## Verification and evidence
+
+Threat controls are verified through the normal repository gates rather than by
+this document alone:
+
+- `cargo fmt`, Clippy, locked tests, coverage, fuzz compilation/campaigns, and
+  independent amd64/arm64 dependency audits;
+- `tools/check-supply-chain-policy.sh` for workflow, pin, image, runner, and
+  release invariants;
+- Docker smokes for setup, API, fixture privilege, root-helper, upgrade,
+  rollback, and recovery behavior;
+- security-focused unit and integration tests for authentication, CSRF,
+  WebAuthn, path handling, mount identity, upload publication, required audit,
+  key rotation, and concurrency;
+- exact-commit reproducibility, staging, load, hardware-FIDO2, SMB, and 72-hour
+  soak gates in `docs/RELEASE-CHECKLIST.md`.
+
+Passing CI validates tested controls but does not close unchecked release
+checklist items or change an accepted residual risk.
+
+## Review record
+
+| Date | Baseline | Scope | Result |
+| --- | --- | --- | --- |
+| 2026-08-02 | `c11c5d2b7e61e4b30b20d4921315fcf31a86390e` | Initial 0.5.0 application, storage, deployment, CI, and release model | Trust boundaries, invariants, abuse cases, and accepted risks documented; open release gates remain fail closed |
+
+## Review triggers
+
+Review and update this model when any of the following changes:
+
+- supported operating system, architecture, kernel primitive, filesystem, or
+  deployment topology;
+- TLS termination, reverse-proxy trust, client-identity processing, or public
+  binding behavior;
+- authentication, MFA, recovery, bearer token, cookie, CSRF, or session model;
+- cryptography, keyring format, encrypted fields, secret lifecycle, or the
+  compensated RSA advisory conditions;
+- storage capability, mount validation, upload publication, external-writer,
+  overwrite, delete, backup, migration, or rollback semantics;
+- audit atomicity, event retention, privacy settings, journald forwarding, or
+  regulatory evidence requirements;
+- runner trust, workflow permissions, artifact flow, builder image selection,
+  repository variables, signing keys, tag authorization, or release evidence;
+- a new advisory, security incident, remotely triggerable restart, failed
+  invariant, or material load/soak result.
+
+Every review should record the date, relevant commit, changed assumptions,
+affected threat and invariant IDs, and the tests or operational evidence used
+to accept the resulting residual risk.
