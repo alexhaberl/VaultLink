@@ -1,5 +1,10 @@
 # Security Policy
 
+The [threat model](THREAT_MODEL.md) defines protected assets, attacker
+capabilities, trust boundaries, security invariants, abuse cases, and accepted
+residual risks. This policy remains authoritative for supported versions,
+operational requirements, advisory exceptions, and vulnerability reporting.
+
 ## Supported versions
 
 Release line: `0.5.0` for Linux x86_64 and aarch64. Its hardening work passed through the internal, untagged 0.4.9 candidate. Only artifacts attached to the signed, annotated `v0.5.0` tag are supported; if that tag is absent, no published version is supported. Windows hosts are not supported.

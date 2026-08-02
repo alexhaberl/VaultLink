@@ -6,6 +6,10 @@ Status: `0.5.0` is planned as the next release for Debian 13 on amd64 and arm64.
 
 ## 1. Security model
 
+The project-wide [threat model](THREAT_MODEL.md) maps protected assets,
+attacker capabilities, deployment and release trust boundaries, testable
+security invariants, and explicitly accepted residual risks.
+
 Successful security-relevant SQLite mutations and their audit rows share an `IMMEDIATE` transaction. An audit failure rolls back the mutation; the JSON API returns `503 audit_unavailable`. Rejected logins and other observations remain best effort because there is no domain mutation to roll back.
 
 If a file operation is already visible in the filesystem, a later audit failure is not reported as a failed operation. API and queue clients receive `202` with `audit_durability_uncertain`; browsers display a warning. Clients must not retry that response automatically. Rename/delete operations remain in the unchanged SecureFS journal and are completed once as actor `system` without a client IP.
