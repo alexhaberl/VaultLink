@@ -17,3 +17,5 @@ Makefile text eol=lf
 Dockerfile* text eol=lf
 Caddyfile text eol=lf
 .gitignore text eol=lf
+.dockerignore text eol=lf
+.gitleaksignore text eol=lf

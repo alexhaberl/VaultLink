@@ -37,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Resolve pinned Rust toolchain
         id: rust_toolchain
@@ -54,6 +55,23 @@ jobs:
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.expected_rust_host }}"
       - name: Supply-chain policy
         run: sh tools/check-supply-chain-policy.sh
+      - name: Full-history secret scan
+        if: matrix.architecture == 'arm64'
+        shell: bash
+        env:
+          GITLEAKS_VERSION: 8.30.0
+          GITLEAKS_SHA256: b4cbbb6ddf7d1b2a603088cd03a4e3f7ce48ee7fd449b51f7de6ee2906f5fa2f
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d "$RUNNER_TEMP/vaultlink-gitleaks.XXXXXXXXXX")
+          trap 'rm -rf -- "$work"' EXIT
+          archive="$work/gitleaks.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --retry 5 --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$work" gitleaks
+          GITLEAKS_BIN="$work/gitleaks" make secret-check
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Lints

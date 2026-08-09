@@ -1,4 +1,4 @@
-.PHONY: dev-setup sample-data test security-test fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-upgrade-safety-test
+.PHONY: dev-setup sample-data test security-test secret-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-upgrade-safety-test
 
 CONFIG ?= config/development.toml
 DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
@@ -27,6 +27,9 @@ security-test:
 	cargo test auth
 	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh; else echo "shellcheck is not installed; skipping script checks"; fi
 	sh tools/check-supply-chain-policy.sh
+
+secret-check:
+	sh tools/check-secrets.sh
 
 fuzz: fuzz-parallel
 

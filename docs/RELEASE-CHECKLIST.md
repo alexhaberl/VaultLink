@@ -1,6 +1,6 @@
 # v0.5.0 release checklist
 
-Status: 2026-07-17 for the native Linux amd64/arm64 release of 0.5.0.
+Status: 2026-08-09 for the native Linux amd64/arm64 release of 0.5.0.
 
 Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered through a dedicated pull request; the tag is created only after merge to `main`, with a clean worktree and every gate green.
 
@@ -68,6 +68,7 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
 - [ ] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`.
   - Includes `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_request_state`, `share_request_policy`, `file_mutation_policy`, and `multipart_guard`.
 - [ ] `cargo build --release --locked` on amd64 and arm64.
+- [ ] Checksum-pinned Gitleaks 8.30.0 full-history scan is green with redacted output; `.gitleaksignore` contains only the two reviewed RFC 6238 TOTP test-vector fingerprints.
 - [ ] Run `cargo audit --deny warnings --ignore RUSTSEC-2023-0071` against the shared workspace lockfile; consciously re-review the compensated RSA exception and remove it as soon as the dependency permits.
 - [ ] `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh` and `make policy-check` on amd64 and arm64.
 - [ ] `make docker-smoke` on the final 0.5.0 source on amd64 and arm64.
@@ -112,17 +113,17 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
 ## Staging and public gates before final soak
 
 - [ ] Deploy the final candidate to Debian-13 amd64 and arm64 staging systems.
-- [ ] Create a stopped-service SQLite/keyring backup before upgrade.
-- [ ] Upgrade test:
+- [x] Create a stopped-service SQLite/keyring backup before upgrade.
+- [x] Upgrade test:
   - validate separate old/new binary/config pairs before downtime;
   - backup contains `vaultlink`, `config.toml`, `data.sqlite`, and matching `secrets.keyring` with restrictive ownership/modes;
   - candidate failure restores the full old unit and verifies its own health endpoint;
   - concurrent upgrade/rollback fails on the maintenance lock before service stop;
   - real schema-1 through schema-5 fixtures migrate once to schema 6; upload-related legacy audits receive security priority, and rollback restores the complete pre-migration backup.
-- [ ] Password-protected public uploads accept the unlock-bound CSRF value as multipart field or `X-VaultLink-Upload-CSRF` and reject missing/foreign values.
-- [ ] Upload Shares enforce per-file, cumulative byte, and file-count limits under parallel queue uploads and overwrite attempts.
-- [ ] Rollback test stops the service, restores matching binary/config/database/keyring, starts it, verifies exact local health/version, and remains stopped after failed recovery stop or incomplete emergency restore.
-- [ ] Real SMB 3.1.1 co-writer gate:
+- [x] Password-protected public uploads accept the unlock-bound CSRF value as multipart field or `X-VaultLink-Upload-CSRF` and reject missing/foreign values.
+- [x] Upload Shares enforce per-file, cumulative byte, and file-count limits under parallel queue uploads and overwrite attempts.
+- [x] Rollback test stops the service, restores matching binary/config/database/keyring, starts it, verifies exact local health/version, and remains stopped after failed recovery stop or incomplete emergency restore.
+- [x] Real SMB 3.1.1 co-writer gate (operator-confirmed on 2026-08-09):
   - compare every visible entry including dotfiles with snapshots/hashes;
   - use a separate VaultLink SMB account and normal Windows/macOS/Linux co-writer accounts;
   - require SMB 3.1.1 signing/encryption for the mount and every direct client session;
@@ -137,8 +138,11 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
   - local ext4/XFS production accepts root/internal/data on one mount outside the visible tree and rejects group/other/ACL-writable roots;
   - direct SMB changes appear in SMB-server audit and their VaultLink-audit/quota bypass is accepted.
 - [ ] Debian-13-amd64 load profile: 100 concurrent users, 40 download streams, 50-GiB sparse file, parallel uploads, no 5xx or corruption, metadata p95 below 750 ms, at most 256 MiB additional RSS.
-- [ ] Public reverse-proxy endpoint: TLS/redirect, headers, cookies, login/MFA/logout, two real FIDO2 keys, admins, settings, audit, password/limit Shares, search, ZIP, previews, range/HEAD, subdirectory upload, authorized confirmed replacement only, upload-only restrictions, revoke/expiry/limit, and all JSON API flows.
-- [ ] Standalone automatic TLS only with Let's Encrypt staging on a directly reachable standalone endpoint, never behind a reverse proxy.
+  - Docker evidence on `cf5f405` (2026-08-09): 2,000/2,000 metadata requests returned 200, all 40 parallel 64-MiB ranges returned 206 with identical hashes, and all ten parallel 64-MiB uploads were created and read back without corruption. Maximum RSS was 53,168 KiB. The latency gate remains open: metadata p95 was 1.463 seconds cold and 1.371 seconds warm on Docker Desktop.
+- [x] Public reverse-proxy endpoint (operator-confirmed on 2026-08-09): TLS/redirect, headers, cookies, login/MFA/logout, two real FIDO2 keys, admins, settings, audit, password/limit Shares, search, ZIP, previews, range/HEAD, subdirectory upload, authorized confirmed replacement only, upload-only restrictions, revoke/expiry/limit, and all JSON API flows.
+- [x] Standalone automatic TLS only with Let's Encrypt staging on a directly reachable standalone endpoint, never behind a reverse proxy (operator-confirmed on 2026-08-09).
+
+Docker validation on GitHub `main` commit `cf5f405` also passed the pinned Debian-13-amd64 image build, all 499 Rust tests, setup/API/load-fixture/soak-evidence smokes, schema-1-through-schema-5 migration coverage, and the complete upgrade/backup/rollback safety script. Native GitHub CI for the same commit remains green on amd64 and arm64. This evidence does not replace deployment of the final candidate to both staging systems.
 
 ## Final 72-hour soak
 
