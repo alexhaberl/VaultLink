@@ -102,8 +102,11 @@ jobs:
             "$IMAGE@$arm64"
           inspection=$(docker buildx imagetools inspect "$IMAGE:dependency-refresh")
           printf '%s\n' "$inspection"
-          reference=$(printf '%s\n' "$inspection" | sed -n 's/^Name:[[:space:]]*//p' | head -n 1)
-          [[ "$reference" =~ ^${IMAGE}@sha256:[0-9a-f]{64}$ ]]
+          manifest_digest=$(printf '%s\n' "$inspection" \
+            | sed -n 's/^Digest:[[:space:]]*//p' \
+            | head -n 1)
+          [[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          reference="$IMAGE@$manifest_digest"
           printf '## Release builder manifest\n\n`%s`\n' "$reference" >>"$GITHUB_STEP_SUMMARY"
           printf '\nBuilt natively for `linux/amd64` and `linux/arm64` from commit `%s`.\n' \
             "$GITHUB_SHA" >>"$GITHUB_STEP_SUMMARY"

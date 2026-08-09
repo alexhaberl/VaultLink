@@ -35,8 +35,8 @@ final release archive to have identical SHA-256 values. A tag build must match
 those exact binary and archive hashes for its architecture.
 
 `deploy/docker/release-builder-image.lock` is the reviewed source of truth. It
-is intentionally `UNPROVISIONED` until a maintainer performs an explicit
-dependency refresh. Build and push the builder as one linux/amd64+linux/arm64
+starts as `UNPROVISIONED` and remains blocked until a maintainer performs an
+explicit dependency refresh. Build and push the builder as one linux/amd64+linux/arm64
 manifest with Buildx, record the resulting full
 `ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>` reference in the
 lock, and set the repository variable `VAULTLINK_RELEASE_BUILDER_IMAGE` to that
