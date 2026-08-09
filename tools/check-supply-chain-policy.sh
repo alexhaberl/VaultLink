@@ -335,7 +335,7 @@ if ! printf '%s\n' "$publish_job" | grep -F -q '    environment: release-signing
     report "the tag-only publish job must use the protected release-signing environment"
 fi
 if ! grep -F -q "printf '%s\\n' \"\$MINISIGN_PASSWORD\"" .github/workflows/release.yml \
-    || ! grep -F -q '| minisign -S -s "$key"' .github/workflows/release.yml; then
+    || ! grep -F -q "| minisign -S -s \"\$key\"" .github/workflows/release.yml; then
     report "encrypted Minisign keys must receive their secret password non-interactively over stdin"
 fi
 if [ -n "$unexpected_hosted_runners" ]; then
@@ -524,7 +524,7 @@ if ! grep -F -q 'StrictHostKeyChecking yes' tools/configure-soak-ssh.sh \
     || ! grep -F -q 'IdentitiesOnly yes' tools/configure-soak-ssh.sh \
     || ! grep -F -q 'SOAK_SSH_HOST_KEYS' tools/configure-soak-ssh.sh \
     || ! grep -F -q 'SSH_ORIGINAL_COMMAND' deploy/vaultlink-soak-remote.sh \
-    || ! grep -F -q 'allowed_mode=$1' deploy/vaultlink-soak-remote.sh \
+    || ! grep -F -q "allowed_mode=\$1" deploy/vaultlink-soak-remote.sh \
     || ! grep -F -q 'the SSH key cannot start a soak' deploy/vaultlink-soak-remote.sh \
     || ! grep -F -q 'the SSH key cannot collect soak evidence' deploy/vaultlink-soak-remote.sh \
     || ! grep -F -q 'unsupported bridge command' deploy/vaultlink-soak-remote.sh \
