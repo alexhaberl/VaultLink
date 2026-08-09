@@ -672,6 +672,8 @@ if ! grep -F -q -- '--name vaultlink-release-amd64' .github/workflows/soak-start
 fi
 if ! grep -F -q 'ExecStart=/usr/local/libexec/vaultlink/soak-monitor.sh' deploy/vaultlink-soak@.service \
     || ! grep -F -x -q 'Group=vaultlink-soak' deploy/vaultlink-soak@.service \
+    || ! grep -F -x -q 'CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE' deploy/vaultlink-soak@.service \
+    || ! grep -F -x -q 'AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE' deploy/vaultlink-soak@.service \
     || [ "$(grep -F -c -- '-m 2750' deploy/vaultlink-soak-control.sh || true)" -lt 2 ] \
     || ! grep -F -q "install -d -m 2750 \"\$SOAK_EVIDENCE_DIR\"" tools/soak-monitor.sh \
     || ! grep -F -q 'SOAK_SECONDS=259200' deploy/vaultlink-soak-control.sh; then
