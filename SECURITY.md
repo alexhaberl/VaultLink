@@ -14,6 +14,7 @@ Release line: `0.5.0` for Linux x86_64 and aarch64. Its hardening work passed th
 - GitHub Actions are pinned to full commit SHAs and build containers to SHA-256 manifest digests. Human-readable versions remain beside the pins and Dependabot proposes reviewed updates.
 - Rust toolchains and CI-installed Cargo tools use exact versions. `tools/check-supply-chain-policy.sh` rejects mutable workflow references, remote `curl | sh`, and missing Docker build-context exclusions.
 - Push and pull-request CI audits the shared workspace `Cargo.lock`, compiles every fuzz target, and runs setup, API, upgrade, and rollback Docker smokes without external runtime networking.
+- Native CI runs checksum-pinned Gitleaks 8.30.0 over the complete fetched Git history with redacted output, recursive decoding, and archive inspection. `.gitleaksignore` contains only two commit-bound findings for the public RFC 6238 Appendix B TOTP test vector.
 - Local `.env`, root `config.toml`, and SQLite files are excluded from the Docker context; the smoke image copies only build inputs and deploy tests explicitly.
 - Debian build packages come exclusively from the checked-in, timestamped Debian snapshot and an exact direct/transitive package lock. The weekly and manually dispatched native reproducibility gate compares two clean binary and archive builds per architecture before release.
 

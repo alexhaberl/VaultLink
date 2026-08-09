@@ -68,6 +68,7 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
 - [ ] `cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets`.
   - Includes `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_request_state`, `share_request_policy`, `file_mutation_policy`, and `multipart_guard`.
 - [ ] `cargo build --release --locked` on amd64 and arm64.
+- [ ] Checksum-pinned Gitleaks 8.30.0 full-history scan is green with redacted output; `.gitleaksignore` contains only the two reviewed RFC 6238 TOTP test-vector fingerprints.
 - [ ] Run `cargo audit --deny warnings --ignore RUSTSEC-2023-0071` against the shared workspace lockfile; consciously re-review the compensated RSA exception and remove it as soon as the dependency permits.
 - [ ] `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh` and `make policy-check` on amd64 and arm64.
 - [ ] `make docker-smoke` on the final 0.5.0 source on amd64 and arm64.

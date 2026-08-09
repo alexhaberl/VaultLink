@@ -65,6 +65,38 @@ if [ -n "$bad_uses" ]; then
     report "external actions must use a full 40-character commit SHA"
 fi
 
+gitleaks_ignore=.gitleaksignore
+gitleaks_script=tools/check-secrets.sh
+gitleaks_ci=.github/workflows/ci.yml
+gitleaks_fingerprints='a35aeccbffe926997ca69bd2b91ac340ec3af511:src/auth.rs:generic-api-key:375
+ccbafdc3a8810e29ea2981f2ad65ac9673043aa9:src/auth.rs:generic-api-key:375'
+if [ ! -f "$gitleaks_ignore" ]; then
+    report "Gitleaks ignore file is missing"
+else
+    gitleaks_ignore_entries=$(grep -E -v '^[[:space:]]*(#|$)' "$gitleaks_ignore" || true)
+    if [ "$(printf '%s\n' "$gitleaks_ignore_entries" | grep -c . || true)" -ne 2 ]; then
+        report "Gitleaks ignore file must contain exactly the two reviewed RFC test-vector fingerprints"
+    fi
+    for fingerprint in $gitleaks_fingerprints; do
+        if ! grep -F -x -q "$fingerprint" "$gitleaks_ignore"; then
+            report "Gitleaks ignore file is missing reviewed fingerprint $fingerprint"
+        fi
+    done
+fi
+if ! grep -F -x -q 'expected_gitleaks_version=8.30.0' "$gitleaks_script" \
+    || ! grep -F -q -- '--redact=100' "$gitleaks_script" \
+    || ! grep -F -q -- '--max-decode-depth=5' "$gitleaks_script" \
+    || ! grep -F -q -- '--max-archive-depth=2' "$gitleaks_script" \
+    || ! grep -F -q -- '--log-opts="--all --full-history"' "$gitleaks_script"; then
+    report "secret scan must use pinned Gitleaks with redacted full-history, decoding, and archive coverage"
+fi
+if ! grep -F -q 'fetch-depth: 0' "$gitleaks_ci" \
+    || ! grep -F -q 'GITLEAKS_VERSION: 8.30.0' "$gitleaks_ci" \
+    || ! grep -F -q 'GITLEAKS_SHA256: b4cbbb6ddf7d1b2a603088cd03a4e3f7ce48ee7fd449b51f7de6ee2906f5fa2f' "$gitleaks_ci" \
+    || ! grep -F -q "GITLEAKS_BIN=\"\$work/gitleaks\" make secret-check" "$gitleaks_ci"; then
+    report "native CI must run the checksum-pinned Gitleaks full-history gate"
+fi
+
 smoke_dockerfile=deploy/docker/Dockerfile.setup-smoke
 builder_dockerfile=deploy/docker/Dockerfile.release-builder
 snapshot_sources=deploy/docker/debian-snapshot.sources
@@ -150,7 +182,7 @@ if [ "$(printf '%s\n' "$audit_commands" | grep -c . || true)" -ne 3 ] \
     report "RUSTSEC-2023-0071 must be the only explicit cargo-audit exception"
 fi
 
-if ! grep -E -q '^COPY Cargo\.toml Cargo\.lock rust-toolchain\.toml Makefile \.dockerignore \./$' "$smoke_dockerfile" \
+if ! grep -E -q '^COPY Cargo\.toml Cargo\.lock rust-toolchain\.toml Makefile \.dockerignore \.gitleaksignore \./$' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY .cargo ./.cargo' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY .github ./.github' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY deploy ./deploy' "$smoke_dockerfile" \

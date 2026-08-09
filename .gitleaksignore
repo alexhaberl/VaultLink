@@ -1,0 +1,3 @@
+# RFC 6238 Appendix B TOTP test vector in fn rfc_totp(); public test data, not a deployable secret.
+a35aeccbffe926997ca69bd2b91ac340ec3af511:src/auth.rs:generic-api-key:375
+ccbafdc3a8810e29ea2981f2ad65ac9673043aa9:src/auth.rs:generic-api-key:375
