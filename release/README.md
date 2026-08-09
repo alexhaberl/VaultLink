@@ -11,10 +11,11 @@ Commit the public key as `release/minisign.pub`. Store the complete private key 
 The tag-only publish job uses the protected `release-signing` GitHub Environment.
 Only an authorized maintainer may approve it and push the annotated release tag
 after every checklist gate is complete. The workflow independently requires the
-tag version to match Cargo metadata, verifies that the tagged commit equals the
-current `origin/main`, rebuilds/tests that commit on both native architectures,
-and grants `contents: write` only to the publish job. Branch dry-runs remain
-read-only.
+repository to be public, requires the tag version to match Cargo metadata,
+verifies that the tagged commit equals the current `origin/main`, rebuilds/tests
+that commit on both native architectures, and grants `contents: write` only to
+the publish job. A version tag pushed while the repository is private cannot
+publish. Branch dry-runs remain read-only.
 
 ## Supply-chain pin maintenance
 
