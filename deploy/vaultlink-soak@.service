@@ -30,8 +30,11 @@ RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_DAC_READ_SEARCH
+# The monitor hashes /proc/$MAINPID/exe and samples /proc/$MAINPID/status for
+# the unprivileged vaultlink.service process. Debian's ptrace access checks
+# require CAP_SYS_PTRACE even though this unit otherwise runs as root.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadWritePaths=/var/lib/vaultlink-soak
 ReadOnlyPaths=/etc/vaultlink /var/lib/vaultlink /opt/vaultlink
