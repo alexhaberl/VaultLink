@@ -263,10 +263,10 @@ if ! grep -F -q 'workflow_dispatch:' .github/workflows/release-builder.yml \
     || ! grep -F -q 'ghcr.io/alexhaberl/vaultlink-release-builder' .github/workflows/release-builder.yml; then
     report "release builder refresh must be manual, main-only, native multiarch, and digest-published to GHCR"
 fi
-if ! grep -F -q 'inspection=$(docker buildx imagetools inspect "$IMAGE:dependency-refresh")' .github/workflows/release-builder.yml \
+if ! grep -F -q "inspection=${literal_dollar}(docker buildx imagetools inspect \"${literal_dollar}IMAGE:dependency-refresh\")" .github/workflows/release-builder.yml \
     || ! grep -F -q "sed -n 's/^Digest:[[:space:]]*//p'" .github/workflows/release-builder.yml \
-    || ! grep -F -q '[[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]' .github/workflows/release-builder.yml \
-    || ! grep -F -q 'reference="$IMAGE@$manifest_digest"' .github/workflows/release-builder.yml \
+    || ! grep -F -q "[[ \"${literal_dollar}manifest_digest\" =~ ^sha256:[0-9a-f]{64}${literal_dollar} ]]" .github/workflows/release-builder.yml \
+    || ! grep -F -q "reference=\"${literal_dollar}IMAGE@${literal_dollar}manifest_digest\"" .github/workflows/release-builder.yml \
     || grep -F -q "sed -n 's/^Name:[[:space:]]*//p'" .github/workflows/release-builder.yml; then
     report "release builder summary must construct its immutable reference from the inspected manifest Digest"
 fi
