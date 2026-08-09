@@ -37,18 +37,21 @@ sudo install -d -o root -g vaultlink-soak -m 2750 /var/lib/vaultlink-soak
 sudo systemctl daemon-reload
 ```
 
-Generate a dedicated Ed25519 key pair outside the repository. Install only its
-public key on the host, with the forced command and OpenSSH restrictions:
+Generate separate Ed25519 key pairs for start and collection outside the
+repository. Install only their public keys on the host, with mode-specific
+forced commands and OpenSSH restrictions:
 
 ```text
-restrict,command="/usr/local/sbin/vaultlink-soak-remote" ssh-ed25519 AAAA... vaultlink-soak-actions
+restrict,command="/usr/local/sbin/vaultlink-soak-remote start" ssh-ed25519 AAAA... vaultlink-soak-start
+restrict,command="/usr/local/sbin/vaultlink-soak-remote collect" ssh-ed25519 AAAA... vaultlink-soak-collector
 ```
 
 Save that line as
 `/var/lib/vaultlink-soak-bridge/.ssh/authorized_keys`, owned by
 `vaultlink-soak-bridge:vaultlink-soak` with mode `0600`. Disable password and
 keyboard-interactive authentication for this account in `sshd_config`; the
-account must not have another SSH key.
+account must not have any other SSH key. The collector key cannot invoke
+`start`, and the approval-gated start key cannot invoke `collect`.
 
 Grant only the validated root control entry through `/etc/sudoers.d/vaultlink-soak`:
 
@@ -60,7 +63,15 @@ The root control independently requires exactly three lowercase hexadecimal
 arguments and rejects any other invocation. Do not grant general `systemctl`,
 file installation, shell, or editor access.
 
-Create the protected GitHub Environment `release-soak` and store:
+Create two GitHub Environments with five SSH secrets each:
+
+- `release-soak` is used only by the manual start workflow. Require maintainer
+  approval for this environment.
+- `release-soak-collector` is used by the hourly collector. Do not configure a
+  required reviewer because scheduled jobs cannot receive an approval every
+  hour. Restrict deployments to the protected `main` branch instead.
+
+Store in both environments, using the corresponding distinct private key:
 
 - `SOAK_SSH_HOST`: exact DNS name or IP address
 - `SOAK_SSH_PORT`: SSH port, normally `22`
@@ -69,9 +80,10 @@ Create the protected GitHub Environment `release-soak` and store:
 - `SOAK_SSH_HOST_KEYS`: an exact `known_hosts` entry copied through a trusted
   administrative channel, never obtained with `ssh-keyscan` inside the job
 
-Require maintainer approval for the environment. Rotate the bridge key if its
-private half is ever exposed and verify the host key out of band before
-updating `SOAK_SSH_HOST_KEYS`.
+Rotate the bridge key if its private half is ever exposed and verify the host
+key out of band before updating `SOAK_SSH_HOST_KEYS`. The collector environment
+has no approval gate, but its dedicated credential is limited by its forced SSH
+command to the read-only `collect` operation.
 
 Create `/etc/vaultlink/soak.env` as root with mode `0600`. It supplies the
 staging-only public share tokens and local paths without placing secrets in
@@ -124,7 +136,8 @@ commit; changing them afterwards invalidates the evidence.
    `vaultlink-soak@COMMIT.service`. The GitHub job exits;
    the systemd monitor and repeated load profiles continue without an Actions
    token.
-4. The hourly GitHub-hosted collector requests a tar stream from the forced
+4. The scheduled GitHub-hosted collector runs at minute 17 of every hour and
+   requests a tar stream from the forced
    bridge. The remote collector reads only group-readable evidence and uses unprivileged
    `systemctl is-active`/`is-failed` queries for the exact commit-bound monitor
    unit. While running it

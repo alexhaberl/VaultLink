@@ -72,7 +72,7 @@ Goal: public GitHub release for Debian 13 amd64 and arm64. Work is delivered thr
 - [ ] `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh` and `make policy-check` on amd64 and arm64.
 - [ ] `make docker-smoke` on the final 0.5.0 source on amd64 and arm64.
 - [ ] Weekly/manual reproducibility workflow builds twice per architecture with empty targets and identical `SOURCE_DATE_EPOCH`; binary and archive SHA-256 values match bit-for-bit.
-- [ ] Debian image, snapshot, and direct/transitive packages match `debian-snapshot.sources` and `debian-packages.lock`; the source-independent release builder is a linux/amd64+linux/arm64 manifest.
+- [ ] Debian image, snapshot, and direct/transitive packages match `debian-snapshot.sources` and `debian-packages.lock`; the source-independent release builder is built natively by the manual GitHub workflow and published as a linux/amd64+linux/arm64 manifest.
 - [ ] Replace `UNPROVISIONED` in `release-builder-image.lock` with the full `ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>` reference; `VAULTLINK_RELEASE_BUILDER_IMAGE` must match and Actions must have package read access.
 
 ## Historical observation before the 0.3.2 upgrade
@@ -103,9 +103,9 @@ Goal: public GitHub release for Debian 13 amd64 and arm64. Work is delivered thr
 - [ ] Repeat `cargo-audit 0.22.2 --deny warnings --ignore RUSTSEC-2023-0071`, inspect the shared `Cargo.lock`, and confirm no additional exception exists.
 - [ ] GitHub Actions CI green on final `main`.
 - [ ] Locked release dry-run green on GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm`, using exactly the digest-pinned multi-arch Debian 13 builder with no runtime APT/Cargo installation. The tag-only signing and publishing job runs on a fresh `ubuntu-24.04` VM behind the protected `release-signing` environment.
-- [ ] Before candidate preflight, generate and commit non-empty valid Minisign Ed25519 `release/minisign.pub` offline and provision both signing secrets in the protected `release-signing` environment. Do not change keys or builder pins after soak begins.
+- [x] Generated a password-protected Minisign Ed25519 key offline, committed only `release/minisign.pub`, and provisioned both signing secrets in the main-restricted `release-signing` environment on 2026-08-09. Do not change keys or builder pins after soak begins; enable the required-reviewer rule when the repository becomes public.
 - [ ] amd64 and arm64 reproducibility evidence belongs to the exact final commit and contains equal hashes for both independent builds.
-- [ ] Provision `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` in `release-signing`; tag publication must fail without all three key materials.
+- [x] Provisioned `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` in `release-signing`; tag publication fails without all three key materials.
 - [ ] An authorized maintainer approves the `release-signing` environment and pushes annotated `v0.5.0` only after merge and all gates. Exact tag/main equality and the tag-only `contents: write` job complete the approval chain.
 - [ ] Verify versioned amd64/arm64 archives, standalone binaries, README, LICENSE, examples, systemd/deploy files, `SHA256SUMS-*`, architecture-specific CycloneDX SBOMs, deterministic `tar.gz`, and tag-only Minisign signatures.
 
@@ -148,10 +148,10 @@ Docker validation on GitHub `main` commit `cf5f405` also passed the pinned Debia
 
 - [ ] Before soak, replace `Unreleased release candidate` in the top changelog entry with the real planned UTC date (`YYYY-MM-DD`). Candidate-mode manual release workflow succeeds for that exact commit and sets `vaultlink/release-candidate-preflight`.
 - [ ] Start only after the final runtime deployment.
-- [ ] Provision protected `release-soak` secrets for the dedicated SSH host, port, user, private key, and exact trusted `known_hosts` entry.
+- [ ] Provision the dedicated SSH host, port, user, exact trusted `known_hosts` entry, and distinct mode-restricted start/collect private keys in protected `release-soak` and branch-restricted `release-soak-collector`; only the manual start environment requires approval so the collector can run hourly.
 - [ ] Start the dedicated Debian-13 amd64 soak host only through the protected GitHub-hosted workflow on exact `origin/main`; require candidate preflight, pinned SSH host keys, the forced-command bridge, and fail closed on OS/architecture mismatch.
 - [ ] Run at least 259200 seconds with no unplanned restarts, `PRAGMA integrity_check = ok`, continuous version `0.5.0`, no 5xx/panic/database journal errors, metadata p95 below 750 ms at the specified load, RSS at most 256 MiB and at most 15% growth between warm/final medians.
-- [ ] Hourly collector uploads atomic result, CSV, load reports, journal, commit, and full binary hash as `soak-evidence-COMMIT`, setting `vaultlink/72h-soak` to success.
+- [ ] Scheduled collector runs at minute 17 of every hour and uploads atomic result, CSV, load reports, journal, commit, and full binary hash as `soak-evidence-COMMIT`, setting `vaultlink/72h-soak` to success.
 - [ ] Any commit change after soak begins, including docs/CI/deploy/config/version, invalidates the evidence and restarts the full gate.
 
 ## Tag release

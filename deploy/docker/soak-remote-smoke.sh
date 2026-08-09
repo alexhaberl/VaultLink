@@ -19,7 +19,7 @@ install -m 0755 tools/collect-soak-evidence.sh /usr/local/libexec/vaultlink/coll
 bundle="$work/idle.tar.gz"
 SSH_CONNECTION='192.0.2.1 12345 192.0.2.2 22' \
 SSH_ORIGINAL_COMMAND=collect \
-    /usr/local/sbin/vaultlink-soak-remote >"$bundle"
+    /usr/local/sbin/vaultlink-soak-remote collect >"$bundle"
 mkdir "$work/idle"
 tar -xzf "$bundle" -C "$work/idle"
 [ "$(cat "$work/idle/collector.exit")" -eq 0 ] \
@@ -29,17 +29,27 @@ grep -F -x -q 'state=idle' "$work/idle/collector.output" \
 
 if SSH_CONNECTION='192.0.2.1 12345 192.0.2.2 22' \
     SSH_ORIGINAL_COMMAND='collect extra' \
-    /usr/local/sbin/vaultlink-soak-remote >/dev/null 2>&1; then
+    /usr/local/sbin/vaultlink-soak-remote collect >/dev/null 2>&1; then
     fail "bridge accepted extra collect arguments"
 fi
 if SSH_ORIGINAL_COMMAND=collect \
-    /usr/local/sbin/vaultlink-soak-remote >/dev/null 2>&1; then
+    /usr/local/sbin/vaultlink-soak-remote collect >/dev/null 2>&1; then
     fail "bridge accepted a non-SSH invocation"
 fi
 if SSH_CONNECTION='192.0.2.1 12345 192.0.2.2 22' \
     SSH_ORIGINAL_COMMAND='start invalid invalid invalid' \
-    /usr/local/sbin/vaultlink-soak-remote >/dev/null 2>&1; then
+    /usr/local/sbin/vaultlink-soak-remote start >/dev/null 2>&1; then
     fail "bridge accepted invalid start hashes"
+fi
+if SSH_CONNECTION='192.0.2.1 12345 192.0.2.2 22' \
+    SSH_ORIGINAL_COMMAND=collect \
+    /usr/local/sbin/vaultlink-soak-remote start >/dev/null 2>&1; then
+    fail "start-only key accepted evidence collection"
+fi
+if SSH_CONNECTION='192.0.2.1 12345 192.0.2.2 22' \
+    SSH_ORIGINAL_COMMAND='start aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+    /usr/local/sbin/vaultlink-soak-remote collect >/dev/null 2>&1; then
+    fail "collector key accepted soak start"
 fi
 
 echo "Restricted soak SSH bridge smoke passed"

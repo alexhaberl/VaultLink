@@ -253,6 +253,16 @@ if ! grep -F -q 'release-builder-image.lock' tools/verify-release-builder.sh \
     || ! grep -F -q 'Dockerfile.release-builder' docs/GITHUB-HOSTED-RUNNERS.md; then
     report "checked-in builder pin, exact variable equality, and provisioning blocker must be documented"
 fi
+if ! grep -F -q 'workflow_dispatch:' .github/workflows/release-builder.yml \
+    || grep -F -q 'pull_request:' .github/workflows/release-builder.yml \
+    || ! grep -F -q 'runner: ubuntu-24.04' .github/workflows/release-builder.yml \
+    || ! grep -F -q 'runner: ubuntu-24.04-arm' .github/workflows/release-builder.yml \
+    || ! grep -F -q 'push-by-digest=true' .github/workflows/release-builder.yml \
+    || ! grep -F -q -- '--provenance=false' .github/workflows/release-builder.yml \
+    || ! grep -F -q 'packages: write' .github/workflows/release-builder.yml \
+    || ! grep -F -q 'ghcr.io/alexhaberl/vaultlink-release-builder' .github/workflows/release-builder.yml; then
+    report "release builder refresh must be manual, main-only, native multiarch, and digest-published to GHCR"
+fi
 if grep -E -q '(install-pinned-debian-packages\.sh|cargo[[:space:]]+install[[:space:]])' \
     .github/workflows/release.yml .github/workflows/reproducibility.yml; then
     report "release and reproducibility jobs must not install APT or Cargo tooling at runtime"
@@ -323,6 +333,10 @@ if [ "$publish_runner" != '    runs-on: ubuntu-24.04' ]; then
 fi
 if ! printf '%s\n' "$publish_job" | grep -F -q '    environment: release-signing'; then
     report "the tag-only publish job must use the protected release-signing environment"
+fi
+if ! grep -F -q "printf '%s\\n' \"\$MINISIGN_PASSWORD\"" .github/workflows/release.yml \
+    || ! grep -F -q "| minisign -S -s \"\$key\"" .github/workflows/release.yml; then
+    report "encrypted Minisign keys must receive their secret password non-interactively over stdin"
 fi
 if [ -n "$unexpected_hosted_runners" ]; then
     printf '%s\n' "$unexpected_hosted_runners" >&2
@@ -483,7 +497,6 @@ done
 
 for workflow in .github/workflows/soak-start.yml .github/workflows/soak-collect.yml; do
     if ! grep -F -q 'runs-on: ubuntu-24.04' "$workflow" \
-        || ! grep -F -q 'environment: release-soak' "$workflow" \
         || ! grep -F -q 'tools/configure-soak-ssh.sh' "$workflow"; then
         report "$workflow must use protected GitHub-hosted orchestration with pinned SSH transport"
     fi
@@ -491,6 +504,12 @@ for workflow in .github/workflows/soak-start.yml .github/workflows/soak-collect.
         report "$workflow must never accept pull-request execution"
     fi
 done
+if ! grep -F -q 'environment: release-soak' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'environment: release-soak-collector' .github/workflows/soak-collect.yml \
+    || ! grep -F -q "cron: '17 * * * *'" .github/workflows/soak-collect.yml \
+    || ! grep -F -q 'workflow_dispatch:' .github/workflows/soak-collect.yml; then
+    report "soak start must require approval while the branch-restricted collector runs hourly and on demand"
+fi
 if ! grep -F -q 'vaultlink/72h-soak' .github/workflows/soak-start.yml \
     || ! grep -F -q 'vaultlink/72h-soak' .github/workflows/soak-collect.yml \
     || ! grep -F -q 'vaultlink/72h-soak' .github/workflows/release.yml \
@@ -505,6 +524,9 @@ if ! grep -F -q 'StrictHostKeyChecking yes' tools/configure-soak-ssh.sh \
     || ! grep -F -q 'IdentitiesOnly yes' tools/configure-soak-ssh.sh \
     || ! grep -F -q 'SOAK_SSH_HOST_KEYS' tools/configure-soak-ssh.sh \
     || ! grep -F -q 'SSH_ORIGINAL_COMMAND' deploy/vaultlink-soak-remote.sh \
+    || ! grep -F -q "allowed_mode=\$1" deploy/vaultlink-soak-remote.sh \
+    || ! grep -F -q 'the SSH key cannot start a soak' deploy/vaultlink-soak-remote.sh \
+    || ! grep -F -q 'the SSH key cannot collect soak evidence' deploy/vaultlink-soak-remote.sh \
     || ! grep -F -q 'unsupported bridge command' deploy/vaultlink-soak-remote.sh \
     || ! grep -F -q "ssh -F \"\$SSH_CONFIG\" vaultlink-soak" .github/workflows/soak-start.yml \
     || ! grep -F -q "ssh -F \"\$SSH_CONFIG\" vaultlink-soak collect" .github/workflows/soak-collect.yml; then

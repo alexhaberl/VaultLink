@@ -377,7 +377,8 @@ jobs:
             binary="dist/vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
             checksums="dist/SHA256SUMS-${arch}"
             for asset in "$archive" "$binary" "$checksums"; do
-              minisign -S -s "$key" -m "$asset" -x "${asset}.minisig"
+              printf '%s\n' "$MINISIGN_PASSWORD" \
+                | minisign -S -s "$key" -m "$asset" -x "${asset}.minisig"
               minisign -V -p release/minisign.pub -m "$asset" -x "${asset}.minisig"
             done
           done

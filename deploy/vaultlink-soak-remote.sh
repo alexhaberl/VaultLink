@@ -28,6 +28,9 @@ valid_hash() {
 }
 
 [ -n "${SSH_CONNECTION:-}" ] || fail "the bridge is SSH-only"
+[ "$#" -eq 1 ] || fail "the forced bridge mode is required"
+allowed_mode=$1
+case "$allowed_mode" in start|collect) ;; *) fail "unsupported forced bridge mode" ;; esac
 original=${SSH_ORIGINAL_COMMAND:-}
 old_ifs=$IFS
 IFS=' '
@@ -40,6 +43,7 @@ IFS=$old_ifs
 
 case "$1" in
     start)
+        [ "$allowed_mode" = start ] || fail "the SSH key cannot start a soak"
         [ "$#" -eq 4 ] || fail "start requires commit, binary, and orchestration hashes"
         valid_commit "$2" || fail "invalid commit SHA"
         valid_hash "$3" || fail "invalid binary SHA-256"
@@ -47,6 +51,7 @@ case "$1" in
         exec sudo -- "$control" start "$2" "$3" "$4"
         ;;
     collect)
+        [ "$allowed_mode" = collect ] || fail "the SSH key cannot collect soak evidence"
         [ "$#" -eq 1 ] || fail "collect takes no arguments"
         work=$(mktemp -d)
         trap 'rm -rf "$work"' EXIT HUP INT TERM

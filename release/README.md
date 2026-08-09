@@ -45,19 +45,19 @@ the two before any job container starts and require `packages: read` plus GHCR
 credentials. An unset marker, mismatch, mutable tag, different repository, or
 unavailable private image is an intentional external release blocker.
 
-The refresh is performed from a reviewed clean tree; the temporary tag is not
-used by any release job:
+The refresh is performed from reviewed `main` by manually dispatching
+`Refresh release builder`. Its matrix builds natively on GitHub-hosted amd64
+and arm64 runners, pushes platform images by digest, and publishes their joint
+manifest under the temporary `dependency-refresh` tag. No release job uses
+that tag.
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -f deploy/docker/Dockerfile.release-builder \
-  -t ghcr.io/alexhaberl/vaultlink-release-builder:dependency-refresh --push .
-docker buildx imagetools inspect \
-  ghcr.io/alexhaberl/vaultlink-release-builder:dependency-refresh
+gh workflow run release-builder.yml --ref main
 ```
 
-Copy the reported manifest digest—not either platform-child digest—into the
-checked-in full reference and the repository variable, then rerun both native
+Copy the manifest reference reported in the workflow summary, not either
+platform-child digest, into the checked-in lock and the repository variable,
+then rerun both native
 reproducibility jobs. For a private package, explicitly grant this repository's
 Actions token read access to the GHCR package. Updating the temporary tag later
 cannot affect the pinned jobs.
