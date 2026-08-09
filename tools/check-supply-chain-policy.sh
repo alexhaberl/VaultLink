@@ -742,6 +742,14 @@ fi
 if ! grep -F -x -q 'TasksMax=512' deploy/vaultlink.service; then
     report "vaultlink.service must retain its explicit task ceiling"
 fi
+if grep -F -x -q 'RestrictSUIDSGID=true' deploy/vaultlink.service; then
+    report "vaultlink.service must not block the required openat2(O_CREAT) storage workflows"
+fi
+if ! grep -F -x -q 'NoNewPrivileges=true' deploy/vaultlink.service \
+    || ! grep -F -x -q 'UMask=0077' deploy/vaultlink.service \
+    || ! grep -F -x -q 'CapabilityBoundingSet=' deploy/vaultlink.service; then
+    report "vaultlink.service must retain its unprivileged no-escalation boundary"
+fi
 
 if ! grep -E -q '^[[:space:]]+cancel-in-progress:[[:space:]]+true$' .github/workflows/fuzz.yml; then
     report "fuzz workflow must cancel superseded runs"
