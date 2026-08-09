@@ -263,6 +263,13 @@ if ! grep -F -q 'workflow_dispatch:' .github/workflows/release-builder.yml \
     || ! grep -F -q 'ghcr.io/alexhaberl/vaultlink-release-builder' .github/workflows/release-builder.yml; then
     report "release builder refresh must be manual, main-only, native multiarch, and digest-published to GHCR"
 fi
+if ! grep -F -q 'inspection=$(docker buildx imagetools inspect "$IMAGE:dependency-refresh")' .github/workflows/release-builder.yml \
+    || ! grep -F -q "sed -n 's/^Digest:[[:space:]]*//p'" .github/workflows/release-builder.yml \
+    || ! grep -F -q '[[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]' .github/workflows/release-builder.yml \
+    || ! grep -F -q 'reference="$IMAGE@$manifest_digest"' .github/workflows/release-builder.yml \
+    || grep -F -q "sed -n 's/^Name:[[:space:]]*//p'" .github/workflows/release-builder.yml; then
+    report "release builder summary must construct its immutable reference from the inspected manifest Digest"
+fi
 if grep -E -q '(install-pinned-debian-packages\.sh|cargo[[:space:]]+install[[:space:]])' \
     .github/workflows/release.yml .github/workflows/reproducibility.yml; then
     report "release and reproducibility jobs must not install APT or Cargo tooling at runtime"
@@ -333,6 +340,10 @@ if [ "$publish_runner" != '    runs-on: ubuntu-24.04' ]; then
 fi
 if ! printf '%s\n' "$publish_job" | grep -F -q '    environment: release-signing'; then
     report "the tag-only publish job must use the protected release-signing environment"
+fi
+if ! printf '%s\n' "$publish_job" \
+    | grep -F -x -q "    if: github.repository_visibility == 'public' && startsWith(github.ref, 'refs/tags/v')"; then
+    report "the tag-only publish job must fail closed until the repository is public"
 fi
 if ! grep -F -q "printf '%s\\n' \"\$MINISIGN_PASSWORD\"" .github/workflows/release.yml \
     || ! grep -F -q "| minisign -S -s \"\$key\"" .github/workflows/release.yml; then
@@ -684,6 +695,13 @@ fi
 if grep -E -i -q 'APT packages are installed from Debian.s signed live repositories|Do not describe builds as bit-for-bit reproducible' release/README.md \
     || ! grep -F -q 'debian-snapshot.sources' release/README.md; then
     report "release signing documentation must describe the immutable snapshot and reproducibility gate"
+fi
+if grep -F -q 'Persistent native CI runners' THREAT_MODEL.md \
+    || grep -F -q 'Signed private GitHub release' THREAT_MODEL.md \
+    || grep -F -q 'docs/SELF-HOSTED-RUNNER.md' THREAT_MODEL.md \
+    || ! grep -F -q 'Public visibility is not release authorization' THREAT_MODEL.md \
+    || ! grep -F -q 'docs/GITHUB-HOSTED-RUNNERS.md' THREAT_MODEL.md; then
+    report "the threat model must describe the public-release boundary and GitHub-hosted runner strategy"
 fi
 
 if ! grep -F -q 'runs_on: ubuntu-24.04' .github/workflows/fuzz.yml \

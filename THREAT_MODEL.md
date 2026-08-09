@@ -2,10 +2,10 @@
 
 | Field | Value |
 | --- | --- |
-| Last reviewed | 2026-08-02 |
-| Baseline commit | `c11c5d2b7e61e4b30b20d4921315fcf31a86390e` |
+| Last reviewed | 2026-08-09 |
+| Baseline commit | `5efa3fdf6045753d7754cc98ef9192dfc1373cfa` |
 | Applies to | Planned VaultLink 0.5.0 on Debian 13 amd64 and arm64 |
-| Companion documents | [Security policy](SECURITY.md), [release checklist](docs/RELEASE-CHECKLIST.md), [runner strategy](docs/SELF-HOSTED-RUNNER.md) |
+| Companion documents | [Security policy](SECURITY.md), [release checklist](docs/RELEASE-CHECKLIST.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
 
 ## Purpose
 
@@ -95,7 +95,7 @@ kernel primitives include `openat2(2)`, `renameat2(2)`, and statx mount IDs.
 | Local unprivileged user | Interact with host resources allowed by Linux permissions | `vaultlink` uid, root, protected files, or Docker-group authority |
 | Host or storage administrator | Control the system or service inside the documented trust boundary | Independence for tamper-resistant audit evidence |
 | Repository contributor or dependency author | Propose source, workflow, lockfile, action, or container changes for review | Release tag authorization or repository-secret access by default |
-| Compromised persistent CI runner | Execute as the runner account and Docker-equivalent root; tamper with work performed on that runner | Selecting the hosted publish container or receiving Minisign secrets |
+| Compromised GitHub-hosted CI job | Control its ephemeral workspace, job-scoped token, and produced artifacts | Persistence into another job or access to signing secrets and write authority not assigned to that job |
 | Authorized release maintainer | Change reviewed repository configuration and push the annotated release tag | Permission to bypass exact-commit, evidence, pin, or key checks without changing reviewed controls |
 
 ## System and trust boundaries
@@ -111,11 +111,12 @@ flowchart LR
     App --> Journal["journald"]
     Journal --> WORM["Optional independent WORM sink"]
 
-    Source["Reviewed source and pins"] --> Runners["Persistent native CI runners"]
+    Public["Public readers, forks, and pull requests"] --> Source["Reviewed source and pins"]
+    Source --> Runners["Ephemeral GitHub-hosted native jobs"]
     Runners --> Artifacts["Unsigned build artifacts + evidence"]
-    Artifacts --> Publish["Ephemeral GitHub-hosted publish job"]
-    GitHub["GitHub vars, tag authorization, and secrets"] --> Publish
-    Publish --> Release["Signed private GitHub release"]
+    Artifacts --> Publish["Separate GitHub-hosted publish job"]
+    GitHub["Protected environment, vars, tag authorization, and secrets"] --> Publish
+    Publish --> Release["Signed public GitHub release"]
 ```
 
 | Boundary | Security decision |
@@ -127,9 +128,9 @@ flowchart LR
 | TB-05 VaultLink to mounted storage | Descriptor-relative capabilities, mount identity, internal namespaces, and atomic publication confine filesystem effects |
 | TB-06 External SMB writer to visible storage | External writers are trusted publishers but remain excluded from internal storage and local security state |
 | TB-07 VaultLink host to external audit sink | The local host is not an independent witness; WORM forwarding is required when tamper resistance matters |
-| TB-08 Reviewed source to persistent CI | Pins, policy checks, native isolation, and reproducibility evidence constrain build inputs; runner compromise remains in scope |
-| TB-09 Persistent CI to secret-bearing publication | Persistent runners provide unsigned artifacts only; an ephemeral hosted job independently selects its pinned image, verifies inputs, signs, and publishes |
-| TB-10 Maintainer authorization to release | An annotated version tag must equal the approved `main` commit and all exact-commit evidence must succeed |
+| TB-08 Reviewed source to GitHub-hosted CI | Full-SHA and digest pins, policy checks, ephemeral native jobs, and reproducibility evidence constrain build inputs; GitHub's runner and artifact isolation remain trusted |
+| TB-09 Public repository activity to secret-bearing publication | Public visibility grants read, fork, and pull-request access, not tag creation, environment approval, signing secrets, or publication authority; publication additionally requires public visibility, an authorized version tag, and the protected `release-signing` environment |
+| TB-10 Maintainer authorization to release | An annotated version tag must equal the approved `main` commit, the repository must be public, environment approval must succeed, and all exact-commit evidence must pass |
 
 ## Security invariants
 
@@ -149,7 +150,7 @@ A change that weakens one requires an explicit threat-model review.
 | INV-09 | An untrusted network peer cannot assert another client identity through forwarding headers | exact trusted-proxy allowlist and right-to-left chain validation |
 | INV-10 | RSA WebAuthn credentials remain unreachable while `RUSTSEC-2023-0071` is excepted | no RS256 advertising, centralized runtime rejection, persistence/authentication regression tests |
 | INV-11 | A release-time image is an exact reviewed multi-architecture digest or the workflow fails before protected work | repository variable equals `deploy/docker/release-builder-image.lock`, builder verification and supply-chain policy |
-| INV-12 | Persistent runners never receive signing secrets or choose the environment that receives them | tag-only GitHub-hosted `publish` job, direct GitHub variable lookup, job-scoped permissions |
+| INV-12 | Pull-request and non-publish jobs never receive signing secrets or release write authority, and cannot choose the environment that does | public-and-tag-only GitHub-hosted `publish` job, protected `release-signing` environment, direct GitHub variable lookup, job-scoped permissions |
 | INV-13 | Signed artifacts correspond to the exact approved commit and verified native/reproducible evidence | release workflow gates, checksums, SBOMs, soak evidence, exact tag-to-`main` equality |
 | INV-14 | Missing Minisign material, builder provisioning, or release evidence blocks publication | fail-closed workflow and unchecked release checklist gates |
 
@@ -201,8 +202,8 @@ test evidence against which each case is reviewed.
 | --- | --- | --- | --- |
 | TM-SC-01 | A mutable action, tool, base image, Debian mirror, or Rust dependency changes without review | Full action SHAs, image digests, exact toolchain/tools, immutable Debian snapshot/package lock, Cargo.lock, policy checks, Dependabot review | Registry, upstream, maintainer, and cryptographic trust are not eliminated. Reassess pinning or package source changes. |
 | TM-SC-02 | A vulnerable or malicious dependency enters the graph | Independent native audits, sole documented RSA exception, SBOMs, duplicate policy, locked builds, fuzz/lint/test gates | Audits detect known advisories, not all malicious behavior. Reassess every exception and security-sensitive dependency update. |
-| TM-SC-03 | A compromised persistent runner exfiltrates the signing key or write token | Signing and publication run only on an ephemeral GitHub-hosted runner; secrets are step-scoped; publication permissions are job-scoped; private key uses a temporary `0600` file | GitHub and an authorized maintainer remain trusted. Reassess runner placement, secret scope, or publication permissions. |
-| TM-SC-04 | A compromised persistent runner selects a malicious publish container | Hosted publish resolves its image directly from the GitHub-managed repository variable, not a runner output; image is digest-pinned and verified against the checked-in lock | A repository administrator can change the variable and is inside the release-authorization boundary. Reassess variable administration or environment protections. |
+| TM-SC-03 | A public contributor or compromised non-publish job reaches signing secrets or release write authority | Public visibility is not release authorization; release has no pull-request trigger, publish requires public visibility plus an authorized `v*` tag, and only the protected `release-signing` job receives job-scoped `contents: write` and signing secrets | GitHub configuration and authorized maintainers remain trusted. Reassess repository visibility, tag rules, environment protection, secret scope, or publication permissions. |
+| TM-SC-04 | A compromised build job selects a malicious publish container | Publish resolves its image directly from the GitHub-managed repository variable, not another job's output; the image is digest-pinned and verified against the checked-in lock | A repository administrator can change the variable and is inside the release-authorization boundary. Reassess variable administration or environment protections. |
 | TM-SC-05 | A runner tampers with native artifacts before signing | Separate architecture artifacts, internal checksums, exact-commit status, reproducibility evidence, hosted verification before signing | A coordinated compromise of all evidence producers or GitHub control plane remains outside the guaranteed boundary. Reassess artifact/evidence independence. |
 | TM-SC-06 | A stale, unreviewed, or partial commit is released | Annotated tag must equal current `origin/main`; candidate, reproducibility, soak, and release evidence are commit-bound; publication is tag-only | Maintainer and GitHub tag controls remain trusted. Any post-soak commit invalidates evidence. |
 | TM-SC-07 | Missing builder, public key, private key, or password causes an unsafe fallback | `UNPROVISIONED`, empty/mismatched variables, missing `release/minisign.pub`, absent secrets, or invalid evidence all fail closed | This intentionally blocks release readiness until explicit provisioning; no fallback is supported. |
@@ -213,7 +214,7 @@ test evidence against which each case is reviewed.
 | --- | --- | --- | --- |
 | TM-OPS-01 | Slow, parallel, or expensive requests exhaust the service | Layered connection/stream/upload/Argon2/ZIP/search/preview limits, request deadlines, body bounds, per-peer budgets | Volumetric attacks and shared upstream exhaustion require proxy/network controls. Reassess after the final load profile. |
 | TM-OPS-02 | Repeated process failure resets local defenses or makes the service unavailable | systemd hardening/restart policy, fail-closed startup, soak restart gate, upstream rate limits | VaultLink is single-process and its rate-limit counters are not persistent. A remotely triggerable restart is a security defect requiring immediate review. |
-| TM-OPS-03 | Host service privileges are used to attack the system | Dedicated user, empty capability set by default, restrictive systemd sandbox, narrow standalone capability override | Docker-group CI users and host root are privileged by design and require dedicated systems. Reassess service-unit overrides. |
+| TM-OPS-03 | Host service privileges are used to attack the system | Dedicated user, empty capability set by default, restrictive systemd sandbox, narrow standalone capability override | Host root is privileged by design; GitHub-hosted CI isolation and the GitHub control plane remain trusted separately. Reassess service-unit overrides. |
 | TM-OPS-04 | Operational privacy settings create misleading forensic expectations | Client-IP audit is opt-in, purge is constrained and audited, client IPs never mirror to journald | Privacy-preserving defaults reduce correlation. Operators must choose and document their lawful forensic requirements. |
 
 ## Accepted residual risks
@@ -232,6 +233,7 @@ The following are explicit design decisions, not undisclosed guarantees:
 | RA-08 | `RUSTSEC-2023-0071` remains in the lockfile | All compensating conditions and mandatory re-review triggers in `SECURITY.md` continue to hold |
 | RA-09 | Host root, storage administrators, GitHub administrators, and the GitHub control plane retain powerful trusted roles | Access is restricted, reviewed, and separated where the supported deployment requires it |
 | RA-10 | Release provisioning and final evidence are incomplete before the first supported tag | The workflow remains fail closed and no release is described as supported before every checklist gate succeeds |
+| RA-11 | The supported source repository and release are public | Public users may read, fork, and propose changes but receive no implicit write, tag, environment-approval, signing-secret, or release authority; branch, tag, and environment protections remain mandatory |
 
 ## Verification and evidence
 
@@ -258,6 +260,7 @@ checklist items or change an accepted residual risk.
 | Date | Baseline | Scope | Result |
 | --- | --- | --- | --- |
 | 2026-08-02 | `c11c5d2b7e61e4b30b20d4921315fcf31a86390e` | Initial 0.5.0 application, storage, deployment, CI, and release model | Trust boundaries, invariants, abuse cases, and accepted risks documented; open release gates remain fail closed |
+| 2026-08-09 | `5efa3fdf6045753d7754cc98ef9192dfc1373cfa` | Public-repository release and migration from persistent self-hosted CI to ephemeral GitHub-hosted runners | Public visibility is explicitly not release authorization; publication requires public visibility, an authorized exact-main tag, the protected signing environment, pinned inputs, and complete evidence |
 
 ## Review triggers
 
@@ -274,8 +277,9 @@ Review and update this model when any of the following changes:
   overwrite, delete, backup, migration, or rollback semantics;
 - audit atomicity, event retention, privacy settings, journald forwarding, or
   regulatory evidence requirements;
-- runner trust, workflow permissions, artifact flow, builder image selection,
-  repository variables, signing keys, tag authorization, or release evidence;
+- repository visibility, runner trust, workflow permissions, artifact flow,
+  builder image selection, repository variables, signing keys, branch/tag rules,
+  environment protection, or release evidence;
 - a new advisory, security incident, remotely triggerable restart, failed
   invariant, or material load/soak result.
 
