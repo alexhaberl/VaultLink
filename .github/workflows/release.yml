@@ -114,6 +114,8 @@ jobs:
           package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           test -n "$package_version"
           append_github_env "PACKAGE_VERSION=$package_version"
+          test "$PWD" = "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           candidate_commit=$GITHUB_SHA
           release_stage=$PREFLIGHT_MODE
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
