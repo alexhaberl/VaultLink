@@ -5,7 +5,7 @@ LANG=C
 export LC_ALL LANG
 
 state_root=${SOAK_STATE_ROOT:-/var/lib/vaultlink-soak}
-runner_group=github-runner
+runner_group=vaultlink-soak
 unit_prefix=vaultlink-soak@
 
 fail() {
@@ -36,7 +36,7 @@ expected_orchestration_hash=$4
 valid_commit "$commit" || { echo "invalid commit SHA" >&2; exit 64; }
 valid_hash "$expected_hash" || { echo "invalid binary SHA-256" >&2; exit 64; }
 valid_hash "$expected_orchestration_hash" || { echo "invalid orchestration SHA-256" >&2; exit 64; }
-getent group "$runner_group" >/dev/null || fail "runner group $runner_group does not exist"
+getent group "$runner_group" >/dev/null || fail "soak bridge group $runner_group does not exist"
 [ "$(uname -m)" = x86_64 ] || fail "soak host must be x86_64"
 [ -r /etc/os-release ] || fail "/etc/os-release is missing"
 os_id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')
@@ -52,8 +52,10 @@ os_version_id=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')
 actual_orchestration_hash=$(
     for file in \
         /usr/local/sbin/vaultlink-soak-control \
+        /usr/local/sbin/vaultlink-soak-remote \
         /usr/local/libexec/vaultlink/soak-monitor.sh \
         /usr/local/libexec/vaultlink/load-test.sh \
+        /usr/local/libexec/vaultlink/collect-soak-evidence.sh \
         /etc/systemd/system/vaultlink-soak@.service; do
         [ -f "$file" ] || fail "installed orchestration file is missing: $file"
         [ "$(stat -c '%u' "$file")" -eq 0 ] \

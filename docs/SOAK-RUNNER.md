@@ -1,18 +1,27 @@
-# Dedicated 72-hour soak runner
+# Dedicated 72-hour soak host
 
-The `vaultlink-soak` runner is a Debian 13 amd64 staging host, not a general CI
-worker. Register it at repository scope with the labels
-`self-hosted,Linux,X64,vaultlink-soak`, disable default-label job routing where
-possible, and allow only workflows from the protected `main` branch. Do not
-place signing keys, production credentials, or unrelated workloads on it.
+The soak system is a Debian 13 amd64 staging host, not a GitHub Actions runner.
+The protected manual workflows run on ephemeral GitHub-hosted Ubuntu VMs and
+connect through a dedicated, host-key-pinned SSH key. That key is restricted by
+`authorized_keys` to `vaultlink-soak-remote`, which accepts only validated
+`start` and `collect` requests. Do not place signing keys, GitHub tokens,
+production credentials, or unrelated workloads on the host.
 
 ## Host provisioning
 
 Deploy the exact 0.5.0 candidate through the normal verified upgrade procedure
 before starting a soak. The running `/proc/MAINPID/exe` hash must match the
 64-character hash supplied to the manual start workflow. Provision `curl`,
-`gh`, `sqlite3`, GNU coreutils, systemd, and a repository runner account/group
-named `github-runner`.
+`sqlite3`, GNU coreutils, OpenSSH server, `sudo`, and systemd. Create a locked,
+key-only bridge account and evidence group:
+
+```sh
+sudo addgroup --system vaultlink-soak
+sudo adduser --system --ingroup vaultlink-soak \
+  --home /var/lib/vaultlink-soak-bridge --shell /bin/sh vaultlink-soak-bridge
+sudo install -d -o vaultlink-soak-bridge -g vaultlink-soak -m 0700 \
+  /var/lib/vaultlink-soak-bridge/.ssh
+```
 
 Install the root-owned orchestration files from the same reviewed commit:
 
@@ -20,11 +29,49 @@ Install the root-owned orchestration files from the same reviewed commit:
 sudo install -d -o root -g root -m 0755 /usr/local/libexec/vaultlink
 sudo install -m 0755 tools/soak-monitor.sh /usr/local/libexec/vaultlink/soak-monitor.sh
 sudo install -m 0755 tools/load-test.sh /usr/local/libexec/vaultlink/load-test.sh
+sudo install -m 0755 tools/collect-soak-evidence.sh /usr/local/libexec/vaultlink/collect-soak-evidence.sh
 sudo install -m 0755 deploy/vaultlink-soak-control.sh /usr/local/sbin/vaultlink-soak-control
+sudo install -m 0755 deploy/vaultlink-soak-remote.sh /usr/local/sbin/vaultlink-soak-remote
 sudo install -m 0644 deploy/vaultlink-soak@.service /etc/systemd/system/vaultlink-soak@.service
-sudo install -d -o root -g github-runner -m 2750 /var/lib/vaultlink-soak
+sudo install -d -o root -g vaultlink-soak -m 2750 /var/lib/vaultlink-soak
 sudo systemctl daemon-reload
 ```
+
+Generate a dedicated Ed25519 key pair outside the repository. Install only its
+public key on the host, with the forced command and OpenSSH restrictions:
+
+```text
+restrict,command="/usr/local/sbin/vaultlink-soak-remote" ssh-ed25519 AAAA... vaultlink-soak-actions
+```
+
+Save that line as
+`/var/lib/vaultlink-soak-bridge/.ssh/authorized_keys`, owned by
+`vaultlink-soak-bridge:vaultlink-soak` with mode `0600`. Disable password and
+keyboard-interactive authentication for this account in `sshd_config`; the
+account must not have another SSH key.
+
+Grant only the validated root control entry through `/etc/sudoers.d/vaultlink-soak`:
+
+```text
+vaultlink-soak-bridge ALL=(root) NOPASSWD: /usr/local/sbin/vaultlink-soak-control start *
+```
+
+The root control independently requires exactly three lowercase hexadecimal
+arguments and rejects any other invocation. Do not grant general `systemctl`,
+file installation, shell, or editor access.
+
+Create the protected GitHub Environment `release-soak` and store:
+
+- `SOAK_SSH_HOST`: exact DNS name or IP address
+- `SOAK_SSH_PORT`: SSH port, normally `22`
+- `SOAK_SSH_USER`: `vaultlink-soak-bridge`
+- `SOAK_SSH_PRIVATE_KEY`: the dedicated private key
+- `SOAK_SSH_HOST_KEYS`: an exact `known_hosts` entry copied through a trusted
+  administrative channel, never obtained with `ssh-keyscan` inside the job
+
+Require maintainer approval for the environment. Rotate the bridge key if its
+private half is ever exposed and verify the host key out of band before
+updating `SOAK_SSH_HOST_KEYS`.
 
 Create `/etc/vaultlink/soak.env` as root with mode `0600`. It supplies the
 staging-only public share tokens and local paths without placing secrets in
@@ -58,11 +105,9 @@ for at least 200 additional files. The twelve required profiles retain 120
 namespaced 64 MiB random-payload files (7.5 GiB before filesystem overhead);
 the larger limits provide retry and operational reserve.
 
-Grant the runner passwordless sudo only for the fixed root-owned command
-`/usr/local/sbin/vaultlink-soak-control start` with its three validated hexadecimal
-arguments. Do not grant general `systemctl`, file-installation, shell, or editor
-access. Re-provision changed orchestration files before starting the final run;
-changing them afterwards changes the candidate commit and invalidates evidence.
+Re-provision every changed orchestration file before starting the final run.
+The control compares all installed orchestration hashes with the approved
+commit; changing them afterwards invalidates the evidence.
 
 ## Start, collection, and release binding
 
@@ -73,19 +118,22 @@ changing them afterwards changes the candidate commit and invalidates evidence.
    successful Candidate-Preflight's `vaultlink-release-amd64` artifact, verifies
    its checksum manifest, derives the binary hash, and requires all three values
    (artifact, input, live executable) to match.
-3. The root control verifies the live executable, creates a single locked state
+3. The hosted job opens the restricted SSH bridge. The root control verifies
+   the live executable, creates a single locked state
    directory and a commit/start/random upload namespace, and starts
    `vaultlink-soak@COMMIT.service`. The GitHub job exits;
    the systemd monitor and repeated load profiles continue without an Actions
    token.
-4. The hourly collector reads only group-readable evidence and uses unprivileged
+4. The hourly GitHub-hosted collector requests a tar stream from the forced
+   bridge. The remote collector reads only group-readable evidence and uses unprivileged
    `systemctl is-active`/`is-failed` queries for the exact commit-bound monitor
    unit. While running it
    refreshes the `vaultlink/72h-soak` pending status. At completion it verifies
    and uploads `soak-evidence-COMMIT`, then records success or failure on that
-   exact commit with a link to the collector run. Ensure the runner service can
-   read systemd unit state over the system bus; it receives no general sudo or
-   unit-control permission. Missing results from an inactive/failed unit, or
+   exact commit with a link to the collector run. The bridge account can read
+   systemd unit state over the system bus but receives no general sudo or
+   unit-control permission. The hosted job rejects archive traversal, links,
+   malformed metadata, or files outside the fixed evidence envelope. Missing results from an inactive/failed unit, or
    from a unit more than 15 minutes past its persisted deadline, become partial
    failure evidence instead of remaining pending.
 5. The tag workflow follows that link, downloads the artifact, revalidates at
@@ -98,9 +146,10 @@ SQLite integrity failures, error-priority service journal entries, RSS over
 256 MiB, more than 15 percent median RSS growth, failed load profiles, and a
 changed executable hash. Each load profile samples RSS every second, retains
 pre-/post-load state and the absolute peak, and uses its run-unique namespace so
-restarted soaks cannot collide with old uploads. A fresh last-hour collector job supplies a fresh
-GitHub token; the long-running service never depends on token lifetime.
+restarted soaks cannot collide with old uploads. Each collector job supplies a
+fresh GitHub token; neither the bridge nor the long-running service ever receives
+one.
 
-After the tag is published, archive the evidence outside the runner and remove
+After the tag is published, archive the evidence outside the host and remove
 the `active` state under an administrator-controlled maintenance procedure.
 Never remove or replace active evidence while the systemd unit is running.

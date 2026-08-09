@@ -2,7 +2,7 @@
 
 Status: 2026-08-09 for the native Linux amd64/arm64 release of 0.5.0.
 
-Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered through a dedicated pull request; the tag is created only after merge to `main`, with a clean worktree and every gate green.
+Goal: public GitHub release for Debian 13 amd64 and arm64. Work is delivered through a dedicated pull request; the repository and tag are made public only after merge to `main`, with a clean worktree and every gate green.
 
 ## Feature scope for 0.5.0
 
@@ -50,7 +50,6 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
 ## Explicit non-goals for 0.5.0
 
 - DEB package.
-- Public repository.
 - API tokens or third-party API clients as a stable public contract.
 - Inline preview for other file types.
 - Built-in ACME behind Nginx/Caddy; automatic TLS is for direct standalone port 443 only.
@@ -100,14 +99,14 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
 
 ## Remaining release gates
 
-- [ ] Ten-minute fuzz gate on amd64 and arm64 for path normalization, byte range, filenames, ZIP/search/preview paths, overwrite policy, real upload-request state, real Share-request policy, file mutation/subtree policy, and multipart streaming boundaries. The weekly native matrix runs all nine targets with four workers in three groups and a 120-minute timeout; the manual final-commit run remains the release gate.
+- [ ] Ten-minute fuzz gate on amd64 and arm64 for path normalization, byte range, filenames, ZIP/search/preview paths, overwrite policy, real upload-request state, real Share-request policy, file mutation/subtree policy, and multipart streaming boundaries. The weekly native matrix runs all nine targets with two workers while private and four when public, with a 120-minute timeout; the manual final-commit run remains the release gate.
 - [ ] Repeat `cargo-audit 0.22.2 --deny warnings --ignore RUSTSEC-2023-0071`, inspect the shared `Cargo.lock`, and confirm no additional exception exists.
 - [ ] GitHub Actions CI green on final `main`.
-- [ ] Locked release dry-run green on `[self-hosted, Linux, X64, vaultlink]` and `[self-hosted, Linux, ARM64, vaultlink]`, using exactly the digest-pinned multi-arch builder with no runtime APT/Cargo installation. Architecture-independent verification and preflight jobs run on arm64; only the tag-only signing and publishing job runs on GitHub-hosted `ubuntu-24.04`.
-- [ ] Before candidate preflight, generate and commit non-empty valid Minisign Ed25519 `release/minisign.pub` offline and provision both signing secrets. Do not change keys or builder pins after soak begins.
+- [ ] Locked release dry-run green on GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm`, using exactly the digest-pinned multi-arch Debian 13 builder with no runtime APT/Cargo installation. The tag-only signing and publishing job runs on a fresh `ubuntu-24.04` VM behind the protected `release-signing` environment.
+- [ ] Before candidate preflight, generate and commit non-empty valid Minisign Ed25519 `release/minisign.pub` offline and provision both signing secrets in the protected `release-signing` environment. Do not change keys or builder pins after soak begins.
 - [ ] amd64 and arm64 reproducibility evidence belongs to the exact final commit and contains equal hashes for both independent builds.
-- [ ] Provision `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD`; tag publication must fail without all three key materials.
-- [ ] An authorized maintainer pushes annotated `v0.5.0` only after merge and all gates. Because the private GitHub Free repository has no effective environment approval, tag authorization, exact tag/main equality, and the tag-only `contents: write` job form the explicit approval chain.
+- [ ] Provision `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` in `release-signing`; tag publication must fail without all three key materials.
+- [ ] An authorized maintainer approves the `release-signing` environment and pushes annotated `v0.5.0` only after merge and all gates. Exact tag/main equality and the tag-only `contents: write` job complete the approval chain.
 - [ ] Verify versioned amd64/arm64 archives, standalone binaries, README, LICENSE, examples, systemd/deploy files, `SHA256SUMS-*`, architecture-specific CycloneDX SBOMs, deterministic `tar.gz`, and tag-only Minisign signatures.
 
 ## Staging and public gates before final soak
@@ -137,8 +136,9 @@ Goal: private GitHub release for Debian 13 amd64 and arm64. Work is delivered th
   - complete CIFS unmount with a local fallback mountpoint is rejected before secret/database access;
   - local ext4/XFS production accepts root/internal/data on one mount outside the visible tree and rejects group/other/ACL-writable roots;
   - direct SMB changes appear in SMB-server audit and their VaultLink-audit/quota bypass is accepted.
-- [ ] Debian-13-amd64 load profile: 100 concurrent users, 40 download streams, 50-GiB sparse file, parallel uploads, no 5xx or corruption, metadata p95 below 750 ms, at most 256 MiB additional RSS.
+- [x] Debian-13-amd64 load profile: 100 concurrent users, 40 download streams, 50-GiB sparse file, parallel uploads, no 5xx or corruption, metadata p95 below 750 ms, at most 256 MiB additional RSS (operator-confirmed successful on native Debian 13 amd64 on 2026-08-09).
   - Docker evidence on `cf5f405` (2026-08-09): 2,000/2,000 metadata requests returned 200, all 40 parallel 64-MiB ranges returned 206 with identical hashes, and all ten parallel 64-MiB uploads were created and read back without corruption. Maximum RSS was 53,168 KiB. The latency gate remains open: metadata p95 was 1.463 seconds cold and 1.371 seconds warm on Docker Desktop.
+  - The later native Debian 13 amd64 run met the release thresholds, including metadata p95 below 750 ms; the slower Docker Desktop timing is retained only as historical, non-authoritative evidence.
 - [x] Public reverse-proxy endpoint (operator-confirmed on 2026-08-09): TLS/redirect, headers, cookies, login/MFA/logout, two real FIDO2 keys, admins, settings, audit, password/limit Shares, search, ZIP, previews, range/HEAD, subdirectory upload, authorized confirmed replacement only, upload-only restrictions, revoke/expiry/limit, and all JSON API flows.
 - [x] Standalone automatic TLS only with Let's Encrypt staging on a directly reachable standalone endpoint, never behind a reverse proxy (operator-confirmed on 2026-08-09).
 
@@ -148,7 +148,8 @@ Docker validation on GitHub `main` commit `cf5f405` also passed the pinned Debia
 
 - [ ] Before soak, replace `Unreleased release candidate` in the top changelog entry with the real planned UTC date (`YYYY-MM-DD`). Candidate-mode manual release workflow succeeds for that exact commit and sets `vaultlink/release-candidate-preflight`.
 - [ ] Start only after the final runtime deployment.
-- [ ] Start dedicated `[self-hosted, Linux, X64, vaultlink-soak]` Debian-13 runner only through the manual workflow on the exact `origin/main`; require candidate preflight and fail closed on OS/architecture mismatch.
+- [ ] Provision protected `release-soak` secrets for the dedicated SSH host, port, user, private key, and exact trusted `known_hosts` entry.
+- [ ] Start the dedicated Debian-13 amd64 soak host only through the protected GitHub-hosted workflow on exact `origin/main`; require candidate preflight, pinned SSH host keys, the forced-command bridge, and fail closed on OS/architecture mismatch.
 - [ ] Run at least 259200 seconds with no unplanned restarts, `PRAGMA integrity_check = ok`, continuous version `0.5.0`, no 5xx/panic/database journal errors, metadata p95 below 750 ms at the specified load, RSS at most 256 MiB and at most 15% growth between warm/final medians.
 - [ ] Hourly collector uploads atomic result, CSV, load reports, journal, commit, and full binary hash as `soak-evidence-COMMIT`, setting `vaultlink/72h-soak` to success.
 - [ ] Any commit change after soak begins, including docs/CI/deploy/config/version, invalidates the evidence and restarts the full gate.
@@ -163,4 +164,4 @@ Docker validation on GitHub `main` commit `cf5f405` also passed the pinned Debia
 - [ ] Changelog date equals the current UTC date during tagging. A missed date requires a new commit, candidate preflight, and full soak.
 - [ ] Create annotated `v0.5.0`; tag commit exactly equals approved `origin/main` and release secrets are authorized.
 - [ ] Offline `release/minisign.pub` is committed and both signing secrets are provisioned.
-- [ ] Tag workflow creates a private GitHub Release from CI-only artifacts; verify both archives, binaries, and architecture-specific `SHA256SUMS`/Minisign files against `release/minisign.pub`.
+- [ ] Tag workflow creates the GitHub Release from CI-only artifacts; verify both archives, binaries, and architecture-specific `SHA256SUMS`/Minisign files against `release/minisign.pub`.

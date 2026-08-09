@@ -30,8 +30,7 @@ concurrency:
 jobs:
   release_environment:
     name: Resolve pinned release environment
-    if: github.repository_visibility == 'private'
-    runs-on: [self-hosted, Linux, ARM64, vaultlink]
+    runs-on: ubuntu-24.04-arm
     env:
       RELEASE_BUILDER_IMAGE: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
     outputs:
@@ -63,23 +62,20 @@ jobs:
 
   build:
     name: Native Debian 13 (${{ matrix.release_architecture }})
-    if: github.repository_visibility == 'private'
     needs: release_environment
     strategy:
       fail-fast: false
       matrix:
         include:
           - release_architecture: amd64
-            runs_on: '["self-hosted", "Linux", "X64", "vaultlink"]'
+            runs_on: ubuntu-24.04
             expected_uname: x86_64
             expected_rust_host: x86_64-unknown-linux-gnu
-            self_hosted: true
           - release_architecture: arm64
-            runs_on: '["self-hosted", "Linux", "ARM64", "vaultlink"]'
+            runs_on: ubuntu-24.04-arm
             expected_uname: aarch64
             expected_rust_host: aarch64-unknown-linux-gnu
-            self_hosted: true
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 90
     container:
       image: ${{ needs.release_environment.outputs.image }}
@@ -96,12 +92,6 @@ jobs:
       PREFLIGHT_MODE: ${{ inputs.preflight_mode || 'dry-run' }}
       FULL_EVIDENCE_PREFLIGHT: "false"
     steps:
-      - name: Restore host workspace ownership before checkout
-        if: ${{ matrix.self_hosted }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -114,13 +104,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          append_github_env() {
+            printf '%s\n' "$1" >>"$GITHUB_ENV"
+          }
           expected_rust_version=$(sh tools/rust-toolchain-channel.sh)
           test "$(rustc --version | awk '{print $2}')" = "$expected_rust_version"
           test "$(uname -m)" = "$EXPECTED_UNAME"
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_RUST_HOST"
           package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           test -n "$package_version"
-          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
+          append_github_env "PACKAGE_VERSION=$package_version"
           candidate_commit=$GITHUB_SHA
           release_stage=$PREFLIGHT_MODE
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
@@ -205,7 +198,7 @@ jobs:
             evidence_output=$(sh tools/check-soak-evidence.sh "$candidate_commit" "$soak_dir")
             soak_binary_sha256=$(printf '%s\n' "$evidence_output" | sed -n 's/^binary_sha256=//p')
             test "${#soak_binary_sha256}" -eq 64
-            echo "SOAK_BINARY_SHA256=$soak_binary_sha256" >> "$GITHUB_ENV"
+            append_github_env "SOAK_BINARY_SHA256=$soak_binary_sha256"
 
             repro_context="vaultlink/reproducibility-$RELEASE_ARCHITECTURE"
             validate_gate "$repro_context" .github/workflows/reproducibility.yml
@@ -226,9 +219,9 @@ jobs:
             test "$(printf '%s\n' "$binary_hashes" | sort -u | grep -c .)" -eq 1
             test "$(printf '%s\n' "$archive_hashes" | grep -c .)" -eq 2
             test "$(printf '%s\n' "$archive_hashes" | sort -u | grep -c .)" -eq 1
-            echo "REPRO_BINARY_SHA256=$(printf '%s\n' "$binary_hashes" | head -n 1)" >> "$GITHUB_ENV"
-            echo "REPRO_ARCHIVE_SHA256=$(printf '%s\n' "$archive_hashes" | head -n 1)" >> "$GITHUB_ENV"
-            echo "FULL_EVIDENCE_PREFLIGHT=true" >> "$GITHUB_ENV"
+            append_github_env "REPRO_BINARY_SHA256=$(printf '%s\n' "$binary_hashes" | head -n 1)"
+            append_github_env "REPRO_ARCHIVE_SHA256=$(printf '%s\n' "$archive_hashes" | head -n 1)"
+            append_github_env 'FULL_EVIDENCE_PREFLIGHT=true'
           fi
           sh tools/check-supply-chain-policy.sh
       - name: Architecture-independent quality and dependency gates
@@ -294,18 +287,12 @@ jobs:
             dist/SHA256SUMS-${{ matrix.release_architecture }}
           if-no-files-found: error
           retention-days: 7
-      - name: Restore host workspace ownership
-        if: ${{ always() && matrix.self_hosted }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
-
   publish:
     name: Verify, sign, and publish
-    if: github.repository_visibility == 'private' && startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [release_environment, build]
     runs-on: ubuntu-24.04
+    environment: release-signing
     timeout-minutes: 30
     permissions:
       actions: read
@@ -313,7 +300,7 @@ jobs:
       packages: read
     container:
       # Resolve the secret-bearing job's image directly from GitHub configuration;
-      # never trust an output produced on a persistent self-hosted runner here.
+      # never let another job select the environment that receives the key.
       image: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
       credentials:
         username: ${{ github.actor }}
@@ -394,7 +381,7 @@ jobs:
               minisign -V -p release/minisign.pub -m "$asset" -x "${asset}.minisig"
             done
           done
-      - name: Create private release
+      - name: Create release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
@@ -425,9 +412,9 @@ jobs:
 
   dry_run:
     name: Verify combined dry run
-    if: github.repository_visibility == 'private' && !startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     needs: [release_environment, build]
-    runs-on: [self-hosted, Linux, ARM64, vaultlink]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
       actions: read
@@ -486,8 +473,10 @@ jobs:
               "$root/config/production-reverse-proxy.toml" \
               "$root/deploy/vaultlink-upgrade.sh" \
               "$root/deploy/vaultlink-rollback.sh" \
+              "$root/deploy/vaultlink-soak-remote.sh" \
               "$root/deploy/vaultlink-soak@.service" \
               "$root/docs/RELEASE-CHECKLIST.md" \
+              "$root/tools/collect-soak-evidence.sh" \
               "$root/docs/UPGRADE-ROLLBACK.md" \
               "$root/tools/check-soak-evidence.sh"; do
               grep -F -x -q "$required_path" <<<"$archive_listing"
@@ -513,9 +502,9 @@ jobs:
 
   publish_main_statuses:
     name: Publish exact-commit release preflight statuses
-    if: ${{ always() && github.repository_visibility == 'private' && github.ref == 'refs/heads/main' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
     needs: [release_environment, build, dry_run]
-    runs-on: [self-hosted, Linux, ARM64, vaultlink]
+    runs-on: ubuntu-24.04-arm
     permissions:
       statuses: write
     env:

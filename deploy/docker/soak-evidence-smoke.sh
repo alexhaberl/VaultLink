@@ -29,8 +29,10 @@ namespace=${commit}-1000000-0123456789abcdef
 orchestration_hash=$(
     for file in \
         deploy/vaultlink-soak-control.sh \
+        deploy/vaultlink-soak-remote.sh \
         tools/soak-monitor.sh \
         tools/load-test.sh \
+        tools/collect-soak-evidence.sh \
         deploy/vaultlink-soak@.service; do
         sha256sum "$file" | awk '{print $1}'
     done | sha256sum | awk '{print $1}'

@@ -83,8 +83,10 @@ case "$orchestration_sha256" in *[!0-9a-f]*|'') echo "invalid orchestration hash
 approved_orchestration_sha256=$(
     for file in \
         deploy/vaultlink-soak-control.sh \
+        deploy/vaultlink-soak-remote.sh \
         tools/soak-monitor.sh \
         tools/load-test.sh \
+        tools/collect-soak-evidence.sh \
         deploy/vaultlink-soak@.service; do
         [ -f "$file" ] || { echo "approved orchestration file is missing: $file" >&2; exit 1; }
         sha256sum "$file" | awk '{print $1}'

@@ -7,7 +7,7 @@ ConditionPathExists=/var/lib/vaultlink-soak/%i/unit.env
 [Service]
 Type=exec
 User=root
-Group=github-runner
+Group=vaultlink-soak
 EnvironmentFile=/etc/vaultlink/soak.env
 EnvironmentFile=/var/lib/vaultlink-soak/%i/unit.env
 ExecStart=/usr/local/libexec/vaultlink/soak-monitor.sh
