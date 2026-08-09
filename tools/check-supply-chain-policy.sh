@@ -199,6 +199,9 @@ fi
 if ! grep -F -q "docker run --rm --network none \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-evidence-smoke.sh" Makefile; then
     report "make docker-smoke must run soak-evidence-smoke.sh as vaultlink without network access"
 fi
+if ! grep -F -q "docker run --rm --network none --user root \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-remote-smoke.sh" Makefile; then
+    report "make docker-smoke must exercise the restricted soak bridge without network access"
+fi
 
 literal_dollar='$'
 release_container_value="${literal_dollar}{{ needs.release_environment.outputs.image }}"
@@ -209,7 +212,7 @@ exact_main_tag_reference="test \"${literal_dollar}tag_commit\" = \"${literal_dol
 ancestor_tag_reference="git merge-base --is-ancestor \"${literal_dollar}tag_commit\" \"${literal_dollar}main_commit\""
 release_container_count=$(grep -F -c "image: $release_container_value" .github/workflows/release.yml || true)
 if [ "$release_container_count" -ne 2 ]; then
-    report "self-hosted release containers must consume the validated prebuilt release image"
+    report "release build containers must consume the validated prebuilt release image"
 fi
 publish_job=$(awk '
     $0 == "  publish:" { publish = 1 }
@@ -247,7 +250,7 @@ fi
 if ! grep -F -q 'release-builder-image.lock' tools/verify-release-builder.sh \
     || ! grep -F -q "RELEASE_BUILDER_IMAGE\" != \"\$locked_image" tools/verify-release-builder.sh \
     || ! grep -F -q 'UNPROVISIONED' release/README.md \
-    || ! grep -F -q 'Dockerfile.release-builder' docs/SELF-HOSTED-RUNNER.md; then
+    || ! grep -F -q 'Dockerfile.release-builder' docs/GITHUB-HOSTED-RUNNERS.md; then
     report "checked-in builder pin, exact variable equality, and provisioning blocker must be documented"
 fi
 if grep -E -q '(install-pinned-debian-packages\.sh|cargo[[:space:]]+install[[:space:]])' \
@@ -280,8 +283,8 @@ builder_base_image=$(sed -n 's/^FROM[[:space:]][[:space:]]*\([^[:space:]][^[:spa
 if [ -z "$stable_toolchain" ] || [ -z "$docker_image" ] || [ -z "$builder_base_image" ]; then
     report "stable Rust toolchain and canonical container pin must be readable"
 else
-    if [ "$ci_toolchain_uses" -ne 2 ] || [ "$ci_toolchain_value_count" -ne 2 ] \
-        || [ "$ci_toolchain_refs" -ne 2 ] || [ "$ci_toolchain_resolvers" -ne 2 ]; then
+    if [ "$ci_toolchain_uses" -ne 4 ] || [ "$ci_toolchain_value_count" -ne 4 ] \
+        || [ "$ci_toolchain_refs" -ne 4 ] || [ "$ci_toolchain_resolvers" -ne 4 ]; then
         report "every stable Rust toolchain action must resolve rust-toolchain.toml exactly once"
     fi
     case "$docker_image" in
@@ -293,33 +296,41 @@ else
     fi
 fi
 
-for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
-    if ! grep -F -q '["self-hosted", "Linux", "X64", "vaultlink"]' "$workflow"; then
-        report "$workflow must keep amd64 on the dedicated self-hosted runner"
+for workflow in \
+    .github/workflows/ci.yml \
+    .github/workflows/fuzz.yml \
+    .github/workflows/release.yml \
+    .github/workflows/reproducibility.yml; do
+    if ! grep -F -q 'runs_on: ubuntu-24.04' "$workflow"; then
+        report "$workflow must keep amd64 on the pinned GitHub-hosted Ubuntu 24.04 runner"
     fi
-    if ! grep -F -q '["self-hosted", "Linux", "ARM64", "vaultlink"]' "$workflow"; then
-        report "$workflow must keep arm64 on the dedicated self-hosted runner"
+    if ! grep -F -q 'runs_on: ubuntu-24.04-arm' "$workflow"; then
+        report "$workflow must keep arm64 on the pinned GitHub-hosted Ubuntu 24.04 runner"
     fi
 done
 
 hosted_runner_lines=$(grep -R -H -E 'runs[_-]on:.*(ubuntu-|windows-|macos-)' .github/workflows || true)
-allowed_hosted_runner='.github/workflows/release.yml:    runs-on: ubuntu-24.04'
-allowed_hosted_runner_count=$(printf '%s\n' "$hosted_runner_lines" \
-    | grep -F -x -c "$allowed_hosted_runner" || true)
 unexpected_hosted_runners=$(printf '%s\n' "$hosted_runner_lines" \
-    | grep -F -v -x "$allowed_hosted_runner" || true)
+    | grep -E -v 'runs[_-]on: ubuntu-24\.04(-arm)?$' || true)
+unexpected_self_hosted=$(grep -R -H -F 'self-hosted' .github/workflows || true)
 publish_runner=$(awk '
     $0 == "  publish:" { publish = 1; next }
     publish && /^  [[:alnum:]_-]+:$/ { exit }
     publish && /^    runs-on:/ { print; exit }
 ' .github/workflows/release.yml)
-if [ "$allowed_hosted_runner_count" -ne 1 ] \
-    || [ "$publish_runner" != '    runs-on: ubuntu-24.04' ]; then
-    report "the tag-only publish job must use the sole approved GitHub-hosted ubuntu-24.04 runner"
+if [ "$publish_runner" != '    runs-on: ubuntu-24.04' ]; then
+    report "the tag-only publish job must use the pinned GitHub-hosted ubuntu-24.04 runner"
+fi
+if ! printf '%s\n' "$publish_job" | grep -F -q '    environment: release-signing'; then
+    report "the tag-only publish job must use the protected release-signing environment"
 fi
 if [ -n "$unexpected_hosted_runners" ]; then
     printf '%s\n' "$unexpected_hosted_runners" >&2
-    report "only the tag-only release publish job may use GitHub-hosted compute"
+    report "workflows may use only pinned GitHub-hosted Ubuntu 24.04 runner labels"
+fi
+if [ -n "$unexpected_self_hosted" ]; then
+    printf '%s\n' "$unexpected_self_hosted" >&2
+    report "public-repository workflows must not target persistent self-hosted runners"
 fi
 
 for architecture in amd64 arm64; do
@@ -471,8 +482,10 @@ for target in path_normalization byte_range filename zip_search_preview_paths up
 done
 
 for workflow in .github/workflows/soak-start.yml .github/workflows/soak-collect.yml; do
-    if ! grep -F -q 'runs-on: [self-hosted, Linux, X64, vaultlink-soak]' "$workflow"; then
-        report "$workflow must use the isolated amd64 soak runner"
+    if ! grep -F -q 'runs-on: ubuntu-24.04' "$workflow" \
+        || ! grep -F -q 'environment: release-soak' "$workflow" \
+        || ! grep -F -q 'tools/configure-soak-ssh.sh' "$workflow"; then
+        report "$workflow must use protected GitHub-hosted orchestration with pinned SSH transport"
     fi
     if grep -F -q 'pull_request:' "$workflow"; then
         report "$workflow must never accept pull-request execution"
@@ -486,9 +499,22 @@ if ! grep -F -q 'vaultlink/72h-soak' .github/workflows/soak-start.yml \
 fi
 if grep -F -q 'git fetch' .github/workflows/soak-start.yml \
     || ! grep -F -q 'git/ref/heads/main' .github/workflows/soak-start.yml; then
-    report "private-repository soak start must resolve the exact main ref through the authenticated GitHub API"
+    report "soak start must resolve the exact main ref through the authenticated GitHub API"
+fi
+if ! grep -F -q 'StrictHostKeyChecking yes' tools/configure-soak-ssh.sh \
+    || ! grep -F -q 'IdentitiesOnly yes' tools/configure-soak-ssh.sh \
+    || ! grep -F -q 'SOAK_SSH_HOST_KEYS' tools/configure-soak-ssh.sh \
+    || ! grep -F -q 'SSH_ORIGINAL_COMMAND' deploy/vaultlink-soak-remote.sh \
+    || ! grep -F -q 'unsupported bridge command' deploy/vaultlink-soak-remote.sh \
+    || ! grep -F -q "ssh -F \"\$SSH_CONFIG\" vaultlink-soak" .github/workflows/soak-start.yml \
+    || ! grep -F -q "ssh -F \"\$SSH_CONFIG\" vaultlink-soak collect" .github/workflows/soak-collect.yml; then
+    report "soak transport must pin the host and expose only the restricted start/collect bridge"
 fi
 if ! grep -F -q 'SOAK_ORCHESTRATION_SHA256' deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q '/usr/local/sbin/vaultlink-soak-remote' deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q '/usr/local/libexec/vaultlink/collect-soak-evidence.sh' deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q 'deploy/vaultlink-soak-remote.sh' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'tools/collect-soak-evidence.sh' .github/workflows/soak-start.yml \
     || ! grep -F -q 'orchestration_sha256=' tools/soak-monitor.sh \
     || ! grep -F -q 'approved_orchestration_sha256=' tools/check-soak-evidence.sh \
     || ! grep -F -q 'load profiles do not cover all 12 six-hour soak buckets' tools/check-soak-evidence.sh \
@@ -521,7 +547,10 @@ for numeric_script in \
     tools/soak-monitor.sh \
     tools/check-soak-evidence.sh \
     tools/collect-soak-evidence.sh \
+    tools/configure-soak-ssh.sh \
     deploy/vaultlink-soak-control.sh \
+    deploy/vaultlink-soak-remote.sh \
+    deploy/docker/soak-remote-smoke.sh \
     deploy/docker/soak-evidence-smoke.sh; do
     if ! grep -F -x -q 'LC_ALL=C' "$numeric_script" \
         || ! grep -F -x -q 'LANG=C' "$numeric_script" \
@@ -545,7 +574,7 @@ for gate_context in \
     case "$gate_context" in
         vaultlink/native-*)
             producer=.github/workflows/ci.yml
-            producer_context="vaultlink/native-${literal_dollar}{{ matrix.architecture }}"
+            producer_context="vaultlink/native-${literal_dollar}architecture"
             release_context=$gate_context
             ;;
         vaultlink/fuzz-*)
@@ -609,7 +638,7 @@ if ! grep -F -q -- '--name vaultlink-release-amd64' .github/workflows/soak-start
     report "soak start must bind its live binary hash to the candidate-preflight amd64 artifact"
 fi
 if ! grep -F -q 'ExecStart=/usr/local/libexec/vaultlink/soak-monitor.sh' deploy/vaultlink-soak@.service \
-    || ! grep -F -x -q 'Group=github-runner' deploy/vaultlink-soak@.service \
+    || ! grep -F -x -q 'Group=vaultlink-soak' deploy/vaultlink-soak@.service \
     || [ "$(grep -F -c -- '-m 2750' deploy/vaultlink-soak-control.sh || true)" -lt 2 ] \
     || ! grep -F -q "install -d -m 2750 \"\$SOAK_EVIDENCE_DIR\"" tools/soak-monitor.sh \
     || ! grep -F -q 'SOAK_SECONDS=259200' deploy/vaultlink-soak-control.sh; then
@@ -617,8 +646,8 @@ if ! grep -F -q 'ExecStart=/usr/local/libexec/vaultlink/soak-monitor.sh' deploy/
 fi
 
 repro_workflow=.github/workflows/reproducibility.yml
-if ! grep -F -q "runs_on: '[\"self-hosted\", \"Linux\", \"X64\", \"vaultlink\"]'" "$repro_workflow" \
-    || ! grep -F -q "runs_on: '[\"self-hosted\", \"Linux\", \"ARM64\", \"vaultlink\"]'" "$repro_workflow" \
+if ! grep -F -q 'runs_on: ubuntu-24.04' "$repro_workflow" \
+    || ! grep -F -q 'runs_on: ubuntu-24.04-arm' "$repro_workflow" \
     || ! grep -F -q 'target/repro-first' "$repro_workflow" \
     || ! grep -F -q 'target/repro-second' "$repro_workflow" \
     || [ "$(grep -E -c '^[[:space:]]+cmp[[:space:]]+' "$repro_workflow" || true)" -ne 3 ]; then
@@ -635,25 +664,25 @@ if grep -E -i -q 'APT packages are installed from Debian.s signed live repositor
     report "release signing documentation must describe the immutable snapshot and reproducibility gate"
 fi
 
-if ! grep -F -q "runs_on: '[\"self-hosted\", \"Linux\", \"X64\", \"vaultlink\"]'" .github/workflows/fuzz.yml \
-    || ! grep -F -q "runs_on: '[\"self-hosted\", \"Linux\", \"ARM64\", \"vaultlink\"]'" .github/workflows/fuzz.yml; then
+if ! grep -F -q 'runs_on: ubuntu-24.04' .github/workflows/fuzz.yml \
+    || ! grep -F -q 'runs_on: ubuntu-24.04-arm' .github/workflows/fuzz.yml; then
     report "fuzz workflow must retain native amd64 and arm64 matrix runners"
 fi
-if ! grep -F -q 'runs-on: [self-hosted, Linux, ARM64, vaultlink]' .github/workflows/security-audit.yml; then
-    report "security audit workflow must use the dedicated self-hosted arm64 runner"
+if ! grep -F -q 'runs-on: ubuntu-24.04-arm' .github/workflows/security-audit.yml; then
+    report "security audit workflow must use the pinned GitHub-hosted arm64 runner"
 fi
 
-arm64_release_jobs=$(grep -F -c 'runs-on: [self-hosted, Linux, ARM64, vaultlink]' .github/workflows/release.yml || true)
+arm64_release_jobs=$(grep -F -c 'runs-on: ubuntu-24.04-arm' .github/workflows/release.yml || true)
 if [ "$arm64_release_jobs" -ne 3 ]; then
-    report "architecture-independent release jobs other than tag publication must use the self-hosted arm64 runner"
+    report "architecture-independent release jobs other than tag publication must use GitHub-hosted arm64"
 fi
 
 if ! grep -F -q 'run: make fuzz-parallel' .github/workflows/fuzz.yml; then
     report "fuzz workflow must run all targets through the parallel Make target"
 fi
 
-if ! grep -E -q '^[[:space:]]+FUZZ_JOBS:[[:space:]]+4$' .github/workflows/fuzz.yml; then
-    report "fuzz workflow must run all nine targets across four workers"
+if ! grep -F -q "FUZZ_JOBS: ${literal_dollar}{{ github.repository_visibility == 'public' && '4' || '2' }}" .github/workflows/fuzz.yml; then
+    report "fuzz workflow must cap private runners at two and public runners at four workers"
 fi
 
 if ! grep -E -q '^[[:space:]]+CARGO_BUILD_JOBS:[[:space:]]+2$' .github/workflows/fuzz.yml; then

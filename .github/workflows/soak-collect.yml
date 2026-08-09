@@ -14,19 +14,88 @@ concurrency:
 jobs:
   collect:
     if: github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, Linux, X64, vaultlink-soak]
+    runs-on: ubuntu-24.04
+    environment: release-soak
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Read atomic host-side result
+      - name: Configure pinned soak-host SSH transport
+        id: ssh
+        shell: bash
+        env:
+          SOAK_SSH_HOST: ${{ secrets.SOAK_SSH_HOST }}
+          SOAK_SSH_PORT: ${{ secrets.SOAK_SSH_PORT }}
+          SOAK_SSH_USER: ${{ secrets.SOAK_SSH_USER }}
+          SOAK_SSH_PRIVATE_KEY: ${{ secrets.SOAK_SSH_PRIVATE_KEY }}
+          SOAK_SSH_HOST_KEYS: ${{ secrets.SOAK_SSH_HOST_KEYS }}
+        run: sh tools/configure-soak-ssh.sh
+      - name: Read atomic host-side result over restricted SSH
         id: collect
         shell: bash
+        env:
+          SSH_CONFIG: ${{ steps.ssh.outputs.config }}
         run: |
           set -euo pipefail
+          export LC_ALL=C LANG=C
+          bundle="$RUNNER_TEMP/soak-collector.tar.gz"
+          remote="$RUNNER_TEMP/soak-collector"
           destination="$RUNNER_TEMP/soak-evidence"
-          sh tools/collect-soak-evidence.sh "$destination"
+          test ! -e "$bundle"
+          test ! -e "$remote"
+          test ! -e "$destination"
+          ssh -F "$SSH_CONFIG" vaultlink-soak collect >"$bundle"
+          entries=$(tar -tzf "$bundle")
+          unsafe=$(printf '%s\n' "$entries" \
+            | grep -E -v '^(\./)?(collector\.(exit|log|output)|evidence(/[^/]+)*)/?$' \
+            || true)
+          test -z "$unsafe"
+          if printf '%s\n' "$entries" | sed 's#^\./##' \
+            | grep -E -q '(^|/)\.\.?(/|$)|^/'; then
+            echo 'remote soak bundle contains an unsafe path' >&2
+            exit 1
+          fi
+          unsafe_types=$(tar -tvzf "$bundle" | cut -c1 | grep -E -v '^[-d]$' || true)
+          test -z "$unsafe_types"
+          mkdir "$remote"
+          tar -xzf "$bundle" -C "$remote" --no-same-owner --no-same-permissions
+          test -s "$remote/collector.exit"
+          test -f "$remote/collector.log"
+          test -f "$remote/collector.output"
+          collector_exit=$(cat "$remote/collector.exit")
+          case "$collector_exit" in ''|*[!0-9]*) exit 1 ;; esac
+          if [[ "$collector_exit" -ne 0 ]]; then
+            sed -n '1,200p' "$remote/collector.log" >&2
+            exit "$collector_exit"
+          fi
+          output_value() {
+            key=$1
+            values=$(sed -n "s/^${key}=//p" "$remote/collector.output")
+            [[ "$(printf '%s\n' "$values" | grep -c . || true)" -le 1 ]]
+            printf '%s\n' "$values"
+          }
+          state=$(output_value state)
+          case "$state" in idle|pending|success|failure) ;; *) exit 1 ;; esac
+          printf 'state=%s\n' "$state" >>"$GITHUB_OUTPUT"
+          commit_sha=$(output_value commit_sha)
+          if [[ -n "$commit_sha" ]]; then
+            [[ "$commit_sha" =~ ^[0-9a-f]{40}$ ]]
+            printf 'commit_sha=%s\n' "$commit_sha" >>"$GITHUB_OUTPUT"
+          fi
+          if [[ "$state" == success || "$state" == failure ]]; then
+            test -d "$remote/evidence"
+            mv "$remote/evidence" "$destination"
+            printf 'evidence_dir=%s\n' "$destination" >>"$GITHUB_OUTPUT"
+            binary_sha256=$(output_value binary_sha256)
+            duration_seconds=$(output_value duration_seconds)
+            [[ "$binary_sha256" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$duration_seconds" =~ ^[0-9]+$ ]]
+            printf 'binary_sha256=%s\n' "$binary_sha256" >>"$GITHUB_OUTPUT"
+            printf 'duration_seconds=%s\n' "$duration_seconds" >>"$GITHUB_OUTPUT"
+          else
+            test ! -e "$remote/evidence"
+          fi
       - name: Verify successful evidence before publication
         id: verify
         if: ${{ always() && steps.collect.outcome == 'success' && steps.collect.outputs.state == 'success' }}

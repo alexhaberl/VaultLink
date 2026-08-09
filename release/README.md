@@ -8,7 +8,13 @@ minisign -G -p minisign.pub -s vaultlink-release.key
 
 Commit the public key as `release/minisign.pub`. Store the complete private key only in the GitHub Actions secret `MINISIGN_SECRET_KEY`; store its password in `MINISIGN_PASSWORD`. Never place the private key in the repository, VM, release artifact, or logs. The release workflow intentionally fails when the public key or either secret is absent.
 
-The current private GitHub Free repository does not rely on an Actions Environment as an approval boundary. Only an authorized maintainer may push the annotated release tag after every checklist gate is complete. The workflow independently requires the tag version to match Cargo metadata, verifies that the tagged commit equals the current `origin/main`, rebuilds/tests that commit on both native architectures, and grants `contents: write` only to the tag-only publish job. Branch dry-runs remain read-only.
+The tag-only publish job uses the protected `release-signing` GitHub Environment.
+Only an authorized maintainer may approve it and push the annotated release tag
+after every checklist gate is complete. The workflow independently requires the
+tag version to match Cargo metadata, verifies that the tagged commit equals the
+current `origin/main`, rebuilds/tests that commit on both native architectures,
+and grants `contents: write` only to the publish job. Branch dry-runs remain
+read-only.
 
 ## Supply-chain pin maintenance
 
@@ -58,12 +64,12 @@ cannot affect the pinned jobs.
 
 ## Multi-architecture assets
 
-Release builds are native: amd64 and arm64 run on their dedicated self-hosted
-runners. Architecture-independent verification and preflight jobs run on arm64.
-The tag-only signing and publishing job runs on an ephemeral GitHub-hosted
-`ubuntu-24.04` runner so release secrets never reach the persistent CI runners.
-Both builds use the same digest-pinned multi-platform Debian 13/Rust OCI index
-selected by `rust-toolchain.toml` and verify the host architecture before
+Release builds are native: amd64 runs on GitHub-hosted `ubuntu-24.04` and arm64
+on `ubuntu-24.04-arm`. Architecture-independent verification and preflight jobs
+run on arm64. The tag-only signing and publishing job uses a fresh
+`ubuntu-24.04` VM, so the release key and write token are discarded with that
+job. Both builds use the same digest-pinned multi-platform Debian 13/Rust OCI
+index selected by `rust-toolchain.toml` and verify the host architecture before
 compiling.
 
 Each architecture produces a versioned archive, standalone binary, CycloneDX

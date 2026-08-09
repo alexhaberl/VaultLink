@@ -15,22 +15,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
+  native:
     name: Native Linux (${{ matrix.architecture }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
         include:
           - architecture: amd64
-            runs_on: '["self-hosted", "Linux", "X64", "vaultlink"]'
+            runs_on: ubuntu-24.04
             expected_uname: x86_64
             expected_rust_host: x86_64-unknown-linux-gnu
           - architecture: arm64
-            runs_on: '["self-hosted", "Linux", "ARM64", "vaultlink"]'
+            runs_on: ubuntu-24.04-arm
             expected_uname: aarch64
             expected_rust_host: aarch64-unknown-linux-gnu
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
@@ -84,59 +83,141 @@ jobs:
         run: |
           cargo build --locked --bin vaultlink
           sh tools/check-version-consistency.sh --binary target/debug/vaultlink
-      - name: Install pinned coverage tool
-        if: matrix.architecture == 'arm64'
-        run: |
-          rustup component add llvm-tools-preview
-          cargo install --locked cargo-llvm-cov --version 0.8.6
-      - name: Coverage
-        if: matrix.architecture == 'arm64'
-        run: |
-          # Baseline measured on 2026-07-14: 83.74% lines. The initial
-          # regression floor is floor(83.74) - 2 percentage points.
-          cargo llvm-cov --locked --package vaultlink --all-targets --all-features \
-            --lcov --output-path coverage.lcov --fail-under-lines 81
-      - name: Upload coverage report
-        if: matrix.architecture == 'arm64'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-${{ github.sha }}
-          path: coverage.lcov
-          if-no-files-found: error
-          retention-days: 14
-      - name: Fuzz crate compiles
-        run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets
       - name: Deployment artifacts
         run: shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
       - name: Install pinned cargo-audit
         run: cargo install --locked cargo-audit --version 0.22.2
       - name: Audit workspace lockfile
         run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071
-      - name: Setup, API, root-helper, soak-evidence, upgrade, and rollback smokes
-        run: make docker-smoke
       - name: Native ${{ matrix.architecture }} release build on main
         if: github.event_name == 'push'
         run: |
           cargo build --locked --release
           sh tools/check-version-consistency.sh --binary target/release/vaultlink
-      - name: Publish exact-commit native gate
-        if: ${{ always() && github.event_name == 'push' }}
+
+  coverage:
+    name: Coverage (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve pinned Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: echo "channel=$(sh tools/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+          components: llvm-tools-preview
+      - name: Verify native architecture
+        run: test "$(uname -m)" = aarch64
+      - name: Install pinned coverage tool
+        run: cargo install --locked cargo-llvm-cov --version 0.8.6
+      - name: Coverage
+        run: |
+          # Baseline measured on 2026-07-14: 83.74% lines. The initial
+          # regression floor is floor(83.74) - 2 percentage points.
+          cargo llvm-cov --locked --package vaultlink --all-targets --all-features \
+            --lcov --output-path coverage.lcov --fail-under-lines 81
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage.lcov
+          if-no-files-found: error
+          retention-days: 14
+
+  fuzz_compile:
+    name: Fuzz crate compiles (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runs_on: ubuntu-24.04
+            expected_uname: x86_64
+          - architecture: arm64
+            runs_on: ubuntu-24.04-arm
+            expected_uname: aarch64
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve pinned Rust toolchain
+        id: rust_toolchain
+        shell: bash
+        run: echo "channel=$(sh tools/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ steps.rust_toolchain.outputs.channel }}
+      - name: Verify native architecture
+        run: test "$(uname -m)" = "${{ matrix.expected_uname }}"
+      - run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets
+
+  docker_smoke:
+    name: Docker smoke (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runs_on: ubuntu-24.04
+            expected_uname: x86_64
+          - architecture: arm64
+            runs_on: ubuntu-24.04-arm
+            expected_uname: aarch64
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify native architecture
+        run: test "$(uname -m)" = "${{ matrix.expected_uname }}"
+      - name: Setup, API, root-helper, soak-evidence, upgrade, and rollback smokes
+        run: make docker-smoke
+
+  publish_native_gates:
+    name: Publish exact-commit native gates
+    if: ${{ always() && github.event_name == 'push' }}
+    needs: [native, coverage, fuzz_compile, docker_smoke]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Publish aggregate amd64 and arm64 results
         env:
-          GATE_RESULT: ${{ job.status }}
+          NATIVE_RESULT: ${{ needs.native.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+          FUZZ_COMPILE_RESULT: ${{ needs.fuzz_compile.result }}
+          DOCKER_SMOKE_RESULT: ${{ needs.docker_smoke.result }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          case "$GATE_RESULT" in
-            success) state=success; description='Native CI and release build passed' ;;
-            *) state=failure; description='Native CI or release build failed' ;;
-          esac
-          curl --fail-with-body --silent --show-error \
-            --retry 5 \
-            --retry-delay 2 \
-            --retry-max-time 60 \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-            --data "{\"state\":\"$state\",\"context\":\"vaultlink/native-${{ matrix.architecture }}\",\"description\":\"$description\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}"
+          set -euo pipefail
+          state=success
+          description='Hosted native CI, release builds, fuzz compile, coverage, and Docker smokes passed'
+          for result in "$NATIVE_RESULT" "$COVERAGE_RESULT" "$FUZZ_COMPILE_RESULT" "$DOCKER_SMOKE_RESULT"; do
+            if [[ "$result" != success ]]; then
+              state=failure
+              description='A hosted native CI, fuzz, coverage, or Docker gate failed'
+            fi
+          done
+          for architecture in amd64 arm64; do
+            curl --fail-with-body --silent --show-error \
+              --retry 5 \
+              --retry-delay 2 \
+              --retry-max-time 60 \
+              --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+              --data "{\"state\":\"$state\",\"context\":\"vaultlink/native-$architecture\",\"description\":\"$description\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}"
+          done

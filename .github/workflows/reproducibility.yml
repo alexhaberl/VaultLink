@@ -11,7 +11,7 @@ permissions:
 jobs:
   release_environment:
     name: Resolve pinned reproducibility environment
-    runs-on: [self-hosted, Linux, ARM64, vaultlink]
+    runs-on: ubuntu-24.04-arm
     env:
       RELEASE_BUILDER_IMAGE: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
     outputs:
@@ -52,12 +52,12 @@ jobs:
       matrix:
         include:
           - architecture: amd64
-            runs_on: '["self-hosted", "Linux", "X64", "vaultlink"]'
+            runs_on: ubuntu-24.04
             expected_uname: x86_64
           - architecture: arm64
-            runs_on: '["self-hosted", "Linux", "ARM64", "vaultlink"]'
+            runs_on: ubuntu-24.04-arm
             expected_uname: aarch64
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 120
     container:
       image: ${{ needs.release_environment.outputs.image }}
@@ -104,6 +104,9 @@ jobs:
           sh tools/assemble-release-archive.sh \
             target/repro-first/release/vaultlink repro/first-sbom.cdx.json \
             repro/first-dist "$version" '${{ matrix.architecture }}'
+          # Standard hosted runners provide 14 GiB. Preserve the first outputs,
+          # then release its build tree before the independent second build.
+          rm -rf target/repro-first
 
           CARGO_TARGET_DIR=target/repro-second cargo build --locked --release
           rm -f ./*.cdx.json

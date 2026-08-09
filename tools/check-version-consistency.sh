@@ -131,8 +131,8 @@ fi
 
 if [ "$release_candidate" -eq 1 ] || [ -n "$release_tag" ]; then
     grep -Fq "# v$package_version release checklist" docs/RELEASE-CHECKLIST.md
-    grep -Fq "VaultLink-$package_version-debian13-amd64.tar.gz" docs/SELF-HOSTED-RUNNER.md
-    grep -Fq "VaultLink-$package_version-debian13-arm64.tar.gz" docs/SELF-HOSTED-RUNNER.md
+    grep -Fq "VaultLink-$package_version-debian13-amd64.tar.gz" docs/GITHUB-HOSTED-RUNNERS.md
+    grep -Fq "VaultLink-$package_version-debian13-arm64.tar.gz" docs/GITHUB-HOSTED-RUNNERS.md
 fi
 
 if [ -n "$release_tag" ]; then
