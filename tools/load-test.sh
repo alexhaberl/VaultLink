@@ -64,7 +64,21 @@ soak_curl() {
 }
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT HUP INT TERM
+admission_holders=""
+stop_admission_holders() {
+    for holder_pid in $admission_holders; do
+        kill "$holder_pid" 2>/dev/null || true
+    done
+    for holder_pid in $admission_holders; do
+        wait "$holder_pid" 2>/dev/null || true
+    done
+    admission_holders=""
+}
+cleanup() {
+    stop_admission_holders
+    rm -rf "$work"
+}
+trap cleanup EXIT HUP INT TERM
 # Generate one fresh, non-sparse payload per profile. Reusing it for the ten
 # parallel uploads keeps generation bounded while detecting zero/sparse damage.
 dd if=/dev/urandom of="$work/upload.bin" bs=1M count=64 status=none
@@ -85,31 +99,29 @@ rm "$work/expected-zero-range.bin"
 upload_hash=$(sha256sum "$work/upload.bin" | awk '{print $1}')
 
 verify_forwarded_admission_identity() {
-    holders=""
     identity=198.18.255.1
+    # Keep the server-side bodies open. The previous 1 MiB range fit into
+    # loopback TCP buffers, so VaultLink could release all admission permits
+    # before the rate-limited clients had drained their responses.
+    admission_range_end=1073741823
+    [ "$fixture_bytes" -gt "$admission_range_end" ] || {
+        echo "download fixture must be at least 1 GiB for the admission test" >&2
+        return 1
+    }
     holder=0
     while [ "$holder" -lt 16 ]; do
-        soak_curl "$identity" --silent --show-error --max-time 10 \
-            --limit-rate 1024 --range 0-1048575 \
+        curl --interface 127.0.0.1 --header "X-Forwarded-For: $identity" \
+            --silent --show-error --max-time 30 \
+            --limit-rate 1024 --range "0-$admission_range_end" \
             --dump-header "$work/admission-$holder.headers" --output /dev/null \
             "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download" &
-        holders="$holders $!"
+        admission_holders="$admission_holders $!"
         holder=$((holder + 1))
     done
-    stop_admission_holders() {
-        for holder_pid in $holders; do
-            kill "$holder_pid" 2>/dev/null || true
-        done
-        for holder_pid in $holders; do
-            wait "$holder_pid" 2>/dev/null || true
-        done
-    }
-    trap stop_admission_holders HUP INT TERM
     sleep 2
     for header in "$work"/admission-*.headers; do
         grep -E -q '^HTTP/[0-9.]+ 206([[:space:]]|$)' "$header" || {
             stop_admission_holders
-            trap - HUP INT TERM
             echo "could not saturate the forwarded stream admission key" >&2
             return 1
         }
@@ -121,13 +133,12 @@ verify_forwarded_admission_identity() {
         --range 0-0 --output /dev/null --write-out '%{http_code}' \
         "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download")
     stop_admission_holders
-    trap - HUP INT TERM
     [ "$same_status" = 503 ] || {
-        echo "same forwarded identity bypassed the per-client stream limit" >&2
+        echo "same forwarded identity bypassed the per-client stream limit (HTTP $same_status; expected 503)" >&2
         return 1
     }
     [ "$distinct_status" = 206 ] || {
-        echo "distinct forwarded identity did not receive an independent admission key" >&2
+        echo "distinct forwarded identity did not receive an independent admission key (HTTP $distinct_status; expected 206)" >&2
         return 1
     }
 }

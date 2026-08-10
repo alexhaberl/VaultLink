@@ -408,6 +408,91 @@ async fn response_admission_releases_handlers_but_bounds_stream_bodies() {
 }
 
 #[tokio::test]
+async fn trusted_forwarded_clients_receive_independent_stream_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut state = test_state(root.path(), data.path());
+    let mut config = (*state.config).clone();
+    config.server.mode = ServerMode::ReverseProxy;
+    config.reverse_proxy.enabled = true;
+    config.reverse_proxy.trust_x_forwarded_headers = true;
+    config.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    state.config = Arc::new(config);
+    state.response_admission = Arc::new(tokio::sync::Semaphore::new(
+        crate::MAX_IN_FLIGHT_STREAMS_PER_CLIENT + 2,
+    ));
+    state.stream_admission = Arc::new(tokio::sync::Semaphore::new(
+        crate::MAX_IN_FLIGHT_STREAMS_PER_CLIENT + 2,
+    ));
+    let app = Router::new()
+        .route(
+            "/download",
+            get(|| async {
+                Response::new(Body::from_stream(futures_util::stream::pending::<
+                    io::Result<Bytes>,
+                >()))
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            response_admission,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state,
+            audit_client_ip_context,
+        ));
+    let forwarded_request = |identity: &str| {
+        let mut request = Request::builder()
+            .uri("/download")
+            .header("x-forwarded-for", identity)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        request
+    };
+
+    let mut held_responses = Vec::new();
+    for _ in 0..crate::MAX_IN_FLIGHT_STREAMS_PER_CLIENT {
+        let response = app
+            .clone()
+            .oneshot(forwarded_request("198.18.255.1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        held_responses.push(response);
+    }
+
+    let same_client = app
+        .clone()
+        .oneshot(forwarded_request("198.18.255.1"))
+        .await
+        .unwrap();
+    assert_eq!(same_client.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        same_client.headers().get(header::RETRY_AFTER),
+        Some(&HeaderValue::from_static("1"))
+    );
+
+    let distinct_client = app
+        .clone()
+        .oneshot(forwarded_request("198.18.255.2"))
+        .await
+        .unwrap();
+    assert_eq!(distinct_client.status(), StatusCode::OK);
+
+    drop(held_responses);
+    assert_eq!(
+        app.oneshot(forwarded_request("198.18.255.1"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn malformed_trusted_forwarding_is_rejected_before_admission_with_security_headers() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
