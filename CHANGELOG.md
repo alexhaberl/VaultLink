@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 — 2026-08-13
+## 0.5.0 — 2026-08-14
 
 This work was developed under the internal `0.4.9` hardening candidate. That candidate is not published or tagged; the first releasable artifact containing these changes is 0.5.0.
 
