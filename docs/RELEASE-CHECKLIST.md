@@ -73,7 +73,8 @@ Goal: signed public GitHub release for Debian 13 amd64 and arm64. The repository
 - [ ] `make docker-smoke` on the final 0.5.0 source on amd64 and arm64.
 - [ ] Weekly/manual reproducibility workflow builds twice per architecture with empty targets and identical `SOURCE_DATE_EPOCH`; binary and archive SHA-256 values match bit-for-bit.
 - [x] Debian image, snapshot, and direct/transitive packages match `debian-snapshot.sources` and `debian-packages.lock`; the source-independent release builder was built natively by the manual GitHub workflow and published as a linux/amd64+linux/arm64 manifest on 2026-08-09.
-- [ ] After every change to `Dockerfile.release-builder`, including the pending base-digest update in PR #101, rebuild and publish the native amd64/arm64 image. Replace the old manifest in `release-builder-image.lock` with the new full `ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>` reference, set `VAULTLINK_RELEASE_BUILDER_IMAGE` to the same value, and verify package read access through the locked release dry-run before selecting the final candidate.
+- [x] After the base-digest update in PR #101, rebuilt and published the native amd64/arm64 release-builder image from `main` commit `013b2f5e2ee514e9f02dda9b3d3d2c86cd69bc2c` in [workflow run 31480630773](https://github.com/alexhaberl/VaultLink/actions/runs/31480630773). Pinned the resulting multiarch manifest `sha256:a2ce314620196c1d5ded1fd514910337878e888a6550be91d33519be4190f7ba` in `release-builder-image.lock` and `VAULTLINK_RELEASE_BUILDER_IMAGE` on 2026-08-11.
+- [ ] Verify Actions package read access and the updated builder through the locked release dry-run before selecting the final candidate.
 
 ## Historical observation before the 0.3.2 upgrade
 

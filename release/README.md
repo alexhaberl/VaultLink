@@ -9,8 +9,11 @@ minisign -G -p minisign.pub -s vaultlink-release.key
 Commit the public key as `release/minisign.pub`. Store the complete private key only in the GitHub Actions secret `MINISIGN_SECRET_KEY`; store its password in `MINISIGN_PASSWORD`. Never place the private key in the repository, VM, release artifact, or logs. The release workflow intentionally fails when the public key or either secret is absent.
 
 The tag-only publish job uses the protected `release-signing` GitHub Environment.
-Only an authorized maintainer may approve it and push the annotated release tag
-after every checklist gate is complete. The workflow independently requires the
+The owner-only `v*` tag ruleset allows only the repository owner to create,
+update, or delete release tags. The Environment intentionally has no required
+reviewer: this personal repository has only one authorized release approver, so
+preventing self-review would deadlock publication. Its deployment branch
+policies accept only `main` and `v*`. The workflow independently requires the
 repository to be public, requires the tag version to match Cargo metadata,
 verifies that the tagged commit equals the current `origin/main`, rebuilds/tests
 that commit on both native architectures, and grants `contents: write` only to
