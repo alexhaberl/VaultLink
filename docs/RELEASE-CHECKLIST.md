@@ -1,8 +1,8 @@
 # v0.5.0 release checklist
 
-Status: 2026-08-09 for the native Linux amd64/arm64 release of 0.5.0.
+Status: 2026-08-11 for the native Linux amd64/arm64 release of 0.5.0.
 
-Goal: public GitHub release for Debian 13 amd64 and arm64. Work is delivered through a dedicated pull request; the repository and tag are made public only after merge to `main`, with a clean worktree and every gate green.
+Goal: signed public GitHub release for Debian 13 amd64 and arm64. The repository is already public as an explicitly unreleased development tree so standard GitHub-hosted CI remains ephemeral and does not consume private-repository minutes. Only the signed `v0.5.0` tag and release assets are published after merge to `main`, with a clean worktree and every release gate green.
 
 ## Feature scope for 0.5.0
 
@@ -73,7 +73,7 @@ Goal: public GitHub release for Debian 13 amd64 and arm64. Work is delivered thr
 - [ ] `make docker-smoke` on the final 0.5.0 source on amd64 and arm64.
 - [ ] Weekly/manual reproducibility workflow builds twice per architecture with empty targets and identical `SOURCE_DATE_EPOCH`; binary and archive SHA-256 values match bit-for-bit.
 - [x] Debian image, snapshot, and direct/transitive packages match `debian-snapshot.sources` and `debian-packages.lock`; the source-independent release builder was built natively by the manual GitHub workflow and published as a linux/amd64+linux/arm64 manifest on 2026-08-09.
-- [ ] Replace `UNPROVISIONED` in `release-builder-image.lock` with the full `ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>` reference; `VAULTLINK_RELEASE_BUILDER_IMAGE` must match and Actions package read access must be verified by the locked release dry-run.
+- [ ] After every change to `Dockerfile.release-builder`, including the pending base-digest update in PR #101, rebuild and publish the native amd64/arm64 image. Replace the old manifest in `release-builder-image.lock` with the new full `ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>` reference, set `VAULTLINK_RELEASE_BUILDER_IMAGE` to the same value, and verify package read access through the locked release dry-run before selecting the final candidate.
 
 ## Historical observation before the 0.3.2 upgrade
 
@@ -104,10 +104,10 @@ Goal: public GitHub release for Debian 13 amd64 and arm64. Work is delivered thr
 - [ ] GitHub Actions CI green on final `main`.
 - [ ] Locked release dry-run green on GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm`, using exactly the digest-pinned multi-arch Debian 13 builder with no runtime APT/Cargo installation. The tag-only signing and publishing job runs on a fresh `ubuntu-24.04` VM behind the protected `release-signing` environment.
 - [x] Generated a password-protected Minisign Ed25519 key offline, committed only `release/minisign.pub`, and provisioned both signing secrets in the main-restricted `release-signing` environment on 2026-08-09. Do not change keys or builder pins after soak begins.
-- [ ] After the repository becomes public and before creating any `v*` tag, enable a required reviewer with self-review prevented on `release-signing`, and activate a `v*` tag ruleset that restricts creation, update, and deletion to authorized maintainers. Confirm that the workflow's public-visibility gate is present.
+- [x] After the repository became public and before creating any `v*` tag, restricted `release-signing` to the existing `main` branch and `v*` tag policies and activated a `v*` tag ruleset that restricts creation, update, and deletion to the repository owner on 2026-08-11. A required reviewer is intentionally not configured: this personal repository has only one authorized release approver, so preventing self-review would deadlock publication. The workflow's public-visibility gate remains present.
 - [ ] amd64 and arm64 reproducibility evidence belongs to the exact final commit and contains equal hashes for both independent builds.
 - [x] Provisioned `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` in `release-signing`; tag publication fails without all three key materials.
-- [ ] An authorized maintainer approves the `release-signing` environment and pushes annotated `v0.5.0` only after merge and all gates. Exact tag/main equality and the tag-only `contents: write` job complete the approval chain.
+- [ ] The repository owner pushes the signed, annotated `v0.5.0` tag only after merge and all gates. The owner-only tag ruleset, exact tag/main equality and the tag-only `contents: write` job complete the approval chain.
 - [ ] Verify versioned amd64/arm64 archives, standalone binaries, README, LICENSE, examples, systemd/deploy files, `SHA256SUMS-*`, architecture-specific CycloneDX SBOMs, deterministic `tar.gz`, and tag-only Minisign signatures.
 
 ## Staging and public gates before final soak

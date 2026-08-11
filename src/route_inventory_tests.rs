@@ -276,10 +276,10 @@ fn approved_source_level_registration_counts_include_test_fixtures() {
     let api_router = router_registration_block(API_SOURCE);
 
     assert_eq!(occurrences(&web, ".route("), 53);
-    assert_eq!(occurrences(&web_tests, ".route("), 3);
+    assert_eq!(occurrences(&web_tests, ".route("), 4);
     assert_eq!(
         occurrences(&web, ".route(") + occurrences(&web_tests, ".route("),
-        56
+        57
     );
     assert_eq!(occurrences(&api, ".route("), 29);
     assert_eq!(occurrences(&api_tests, ".route("), 1);
