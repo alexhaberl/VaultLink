@@ -179,4 +179,18 @@ sh tools/check-soak-evidence.sh "$commit" "$destination" >/dev/null
 [ "$(stat -c '%a' "$active")" = 2750 ] \
     || fail "synthetic evidence directory lost its setgid group-readable mode"
 
+latency_evidence="$work/latency-evidence"
+cp -R "$destination" "$latency_evidence"
+sed -i 's/,0\.100000$/,1.999999/' "$latency_evidence/load-1/metadata-load.csv"
+sed -i 's/^metadata_p95_seconds=0\.100000$/metadata_p95_seconds=1.999999/' \
+    "$latency_evidence/load-1/result.env"
+sh tools/check-soak-evidence.sh "$commit" "$latency_evidence" >/dev/null \
+    || fail "evidence verifier rejected metadata p95 below 2 seconds"
+sed -i 's/,1\.999999$/,2.000000/' "$latency_evidence/load-1/metadata-load.csv"
+sed -i 's/^metadata_p95_seconds=1\.999999$/metadata_p95_seconds=2.000000/' \
+    "$latency_evidence/load-1/result.env"
+if sh tools/check-soak-evidence.sh "$commit" "$latency_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted metadata p95 at the strict 2-second boundary"
+fi
+
 echo "Synthetic soak evidence collection and verification passed"

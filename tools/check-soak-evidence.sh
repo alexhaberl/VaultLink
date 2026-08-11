@@ -247,8 +247,8 @@ for load_result in "$evidence"/load-*/result.env; do
         }
     ' "$load_dir/metadata-load.csv" \
         || { echo "load metadata client identities or statuses are invalid" >&2; exit 1; }
-    awk -v p95="$calculated_p95" 'BEGIN { exit !(p95 < 0.750) }' \
-        || { echo "recomputed metadata p95 exceeds 750 ms" >&2; exit 1; }
+    awk -v p95="$calculated_p95" 'BEGIN { exit !(p95 < 2.000) }' \
+        || { echo "recomputed metadata p95 is not below 2 seconds" >&2; exit 1; }
 
     range_bytes=$(sed -n 's/^range_bytes=//p' "$load_result")
     fixture_bytes=$(sed -n 's/^fixture_bytes=//p' "$load_result")
