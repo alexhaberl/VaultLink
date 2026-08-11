@@ -10,6 +10,18 @@ fail() {
     exit 1
 }
 
+refresh_evidence_manifest() {
+    evidence=$1
+    manifest_tmp="$work/SHA256SUMS.tmp"
+    (
+        cd "$evidence"
+        find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum >"$manifest_tmp"
+        mv "$manifest_tmp" SHA256SUMS
+    )
+}
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 state="$work/state"
@@ -178,5 +190,21 @@ grep -F -x -q "commit_sha=$commit" "$outputs" || fail "collector changed the com
 sh tools/check-soak-evidence.sh "$commit" "$destination" >/dev/null
 [ "$(stat -c '%a' "$active")" = 2750 ] \
     || fail "synthetic evidence directory lost its setgid group-readable mode"
+
+latency_evidence="$work/latency-evidence"
+cp -R "$destination" "$latency_evidence"
+sed -i 's/,0\.100000$/,1.999999/' "$latency_evidence/load-1/metadata-load.csv"
+sed -i 's/^metadata_p95_seconds=0\.100000$/metadata_p95_seconds=1.999999/' \
+    "$latency_evidence/load-1/result.env"
+refresh_evidence_manifest "$latency_evidence"
+sh tools/check-soak-evidence.sh "$commit" "$latency_evidence" >/dev/null \
+    || fail "evidence verifier rejected metadata p95 below 2 seconds"
+sed -i 's/,1\.999999$/,2.000000/' "$latency_evidence/load-1/metadata-load.csv"
+sed -i 's/^metadata_p95_seconds=1\.999999$/metadata_p95_seconds=2.000000/' \
+    "$latency_evidence/load-1/result.env"
+refresh_evidence_manifest "$latency_evidence"
+if sh tools/check-soak-evidence.sh "$commit" "$latency_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted metadata p95 at the strict 2-second boundary"
+fi
 
 echo "Synthetic soak evidence collection and verification passed"

@@ -575,6 +575,13 @@ if ! grep -F -q 'dd if=/dev/urandom' tools/load-test.sh \
     || ! grep -F -q 'at least 16 GiB' docs/SOAK-RUNNER.md; then
     report "soak uploads must use non-sparse payloads with documented quota reserve"
 fi
+if ! grep -F -q 'p95 < 2.000' tools/load-test.sh \
+    || ! grep -F -q 'p95 < 2.000' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'strictly below' docs/SOAK-RUNNER.md \
+    || ! grep -F -q '2 seconds' docs/SOAK-RUNNER.md \
+    || ! grep -F -q 'metadata p95 below 2 seconds' docs/RELEASE-CHECKLIST.md; then
+    report "load execution, evidence verification, and release documentation must share the strict 2-second metadata p95 gate"
+fi
 for numeric_script in \
     tools/load-test.sh \
     tools/soak-monitor.sh \
