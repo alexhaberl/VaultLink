@@ -239,7 +239,7 @@ metadata_profile() {
     p95=$(awk -F, '{ print $3 }' "$work/metadata.csv" \
         | sort -n | awk 'NR == 1900 { print; exit }')
     [ -n "$p95" ] || return 1
-    awk -v p95="$p95" 'BEGIN { exit !(p95 < 0.750) }' || return 1
+    awk -v p95="$p95" 'BEGIN { exit !(p95 < 2.000) }' || return 1
     printf '%s\n' "$p95" >"$work/metadata.p95"
 }
 

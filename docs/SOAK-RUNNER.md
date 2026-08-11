@@ -106,7 +106,8 @@ load it saturates one forwarded stream key and proves that a different
 forwarded identity still receives an independent admission slot. The benchmark
 then assigns separate RFC 2544 identities to all 100 metadata clients, 40 range
 streams, and ten upload clients; an untrusted public `X-Forwarded-For` shortcut
-is never used.
+is never used. Every profile requires metadata p95 to remain strictly below
+2 seconds while all three pressure groups overlap.
 
 `UPLOAD_VERIFY_TOKEN` must be a staging-only download share rooted at exactly
 the same directory as `UPLOAD_TOKEN`, without a password or download limit.

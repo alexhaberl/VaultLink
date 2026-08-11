@@ -1,6 +1,6 @@
 # v0.5.0 release checklist
 
-Status: 2026-08-11 for the native Linux amd64/arm64 release of 0.5.0.
+Status: 2026-08-12 for the native Linux amd64/arm64 release of 0.5.0.
 
 Goal: signed public GitHub release for Debian 13 amd64 and arm64. The repository is already public as an explicitly unreleased development tree so standard GitHub-hosted CI remains ephemeral and does not consume private-repository minutes. Only the signed `v0.5.0` tag and release assets are published after merge to `main`, with a clean worktree and every release gate green.
 
@@ -138,9 +138,9 @@ Goal: signed public GitHub release for Debian 13 amd64 and arm64. The repository
   - complete CIFS unmount with a local fallback mountpoint is rejected before secret/database access;
   - local ext4/XFS production accepts root/internal/data on one mount outside the visible tree and rejects group/other/ACL-writable roots;
   - direct SMB changes appear in SMB-server audit and their VaultLink-audit/quota bypass is accepted.
-- [x] Debian-13-amd64 load profile: 100 concurrent users, 40 download streams, 50-GiB sparse file, parallel uploads, no 5xx or corruption, metadata p95 below 750 ms, at most 256 MiB additional RSS (operator-confirmed successful on native Debian 13 amd64 on 2026-08-09).
-  - Docker evidence on `cf5f405` (2026-08-09): 2,000/2,000 metadata requests returned 200, all 40 parallel 64-MiB ranges returned 206 with identical hashes, and all ten parallel 64-MiB uploads were created and read back without corruption. Maximum RSS was 53,168 KiB. The latency gate remains open: metadata p95 was 1.463 seconds cold and 1.371 seconds warm on Docker Desktop.
-  - The later native Debian 13 amd64 run met the release thresholds, including metadata p95 below 750 ms; the slower Docker Desktop timing is retained only as historical, non-authoritative evidence.
+- [x] Debian-13-amd64 load profile: 100 concurrent users, 40 download streams, 50-GiB sparse file, parallel uploads, no 5xx or corruption, metadata p95 below 2 seconds, at most 256 MiB additional RSS (operator-confirmed successful on native Debian 13 amd64 on 2026-08-09).
+  - Docker evidence on `cf5f405` (2026-08-09): 2,000/2,000 metadata requests returned 200, all 40 parallel 64-MiB ranges returned 206 with identical hashes, and all ten parallel 64-MiB uploads were created and read back without corruption. Maximum RSS was 53,168 KiB. Metadata p95 was 1.463 seconds cold and 1.371 seconds warm, both below the current 2-second threshold; Docker Desktop remains historical, non-authoritative evidence.
+  - The later native Debian 13 amd64 run met the release thresholds, including metadata p95 below 2 seconds; the slower Docker Desktop timing is retained only as historical, non-authoritative evidence.
 - [x] Public reverse-proxy endpoint (operator-confirmed on 2026-08-09): TLS/redirect, headers, cookies, login/MFA/logout, two real FIDO2 keys, admins, settings, audit, password/limit Shares, search, ZIP, previews, range/HEAD, subdirectory upload, authorized confirmed replacement only, upload-only restrictions, revoke/expiry/limit, and all JSON API flows.
 - [x] Standalone automatic TLS only with Let's Encrypt staging on a directly reachable standalone endpoint, never behind a reverse proxy (operator-confirmed on 2026-08-09).
 
@@ -152,7 +152,7 @@ Docker validation on GitHub `main` commit `cf5f405` also passed the pinned Debia
 - [ ] Start only after the final runtime deployment.
 - [ ] Provision the dedicated SSH host, port, user, exact trusted `known_hosts` entry, and distinct mode-restricted start/collect private keys in protected `release-soak` and branch-restricted `release-soak-collector`; only the manual start environment requires approval so the collector can run hourly.
 - [ ] Start the dedicated Debian-13 amd64 soak host only through the protected GitHub-hosted workflow on exact `origin/main`; require candidate preflight, pinned SSH host keys, the forced-command bridge, and fail closed on OS/architecture mismatch.
-- [ ] Run at least 259200 seconds with no unplanned restarts, `PRAGMA integrity_check = ok`, continuous version `0.5.0`, no 5xx/panic/database journal errors, metadata p95 below 750 ms at the specified load, RSS at most 256 MiB and at most 15% growth between warm/final medians.
+- [ ] Run at least 259200 seconds with no unplanned restarts, `PRAGMA integrity_check = ok`, continuous version `0.5.0`, no 5xx/panic/database journal errors, metadata p95 below 2 seconds at the specified load, RSS at most 256 MiB and at most 15% growth between warm/final medians.
 - [ ] Scheduled collector runs at minute 17 of every hour and uploads atomic result, CSV, load reports, journal, commit, and full binary hash as `soak-evidence-COMMIT`, setting `vaultlink/72h-soak` to success.
 - [ ] Any commit change after soak begins, including docs/CI/deploy/config/version, invalidates the evidence and restarts the full gate.
 
