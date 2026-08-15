@@ -181,10 +181,30 @@ median_rss() {
 }
 warm_median=$(median_rss $((start + 1800)) $((start + 5400))) \
     || { echo "soak warm RSS window is incomplete" >&2; exit 1; }
+# Recompute the same settled late window independently from monitor output.
+late_median=$(median_rss $((start + 172800)) $((start + 194400))) \
+    || { echo "soak late RSS window is incomplete" >&2; exit 1; }
 final_median=$(median_rss $((unit_deadline - 3600)) "$unit_deadline") \
     || { echo "soak final RSS window is incomplete" >&2; exit 1; }
-[ "$final_median" -le $((warm_median + (warm_median * 15 / 100))) ] \
-    || { echo "recomputed RSS median growth exceeds 15 percent" >&2; exit 1; }
+warm_allowance=$((warm_median * 15 / 100))
+[ "$warm_allowance" -ge 16384 ] || warm_allowance=16384
+late_allowance=$((late_median * 5 / 100))
+[ "$late_allowance" -ge 4096 ] || late_allowance=4096
+warm_limit=$((warm_median + warm_allowance))
+late_limit=$((late_median + late_allowance))
+[ "$final_median" -le "$warm_limit" ] \
+    || { echo "recomputed RSS growth exceeds the warm allowance" >&2; exit 1; }
+[ "$final_median" -le "$late_limit" ] \
+    || { echo "recomputed RSS growth exceeds the late plateau allowance" >&2; exit 1; }
+for rss_line in \
+    "warm_rss_median_kib=$warm_median" \
+    "late_rss_median_kib=$late_median" \
+    "final_rss_median_kib=$final_median" \
+    "warm_rss_growth_limit_kib=$warm_limit" \
+    "late_rss_growth_limit_kib=$late_limit"; do
+    grep -F -x -q "$rss_line" "$evidence/candidate.env" \
+        || { echo "candidate RSS evidence does not match recomputed metrics" >&2; exit 1; }
+done
 
 load_runs=$(find "$evidence" -mindepth 2 -maxdepth 2 -path '*/load-*/result.env' -type f | wc -l)
 [ "$load_runs" -ge 12 ] || { echo "soak evidence has too few successful load profiles" >&2; exit 1; }

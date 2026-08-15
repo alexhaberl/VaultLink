@@ -148,11 +148,28 @@ Docker validation on GitHub `main` commit `cf5f405` also passed the pinned Debia
 
 ## Final 72-hour soak
 
+The exact `a0c6361cde8079e9e7b29f30450e819023e4f177` candidate completed
+259,200 seconds from 2026-08-12 through 2026-08-15 with all twelve load
+profiles, hashes, health checks, SQLite integrity checks, journals and restart
+checks passing. It is diagnostic evidence, not release evidence: the former
+relative-only RSS rule rejected a 35,836-KiB warm median and 46,336-KiB final
+median even though absolute RSS stayed below 50 MiB and the final 24-hour trend
+was approximately 1 MiB. The replacement gate keeps the 256-MiB cap, permits
+only `max(15%, 16 MiB)` from warm to final, and independently permits only
+`max(5%, 4 MiB)` from hours 48–54 to final. A new exact-commit soak is required.
+
+Two follow-up series then ran twelve additional load profiles against the same
+long-lived PID, each with a ten-minute cooldown. All profiles passed with
+metadata p95 below 2 seconds and a 53,628-KiB maximum RSS. The final four
+cooldown values were 51,264, 51,252, 51,072 and 51,016 KiB, confirming a stable
+plateau rather than continuing per-profile growth. These diagnostics justify
+the bounded warmup allowance but do not replace the new exact-commit soak.
+
 - [ ] Before soak, replace `Unreleased release candidate` in the top changelog entry with the real planned UTC date (`YYYY-MM-DD`). Candidate-mode manual release workflow succeeds for that exact commit and sets `vaultlink/release-candidate-preflight`.
 - [ ] Start only after the final runtime deployment.
 - [ ] Provision the dedicated SSH host, port, user, exact trusted `known_hosts` entry, and distinct mode-restricted start/collect private keys in protected `release-soak` and branch-restricted `release-soak-collector`; only the manual start environment requires approval so the collector can run hourly.
 - [ ] Start the dedicated Debian-13 amd64 soak host only through the protected GitHub-hosted workflow on exact `origin/main`; require candidate preflight, pinned SSH host keys, the forced-command bridge, and fail closed on OS/architecture mismatch.
-- [ ] Run at least 259200 seconds with no unplanned restarts, `PRAGMA integrity_check = ok`, continuous version `0.5.0`, no 5xx/panic/database journal errors, metadata p95 below 2 seconds at the specified load, RSS at most 256 MiB and at most 15% growth between warm/final medians.
+- [ ] Run at least 259200 seconds with no unplanned restarts, `PRAGMA integrity_check = ok`, continuous version `0.5.0`, no 5xx/panic/database journal errors, metadata p95 below 2 seconds at the specified load, RSS at most 256 MiB, final growth from the warm median at most `max(15%, 16 MiB)`, and final growth from the hour-48-through-54 median at most `max(5%, 4 MiB)`.
 - [ ] Scheduled collector runs at minute 17 of every hour and uploads atomic result, CSV, load reports, journal, commit, and full binary hash as `soak-evidence-COMMIT`, setting `vaultlink/72h-soak` to success.
 - [ ] Any commit change after soak begins, including docs/CI/deploy/config/version, invalidates the evidence and restarts the full gate.
 

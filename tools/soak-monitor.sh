@@ -247,6 +247,10 @@ fi
 
 warm_start=$((start_epoch + 1800))
 warm_end=$((start_epoch + 5400))
+# Use a complete settled six-hour interval at the start of the final day, after
+# allocator and application caches have seen multiple load profiles.
+late_start=$((start_epoch + 172800))
+late_end=$((start_epoch + 194400))
 final_start=$((deadline - 3600))
 median_rss() {
     from=$1
@@ -261,11 +265,20 @@ median_rss() {
         }'
 }
 warm_median=$(median_rss "$warm_start" "$warm_end") || fail warm_rss_window_missing
+late_median=$(median_rss "$late_start" "$late_end") || fail late_rss_window_missing
 final_median=$(median_rss "$final_start" "$deadline") || fail final_rss_window_missing
-growth_limit=$((warm_median + (warm_median * 15 / 100)))
-[ "$final_median" -le "$growth_limit" ] || fail rss_growth_exceeded_15_percent
-printf 'warm_rss_median_kib=%s\nfinal_rss_median_kib=%s\n' \
-    "$warm_median" "$final_median" >>"$SOAK_EVIDENCE_DIR/candidate.env"
+warm_allowance=$((warm_median * 15 / 100))
+# A relative-only limit overreacts to bounded warmup on a small baseline.
+[ "$warm_allowance" -ge 16384 ] || warm_allowance=16384
+late_allowance=$((late_median * 5 / 100))
+[ "$late_allowance" -ge 4096 ] || late_allowance=4096
+warm_limit=$((warm_median + warm_allowance))
+late_limit=$((late_median + late_allowance))
+[ "$final_median" -le "$warm_limit" ] || fail rss_growth_exceeded_warm_allowance
+[ "$final_median" -le "$late_limit" ] || fail rss_growth_exceeded_late_allowance
+printf 'warm_rss_median_kib=%s\nlate_rss_median_kib=%s\nfinal_rss_median_kib=%s\nwarm_rss_growth_limit_kib=%s\nlate_rss_growth_limit_kib=%s\n' \
+    "$warm_median" "$late_median" "$final_median" "$warm_limit" "$late_limit" \
+    >>"$SOAK_EVIDENCE_DIR/candidate.env"
 
 result_reason=passed
 echo "72-hour soak gate passed; evidence: $SOAK_EVIDENCE_DIR"

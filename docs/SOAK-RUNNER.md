@@ -157,12 +157,16 @@ commit; changing them afterwards invalidates the evidence.
 
 The monitor rejects restarts, inactive health, non-0.5.0 health responses,
 SQLite integrity failures, error-priority service journal entries, RSS over
-256 MiB, more than 15 percent median RSS growth, failed load profiles, and a
-changed executable hash. Each load profile samples RSS every second, retains
-pre-/post-load state and the absolute peak, and uses its run-unique namespace so
-restarted soaks cannot collide with old uploads. Each collector job supplies a
-fresh GitHub token; neither the bridge nor the long-running service ever receives
-one.
+256 MiB, failed load profiles, and a changed executable hash. RSS retention must
+also pass both independent growth checks: the final-hour median may grow from
+the warm median by at most the larger of 15 percent or 16 MiB, and from the
+hour-48-through-54 median by at most the larger of 5 percent or 4 MiB. The
+absolute floor prevents a small, bounded allocator/cache warmup from dominating
+a low baseline, while the late-window check still rejects an ongoing trend.
+Each load profile samples RSS every second, retains pre-/post-load state and the
+absolute peak, and uses its run-unique namespace so restarted soaks cannot
+collide with old uploads. Each collector job supplies a fresh GitHub token;
+neither the bridge nor the long-running service ever receives one.
 
 After the tag is published, archive the evidence outside the host and remove
 the `active` state under an administrator-controlled maintenance procedure.
