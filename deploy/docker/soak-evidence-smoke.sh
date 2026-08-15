@@ -22,6 +22,40 @@ refresh_evidence_manifest() {
     )
 }
 
+rewrite_rss_evidence() {
+    evidence=$1
+    warm=$2
+    late=$3
+    final=$4
+    metrics_tmp="$work/metrics.csv.tmp"
+    awk -F, -v OFS=, -v start="$start" -v end="$end" \
+        -v warm="$warm" -v late="$late" -v final="$final" '
+        NR == 1 { print; next }
+        $1 >= start + 1800 && $1 <= start + 5400 { $4 = warm }
+        $1 >= start + 172800 && $1 <= start + 194400 { $4 = late }
+        $1 >= end - 3600 && $1 <= end { $4 = final }
+        { print }
+    ' "$evidence/metrics.csv" >"$metrics_tmp"
+    mv "$metrics_tmp" "$evidence/metrics.csv"
+
+    warm_allowance=$((warm * 15 / 100))
+    [ "$warm_allowance" -ge 16384 ] || warm_allowance=16384
+    late_allowance=$((late * 5 / 100))
+    [ "$late_allowance" -ge 4096 ] || late_allowance=4096
+    sed -i \
+        '/^warm_rss_median_kib=/d;
+         /^late_rss_median_kib=/d;
+         /^final_rss_median_kib=/d;
+         /^warm_rss_growth_limit_kib=/d;
+         /^late_rss_growth_limit_kib=/d' \
+        "$evidence/candidate.env"
+    printf 'warm_rss_median_kib=%s\nlate_rss_median_kib=%s\nfinal_rss_median_kib=%s\nwarm_rss_growth_limit_kib=%s\nlate_rss_growth_limit_kib=%s\n' \
+        "$warm" "$late" "$final" \
+        "$((warm + warm_allowance))" "$((late + late_allowance))" \
+        >>"$evidence/candidate.env"
+    refresh_evidence_manifest "$evidence"
+}
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 state="$work/state"
@@ -103,13 +137,23 @@ printf 'epoch,timestamp,pid,rss_kib,restarts,health_sha256,config_sha256,integri
 sample=0
 while [ "$sample" -le 864 ]; do
     epoch=$((start + (sample * 300)))
-    rss=100000
-    [ "$epoch" -lt $((end - 3600)) ] || rss=110000
+    rss=35000
+    [ "$epoch" -le $((start + 5400)) ] || rss=45000
+    [ "$epoch" -lt $((start + 172800)) ] || rss=45228
+    [ "$epoch" -le $((start + 194400)) ] || rss=45876
+    [ "$epoch" -lt $((end - 3600)) ] || rss=46336
     printf '%s,synthetic,1234,%s,0,%s,%s,ok\n' \
         "$epoch" "$rss" "$health_hash" "$config_hash" \
         >>"$active/metrics.csv"
     sample=$((sample + 1))
 done
+printf '%s\n' \
+    'warm_rss_median_kib=35000' \
+    'late_rss_median_kib=45228' \
+    'final_rss_median_kib=46336' \
+    'warm_rss_growth_limit_kib=51384' \
+    'late_rss_growth_limit_kib=49324' \
+    >>"$active/candidate.env"
 
 run=1
 while [ "$run" -le 12 ]; do
@@ -205,6 +249,26 @@ sed -i 's/^metadata_p95_seconds=1\.999999$/metadata_p95_seconds=2.000000/' \
 refresh_evidence_manifest "$latency_evidence"
 if sh tools/check-soak-evidence.sh "$commit" "$latency_evidence" >/dev/null 2>&1; then
     fail "evidence verifier accepted metadata p95 at the strict 2-second boundary"
+fi
+
+warm_boundary_evidence="$work/warm-boundary-evidence"
+cp -R "$destination" "$warm_boundary_evidence"
+rewrite_rss_evidence "$warm_boundary_evidence" 35000 51384 51384
+sh tools/check-soak-evidence.sh "$commit" "$warm_boundary_evidence" >/dev/null \
+    || fail "evidence verifier rejected the exact 16-MiB warm-growth boundary"
+rewrite_rss_evidence "$warm_boundary_evidence" 35000 51385 51385
+if sh tools/check-soak-evidence.sh "$commit" "$warm_boundary_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted warm RSS growth one KiB beyond its allowance"
+fi
+
+late_boundary_evidence="$work/late-boundary-evidence"
+cp -R "$destination" "$late_boundary_evidence"
+rewrite_rss_evidence "$late_boundary_evidence" 35000 45000 49096
+sh tools/check-soak-evidence.sh "$commit" "$late_boundary_evidence" >/dev/null \
+    || fail "evidence verifier rejected the exact 4-MiB late-growth boundary"
+rewrite_rss_evidence "$late_boundary_evidence" 35000 45000 49097
+if sh tools/check-soak-evidence.sh "$commit" "$late_boundary_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted late RSS growth one KiB beyond its allowance"
 fi
 
 echo "Synthetic soak evidence collection and verification passed"
