@@ -210,6 +210,7 @@ toolchain_resolver_reference="channel=${literal_dollar}(sh tools/rust-toolchain-
 toolchain_output_value="${literal_dollar}{{ steps.rust_toolchain.outputs.channel }}"
 exact_main_tag_reference="test \"${literal_dollar}tag_commit\" = \"${literal_dollar}main_commit\""
 ancestor_tag_reference="git merge-base --is-ancestor \"${literal_dollar}tag_commit\" \"${literal_dollar}main_commit\""
+safe_directory_reference="git config --global --add safe.directory \"${literal_dollar}GITHUB_WORKSPACE\""
 release_container_count=$(grep -F -c "image: $release_container_value" .github/workflows/release.yml || true)
 if [ "$release_container_count" -ne 2 ]; then
     report "release build containers must consume the validated prebuilt release image"
@@ -340,6 +341,10 @@ if [ "$publish_runner" != '    runs-on: ubuntu-24.04' ]; then
 fi
 if ! printf '%s\n' "$publish_job" | grep -F -q '    environment: release-signing'; then
     report "the tag-only publish job must use the protected release-signing environment"
+fi
+if ! printf '%s\n' "$publish_job" \
+    | grep -F -q "$safe_directory_reference"; then
+    report "the containerized publish job must trust only its ephemeral checked-out workspace"
 fi
 if ! printf '%s\n' "$publish_job" \
     | grep -F -x -q "    if: github.repository_visibility == 'public' && startsWith(github.ref, 'refs/tags/v')"; then
