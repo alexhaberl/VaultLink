@@ -1,0 +1,35 @@
+[Unit]
+Description=Check for a signed VaultLink release update
+After=network-online.target local-fs.target vaultlink.service
+Wants=network-online.target
+ConditionFileIsExecutable=/usr/local/sbin/vaultlink-update
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/vaultlink-update auto
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateIPC=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RemoveIPC=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETGID CAP_SETUID
+ReadWritePaths=/opt/vaultlink /etc/vaultlink /var/lib/vaultlink /var/lib/vaultlink-backups /run/lock /var/tmp

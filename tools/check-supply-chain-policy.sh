@@ -202,6 +202,20 @@ fi
 if ! grep -F -q "docker run --rm --network none --user root \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-remote-smoke.sh" Makefile; then
     report "make docker-smoke must exercise the restricted soak bridge without network access"
 fi
+if ! grep -F -q "docker run --rm --network none --user root \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/update-safety-test.sh" Makefile; then
+    report "make docker-smoke must exercise signed release updates without external networking"
+fi
+if ! grep -F -q "github_origin=https://github.com" deploy/vaultlink-update.sh \
+    || ! grep -F -q "repository=alexhaberl/VaultLink" deploy/vaultlink-update.sh \
+    || ! grep -F -q -- "--proto '=https'" deploy/vaultlink-update.sh \
+    || ! grep -F -q "validate_stable_tag \"\$latest_tag\"" deploy/vaultlink-update.sh \
+    || ! grep -F -q "minisign -V -q -p \"\$public_key\"" deploy/vaultlink-update.sh \
+    || ! grep -F -q "cmp -s \"\$public_key\" \"\$candidate_public_key\"" deploy/vaultlink-update.sh \
+    || ! grep -F -q "candidate_version=\$(read_bounded_version" deploy/vaultlink-update.sh \
+    || ! grep -F -q 'systemctl --quiet is-active vaultlink.service' deploy/vaultlink-update.sh \
+    || ! grep -F -q "backup_directory=\$(\"\$candidate_upgrade\" \"\$candidate_binary\" \"\$live_config\")" deploy/vaultlink-update.sh; then
+    report "the release updater must remain repository-bound, signed, version-bound, and transactional"
+fi
 
 literal_dollar='$'
 release_container_value="${literal_dollar}{{ needs.release_environment.outputs.image }}"

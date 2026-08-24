@@ -54,6 +54,27 @@ for removed_asset in \
     [ ! -e "$removed_asset" ] || fail "$removed_asset is a removed legacy component"
 done
 
+for update_asset in \
+    deploy/vaultlink-update.sh \
+    deploy/vaultlink-update.conf.example \
+    deploy/vaultlink-update.service \
+    deploy/vaultlink-update.timer \
+    deploy/docker/update-safety-test.sh; do
+    [ -f "$update_asset" ] || fail "$update_asset is missing"
+done
+[ "$(sed -n 's/^auto_install=//p' deploy/vaultlink-update.conf.example)" = false ] \
+    || fail "automatic release installation must be opt-in"
+grep -F -x -q 'repository=alexhaberl/VaultLink' deploy/vaultlink-update.sh \
+    || fail "the updater repository must be fixed"
+grep -F -x -q 'public_key=/usr/share/vaultlink/minisign.pub' deploy/vaultlink-update.sh \
+    || fail "the updater trust key path must be fixed"
+grep -F -q "minisign -V -q -p \"\$public_key\"" deploy/vaultlink-update.sh \
+    || fail "the updater must verify release assets with the pinned Minisign key"
+grep -F -x -q 'ExecStart=/usr/local/sbin/vaultlink-update auto' deploy/vaultlink-update.service \
+    || fail "the update service must use the configured automatic mode"
+grep -F -x -q 'Persistent=true' deploy/vaultlink-update.timer \
+    || fail "the signed update timer must retain missed checks"
+
 helper=tools/prepare-load-fixture.sh
 grep -F -q '/usr/bin/env -i' "$helper" \
     || fail "load fixture root phase must clear the caller environment"

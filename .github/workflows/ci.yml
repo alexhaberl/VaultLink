@@ -182,7 +182,7 @@ jobs:
           persist-credentials: false
       - name: Verify native architecture
         run: test "$(uname -m)" = "${{ matrix.expected_uname }}"
-      - name: Setup, API, root-helper, soak-evidence, upgrade, and rollback smokes
+      - name: Setup, API, root-helper, soak, upgrade, rollback, and signed-update smokes
         run: make docker-smoke
 
   publish_native_gates:

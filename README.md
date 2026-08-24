@@ -61,7 +61,7 @@ VaultLink/
 │   ├── web.rs              stable HTML facade, router, API re-exports
 │   └── web/                middleware, rendering, browsing, transfer, upload domains
 ├── config/                 example configurations
-├── deploy/                 systemd, Caddy, upgrade/rollback
+├── deploy/                 systemd, Caddy, signed updates, upgrade/rollback
 ├── docs/                   upgrade, rollback, release gates
 ├── fuzz/                   path, range, multipart, preview, upload, API-policy fuzzing
 ├── Makefile
@@ -86,7 +86,7 @@ sudo deploy/vaultlink-upgrade.sh /pfad/zum/neuen/vaultlink /pfad/zur/neuen-confi
 
 The upgrade script is for an existing installation. Candidate configuration remains separate from live configuration until the stopped activation phase. Every verified backup and automatic restore contains the matching binary, `config.toml`, SQLite database, and `secrets.keyring`. Old and new binary/config pairs are validated as the unprivileged `vaultlink` user before downtime.
 
-Restore and rollback details: [docs/UPGRADE-ROLLBACK.md](docs/UPGRADE-ROLLBACK.md).
+Signed update, restore, and rollback details: [docs/UPGRADE-ROLLBACK.md](docs/UPGRADE-ROLLBACK.md).
 
 ## 4. Configuration model
 
@@ -293,7 +293,7 @@ Test first with `letsencrypt_staging = true` and `hsts_enabled = false`. For pro
 Use the signed Debian-13 archive matching the host architecture and verify signatures/checksums as described in [docs/UPGRADE-ROLLBACK.md](docs/UPGRADE-ROLLBACK.md):
 
 ```sh
-sudo apt update && sudo apt install -y cifs-utils coreutils curl sqlite3 util-linux
+sudo apt update && sudo apt install -y cifs-utils coreutils curl minisign sqlite3 util-linux
 
 sudo useradd --system --home /var/lib/vaultlink --shell /usr/sbin/nologin vaultlink
 sudo install -d -o root -g vaultlink -m 0750 /opt/vaultlink /etc/vaultlink /etc/vaultlink/tls
@@ -304,6 +304,28 @@ sudo systemctl daemon-reload
 ```
 
 Adjust `ReadWritePaths=/mnt/storage` in [deploy/vaultlink.service](deploy/vaultlink.service) to the validated mount base. Manual assets remain in [deploy/mnt-storage.mount.example](deploy/mnt-storage.mount.example) and [deploy/vaultlink-external-storage.conf](deploy/vaultlink-external-storage.conf).
+
+Optionally install the signed release updater. Its daily timer checks only the
+latest stable release from `alexhaberl/VaultLink`; automatic installation is
+disabled until the root-owned configuration explicitly enables it:
+
+```sh
+sudo install -d -o root -g root -m 0755 /usr/local/sbin /usr/share/vaultlink
+sudo install -o root -g root -m 0755 deploy/vaultlink-update.sh /usr/local/sbin/vaultlink-update
+sudo install -o root -g root -m 0644 minisign.pub /usr/share/vaultlink/minisign.pub
+sudo install -o root -g root -m 0644 deploy/vaultlink-update.service deploy/vaultlink-update.timer /etc/systemd/system/
+sudo test -e /etc/vaultlink/update.conf || sudo install -o root -g root -m 0644 deploy/vaultlink-update.conf.example /etc/vaultlink/update.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now vaultlink-update.timer
+```
+
+Use `sudo vaultlink-update check` for a non-mutating check and
+`sudo vaultlink-update install` for an immediate verified update. Set exactly
+`auto_install=true` in `/etc/vaultlink/update.conf` to let the timer install a
+newer signed release automatically while `vaultlink.service` is active. A
+deliberately stopped service remains untouched. Every installation retains the live
+configuration and delegates activation to the same complete backup, readiness,
+integrity, and automatic-rollback path as a manual upgrade.
 
 ### Provision a CIFS mount safely
 
