@@ -319,6 +319,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Trust checked-out release workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Container and host runner UIDs differ. Keep Git's ownership guard
+          # enabled everywhere else while trusting this ephemeral checkout.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Verify prebuilt release environment
         run: sh tools/verify-release-builder.sh
       - name: Verify release inputs

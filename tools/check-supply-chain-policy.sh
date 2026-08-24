@@ -342,6 +342,10 @@ if ! printf '%s\n' "$publish_job" | grep -F -q '    environment: release-signing
     report "the tag-only publish job must use the protected release-signing environment"
 fi
 if ! printf '%s\n' "$publish_job" \
+    | grep -F -q 'git config --global --add safe.directory "$GITHUB_WORKSPACE"'; then
+    report "the containerized publish job must trust only its ephemeral checked-out workspace"
+fi
+if ! printf '%s\n' "$publish_job" \
     | grep -F -x -q "    if: github.repository_visibility == 'public' && startsWith(github.ref, 'refs/tags/v')"; then
     report "the tag-only publish job must fail closed until the repository is public"
 fi

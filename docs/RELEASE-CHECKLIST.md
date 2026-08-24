@@ -1,8 +1,31 @@
 # v0.5.0 release checklist
 
-Status: 2026-08-12 for the native Linux amd64/arm64 release of 0.5.0.
+Status: released on 2026-08-24 for native Linux amd64 and arm64.
 
 Goal: signed public GitHub release for Debian 13 amd64 and arm64. The repository is already public as an explicitly unreleased development tree so standard GitHub-hosted CI remains ephemeral and does not consume private-repository minutes. Only the signed `v0.5.0` tag and release assets are published after merge to `main`, with a clean worktree and every release gate green.
+
+## Release outcome
+
+The signed, annotated `v0.5.0` tag targets exact `main` commit
+`60bfb9c60c5df408890b4a645218e2b99ff0906f`. GitHub verified its SSH
+signature, the exact-commit 72-hour soak and evidence preflight succeeded, and
+the tag workflow built both native architectures successfully. The amd64
+release binary retained the soak-verified SHA-256
+`fd6bc4fb6c4fe405fdffdb738300d9546bcf2006941201082e93b2cc25aae319`.
+
+The tag workflow's protected publish job stopped before downloading, signing,
+or publishing assets because Git rejected the container-mounted checkout as a
+repository with dubious ownership. The owner completed a controlled recovery
+from only the two successful, CI-produced architecture artifacts from that tag
+run: all architecture-specific checksum manifests and the soak binary hash
+were verified locally, the six intended assets were signed with the same
+offline Minisign key represented by `release/minisign.pub`, every signature was
+verified, and the 14 uploaded asset names, sizes, and GitHub SHA-256 digests
+were compared byte-for-byte with the verified local files. No tag, source,
+binary, archive, SBOM, or checksum manifest was rebuilt or modified during the
+recovery. The failed workflow run remains part of the audit trail, while the
+workflow now explicitly trusts only its ephemeral checked-out workspace before
+performing Git-based release checks.
 
 ## Feature scope for 0.5.0
 
