@@ -42,11 +42,12 @@ RUN test ! -e /work/config.toml \
     && ! find /work -type f -name '*.sqlite*' -print -quit | grep -q .
 
 RUN install -d /opt/vaultlink /var/lib/vaultlink \
-        /var/log/vaultlink /mnt/storage \
+        /var/log/vaultlink /mnt/storage /usr/local/sbin \
     && install -m 0755 /bin/true /opt/vaultlink/vaultlink \
+    && install -m 0755 deploy/vaultlink-update.sh /usr/local/sbin/vaultlink-update \
     && systemd-analyze verify deploy/vaultlink.service \
         deploy/vaultlink-update.service deploy/vaultlink-update.timer \
-    && rm -f /opt/vaultlink/vaultlink
+    && rm -f /opt/vaultlink/vaultlink /usr/local/sbin/vaultlink-update
 
 RUN cargo build --release --locked
 

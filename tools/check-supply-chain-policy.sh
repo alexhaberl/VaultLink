@@ -193,6 +193,11 @@ if ! grep -F -q 'shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh' "$smoke_d
     || ! grep -F -q 'sh tools/check-supply-chain-policy.sh' "$smoke_dockerfile"; then
     report "Docker smoke build must run shell and supply-chain policy gates"
 fi
+if ! grep -F -q 'install -m 0755 deploy/vaultlink-update.sh /usr/local/sbin/vaultlink-update' "$smoke_dockerfile" \
+    || ! grep -F -q 'systemd-analyze verify deploy/vaultlink.service' "$smoke_dockerfile" \
+    || ! grep -F -q 'deploy/vaultlink-update.service deploy/vaultlink-update.timer' "$smoke_dockerfile"; then
+    report "Docker smoke build must provision and verify the signed updater units"
+fi
 if ! grep -F -q "docker run --rm --network none --user root \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/load-fixture-smoke.sh" Makefile; then
     report "make docker-smoke must run load-fixture-smoke.sh as root without network access"
 fi
