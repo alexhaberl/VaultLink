@@ -54,10 +54,10 @@ from another job's output.
 
 Release asset names identify version, Debian baseline, and architecture:
 
-- `VaultLink-0.5.0-debian13-amd64.tar.gz`
-- `VaultLink-0.5.0-debian13-arm64.tar.gz`
-- `vaultlink-0.5.0-debian13-ARCH`
-- `vaultlink-0.5.0-debian13-ARCH.cdx.json`
+- `VaultLink-0.5.1-debian13-amd64.tar.gz`
+- `VaultLink-0.5.1-debian13-arm64.tar.gz`
+- `vaultlink-0.5.1-debian13-ARCH`
+- `vaultlink-0.5.1-debian13-ARCH.cdx.json`
 - `SHA256SUMS-ARCH`
 
 Archives, standalone binaries, and checksum manifests receive separate

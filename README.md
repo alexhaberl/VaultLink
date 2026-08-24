@@ -2,7 +2,7 @@
 
 VaultLink is a server-rendered Rust web application that securely exposes an already mounted Linux directory through public download and upload links. Supported host platforms are Linux x86_64 and aarch64; Windows host support was removed in 0.4.1. Windows, macOS, and Linux clients remain interoperable through an external standard SMB server.
 
-Status: `0.5.0` is planned as the next release for Debian 13 on amd64 and arm64. The release line is published only when the signed, annotated `v0.5.0` tag is available. See the [changelog](CHANGELOG.md) and [release checklist](docs/RELEASE-CHECKLIST.md) for scope and remaining release gates.
+Status: `0.5.1` is the current unreleased development line for Debian 13 on amd64 and arm64. The latest supported release remains the signed, annotated [`v0.5.0`](https://github.com/alexhaberl/VaultLink/releases/tag/v0.5.0). See the [changelog](CHANGELOG.md) for development changes and the historical [v0.5.0 release checklist](docs/RELEASE-CHECKLIST.md) for its evidence.
 
 ## 1. Security model
 
@@ -150,7 +150,7 @@ Audited co-writer mode requires:
 - `allow_external_writer_replace = true` explicitly accepts last-writer-wins lost-update risk.
 - The SMB server must require SMB 3.1.1 signing and encryption for every direct client session; VaultLink's `seal` protects only its own Linux mount.
 
-Other network filesystems with external writers are not approved in 0.5.0. Runtime-editable settings under `/admin/settings` include `public_base_url`, upload limits, blocked extensions, Share-password policy, unlock duration, ZIP/search/text/media preview limits and extensions, and PDF-preview status. Server mode, bind address, TLS paths, trusted proxies, storage paths, and ACME mode remain file/restart based.
+Other network filesystems with external writers are not approved in 0.5.x. Runtime-editable settings under `/admin/settings` include `public_base_url`, upload limits, blocked extensions, Share-password policy, unlock duration, ZIP/search/text/media preview limits and extensions, and PDF-preview status. Server mode, bind address, TLS paths, trusted proxies, storage paths, and ACME mode remain file/restart based.
 
 ## 5. Routes and API design
 
@@ -174,7 +174,7 @@ Other network filesystems with external writers are not approved in 0.5.0. Runti
 
 `max_downloads` counts completed content transfers (download, ZIP, counted preview), not public metadata/landing requests or uploads. `HEAD` returns metadata only when the equivalent `GET` could begin under the current transfer session and does not itself consume quota.
 
-The session-based JSON API under `/api/v2` uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Version 0.5.0 intentionally has no API tokens. Mutating administrator API routes require `X-CSRF-Token`. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
+The session-based JSON API under `/api/v2` uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Version 0.5.x intentionally has no API tokens. Mutating administrator API routes require `X-CSRF-Token`. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
 
 After `/api/v2/session/mfa`, clients must retain both the rotated `Set-Cookie` value and returned `csrf_token`; the pre-MFA token becomes invalid. Before a password-protected Share is unlocked, public metadata returns only `{"locked":true}`. The unlock response returns an upload CSRF token sent as multipart field `csrf` by browser forms or `X-VaultLink-Upload-CSRF` by API clients.
 

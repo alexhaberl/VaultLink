@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1 — Unreleased release candidate
+
+- Fixed Git ownership validation for the containerized tag-publishing job and documented the controlled `v0.5.0` recovery publication.
+- Refreshed the shared Rust 1.97.1 Debian container base digest for subsequent development builds.
+
 ## 0.5.0 — 2026-08-24
 
 This work was developed under the internal `0.4.9` hardening candidate. That candidate is not published or tagged; the first releasable artifact containing these changes is 0.5.0.

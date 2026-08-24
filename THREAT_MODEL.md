@@ -4,7 +4,7 @@
 | --- | --- |
 | Last reviewed | 2026-08-09 |
 | Baseline commit | `5efa3fdf6045753d7754cc98ef9192dfc1373cfa` |
-| Applies to | Planned VaultLink 0.5.0 on Debian 13 amd64 and arm64 |
+| Applies to | VaultLink 0.5.1 development on Debian 13 amd64 and arm64 |
 | Companion documents | [Security policy](SECURITY.md), [release checklist](docs/RELEASE-CHECKLIST.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
 
 ## Purpose

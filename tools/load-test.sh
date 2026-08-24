@@ -169,7 +169,7 @@ load_snapshot() {
     curl --fail --silent --show-error \
         "${VAULTLINK_HEALTH_URL:-http://127.0.0.1:8080/api/v2/health/ready}" \
         -o "$health_body"
-    expected_health="{\"ok\":true,\"version\":\"${SOAK_EXPECTED_VERSION:-0.5.0}\"}"
+    expected_health="{\"ok\":true,\"version\":\"${SOAK_EXPECTED_VERSION:-0.5.1}\"}"
     [ "$(cat "$health_body")" = "$expected_health" ] || return 1
     health_sha256=$(sha256sum "$health_body" | awk '{print $1}')
     integrity=$(sqlite3 "file:${VAULTLINK_DATABASE:-/var/lib/vaultlink/data.sqlite}?mode=ro" \

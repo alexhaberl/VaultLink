@@ -47,7 +47,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
           main_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
           test "$main_commit" = "$APPROVED_COMMIT"
-          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" = 0.5.0
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" = 0.5.1
           sh tools/check-version-consistency.sh --release-candidate
           sh tools/check-supply-chain-policy.sh
           validate_gate() {
@@ -102,7 +102,7 @@ jobs:
             cd "$candidate_artifact"
             sha256sum -c SHA256SUMS-amd64
           )
-          candidate_binary="$candidate_artifact/vaultlink-0.5.0-debian13-amd64"
+          candidate_binary="$candidate_artifact/vaultlink-0.5.1-debian13-amd64"
           test -s "$candidate_binary"
           candidate_binary_sha256=$(sha256sum "$candidate_binary" | awk '{print $1}')
           test "$candidate_binary_sha256" = "$APPROVED_BINARY_SHA256"
