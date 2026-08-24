@@ -9,7 +9,7 @@ production credentials, or unrelated workloads on the host.
 
 ## Host provisioning
 
-Deploy the exact 0.5.0 candidate through the normal verified upgrade procedure
+Deploy the exact 0.5.1 candidate through the normal verified upgrade procedure
 before starting a soak. The running `/proc/MAINPID/exe` hash must match the
 64-character hash supplied to the manual start workflow. Provision `curl`,
 `sqlite3`, GNU coreutils, OpenSSH server, `sudo`, and systemd. Create a locked,
@@ -155,7 +155,7 @@ commit; changing them afterwards invalidates the evidence.
    evidence hash with its newly built amd64 binary. A status from another
    commit, an expired/missing artifact, or any hash mismatch blocks release.
 
-The monitor rejects restarts, inactive health, non-0.5.0 health responses,
+The monitor rejects restarts, inactive health, non-0.5.1 health responses,
 SQLite integrity failures, error-priority service journal entries, RSS over
 256 MiB, failed load profiles, and a changed executable hash. RSS retention must
 also pass both independent growth checks: the final-hour median may grow from

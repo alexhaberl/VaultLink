@@ -19,8 +19,8 @@ fi
 if ! sh tools/check-version-consistency.sh; then
     report "package, documentation, and health version policy failed"
 fi
-if ! grep -F -x -q 'release_version=0.5.0' tools/check-version-consistency.sh; then
-    report "candidate and tag version policy must be fixed to the 0.5.0 release line"
+if ! grep -F -x -q 'release_version=0.5.1' tools/check-version-consistency.sh; then
+    report "candidate and tag version policy must be fixed to the 0.5.1 release line"
 fi
 if ! awk '
     $0 == "[profile.release]" { release_profile = 1; profiles++; next }

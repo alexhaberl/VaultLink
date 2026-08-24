@@ -7,7 +7,7 @@ operational requirements, advisory exceptions, and vulnerability reporting.
 
 ## Supported versions
 
-Release line: `0.5.0` for Linux x86_64 and aarch64. Its hardening work passed through the internal, untagged 0.4.9 candidate. Only artifacts attached to the signed, annotated `v0.5.0` tag are supported; if that tag is absent, no published version is supported. Windows hosts are not supported.
+Release line: `0.5.1` is the unreleased development line for Linux x86_64 and aarch64. The latest supported artifacts remain attached to the signed, annotated `v0.5.0` tag. Windows hosts are not supported.
 
 ## Build and release security
 

@@ -66,7 +66,7 @@ mkdir -p "$active"
 chmod 2750 "$state" "$active"
 ln -s "$commit" "$state/active"
 
-health='{"ok":true,"version":"0.5.0"}'
+health='{"ok":true,"version":"0.5.1"}'
 printf '%s' "$health" >"$active/health.json"
 health_hash=$(printf '%s' "$health" | sha256sum | awk '{print $1}')
 binary_hash=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
@@ -97,7 +97,7 @@ printf '%s\n' \
     'architecture=amd64' \
     'os_id=debian' \
     'os_version_id=13' \
-    'expected_version=0.5.0' \
+    'expected_version=0.5.1' \
     "start_epoch=$start" \
     "end_epoch=$end" \
     'duration_seconds=259200' \
@@ -116,7 +116,7 @@ printf '%s\n' \
     'SOAK_SECONDS=259200' \
     'SOAK_INTERVAL_SECONDS=300' \
     'SOAK_LOAD_INTERVAL_SECONDS=21600' \
-    'SOAK_EXPECTED_VERSION=0.5.0' \
+    'SOAK_EXPECTED_VERSION=0.5.1' \
     >"$active/unit.env"
 printf '%s\n' \
     "commit=$commit" \
@@ -127,7 +127,7 @@ printf '%s\n' \
     'os_id=debian' \
     'os_version_id=13' \
     "config_sha256=$config_hash" \
-    'expected_version=0.5.0' \
+    'expected_version=0.5.1' \
     "health_sha256=$health_hash" \
     >"$active/candidate.env"
 printf '%s\n' 'VaultLink soak fixture started normally' >"$active/vaultlink-journal.log"
