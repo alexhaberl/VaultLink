@@ -481,6 +481,10 @@ jobs:
               "$root/README.md" \
               "$root/bin/vaultlink" \
               "$root/config/production-reverse-proxy.toml" \
+              "$root/deploy/vaultlink-update.sh" \
+              "$root/deploy/vaultlink-update.conf.example" \
+              "$root/deploy/vaultlink-update.service" \
+              "$root/deploy/vaultlink-update.timer" \
               "$root/deploy/vaultlink-upgrade.sh" \
               "$root/deploy/vaultlink-rollback.sh" \
               "$root/deploy/vaultlink-soak-remote.sh" \

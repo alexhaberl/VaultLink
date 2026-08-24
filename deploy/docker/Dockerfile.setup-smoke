@@ -28,7 +28,7 @@ COPY release ./release
 COPY tools ./tools
 
 RUN chmod 0644 deploy/Caddyfile deploy/*.conf deploy/*.example \
-        deploy/vaultlink.service deploy/docker/*.lock \
+        deploy/*.service deploy/*.timer deploy/docker/*.lock \
         deploy/docker/*.sources tools/*.txt \
     && chmod 0755 deploy/*.sh deploy/docker/*.sh tools/*.sh \
     && groupadd --system vaultlink \
@@ -42,10 +42,12 @@ RUN test ! -e /work/config.toml \
     && ! find /work -type f -name '*.sqlite*' -print -quit | grep -q .
 
 RUN install -d /opt/vaultlink /var/lib/vaultlink \
-        /var/log/vaultlink /mnt/storage \
+        /var/log/vaultlink /mnt/storage /usr/local/sbin \
     && install -m 0755 /bin/true /opt/vaultlink/vaultlink \
+    && install -m 0755 deploy/vaultlink-update.sh /usr/local/sbin/vaultlink-update \
     && systemd-analyze verify deploy/vaultlink.service \
-    && rm -f /opt/vaultlink/vaultlink
+        deploy/vaultlink-update.service deploy/vaultlink-update.timer \
+    && rm -f /opt/vaultlink/vaultlink /usr/local/sbin/vaultlink-update
 
 RUN cargo build --release --locked
 

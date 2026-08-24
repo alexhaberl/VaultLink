@@ -4,6 +4,7 @@
 
 - Fixed Git ownership validation for the containerized tag-publishing job and documented the controlled `v0.5.0` recovery publication.
 - Refreshed the shared Rust 1.97.1 Debian container base digest for subsequent development builds.
+- Added an opt-in systemd updater that discovers only stable releases from the official GitHub repository, verifies the pinned Minisign key and signed architecture checksum before using the existing backup, readiness, and automatic-rollback upgrade path.
 
 ## 0.5.0 — 2026-08-24
 

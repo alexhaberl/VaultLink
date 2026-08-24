@@ -1,4 +1,4 @@
-.PHONY: dev-setup sample-data test security-test secret-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test
+.PHONY: dev-setup sample-data test security-test secret-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test docker-update-safety-test
 
 CONFIG ?= config/development.toml
 DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
@@ -68,6 +68,7 @@ docker-smoke: docker-smoke-build
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-evidence-smoke.sh
 	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-remote-smoke.sh
 	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh
+	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) sh deploy/docker/update-safety-test.sh
 
 docker-setup-smoke: docker-smoke-build
 	docker run --rm --network none $(DOCKER_SMOKE_IMAGE)
@@ -86,3 +87,6 @@ docker-soak-remote-smoke: docker-smoke-build
 
 docker-upgrade-safety-test: docker-smoke-build
 	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) bash deploy/docker/upgrade-safety-test.sh
+
+docker-update-safety-test: docker-smoke-build
+	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) sh deploy/docker/update-safety-test.sh

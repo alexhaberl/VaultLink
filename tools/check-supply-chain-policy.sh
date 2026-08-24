@@ -193,6 +193,11 @@ if ! grep -F -q 'shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh' "$smoke_d
     || ! grep -F -q 'sh tools/check-supply-chain-policy.sh' "$smoke_dockerfile"; then
     report "Docker smoke build must run shell and supply-chain policy gates"
 fi
+if ! grep -F -q 'install -m 0755 deploy/vaultlink-update.sh /usr/local/sbin/vaultlink-update' "$smoke_dockerfile" \
+    || ! grep -F -q 'systemd-analyze verify deploy/vaultlink.service' "$smoke_dockerfile" \
+    || ! grep -F -q 'deploy/vaultlink-update.service deploy/vaultlink-update.timer' "$smoke_dockerfile"; then
+    report "Docker smoke build must provision and verify the signed updater units"
+fi
 if ! grep -F -q "docker run --rm --network none --user root \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/load-fixture-smoke.sh" Makefile; then
     report "make docker-smoke must run load-fixture-smoke.sh as root without network access"
 fi
@@ -201,6 +206,20 @@ if ! grep -F -q "docker run --rm --network none \$(DOCKER_SMOKE_IMAGE) sh deploy
 fi
 if ! grep -F -q "docker run --rm --network none --user root \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/soak-remote-smoke.sh" Makefile; then
     report "make docker-smoke must exercise the restricted soak bridge without network access"
+fi
+if ! grep -F -q "docker run --rm --network none --user root \$(DOCKER_SMOKE_IMAGE) sh deploy/docker/update-safety-test.sh" Makefile; then
+    report "make docker-smoke must exercise signed release updates without external networking"
+fi
+if ! grep -F -q "github_origin=https://github.com" deploy/vaultlink-update.sh \
+    || ! grep -F -q "repository=alexhaberl/VaultLink" deploy/vaultlink-update.sh \
+    || ! grep -F -q -- "--proto '=https'" deploy/vaultlink-update.sh \
+    || ! grep -F -q "validate_stable_tag \"\$latest_tag\"" deploy/vaultlink-update.sh \
+    || ! grep -F -q "minisign -V -q -p \"\$public_key\"" deploy/vaultlink-update.sh \
+    || ! grep -F -q "cmp -s \"\$public_key\" \"\$candidate_public_key\"" deploy/vaultlink-update.sh \
+    || ! grep -F -q "candidate_version=\$(read_bounded_version" deploy/vaultlink-update.sh \
+    || ! grep -F -q 'systemctl --quiet is-active vaultlink.service' deploy/vaultlink-update.sh \
+    || ! grep -F -q "backup_directory=\$(\"\$candidate_upgrade\" \"\$candidate_binary\" \"\$live_config\")" deploy/vaultlink-update.sh; then
+    report "the release updater must remain repository-bound, signed, version-bound, and transactional"
 fi
 
 literal_dollar='$'

@@ -29,6 +29,68 @@ If activation, startup, readiness or the post-start integrity check fails, the s
 
 The candidate binary performs any supported forward schema migration when it starts. The upgrade script does not edit schemas, aliases, credentials or storage layouts itself. Because startup can advance the database to schema 6, keep the complete pre-upgrade backup until the candidate has been accepted. Advancing from schema 3 signs out all administrators once.
 
+## Signed GitHub release updater
+
+The optional root-owned updater uses the fixed
+`https://github.com/alexhaberl/VaultLink/releases/latest` endpoint. It accepts
+only a stable `vMAJOR.MINOR.PATCH` tag, Debian 13, and the host's exact
+`amd64`/`x86_64` or `arm64`/`aarch64` pairing. It does not accept a repository,
+URL, channel, public key, architecture, or release version from its
+configuration.
+
+Before executing release content it downloads the architecture-specific
+archive, its Minisign signature, `SHA256SUMS-ARCH`, and that manifest's
+signature into a root-controlled temporary directory. Both signatures must verify
+against `/usr/share/vaultlink/minisign.pub`; the signed checksum must match the
+archive; every archive path must remain below its exact versioned root; links
+and special files are rejected; the embedded public key must equal the pinned
+installed key; and the candidate binary must report the tagged version.
+Only root can modify the workspace or its contents. The exact candidate binary
+is made traversable and executable by the unprivileged `vaultlink` account only
+for its bounded version preflight; signatures, manifests, and helpers remain
+root-only.
+
+Install it from a previously verified release archive:
+
+```sh
+sudo apt install -y curl minisign
+sudo install -d -o root -g root -m 0755 /usr/local/sbin /usr/share/vaultlink
+sudo install -o root -g root -m 0755 deploy/vaultlink-update.sh /usr/local/sbin/vaultlink-update
+sudo install -o root -g root -m 0644 minisign.pub /usr/share/vaultlink/minisign.pub
+sudo install -o root -g root -m 0644 deploy/vaultlink-update.service deploy/vaultlink-update.timer /etc/systemd/system/
+sudo test -e /etc/vaultlink/update.conf || sudo install -o root -g root -m 0644 deploy/vaultlink-update.conf.example /etc/vaultlink/update.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now vaultlink-update.timer
+```
+
+The commands are:
+
+```sh
+sudo /usr/local/sbin/vaultlink-update check
+sudo /usr/local/sbin/vaultlink-update install
+sudo /usr/local/sbin/vaultlink-update auto
+```
+
+`check` reports the installed and latest versions without downloading or
+executing release assets. `install` installs only a newer verified release.
+`auto` is used by the timer: it remains check-only when the configuration is
+absent or contains `auto_install=false`, and installs when it contains exactly
+`auto_install=true` and `vaultlink.service` is currently active. A deliberately
+stopped service is never updated or started by the timer. Unknown, duplicate,
+writable, non-root-owned, or malformed
+configuration is rejected. Timer results are available through
+`journalctl -u vaultlink-update.service`.
+
+The updater executes the upgrade helper from the already verified release
+archive so a candidate may carry its matching migration orchestration. That
+helper still validates both Binary/Config pairs before downtime, holds the
+shared maintenance lock, preserves the existing configuration, creates the
+complete four-file backup, checks readiness and database integrity, and
+automatically restores the previous unit on failure. A missing release,
+network error, signature/checksum mismatch, unsupported host, downgrade,
+pre-release, malformed archive, or failed upgrade leaves the installed service
+unchanged. The Minisign trust key is never rotated automatically.
+
 ## Rollback
 
 Run:

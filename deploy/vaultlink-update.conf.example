@@ -1,0 +1,3 @@
+# The timer always checks the latest stable signed GitHub release. Keep this
+# false to report availability in the journal without changing the system.
+auto_install=false
