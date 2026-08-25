@@ -206,6 +206,18 @@ for workflow in \
         report "$workflow must be a protected, manual, main-only immutable-image refresh"
     fi
 done
+buildkit_image='docker.io/moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8'
+for refresh_workflow in \
+    .github/workflows/package-builders-refresh.yml \
+    .github/workflows/qemu-runner-refresh.yml; do
+    if ! grep -F -x -q "  BUILDKIT_IMAGE: $buildkit_image" "$refresh_workflow" \
+        || ! grep -F -q 'docker buildx create --driver docker-container' "$refresh_workflow" \
+        || ! grep -F -q -- '--driver-opt "image=$BUILDKIT_IMAGE" --name "$builder" --use' "$refresh_workflow" \
+        || ! grep -F -q 'docker buildx inspect --bootstrap' "$refresh_workflow"; then
+        report "$refresh_workflow must use the reviewed immutable BuildKit image with the docker-container driver"
+    fi
+done
+
 if ! grep -F -q 'package-targets.py matrix --allow-unprovisioned' .github/workflows/package-builders-refresh.yml \
     || ! grep -F -q 'runs-on: ${{ matrix.runner }}' .github/workflows/package-builders-refresh.yml \
     || ! grep -F -q 'push-by-digest=true' .github/workflows/package-builders-refresh.yml \

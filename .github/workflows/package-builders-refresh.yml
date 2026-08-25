@@ -35,6 +35,9 @@ concurrency:
   group: vaultlink-package-builder-refresh
   cancel-in-progress: false
 
+env:
+  BUILDKIT_IMAGE: docker.io/moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
 jobs:
   prepare:
     if: github.ref == 'refs/heads/main'
@@ -128,7 +131,8 @@ jobs:
           fi
           metadata="$RUNNER_TEMP/build-metadata.json"
           builder="vaultlink-package-builder-$TARGET_ID"
-          docker buildx create --driver docker-container --name "$builder" --use
+          docker buildx create --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE" --name "$builder" --use
           trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
           docker buildx inspect --bootstrap
           docker buildx build \
@@ -205,17 +209,17 @@ jobs:
             line=$(cat "digests/builder-digest-$first.tsv")
             IFS=$'\t' read -r first_id repository first_digest first_base first_packages first_snapshot <<<"$line"
             test "$first_id" = "$first"
-            refs="$repository@$first_digest"
+            refs=("$repository@$first_digest")
             if [[ -n "$second" ]]; then
               line=$(cat "digests/builder-digest-$second.tsv")
               IFS=$'\t' read -r second_id second_repository second_digest second_base second_packages second_snapshot <<<"$line"
               test "$second_id" = "$second"
               test "$second_repository" = "$repository"
-              refs="$refs $repository@$second_digest"
+              refs+=("$repository@$second_digest")
             fi
             # The tag is only a discovery aid; workflows consume the immutable digest.
             docker buildx imagetools create \
-              --tag "$repository:dependency-refresh-$GITHUB_RUN_ID" $refs
+              --tag "$repository:dependency-refresh-$GITHUB_RUN_ID" "${refs[@]}"
             docker buildx imagetools inspect \
               "$repository:dependency-refresh-$GITHUB_RUN_ID" --raw \
               | jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' \
