@@ -190,7 +190,7 @@
       "distribution": "arch",
       "version": "rolling",
       "snapshot_date": "UNPROVISIONED",
-      "snapshot_source": "https://archive.archlinux.org/repos/{snapshot_date}/$repo/os/$arch",
+      "snapshot_source": "https://archive.archlinux.org/repos/{year}/{month}/{day}/$repo/os/$arch",
       "architecture": "amd64",
       "runner": "ubuntu-24.04",
       "uname": "x86_64",

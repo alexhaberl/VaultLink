@@ -183,7 +183,7 @@ def validate(allow_unprovisioned: bool) -> dict:
         snapshot_date = target["snapshot_date"]
         snapshot_source = target["snapshot_source"]
         if target["distribution"] == "arch":
-            if snapshot_source != "https://archive.archlinux.org/repos/{snapshot_date}/$repo/os/$arch":
+            if snapshot_source != "https://archive.archlinux.org/repos/{year}/{month}/{day}/$repo/os/$arch":
                 die(f"{target_id} has an invalid Arch snapshot source")
             if snapshot_date == "UNPROVISIONED":
                 if not allow_unprovisioned:

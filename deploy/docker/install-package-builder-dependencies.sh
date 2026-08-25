@@ -87,9 +87,10 @@ case "$distribution:$version" in
             20??-??-??) ;;
             *) echo "Arch snapshot date is not provisioned" >&2; exit 77 ;;
         esac
+        arch_snapshot_path=$(printf '%s\n' "$arch_snapshot_date" | tr '-' '/')
         # shellcheck disable=SC2016
         printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' \
-            "$arch_snapshot_date" >/etc/pacman.d/mirrorlist
+            "$arch_snapshot_path" >/etc/pacman.d/mirrorlist
         # Refresh both databases and permit downgrades so a newer mutable base
         # cannot survive as a mixed state above the selected archive snapshot.
         pacman -Syyuu --noconfirm --needed \
