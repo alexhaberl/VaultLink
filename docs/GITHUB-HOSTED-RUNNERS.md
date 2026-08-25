@@ -35,10 +35,12 @@ or inconsistent.
 
 QEMU never compiles a release binary. KVM may accelerate a job when GitHub
 exposes it, but workflows cannot depend on KVM and must pass under software
-emulation. Fedora 44 guests keep SELinux `Enforcing`; disabling it invalidates
-the gate. The Arch guest and builder use the snapshot date committed for the
-candidate, while a separate weekly read-only job probes the current rolling
-image.
+emulation. The managed arm64 runner is always exercised with TCG because a
+visible `/dev/kvm` device does not guarantee usable nested virtualization;
+amd64 may use KVM when the runner exposes it. Fedora 44 guests keep SELinux
+`Enforcing`; disabling it invalidates the gate. The Arch guest and builder use
+the snapshot date committed for the candidate, while a separate weekly
+read-only job probes the current rolling image.
 
 ## Immutable images and refresh
 
