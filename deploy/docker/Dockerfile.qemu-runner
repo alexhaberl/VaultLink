@@ -12,7 +12,7 @@ RUN set -eu \
     && test "${VERSION_ID:-}" = 24.04 \
     && apt-get update \
     && if [ "$TARGETARCH" = amd64 ]; then qemu_packages=qemu-system-x86; \
-       elif [ "$TARGETARCH" = arm64 ]; then qemu_packages='qemu-system-arm qemu-efi-aarch64'; \
+       elif [ "$TARGETARCH" = arm64 ]; then qemu_packages='qemu-system-arm qemu-efi-aarch64 libguestfs-tools linux-image-virtual policycoreutils'; \
        else echo "unsupported QEMU runner architecture: $TARGETARCH" >&2; exit 1; fi \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates cloud-image-utils coreutils curl jq openssh-client openssl \

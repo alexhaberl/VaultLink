@@ -39,6 +39,21 @@ if [ "$distribution" != arch ]; then
 fi
 [ "$(cat /usr/local/share/vaultlink-vm-target)" = "$target_id" ]
 [ "$(sha256sum /usr/local/share/vaultlink-vm-packages.lock | awk '{print $1}')" = "$vm_packages_sha256" ]
+/bin/sh /tmp/check-vm-root-capacity.sh 6979321856 1073741824
+if [ "$distribution" = arch ]; then
+    [ -L /etc/systemd/system/systemd-time-wait-sync.service ]
+    [ "$(readlink /etc/systemd/system/systemd-time-wait-sync.service)" = /dev/null ]
+    systemctl is-enabled systemd-time-wait-sync.service | grep -F -x -q masked
+    [ "$(systemctl show -p LoadState --value systemd-time-wait-sync.service)" = masked ]
+    [ "$(systemctl show -p ActiveState --value systemd-time-wait-sync.service)" = inactive ]
+    if systemctl --quiet is-failed systemd-time-wait-sync.service; then
+        exit 70
+    fi
+    if systemctl is-enabled systemd-timesyncd.service 2>/dev/null \
+        | grep -F -x -q masked; then
+        exit 70
+    fi
+fi
 
 # Prove that the immutable guest still has the complete package closure that
 # was measured while its image was provisioned.  Hashing only the stored lock

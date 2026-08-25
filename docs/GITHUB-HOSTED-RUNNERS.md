@@ -67,6 +67,26 @@ verified on the native runner. Otherwise the guest refresh accepts only the
 four locks already committed at its own revision. The final pin pull request
 therefore updates those four locks and all nine target records atomically.
 
+Provisioned guest disks are normalized to an 8 GiB virtual size. Cloud-init
+must grow the root partition and filesystem before package installation, and
+both provisioning and the full-system gate reject a root filesystem below the
+reviewed capacity. Fedora 44 arm64 needs a longer systemd device timeout only
+while its UEFI guest boots under slow TCG emulation. The harness injects that
+temporary override into its disposable overlay and verifies that cloud-init
+removed both the override and cleanup helper before any guest image or gate
+evidence is accepted.
+
+Because standard runners have limited local SSD space, refresh and full-system
+jobs record both real and apparent guest-image usage. Once an immutable image
+has been extracted, its exact OCI image is removed before the next disk-heavy
+phase; sparse QCOW2 and raw test disks remain sparse on the host.
+
+The Arch test guest receives its clock from QEMU's host-backed RTC. Its
+`systemd-time-wait-sync` service is masked in the immutable test image so an
+egressless boot cannot wait forever for an external NTP server. This harness
+setting is not part of any VaultLink package and does not alter installed
+systems.
+
 The protected manual image-refresh workflow:
 
 1. runs only from an authorized `main` commit;

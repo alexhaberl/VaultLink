@@ -129,6 +129,21 @@ jobs:
           docker cp "$container:/images/guest-image.env" "vm-test/$TARGET_ID/guest-image.env"
           docker rm "$container" >/dev/null
           trap - EXIT
+          storage_evidence="vm-test/$TARGET_ID/host-storage.txt"
+          {
+            printf '%s\n' 'stage=before-guest-image-removal'
+            df -B1 "$PWD"
+            du -B1 "vm-test/$TARGET_ID/guest.qcow2"
+            du -B1 --apparent-size "vm-test/$TARGET_ID/guest.qcow2"
+          } >"$storage_evidence"
+          docker image rm "$VM_IMAGE"
+          {
+            printf '%s\n' 'stage=after-guest-image-removal'
+            df -B1 "$PWD"
+          } >>"$storage_evidence"
+          test -f "vm-test/$TARGET_ID/guest-image.env"
+          test ! -L "vm-test/$TARGET_ID/guest-image.env"
+          test "$(wc -l <"vm-test/$TARGET_ID/guest-image.env")" -eq 7
           grep -F -x -q "target_id=$TARGET_ID" "vm-test/$TARGET_ID/guest-image.env"
           grep -F -x -q 'upstream_sha256=${{ matrix.vm_upstream_sha256 }}' \
             "vm-test/$TARGET_ID/guest-image.env"
@@ -136,6 +151,16 @@ jobs:
             "vm-test/$TARGET_ID/guest-image.env"
           grep -F -x -q "qemu_runner_image=$qemu_runner" \
             "vm-test/$TARGET_ID/guest-image.env"
+          grep -F -x -q 'virtual_size=8589934592' \
+            "vm-test/$TARGET_ID/guest-image.env"
+          grep -F -x -q 'cold_boot_verified=true' \
+            "vm-test/$TARGET_ID/guest-image.env"
+          grep -E -x -q 'provision_acceleration=(kvm|tcg)' \
+            "vm-test/$TARGET_ID/guest-image.env"
+          if [[ "$ARCHITECTURE" == arm64 ]]; then
+            grep -F -x -q 'provision_acceleration=tcg' \
+              "vm-test/$TARGET_ID/guest-image.env"
+          fi
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           asset=$(python3 tools/package-targets.py asset "$TARGET_ID" "$version")
           kvm_args=()
@@ -150,6 +175,10 @@ jobs:
             sh tools/run-distro-vm-test.sh \
               "$TARGET_ID" "vm-test/$TARGET_ID/package/$asset" \
               "vm-test/$TARGET_ID/guest.qcow2" "vm-test/$TARGET_ID/evidence"
+          {
+            printf '%s\n' 'stage=after-full-system-gate'
+            df -B1 "$PWD"
+          } >>"$storage_evidence"
       - name: Upload full-system evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -157,6 +186,7 @@ jobs:
           name: distro-vm-${{ inputs.commit_sha }}-${{ matrix.id }}
           path: |
             vm-test/${{ matrix.id }}/evidence
+            vm-test/${{ matrix.id }}/host-storage.txt
             vm-test/${{ matrix.id }}/qemu-runner-verification.env
           if-no-files-found: error
           retention-days: 30
