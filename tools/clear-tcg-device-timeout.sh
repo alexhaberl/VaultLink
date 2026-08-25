@@ -8,7 +8,7 @@ LANG=C
 export PATH CDPATH LC_ALL LANG
 
 override=/etc/systemd/system.conf.d/90-vaultlink-tcg-device-timeout.conf
-cleanup=/usr/local/sbin/vaultlink-clear-tcg-device-timeout
+cleanup=/usr/local/bin/vaultlink-clear-tcg-device-timeout
 directory_marker=/etc/systemd/system.conf.d/.vaultlink-tcg-created-directory
 [ "$0" = "$cleanup" ] || exit 70
 [ -f "$override" ] && [ ! -L "$override" ] || exit 70

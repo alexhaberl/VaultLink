@@ -979,6 +979,10 @@ if ! grep -F -q 'libguestfs-tools' deploy/docker/Dockerfile.qemu-runner \
     || ! grep -F -q 'guestfish get-backend-settings' "$tcg_timeout_manager" \
     || ! grep -F -q 'DefaultDeviceTimeoutSec=5min' "$tcg_timeout_manager" \
     || ! grep -F -q 'DefaultDeviceTimeoutSec=5min' "$tcg_timeout_cleanup" \
+    || ! grep -F -q 'cleanup=/usr/local/bin/vaultlink-clear-tcg-device-timeout' "$tcg_timeout_manager" \
+    || ! grep -F -q 'cleanup=/usr/local/bin/vaultlink-clear-tcg-device-timeout' "$tcg_timeout_cleanup" \
+    || ! grep -F -q 'tcg_cleanup_command=/usr/local/bin/vaultlink-clear-tcg-device-timeout' "$vm_provisioner" \
+    || ! grep -F -q 'tcg_cleanup_command=/usr/local/bin/vaultlink-clear-tcg-device-timeout' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'rmdir -- /etc/systemd/system.conf.d' "$tcg_timeout_cleanup" \
     || ! grep -F -q 'rm -f -- "$cleanup"' "$tcg_timeout_cleanup" \
     || ! grep -F -q 'state_file=$image.vaultlink-tcg-state' "$tcg_timeout_manager" \
@@ -986,7 +990,10 @@ if ! grep -F -q 'libguestfs-tools' deploy/docker/Dockerfile.qemu-runner \
     || ! grep -F -q 'clean-existing-directory' "$tcg_timeout_manager" \
     || ! grep -F -q 'feature-available selinuxrelabel' "$tcg_timeout_manager" \
     || ! grep -F -q 'is-dir /etc/systemd' "$tcg_timeout_manager" \
-    || ! grep -F -q 'is-dir /usr/local/sbin' "$tcg_timeout_manager" \
+    || ! grep -F -q 'is-symlink /usr/local/bin' "$tcg_timeout_manager" \
+    || ! grep -F -q 'is-dir /usr/local/bin' "$tcg_timeout_manager" \
+    || ! grep -F -q 'report_unexpected_state' "$tcg_timeout_manager" \
+    || ! grep -F -q 'state_boolean_lines=' "$tcg_timeout_manager" \
     || [ "$(grep -F -c -- '--format=qcow2' "$tcg_timeout_manager" || true)" -ne 2 ] \
     || ! grep -F -q 'selinux-relabel $selinux_policy $override force:true' "$tcg_timeout_manager" \
     || ! grep -F -q 'selinux-relabel $selinux_policy $cleanup force:true' "$tcg_timeout_manager" \
@@ -1024,6 +1031,11 @@ if ! grep -F -q 'libguestfs-tools' deploy/docker/Dockerfile.qemu-runner \
     || ! grep -F -q 'full-system QEMU exited with status' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'root filesystem is smaller than the reviewed minimum' "$root_capacity_check"; then
     report "guest images must enforce reviewed capacity and a removable Fedora arm64 TCG device-timeout override"
+fi
+if grep -F -q '/usr/local/sbin/vaultlink-clear-tcg-device-timeout' \
+    "$tcg_timeout_manager" "$tcg_timeout_cleanup" "$vm_provisioner" \
+    tools/run-distro-vm-test.sh; then
+    report "the Fedora TCG cleanup helper must not traverse the /usr/local/sbin compatibility symlink"
 fi
 if grep -F -q 'supermin.d/packages' deploy/docker/Dockerfile.qemu-runner \
     || grep -F -q 'supermin.d/hostfiles' deploy/docker/Dockerfile.qemu-runner; then

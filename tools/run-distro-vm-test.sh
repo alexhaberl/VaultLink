@@ -38,7 +38,7 @@ if [ "$target_id" = fedora44-arm64 ]; then
     [ "$architecture" = arm64 ] || exit 77
     ssh_timeout=3600
     tcg_timeout_override=true
-    tcg_cleanup_command=/usr/local/sbin/vaultlink-clear-tcg-device-timeout
+    tcg_cleanup_command=/usr/local/bin/vaultlink-clear-tcg-device-timeout
 fi
 
 work=$(mktemp -d)
