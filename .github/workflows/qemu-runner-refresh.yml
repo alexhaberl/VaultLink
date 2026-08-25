@@ -17,6 +17,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/alexhaberl/vaultlink-qemu-runner
+  BUILDKIT_IMAGE: docker.io/moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
 
 jobs:
   build:
@@ -60,6 +61,11 @@ jobs:
         run: |
           set -euo pipefail
           metadata="$RUNNER_TEMP/build-metadata.json"
+          builder="vaultlink-qemu-runner-${{ matrix.architecture }}"
+          docker buildx create --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE" --name "$builder" --use
+          trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
+          docker buildx inspect --bootstrap
           docker buildx build \
             --platform 'linux/${{ matrix.architecture }}' \
             --file deploy/docker/Dockerfile.qemu-runner \
