@@ -9,9 +9,10 @@ production credentials, or unrelated workloads on the host.
 
 ## Host provisioning
 
-Deploy the exact 0.5.1 candidate through the normal verified upgrade procedure
-before starting a soak. The running `/proc/MAINPID/exe` hash must match the
-64-character hash supplied to the manual start workflow. Provision `curl`,
+Install the exact final Debian 13 amd64 DEB and activate its packaged candidate
+through the normal verified procedure before starting a soak. The running
+`/proc/MAINPID/exe` hash must match both the binary extracted from that DEB and
+the 64-character hash supplied to the manual start workflow. Provision `curl`,
 `sqlite3`, GNU coreutils, OpenSSH server, `sudo`, and systemd. Create a locked,
 key-only bridge account and evidence group:
 
@@ -124,13 +125,15 @@ commit; changing them afterwards invalidates the evidence.
 
 ## Start, collection, and release binding
 
-1. Run the complete native, Docker, fuzz, upgrade, and reproducibility gates.
+1. Run the complete native, Docker, fuzz, package, upgrade, reproducibility,
+   distro-VM, and per-target load gates for one exact commit.
 2. Dispatch `Start 72-hour release soak` from `main` with the exact 40-character
    `origin/main` commit and SHA-256 of the already running amd64 binary. The
    supplied hash is only an explicit confirmation: the workflow downloads the
-   successful Candidate-Preflight's `vaultlink-release-amd64` artifact, verifies
-   its checksum manifest, derives the binary hash, and requires all three values
-   (artifact, input, live executable) to match.
+   successful candidate gate's manifest-named Debian 13 amd64 DEB, verifies the
+   candidate checksum evidence, safely extracts its package payload, derives
+   the binary hash, and requires all four values (DEB, extracted payload, input,
+   and live executable) to match.
 3. The hosted job opens the restricted SSH bridge. The root control verifies
    the live executable, creates a single locked state
    directory and a commit/start/random upload namespace, and starts
@@ -152,10 +155,11 @@ commit; changing them afterwards invalidates the evidence.
    failure evidence instead of remaining pending.
 5. The tag workflow follows that link, downloads the artifact, revalidates at
    least 72 hours of metrics and load reports, and compares the complete
-   evidence hash with its newly built amd64 binary. A status from another
-   commit, an expired/missing artifact, or any hash mismatch blocks release.
+   evidence hash with the payload extracted from its byte-identical Debian 13
+   amd64 DEB. A status from another commit, an expired/missing artifact, or any
+   package/payload/live hash mismatch blocks release.
 
-The monitor rejects restarts, inactive health, non-0.5.1 health responses,
+The monitor rejects restarts, inactive health, non-0.6.0 health responses,
 SQLite integrity failures, error-priority service journal entries, RSS over
 256 MiB, failed load profiles, and a changed executable hash. RSS retention must
 also pass both independent growth checks: the final-hour median may grow from

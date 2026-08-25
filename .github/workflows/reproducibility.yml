@@ -1,73 +1,80 @@
-name: Reproducible release build
+name: Reproducible native packages
 
 on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   packages: read
-  statuses: write
+
+concurrency:
+  group: vaultlink-package-reproducibility-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release_environment:
-    name: Resolve pinned reproducibility environment
-    runs-on: ubuntu-24.04-arm
-    env:
-      RELEASE_BUILDER_IMAGE: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
     outputs:
-      image: ${{ steps.image.outputs.image }}
+      matrix: ${{ steps.targets.outputs.matrix }}
+      packages_run: ${{ steps.packages.outputs.packages_run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Validate pinned release image before matrix startup
-        id: image
+      - name: Require the complete immutable target lock
+        id: targets
         shell: bash
         run: |
           set -euo pipefail
-          image="$RELEASE_BUILDER_IMAGE"
-          locked_image=$(sed -n '1p' deploy/docker/release-builder-image.lock)
-          test "$(wc -l <deploy/docker/release-builder-image.lock)" -eq 1
-          if [[ "$locked_image" == UNPROVISIONED ]]; then
-            echo "release builder is UNPROVISIONED; commit its real manifest digest in a dependency-refresh change" >&2
-            exit 1
-          fi
-          case "$locked_image" in
-            ghcr.io/alexhaberl/vaultlink-release-builder@sha256:*) ;;
-            *) echo "checked-in release builder is not the fixed digest-pinned GHCR image" >&2; exit 1 ;;
-          esac
-          test "$image" = "$locked_image"
-          digest=${image##*@sha256:}
-          printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$'
-          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+          python3 tools/package-targets.py validate
+          printf 'matrix=%s\n' "$(python3 tools/package-targets.py matrix)" \
+            >>"$GITHUB_OUTPUT"
+      - name: Resolve the exact successful package run for this commit
+        id: packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          lines=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/statuses?per_page=100" \
+            --jq '.[] | select(.context == "vaultlink/packages") | [.state,.target_url] | @tsv')
+          line=$(printf '%s\n' "$lines" | sed -n '1p')
+          test -n "$line"
+          IFS=$'\t' read -r state target_url <<<"$line"
+          test "$state" = success
+          prefix="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/"
+          case "$target_url" in "$prefix"*) ;; *) exit 77 ;; esac
+          packages_run=${target_url#"$prefix"}
+          [[ "$packages_run" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$packages_run" \
+            --jq '[.head_sha,.head_branch,.conclusion,.path] | @tsv')
+          IFS=$'\t' read -r run_sha run_branch conclusion run_path <<<"$run"
+          run_path=${run_path%%@*}
+          test "$run_sha" = "$GITHUB_SHA"
+          test "$run_branch" = main
+          test "$conclusion" = success
+          test "$run_path" = .github/workflows/packages.yml
+          printf 'packages_run=%s\n' "$packages_run" >>"$GITHUB_OUTPUT"
 
   compare:
-    name: Clean native comparison (${{ matrix.architecture }})
-    concurrency:
-      group: reproducibility-${{ github.ref }}-${{ matrix.architecture }}
-      cancel-in-progress: false
-    needs: release_environment
+    needs: prepare
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - architecture: amd64
-            runs_on: ubuntu-24.04
-            expected_uname: x86_64
-          - architecture: arm64
-            runs_on: ubuntu-24.04-arm
-            expected_uname: aarch64
-    runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 120
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
     container:
-      image: ${{ needs.release_environment.outputs.image }}
+      image: ${{ matrix.builder_image }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       CARGO_TERM_COLOR: always
-      SOURCE_DATE_EPOCH: "0"
-      RELEASE_BUILDER_IMAGE: ${{ needs.release_environment.outputs.image }}
+      PACKAGES_RUN: ${{ needs.prepare.outputs.packages_run }}
+      TARGET_ID: ${{ matrix.id }}
     steps:
       - name: Restore host workspace ownership before checkout
         shell: bash
@@ -75,90 +82,137 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Verify prebuilt release environment
-        run: sh tools/verify-release-builder.sh
-      - name: Verify native inputs
+      - name: Verify immutable native builder
         shell: bash
         run: |
           set -euo pipefail
-          test "$(uname -m)" = "${{ matrix.expected_uname }}"
-          test "$(rustc --version | awk '{print $2}')" = "$(sh tools/rust-toolchain-channel.sh)"
-          sh tools/check-supply-chain-policy.sh
-      - name: Build twice from empty target directories
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python3 tools/package-targets.py validate
+          sh tools/verify-package-builder.sh "$TARGET_ID"
+      - name: Download the exact release-candidate package artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          install -d candidate
+          gh run download "$PACKAGES_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name "vaultlink-package-$TARGET_ID" --dir candidate
+      - name: Build package twice from clean target directories
         shell: bash
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          test -n "$version"
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
+          export SOURCE_DATE_EPOCH
+          asset=$(python3 tools/package-targets.py asset "$TARGET_ID" "$version")
+          test -s "candidate/$asset"
+          test -s "candidate/$TARGET_ID.cdx.json"
+          test "$(find candidate -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
           rm -rf target/repro-first target/repro-second repro
-          mkdir -p repro
-
-          CARGO_TARGET_DIR=target/repro-first cargo build --locked --release
-          rm -f ./*.cdx.json
-          cargo cyclonedx --format json
-          first_raw_sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print)
-          test "$(printf '%s\n' "$first_raw_sbom" | grep -c .)" -eq 1
-          python3 tools/normalize-cyclonedx-sbom.py \
-            "$first_raw_sbom" repro/first-sbom.cdx.json
-          rm -f "$first_raw_sbom"
-          sh tools/assemble-release-archive.sh \
-            target/repro-first/release/vaultlink repro/first-sbom.cdx.json \
-            repro/first-dist "$version" '${{ matrix.architecture }}'
-          # Standard hosted runners provide 14 GiB. Preserve the first outputs,
-          # then release its build tree before the independent second build.
+          install -d repro/first repro/second
+          build_once() {
+            label=$1
+            cargo_target=$2
+            output=$3
+            CARGO_TARGET_DIR="$cargo_target" cargo build --locked --release
+            rm -f ./*.cdx.json
+            cargo cyclonedx --format json
+            raw_sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print)
+            test "$(printf '%s\n' "$raw_sbom" | grep -c .)" -eq 1
+            python3 tools/normalize-cyclonedx-sbom.py \
+              "$raw_sbom" "$output/$TARGET_ID.cdx.json"
+            rm -f "$raw_sbom"
+            cp "$cargo_target/release/vaultlink" "$output/vaultlink"
+            sh tools/build-native-package.sh \
+              "$TARGET_ID" "$version" "$cargo_target/release/vaultlink" \
+              "$output/$TARGET_ID.cdx.json" "$output"
+            sh tools/verify-native-package.sh \
+              "$TARGET_ID" "$version" "$output/$asset" \
+              "$cargo_target/release/vaultlink" "$output/$TARGET_ID.cdx.json"
+            printf '%s\n' "$label complete"
+          }
+          build_once first target/repro-first repro/first
           rm -rf target/repro-first
-
-          CARGO_TARGET_DIR=target/repro-second cargo build --locked --release
-          rm -f ./*.cdx.json
-          cargo cyclonedx --format json
-          second_raw_sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print)
-          test "$(printf '%s\n' "$second_raw_sbom" | grep -c .)" -eq 1
-          python3 tools/normalize-cyclonedx-sbom.py \
-            "$second_raw_sbom" repro/second-sbom.cdx.json
-          rm -f "$second_raw_sbom"
-          sh tools/assemble-release-archive.sh \
-            target/repro-second/release/vaultlink repro/second-sbom.cdx.json \
-            repro/second-dist "$version" '${{ matrix.architecture }}'
-
-          standalone="vaultlink-${version}-debian13-${{ matrix.architecture }}"
-          archive="VaultLink-${version}-debian13-${{ matrix.architecture }}.tar.gz"
-          cmp "repro/first-dist/$standalone" "repro/second-dist/$standalone"
-          cmp repro/first-sbom.cdx.json repro/second-sbom.cdx.json
-          cmp "repro/first-dist/$archive" "repro/second-dist/$archive"
+          build_once second target/repro-second repro/second
+          cmp repro/first/vaultlink repro/second/vaultlink
+          cmp "repro/first/$TARGET_ID.cdx.json" "repro/second/$TARGET_ID.cdx.json"
+          cmp "repro/first/$asset" "repro/second/$asset"
+          cmp "candidate/$TARGET_ID.cdx.json" "repro/first/$TARGET_ID.cdx.json"
+          cmp "candidate/$TARGET_ID.cdx.json" "repro/second/$TARGET_ID.cdx.json"
+          cmp "candidate/$asset" "repro/first/$asset"
+          cmp "candidate/$asset" "repro/second/$asset"
+          sh tools/verify-native-package.sh \
+            "$TARGET_ID" "$version" "candidate/$asset" \
+            repro/first/vaultlink "candidate/$TARGET_ID.cdx.json"
+          sh tools/lint-native-package.sh "$TARGET_ID" "repro/first/$asset"
           sha256sum \
-            "repro/first-dist/$standalone" "repro/second-dist/$standalone" \
-            "repro/first-dist/$archive" "repro/second-dist/$archive" \
-            >"repro/SHA256SUMS-${{ matrix.architecture }}"
-          printf 'version=%s\ncommit=%s\nsource_date_epoch=%s\narchitecture=%s\nbuilder_image=%s\n' \
-            "$version" "$GITHUB_SHA" "$SOURCE_DATE_EPOCH" "${{ matrix.architecture }}" \
-            "$RELEASE_BUILDER_IMAGE" \
-            >"repro/manifest-${{ matrix.architecture }}.env"
+            "candidate/$TARGET_ID.cdx.json" "candidate/$asset" \
+            repro/first/vaultlink repro/second/vaultlink \
+            "repro/first/$TARGET_ID.cdx.json" "repro/second/$TARGET_ID.cdx.json" \
+            "repro/first/$asset" "repro/second/$asset" \
+            >"repro/$TARGET_ID.sha256"
+          printf 'target=%s\nversion=%s\ncommit=%s\npackages_run=%s\nbuilder_image=%s\nsource_date_epoch=%s\n' \
+            "$TARGET_ID" "$version" "$GITHUB_SHA" "$PACKAGES_RUN" \
+            '${{ matrix.builder_image }}' \
+            "$SOURCE_DATE_EPOCH" >"repro/$TARGET_ID.env"
       - name: Upload comparison evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: reproducibility-${{ github.sha }}-${{ matrix.architecture }}
+          name: package-reproducibility-${{ github.sha }}-${{ matrix.id }}
           path: |
-            repro/SHA256SUMS-${{ matrix.architecture }}
-            repro/manifest-${{ matrix.architecture }}.env
+            repro/${{ matrix.id }}.sha256
+            repro/${{ matrix.id }}.env
           if-no-files-found: error
           retention-days: 30
       - name: Restore host workspace ownership
         if: always()
         shell: bash
         run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
-      - name: Publish exact-commit reproducibility status
-        if: always()
+
+  publish_gate:
+    name: Publish exact-commit package reproducibility gate
+    if: always()
+    needs: [prepare, compare]
+    runs-on: ubuntu-24.04
+    permissions:
+      statuses: write
+    steps:
+      - name: Record the package-run binding
+        if: needs.prepare.result == 'success' && needs.compare.result == 'success'
         env:
-          GH_TOKEN: ${{ github.token }}
-          JOB_RESULT: ${{ job.status }}
+          PACKAGES_RUN: ${{ needs.prepare.outputs.packages_run }}
         shell: bash
         run: |
-          case "$JOB_RESULT" in
-            success) state=success; description='Two clean native builds matched' ;;
-            *) state=failure; description='Native reproducibility gate failed' ;;
-          esac
+          set -euo pipefail
+          printf 'commit=%s\npackages_run=%s\n' \
+            "$GITHUB_SHA" "$PACKAGES_RUN" >reproducibility-binding.env
+      - name: Upload the package-run binding
+        if: needs.prepare.result == 'success' && needs.compare.result == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-reproducibility-binding-${{ github.sha }}
+          path: reproducibility-binding.env
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish aggregate result
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          COMPARE_RESULT: ${{ needs.compare.result }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PREPARE_RESULT" == success && "$COMPARE_RESULT" == success ]]; then
+            state=success
+            description='All nine package, binary, and SBOM double-build comparisons matched'
+          else
+            state=failure
+            description='Package reproducibility matrix failed or locks are unprovisioned'
+          fi
           gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
             -f state="$state" \
-            -f context='vaultlink/reproducibility-${{ matrix.architecture }}' \
+            -f context='vaultlink/package-reproducibility' \
             -f description="$description" \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

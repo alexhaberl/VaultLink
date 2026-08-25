@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = vaultlink
+
+[Action]
+Description = Verifying VaultLink is inactive before removal
+When = PreTransaction
+Exec = /usr/lib/vaultlink/package/deploy/vaultlink-package-lifecycle.sh preremove-preflight pkg.tar.zst arch rolling x86_64 vaultlink remove
+AbortOnFail

@@ -16,7 +16,8 @@ staged_keyring=
 config_path=/etc/vaultlink/config.toml
 staged_config=/etc/vaultlink/.config.toml.new
 restore_config=/etc/vaultlink/.config.toml.restore
-maintenance_lock=/run/lock/vaultlink-maintenance.lock
+lock_directory=/run/vaultlink-locks
+maintenance_lock=$lock_directory/maintenance.lock
 readiness_attempts=${VAULTLINK_READINESS_ATTEMPTS:-30}
 readiness_timeout_seconds=${VAULTLINK_READINESS_TIMEOUT_SECONDS:-60}
 readiness_interval_seconds=${VAULTLINK_READINESS_INTERVAL_SECONDS:-1}
@@ -37,18 +38,103 @@ new_config=$2
 [ -s "$keyring" ] || { echo "VaultLink secrets keyring is missing or empty" >&2; exit 1; }
 [ -f "$config_path" ] || { echo "VaultLink configuration is missing: $config_path" >&2; exit 1; }
 
-for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock awk; do
+for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock awk stat; do
     command -v "$required_command" >/dev/null || {
         echo "$required_command is required for a safe upgrade" >&2
         exit 1
     }
 done
 
-exec 9>"$maintenance_lock"
-if ! flock -n 9; then
-    echo "another VaultLink upgrade or rollback is already running" >&2
+validate_lock_directory() {
+    [ -d /run ] && [ ! -L /run ] \
+        && [ "$(stat -Lc '%u:%g:%a' /run 2>/dev/null || true)" = 0:0:755 ] \
+        && [ -d "$lock_directory" ] && [ ! -L "$lock_directory" ] \
+        && [ "$(stat -Lc '%u:%g:%a' "$lock_directory" 2>/dev/null || true)" = 0:0:700 ]
+}
+
+prepare_maintenance_lock() {
+    [ -d /run ] && [ ! -L /run ] \
+        && [ "$(stat -Lc '%u:%g:%a' /run 2>/dev/null || true)" = 0:0:755 ] \
+        || return 1
+    if [ -e "$lock_directory" ] || [ -L "$lock_directory" ]; then
+        validate_lock_directory || return 1
+    else
+        install -d -o root -g root -m 0700 "$lock_directory" || return 1
+    fi
+    if [ -e "$maintenance_lock" ] || [ -L "$maintenance_lock" ]; then
+        [ -f "$maintenance_lock" ] && [ ! -L "$maintenance_lock" ] \
+            && [ "$(stat -Lc '%u:%g:%a' "$maintenance_lock" 2>/dev/null || true)" = 0:0:600 ] \
+            || return 1
+    else
+        install -o root -g root -m 0600 /dev/null "$maintenance_lock" || return 1
+    fi
+    validate_lock_directory \
+        && [ -f "$maintenance_lock" ] && [ ! -L "$maintenance_lock" ] \
+        && [ "$(stat -Lc '%u:%g:%a' "$maintenance_lock" 2>/dev/null || true)" = 0:0:600 ]
+}
+
+validate_open_maintenance_lock() {
+    maintenance_fd=$1
+    validate_lock_directory \
+        && [ -f "$maintenance_lock" ] && [ ! -L "$maintenance_lock" ] \
+        && [ "$(stat -Lc '%u:%g:%a' "$maintenance_lock" 2>/dev/null || true)" = 0:0:600 ] \
+        && [ "$(stat -Lc '%d:%i' "/proc/self/fd/$maintenance_fd" 2>/dev/null || true)" = \
+            "$(stat -Lc '%d:%i' "$maintenance_lock" 2>/dev/null || true)" ]
+}
+
+prepare_maintenance_lock || {
+    echo "VaultLink maintenance lock path is unsafe" >&2
     exit 1
+}
+
+# The native-package updater intentionally supplies the live configuration as
+# both the current and candidate configuration. Bind that case by inode and
+# keep it strictly read-only: replacing an identical path would still destroy
+# inode, mtime, ACL, xattr, and SELinux-label continuity.
+config_is_live=0
+new_config_identity=$(stat -Lc '%d:%i' "$new_config" 2>/dev/null || true)
+live_config_identity=$(stat -Lc '%d:%i' "$config_path" 2>/dev/null || true)
+if [ -n "$new_config_identity" ] \
+    && [ "$new_config_identity" = "$live_config_identity" ]; then
+    config_is_live=1
 fi
+
+# The signed package updater already holds this lock while it replaces the
+# package payload. It may transfer the same open file description on FD 8 so
+# package installation and runtime activation remain one race-free critical
+# section. Validate both the bounded descriptor number and its inode before
+# accepting it. Standalone/manual upgrades retain the independent FD 9 path.
+case "${VAULTLINK_MAINTENANCE_LOCK_FD:-}" in
+    '')
+        exec 9>"$maintenance_lock"
+        if ! validate_open_maintenance_lock 9 \
+            || ! flock -n 9 \
+            || ! validate_open_maintenance_lock 9; then
+            echo "another VaultLink upgrade or rollback is already running" >&2
+            exit 1
+        fi
+        ;;
+    8)
+        inherited_lock_identity=$(stat -Lc '%d:%i' /proc/self/fd/8 2>/dev/null || true)
+        maintenance_lock_identity=$(stat -Lc '%d:%i' "$maintenance_lock" 2>/dev/null || true)
+        inherited_lock_probe_status=0
+        flock -n -E 75 "$maintenance_lock" true >/dev/null 2>&1 \
+            || inherited_lock_probe_status=$?
+        if [ -z "$inherited_lock_identity" ] \
+            || [ "$inherited_lock_identity" != "$maintenance_lock_identity" ] \
+            || [ "$inherited_lock_probe_status" -ne 75 ] \
+            || ! validate_open_maintenance_lock 8 \
+            || ! flock -n 8 \
+            || ! validate_open_maintenance_lock 8; then
+            echo "inherited VaultLink maintenance lock is invalid or not held" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "VAULTLINK_MAINTENANCE_LOCK_FD must be unset or exactly 8" >&2
+        exit 1
+        ;;
+esac
 
 validate_bounded_integer() {
     name=$1
@@ -388,8 +474,10 @@ restore_verified_backup() {
 
     install -o root -g root -m 0755 "$backup_dir/vaultlink" "$restore_binary" \
         || restore_failed=1
-    install -o root -g vaultlink -m 0640 "$backup_dir/config.toml" "$restore_config" \
-        || restore_failed=1
+    if [ "$config_is_live" -eq 0 ]; then
+        install -o root -g vaultlink -m 0640 "$backup_dir/config.toml" "$restore_config" \
+            || restore_failed=1
+    fi
     install -o vaultlink -g vaultlink -m 0600 "$backup_dir/data.sqlite" "$staged_data" \
         || restore_failed=1
     install -o vaultlink -g vaultlink -m 0600 "$backup_dir/secrets.keyring" "$staged_keyring" \
@@ -406,7 +494,9 @@ restore_verified_backup() {
     fi
 
     mv -f "$restore_binary" "$live_binary" || restore_failed=1
-    mv -f "$restore_config" "$config_path" || restore_failed=1
+    if [ "$config_is_live" -eq 0 ]; then
+        mv -f "$restore_config" "$config_path" || restore_failed=1
+    fi
     rm -f "$data-wal" "$data-shm" || restore_failed=1
     mv -f "$staged_data" "$data" || restore_failed=1
     mv -f "$staged_keyring" "$keyring" || restore_failed=1
@@ -485,7 +575,11 @@ install -o root -g root -m 0700 "$live_binary" "$backup_stage/vaultlink"
 install -o root -g root -m 0600 "$config_path" "$backup_stage/config.toml"
 install -o root -g root -m 0600 "$keyring" "$backup_stage/secrets.keyring"
 install -o root -g root -m 0755 "$new_binary" "$staged_binary"
-install -o root -g vaultlink -m 0640 "$new_config" "$staged_config"
+candidate_config=$new_config
+if [ "$config_is_live" -eq 0 ]; then
+    install -o root -g vaultlink -m 0640 "$new_config" "$staged_config"
+    candidate_config=$staged_config
+fi
 
 # Validate both exact binary/configuration pairs as the service account before
 # entering downtime.
@@ -500,7 +594,7 @@ old_health_body='{"ok":true,"version":"'"$old_version"'"}'
 
 candidate_version=$(read_bounded_version "$staged_binary" "candidate")
 candidate_readiness_target=$(derive_readiness_target \
-    "$staged_binary" "$staged_config" "candidate binary/configuration")
+    "$staged_binary" "$candidate_config" "candidate binary/configuration")
 readiness_url=$(printf '%s\n' "$candidate_readiness_target" | sed -n '1p')
 readiness_connect_to=$(printf '%s\n' "$candidate_readiness_target" | sed -n '2p')
 [ "$readiness_connect_to" != "-" ] || readiness_connect_to=
@@ -530,7 +624,9 @@ backup_valid=1
 # any later step fails.
 candidate_activated=1
 mv -f "$staged_binary" "$live_binary"
-mv -f "$staged_config" "$config_path"
+if [ "$config_is_live" -eq 0 ]; then
+    mv -f "$staged_config" "$config_path"
+fi
 
 systemctl start "$service"
 wait_until_active

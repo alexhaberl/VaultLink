@@ -70,8 +70,26 @@ grep -F -x -q 'public_key=/usr/share/vaultlink/minisign.pub' deploy/vaultlink-up
     || fail "the updater trust key path must be fixed"
 grep -F -q "minisign -V -q -p \"\$public_key\"" deploy/vaultlink-update.sh \
     || fail "the updater must verify release assets with the pinned Minisign key"
-grep -F -x -q 'ExecStart=/usr/local/sbin/vaultlink-update auto' deploy/vaultlink-update.service \
+grep -F -x -q 'ExecStart=/usr/sbin/vaultlink-update auto' deploy/vaultlink-update.service \
     || fail "the update service must use the configured automatic mode"
+grep -F -x -q 'ExecStartPre=+/usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh' \
+    deploy/vaultlink.service \
+    || fail "VaultLink service must enforce package/runtime parity before every start"
+[ "$(grep -F -c 'ExecStartPre=' deploy/vaultlink.service)" -eq 1 ] \
+    || fail "VaultLink service must define exactly one reviewed ExecStartPre guard"
+grep -F -x -q 'StartLimitIntervalSec=1h' deploy/vaultlink.service \
+    || fail "VaultLink service must bound repeated parity-guard start failures"
+grep -F -x -q 'StartLimitBurst=3' deploy/vaultlink.service \
+    || fail "VaultLink service must cap parity-guard restart attempts"
+grep -F -x -q 'TimeoutStartSec=90min' deploy/vaultlink-update.service \
+    || fail "the update service must allow a bounded full package transaction"
+grep -F -x -q 'TimeoutStopSec=30min' deploy/vaultlink-update.service \
+    || fail "the update service must allow bounded fail-closed recovery on stop"
+grep -F -x -q 'ProtectSystem=false' deploy/vaultlink-update.service \
+    || fail "the package-manager update service must permit distribution transaction hooks"
+if grep -F -q 'ReadWritePaths=' deploy/vaultlink-update.service; then
+    fail "the package-manager update service must not claim a brittle filesystem allowlist"
+fi
 grep -F -x -q 'Persistent=true' deploy/vaultlink-update.timer \
     || fail "the signed update timer must retain missed checks"
 

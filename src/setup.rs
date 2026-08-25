@@ -1257,7 +1257,7 @@ fn setup_browse_path_allowed(path: &Path, file_kind: Option<&str>, mode: Option<
         return false;
     }
     let roots: &[&str] = if file_kind.is_some() {
-        &["/etc/ssl", "/etc/letsencrypt"]
+        &["/etc/ssl", "/etc/letsencrypt", "/etc/pki/tls"]
     } else if mode == Some("development") {
         &["/mnt", "/srv", "/media", "/var/lib/vaultlink", "/tmp"]
     } else {
@@ -2272,6 +2272,16 @@ mod tests {
         assert!(setup_browse_path_allowed(
             Path::new("/etc/letsencrypt/live/example/fullchain.pem"),
             Some("certificate"),
+            Some("standalone_tls")
+        ));
+        assert!(setup_browse_path_allowed(
+            Path::new("/etc/pki/tls/certs/example.crt"),
+            Some("certificate"),
+            Some("standalone_tls")
+        ));
+        assert!(setup_browse_path_allowed(
+            Path::new("/etc/pki/tls/private/example.key"),
+            Some("private_key"),
             Some("standalone_tls")
         ));
         assert!(!setup_browse_path_allowed(

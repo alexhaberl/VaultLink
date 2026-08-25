@@ -7,16 +7,17 @@ operational requirements, advisory exceptions, and vulnerability reporting.
 
 ## Supported versions
 
-Release line: `0.5.1` is the unreleased development line for Linux x86_64 and aarch64. The latest supported artifacts remain attached to the signed, annotated `v0.5.0` tag. Windows hosts are not supported.
+Release line: `0.6.0` is unreleased. There is currently no supported public release: the `v0.5.0` archive release was withdrawn on 2026-08-25, while its annotated tag and evidence remain public for auditability. The 0.6.0 support target is native packages for Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported.
 
 ## Build and release security
 
 - GitHub Actions are pinned to full commit SHAs and build containers to SHA-256 manifest digests. Human-readable versions remain beside the pins and Dependabot proposes reviewed updates.
 - Rust toolchains and CI-installed Cargo tools use exact versions. `tools/check-supply-chain-policy.sh` rejects mutable workflow references, remote `curl | sh`, and missing Docker build-context exclusions.
-- Push and pull-request CI audits the shared workspace `Cargo.lock`, compiles every fuzz target, and runs setup, API, signed-update, upgrade, and rollback Docker smokes without external runtime networking.
+- Push and pull-request CI audits the shared workspace `Cargo.lock`, compiles every fuzz target, and runs setup, API, package, signed-update, upgrade, and rollback Docker smokes without external runtime networking.
 - Native CI runs checksum-pinned Gitleaks 8.30.0 over the complete fetched Git history with redacted output, recursive decoding, and archive inspection. `.gitleaksignore` contains only two commit-bound findings for the public RFC 6238 Appendix B TOTP test vector.
 - Local `.env`, root `config.toml`, and SQLite files are excluded from the Docker context; the smoke image copies only build inputs and deploy tests explicitly.
-- Debian build packages come exclusively from the checked-in, timestamped Debian snapshot and an exact direct/transitive package lock. The weekly and manually dispatched native reproducibility gate compares two clean binary and archive builds per architecture before release.
+- The declarative package-target manifest is the sole target matrix. Every target uses a source-independent, digest-pinned builder with a fixed Rust version and complete distro package lock or dated snapshot. Native reproducibility gates compare two clean payload, SBOM, and final-package builds; full-system gates boot digest-pinned target guests without unrestricted guest networking.
+- Release publication is package-only and fail-closed on the three commit-bound `vaultlink/packages`, `vaultlink/package-reproducibility`, and `vaultlink/distro-vms` gates. The protected signing job creates and re-verifies a 21-asset draft before publication; published package assets are retained for authenticated rollback.
 
 ### Compensated WebAuthn RSA advisory
 
@@ -32,7 +33,7 @@ Do not open a public issue. Use GitHub's private vulnerability reporting for thi
 
 ## Operational assumptions
 
-- VaultLink runs as the dedicated `vaultlink` user on Debian 13 x86_64 or aarch64.
+- VaultLink runs as the dedicated `vaultlink` user on one exact package target documented above. A package built on that distribution and architecture is not claimed compatible with a derivative or another release.
 - Production traffic is HTTPS, preferably terminated by a trusted reverse proxy.
 - Every production configuration uses `require_mount=true` with a pre-provisioned service-owned root, private internal directory and data directory plus an exact filesystem type and active `/proc/self/mountinfo` source. CIFS may place the reserved internal directory directly below the share root; other required mounts use a private sibling. This remains fail-closed when a remote mount disappears and exposes its local fallback directory.
 - Without `external_writers`, the visible root, private sibling and data directory are owned by the VaultLink service uid and are not writable through group/other mode bits or a POSIX ACL mask. Other local writers are unsupported in this mode.
@@ -43,8 +44,9 @@ Do not open a public issue. Use GitHub's private vulnerability reporting for thi
 - Overwrite publication is disabled by default whenever external writers are enabled. `allow_external_writer_replace=true` is an explicit last-writer-wins exception: atomic VaultLink publication can overwrite a newer concurrent SMB-client change because standard clients do not participate in VaultLink's storage lock. Operators accepting this mode must treat that undetectable lost-update risk as part of their storage policy.
 - SQLite/WAL, configuration, TLS keys and ACME credentials remain on an audited local filesystem and use the documented restrictive permissions. SQLite must be on a filesystem separate from CIFS/SMB storage and may share an audited local ext*/XFS/Btrfs/F2FS/Bcachefs/ZFS mount only when it is outside the visible tree.
 - SQLite stores Share tokens, TOTP seeds and WebAuthn credentials encrypted at rest. The adjacent matching `secrets.keyring` contains the keys needed to decrypt them. A complete database/keyring pair or upgrade/rollback backup is therefore a production credential and must remain restricted to audited root/service access, encrypted storage and protected backup handling.
-- Upgrade and rollback backups are inseparable Binary/Config/SQLite/Keyring units. The live configuration is never rewritten for a candidate before downtime; automatic recovery restores and health-checks the matching old unit.
-- The optional updater is a separate root-owned systemd service. It uses a fixed official-repository URL, accepts stable releases only, verifies both the release archive and architecture checksum manifest against the locally pinned Minisign key, rejects key replacement and downgrades, and delegates activation to the existing complete-backup/automatic-restore upgrade path. Automatic installation is an explicit host configuration opt-in.
+- Upgrade and rollback backups are inseparable Binary/Config/SQLite/Keyring units. The live configuration is never rewritten for a candidate before downtime; automatic recovery restores and health-checks the matching old unit and reinstalls the previously verified native package.
+- The optional updater is a separate root-owned systemd service available only to a valid package-bound installation. It uses a fixed official-repository URL, accepts stable releases only, verifies the signed global checksum and direct signatures for both the new and currently installed native package, binds package format/OS version/architecture to the root-owned marker and package database, rejects key replacement and downgrades, preflights dependencies, and performs an offline native-package transaction. Automatic installation is an explicit host configuration opt-in and never updates or starts a deliberately stopped service.
+- Package installation does not install a production configuration or enable either systemd unit. Removal preserves configuration, SQLite, keyring, service user, logs, mounts, and backups. A markerless archive installation is rejected rather than adopted.
 - One VaultLink process owns a storage-root/data-directory pair; active-active multi-process operation on the same pair is unsupported.
 - Administrator sessions have both the configured absolute lifetime and a 30-minute inactivity limit by default. Activity updates are coalesced to one SQLite write per minute, so an idle session expires conservatively after 29 to 30 minutes and can never outlive its absolute expiry.
 - Administrator recovery assumes SSH/host access and is performed locally with `recover-admin` as the `vaultlink` service user; VaultLink deliberately exposes no public password-reset endpoint.

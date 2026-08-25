@@ -1,7 +1,11 @@
 .git
+.agents
+.codex
 target
 fuzz/target
 dev
+dist
+.tmp
 /config.toml
 .env
 .env.*

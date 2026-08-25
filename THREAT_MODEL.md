@@ -2,10 +2,10 @@
 
 | Field | Value |
 | --- | --- |
-| Last reviewed | 2026-08-09 |
-| Baseline commit | `5efa3fdf6045753d7754cc98ef9192dfc1373cfa` |
-| Applies to | VaultLink 0.5.1 development on Debian 13 amd64 and arm64 |
-| Companion documents | [Security policy](SECURITY.md), [release checklist](docs/RELEASE-CHECKLIST.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
+| Last reviewed | 2026-08-25 |
+| Baseline commit | Unreleased package implementation; the final commit is recorded before the soak |
+| Applies to | VaultLink 0.6.0 native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
+| Companion documents | [Security policy](SECURITY.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
 
 ## Purpose
 
@@ -60,10 +60,13 @@ VaultLink does not claim to protect against:
 - confidentiality after an administrator or recipient intentionally downloads
   or shares plaintext content.
 
-The supported deployment trusts Debian 13, the Linux security primitives used
-by VaultLink, the configured TLS endpoint, the audited local filesystem, and
-the operator-managed identities and ACLs described in `SECURITY.md`. Required
-kernel primitives include `openat2(2)`, `renameat2(2)`, and statx mount IDs.
+The supported deployment trusts the exact Debian, Ubuntu, Fedora, or Arch
+package target named in `docs/PACKAGING.md`, the Linux security primitives used
+by VaultLink, the native package database, the configured TLS endpoint, the
+audited local filesystem, and the operator-managed identities and ACLs
+described in `SECURITY.md`. Required kernel primitives include `openat2(2)`,
+`renameat2(2)`, and statx mount IDs. A derivative or different OS release is
+not assumed equivalent.
 
 ## Protected assets
 
@@ -76,8 +79,8 @@ kernel primitives include `openat2(2)`, `renameat2(2)`, and statx mount IDs.
 | `secrets.keyring` and encrypted database fields | Confidentiality, exact database/keyring pairing, and atomic rotation |
 | Configuration, mount identity, and internal storage | Fail-closed validation and service-only modification |
 | Audit records | Atomicity for required events, bounded retention, and honest trust-boundary documentation |
-| Backups and rollback units | Confidentiality and inseparable binary/config/database/keyring consistency |
-| Source, dependencies, builder image, and workflow definitions | Reviewed immutable inputs and reproducible provenance |
+| Backups, old packages, and rollback units | Confidentiality and inseparable package/binary/config/database/keyring consistency |
+| Source, dependencies, target manifest, builder/guest images, and workflow definitions | Reviewed immutable inputs and reproducible provenance |
 | Minisign private key and publication token | Exposure only to the isolated tag-only publish job |
 | Release artifacts, SBOMs, checksums, and evidence | Exact-commit integrity, architecture identity, and verified signatures |
 
@@ -112,8 +115,9 @@ flowchart LR
     Journal --> WORM["Optional independent WORM sink"]
 
     Public["Public readers, forks, and pull requests"] --> Source["Reviewed source and pins"]
-    Source --> Runners["Ephemeral GitHub-hosted native jobs"]
-    Runners --> Artifacts["Unsigned build artifacts + evidence"]
+    Source --> Runners["Ephemeral native amd64/arm64 runners"]
+    Runners --> Builders["Pinned distro builders + QEMU guests"]
+    Builders --> Artifacts["Nine unsigned packages + evidence"]
     Artifacts --> Publish["Separate GitHub-hosted publish job"]
     GitHub["Protected environment, vars, tag authorization, and secrets"] --> Publish
     Publish --> Release["Signed public GitHub release"]
@@ -128,8 +132,8 @@ flowchart LR
 | TB-05 VaultLink to mounted storage | Descriptor-relative capabilities, mount identity, internal namespaces, and atomic publication confine filesystem effects |
 | TB-06 External SMB writer to visible storage | External writers are trusted publishers but remain excluded from internal storage and local security state |
 | TB-07 VaultLink host to external audit sink | The local host is not an independent witness; WORM forwarding is required when tamper resistance matters |
-| TB-08 Reviewed source to GitHub-hosted CI | Full-SHA and digest pins, policy checks, ephemeral native jobs, and reproducibility evidence constrain build inputs; GitHub's runner and artifact isolation remain trusted |
-| TB-09 Public repository activity to secret-bearing publication | Public visibility grants read, fork, and pull-request access, not tag creation, environment approval, signing secrets, or publication authority; publication additionally requires public visibility, an authorized version tag, and the protected `release-signing` environment |
+| TB-08 Reviewed source to GitHub-hosted CI | Full-SHA and digest pins, one declarative target manifest, ephemeral native jobs, target builders/guests, package allowlists, and reproducibility evidence constrain build inputs; GitHub's runner, registry, and artifact isolation remain trusted |
+| TB-09 Public repository activity to secret-bearing publication | Public visibility grants read, fork, and pull-request access, not tag creation, environment approval, signing/policy secrets, or publication authority; publication additionally requires public visibility, an authorized version tag, the protected `release-signing` environment, and an admin-read proof that Immutable Releases is enabled |
 | TB-10 Maintainer authorization to release | An annotated version tag must equal the approved `main` commit, the repository must be public, environment approval must succeed, and all exact-commit evidence must pass |
 
 ## Security invariants
@@ -149,10 +153,11 @@ A change that weakens one requires an explicit threat-model review.
 | INV-08 | Unknown and known administrator usernames consume the same admitted Argon2 resource class | shared Argon2 semaphore and dummy hashing path in `src/http_auth.rs` and `src/services/auth.rs` |
 | INV-09 | An untrusted network peer cannot assert another client identity through forwarding headers | exact trusted-proxy allowlist and right-to-left chain validation |
 | INV-10 | RSA WebAuthn credentials remain unreachable while `RUSTSEC-2023-0071` is excepted | no RS256 advertising, centralized runtime rejection, persistence/authentication regression tests |
-| INV-11 | A release-time image is an exact reviewed multi-architecture digest or the workflow fails before protected work | repository variable equals `deploy/docker/release-builder-image.lock`, builder verification and supply-chain policy |
+| INV-11 | Every release builder and guest is the exact reviewed digest declared for that target or the workflow fails before protected work | `release/package-targets.json`, image-refresh workflow, manifest validation, and supply-chain policy |
 | INV-12 | Pull-request and non-publish jobs never receive signing secrets or release write authority, and cannot choose the environment that does | public-and-tag-only GitHub-hosted `publish` job, protected `release-signing` environment, direct GitHub variable lookup, job-scoped permissions |
-| INV-13 | Signed artifacts correspond to the exact approved commit and verified native/reproducible evidence | release workflow gates, checksums, SBOMs, soak evidence, exact tag-to-`main` equality |
-| INV-14 | Missing Minisign material, builder provisioning, or release evidence blocks publication | fail-closed workflow and unchecked release checklist gates |
+| INV-13 | All 21 signed assets correspond to the exact approved commit and complete native package/reproducibility/VM evidence | release workflow gates, global checksums, all-target SBOM bundle, soak evidence, exact tag-to-`main` equality |
+| INV-14 | Missing Minisign material, target image provisioning, matrix evidence, release evidence, or immutable-release policy proof blocks publication | fail-closed aggregate gates, admin-read pre-publication checks, and unchecked release checklist gates |
+| INV-15 | A package update cannot silently mix package database, candidate, active binary, or runtime state versions | root-only staged inputs and pinned Minisign key, exact install marker, signed new and old packages, offline dependency preflight and transaction, canonical frozen backup sources, authenticated package reinstall, preserved updater-config identity, post-recovery parity checks, and a root package/runtime `ExecStartPre` guard with bounded restart attempts before every service start |
 
 ## Threat register
 
@@ -193,28 +198,29 @@ test evidence against which each case is reviewed.
 | TM-DATA-01 | Theft of SQLite, keyring, configuration, or a complete backup exposes credentials and policy | Service-only ownership/modes, local-filesystem requirement, encrypted fields, protected backup procedures | Database plus matching keyring is a production credential. Host/disk encryption and backup custody remain operator responsibilities. |
 | TM-DATA-02 | Power loss or concurrent operation corrupts key rotation or creates mixed secret state | Keyring locking, write-before-reencrypt sequencing, transactional row updates, startup decryption validation, rotation tests | Filesystem durability and host integrity are trusted. Reassess keyring format or rotation algorithm. |
 | TM-DATA-03 | An administrator suppresses or rewrites evidence | Required audit is atomic with protected mutations; events mirror to journald; local retention is bounded and priority-aware | Host/root/log administrators can tamper with local evidence. Independently administered append-only or WORM forwarding is required for stronger assurance. |
-| TM-DATA-04 | An old binary, mismatched configuration, or partial backup is activated after migration | Forward-only schema validation, inseparable four-file backup unit, maintenance lock, transactional upgrade/rollback, exact health/version checks | Manual recovery by a trusted host administrator remains possible and powerful. Reassess schema or deployment tooling changes. |
+| TM-DATA-04 | An old binary, mismatched configuration, swapped rollback input, or partial backup is activated after migration | Forward-only schema validation, inseparable four-file backup unit, canonical symlink-free `root:root` mode-`0700` backup subtree, exact `0700`/`0600` source modes, identity-and-hash freezing before use, maintenance lock, transactional upgrade/rollback, exact health/version checks | Manual recovery by a trusted host administrator remains possible and powerful. Reassess schema, backup layout, or deployment tooling changes. |
 | TM-DATA-05 | Unbounded database or audit growth causes denial of service | Bounded audit rows and retention, upload/transfer accounting, connection pool, busy timeout, bounded limiter state | Storage capacity still requires monitoring. Reassess after load tests or schema growth. |
 
 ### Build, dependency, and release supply chain
 
 | ID | Abuse case | Controls | Residual risk and review trigger |
 | --- | --- | --- | --- |
-| TM-SC-01 | A mutable action, tool, base image, Debian mirror, or Rust dependency changes without review | Full action SHAs, image digests, exact toolchain/tools, immutable Debian snapshot/package lock, Cargo.lock, policy checks, Dependabot review | Registry, upstream, maintainer, and cryptographic trust are not eliminated. Reassess pinning or package source changes. |
+| TM-SC-01 | A mutable action, tool, base image, distro snapshot/repository, or Rust dependency changes without review | Full action SHAs, per-target builder/guest digests, a QEMU-harness image/base lock with live-verified package closures for both architectures, fixed toolchain/tools, complete package locks or dated snapshots, Cargo.lock, policy checks, Dependabot review | Registry, upstream, maintainer, and cryptographic trust are not eliminated. Reassess pinning or package source changes. |
 | TM-SC-02 | A vulnerable or malicious dependency enters the graph | Independent native audits, sole documented RSA exception, SBOMs, duplicate policy, locked builds, fuzz/lint/test gates | Audits detect known advisories, not all malicious behavior. Reassess every exception and security-sensitive dependency update. |
-| TM-SC-03 | A public contributor or compromised non-publish job reaches signing secrets or release write authority | Public visibility is not release authorization; release has no pull-request trigger, publish requires public visibility plus an authorized `v*` tag, and only the protected `release-signing` job receives job-scoped `contents: write` and signing secrets | GitHub configuration and authorized maintainers remain trusted. Reassess repository visibility, tag rules, environment protection, secret scope, or publication permissions. |
+| TM-SC-03 | A public contributor or compromised non-publish job reaches signing secrets, the release-policy token, or release write authority | Public visibility is not release authorization; release has no pull-request trigger, publish requires public visibility plus an authorized `v*` tag, and only the protected `release-signing` job receives job-scoped `contents: write`, signing secrets, and the repository-scoped read-only Administration token | GitHub configuration and authorized maintainers remain trusted. Reassess repository visibility, tag rules, environment protection, secret scope, or publication permissions. |
 | TM-SC-04 | A compromised build job selects a malicious publish container | Publish resolves its image directly from the GitHub-managed repository variable, not another job's output; the image is digest-pinned and verified against the checked-in lock | A repository administrator can change the variable and is inside the release-authorization boundary. Reassess variable administration or environment protections. |
-| TM-SC-05 | A runner tampers with native artifacts before signing | Separate architecture artifacts, internal checksums, exact-commit status, reproducibility evidence, hosted verification before signing | A coordinated compromise of all evidence producers or GitHub control plane remains outside the guaranteed boundary. Reassess artifact/evidence independence. |
+| TM-SC-05 | A runner, builder, QEMU harness, or guest tampers with a target package or its evidence before signing | Native per-target artifacts, twice-clean bit identity, package lint/allowlists, commit-bound QEMU base/package locks verified against the running harness, isolated full guests, internal hashes, exact-commit aggregate gates, and draft re-download verification | A coordinated compromise of evidence producers, the reviewed harness itself, GHCR, or the GitHub control plane remains outside the guaranteed boundary. Reassess artifact/evidence independence. |
 | TM-SC-06 | A stale, unreviewed, or partial commit is released | Annotated tag must equal current `origin/main`; candidate, reproducibility, soak, and release evidence are commit-bound; publication is tag-only | Maintainer and GitHub tag controls remain trusted. Any post-soak commit invalidates evidence. |
-| TM-SC-07 | Missing builder, public key, private key, or password causes an unsafe fallback | `UNPROVISIONED`, empty/mismatched variables, missing `release/minisign.pub`, absent secrets, or invalid evidence all fail closed | This intentionally blocks release readiness until explicit provisioning; no fallback is supported. |
-| TM-SC-08 | A forged, redirected, downgraded, wrong-architecture, or malformed remote update gains root execution | Fixed official GitHub path, HTTPS-only redirects, stable strict SemVer, Debian/architecture binding, pinned root-owned Minisign key, independently signed checksum manifest, bounded downloads, archive path/type validation, exact candidate version, existing transactional upgrade/restore | GitHub availability, the release signing key, host root, CA trust, and the installed updater remain trusted. Key rotation is manual. Reassess repository ownership, asset naming, signing, updater privileges, or release hosting. |
+| TM-SC-07 | Missing builder, public key, private key, password, or immutable-release policy proof causes an unsafe fallback | `UNPROVISIONED`, empty/mismatched variables, missing `release/minisign.pub`, absent signing/policy secrets, a disabled immutable-release setting, or invalid evidence all fail closed before publication | The Administration token is repository-scoped and read-only; this intentionally blocks release readiness until explicit provisioning, with no fallback. |
+| TM-SC-08 | A forged, redirected, downgraded, cross-distro, wrong-architecture, malformed, or power-interrupted package update gains root execution, serves mixed code, or prevents recovery | Fixed official GitHub path, HTTPS-only redirects, stable strict SemVer, root-only `mktemp` staging, pinned root-owned Minisign key, direct package signatures, signed global checksums, exact marker/OS/package-database binding, bounded safe package inspection, exact DEB dependency preflight and fail-closed configure-only continuation, signed Arch install/remove wrappers, exact payload version, verified old-package download, offline package-manager transaction, preserved `update.conf` presence and inode, complete restore, final version parity, and a fail-closed package/runtime guard with bounded restarts before every service start | GitHub availability and retention, the release signing key, host root, CA trust, native package manager, and installed updater remain trusted. A power loss is fail-closed but may require operator recovery from retained evidence. Key rotation is manual. Reassess repository ownership, asset retention/naming, package formats, signing, updater privileges, or release hosting. |
+| TM-SC-09 | A maintainer script, unexpected package path, dependency, mode, package-manager hook, or systemd unit expands host authority | Format-specific linter, common positive allowlist, offline lifecycle smokes, no-autostart assertion, exact file inventory, signed Arch transaction wrappers, real update-unit/package-manager VM probes, and SELinux-enforcing Fedora guest | The root updater intentionally needs `ProtectSystem=false` for native package-manager hooks; all unrelated sandboxing remains enabled, transactions have 90-minute start and 30-minute stop ceilings, and signed allowlists plus parity checks are the write boundary. Native package-manager behavior and distribution policy remain trusted. Reassess every package layout, scriptlet, dependency, service unit, hook, or sandbox change. |
 
 ### Operations and availability
 
 | ID | Abuse case | Controls | Residual risk and review trigger |
 | --- | --- | --- | --- |
 | TM-OPS-01 | Slow, parallel, or expensive requests exhaust the service | Layered connection/stream/upload/Argon2/ZIP/search/preview limits, request deadlines, body bounds, per-peer budgets | Volumetric attacks and shared upstream exhaustion require proxy/network controls. Reassess after the final load profile. |
-| TM-OPS-02 | Repeated process failure resets local defenses or makes the service unavailable | systemd hardening/restart policy, fail-closed startup, soak restart gate, upstream rate limits | VaultLink is single-process and its rate-limit counters are not persistent. A remotely triggerable restart is a security defect requiring immediate review. |
+| TM-OPS-02 | Repeated process or package/runtime parity failure resets local defenses or makes the service unavailable | systemd hardening/restart policy, root package/runtime start guard, `StartLimitIntervalSec=1h`, `StartLimitBurst=3`, fail-closed startup, soak restart gate, upstream rate limits | VaultLink is single-process and its rate-limit counters are not persistent. A remotely triggerable restart is a security defect requiring immediate review. Mixed package state remains unavailable until trusted operator recovery. |
 | TM-OPS-03 | Host service privileges are used to attack the system | Dedicated user, empty capability set by default, restrictive systemd sandbox, narrow standalone capability override | Host root is privileged by design; GitHub-hosted CI isolation and the GitHub control plane remain trusted separately. Reassess service-unit overrides. |
 | TM-OPS-04 | Operational privacy settings create misleading forensic expectations | Client-IP audit is opt-in, purge is constrained and audited, client IPs never mirror to journald | Privacy-preserving defaults reduce correlation. Operators must choose and document their lawful forensic requirements. |
 
@@ -233,8 +239,9 @@ The following are explicit design decisions, not undisclosed guarantees:
 | RA-07 | One process owns each storage/data pair and can be an availability bottleneck | Active-active operation is unsupported; backup, monitoring, and recovery are operational controls |
 | RA-08 | `RUSTSEC-2023-0071` remains in the lockfile | All compensating conditions and mandatory re-review triggers in `SECURITY.md` continue to hold |
 | RA-09 | Host root, storage administrators, GitHub administrators, and the GitHub control plane retain powerful trusted roles | Access is restricted, reviewed, and separated where the supported deployment requires it |
-| RA-10 | Release provisioning and final evidence are incomplete before the first supported tag | The workflow remains fail closed and no release is described as supported before every checklist gate succeeds |
+| RA-10 | Release provisioning and final package/VM evidence are incomplete before the first supported package tag | The workflow remains fail closed and no release is described as supported before every target and checklist gate succeeds |
 | RA-11 | The supported source repository and release are public | Public users may read, fork, and propose changes but receive no implicit write, tag, environment-approval, signing-secret, or release authority; branch, tag, and environment protections remain mandatory |
+| RA-12 | VaultLink does not operate APT, DNF, or Pacman repositories and depends on GitHub retaining old package assets | Repository-level immutable releases protect future published assets; whole package releases are never deleted, and updates fail closed when the authenticated old package cannot be obtained |
 
 ## Verification and evidence
 
@@ -245,13 +252,14 @@ this document alone:
   independent amd64/arm64 dependency audits;
 - `tools/check-supply-chain-policy.sh` for workflow, pin, image, runner, and
   release invariants;
-- Docker smokes for setup, API, fixture privilege, root-helper, upgrade,
-  rollback, and recovery behavior;
+- Docker smokes for setup, API, package lifecycle, fixture privilege,
+  root-helper, update, rollback, and recovery behavior;
 - security-focused unit and integration tests for authentication, CSRF,
   WebAuthn, path handling, mount identity, upload publication, required audit,
   key rotation, and concurrency;
-- exact-commit reproducibility, staging, load, hardware-FIDO2, SMB, and 72-hour
-  soak gates in `docs/RELEASE-CHECKLIST.md`.
+- exact-commit nine-target package reproducibility, full-system VM, per-target
+  load, staging, hardware-FIDO2, SMB, and Debian 72-hour soak gates in
+  `docs/RELEASE-CHECKLIST-0.6.0.md`.
 
 Passing CI validates tested controls but does not close unchecked release
 checklist items or change an accepted residual risk.
@@ -262,6 +270,7 @@ checklist items or change an accepted residual risk.
 | --- | --- | --- | --- |
 | 2026-08-02 | `c11c5d2b7e61e4b30b20d4921315fcf31a86390e` | Initial 0.5.0 application, storage, deployment, CI, and release model | Trust boundaries, invariants, abuse cases, and accepted risks documented; open release gates remain fail closed |
 | 2026-08-09 | `5efa3fdf6045753d7754cc98ef9192dfc1373cfa` | Public-repository release and migration from persistent self-hosted CI to ephemeral GitHub-hosted runners | Public visibility is explicitly not release authorization; publication requires public visibility, an authorized exact-main tag, the protected signing environment, pinned inputs, and complete evidence |
+| 2026-08-25 | Unreleased 0.6.0 package implementation | Nine-target native-package distribution, package-bound authenticated updater, per-distro builders and full-system guests, 21-asset release, and withdrawal of 0.5.0 | Archive installation is removed from support; target identity, package database, old/new signed packages, runtime state, and commit-bound package/VM evidence become release and recovery boundaries |
 
 ## Review triggers
 

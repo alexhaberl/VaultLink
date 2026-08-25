@@ -2,7 +2,7 @@
 
 VaultLink is a server-rendered Rust web application that securely exposes an already mounted Linux directory through public download and upload links. Supported host platforms are Linux x86_64 and aarch64; Windows host support was removed in 0.4.1. Windows, macOS, and Linux clients remain interoperable through an external standard SMB server.
 
-Status: `0.5.1` is the current unreleased development line for Debian 13 on amd64 and arm64. The latest supported release remains the signed, annotated [`v0.5.0`](https://github.com/alexhaberl/VaultLink/releases/tag/v0.5.0). See the [changelog](CHANGELOG.md) for development changes and the historical [v0.5.0 release checklist](docs/RELEASE-CHECKLIST.md) for its evidence.
+Status: `0.6.0` is the current unreleased package-only development line for Debian 13, Ubuntu 24.04/26.04 LTS, Fedora 44, and an Arch Linux release snapshot. The `v0.5.0` GitHub release and its archive assets were withdrawn on 2026-08-25 and are unsupported; its annotated tag, commit, workflow evidence, and [historical checklist](docs/RELEASE-CHECKLIST.md) remain for audit purposes. There is currently no supported public VaultLink release. See the [package contract](docs/PACKAGING.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), and [changelog](CHANGELOG.md).
 
 ## 1. Security model
 
@@ -62,6 +62,8 @@ VaultLink/
 │   └── web/                middleware, rendering, browsing, transfer, upload domains
 ├── config/                 example configurations
 ├── deploy/                 systemd, Caddy, signed updates, upgrade/rollback
+├── packaging/              deterministic DEB, RPM, and Arch package inputs
+├── release/                declarative target and immutable image manifest
 ├── docs/                   upgrade, rollback, release gates
 ├── fuzz/                   path, range, multipart, preview, upload, API-policy fuzzing
 ├── Makefile
@@ -78,13 +80,18 @@ Fresh installations create schema 6 and version-2 through version-6 migration re
 
 The database defaults to `/var/lib/vaultlink/data.sqlite`; its required matching keyring is `/var/lib/vaultlink/secrets.keyring`. Both must be owned by `vaultlink:vaultlink` with mode `0600`. The database contains encrypted secrets, but the matching keyring can decrypt them, so the pair and every complete backup are production credentials.
 
-Upgrade with the service stopped during backup and activation:
+Install a newer signed native package through the package-bound updater:
 
 ```sh
-sudo deploy/vaultlink-upgrade.sh /pfad/zum/neuen/vaultlink /pfad/zur/neuen-config.toml
+sudo vaultlink-update check
+sudo vaultlink-update install
 ```
 
-The upgrade script is for an existing installation. Candidate configuration remains separate from live configuration until the stopped activation phase. Every verified backup and automatic restore contains the matching binary, `config.toml`, SQLite database, and `secrets.keyring`. Old and new binary/config pairs are validated as the unprivileged `vaultlink` user before downtime.
+Do not call the packaged upgrade helper with a raw binary. The updater verifies
+the package, signatures, package database, candidate, and rollback package
+before the helper can activate anything. Every verified backup and automatic
+restore contains the matching binary, `config.toml`, SQLite database, and
+`secrets.keyring`.
 
 Signed update, restore, and rollback details: [docs/UPGRADE-ROLLBACK.md](docs/UPGRADE-ROLLBACK.md).
 
@@ -150,7 +157,7 @@ Audited co-writer mode requires:
 - `allow_external_writer_replace = true` explicitly accepts last-writer-wins lost-update risk.
 - The SMB server must require SMB 3.1.1 signing and encryption for every direct client session; VaultLink's `seal` protects only its own Linux mount.
 
-Other network filesystems with external writers are not approved in 0.5.x. Runtime-editable settings under `/admin/settings` include `public_base_url`, upload limits, blocked extensions, Share-password policy, unlock duration, ZIP/search/text/media preview limits and extensions, and PDF-preview status. Server mode, bind address, TLS paths, trusted proxies, storage paths, and ACME mode remain file/restart based.
+Other network filesystems with external writers are not approved in 0.6.0. Runtime-editable settings under `/admin/settings` include `public_base_url`, upload limits, blocked extensions, Share-password policy, unlock duration, ZIP/search/text/media preview limits and extensions, and PDF-preview status. Server mode, bind address, TLS paths, trusted proxies, storage paths, and ACME mode remain file/restart based.
 
 ## 5. Routes and API design
 
@@ -174,7 +181,7 @@ Other network filesystems with external writers are not approved in 0.5.x. Runti
 
 `max_downloads` counts completed content transfers (download, ZIP, counted preview), not public metadata/landing requests or uploads. `HEAD` returns metadata only when the equivalent `GET` could begin under the current transfer session and does not itself consume quota.
 
-The session-based JSON API under `/api/v2` uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Version 0.5.x intentionally has no API tokens. Mutating administrator API routes require `X-CSRF-Token`. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
+The session-based JSON API under `/api/v2` uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Version 0.6.0 intentionally has no API tokens. Mutating administrator API routes require `X-CSRF-Token`. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
 
 After `/api/v2/session/mfa`, clients must retain both the rotated `Set-Cookie` value and returned `csrf_token`; the pre-MFA token becomes invalid. Before a password-protected Share is unlocked, public metadata returns only `{"locked":true}`. The unlock response returns an upload CSRF token sent as multipart field `csrf` by browser forms or `X-VaultLink-Upload-CSRF` by API clients.
 
@@ -288,44 +295,153 @@ letsencrypt_staging = true
 
 Test first with `letsencrypt_staging = true` and `hsts_enabled = false`. For production, set staging to false and then enable HSTS. VaultLink must itself be publicly reachable on port 443.
 
-## 8. Debian deployment
+## 8. Native package deployment
 
-Use the signed Debian-13 archive matching the host architecture and verify signatures/checksums as described in [docs/UPGRADE-ROLLBACK.md](docs/UPGRADE-ROLLBACK.md):
+VaultLink 0.6.0 supports only the exact native packages listed in
+[docs/PACKAGING.md](docs/PACKAGING.md): Debian 13 and Ubuntu 24.04/26.04 on
+amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch snapshot on
+x86_64. Install the matching package from the GitHub release after verifying
+both its direct Minisign signature and its digest in the signed global
+`SHA256SUMS`:
 
 ```sh
-sudo apt update && sudo apt install -y cifs-utils coreutils curl minisign sqlite3 util-linux
+# Set PACKAGE to exactly one matching release asset, for example
+# vaultlink_0.6.0-1+deb13_amd64.deb,
+# vaultlink_0.6.0-1+ubuntu24.04_arm64.deb,
+# vaultlink-0.6.0-1.fc44.x86_64.rpm, or
+# vaultlink-0.6.0-1-x86_64.pkg.tar.zst.
+: "${PACKAGE:?set PACKAGE to the exact asset for this host}"
+# Obtain minisign.pub through a separately trusted copy of this repository;
+# its key ID is EC6AEC772F7CDDEC.
+PUBLIC_KEY=/path/to/trusted/minisign.pub
 
-sudo useradd --system --home /var/lib/vaultlink --shell /usr/sbin/nologin vaultlink
-sudo install -d -o root -g vaultlink -m 0750 /opt/vaultlink /etc/vaultlink /etc/vaultlink/tls
-sudo install -d -o vaultlink -g vaultlink -m 0750 /var/lib/vaultlink /var/log/vaultlink
-sudo install -o root -g root -m 0755 bin/vaultlink /opt/vaultlink/vaultlink
-sudo install -o root -g root -m 0644 deploy/vaultlink.service /etc/systemd/system/vaultlink.service
-sudo systemctl daemon-reload
+# Freeze every input in one root-only staging directory *before* verification.
+# PACKAGE must be a basename, not a path containing '/'.
+case "$PACKAGE" in */*|'') exit 64 ;; esac
+STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.6.0.XXXXXXXX)
+test "$(sudo stat -c '%u:%g:%a' "$STAGE")" = 0:0:700
+sudo install -o root -g root -m 0600 \
+  "$PACKAGE" "$PACKAGE.minisig" SHA256SUMS SHA256SUMS.minisig \
+  "$PUBLIC_KEY" "$STAGE/"
+ROOT_PACKAGE="$STAGE/$PACKAGE"
+ROOT_PUBLIC_KEY="$STAGE/$(basename -- "$PUBLIC_KEY")"
+test "$(sudo sha256sum "$ROOT_PUBLIC_KEY" | awk '{ print $1 }')" = \
+  200d64c2f2e42ace790a6d74f8b101801065b2d9a51c8fdda5b47b4f2b2f9809
+
+sudo env STAGE="$STAGE" PACKAGE="$PACKAGE" ROOT_PUBLIC_KEY="$ROOT_PUBLIC_KEY" \
+  sh -eu -c '
+    cd "$STAGE"
+    minisign -V -q -p "$ROOT_PUBLIC_KEY" -m SHA256SUMS -x SHA256SUMS.minisig
+    awk -v package="$PACKAGE" \
+      '\''NF == 2 && $2 == package && $1 ~ /^[0-9a-f]{64}$/ { print }'\'' \
+      SHA256SUMS > package.sha256
+    test "$(wc -l < package.sha256)" -eq 1
+    sha256sum -c package.sha256
+    minisign -V -q -p "$ROOT_PUBLIC_KEY" -m "$PACKAGE" -x "$PACKAGE.minisig"
+    rm -f package.sha256
+  '
+
+# Debian or Ubuntu: require the exact signed-package dependency set and prove
+# every dependency fully installed before dpkg is allowed to unpack anything.
+DEB_DEPENDS=$(sudo dpkg-deb -f "$ROOT_PACKAGE" Depends)
+test "$DEB_DEPENDS" = \
+  'ca-certificates, curl, libc6, libgcc-s1, mawk, minisign, sqlite3, systemd'
+for dependency in ca-certificates curl libc6 libgcc-s1 mawk minisign sqlite3 systemd; do
+  test "$(dpkg-query -W -f='${db:Status-Status}' "$dependency" 2>/dev/null)" = \
+    installed
+done
+sudo dpkg -i "$ROOT_PACKAGE"
+
+# Fedora
+sudo rpm -Uvh "$ROOT_PACKAGE"
+
+# Arch Linux: extract the installer from that same verified root-owned copy.
+ROOT_INSTALLER="$STAGE/vaultlink-package-install.sh"
+sudo sh -eu -c '
+  bsdtar -xOf "$1" \
+    usr/lib/vaultlink/package/deploy/vaultlink-package-install.sh >"$2"
+  chown root:root "$2"
+  chmod 0700 "$2"
+' sh "$ROOT_PACKAGE" "$ROOT_INSTALLER"
+sudo "$ROOT_INSTALLER" "$ROOT_PACKAGE"
 ```
 
-Adjust `ReadWritePaths=/mnt/storage` in [deploy/vaultlink.service](deploy/vaultlink.service) to the validated mount base. Manual assets remain in [deploy/mnt-storage.mount.example](deploy/mnt-storage.mount.example) and [deploy/vaultlink-external-storage.conf](deploy/vaultlink-external-storage.conf).
+Remove the staging directory after the package manager or Arch wrapper has
+completed. Never verify a user-writable pathname and later pass that pathname
+to a privileged package operation; the verified object and installed object
+must be the same root-owned file.
 
-Optionally install the signed release updater. Its daily timer checks only the
-latest stable release from `alexhaberl/VaultLink`; automatic installation is
-disabled until the root-owned configuration explicitly enables it:
+These commands do not use a VaultLink package repository. The DEB dependency
+check above is a mandatory offline preflight of the exact `Depends` field; do
+not run `dpkg -i` until every listed package reports `installed`. If `dpkg -i`
+nevertheless fails for a missing dependency after leaving `vaultlink`
+unpacked, keep the application service and update timer inactive and disabled,
+install the missing dependency manually with the operating system's package
+manager, and continue that same transaction only with
+`sudo dpkg --configure vaultlink`. Do not run `dpkg -i` again over the unpacked
+package. Stop for manual recovery if the package database, candidate, marker,
+or runtime cannot subsequently prove exact parity. RPM and Arch likewise
+require their complete dependencies before the offline VaultLink package
+transaction. `cifs-utils` is required only when VaultLink itself provisions or
+mounts SMB storage.
+
+Do not use a direct initial `pacman -U`. Pacman 7 can register a package even
+when an `.INSTALL` hook rejects unsafe pre-existing state, so VaultLink's
+signed, embedded Arch wrapper performs the fail-closed preflight and verifies
+the postconditions around `pacman -U`. Package updates are still performed by
+the verified VaultLink updater through Pacman.
+
+On Arch, ordinary removal must use the installed, signed
+`/usr/lib/vaultlink/package/deploy/vaultlink-package-remove.sh` wrapper. A
+later reinstall must use `vaultlink-package-install.sh` extracted from the
+new, root-staged, Minisign-verified package as shown above. Direct
+`pacman -R vaultlink` and direct manual reinstall with `pacman -U` are
+unsupported. Removal, reinstall, and signed updates preserve both the
+intentional absence of `/etc/vaultlink/update.conf` and, when it is present,
+the same file, inode, bytes, owner, mode, and modification time.
+
+The package installs a candidate under `/usr/lib/vaultlink/package`, creates a
+package-bound installation marker, and places the initial runtime under
+`/opt/vaultlink`. It never creates or overwrites a production `config.toml` and
+does not enable or start the service or updater timer. Existing markerless
+archive installations are rejected; the withdrawn 0.5.0 archive has no
+supported in-place upgrade path to 0.6.0.
+
+Adjust `ReadWritePaths=/mnt/storage` with a systemd drop-in when using another
+validated mount base. Packaged examples include the equivalent of
+[deploy/mnt-storage.mount.example](deploy/mnt-storage.mount.example) and
+[deploy/vaultlink-external-storage.conf](deploy/vaultlink-external-storage.conf).
+
+The package also installs the root-owned updater as
+`/usr/sbin/vaultlink-update`. Its daily timer and automatic installation remain
+disabled until the administrator explicitly opts in:
 
 ```sh
-sudo install -d -o root -g root -m 0755 /usr/local/sbin /usr/share/vaultlink
-sudo install -o root -g root -m 0755 deploy/vaultlink-update.sh /usr/local/sbin/vaultlink-update
-sudo install -o root -g root -m 0644 minisign.pub /usr/share/vaultlink/minisign.pub
-sudo install -o root -g root -m 0644 deploy/vaultlink-update.service deploy/vaultlink-update.timer /etc/systemd/system/
-sudo test -e /etc/vaultlink/update.conf || sudo install -o root -g root -m 0644 deploy/vaultlink-update.conf.example /etc/vaultlink/update.conf
-sudo systemctl daemon-reload
+sudo vaultlink-update check
+sudo vaultlink-update install
+
+# Optional unattended updates; first review /etc/vaultlink/update.conf.
+sudoedit /etc/vaultlink/update.conf
 sudo systemctl enable --now vaultlink-update.timer
 ```
 
-Use `sudo vaultlink-update check` for a non-mutating check and
-`sudo vaultlink-update install` for an immediate verified update. Set exactly
-`auto_install=true` in `/etc/vaultlink/update.conf` to let the timer install a
-newer signed release automatically while `vaultlink.service` is active. A
-deliberately stopped service remains untouched. Every installation retains the live
-configuration and delegates activation to the same complete backup, readiness,
-integrity, and automatic-rollback path as a manual upgrade.
+Set exactly `auto_install=true` to permit `auto` to install a newer signed
+package, and only while `vaultlink.service` was already active. A deliberately
+stopped service remains stopped. Signed updater installation and its automatic
+recovery verify both the new and currently installed release packages and use
+no distro repository during the transaction. A standalone rollback first requires
+the matching signed target package to be installed, then binds the frozen
+root-only backup to that package's database record, candidate, and runtime
+guard before activation. Both paths preserve state and require package
+database, candidate, active binary, and readiness versions to agree.
+
+Every service start first runs the root-owned package/runtime parity guard.
+`StartLimitIntervalSec=1h` and `StartLimitBurst=3` bound repeated fail-closed
+starts after a crash or power loss. The root updater needs
+`ProtectSystem=false` because native package-manager hooks have distro-owned
+write sets; all unrelated namespace, device, kernel, process, and network
+hardening remains enabled, and its oneshot is bounded by
+`TimeoutStartSec=90min` and `TimeoutStopSec=30min`.
 
 ### Provision a CIFS mount safely
 

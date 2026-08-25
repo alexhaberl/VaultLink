@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.7
+# This image contains the userspace QEMU test harness only. Guest images remain
+# separate digest-pinned OCI artifacts in release/package-targets.json.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE
+ARG TARGETARCH
+RUN set -eu \
+    && . /etc/os-release \
+    && test "${ID:-}" = ubuntu \
+    && test "${VERSION_ID:-}" = 24.04 \
+    && apt-get update \
+    && if [ "$TARGETARCH" = amd64 ]; then qemu_packages=qemu-system-x86; \
+       elif [ "$TARGETARCH" = arm64 ]; then qemu_packages='qemu-system-arm qemu-efi-aarch64'; \
+       else echo "unsupported QEMU runner architecture: $TARGETARCH" >&2; exit 1; fi \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates cloud-image-utils coreutils curl jq openssh-client openssl \
+        python3 qemu-utils $qemu_packages \
+    && dpkg-query -W -f='${binary:Package}=${Version}\n' \
+        | LC_ALL=C sort >/usr/local/share/vaultlink-qemu-runner-packages.lock \
+    && printf 'base_image=%s\narchitecture=%s\n' "$BASE_IMAGE" "$TARGETARCH" \
+        >/usr/local/share/vaultlink-qemu-runner.env \
+    && chmod 0644 /usr/local/share/vaultlink-qemu-runner-packages.lock \
+        /usr/local/share/vaultlink-qemu-runner.env \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC
+WORKDIR /work

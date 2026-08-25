@@ -1,0 +1,346 @@
+name: Native distribution packages
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  REAL_UPDATE_NEW_VERSION: 0.6.1
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+      provisioned: ${{ steps.targets.outputs.provisioned }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate the sole package-target manifest
+        id: targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          provisioned=true
+          if ! python3 tools/package-targets.py validate; then
+            if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
+              echo 'Package builders, VM guests, or the Arch snapshot are not provisioned.' >&2
+              exit 77
+            fi
+            python3 tools/package-targets.py validate --allow-unprovisioned
+            provisioned=false
+          fi
+          printf 'provisioned=%s\nmatrix=%s\n' "$provisioned" \
+            "$(python3 tools/package-targets.py matrix --allow-unprovisioned)" \
+            >>"$GITHUB_OUTPUT"
+
+  build:
+    if: needs.prepare.outputs.provisioned == 'true'
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    container:
+      image: ${{ matrix.builder_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CARGO_TERM_COLOR: always
+      TARGET_ID: ${{ matrix.id }}
+    steps:
+      - name: Restore host workspace ownership before checkout
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify native builder and target lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          source_date_epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          [[ "$source_date_epoch" =~ ^[0-9]+$ ]]
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >>"$GITHUB_ENV"
+          python3 tools/package-targets.py validate
+          sh tools/verify-package-builder.sh "$TARGET_ID"
+          test "$(uname -m)" = '${{ matrix.uname }}'
+      - name: Build native binary and normalized SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          printf 'PACKAGE_VERSION=%s\n' "$version" >>"$GITHUB_ENV"
+          cargo build --locked --release
+          sh tools/check-version-consistency.sh --binary target/release/vaultlink
+          rm -f ./*.cdx.json
+          cargo cyclonedx --format json
+          raw_sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print)
+          test "$(printf '%s\n' "$raw_sbom" | grep -c .)" -eq 1
+          install -d dist
+          python3 tools/normalize-cyclonedx-sbom.py \
+            "$raw_sbom" "dist/$TARGET_ID.cdx.json"
+      - name: Build, inspect, and lint native package
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh tools/build-native-package.sh \
+            "$TARGET_ID" "$PACKAGE_VERSION" target/release/vaultlink \
+            "dist/$TARGET_ID.cdx.json" dist
+          package=$(python3 tools/package-targets.py asset "$TARGET_ID" "$PACKAGE_VERSION")
+          package_path="dist/$package"
+          sh tools/verify-native-package.sh \
+            "$TARGET_ID" "$PACKAGE_VERSION" "$package_path" \
+            target/release/vaultlink "dist/$TARGET_ID.cdx.json"
+          sh tools/lint-native-package.sh "$TARGET_ID" "$package_path"
+          printf 'target=%s\nversion=%s\npackage=%s\npackage_sha256=%s\nbinary_sha256=%s\n' \
+            "$TARGET_ID" "$PACKAGE_VERSION" "$package" \
+            "$(sha256sum "$package_path" | awk '{print $1}')" \
+            "$(sha256sum target/release/vaultlink | awk '{print $1}')" \
+            >"dist/$TARGET_ID.package.env"
+          install -d "dist/release-input-$TARGET_ID"
+          cp "$package_path" "dist/$TARGET_ID.cdx.json" \
+            "dist/release-input-$TARGET_ID/"
+      - name: Build native test-only package update fixture from the same commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$PACKAGE_VERSION" = 0.6.0
+          test "$REAL_UPDATE_NEW_VERSION" = 0.6.1
+          test "$(target/release/vaultlink --version)" = "$PACKAGE_VERSION"
+          old_binary_sha256=$(sha256sum target/release/vaultlink | awk '{print $1}')
+          fixture_source=$(mktemp -d "$RUNNER_TEMP/vaultlink-real-update-source.XXXXXXXX")
+          git archive "$GITHUB_SHA" | tar -x -C "$fixture_source"
+          python3 - "$fixture_source" "$PACKAGE_VERSION" \
+            "$REAL_UPDATE_NEW_VERSION" <<'PY'
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          old_version = sys.argv[2]
+          new_version = sys.argv[3]
+
+          def replace_once(path, old, new):
+              text = path.read_text(encoding="utf-8")
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected exactly one version binding in {path}")
+              path.write_text(text.replace(old, new), encoding="utf-8")
+
+          replace_once(
+              root / "Cargo.toml",
+              f'name = "vaultlink"\nversion = "{old_version}"\n',
+              f'name = "vaultlink"\nversion = "{new_version}"\n',
+          )
+          replace_once(
+              root / "Cargo.lock",
+              f'[[package]]\nname = "vaultlink"\nversion = "{old_version}"\n',
+              f'[[package]]\nname = "vaultlink"\nversion = "{new_version}"\n',
+          )
+          PY
+          (
+            cd "$fixture_source"
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+              cargo build --locked --release
+            test "$("$GITHUB_WORKSPACE/target/release/vaultlink" --version)" = \
+              "$REAL_UPDATE_NEW_VERSION"
+            rm -f ./*.cdx.json
+            cargo cyclonedx --format json
+          )
+          raw_fixture_sbom=$(find "$fixture_source" -maxdepth 1 \
+            -name '*.cdx.json' -type f -print)
+          test "$(printf '%s\n' "$raw_fixture_sbom" | grep -c .)" -eq 1
+          fixture_sbom="dist/$TARGET_ID.real-update-new.cdx.json"
+          python3 tools/normalize-cyclonedx-sbom.py \
+            "$raw_fixture_sbom" "$fixture_sbom"
+          fixture_dir="dist/real-update-fixture-$TARGET_ID"
+          install -d "$fixture_dir"
+          old_asset=$(python3 tools/package-targets.py asset \
+            "$TARGET_ID" "$PACKAGE_VERSION")
+          new_asset=$(python3 tools/package-targets.py asset \
+            "$TARGET_ID" "$REAL_UPDATE_NEW_VERSION")
+          cp "dist/$old_asset" "$fixture_dir/$old_asset"
+          sh tools/build-native-package.sh \
+            "$TARGET_ID" "$REAL_UPDATE_NEW_VERSION" \
+            target/release/vaultlink "$fixture_sbom" "$fixture_dir"
+          sh tools/lint-native-package.sh \
+            "$TARGET_ID" "$fixture_dir/$new_asset"
+          printf 'target=%s\nold_version=%s\nnew_version=%s\nold_asset=%s\nnew_asset=%s\nold_binary_sha256=%s\nnew_binary_sha256=%s\nold_package_sha256=%s\nnew_package_sha256=%s\n' \
+            "$TARGET_ID" "$PACKAGE_VERSION" "$REAL_UPDATE_NEW_VERSION" \
+            "$old_asset" "$new_asset" "$old_binary_sha256" \
+            "$(sha256sum target/release/vaultlink | awk '{print $1}')" \
+            "$(sha256sum "$fixture_dir/$old_asset" | awk '{print $1}')" \
+            "$(sha256sum "$fixture_dir/$new_asset" | awk '{print $1}')" \
+            >"$fixture_dir/fixture.env"
+      - name: Upload unsigned release inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vaultlink-package-${{ matrix.id }}
+          path: dist/release-input-${{ matrix.id }}/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload package evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vaultlink-package-evidence-${{ matrix.id }}
+          path: dist/${{ matrix.id }}.package.env
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload test-only real package update fixtures
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vaultlink-real-package-update-fixture-${{ matrix.id }}
+          path: dist/real-update-fixture-${{ matrix.id }}/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Restore host workspace ownership
+        if: always()
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+
+  smoke:
+    if: needs.prepare.outputs.provisioned == 'true'
+    needs: [prepare, build]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      TARGET_ID: ${{ matrix.id }}
+      BUILDER_IMAGE: ${{ matrix.builder_image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vaultlink-package-${{ matrix.id }}
+          path: offline-smoke/${{ matrix.id }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vaultlink-real-package-update-fixture-${{ matrix.id }}
+          path: real-update-smoke/${{ matrix.id }}
+      - name: Run lifecycle, systemd, API, migration, and rollback smoke offline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker pull "$BUILDER_IMAGE"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          asset=$(python3 tools/package-targets.py asset "$TARGET_ID" "$version")
+          package="offline-smoke/$TARGET_ID/$asset"
+          test -s "$package"
+          docker run --rm --network none --user root \
+            --volume "$PWD:/work" --workdir /work \
+            "$BUILDER_IMAGE" \
+            sh tools/package-offline-smoke.sh \
+              "$TARGET_ID" "$version" "$package" \
+            | tee "offline-smoke/$TARGET_ID/offline-smoke.env"
+          grep -F -x -q 'network=none' \
+            "offline-smoke/$TARGET_ID/offline-smoke.env"
+          grep -F -x -q 'real_migration=ok' \
+            "offline-smoke/$TARGET_ID/offline-smoke.env"
+          grep -F -x -q 'upgrade_migration_backup_rollback=ok' \
+            "offline-smoke/$TARGET_ID/offline-smoke.env"
+      - name: Run signed real-package update and recovery smoke offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = '${{ matrix.uname }}'
+          old_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test "$old_version" = 0.6.0
+          test "$REAL_UPDATE_NEW_VERSION" = 0.6.1
+          old_asset=$(python3 tools/package-targets.py asset \
+            "$TARGET_ID" "$old_version")
+          new_asset=$(python3 tools/package-targets.py asset \
+            "$TARGET_ID" "$REAL_UPDATE_NEW_VERSION")
+          fixture_dir="real-update-smoke/$TARGET_ID"
+          test -s "$fixture_dir/$old_asset"
+          test -s "$fixture_dir/$new_asset"
+          set -o pipefail
+          make docker-real-package-update-smoke \
+            REAL_PACKAGE_TARGET="$TARGET_ID" \
+            REAL_PACKAGE_BUILDER_IMAGE="$BUILDER_IMAGE" \
+            REAL_PACKAGE_OLD_VERSION="$old_version" \
+            REAL_PACKAGE_NEW_VERSION="$REAL_UPDATE_NEW_VERSION" \
+            REAL_PACKAGE_OLD_PACKAGE="$fixture_dir/$old_asset" \
+            REAL_PACKAGE_NEW_PACKAGE="$fixture_dir/$new_asset" \
+            | tee "$fixture_dir/real-package-update-smoke.env"
+          evidence="$fixture_dir/real-package-update-smoke.env"
+          grep -F -x -q 'missing_dependency_zero_mutation=ok' "$evidence"
+          grep -F -x -q 'success_parity=ok' "$evidence"
+          grep -F -x -q 'activation_old_package_reinstall=ok' "$evidence"
+          package_format=$(python3 tools/package-targets.py get \
+            "$TARGET_ID" package_format)
+          if [[ "$package_format" == deb ]]; then
+            grep -F -x -q 'archive_parser_negative_fixtures=ok' "$evidence"
+          else
+            grep -F -x -q 'archive_parser_negative_fixtures=not-applicable' \
+              "$evidence"
+          fi
+      - name: Upload offline smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vaultlink-package-offline-smoke-${{ matrix.id }}
+          path: offline-smoke/${{ matrix.id }}/offline-smoke.env
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload real package update evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vaultlink-real-package-update-evidence-${{ matrix.id }}
+          path: real-update-smoke/${{ matrix.id }}/*.env
+          if-no-files-found: error
+          retention-days: 30
+
+  publish_gate:
+    name: Publish exact-commit package gate
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    needs: [prepare, build, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      statuses: write
+    steps:
+      - name: Publish aggregate result
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PREPARE_RESULT" == success && "$BUILD_RESULT" == success \
+            && "$SMOKE_RESULT" == success ]]; then
+            state=success
+            description='All nine packages passed native offline lifecycle and real update/recovery gates'
+          else
+            state=failure
+            description='Native package matrix failed or package images are unprovisioned'
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context='vaultlink/packages' \
+            -f description="$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

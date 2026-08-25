@@ -1,0 +1,210 @@
+name: Full-system distribution package gates
+run-name: Distro VMs ${{ inputs.commit_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact origin/main commit whose package artifacts must be tested
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+concurrency:
+  group: vaultlink-distro-vms-${{ inputs.commit_sha }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+      packages_run: ${{ steps.packages.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate exact main commit and immutable VM matrix
+        id: targets
+        shell: bash
+        env:
+          APPROVED_COMMIT: ${{ inputs.commit_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$APPROVED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
+          main_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          test "$main_commit" = "$APPROVED_COMMIT"
+          python3 tools/package-targets.py validate
+          qemu_runner=$(cat deploy/docker/qemu-runner-image.lock)
+          test "$(wc -l <deploy/docker/qemu-runner-image.lock)" -eq 1
+          [[ "$qemu_runner" =~ ^ghcr\.io/alexhaberl/vaultlink-qemu-runner@sha256:[0-9a-f]{64}$ ]]
+          printf 'matrix=%s\n' "$(python3 tools/package-targets.py matrix)" >>"$GITHUB_OUTPUT"
+      - name: Resolve exact successful package run
+        id: packages
+        shell: bash
+        env:
+          APPROVED_COMMIT: ${{ inputs.commit_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          lines=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/commits/$APPROVED_COMMIT/statuses?per_page=100" \
+            --jq '.[] | select(.context == "vaultlink/packages") | [.state,.target_url] | @tsv')
+          line=$(printf '%s\n' "$lines" | sed -n '1p')
+          IFS=$'\t' read -r state target_url <<<"$line"
+          test "$state" = success
+          prefix="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/"
+          case "$target_url" in "$prefix"*) ;; *) exit 77 ;; esac
+          run_id=${target_url#"$prefix"}
+          [[ "$run_id" =~ ^[0-9]+$ ]]
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+            --jq '[.head_sha,.head_branch,.conclusion,.path] | @tsv')
+          IFS=$'\t' read -r run_sha run_branch conclusion run_path <<<"$run"
+          run_path=${run_path%%@*}
+          test "$run_sha" = "$APPROVED_COMMIT"
+          test "$run_branch" = main
+          test "$conclusion" = success
+          test "$run_path" = .github/workflows/packages.yml
+          printf 'run_id=%s\n' "$run_id" >>"$GITHUB_OUTPUT"
+
+  test:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    env:
+      TARGET_ID: ${{ matrix.id }}
+      VM_IMAGE: ${{ matrix.vm_image }}
+      ARCHITECTURE: ${{ matrix.architecture }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+      - name: Download exact package artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGES_RUN: ${{ needs.prepare.outputs.packages_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 0755 "vm-test/$TARGET_ID/package"
+          gh run download "$PACKAGES_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name "vaultlink-package-$TARGET_ID" \
+            --dir "vm-test/$TARGET_ID/package"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          asset=$(python3 tools/package-targets.py asset "$TARGET_ID" "$version")
+          test -s "vm-test/$TARGET_ID/package/$asset"
+          test -s "vm-test/$TARGET_ID/package/$TARGET_ID.cdx.json"
+      - name: Extract digest-pinned guest and run offline full-system gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          qemu_runner=$(cat deploy/docker/qemu-runner-image.lock)
+          docker pull "$qemu_runner"
+          docker run --rm --network none --user root \
+            --volume "$PWD:/work:ro" --workdir /work \
+            "$qemu_runner" \
+            sh tools/verify-qemu-runner.sh "$ARCHITECTURE" \
+            >"vm-test/$TARGET_ID/qemu-runner-verification.env"
+          docker pull "$VM_IMAGE"
+          container="vaultlink-vm-image-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$TARGET_ID"
+          docker create --name "$container" "$VM_IMAGE" /bin/true >/dev/null
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/images/guest.qcow2" "vm-test/$TARGET_ID/guest.qcow2"
+          docker cp "$container:/images/guest-image.env" "vm-test/$TARGET_ID/guest-image.env"
+          docker rm "$container" >/dev/null
+          trap - EXIT
+          grep -F -x -q "target_id=$TARGET_ID" "vm-test/$TARGET_ID/guest-image.env"
+          grep -F -x -q 'upstream_sha256=${{ matrix.vm_upstream_sha256 }}' \
+            "vm-test/$TARGET_ID/guest-image.env"
+          grep -F -x -q 'packages_sha256=${{ matrix.vm_packages_sha256 }}' \
+            "vm-test/$TARGET_ID/guest-image.env"
+          grep -F -x -q "qemu_runner_image=$qemu_runner" \
+            "vm-test/$TARGET_ID/guest-image.env"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          asset=$(python3 tools/package-targets.py asset "$TARGET_ID" "$version")
+          kvm_args=()
+          if [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
+            kvm_args+=(--device /dev/kvm)
+          fi
+          docker run --rm --network none --user root \
+            "${kvm_args[@]}" \
+            --volume "$PWD:/work" --workdir /work \
+            "$qemu_runner" \
+            sh tools/run-distro-vm-test.sh \
+              "$TARGET_ID" "vm-test/$TARGET_ID/package/$asset" \
+              "vm-test/$TARGET_ID/guest.qcow2" "vm-test/$TARGET_ID/evidence"
+      - name: Upload full-system evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distro-vm-${{ inputs.commit_sha }}-${{ matrix.id }}
+          path: |
+            vm-test/${{ matrix.id }}/evidence
+            vm-test/${{ matrix.id }}/qemu-runner-verification.env
+          if-no-files-found: error
+          retention-days: 30
+
+  publish_gate:
+    name: Publish exact-commit distro VM gate
+    if: always()
+    needs: [prepare, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      statuses: write
+    steps:
+      - name: Record the package-run binding
+        if: needs.prepare.result == 'success' && needs.test.result == 'success'
+        env:
+          APPROVED_COMMIT: ${{ inputs.commit_sha }}
+          PACKAGES_RUN: ${{ needs.prepare.outputs.packages_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'commit=%s\npackages_run=%s\n' \
+            "$APPROVED_COMMIT" "$PACKAGES_RUN" >distro-vm-binding.env
+      - name: Upload the package-run binding
+        if: needs.prepare.result == 'success' && needs.test.result == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distro-vm-binding-${{ inputs.commit_sha }}
+          path: distro-vm-binding.env
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish aggregate result
+        env:
+          APPROVED_COMMIT: ${{ inputs.commit_sha }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$APPROVED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$PREPARE_RESULT" == success && "$TEST_RESULT" == success ]]; then
+            state=success
+            description='Nine offline full-system package, load, upgrade, and rollback gates passed'
+          else
+            state=failure
+            description='A full-system distro VM gate failed or its lock was unprovisioned'
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$APPROVED_COMMIT" \
+            -f state="$state" \
+            -f context='vaultlink/distro-vms' \
+            -f description="$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

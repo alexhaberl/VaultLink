@@ -2,6 +2,8 @@
 Description=VaultLink secure file sharing
 After=network-online.target local-fs.target remote-fs.target
 Wants=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=3
 
 [Service]
 # Exactly one serving unit may use a given storage.internal_directory. VaultLink
@@ -9,6 +11,7 @@ Wants=network-online.target
 Type=simple
 User=vaultlink
 Group=vaultlink
+ExecStartPre=+/usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh
 ExecStart=/opt/vaultlink/vaultlink --config /etc/vaultlink/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
@@ -19,10 +22,11 @@ LimitNOFILE=4096
 LimitCORE=0
 TasksMax=512
 NoNewPrivileges=true
-# Do not enable RestrictSUIDSGID here. On Debian 13's systemd 257 it denies
-# openat2(O_CREAT), which VaultLink requires for its private storage lock and
-# atomic file workflows. The unprivileged service identity, UMask=0077,
-# NoNewPrivileges, and empty capability bounding set retain the boundary.
+# Do not enable RestrictSUIDSGID here. The supported distributions' systemd
+# versions can deny openat2(O_CREAT) under this restriction; VaultLink needs it
+# for its private storage lock and atomic file workflows. The unprivileged
+# service identity, UMask=0077, NoNewPrivileges, and empty capability bounding
+# set retain the boundary.
 SystemCallArchitectures=native
 PrivateTmp=true
 PrivateDevices=true
@@ -46,7 +50,7 @@ SystemCallFilter=@system-service openat2 renameat2 statx
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-ReadWritePaths=/var/lib/vaultlink /var/log/vaultlink /mnt/storage
+ReadWritePaths=/var/lib/vaultlink /var/log/vaultlink /mnt/storage -/mnt/.vaultlink-internal
 ReadOnlyPaths=/etc/vaultlink
 
 [Install]

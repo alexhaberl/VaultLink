@@ -109,7 +109,12 @@ case "${1:-}" in
         fi
         ;;
     is-active)
-        service_is_active
+        if service_is_active; then
+            printf '%s\n' active
+            exit 0
+        fi
+        printf '%s\n' inactive
+        exit 3
         ;;
     *)
         echo "unexpected systemctl invocation: $*" >&2
@@ -365,14 +370,40 @@ make_candidate() {
 }
 
 make_source_backup() {
-    source_backup="$TEST_ROOT/source-backup"
+    install -d -o root -g root -m 0700 /var/lib/vaultlink-backups
+    source_backup=/var/lib/vaultlink-backups/source-backup
     rm -rf "$source_backup"
-    mkdir -p "$source_backup"
-    install -m 0755 /opt/vaultlink/vaultlink "$source_backup/vaultlink"
-    install -m 0640 "$CONFIG_PATH" "$source_backup/config.toml"
+    install -d -o root -g root -m 0700 "$source_backup"
+    install -o root -g root -m 0700 /opt/vaultlink/vaultlink "$source_backup/vaultlink"
+    install -o root -g root -m 0600 "$CONFIG_PATH" "$source_backup/config.toml"
     "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite ".backup '$source_backup/data.sqlite'"
-    install -m 0600 /var/lib/vaultlink/secrets.keyring "$source_backup/secrets.keyring"
+    chown root:root "$source_backup/data.sqlite"
+    chmod 0600 "$source_backup/data.sqlite"
+    install -o root -g root -m 0600 \
+        /var/lib/vaultlink/secrets.keyring "$source_backup/secrets.keyring"
     printf '%s\n' "$source_backup"
+}
+
+prepare_package_rollback_target() {
+    package_backup=$1
+    install -d -o root -g root -m 0755 /usr/lib/vaultlink/package/deploy
+    install -o root -g root -m 0755 \
+        "$package_backup/vaultlink" /usr/lib/vaultlink/package/vaultlink
+    runuser -u vaultlink -- /usr/lib/vaultlink/package/vaultlink --version \
+        >/usr/lib/vaultlink/package/version
+    chown root:root /usr/lib/vaultlink/package/version
+    chmod 0644 /usr/lib/vaultlink/package/version
+    cat >/usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh <<'SH'
+#!/bin/sh
+set -eu
+[ "$#" -eq 1 ] && [ "$1" = --package-only ]
+[ -x /usr/lib/vaultlink/package/vaultlink ]
+[ -f /usr/lib/vaultlink/package/version ]
+[ "$(runuser -u vaultlink -- /usr/lib/vaultlink/package/vaultlink --version)" = \
+    "$(cat /usr/lib/vaultlink/package/version)" ]
+SH
+    chown root:root /usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh
+    chmod 0755 /usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh
 }
 
 assert_binary() {
@@ -506,7 +537,10 @@ test_upgrade_rejects_mismatched_binary_configuration_pair_before_stop() {
 test_upgrade_maintenance_lock_fails_before_stop() {
     initialize_live original original
     make_candidate
-    exec 8>/run/lock/vaultlink-maintenance.lock
+    install -d -o root -g root -m 0700 /run/vaultlink-locks
+    install -o root -g root -m 0600 /dev/null \
+        /run/vaultlink-locks/maintenance.lock
+    exec 8>/run/vaultlink-locks/maintenance.lock
     flock -n 8
     expect_failure upgrade-maintenance-lock \
         "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
@@ -518,6 +552,49 @@ test_upgrade_maintenance_lock_fails_before_stop() {
     [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
         || fail "maintenance lock contention stopped the service"
     echo "upgrade and rollback shared maintenance lock passed"
+}
+
+test_upgrade_accepts_only_verified_inherited_lock() {
+    initialize_live original original
+    make_candidate
+    install -d -o root -g root -m 0700 /run/vaultlink-locks
+    install -o root -g root -m 0600 /dev/null \
+        /run/vaultlink-locks/maintenance.lock
+    exec 8>/run/vaultlink-locks/maintenance.lock
+    flock -n 8
+    VAULTLINK_MAINTENANCE_LOCK_FD=8 \
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml" >/dev/null
+    assert_binary candidate
+    assert_config candidate
+    assert_database original
+    assert_service_active
+    if flock -n /run/vaultlink-locks/maintenance.lock -c true; then
+        fail "upgrade helper released the inherited maintenance lock"
+    fi
+    flock -u 8
+    exec 8>&-
+
+    initialize_live original original
+    make_candidate
+    exec 8>"$TEST_ROOT/not-the-maintenance-lock"
+    flock -n 8
+    VAULTLINK_MAINTENANCE_LOCK_FD=8 expect_failure inherited-wrong-inode \
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
+    flock -u 8
+    exec 8>&-
+    assert_binary original
+    assert_config original
+    assert_database original
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "invalid inherited maintenance lock stopped the service"
+
+    initialize_live original original
+    make_candidate
+    VAULTLINK_MAINTENANCE_LOCK_FD=9 expect_failure inherited-invalid-fd \
+        "$UPGRADE" "$TEST_ROOT/candidate" "$TEST_ROOT/candidate.toml"
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "invalid inherited maintenance FD stopped the service"
+    echo "upgrade inherited maintenance-lock contract passed"
 }
 
 test_upgrade_rejects_semantic_downgrades_before_stop() {
@@ -868,9 +945,11 @@ test_upgrade_recovery_stop_failure_requires_manual_recovery() {
 prepare_rollback_case() {
     initialize_live original original
     source_backup=$(make_source_backup)
+    prepare_package_rollback_target "$source_backup"
     write_binary /opt/vaultlink/vaultlink candidate
     write_config "$CONFIG_PATH" candidate
     "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite "UPDATE marker SET value='candidate'"
+    printf '%s\n' inactive >"$MOCK_STATE_DIR/service.state"
     printf '%s\n' "$source_backup"
 }
 
@@ -897,7 +976,7 @@ test_rollback_start_failure() {
     assert_binary candidate
     assert_config candidate
     assert_database candidate
-    assert_service_active
+    assert_service_inactive
     assert_no_incomplete_backup
     echo "rollback start-failure recovery passed"
 }
@@ -909,7 +988,7 @@ test_rollback_rejects_incomplete_backup_before_stop() {
     assert_binary candidate
     assert_config candidate
     assert_database candidate
-    assert_service_active
+    assert_service_inactive
     [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
         || fail "incomplete rollback backup stopped the service"
     echo "rollback incomplete backup-unit preflight passed"
@@ -922,19 +1001,55 @@ test_rollback_rejects_mismatched_pair_before_stop() {
     assert_binary candidate
     assert_config candidate
     assert_database candidate
-    assert_service_active
+    assert_service_inactive
     [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
         || fail "mismatched rollback pair stopped the service"
     echo "rollback binary/configuration pairing preflight passed"
+}
+
+test_rollback_rejects_unsafe_backup_inputs_before_stop() {
+    source_backup=$(prepare_rollback_case)
+    rm -f "$source_backup/config.toml"
+    ln -s "$CONFIG_PATH" "$source_backup/config.toml"
+    expect_failure rollback-symlink-source "$ROLLBACK" "$source_backup"
+    assert_service_inactive
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "symlinked rollback input stopped the service"
+
+    source_backup=$(prepare_rollback_case)
+    chmod 0755 "$source_backup"
+    expect_failure rollback-writable-parent "$ROLLBACK" "$source_backup"
+    assert_service_inactive
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "writable rollback parent stopped the service"
+
+    source_backup=$(prepare_rollback_case)
+    backup_link=/var/lib/vaultlink-backups/source-backup-link
+    ln -s "$source_backup" "$backup_link"
+    expect_failure rollback-symlink-directory "$ROLLBACK" "$backup_link"
+    assert_service_inactive
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "symlinked rollback directory stopped the service"
+
+    source_backup=$(prepare_rollback_case)
+    install -o root -g root -m 0700 /bin/true "$source_backup/vaultlink"
+    expect_failure rollback-wrong-package-candidate "$ROLLBACK" "$source_backup"
+    assert_service_inactive
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "wrong package rollback target stopped the service"
+    echo "rollback root-only input and package-target guards passed"
 }
 
 test_rollback_rejects_semantic_roll_forward_before_stop() {
     initialize_live original original
     source_backup=$(make_source_backup)
     write_binary "$source_backup/vaultlink" original "$HEALTH_URL" - 0 '0.4.2'
+    chmod 0700 "$source_backup/vaultlink"
+    prepare_package_rollback_target "$source_backup"
     write_binary /opt/vaultlink/vaultlink candidate "$HEALTH_URL" - 0 '0.4.1'
     write_config "$CONFIG_PATH" candidate
     "$REAL_SQLITE3" /var/lib/vaultlink/data.sqlite "UPDATE marker SET value='candidate'"
+    printf '%s\n' inactive >"$MOCK_STATE_DIR/service.state"
 
     expect_failure rollback-roll-forward "$ROLLBACK" "$source_backup"
     grep -q 'requested version 0.4.2 is newer than installed version 0.4.1; use the upgrade script' \
@@ -943,7 +1058,7 @@ test_rollback_rejects_semantic_roll_forward_before_stop() {
     assert_binary candidate
     assert_config candidate
     assert_database candidate
-    assert_service_active
+    assert_service_inactive
     [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
         || fail "semantic rollback roll-forward stopped the service"
     echo "rollback semantic roll-forward gate passed"
@@ -973,6 +1088,7 @@ start_health_server
 test_upgrade_success
 test_upgrade_rejects_mismatched_binary_configuration_pair_before_stop
 test_upgrade_maintenance_lock_fails_before_stop
+test_upgrade_accepts_only_verified_inherited_lock
 test_upgrade_rejects_semantic_downgrades_before_stop
 test_semver_prerelease_build_and_validation_rules
 test_upgrade_backup_failure
@@ -990,6 +1106,7 @@ test_rollback_success
 test_rollback_start_failure
 test_rollback_rejects_incomplete_backup_before_stop
 test_rollback_rejects_mismatched_pair_before_stop
+test_rollback_rejects_unsafe_backup_inputs_before_stop
 test_rollback_rejects_semantic_roll_forward_before_stop
 test_rollback_recovery_stop_failure_stays_fail_closed
 

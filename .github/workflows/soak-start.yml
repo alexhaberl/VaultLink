@@ -15,6 +15,7 @@ on:
 permissions:
   actions: read
   contents: read
+  packages: read
   statuses: write
 
 concurrency:
@@ -27,7 +28,17 @@ jobs:
     runs-on: ubuntu-24.04
     environment: release-soak
     timeout-minutes: 10
+    container:
+      image: ${{ vars.VAULTLINK_PACKAGE_SIGNING_IMAGE }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SOAK_TOOL_IMAGE: ${{ vars.VAULTLINK_PACKAGE_SIGNING_IMAGE }}
     steps:
+      - name: Restore host workspace ownership before checkout
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit_sha }}
@@ -47,7 +58,11 @@ jobs:
           test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
           main_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
           test "$main_commit" = "$APPROVED_COMMIT"
-          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" = 0.5.1
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" = 0.6.0
+          python3 tools/package-targets.py validate
+          test "$SOAK_TOOL_IMAGE" = \
+            "$(python3 tools/package-targets.py get debian13-amd64 builder_image)"
+          sh tools/verify-package-builder.sh debian13-amd64
           sh tools/check-version-consistency.sh --release-candidate
           sh tools/check-supply-chain-policy.sh
           validate_gate() {
@@ -85,24 +100,27 @@ jobs:
           validate_gate vaultlink/native-arm64 .github/workflows/ci.yml
           validate_gate vaultlink/fuzz-600s-amd64 .github/workflows/fuzz.yml
           validate_gate vaultlink/fuzz-600s-arm64 .github/workflows/fuzz.yml
-          validate_gate vaultlink/reproducibility-amd64 .github/workflows/reproducibility.yml
-          validate_gate vaultlink/reproducibility-arm64 .github/workflows/reproducibility.yml
+          validate_gate vaultlink/packages .github/workflows/packages.yml
+          validate_gate vaultlink/package-reproducibility .github/workflows/reproducibility.yml
+          validate_gate vaultlink/distro-vms .github/workflows/distro-vms.yml \
+            "Distro VMs $APPROVED_COMMIT" workflow_dispatch
           validate_gate vaultlink/release-dry-run .github/workflows/release.yml
           validate_gate vaultlink/release-candidate-preflight .github/workflows/release.yml \
             "Release candidate $APPROVED_COMMIT" workflow_dispatch
           candidate_run=$VALIDATED_RUN_ID
-          candidate_artifact="$RUNNER_TEMP/release-candidate-amd64"
+          candidate_artifact="$RUNNER_TEMP/release-candidate-packages"
           test ! -e "$candidate_artifact"
           gh run download "$candidate_run" \
             --repo "$GITHUB_REPOSITORY" \
-            --name vaultlink-release-amd64 \
+            --name "vaultlink-release-unsigned-$APPROVED_COMMIT" \
             --dir "$candidate_artifact"
-          test "$(find "$candidate_artifact" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 4
-          (
-            cd "$candidate_artifact"
-            sha256sum -c SHA256SUMS-amd64
-          )
-          candidate_binary="$candidate_artifact/vaultlink-0.5.1-debian13-amd64"
+          sh tools/verify-package-release.sh "$candidate_artifact" 0.6.0
+          test "$(find "$candidate_artifact" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 11
+          deb=$(python3 tools/package-targets.py asset debian13-amd64 0.6.0)
+          extracted="$RUNNER_TEMP/release-candidate-deb"
+          test ! -e "$extracted"
+          dpkg-deb -x "$candidate_artifact/$deb" "$extracted"
+          candidate_binary="$extracted/usr/lib/vaultlink/package/vaultlink"
           test -s "$candidate_binary"
           candidate_binary_sha256=$(sha256sum "$candidate_binary" | awk '{print $1}')
           test "$candidate_binary_sha256" = "$APPROVED_BINARY_SHA256"
@@ -148,3 +166,7 @@ jobs:
             -f context='vaultlink/72h-soak' \
             -f description='Host-side 72-hour soak is running' \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      - name: Restore host workspace ownership
+        if: always()
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"

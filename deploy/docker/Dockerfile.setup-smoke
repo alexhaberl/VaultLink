@@ -14,7 +14,7 @@ RUN cargo install --locked cargo-cyclonedx --version 0.5.9 \
 WORKDIR /work
 COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile .dockerignore .gitleaksignore ./
 COPY .cargo ./.cargo
-COPY README.md SECURITY.md CHANGELOG.md THREAT_MODEL.md ./
+COPY README.md SECURITY.md CHANGELOG.md THREAT_MODEL.md LICENSE ./
 COPY .github ./.github
 COPY src ./src
 COPY templates ./templates
@@ -24,17 +24,18 @@ COPY docs ./docs
 COPY fuzz/Cargo.toml ./fuzz/Cargo.toml
 COPY fuzz/fuzz_targets ./fuzz/fuzz_targets
 COPY deploy ./deploy
+COPY packaging ./packaging
 COPY release ./release
 COPY tools ./tools
 
 RUN chmod 0644 deploy/Caddyfile deploy/*.conf deploy/*.example \
         deploy/*.service deploy/*.timer deploy/docker/*.lock \
         deploy/docker/*.sources tools/*.txt \
-    && chmod 0755 deploy/*.sh deploy/docker/*.sh tools/*.sh \
+    && chmod 0755 deploy/*.sh deploy/docker/*.sh packaging/*.sh tools/*.sh \
     && groupadd --system vaultlink \
     && useradd --system --gid vaultlink --home-dir /nonexistent \
         --no-create-home --shell /usr/sbin/nologin vaultlink \
-    && shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh \
+    && shellcheck deploy/*.sh deploy/docker/*.sh packaging/*.sh tools/*.sh \
     && sh tools/check-supply-chain-policy.sh
 
 RUN test ! -e /work/config.toml \
@@ -42,12 +43,16 @@ RUN test ! -e /work/config.toml \
     && ! find /work -type f -name '*.sqlite*' -print -quit | grep -q .
 
 RUN install -d /opt/vaultlink /var/lib/vaultlink \
-        /var/log/vaultlink /mnt/storage /usr/local/sbin \
+        /var/log/vaultlink /mnt/storage /usr/sbin \
+        /usr/lib/vaultlink/package/deploy \
     && install -m 0755 /bin/true /opt/vaultlink/vaultlink \
-    && install -m 0755 deploy/vaultlink-update.sh /usr/local/sbin/vaultlink-update \
+    && install -m 0755 deploy/vaultlink-update.sh /usr/sbin/vaultlink-update \
+    && install -m 0755 packaging/vaultlink-runtime-guard.sh \
+        /usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh \
     && systemd-analyze verify deploy/vaultlink.service \
         deploy/vaultlink-update.service deploy/vaultlink-update.timer \
-    && rm -f /opt/vaultlink/vaultlink /usr/local/sbin/vaultlink-update
+    && rm -f /opt/vaultlink/vaultlink /usr/sbin/vaultlink-update \
+        /usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh
 
 RUN cargo build --release --locked
 

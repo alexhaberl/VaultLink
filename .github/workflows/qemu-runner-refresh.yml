@@ -1,0 +1,190 @@
+name: Refresh QEMU distro-test runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      ubuntu_base:
+        description: Digest-pinned Ubuntu base image available on amd64 and arm64
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vaultlink-qemu-runner-refresh
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/alexhaberl/vaultlink-qemu-runner
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            uname: x86_64
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            uname: aarch64
+    runs-on: ${{ matrix.runner }}
+    environment: release-image-refresh
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate native immutable input
+        shell: bash
+        env:
+          BASE_IMAGE: ${{ inputs.ubuntu_base }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = '${{ matrix.uname }}'
+          [[ "$BASE_IMAGE" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$ ]]
+      - name: Authenticate to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build native QEMU runner by digest
+        shell: bash
+        env:
+          BASE_IMAGE: ${{ inputs.ubuntu_base }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/build-metadata.json"
+          docker buildx build \
+            --platform 'linux/${{ matrix.architecture }}' \
+            --file deploy/docker/Dockerfile.qemu-runner \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+            --metadata-file "$metadata" \
+            --provenance=false \
+            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+            .
+          digest=$(jq -r '."containerimage.digest" // empty' "$metadata")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          reference="$IMAGE@$digest"
+          docker pull "$reference"
+          docker run --rm "$reference" \
+            cat /usr/local/share/vaultlink-qemu-runner-packages.lock \
+            >'qemu-runner-packages-${{ matrix.architecture }}.lock'
+          LC_ALL=C sort -c 'qemu-runner-packages-${{ matrix.architecture }}.lock'
+          packages_sha256=$(sha256sum \
+            'qemu-runner-packages-${{ matrix.architecture }}.lock' | awk '{print $1}')
+          recorded_base=$(docker run --rm "$reference" \
+            sed -n 's/^base_image=//p' /usr/local/share/vaultlink-qemu-runner.env)
+          test "$recorded_base" = "$BASE_IMAGE"
+          recorded_architecture=$(docker run --rm "$reference" \
+            sed -n 's/^architecture=//p' /usr/local/share/vaultlink-qemu-runner.env)
+          test "$recorded_architecture" = '${{ matrix.architecture }}'
+          lock_dir="$RUNNER_TEMP/qemu-lock-${{ matrix.architecture }}"
+          install -d -m 0700 "$lock_dir"
+          printf '%s\n' "$reference" >"$lock_dir/qemu-runner-image.lock"
+          printf '%s\n' "$BASE_IMAGE" >"$lock_dir/qemu-runner-base-image.lock"
+          install -m 0644 'qemu-runner-packages-${{ matrix.architecture }}.lock' \
+            "$lock_dir/qemu-runner-packages-${{ matrix.architecture }}.lock"
+          docker run --rm --network none --user root \
+            --volume "$PWD:/work:ro" --workdir /work \
+            --volume "$lock_dir:/qemu-lock:ro" \
+            "$reference" \
+            sh tools/verify-qemu-runner.sh \
+              '${{ matrix.architecture }}' /qemu-lock \
+            >'qemu-runner-verification-${{ matrix.architecture }}.env'
+          printf 'base_image=%s\npackages_sha256=%s\narchitecture=%s\n' \
+            "$BASE_IMAGE" "$packages_sha256" '${{ matrix.architecture }}' \
+            >'qemu-runner-${{ matrix.architecture }}.env'
+          printf '%s\n' "$digest" >'digest-${{ matrix.architecture }}'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qemu-runner-digest-${{ matrix.architecture }}
+          path: |
+            digest-${{ matrix.architecture }}
+            qemu-runner-packages-${{ matrix.architecture }}.lock
+            qemu-runner-${{ matrix.architecture }}.env
+            qemu-runner-verification-${{ matrix.architecture }}.env
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: release-image-refresh
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: qemu-runner-digest-*
+          path: digests
+          merge-multiple: true
+      - name: Authenticate to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Publish manifest and lock candidate
+        shell: bash
+        env:
+          UBUNTU_BASE: ${{ inputs.ubuntu_base }}
+        run: |
+          set -euo pipefail
+          amd64=$(cat digests/digest-amd64)
+          arm64=$(cat digests/digest-arm64)
+          [[ "$amd64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          tag="$IMAGE:dependency-refresh-$GITHUB_RUN_ID"
+          docker buildx imagetools create --tag "$tag" "$IMAGE@$amd64" "$IMAGE@$arm64"
+          inspection=$(docker buildx imagetools inspect "$tag")
+          digest=$(printf '%s\n' "$inspection" \
+            | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$tag" --raw \
+            | jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' \
+            | sort >platforms.actual
+          printf '%s\n' linux/amd64 linux/arm64 >platforms.expected
+          cmp platforms.expected platforms.actual
+          for architecture in amd64 arm64; do
+            env_file="digests/qemu-runner-$architecture.env"
+            test "$(sed -n 's/^base_image=//p' "$env_file")" = "$UBUNTU_BASE"
+            test "$(sed -n 's/^architecture=//p' "$env_file")" = "$architecture"
+            expected_packages=$(sed -n 's/^packages_sha256=//p' "$env_file")
+            [[ "$expected_packages" =~ ^[0-9a-f]{64}$ ]]
+            package_lock="digests/qemu-runner-packages-$architecture.lock"
+            test "$(sha256sum "$package_lock" | awk '{print $1}')" = "$expected_packages"
+            LC_ALL=C sort -c -u "$package_lock"
+          done
+          printf '%s@%s\n' "$IMAGE" "$digest" \
+            >deploy/docker/qemu-runner-image.lock
+          printf '%s\n' "$UBUNTU_BASE" \
+            >deploy/docker/qemu-runner-base-image.lock
+          install -m 0644 digests/qemu-runner-packages-amd64.lock \
+            deploy/docker/qemu-runner-packages-amd64.lock
+          install -m 0644 digests/qemu-runner-packages-arm64.lock \
+            deploy/docker/qemu-runner-packages-arm64.lock
+          python3 tools/package-targets.py validate --allow-unprovisioned
+          cp deploy/docker/qemu-runner-image.lock .
+          cp deploy/docker/qemu-runner-base-image.lock .
+          cp deploy/docker/qemu-runner-packages-amd64.lock .
+          cp deploy/docker/qemu-runner-packages-arm64.lock .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qemu-runner-lock-${{ github.run_id }}
+          path: |
+            qemu-runner-image.lock
+            qemu-runner-base-image.lock
+            qemu-runner-packages-amd64.lock
+            qemu-runner-packages-arm64.lock
+            digests/qemu-runner-packages-*.lock
+            digests/qemu-runner-*.env
+          if-no-files-found: error
+          retention-days: 30

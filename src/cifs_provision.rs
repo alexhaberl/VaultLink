@@ -19,6 +19,11 @@ const MOUNT_UNIT_PATH: &str = "/etc/systemd/system/mnt-storage.mount";
 const MOUNT_UNIT_NAME: &str = "mnt-storage.mount";
 const SERVICE_DROP_IN_DIRECTORY: &str = "/etc/systemd/system/vaultlink.service.d";
 const SERVICE_DROP_IN_PATH: &str = "/etc/systemd/system/vaultlink.service.d/external-storage.conf";
+const MOUNT_CIFS_PATHS: [&str; 3] = [
+    "/sbin/mount.cifs",
+    "/usr/sbin/mount.cifs",
+    "/usr/bin/mount.cifs",
+];
 
 #[derive(Debug, Error)]
 #[error("{0}")]
@@ -118,7 +123,10 @@ fn preflight() -> Result<(u32, u32), CifsProvisionError> {
             "provision-cifs must run as root (use sudo); the browser setup must remain unprivileged",
         ));
     }
-    if !Path::new("/sbin/mount.cifs").is_file() && !Path::new("/usr/sbin/mount.cifs").is_file() {
+    if !MOUNT_CIFS_PATHS
+        .iter()
+        .any(|path| Path::new(path).is_file())
+    {
         return Err(error(
             "mount.cifs is missing; install the cifs-utils package first",
         ));
@@ -489,6 +497,13 @@ fn error(message: impl Into<String>) -> CifsProvisionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_cifs_candidates_cover_supported_distribution_layouts() {
+        assert!(MOUNT_CIFS_PATHS.contains(&"/sbin/mount.cifs"));
+        assert!(MOUNT_CIFS_PATHS.contains(&"/usr/sbin/mount.cifs"));
+        assert!(MOUNT_CIFS_PATHS.contains(&"/usr/bin/mount.cifs"));
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()

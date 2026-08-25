@@ -1,5 +1,6 @@
 /target/
 /fuzz/target/
+/.tmp/
 /dev/data/
 /dev/mount/
 /config.toml
