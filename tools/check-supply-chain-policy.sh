@@ -1023,8 +1023,9 @@ if ! grep -F -q 'libguestfs-tools' deploy/docker/Dockerfile.qemu-runner \
     || ! grep -F -q 'host-storage.txt' .github/workflows/distro-vm-images-refresh.yml \
     || ! grep -F -q 'host-storage.txt' .github/workflows/distro-vms.yml \
     || ! grep -F -q 'qemu-img check "$work/overlay.qcow2"' "$vm_provisioner" \
-    || ! grep -F -q "inputs.target_id == 'fedora44-arm64' && 240 || 90" .github/workflows/distro-vm-images-refresh.yml \
-    || ! grep -F -q 'provision_timeout=5400' "$vm_provisioner" \
+    || ! grep -F -q "inputs.target_id == 'fedora44-arm64' && 240 || inputs.target_id == 'ubuntu2604-arm64' && 150 || 90" .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q 'if [ "$target_id" = ubuntu2604-arm64 ]; then' "$vm_provisioner" \
+    || [ "$(grep -F -c 'provision_timeout=5400' "$vm_provisioner" || true)" -ne 2 ] \
     || ! grep -F -q 'cold_boot_timeout=3600' "$vm_provisioner" \
     || ! grep -F -q 'ssh_timeout=3600' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'grep -F -q VAULTLINK_VM_READY "$evidence/serial.log"' tools/run-distro-vm-test.sh \
