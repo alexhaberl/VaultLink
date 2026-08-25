@@ -241,6 +241,14 @@ jobs:
             = "$packages_sha256"
           grep -E -x -q 'kvm|tcg' vm-build/guest.qcow2.acceleration
           grep -F -x -q true vm-build/guest.qcow2.cold-boot-verified
+      - name: Preserve failed guest serial evidence
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distro-vm-failure-${{ inputs.target_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: vm-build/*.serial.log
+          if-no-files-found: warn
+          retention-days: 7
       - name: Publish immutable guest image
         id: image
         shell: bash

@@ -930,6 +930,7 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q 'sh tools/verify-qemu-runner.sh "$ARCHITECTURE"' .github/workflows/distro-vms.yml \
     || ! grep -F -q 'sh tools/verify-qemu-runner.sh "$ARCHITECTURE"' .github/workflows/distro-vm-images-refresh.yml \
     || ! grep -F -q 'restrict=on' tools/run-distro-vm-test.sh \
+    || ! grep -F -q 'restrict=on' tools/provision-distro-vm-image.sh \
     || ! grep -F -q 'acceleration=tcg' tools/run-distro-vm-test.sh \
     || ! grep -F -q '[ "$architecture" = amd64 ]' tools/run-distro-vm-test.sh \
     || ! grep -F -q '[ "$architecture" = amd64 ]' tools/provision-distro-vm-image.sh \
@@ -937,7 +938,12 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q '"$ARCHITECTURE" == amd64' .github/workflows/distro-vm-images-refresh.yml \
     || ! grep -F -q 'VM provisioning QEMU exited with status' tools/provision-distro-vm-image.sh \
     || ! grep -F -q 'cold-boot QEMU exited with status' tools/provision-distro-vm-image.sh \
+    || [ "$(grep -F -c 'cloud-init-output.log /dev/console' tools/provision-distro-vm-image.sh || true)" -ne 2 ] \
+    || [ "$(grep -F -c 'tail -n 2000' tools/provision-distro-vm-image.sh || true)" -ne 6 ] \
+    || ! grep -F -q 'distro-vm-failure-${{ inputs.target_id }}-${{ github.run_id }}-${{ github.run_attempt }}' .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q 'vm-build/*.serial.log' .github/workflows/distro-vm-images-refresh.yml \
     || ! grep -F -q -- '-device virtio-net-pci,netdev=net0,romfile=' tools/provision-distro-vm-image.sh \
+    || ! grep -F -q -- '-device virtio-net-pci,netdev=verify-net,romfile=' tools/provision-distro-vm-image.sh \
     || ! grep -F -q -- '-device virtio-net-pci,netdev=net0,romfile=' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'metadata_clients=100' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'cmp /usr/local/share/vaultlink-vm-packages.lock "$live_vm_packages"' tools/distro-vm-guest-smoke.sh \
