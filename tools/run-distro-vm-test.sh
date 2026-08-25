@@ -117,7 +117,8 @@ if [ "$architecture" = amd64 ] \
 fi
 
 # KVM is an optional acceleration only. restrict=on blocks guest egress while
-# retaining the explicit host-to-guest SSH forwarding channel.
+# retaining the explicit host-to-guest SSH forwarding channel. Network boot is
+# unsupported, so the VirtIO NIC must not depend on a packaged PXE option ROM.
 # shellcheck disable=SC2086
 $qemu $machine_args $firmware_args $acceleration_args \
     -smp 4 -m 6144 -nographic -no-reboot \
@@ -125,7 +126,7 @@ $qemu $machine_args $firmware_args $acceleration_args \
     -drive "if=virtio,file=$work/storage.raw,format=raw,cache=unsafe" \
     -drive "if=virtio,file=$work/seed.img,format=raw,readonly=on" \
     -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22 \
-    -device virtio-net-pci,netdev=net0 \
+    -device virtio-net-pci,netdev=net0,romfile= \
     >"$evidence/serial.log" 2>&1 &
 qemu_pid=$!
 

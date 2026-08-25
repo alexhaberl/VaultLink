@@ -172,13 +172,15 @@ if [ "$architecture" = amd64 ] \
     acceleration_args='-accel kvm -cpu host'
 fi
 
-# Word splitting is intentional only for the fixed QEMU arguments.
+# Word splitting is intentional only for the fixed QEMU arguments. Guests do
+# not network boot; romfile= disables only the unused PXE option ROM.
 # shellcheck disable=SC2086
 $qemu $machine_args $firmware_args $acceleration_args \
     -smp 4 -m 6144 -nographic -no-reboot \
     -drive "if=virtio,file=$work/overlay.qcow2,format=qcow2,cache=unsafe" \
     -drive "if=virtio,file=$work/seed.img,format=raw,readonly=on" \
-    -nic user,model=virtio-net-pci \
+    -netdev user,id=net0 \
+    -device virtio-net-pci,netdev=net0,romfile= \
     >"$work/serial.log" 2>&1 &
 qemu_pid=$!
 
