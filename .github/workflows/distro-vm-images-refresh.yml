@@ -44,6 +44,9 @@ concurrency:
   group: vaultlink-distro-vm-refresh-${{ inputs.target_id }}
   cancel-in-progress: false
 
+env:
+  BUILDKIT_IMAGE: docker.io/moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
 jobs:
   prepare:
     if: github.ref == 'refs/heads/main'
@@ -217,7 +220,8 @@ jobs:
             sh tools/verify-qemu-runner.sh "$ARCHITECTURE" /qemu-lock \
             >vm-build/qemu-runner-verification.env
           kvm_args=()
-          if [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
+          if [[ "$ARCHITECTURE" == amd64 \
+              && -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
             kvm_args+=(--device /dev/kvm)
           fi
           docker run --rm \
@@ -256,6 +260,11 @@ jobs:
             "$QEMU_RUNNER_IMAGE" "$acceleration" \
             >vm-build/guest-image.env
           metadata="$RUNNER_TEMP/vm-metadata.json"
+          builder="vaultlink-distro-vm-$TARGET_ID"
+          docker buildx create --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE" --name "$builder" --use
+          trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
+          docker buildx inspect --bootstrap
           docker buildx build \
             --platform "linux/$ARCHITECTURE" \
             --file deploy/docker/Dockerfile.distro-vm-image \

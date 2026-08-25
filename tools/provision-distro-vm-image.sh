@@ -165,7 +165,8 @@ esac
 
 acceleration=tcg
 acceleration_args='-accel tcg,thread=multi -cpu max'
-if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] \
+if [ "$architecture" = amd64 ] \
+    && [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] \
     && "$qemu" -accel help 2>/dev/null | grep -F -x -q 'kvm'; then
     acceleration=kvm
     acceleration_args='-accel kvm -cpu host'
@@ -190,8 +191,16 @@ while kill -0 "$qemu_pid" 2>/dev/null; do
     fi
     sleep 5
 done
+set +e
 wait "$qemu_pid"
+qemu_status=$?
+set -e
 qemu_pid=
+[ "$qemu_status" -eq 0 ] || {
+    tail -n 200 "$work/serial.log" >&2 || true
+    echo "VM provisioning QEMU exited with status $qemu_status" >&2
+    exit 70
+}
 grep -F -q "VAULTLINK_VM_PROVISIONED_$target_id" "$work/serial.log" || {
     tail -n 200 "$work/serial.log" >&2 || true
     echo "guest did not report successful provisioning" >&2
@@ -290,8 +299,16 @@ while kill -0 "$qemu_pid" 2>/dev/null; do
     fi
     sleep 5
 done
+set +e
 wait "$qemu_pid"
+qemu_status=$?
+set -e
 qemu_pid=
+[ "$qemu_status" -eq 0 ] || {
+    tail -n 200 "$work/verify-serial.log" >&2 || true
+    echo "cold-boot QEMU exited with status $qemu_status" >&2
+    exit 70
+}
 grep -F -q "VAULTLINK_VM_COLD_BOOT_VERIFIED_$target_id" \
     "$work/verify-serial.log" || {
         tail -n 200 "$work/verify-serial.log" >&2 || true

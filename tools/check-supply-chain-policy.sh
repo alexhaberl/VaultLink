@@ -209,7 +209,8 @@ done
 buildkit_image='docker.io/moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8'
 for refresh_workflow in \
     .github/workflows/package-builders-refresh.yml \
-    .github/workflows/qemu-runner-refresh.yml; do
+    .github/workflows/qemu-runner-refresh.yml \
+    .github/workflows/distro-vm-images-refresh.yml; do
     if ! grep -F -x -q "  BUILDKIT_IMAGE: $buildkit_image" "$refresh_workflow" \
         || ! grep -F -q 'docker buildx create --driver docker-container' "$refresh_workflow" \
         || ! grep -F -q -- '--driver-opt "image=$BUILDKIT_IMAGE" --name "$builder" --use' "$refresh_workflow" \
@@ -930,6 +931,12 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q 'sh tools/verify-qemu-runner.sh "$ARCHITECTURE"' .github/workflows/distro-vm-images-refresh.yml \
     || ! grep -F -q 'restrict=on' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'acceleration=tcg' tools/run-distro-vm-test.sh \
+    || ! grep -F -q '[ "$architecture" = amd64 ]' tools/run-distro-vm-test.sh \
+    || ! grep -F -q '[ "$architecture" = amd64 ]' tools/provision-distro-vm-image.sh \
+    || ! grep -F -q '"$ARCHITECTURE" == amd64' .github/workflows/distro-vms.yml \
+    || ! grep -F -q '"$ARCHITECTURE" == amd64' .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q 'VM provisioning QEMU exited with status' tools/provision-distro-vm-image.sh \
+    || ! grep -F -q 'cold-boot QEMU exited with status' tools/provision-distro-vm-image.sh \
     || ! grep -F -q 'metadata_clients=100' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'cmp /usr/local/share/vaultlink-vm-packages.lock "$live_vm_packages"' tools/distro-vm-guest-smoke.sh \
     || ! grep -F -q 'cmp /usr/local/share/vaultlink-vm-packages.lock /run/vaultlink-vm-packages.live' tools/provision-distro-vm-image.sh \

@@ -109,7 +109,8 @@ esac
 
 acceleration=tcg
 acceleration_args='-accel tcg,thread=multi -cpu max'
-if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] \
+if [ "$architecture" = amd64 ] \
+    && [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] \
     && "$qemu" -accel help 2>/dev/null | grep -F -x -q 'kvm'; then
     acceleration=kvm
     acceleration_args='-accel kvm -cpu host'

@@ -139,7 +139,8 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           asset=$(python3 tools/package-targets.py asset "$TARGET_ID" "$version")
           kvm_args=()
-          if [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
+          if [[ "$ARCHITECTURE" == amd64 \
+              && -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
             kvm_args+=(--device /dev/kvm)
           fi
           docker run --rm --network none --user root \
