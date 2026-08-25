@@ -18,6 +18,11 @@ case "$target_id" in *[!a-z0-9-]*|'') exit 64 ;; esac
     && [ ! -e "$output_image" ] && [ ! -L "$output_image" ] || exit 66
 source_image=$(cd -- "$(dirname -- "$source_image")" && pwd)/$(basename -- "$source_image")
 output_image=$(cd -- "$(dirname -- "$output_image")" && pwd)/$(basename -- "$output_image")
+provision_serial_evidence=$output_image.provision.serial.log
+verify_serial_evidence=$output_image.verify.serial.log
+for evidence_path in "$provision_serial_evidence" "$verify_serial_evidence"; do
+    [ ! -e "$evidence_path" ] && [ ! -L "$evidence_path" ] || exit 66
+done
 
 distribution=$(python3 tools/package-targets.py get "$target_id" distribution --allow-unprovisioned)
 distribution_version=$(python3 tools/package-targets.py get "$target_id" version --allow-unprovisioned)
@@ -25,13 +30,29 @@ architecture=$(python3 tools/package-targets.py get "$target_id" architecture --
 work=$(mktemp -d)
 qemu_pid=
 cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
     if [ -n "$qemu_pid" ]; then
         kill "$qemu_pid" 2>/dev/null || true
         wait "$qemu_pid" 2>/dev/null || true
     fi
+    if [ "$status" -ne 0 ]; then
+        if [ -f "$work/serial.log" ]; then
+            install -m 0644 "$work/serial.log" "$provision_serial_evidence" \
+                || true
+        fi
+        if [ -f "$work/verify-serial.log" ]; then
+            install -m 0644 "$work/verify-serial.log" "$verify_serial_evidence" \
+                || true
+        fi
+    fi
     rm -rf "$work"
+    exit "$status"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 case "$distribution" in
     debian | ubuntu)
@@ -117,6 +138,8 @@ cat >"$work/user-data" <<EOF
 #cloud-config
 package_update: false
 package_upgrade: false
+output:
+  all: '| tee -a /var/log/cloud-init-output.log /dev/console'
 write_files:
   - path: /usr/local/share/vaultlink-vm-target
     owner: root:root
@@ -187,7 +210,7 @@ qemu_pid=$!
 deadline=$(( $(date +%s) + 2700 ))
 while kill -0 "$qemu_pid" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
-        tail -n 200 "$work/serial.log" >&2 || true
+        tail -n 2000 "$work/serial.log" >&2 || true
         echo "VM provisioning timed out" >&2
         exit 70
     fi
@@ -199,12 +222,12 @@ qemu_status=$?
 set -e
 qemu_pid=
 [ "$qemu_status" -eq 0 ] || {
-    tail -n 200 "$work/serial.log" >&2 || true
+    tail -n 2000 "$work/serial.log" >&2 || true
     echo "VM provisioning QEMU exited with status $qemu_status" >&2
     exit 70
 }
 grep -F -q "VAULTLINK_VM_PROVISIONED_$target_id" "$work/serial.log" || {
-    tail -n 200 "$work/serial.log" >&2 || true
+    tail -n 2000 "$work/serial.log" >&2 || true
     echo "guest did not report successful provisioning" >&2
     exit 70
 }
@@ -232,9 +255,11 @@ qemu-img convert -q -O qcow2 -o compat=1.1,lazy_refcounts=off \
     "$work/overlay.qcow2" "$output_image"
 qemu-img check "$output_image"
 
-# Cold-boot the converted image without a NIC. This verifies that the image
-# itself (not just the provisioning overlay/session) has the exact target OS
-# identity, reviewed marker, and complete package closure.
+# Cold-boot the converted image with QEMU's restricted user-mode network. Its
+# internal DHCP service lets distro wait-online units complete, while
+# restrict=on and the absence of host forwarding block guest egress. This
+# verifies that the image itself (not just the provisioning overlay/session)
+# has the exact target OS identity, reviewed marker, and package closure.
 case "$distribution" in
     debian | ubuntu | fedora)
         cat >"$work/verify-os.sh" <<EOF
@@ -263,8 +288,8 @@ local-hostname: vaultlink-verify-$target_id
 EOF
 cat >"$work/verify-user-data" <<EOF
 #cloud-config
-network:
-  config: disabled
+output:
+  all: '| tee -a /var/log/cloud-init-output.log /dev/console'
 write_files:
   - path: /usr/local/sbin/vaultlink-verify-os
     owner: root:root
@@ -290,12 +315,14 @@ $qemu $machine_args $firmware_args $acceleration_args \
     -smp 4 -m 6144 -nographic -no-reboot \
     -drive "if=virtio,file=$work/verify-overlay.qcow2,format=qcow2,cache=unsafe" \
     -drive "if=virtio,file=$work/verify-seed.img,format=raw,readonly=on" \
-    -nic none >"$work/verify-serial.log" 2>&1 &
+    -netdev user,id=verify-net,restrict=on \
+    -device virtio-net-pci,netdev=verify-net,romfile= \
+    >"$work/verify-serial.log" 2>&1 &
 qemu_pid=$!
 deadline=$(( $(date +%s) + 1200 ))
 while kill -0 "$qemu_pid" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
-        tail -n 200 "$work/verify-serial.log" >&2 || true
+        tail -n 2000 "$work/verify-serial.log" >&2 || true
         echo "cold-boot VM verification timed out" >&2
         exit 70
     fi
@@ -307,13 +334,13 @@ qemu_status=$?
 set -e
 qemu_pid=
 [ "$qemu_status" -eq 0 ] || {
-    tail -n 200 "$work/verify-serial.log" >&2 || true
+    tail -n 2000 "$work/verify-serial.log" >&2 || true
     echo "cold-boot QEMU exited with status $qemu_status" >&2
     exit 70
 }
 grep -F -q "VAULTLINK_VM_COLD_BOOT_VERIFIED_$target_id" \
     "$work/verify-serial.log" || {
-        tail -n 200 "$work/verify-serial.log" >&2 || true
+        tail -n 2000 "$work/verify-serial.log" >&2 || true
         echo "converted guest failed cold-boot verification" >&2
         exit 70
     }
