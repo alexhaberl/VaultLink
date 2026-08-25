@@ -966,6 +966,10 @@ if ! grep -F -q 'libguestfs-tools' deploy/docker/Dockerfile.qemu-runner \
     || ! grep -F -q 'command -v guestfish' tools/verify-qemu-runner.sh \
     || ! grep -F -q 'guestfish-probe.img=fs:ext4:64M' tools/verify-qemu-runner.sh \
     || ! grep -F -q 'feature-available selinuxrelabel' tools/verify-qemu-runner.sh \
+    || ! grep -F -q 'LIBGUESTFS_BACKEND_SETTINGS=force_tcg' tools/verify-qemu-runner.sh \
+    || ! grep -F -q 'guestfish get-backend-settings' tools/verify-qemu-runner.sh \
+    || ! grep -F -q 'LIBGUESTFS_BACKEND_SETTINGS=force_tcg' "$tcg_timeout_manager" \
+    || ! grep -F -q 'guestfish get-backend-settings' "$tcg_timeout_manager" \
     || ! grep -F -q 'DefaultDeviceTimeoutSec=5min' "$tcg_timeout_manager" \
     || ! grep -F -q 'DefaultDeviceTimeoutSec=5min' "$tcg_timeout_cleanup" \
     || ! grep -F -q 'rmdir -- /etc/systemd/system.conf.d' "$tcg_timeout_cleanup" \

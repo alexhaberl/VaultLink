@@ -74,7 +74,9 @@ reviewed capacity. Fedora 44 arm64 needs a longer systemd device timeout only
 while its UEFI guest boots under slow TCG emulation. The harness injects that
 temporary override into its disposable overlay and verifies that cloud-init
 removed both the override and cleanup helper before any guest image or gate
-evidence is accepted.
+evidence is accepted. The arm64 libguestfs appliance is explicitly forced to
+TCG: this avoids an invalid KVM-only GIC fallback inside the container without
+granting the harness privileged mode, extra capabilities, or host devices.
 
 Because standard runners have limited local SSD space, refresh and full-system
 jobs record both real and apparent guest-image usage. Once an immutable image
