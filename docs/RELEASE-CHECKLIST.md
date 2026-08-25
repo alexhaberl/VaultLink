@@ -1,6 +1,9 @@
 # v0.5.0 release checklist
 
-Status: released on 2026-08-24 for native Linux amd64 and arm64.
+Status: released on 2026-08-24, withdrawn on 2026-08-25, and unsupported. The
+GitHub release and its archive assets were removed; the annotated tag, commit,
+workflow evidence, and this historical checklist are intentionally retained.
+There is no supported upgrade path from this archive layout to 0.6.0.
 
 Goal: signed public GitHub release for Debian 13 amd64 and arm64. The repository is already public as an explicitly unreleased development tree so standard GitHub-hosted CI remains ephemeral and does not consume private-repository minutes. Only the signed `v0.5.0` tag and release assets are published after merge to `main`, with a clean worktree and every release gate green.
 

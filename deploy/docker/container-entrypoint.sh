@@ -23,7 +23,7 @@ PROXY_PID="$!"
 VAULTLINK_PID="$!"
 
 # Invoked indirectly by the EXIT/INT/TERM traps.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     kill "$VAULTLINK_PID" "$PROXY_PID" 2>/dev/null || true
     wait "$VAULTLINK_PID" 2>/dev/null || true

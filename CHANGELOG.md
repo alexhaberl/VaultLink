@@ -1,12 +1,21 @@
 # Changelog
 
-## 0.5.1 — Unreleased release candidate
+## 0.6.0 — Unreleased
 
+- Withdrew the public `v0.5.0` release and archive assets on 2026-08-25 while retaining its annotated tag, commit, workflow evidence, and historical checklist. Version 0.5.0 is unsupported and has no in-place migration path to 0.6.0.
+- Replaced archive distribution with nine native packages: Debian 13 and Ubuntu 24.04/26.04 LTS DEBs on amd64/arm64, Fedora 44 RPMs on x86_64/aarch64, and one x86_64 Arch package built against the release-date snapshot.
+- Added a declarative target manifest, digest-pinned per-distro builders and full-system guests, twice-clean package/SBOM reproducibility, package linters and allowlists, isolated QEMU gates, per-target 100-user gates, and the aggregate `vaultlink/packages`, `vaultlink/package-reproducibility`, and `vaultlink/distro-vms` release checks.
+- Changed the signed updater to require a package-bound installation and to verify both the new and installed native release packages before an offline `dpkg`, `rpm`, or `pacman` transaction. Failure restores the complete old runtime and reinstalls the verified old package; unattended installation remains disabled by default and respects a stopped service.
+- Changed release publication to exactly 21 project assets—nine packages and direct signatures, one deterministic all-target SBOM bundle, and a globally signed checksum manifest—with draft download verification before publication and permanent package-asset retention for rollback.
+- Enabled repository-level immutable releases and made the tag workflow verify the published immutable state, preventing future 0.6.0+ package assets from being replaced or individually deleted.
 - Fixed Git ownership validation for the containerized tag-publishing job and documented the controlled `v0.5.0` recovery publication.
 - Refreshed the shared Rust 1.97.1 Debian container base digest for subsequent development builds.
-- Added an opt-in systemd updater that discovers only stable releases from the official GitHub repository, verifies the pinned Minisign key and signed architecture checksum before using the existing backup, readiness, and automatic-rollback upgrade path.
 
 ## 0.5.0 — 2026-08-24
+
+**Withdrawn and unsupported since 2026-08-25.** The annotated tag and evidence
+remain for audit purposes, but its archive assets were removed. Do not install
+or deploy this version.
 
 This work was developed under the internal `0.4.9` hardening candidate. That candidate is not published or tagged; the first releasable artifact containing these changes is 0.5.0.
 

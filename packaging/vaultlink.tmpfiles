@@ -1,0 +1,7 @@
+d /opt/vaultlink 0750 root vaultlink -
+d /etc/vaultlink 0750 root vaultlink -
+d /etc/vaultlink/tls 0750 root vaultlink -
+d /var/lib/vaultlink 0750 vaultlink vaultlink -
+d /var/lib/vaultlink/setup 0700 vaultlink vaultlink -
+d /var/lib/vaultlink-backups 0700 root root -
+d /var/log/vaultlink 0750 vaultlink vaultlink -

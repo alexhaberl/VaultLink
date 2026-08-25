@@ -1,83 +1,180 @@
-# Release signing key
+# Release signing and immutable package inputs
 
-Before tagging, generate the project key once on an offline trusted system:
+VaultLink 0.6.0 publishes only the nine native packages declared in
+`package-targets.json`. The release workflow must not publish project tar
+archives or standalone binaries. GitHub's automatic source archives are
+unsupported source material.
+
+## Signing key
+
+Generate the project key once on an offline trusted system:
 
 ```sh
 minisign -G -p minisign.pub -s vaultlink-release.key
 ```
 
-Commit the public key as `release/minisign.pub`. Store the complete private key only in the GitHub Actions secret `MINISIGN_SECRET_KEY`; store its password in `MINISIGN_PASSWORD`. Never place the private key in the repository, VM, release artifact, or logs. The release workflow intentionally fails when the public key or either secret is absent.
+Commit only the public key as `release/minisign.pub`. Keep the private key
+offline and inject its complete encrypted value only through
+`MINISIGN_SECRET_KEY`; store its password in `MINISIGN_PASSWORD`. Never place
+the private key in the repository, a builder, guest, staging VM, package,
+artifact, or log. Missing or mismatched key material fails closed.
 
-The tag-only publish job uses the protected `release-signing` GitHub Environment.
-The owner-only `v*` tag ruleset allows only the repository owner to create,
-update, or delete release tags. The Environment intentionally has no required
-reviewer: this personal repository has only one authorized release approver, so
-preventing self-review would deadlock publication. Its deployment branch
-policies accept only `main` and `v*`. The workflow independently requires the
-repository to be public, requires the tag version to match Cargo metadata,
-verifies that the tagged commit equals the current `origin/main`, rebuilds/tests
-that commit on both native architectures, and grants `contents: write` only to
-the publish job. A version tag pushed while the repository is private cannot
-publish. Branch dry-runs remain read-only.
+The same protected Environment contains `RELEASE_ADMIN_READ_TOKEN`, a
+fine-grained token restricted to this repository with read-only
+**Administration** permission. It cannot publish or alter contents; it exists
+only because the normal Actions token cannot read the repository-level
+Immutable Releases setting. The signing job checks that setting before draft
+creation and again immediately before publication. A missing token, inadequate
+scope, or disabled policy leaves the verified release as a non-public draft.
 
-## Supply-chain pin maintenance
+The tag-only job uses the protected `release-signing` Environment. The
+owner-only `v*` tag ruleset permits only the repository owner to create,
+update, or delete release tags. The personal repository intentionally has no
+required reviewer because disabling self-review with no second authorized
+reviewer would deadlock publication. The workflow independently requires:
 
-Release and test workflows pin external actions to full commit SHAs and container images to manifest digests. Keep the adjacent version comments when reviewing Dependabot updates, verify that each SHA belongs to the named upstream repository, and run `make policy-check` plus the release dry-run before merging a pin refresh. Release-time jobs install neither APT packages nor Cargo tools.
+- a public repository;
+- a signed annotated tag whose strict version matches Cargo and all packages;
+- the tag commit to equal current `origin/main`;
+- all commit-bound CI, Fuzz, package, reproducibility, VM, load, and soak
+  evidence; and
+- signing secrets, the read-only release-policy token, and job-scoped
+  `contents: write` only in the final protected job.
 
-The required `VAULTLINK_RELEASE_BUILDER_IMAGE` is a multi-architecture,
-digest-pinned image built only from `deploy/docker/Dockerfile.release-builder`
-and the immutable Debian snapshot in `deploy/docker/debian-snapshot.sources`.
-The builder Dockerfile deliberately copies no application source, workflow, or
-`release-builder-image.lock`, so its digest can safely be pinned by the same
-source commit. Its direct and transitive package
-closure is exact-versioned in `debian-packages.lock`; the image build compares
-the base-image dpkg manifest before and after installation and rejects every
-changed package absent from that lock. Cargo audit/SBOM tools are baked into the
-builder at pinned versions. Reproducibility jobs generate and normalize an
-independent SBOM for each clean build, then require both the binary and complete
-final release archive to have identical SHA-256 values. A tag build must match
-those exact binary and archive hashes for its architecture.
+A tag pushed while any requirement is absent cannot publish. Branch and pull-
+request runs remain secret-free and read-only.
 
-`deploy/docker/release-builder-image.lock` is the reviewed source of truth. It
-starts as `UNPROVISIONED` and remains blocked until a maintainer performs an
-explicit dependency refresh. Build and push the builder as one linux/amd64+linux/arm64
-manifest with Buildx, record the resulting full
-`ghcr.io/alexhaberl/vaultlink-release-builder@sha256:<64-hex>` reference in the
-lock, and set the repository variable `VAULTLINK_RELEASE_BUILDER_IMAGE` to that
-exact same string. Release and reproducibility environment resolvers compare
-the two before any job container starts and require `packages: read` plus GHCR
-credentials. An unset marker, mismatch, mutable tag, different repository, or
-unavailable private image is an intentional external release blocker.
+## Target and image lock
 
-The refresh is performed from reviewed `main` by manually dispatching
-`Refresh release builder`. Its matrix builds natively on GitHub-hosted amd64
-and arm64 runners, pushes platform images by digest, and publishes their joint
-manifest under the temporary `dependency-refresh` tag. No release job uses
-that tag.
+`release/package-targets.json` is the only target matrix and names all nine
+supported packages, native GitHub runner architecture, package architecture,
+package format and asset name, immutable builder, and immutable QEMU guest.
+For Arch it also binds the `rolling` host identity to one dated source
+snapshot selected for the candidate.
 
-```sh
-gh workflow run release-builder.yml --ref main
-```
+The QEMU harness has a separate four-file commit-bound lock under
+`deploy/docker`: its multiarch image digest, exact Ubuntu 24.04 base digest,
+and the complete installed Debian package inventory for amd64 and arm64.
+Every VM refresh and full-system gate compares the running harness marker,
+embedded inventory, and live package database with those reviewed files.
 
-Copy the manifest reference reported in the workflow summary, not either
-platform-child digest, into the checked-in lock and the repository variable,
-then rerun both native
-reproducibility jobs. For a private package, explicitly grant this repository's
-Actions token read access to the GHCR package. Updating the temporary tag later
-cannot affect the pinned jobs.
+Every image reference ends in an OCI `sha256` digest. `UNPROVISIONED`, a
+mutable tag, a repository mismatch, an unavailable platform, or an unselected
+Arch snapshot stops package and release work before compilation.
 
-## Multi-architecture assets
+Builder and guest images are source-independent: their Dockerfiles and locked
+package inputs do not copy application source, workflows, the target manifest,
+or generated release artifacts. They contain a fixed Rust toolchain and the
+complete target-specific package/build/test tool closure. Release jobs do not
+install mutable distro or Cargo tools.
 
-Release builds are native: amd64 runs on GitHub-hosted `ubuntu-24.04` and arm64
-on `ubuntu-24.04-arm`. Architecture-independent verification and preflight jobs
-run on arm64. The tag-only signing and publishing job uses a fresh
-`ubuntu-24.04` VM, so the release key and write token are discarded with that
-job. Both builds use the same digest-pinned multi-platform Debian 13/Rust OCI
-index selected by `rust-toolchain.toml` and verify the host architecture before
-compiling.
+## Refresh procedure
 
-Each architecture produces a versioned archive, standalone binary, CycloneDX
-SBOM, and `SHA256SUMS-ARCH`. The tag workflow signs and verifies the archive,
-binary, and checksum manifest separately. The signed checksum manifest covers
-the SBOM as well. Never rename one architecture's files to make them appear to
-belong to the other architecture.
+Image refresh is a protected two-pull-request operation:
+
+1. merge reviewed recipe/manifest changes with image fields still
+   `UNPROVISIONED`;
+2. manually dispatch the builder and QEMU image refresh workflows from that
+   reviewed `main` commit;
+3. pass the exact successful QEMU refresh run ID to each of the nine VM-image
+   refreshes. The VM workflow accepts that bootstrap input only when GitHub
+   reports a successful manual QEMU refresh on `main` at the same commit, and
+   it downloads and verifies that run's immutable four-lock artifact. Its
+   aggregate lock hash is carried across jobs to reject artifact replacement
+   between validation and native provisioning. With input `0`, the workflow
+   instead requires the already committed four-file lock;
+4. verify native platform, OS identity, Rust version, package closure, guest
+   boot, and the reported GHCR child/manifest digests;
+5. download the QEMU-runner lock artifact, the builder lock artifact, plus all
+   nine `vm-image.tsv` artifacts; review every complete package-closure
+   attachment, and combine the nine VM records in manifest order; and
+6. derive the final manifest from the builder candidate (never from an
+   independently edited JSON file), require that all nine VM records and every
+   lock field are complete, then pin that exact output in a separate reviewed
+   pull request:
+
+   ```sh
+   cat vm-locks/debian13-amd64/vm-image.tsv \
+       vm-locks/debian13-arm64/vm-image.tsv \
+       vm-locks/ubuntu2404-amd64/vm-image.tsv \
+       vm-locks/ubuntu2404-arm64/vm-image.tsv \
+       vm-locks/ubuntu2604-amd64/vm-image.tsv \
+       vm-locks/ubuntu2604-arm64/vm-image.tsv \
+       vm-locks/fedora44-amd64/vm-image.tsv \
+       vm-locks/fedora44-arm64/vm-image.tsv \
+       vm-locks/archlinux-amd64/vm-image.tsv >all-vm-images.tsv
+   for lock in \
+       qemu-runner-image.lock \
+       qemu-runner-base-image.lock \
+       qemu-runner-packages-amd64.lock \
+       qemu-runner-packages-arm64.lock; do
+       install -m 0644 "qemu-lock/$lock" "deploy/docker/$lock"
+   done
+   python3 tools/update-package-target-images.py vm all-vm-images.tsv \
+       package-targets.final.json \
+       --input builder-lock/package-targets.json --require-complete
+   install -m 0644 package-targets.final.json release/package-targets.json
+   python3 tools/package-targets.py validate
+   ```
+
+   The strict final validator accepts neither `UNPROVISIONED` nor a malformed
+   QEMU-runner image/base/package locks and enforces one shared multiarch
+   builder/base digest for each two-architecture distribution. Partial QEMU
+   provisioning is invalid even in bootstrap mode. Stage all four QEMU locks
+   and the target manifest together in the same pinning pull request. This
+   same-commit run-ID path permits the initial nine guest images to be built
+   before that atomic pinning pull request; it never permits an unprovisioned
+   harness to run.
+
+Refresh workflows push immutable images and emit proposed pins but never modify
+`main`. After pinning, run `make policy-check`, the full package matrix,
+package reproducibility, and distro-VM gates.
+
+The secret-free `release-image-refresh` Environment is restricted to `main`.
+After the reviewed builder manifest is pinned, set the repository variable
+`VAULTLINK_PACKAGE_SIGNING_IMAGE` to the exact Debian 13 amd64
+`builder_image` reference; the signing job rejects any mismatch. The refresh
+Environment never receives the Minisign key.
+
+## Reproducibility and evidence
+
+Each target compiles inside its own distribution on a native matching CPU
+runner. Two empty build roots use the same commit-derived
+`SOURCE_DATE_EPOCH`; payload binary, normalized target SBOM, and final package
+must be byte-identical. Format-specific lint and the common package allowlist
+run independently of the builder.
+
+The full-system gate boots the pinned target guest with QEMU on the same
+architecture. The guest receives its package over an isolated host channel,
+has no unrestricted Internet access, and records kernel/OS identity, package
+version, hashes, systemd state, journal, readiness, load result, and SQLite
+integrity. Fedora evidence is invalid unless SELinux remains `Enforcing` with
+no VaultLink-related AVC denial.
+
+The aggregate checks `vaultlink/packages`,
+`vaultlink/package-reproducibility`, and `vaultlink/distro-vms` account for
+all nine manifest targets. Candidate, soak-start, and tag workflows reject a
+missing, skipped, stale, or wrong-commit aggregate.
+
+## Asset assembly and publication
+
+The protected signing job accepts exactly:
+
+- nine manifest-named packages;
+- nine direct package `.minisig` signatures;
+- one deterministic all-target SBOM bundle containing every target SBOM and
+  payload hash;
+- one global `SHA256SUMS`; and
+- `SHA256SUMS.minisig`.
+
+It creates a draft with exactly those 21 project assets, downloads them again
+from GitHub into a clean workspace, and verifies count, exact names, hashes,
+both signature layers, package metadata/inventory, target identity, embedded
+public key, SBOM contents, and payload versions. Only the already verified
+draft is then made public; no asset is rebuilt or replaced during publication.
+
+Published native packages from 0.6.0 onward are authenticated rollback inputs.
+Repository-level GitHub release immutability is enabled, and the tag workflow
+requires the newly published release to report `immutable=true`. Never delete
+an entire package release: if an installed version's old package cannot be
+downloaded and verified, the updater intentionally refuses the update.

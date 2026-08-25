@@ -1,0 +1,264 @@
+name: Refresh native package builders
+
+on:
+  workflow_dispatch:
+    inputs:
+      debian13_base:
+        description: Digest-pinned Debian 13 base image
+        required: true
+        type: string
+      ubuntu2404_base:
+        description: Digest-pinned Ubuntu 24.04 base image
+        required: true
+        type: string
+      ubuntu2604_base:
+        description: Digest-pinned Ubuntu 26.04 base image
+        required: true
+        type: string
+      fedora44_base:
+        description: Digest-pinned Fedora 44 base image
+        required: true
+        type: string
+      archlinux_base:
+        description: Digest-pinned Arch Linux snapshot base image
+        required: true
+        type: string
+      arch_snapshot_date:
+        description: UTC Arch Archive snapshot date (YYYY-MM-DD)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vaultlink-package-builder-refresh
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate target manifest and immutable bases
+        id: matrix
+        shell: bash
+        env:
+          DEBIAN13_BASE: ${{ inputs.debian13_base }}
+          UBUNTU2404_BASE: ${{ inputs.ubuntu2404_base }}
+          UBUNTU2604_BASE: ${{ inputs.ubuntu2604_base }}
+          FEDORA44_BASE: ${{ inputs.fedora44_base }}
+          ARCHLINUX_BASE: ${{ inputs.archlinux_base }}
+          ARCH_SNAPSHOT_DATE: ${{ inputs.arch_snapshot_date }}
+        run: |
+          set -euo pipefail
+          python3 tools/package-targets.py validate --allow-unprovisioned
+          for variable in DEBIAN13_BASE UBUNTU2404_BASE UBUNTU2604_BASE FEDORA44_BASE ARCHLINUX_BASE; do
+            image=${!variable}
+            [[ "$image" =~ ^[a-z0-9.-]+(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$ ]]
+          done
+          [[ "$ARCH_SNAPSHOT_DATE" =~ ^20[0-9]{2}-[01][0-9]-[0-3][0-9]$ ]]
+          python3 -c 'import datetime,os; value=os.environ["ARCH_SNAPSHOT_DATE"]; assert datetime.date.fromisoformat(value).isoformat() == value'
+          printf 'matrix=%s\n' "$(python3 tools/package-targets.py matrix --allow-unprovisioned)" \
+            >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    environment: release-image-refresh
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select immutable distro base
+        id: base
+        shell: bash
+        env:
+          TARGET_ID: ${{ matrix.id }}
+          DEBIAN13_BASE: ${{ inputs.debian13_base }}
+          UBUNTU2404_BASE: ${{ inputs.ubuntu2404_base }}
+          UBUNTU2604_BASE: ${{ inputs.ubuntu2604_base }}
+          FEDORA44_BASE: ${{ inputs.fedora44_base }}
+          ARCHLINUX_BASE: ${{ inputs.archlinux_base }}
+        run: |
+          set -euo pipefail
+          case "$TARGET_ID" in
+            debian13-*) image=$DEBIAN13_BASE ;;
+            ubuntu2404-*) image=$UBUNTU2404_BASE ;;
+            ubuntu2604-*) image=$UBUNTU2604_BASE ;;
+            fedora44-*) image=$FEDORA44_BASE ;;
+            archlinux-*) image=$ARCHLINUX_BASE ;;
+            *) exit 65 ;;
+          esac
+          [[ "$image" =~ ^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$ ]]
+          printf 'image=%s\n' "$image" >>"$GITHUB_OUTPUT"
+      - name: Authenticate to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build native source-independent image
+        shell: bash
+        env:
+          TARGET_ID: ${{ matrix.id }}
+          DISTRIBUTION: ${{ matrix.distribution }}
+          DISTRIBUTION_VERSION: ${{ matrix.version }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+          ARCH_SNAPSHOT_INPUT: ${{ inputs.arch_snapshot_date }}
+          REPOSITORY: ${{ matrix.builder_repository }}
+          BASE_IMAGE: ${{ steps.base.outputs.image }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = '${{ matrix.uname }}'
+          if [[ "$DISTRIBUTION" == arch ]]; then
+            ARCH_SNAPSHOT_DATE=$ARCH_SNAPSHOT_INPUT
+          else
+            ARCH_SNAPSHOT_DATE=UNPROVISIONED
+          fi
+          metadata="$RUNNER_TEMP/build-metadata.json"
+          builder="vaultlink-package-builder-$TARGET_ID"
+          docker buildx create --driver docker-container --name "$builder" --use
+          trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
+          docker buildx inspect --bootstrap
+          docker buildx build \
+            --platform "linux/$ARCHITECTURE" \
+            --file deploy/docker/Dockerfile.package-builder \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+            --build-arg "TARGET_ID=$TARGET_ID" \
+            --build-arg "DISTRIBUTION=$DISTRIBUTION" \
+            --build-arg "DISTRIBUTION_VERSION=$DISTRIBUTION_VERSION" \
+            --build-arg "ARCH_SNAPSHOT_DATE=$ARCH_SNAPSHOT_DATE" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "io.vaultlink.target=$TARGET_ID" \
+            --metadata-file "$metadata" \
+            --provenance=false \
+            --output "type=image,name=$REPOSITORY,push-by-digest=true,name-canonical=true,push=true" \
+            .
+          digest=$(jq -r '."containerimage.digest" // empty' "$metadata")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          reference="$REPOSITORY@$digest"
+          docker pull "$reference"
+          docker run --rm "$reference" \
+            cat /usr/local/share/vaultlink-builder-packages.lock \
+            >"builder-packages-$TARGET_ID.lock"
+          LC_ALL=C sort -c "builder-packages-$TARGET_ID.lock"
+          packages_sha256=$(sha256sum "builder-packages-$TARGET_ID.lock" | awk '{print $1}')
+          [[ "$packages_sha256" =~ ^[0-9a-f]{64}$ ]]
+          recorded_base=$(docker run --rm "$reference" \
+            sed -n 's/^builder_base_image=//p' /usr/local/share/vaultlink-builder.env)
+          test "$recorded_base" = "$BASE_IMAGE"
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$TARGET_ID" "$REPOSITORY" "$digest" "$BASE_IMAGE" "$packages_sha256" \
+            "$ARCH_SNAPSHOT_DATE" \
+            >"builder-digest-$TARGET_ID.tsv"
+      - name: Upload platform digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-builder-digest-${{ matrix.id }}
+          path: |
+            builder-digest-${{ matrix.id }}.tsv
+            builder-packages-${{ matrix.id }}.lock
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: release-image-refresh
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: package-builder-digest-*
+          path: digests
+          merge-multiple: true
+      - name: Authenticate to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Publish builder manifests and render lock update
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapping="$RUNNER_TEMP/builder-images.tsv"
+          : >"$mapping"
+          publish_group() {
+            first=$1
+            second=${2:-}
+            line=$(cat "digests/builder-digest-$first.tsv")
+            IFS=$'\t' read -r first_id repository first_digest first_base first_packages first_snapshot <<<"$line"
+            test "$first_id" = "$first"
+            refs="$repository@$first_digest"
+            if [[ -n "$second" ]]; then
+              line=$(cat "digests/builder-digest-$second.tsv")
+              IFS=$'\t' read -r second_id second_repository second_digest second_base second_packages second_snapshot <<<"$line"
+              test "$second_id" = "$second"
+              test "$second_repository" = "$repository"
+              refs="$refs $repository@$second_digest"
+            fi
+            # The tag is only a discovery aid; workflows consume the immutable digest.
+            docker buildx imagetools create \
+              --tag "$repository:dependency-refresh-$GITHUB_RUN_ID" $refs
+            docker buildx imagetools inspect \
+              "$repository:dependency-refresh-$GITHUB_RUN_ID" --raw \
+              | jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' \
+              | sort >platforms.actual
+            first_architecture=$(python3 tools/package-targets.py get \
+              "$first" architecture --allow-unprovisioned)
+            printf 'linux/%s\n' "$first_architecture" >platforms.expected
+            if [[ -n "$second" ]]; then
+              second_architecture=$(python3 tools/package-targets.py get \
+                "$second" architecture --allow-unprovisioned)
+              printf 'linux/%s\n' "$second_architecture" \
+                >>platforms.expected
+            fi
+            sort -o platforms.expected platforms.expected
+            cmp platforms.expected platforms.actual
+            inspection=$(docker buildx imagetools inspect \
+              "$repository:dependency-refresh-$GITHUB_RUN_ID")
+            digest=$(printf '%s\n' "$inspection" \
+              | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            printf '%s\t%s@%s\t%s\t%s\t%s\n' \
+              "$first" "$repository" "$digest" "$first_base" "$first_packages" "$first_snapshot" >>"$mapping"
+            if [[ -n "$second" ]]; then
+              printf '%s\t%s@%s\t%s\t%s\t%s\n' \
+                "$second" "$repository" "$digest" "$second_base" "$second_packages" "$second_snapshot" >>"$mapping"
+            fi
+          }
+          publish_group debian13-amd64 debian13-arm64
+          publish_group ubuntu2404-amd64 ubuntu2404-arm64
+          publish_group ubuntu2604-amd64 ubuntu2604-arm64
+          publish_group fedora44-amd64 fedora44-arm64
+          publish_group archlinux-amd64
+          python3 tools/update-package-target-images.py \
+            builder "$mapping" package-targets.json
+          python3 tools/package-targets.py validate --allow-unprovisioned
+          printf 'Review the uploaded complete package closures, then combine this partial builder lock with all nine VM locks in one pinning PR.\n' \
+            >>"$GITHUB_STEP_SUMMARY"
+      - name: Upload reviewed target-lock candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-builder-target-lock-${{ github.run_id }}
+          path: |
+            package-targets.json
+            digests/builder-packages-*.lock
+          if-no-files-found: error
+          retention-days: 30

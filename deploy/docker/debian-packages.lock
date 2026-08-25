@@ -1,5 +1,5 @@
 # Direct release tools and every package they add beyond the digest-pinned
-# rust:1.97.0-trixie base image. Refresh only against debian-snapshot.sources.
+# rust:1.97.1-trixie base image. Refresh only against debian-snapshot.sources.
 build-essential=12.12
 ca-certificates=20250419
 clang=1:19.0-63

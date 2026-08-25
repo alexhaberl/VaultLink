@@ -38,7 +38,7 @@ package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p
     echo "Cargo.toml package version is missing" >&2
     exit 1
 }
-release_version=0.5.1
+release_version=0.6.0
 if [ "$release_candidate" -eq 1 ] || [ -n "$release_tag" ]; then
     [ "$package_version" = "$release_version" ] || {
         echo "release preflight is fixed to $release_version, not $package_version" >&2
@@ -77,7 +77,7 @@ changelog_version=$(sed -n 's/^## \([^ ]*\).*/\1/p' CHANGELOG.md | sed -n '1p')
     exit 1
 }
 changelog_heading=$(sed -n 's/^## //p' CHANGELOG.md | sed -n '1p')
-unreleased_heading="$package_version — Unreleased release candidate"
+unreleased_heading="$package_version — Unreleased"
 released_prefix="$package_version — "
 released_date=
 case "$changelog_heading" in
@@ -97,7 +97,7 @@ esac
 
 if [ "$release_candidate" -eq 1 ] || [ -n "$release_tag" ]; then
     [ -n "$released_date" ] || {
-        echo "release preflight requires a committed ISO date and rejects an Unreleased candidate" >&2
+        echo "release preflight requires a committed ISO date and rejects an Unreleased entry" >&2
         exit 1
     }
     normalized_date=$(date -u -d "$released_date" +%F 2>/dev/null) || {
@@ -117,6 +117,29 @@ fi
 grep -Fq 'env!("CARGO_PKG_VERSION")' src/main.rs
 grep -Fq 'env!("CARGO_PKG_VERSION")' src/api.rs
 
+# The bootstrap PR is intentionally allowed to carry UNPROVISIONED image and
+# snapshot fields.  The target shape, ordering, runner binding, formats and
+# asset names are nevertheless release-critical from the first commit.
+python3 tools/package-targets.py validate --allow-unprovisioned
+target_count=$(python3 tools/package-targets.py ids --allow-unprovisioned | wc -l)
+[ "$target_count" -eq 9 ] || {
+    echo "package target manifest must contain exactly nine targets" >&2
+    exit 1
+}
+asset_count=$(python3 tools/package-targets.py assets "$package_version" \
+    --allow-unprovisioned | wc -l)
+[ "$asset_count" -eq 9 ] || {
+    echo "package target manifest must render exactly nine package assets" >&2
+    exit 1
+}
+python3 tools/package-targets.py assets "$package_version" --allow-unprovisioned \
+    | while IFS= read -r package_asset; do
+        grep -Fq "\`$package_asset\`" docs/PACKAGING.md || {
+            echo "package asset is not documented: $package_asset" >&2
+            exit 1
+        }
+    done
+
 if [ -n "$binary" ]; then
     [ -x "$binary" ] || {
         echo "version-check binary is not executable: $binary" >&2
@@ -130,9 +153,10 @@ if [ -n "$binary" ]; then
 fi
 
 if [ "$release_candidate" -eq 1 ] || [ -n "$release_tag" ]; then
-    grep -Fq "# v$package_version release checklist" docs/RELEASE-CHECKLIST.md
-    grep -Fq "VaultLink-$package_version-debian13-amd64.tar.gz" docs/GITHUB-HOSTED-RUNNERS.md
-    grep -Fq "VaultLink-$package_version-debian13-arm64.tar.gz" docs/GITHUB-HOSTED-RUNNERS.md
+    grep -Fq "# v$package_version native-package release checklist" \
+        "docs/RELEASE-CHECKLIST-$package_version.md"
+    # Candidate and tag modes deliberately reject every bootstrap placeholder.
+    python3 tools/package-targets.py validate
 fi
 
 if [ -n "$release_tag" ]; then

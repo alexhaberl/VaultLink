@@ -1,0 +1,46 @@
+# This source-tracked PKGBUILD is executed by makepkg in the pinned Arch
+# builder. The package root is prepared and normalized by
+# tools/build-native-package.sh before makepkg receives it.
+pkgname=vaultlink
+pkgver=${VAULTLINK_PACKAGE_VERSION:?VAULTLINK_PACKAGE_VERSION is required}
+pkgrel=1
+pkgdesc='Secure file sharing for an existing Linux mountpoint'
+arch=("${VAULTLINK_PACKAGE_ARCH:?VAULTLINK_PACKAGE_ARCH is required}")
+url='https://github.com/alexhaberl/VaultLink'
+license=('MIT')
+depends=(
+  'bash'
+  'ca-certificates'
+  'coreutils'
+  'curl'
+  'diffutils'
+  'findutils'
+  'gawk'
+  'gcc-libs'
+  'glibc'
+  'grep'
+  'gzip'
+  'libarchive'
+  'minisign'
+  'sed'
+  'sqlite'
+  'systemd'
+  'tar'
+  'util-linux'
+  'zstd'
+)
+optdepends=('cifs-utils: SMB 3.1.1 storage provisioning')
+install=vaultlink.install
+source=()
+sha256sums=()
+
+# VaultLink supplies an already compiled, verified native candidate. Do not
+# mutate that ELF payload or its package documentation during assembly.
+options=('!strip' '!debug' '!purge' '!zipman')
+
+package() {
+  local prepared_root=/build/vaultlink-package/payload
+  [[ -d "$prepared_root/usr" && ! -L "$prepared_root" ]] \
+    || return 1
+  cp -a -- "$prepared_root/." "$pkgdir/"
+}

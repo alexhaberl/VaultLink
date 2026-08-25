@@ -640,7 +640,7 @@ impl Storage {
 fn validate_mount_policy(storage: &Storage, production_mode: bool) -> Result<(), ConfigError> {
     let internal_directory = storage.internal_directory.as_deref().ok_or_else(|| {
         ConfigError::Invalid(
-            "storage.internal_directory must be configured explicitly; VaultLink 0.5.0 no longer infers a private storage boundary"
+            "storage.internal_directory must be configured explicitly; VaultLink no longer infers a private storage boundary"
                 .into(),
         )
     })?;

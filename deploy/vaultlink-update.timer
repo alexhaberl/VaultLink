@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily signed VaultLink release update check
+Description=Daily signed VaultLink native-package update check
 
 [Timer]
 OnBootSec=15min

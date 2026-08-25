@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1.7
+# The protected refresh workflow verifies guest.qcow2 before it enters context.
+FROM scratch
+ARG TARGET_ID
+ARG UPSTREAM_SHA256
+LABEL org.opencontainers.image.title="VaultLink distro VM ${TARGET_ID}" \
+      org.opencontainers.image.description="Pinned full-system package-test guest" \
+      org.opencontainers.image.vendor="VaultLink" \
+      io.vaultlink.target="${TARGET_ID}" \
+      io.vaultlink.upstream-sha256="${UPSTREAM_SHA256}"
+COPY guest.qcow2 /images/guest.qcow2
+COPY guest-image.env /images/guest-image.env

@@ -1,0 +1,4 @@
+# VaultLink intentionally disables RPM's host-dependent AutoReqProv scan and
+# binds the complete ELF/runtime closure in a reviewed Requires allowlist.
+# libgcc is therefore explicit by design; no other rpmlint error is filtered.
+addFilter(r"^vaultlink\.[^:]+: E: explicit-lib-dependency libgcc$")

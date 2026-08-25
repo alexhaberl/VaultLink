@@ -105,7 +105,7 @@ printf '%s\n' \
     'SOAK_SECONDS=259200' \
     'SOAK_INTERVAL_SECONDS=300' \
     'SOAK_LOAD_INTERVAL_SECONDS=21600' \
-    'SOAK_EXPECTED_VERSION=0.5.1' \
+    'SOAK_EXPECTED_VERSION=0.6.0' \
     >"$tmp"
 chmod 0640 "$tmp"
 chown root:"$runner_group" "$tmp"

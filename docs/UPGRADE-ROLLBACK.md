@@ -1,10 +1,46 @@
-# Upgrade, backup and rollback
+# Upgrade, backup, and rollback
 
-VaultLink currently uses schema 6. Fresh databases are created directly at schema 6. Validated schema-1 through schema-5 databases advance through separate `IMMEDIATE` transactions. Schema 3 adds the share indexes `(active,id)` and `(active,expires_at)`; schema 4 adds administrator-session activity tracking; schema 5 adds audit retention priority; schema 6 reclassifies existing upload, replacement, upload-directory and durability-warning records as security priority under the centralized audit policy. The schema-3-to-4 migration deliberately revokes existing administrator sessions instead of guessing prior activity, while preserving all administrators, credentials, Shares and audit data. Each migration updates the schema fingerprint and changes `PRAGMA user_version` last. Startup rejects future versions, unknown versions, non-empty unversioned databases, fingerprint mismatches and legacy plaintext-secret layouts.
+VaultLink 0.6.0 supports upgrades only between native packages for the exact
+same distribution, release, and architecture. There is no supported adoption,
+upgrade, or migration path from the withdrawn 0.5.0 archive installation. A
+markerless or mismatched installation fails closed before package files or
+runtime state are changed.
 
-Schema migrations are forward-only. VaultLink does not migrate legacy plaintext WebAuthn or secret columns and does not perform an in-place schema downgrade. A rollback must restore the old binary, matching configuration, database and keyring from the same backup.
+## Installation and package identity
 
-## The indivisible backup unit
+The native package owns the release candidate at
+`/usr/lib/vaultlink/package/vaultlink`; the activated runtime remains
+`/opt/vaultlink/vaultlink`. The root-owned
+`/usr/share/vaultlink/install-method.env` marker binds the installation to:
+
+- package format (`deb`, `rpm`, or `pkg.tar.zst`);
+- exact `ID` and `VERSION_ID` from `/etc/os-release` (Arch uses
+  `rolling`);
+- package-manager architecture; and
+- the package database name `vaultlink`.
+
+The marker, package database, candidate version, active binary version, and
+health version must agree. They are checked before and after every update.
+
+Package installation never creates or replaces
+`/etc/vaultlink/config.toml`, never enables or starts
+`vaultlink.service` or `vaultlink-update.timer`, and preserves both the
+intentional absence of `/etc/vaultlink/update.conf` and an existing valid file
+without changing its inode, bytes, owner, mode, or modification time. Removal
+preserves configuration, database, keyring, service identity, logs, mounts,
+and backups.
+
+For a first Debian or Ubuntu installation, the administrator must read the
+exact `Depends` field from the already Minisign-verified, root-staged DEB and
+prove every named package is in the `installed` state before running
+`dpkg -i`. This preflight is offline. If `dpkg -i` nevertheless fails for a
+missing dependency after leaving `vaultlink` unpacked, leave VaultLink
+inactive, install the dependency manually, and continue only with
+`dpkg --configure vaultlink`; do not run `dpkg -i` again over that unpacked
+transaction. Any package-database or package/runtime ambiguity remains
+fail-closed.
+
+## The indivisible runtime backup
 
 Treat these four files as one security and recovery unit:
 
@@ -13,95 +49,156 @@ Treat these four files as one security and recovery unit:
 - `/var/lib/vaultlink/data.sqlite`
 - `/var/lib/vaultlink/secrets.keyring`
 
-The SQLite database contains encrypted Share tokens and encrypted TOTP secrets. It is unusable without its matching keyring. The keyring must remain owned by `vaultlink:vaultlink`, mode `0600`; backup copies remain `root:root`, mode `0600`. Never copy only `data.sqlite`, and never combine a database with a keyring from another installation or backup.
+The SQLite database contains encrypted Share tokens and TOTP secrets and is
+unusable without its matching keyring. The live keyring must remain
+`vaultlink:vaultlink`, mode `0600`. Every rollback source must be inside a
+canonical, absolute, symlink-free subtree of `/var/lib/vaultlink-backups`;
+that root and every directory down to the selected backup must be
+`root:root`, mode `0700`. The backup binary must be `root:root`, mode `0700`,
+and the configuration, database, and keyring copies must each be `root:root`,
+mode `0600`.
 
-## Upgrade
+Before reading their contents for rollback, the helper records each source's
+filesystem identity and hash, copies all four files into a new private
+`root:root` mode-`0700` freeze directory beneath the same backup root, and
+rechecks the original identities, hashes, and frozen copies. It then operates
+only on that frozen set. A source change, link, wrong owner/mode, unsafe parent,
+or path outside the backup root fails before live-state mutation. Never copy
+only `data.sqlite`, combine files from different backups, or point an older
+binary at a database migrated by a newer binary.
 
-Run:
+A package update has one additional recovery input: the exact previously
+installed native package. The updater downloads that package together with
+its existing direct signature and the signed global `SHA256SUMS`, verifies and
+extracts it, and retains the verified inputs in its root-only transaction
+workspace before it allows the package database to change. The updater never
+has access to a signing key.
 
-```sh
-sudo deploy/vaultlink-upgrade.sh /path/to/new/vaultlink /path/to/new-config.toml
-```
+## Signed package updater
 
-The script takes an exclusive maintenance lock, validates the installed and candidate Binary/Config pairs as the unprivileged service account, stages replacements, stops the service, creates a consistent SQLite backup, copies the matching keyring, verifies integrity and restrictive permissions, then activates the candidate. Readiness must return the exact candidate version before the upgrade succeeds.
+The root-owned `/usr/sbin/vaultlink-update` uses the fixed
+`https://github.com/alexhaberl/VaultLink/releases` origin and the installed
+`/usr/share/vaultlink/minisign.pub`. Configuration cannot override the
+repository, URL, channel, public key, distribution, architecture, or version.
 
-If activation, startup, readiness or the post-start integrity check fails, the script restores the complete four-file backup. A `CRITICAL` message means automatic recovery failed; keep the service stopped and restore the reported backup directory manually.
-
-The candidate binary performs any supported forward schema migration when it starts. The upgrade script does not edit schemas, aliases, credentials or storage layouts itself. Because startup can advance the database to schema 6, keep the complete pre-upgrade backup until the candidate has been accepted. Advancing from schema 3 signs out all administrators once.
-
-## Signed GitHub release updater
-
-The optional root-owned updater uses the fixed
-`https://github.com/alexhaberl/VaultLink/releases/latest` endpoint. It accepts
-only a stable `vMAJOR.MINOR.PATCH` tag, Debian 13, and the host's exact
-`amd64`/`x86_64` or `arm64`/`aarch64` pairing. It does not accept a repository,
-URL, channel, public key, architecture, or release version from its
-configuration.
-
-Before executing release content it downloads the architecture-specific
-archive, its Minisign signature, `SHA256SUMS-ARCH`, and that manifest's
-signature into a root-controlled temporary directory. Both signatures must verify
-against `/usr/share/vaultlink/minisign.pub`; the signed checksum must match the
-archive; every archive path must remain below its exact versioned root; links
-and special files are rejected; the embedded public key must equal the pinned
-installed key; and the candidate binary must report the tagged version.
-Only root can modify the workspace or its contents. The exact candidate binary
-is made traversable and executable by the unprivileged `vaultlink` account only
-for its bounded version preflight; signatures, manifests, and helpers remain
-root-only.
-
-Install it from a previously verified release archive:
+Commands:
 
 ```sh
-sudo apt install -y curl minisign
-sudo install -d -o root -g root -m 0755 /usr/local/sbin /usr/share/vaultlink
-sudo install -o root -g root -m 0755 deploy/vaultlink-update.sh /usr/local/sbin/vaultlink-update
-sudo install -o root -g root -m 0644 minisign.pub /usr/share/vaultlink/minisign.pub
-sudo install -o root -g root -m 0644 deploy/vaultlink-update.service deploy/vaultlink-update.timer /etc/systemd/system/
-sudo test -e /etc/vaultlink/update.conf || sudo install -o root -g root -m 0644 deploy/vaultlink-update.conf.example /etc/vaultlink/update.conf
-sudo systemctl daemon-reload
-sudo systemctl enable --now vaultlink-update.timer
+sudo vaultlink-update check
+sudo vaultlink-update install
+sudo vaultlink-update auto
 ```
 
-The commands are:
+`check` compares the installed package with the latest stable strict
+`vMAJOR.MINOR.PATCH` release without executing downloaded content.
+`install` installs only a newer release for the exact package target.
+`auto` remains check-only unless the root-owned configuration contains
+exactly `auto_install=true`. Even then it updates only a service that was
+active before the transaction; a deliberately stopped service is neither
+updated nor started.
 
-```sh
-sudo /usr/local/sbin/vaultlink-update check
-sudo /usr/local/sbin/vaultlink-update install
-sudo /usr/local/sbin/vaultlink-update auto
-```
+Before any mutation, `install`:
 
-`check` reports the installed and latest versions without downloading or
-executing release assets. `install` installs only a newer verified release.
-`auto` is used by the timer: it remains check-only when the configuration is
-absent or contains `auto_install=false`, and installs when it contains exactly
-`auto_install=true` and `vaultlink.service` is currently active. A deliberately
-stopped service is never updated or started by the timer. Unknown, duplicate,
-writable, non-root-owned, or malformed
-configuration is rejected. Timer results are available through
-`journalctl -u vaultlink-update.service`.
+1. validates root execution, the marker, OS release, architecture, active
+   runtime, package candidate, and package database;
+2. downloads the new package and the package for the currently installed
+   release, their direct `.minisig` files, the global `SHA256SUMS`, and
+   `SHA256SUMS.minisig` into a root-only bounded workspace;
+3. verifies the global manifest and both direct signatures against the pinned
+   key, rejects redirects outside the fixed HTTPS origin, and verifies exact
+   asset names and checksums;
+4. safely inspects both packages, rejecting links, special files, unexpected
+   paths, metadata, architecture, version, package name, helper, or embedded-key
+   differences;
+5. executes each payload binary's bounded `--version` preflight as the
+   unprivileged service user; and
+6. proves all dependencies of the new package are already installed.
 
-The updater executes the upgrade helper from the already verified release
-archive so a candidate may carry its matching migration orchestration. That
-helper still validates both Binary/Config pairs before downtime, holds the
-shared maintenance lock, preserves the existing configuration, creates the
-complete four-file backup, checks readiness and database integrity, and
-automatically restores the previous unit on failure. A missing release,
-network error, signature/checksum mismatch, unsupported host, downgrade,
-pre-release, malformed archive, or failed upgrade leaves the installed service
-unchanged. The Minisign trust key is never rotated automatically.
+No distro repository is contacted by the update transaction. Missing new
+dependencies stop the update before activation and require the administrator to
+install the complete dependency set manually.
 
-## Rollback
+`vaultlink-update.service` is a root oneshot with explicit
+`TimeoutStartSec=90min` and `TimeoutStopSec=30min`. It deliberately uses
+`ProtectSystem=false`: native package managers execute distribution-owned
+sysusers, tmpfiles, SELinux, and transaction hooks whose write set cannot be
+represented safely by a VaultLink-only `ReadWritePaths` list. The signed
+package, exact metadata and payload allowlists, dependency preflight, locks,
+and final parity checks form that write boundary. All unrelated namespace,
+device, kernel, process, and network hardening remains enabled.
 
-Run:
+## Transaction and automatic recovery
 
-```sh
-sudo deploy/vaultlink-rollback.sh /var/lib/vaultlink-backups/TIMESTAMP
-```
+The updater holds the shared maintenance lock and records whether the service
+was active. It creates and verifies the complete four-file backup before
+downtime. It then installs the verified package without repository access:
 
-Rollback accepts only a complete backup containing all four files. Before replacement it creates a complete emergency backup of the current state. The requested binary must not be newer than the installed binary. The database and keyring are staged and replaced together while the service is stopped; stale WAL sidecars are removed before restart.
+- DEB: `dpkg -i`
+- RPM: `rpm -Uvh`
+- Arch updater-driven update or authenticated recovery reinstall: `pacman -U`
 
-If rollback activation fails, the emergency four-file unit is restored automatically. Never point an old binary at a database that a newer binary has migrated. To roll back across a schema migration, restore the matching old binary/config/database/keyring backup as one unit. Do not use this workflow to combine files from different backups or to install the former plaintext layout.
+An initial Arch installation is different: the administrator must execute the
+root-owned installer embedded in the already verified package. Direct initial
+`pacman -U` is unsupported because Pacman 7 can ignore a failing `.INSTALL`
+hook's status while still registering the package. The embedded wrapper runs
+the same package-manager command only after a locked preflight and checks all
+installation postconditions before reporting success. Subsequent signed
+updates already have a valid persistent package marker and are safely driven
+through Pacman by `vaultlink-update`.
+
+Normal Arch removal must use the installed, signed
+`vaultlink-package-remove.sh` wrapper, and normal reinstall must use
+`vaultlink-package-install.sh` extracted from the new, root-staged,
+Minisign-verified package. Direct `pacman -R vaultlink` and direct manual
+reinstall with `pacman -U` are unsupported. These transactions preserve the
+exact presence/absence of `update.conf` and, when present, its inode and
+content metadata.
+
+Package maintainer scripts install the new candidate but do not activate it on
+an existing installation. The helper extracted from the already verified new
+package stages and activates that exact candidate, performs any supported
+forward migration, and checks startup, exact-version readiness, SQLite
+integrity, ownership, modes, and hashes.
+
+Any package-manager, migration, activation, startup, readiness, or integrity
+failure enters recovery. Recovery keeps the service stopped, reinstalls the
+already verified old package without repository access, atomically restores the
+complete old runtime backup, and starts the service only if it was active
+before. It then rechecks SQLite integrity and requires the package database,
+package candidate, active binary, and readiness endpoint to report the same old
+version.
+
+If that parity cannot be re-established, recovery is terminal: the service
+remains stopped, the transaction workspace and backup path are reported, and a
+trusted host administrator must recover manually. A failed update is never
+reported as success merely because the process returned to an executable
+state.
+
+Every application start first runs the root-owned package/runtime guard, which
+requires marker, operating system, package database, candidate, and active
+binary parity. It blocks a mixed state after an interrupted transaction or
+power loss. `StartLimitIntervalSec=1h` and `StartLimitBurst=3` bound repeated
+guard failures rather than creating an unbounded restart loop.
+
+## Manual restore
+
+`vaultlink-rollback.sh` accepts only the canonical protected backup subtree and
+exact four-file ownership/mode contract described above, freezes and rechecks
+those inputs, and creates an emergency backup of the current state first. It is
+a state-recovery primitive, not a package-version switch. To cross a package
+version manually:
+
+1. obtain and verify the exact target package, its direct signature, and the
+   signed checksum manifest;
+2. stop VaultLink and reinstall that package with the native package manager;
+3. run the packaged rollback helper against the backup created for that exact
+   version; and
+4. prove package/candidate/active/readiness parity and SQLite integrity before
+   returning the host to service.
+
+Do not use the normal forward-upgrade helper to force a downgrade. A terminal
+recovery error warrants preserving the reported workspace and journal before
+making further changes.
 
 ## Secret rotation
 
@@ -112,15 +209,19 @@ sudo -u vaultlink /opt/vaultlink/vaultlink rotate-secrets \
   --database /var/lib/vaultlink/data.sqlite
 ```
 
-Alternatively pass `--config /etc/vaultlink/config.toml`. Rotation requires exclusive access to `secrets.keyring`; stop the service first. The new key is made durable before ciphertexts are rewritten in an `IMMEDIATE` transaction, and the previous key is removed only after the database commit.
+Alternatively pass `--config /etc/vaultlink/config.toml`. Rotation requires
+exclusive access to `secrets.keyring`; stop the service first. The new key is
+made durable before ciphertexts are rewritten in an `IMMEDIATE` transaction,
+and the previous key is removed only after the database commit.
 
 ## Recovery rules
 
-- Restore only a matching database/keyring pair from the same backup directory.
-- Across a schema rollback, restore the matching binary and configuration from that directory as well; schema downgrades are not supported.
-- Keep the service stopped while manually replacing either file.
-- Preserve owner and mode, remove stale `data.sqlite-wal` and `data.sqlite-shm`, then start VaultLink.
-- Startup authenticates all persisted Share and TOTP ciphertexts. A missing key, wrong key, modified nonce, modified AAD or corrupt ciphertext aborts startup.
-- `recover-admin --database /var/lib/vaultlink/data.sqlite` loads the adjacent keyring automatically.
-
-Backups contain password hashes, encrypted credentials, sessions, audit data and the keys needed to decrypt persistent secrets. Protect them like production credentials and retain them only as long as operationally required.
+- Restore only a matching binary/config/database/keyring set from one backup.
+- Keep the service stopped while replacing any member of that set.
+- Preserve owner and mode and remove stale SQLite WAL sidecars before restart.
+- Startup authenticates all persisted Share and TOTP ciphertexts; a missing
+  key, wrong key, modified nonce/AAD, or corrupt ciphertext aborts startup.
+- `recover-admin --database /var/lib/vaultlink/data.sqlite` loads the adjacent
+  keyring automatically.
+- Protect packages, backups, and retained recovery workspaces as production
+  credentials and remove temporary recovery material only after acceptance.

@@ -1,10 +1,22 @@
-.PHONY: dev-setup sample-data test security-test secret-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test docker-update-safety-test
+.PHONY: dev-setup sample-data test security-test secret-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check package-manifest-bootstrap package-manifest-check native-package verify-native-package docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test docker-update-safety-test docker-real-package-update-smoke
 
 CONFIG ?= config/development.toml
 DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
 FUZZ_MAX_TOTAL_TIME ?= 600
 FUZZ_JOBS ?= 4
 FUZZ_LOG_DIR ?= /tmp/vaultlink-fuzz-logs
+PYTHON ?= python3
+PACKAGE_TARGET ?= debian13-amd64
+PACKAGE_VERSION ?= $(shell sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+PACKAGE_BINARY ?= target/release/vaultlink
+PACKAGE_SBOM ?= target/vaultlink.cdx.json
+PACKAGE_OUTPUT ?= dist
+REAL_PACKAGE_TARGET ?= $(PACKAGE_TARGET)
+REAL_PACKAGE_OLD_VERSION ?= $(PACKAGE_VERSION)
+REAL_PACKAGE_NEW_VERSION ?= 0.6.1
+REAL_PACKAGE_BUILDER_IMAGE ?= $(shell $(PYTHON) tools/package-targets.py get "$(REAL_PACKAGE_TARGET)" builder_image 2>/dev/null)
+REAL_PACKAGE_OLD_PACKAGE ?= $(PACKAGE_OUTPUT)/$(shell $(PYTHON) tools/package-targets.py asset "$(REAL_PACKAGE_TARGET)" "$(REAL_PACKAGE_OLD_VERSION)" --allow-unprovisioned 2>/dev/null)
+REAL_PACKAGE_NEW_PACKAGE ?= $(PACKAGE_OUTPUT)/$(shell $(PYTHON) tools/package-targets.py asset "$(REAL_PACKAGE_TARGET)" "$(REAL_PACKAGE_NEW_VERSION)" --allow-unprovisioned 2>/dev/null)
 FUZZ_TARGETS := path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_request_state share_request_policy file_mutation_policy multipart_guard
 
 dev-setup: sample-data
@@ -25,7 +37,7 @@ security-test:
 	cargo test db::tests::fresh_database_is_exactly_schema_four_without_plaintext_secret_columns
 	cargo test proxy
 	cargo test auth
-	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh; else echo "shellcheck is not installed; skipping script checks"; fi
+	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh deploy/docker/*.sh packaging/*.sh tools/*.sh; else echo "shellcheck is not installed; skipping script checks"; fi
 	sh tools/check-supply-chain-policy.sh
 
 secret-check:
@@ -52,6 +64,25 @@ run: sample-data
 
 policy-check:
 	sh tools/check-supply-chain-policy.sh
+
+# Bootstrap validation intentionally accepts image/snapshot placeholders so the
+# protected refresh workflows can be merged. Release work always uses the
+# strict target, which rejects every unprovisioned manifest or QEMU-runner
+# input and validates the complete image-lock set.
+package-manifest-bootstrap:
+	$(PYTHON) tools/package-targets.py validate --allow-unprovisioned
+
+package-manifest-check:
+	$(PYTHON) tools/package-targets.py validate
+
+native-package:
+	sh tools/build-native-package.sh "$(PACKAGE_TARGET)" "$(PACKAGE_VERSION)" \
+		"$(PACKAGE_BINARY)" "$(PACKAGE_SBOM)" "$(PACKAGE_OUTPUT)"
+
+verify-native-package:
+	sh tools/verify-native-package.sh "$(PACKAGE_TARGET)" "$(PACKAGE_VERSION)" \
+		"$(PACKAGE_OUTPUT)/$$($(PYTHON) tools/package-targets.py asset "$(PACKAGE_TARGET)" "$(PACKAGE_VERSION)")" \
+		"$(PACKAGE_BINARY)" "$(PACKAGE_SBOM)"
 
 docker-smoke-build:
 	@docker version >/dev/null 2>&1 || (echo "Docker is missing or WSL integration is not active" && exit 1)
@@ -90,3 +121,22 @@ docker-upgrade-safety-test: docker-smoke-build
 
 docker-update-safety-test: docker-smoke-build
 	docker run --rm --network none --user root $(DOCKER_SMOKE_IMAGE) sh deploy/docker/update-safety-test.sh
+
+# This intentionally consumes two already-built, native packages. CI builds
+# both versions from the same commit on the target's matching architecture;
+# local callers may point these variables at equivalent disposable fixtures.
+docker-real-package-update-smoke:
+	@docker version >/dev/null 2>&1 || (echo "Docker is missing or WSL integration is not active" && exit 1)
+	@test -n "$(REAL_PACKAGE_BUILDER_IMAGE)" && test "$(REAL_PACKAGE_BUILDER_IMAGE)" != UNPROVISIONED \
+		|| (echo "REAL_PACKAGE_BUILDER_IMAGE must be a provisioned digest-pinned image" >&2; exit 1)
+	@test -s "$(REAL_PACKAGE_OLD_PACKAGE)" \
+		|| (echo "REAL_PACKAGE_OLD_PACKAGE is missing" >&2; exit 1)
+	@test -s "$(REAL_PACKAGE_NEW_PACKAGE)" \
+		|| (echo "REAL_PACKAGE_NEW_PACKAGE is missing" >&2; exit 1)
+	@docker run --rm --network none --user root \
+		--volume "$(CURDIR):/work:ro" --workdir /work \
+		"$(REAL_PACKAGE_BUILDER_IMAGE)" \
+		sh tools/real-package-update-smoke.sh \
+			"$(REAL_PACKAGE_TARGET)" "$(REAL_PACKAGE_OLD_VERSION)" \
+			"/work/$(REAL_PACKAGE_OLD_PACKAGE)" "$(REAL_PACKAGE_NEW_VERSION)" \
+			"/work/$(REAL_PACKAGE_NEW_PACKAGE)"

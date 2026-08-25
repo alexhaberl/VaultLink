@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7
+# Application source is deliberately excluded. BASE_IMAGE must be an immutable
+# distro image selected by the protected image-refresh workflow.
+ARG RUST_IMAGE=rust:1.97.1-trixie@sha256:b1b3c9c0d921d7fa0a6d1f9ec7e4eab87f8c8ec97644c3d791450f131dec813f
+ARG BASE_IMAGE
+FROM ${RUST_IMAGE} AS rust
+
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE
+ARG TARGET_ID
+ARG DISTRIBUTION
+ARG DISTRIBUTION_VERSION
+ARG ARCH_SNAPSHOT_DATE=UNPROVISIONED
+ARG TARGETARCH
+
+COPY --from=rust /usr/local/cargo /usr/local/cargo
+COPY --from=rust /usr/local/rustup /usr/local/rustup
+COPY deploy/docker/install-package-builder-dependencies.sh /tmp/install-package-builder-dependencies.sh
+
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:${PATH} \
+    SOURCE_DATE_EPOCH=0 \
+    TZ=UTC \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN /bin/sh /tmp/install-package-builder-dependencies.sh \
+        "$TARGET_ID" "$DISTRIBUTION" "$DISTRIBUTION_VERSION" "$TARGETARCH" \
+        "$ARCH_SNAPSHOT_DATE" "$BASE_IMAGE" \
+    && cargo install --locked cargo-cyclonedx --version 0.5.9 \
+    && cargo install --locked cargo-audit --version 0.22.2 \
+    && test "$(rustc --version | awk '{print $2}')" = 1.97.1 \
+    && rm -f /tmp/install-package-builder-dependencies.sh
+
+WORKDIR /work

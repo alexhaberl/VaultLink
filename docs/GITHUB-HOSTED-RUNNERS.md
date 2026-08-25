@@ -1,65 +1,119 @@
 # GitHub Actions runner strategy
 
-VaultLink runs every GitHub Actions job on an ephemeral, GitHub-hosted Ubuntu
-24.04 runner:
+All Actions jobs run on ephemeral GitHub-hosted Ubuntu 24.04 runners:
 
 - amd64: `ubuntu-24.04`
 - arm64: `ubuntu-24.04-arm`
 
-No workflow targets a persistent self-hosted runner. This keeps pull-request
-code away from long-lived hosts when the repository is public. Every native job
-checks `uname -m` and, where Rust is used, its compiler host triple before
-building.
+GitHub does not provide managed Debian, Fedora, or Arch runners. VaultLink runs
+digest-pinned distribution containers and same-architecture QEMU guests on the
+two Ubuntu hosts. No workflow targets a persistent self-hosted runner. Every
+native job verifies `uname -m` and, where Rust is used, the compiler host triple
+before accepting evidence.
 
-## Workflow behavior
+The real Debian 13 amd64 staging host and 72-hour soak are not Actions runners.
+The manual start and collector workflows use an environment-protected,
+host-key-pinned SSH connection to the forced-command bridge described in
+[`SOAK-RUNNER.md`](SOAK-RUNNER.md). The host stores no Actions token and never
+executes arbitrary workflow shell.
 
-CI, fuzzing, release, and reproducibility use native amd64/arm64 matrices.
-Architecture-independent security, coverage, release-environment, combined
-artifact, and status-publication work runs on arm64. Signing and publishing runs
-on `ubuntu-24.04` with job-scoped `contents: write`; all other release jobs are
-read-only.
+## Target execution model
 
-Public standard runners provide four vCPUs and 16 GiB RAM. Private standard
-runners provide two vCPUs and 8 GiB RAM. The fuzz campaign therefore runs all
-nine targets for 600 seconds each with `FUZZ_JOBS=2` while the repository is
-private and `FUZZ_JOBS=4` when it is public. `CARGO_BUILD_JOBS=2` bounds the
-memory-intensive instrumented build on both runner sizes.
+`release/package-targets.json` is the only supported-target matrix. Workflow
+jobs render their matrices from it and fail if a target, package name, runner,
+builder digest, guest digest, format, OS version, or architecture is duplicated
+or inconsistent.
 
-The real Debian 13 amd64 staging deployment and 72-hour soak are not GitHub
-runners. The manual start and collector workflows use an environment-protected,
-host-key-pinned SSH connection to a forced-command bridge described in
-[`SOAK-RUNNER.md`](SOAK-RUNNER.md). The host never executes arbitrary workflow
-shell commands and stores no Actions token.
+| Phase | Execution environment | Network policy | Authority |
+| --- | --- | --- | --- |
+| Rust/package build | Target distro builder container on matching native CPU | immutable build inputs only | authoritative |
+| Fast package tests | Target distro container on matching native CPU | package installed offline; runtime network isolated | authoritative |
+| Reproducibility | two empty build roots using the same target builder | immutable build inputs only | authoritative |
+| Full-system test | target guest booted by QEMU on matching native CPU | isolated host package channel; no free guest Internet | authoritative |
+| Local Docker | all x86_64 distro builders/containers | isolated runtime | development evidence only |
+| 72-hour soak | dedicated Debian 13 amd64 system | controlled public application path plus collector bridge | final Debian reference evidence |
 
-## Reproducible Debian 13 builds
+QEMU never compiles a release binary. KVM may accelerate a job when GitHub
+exposes it, but workflows cannot depend on KVM and must pass under software
+emulation. Fedora 44 guests keep SELinux `Enforcing`; disabling it invalidates
+the gate. The Arch guest and builder use the snapshot date committed for the
+candidate, while a separate weekly read-only job probes the current rolling
+image.
 
-Release and reproducibility jobs use the same prebuilt, digest-pinned Debian
-13/Rust OCI index selected through the required repository variable
-`VAULTLINK_RELEASE_BUILDER_IMAGE`. The image is built from the source-independent
-`deploy/docker/Dockerfile.release-builder`, published as a linux/amd64 and
-linux/arm64 manifest, and contains the exact Debian package closure and Cargo
-build/signing tools verified by `tools/verify-release-builder.sh`.
+## Immutable images and refresh
 
-Release jobs perform no APT or Cargo tool installation. The full manifest
-reference must be committed in `deploy/docker/release-builder-image.lock` and
-copied unchanged to the repository variable. `UNPROVISIONED`, a mutable tag, a
-variable mismatch, an unavailable image, or content that differs from the
-checked-in snapshot and package lock fails before release building begins.
+Each target declares `builder_image` and `vm_image` as a complete registry
+reference ending in an OCI digest. `UNPROVISIONED`, a mutable tag, a missing
+platform, a digest mismatch, or an unavailable image stops the relevant gate
+before compilation or guest boot.
 
-The build jobs upload separate short-lived unsigned inputs. The publish job
-downloads both artifacts, verifies `SHA256SUMS-amd64` and
-`SHA256SUMS-arm64`, and only then receives the Minisign key for a tag release.
-Its container image is resolved directly from the GitHub-managed variable, not
-from another job's output.
+The source-independent QEMU harness is locked independently by its multiarch
+image digest, exact Ubuntu 24.04 base digest, and complete native `dpkg`
+inventory for both amd64 and arm64. Before a guest is provisioned or tested,
+the selected harness must match its recorded architecture and OS, its embedded
+inventory must match the commit, and a fresh live package-database inventory
+must be byte-identical. The four locks may be `UNPROVISIONED` only together;
+normal gates fail closed until all four are reviewed and committed.
 
-Release asset names identify version, Debian baseline, and architecture:
+During bootstrap or a reviewed harness refresh, each guest-image refresh
+receives the exact successful QEMU-refresh run ID from the same `main` commit.
+GitHub run metadata (commit, branch, workflow path, event, and result) is
+checked before that run's immutable four-lock artifact is consumed and
+verified on the native runner. Otherwise the guest refresh accepts only the
+four locks already committed at its own revision. The final pin pull request
+therefore updates those four locks and all nine target records atomically.
 
-- `VaultLink-0.5.1-debian13-amd64.tar.gz`
-- `VaultLink-0.5.1-debian13-arm64.tar.gz`
-- `vaultlink-0.5.1-debian13-ARCH`
-- `vaultlink-0.5.1-debian13-ARCH.cdx.json`
-- `SHA256SUMS-ARCH`
+The protected manual image-refresh workflow:
 
-Archives, standalone binaries, and checksum manifests receive separate
-architecture-specific `.minisig` files. The signed checksum manifest also
-covers the architecture-specific SBOM.
+1. runs only from an authorized `main` commit;
+2. builds each builder and guest image natively for its CPU architecture;
+3. verifies the fixed Rust toolchain, builder and QEMU package closures, OS
+   identity, QEMU base digest, and required packaging/QEMU test tools;
+4. pushes immutable images to GHCR; and
+5. emits a complete proposed manifest with resolved digests as an artifact.
+
+It never changes `main` directly. The emitted manifest is reviewed and pinned
+in a second pull request. Release jobs install no mutable distro or Cargo tools
+at runtime.
+
+## Package, VM, and load gates
+
+Every one of the nine targets performs:
+
+- two clean native builds with byte-identical payload, SBOM, and package;
+- `lintian`, `rpmlint`, or `namcap` plus the common path/owner/mode/dependency/
+  scriptlet/unit allowlist;
+- an offline fresh install with no service or timer autostart;
+- setup, systemd analysis, API smoke, migration, backup, upgrade, rollback,
+  reinstall, and state-preserving remove tests;
+- a full guest boot with OS, kernel, package database, active-binary hash,
+  systemd, journal, readiness, and SQLite evidence; and
+- the 100-user profile with p95 below two seconds, no 5xx response or
+  corruption, and the established RSS limit.
+
+Native arm64 jobs are the only authoritative arm64 evidence. Architecture-
+independent security, policy, aggregation, signing, and publication work stays
+on `ubuntu-24.04`. Fuzz parallelism remains bounded by the runner resources.
+
+Three aggregate, commit-bound checks are published:
+
+- `vaultlink/packages`
+- `vaultlink/package-reproducibility`
+- `vaultlink/distro-vms`
+
+Candidate, soak-start, and tag workflows require all three in addition to the
+existing CI, fuzz, security, and release checks. No missing or skipped matrix
+row is treated as success.
+
+## Release assembly
+
+Unsigned target jobs upload only short-lived packages, target SBOMs, hashes,
+and evidence. The protected signing job independently validates the complete
+nine-target set, signs each package and the global `SHA256SUMS`, and creates a
+draft containing exactly the 21 assets defined in
+[`PACKAGING.md`](PACKAGING.md). It downloads the draft from GitHub, repeats all
+hash/signature/package/key/count checks, and only then publishes it.
+
+The signing secret is not exposed to package, container, QEMU, load, soak, or
+pull-request jobs. Starting with 0.6.0, published package assets are immutable
+operational rollback inputs and must not be deleted.

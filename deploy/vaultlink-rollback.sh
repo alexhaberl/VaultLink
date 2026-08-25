@@ -18,7 +18,12 @@ restore_keyring=
 config_path=/etc/vaultlink/config.toml
 staged_config=/etc/vaultlink/.config.toml.rollback.new
 restore_config=/etc/vaultlink/.config.toml.rollback.restore
-maintenance_lock=/run/lock/vaultlink-maintenance.lock
+lock_directory=/run/vaultlink-locks
+maintenance_lock=$lock_directory/maintenance.lock
+package_candidate=/usr/lib/vaultlink/package/vaultlink
+package_version_file=/usr/lib/vaultlink/package/version
+runtime_guard=/usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh
+backup_freeze=
 readiness_attempts=${VAULTLINK_READINESS_ATTEMPTS:-30}
 readiness_timeout_seconds=${VAULTLINK_READINESS_TIMEOUT_SECONDS:-60}
 readiness_interval_seconds=${VAULTLINK_READINESS_INTERVAL_SECONDS:-1}
@@ -30,28 +35,157 @@ if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
     exit 64
 fi
 
-backup_dir=$1
-[ -x "$backup_dir/vaultlink" ] || { echo "backup binary missing" >&2; exit 1; }
-[ -f "$backup_dir/config.toml" ] || { echo "configuration backup missing" >&2; exit 1; }
-[ -f "$backup_dir/data.sqlite" ] || { echo "database backup missing" >&2; exit 1; }
-[ -s "$backup_dir/secrets.keyring" ] || { echo "secrets keyring backup missing or empty" >&2; exit 1; }
+backup_argument=$1
 [ -x "$live_binary" ] || { echo "installed VaultLink binary is missing or not executable" >&2; exit 1; }
 [ -f "$config_path" ] || { echo "live VaultLink configuration is missing" >&2; exit 1; }
 [ -f "$data" ] || { echo "live VaultLink database is missing" >&2; exit 1; }
 [ -s "$keyring" ] || { echo "live VaultLink secrets keyring is missing or empty" >&2; exit 1; }
 
-for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock awk; do
+for required_command in systemctl sqlite3 install mv mktemp rm grep sed sleep date chown chmod curl runuser timeout flock awk cat cmp stat readlink dirname sha256sum wc tr; do
     command -v "$required_command" >/dev/null || {
         echo "$required_command is required for a safe rollback" >&2
         exit 1
     }
 done
 
+validate_lock_directory() {
+    [ -d /run ] && [ ! -L /run ] \
+        && [ "$(stat -Lc '%u:%g:%a' /run 2>/dev/null || true)" = 0:0:755 ] \
+        && [ -d "$lock_directory" ] && [ ! -L "$lock_directory" ] \
+        && [ "$(stat -Lc '%u:%g:%a' "$lock_directory" 2>/dev/null || true)" = 0:0:700 ]
+}
+
+prepare_maintenance_lock() {
+    [ -d /run ] && [ ! -L /run ] \
+        && [ "$(stat -Lc '%u:%g:%a' /run 2>/dev/null || true)" = 0:0:755 ] \
+        || return 1
+    if [ -e "$lock_directory" ] || [ -L "$lock_directory" ]; then
+        validate_lock_directory || return 1
+    else
+        install -d -o root -g root -m 0700 "$lock_directory" || return 1
+    fi
+    if [ -e "$maintenance_lock" ] || [ -L "$maintenance_lock" ]; then
+        [ -f "$maintenance_lock" ] && [ ! -L "$maintenance_lock" ] \
+            && [ "$(stat -Lc '%u:%g:%a' "$maintenance_lock" 2>/dev/null || true)" = 0:0:600 ] \
+            || return 1
+    else
+        install -o root -g root -m 0600 /dev/null "$maintenance_lock" || return 1
+    fi
+    validate_lock_directory \
+        && [ -f "$maintenance_lock" ] && [ ! -L "$maintenance_lock" ] \
+        && [ "$(stat -Lc '%u:%g:%a' "$maintenance_lock" 2>/dev/null || true)" = 0:0:600 ]
+}
+
+validate_open_maintenance_lock() {
+    maintenance_fd=$1
+    validate_lock_directory \
+        && [ -f "$maintenance_lock" ] && [ ! -L "$maintenance_lock" ] \
+        && [ "$(stat -Lc '%u:%g:%a' "$maintenance_lock" 2>/dev/null || true)" = 0:0:600 ] \
+        && [ "$(stat -Lc '%d:%i' "/proc/self/fd/$maintenance_fd" 2>/dev/null || true)" = \
+            "$(stat -Lc '%d:%i' "$maintenance_lock" 2>/dev/null || true)" ]
+}
+
+cleanup_frozen_input() {
+    frozen_status=$?
+    trap - 0
+    trap '' 1 2 15
+    if [ -n "$backup_freeze" ] && [ -d "$backup_freeze" ]; then
+        rm -rf "$backup_freeze"
+    fi
+    exit "$frozen_status"
+}
+trap cleanup_frozen_input 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 143' 15
+
+prepare_maintenance_lock || {
+    echo "VaultLink maintenance lock path is unsafe" >&2
+    exit 1
+}
 exec 9>"$maintenance_lock"
-if ! flock -n 9; then
+if ! validate_open_maintenance_lock 9 \
+    || ! flock -n 9 \
+    || ! validate_open_maintenance_lock 9; then
     echo "another VaultLink upgrade or rollback is already running" >&2
     exit 1
 fi
+
+case "$backup_argument" in
+    "$backup_root"/*) ;;
+    *) echo "backup directory must be an absolute child of $backup_root" >&2; exit 1 ;;
+esac
+[ "$(readlink -f -- "$backup_argument" 2>/dev/null || true)" = "$backup_argument" ] \
+    || { echo "backup directory must be canonical and contain no symlinks" >&2; exit 1; }
+
+validate_backup_directory_chain() {
+    rollback_directory=$1
+    while :; do
+        if [ ! -d "$rollback_directory" ] || [ -L "$rollback_directory" ]; then
+            echo "backup path contains a missing, non-directory, or symlink component: $rollback_directory" >&2
+            return 1
+        fi
+        if [ "$(stat -c '%u:%g:%a' "$rollback_directory")" != 0:0:700 ]; then
+            echo "backup directories must be root:root mode 0700: $rollback_directory" >&2
+            return 1
+        fi
+        [ "$rollback_directory" != "$backup_root" ] || break
+        rollback_parent=$(dirname -- "$rollback_directory")
+        [ "$rollback_parent" != "$rollback_directory" ] \
+            || { echo "backup directory escaped $backup_root" >&2; return 1; }
+        rollback_directory=$rollback_parent
+    done
+}
+
+backup_dir=$backup_argument
+validate_backup_directory_chain "$backup_dir"
+backup_freeze=$(mktemp -d "$backup_root/.rollback-input.XXXXXXXX")
+chown root:root "$backup_freeze"
+chmod 0700 "$backup_freeze"
+
+freeze_backup_source() {
+    rollback_source_name=$1
+    rollback_source_mode=$2
+    rollback_source=$backup_dir/$rollback_source_name
+    rollback_frozen_source=$backup_freeze/$rollback_source_name
+    if [ ! -f "$rollback_source" ] || [ -L "$rollback_source" ]; then
+        echo "backup source is missing, non-regular, or a symlink: $rollback_source_name" >&2
+        return 1
+    fi
+    if [ "$(stat -c '%u:%g:%a' "$rollback_source")" != "0:0:$rollback_source_mode" ]; then
+        echo "backup source has unsafe owner or mode: $rollback_source_name" >&2
+        return 1
+    fi
+    rollback_source_identity=$(stat -c '%d:%i:%s:%u:%g:%a:%Y:%Z' "$rollback_source")
+    rollback_source_hash=$(sha256sum "$rollback_source" | awk '{ print $1 }')
+    install -o root -g root -m "$rollback_source_mode" \
+        "$rollback_source" "$rollback_frozen_source"
+    if [ "$(stat -c '%d:%i:%s:%u:%g:%a:%Y:%Z' "$rollback_source")" != \
+        "$rollback_source_identity" ]; then
+        echo "backup source changed while it was frozen: $rollback_source_name" >&2
+        return 1
+    fi
+    if [ "$(sha256sum "$rollback_source" | awk '{ print $1 }')" != \
+        "$rollback_source_hash" ]; then
+        echo "backup source content changed while it was frozen: $rollback_source_name" >&2
+        return 1
+    fi
+    if [ "$(sha256sum "$rollback_frozen_source" | awk '{ print $1 }')" != \
+        "$rollback_source_hash" ]; then
+        echo "frozen backup source differs from its validated input: $rollback_source_name" >&2
+        return 1
+    fi
+}
+
+freeze_backup_source vaultlink 700
+freeze_backup_source config.toml 600
+freeze_backup_source data.sqlite 600
+freeze_backup_source secrets.keyring 600
+backup_dir=$backup_freeze
+[ -x "$backup_dir/vaultlink" ] || { echo "frozen backup binary missing" >&2; exit 1; }
+[ -f "$backup_dir/config.toml" ] || { echo "frozen configuration backup missing" >&2; exit 1; }
+[ -f "$backup_dir/data.sqlite" ] || { echo "frozen database backup missing" >&2; exit 1; }
+[ -s "$backup_dir/secrets.keyring" ] || { echo "frozen secrets keyring backup missing or empty" >&2; exit 1; }
 
 validate_bounded_integer() {
     name=$1
@@ -460,6 +594,9 @@ on_failure() {
     if [ -d "$emergency_stage" ]; then
         rm -rf "$emergency_stage"
     fi
+    if [ -n "$backup_freeze" ] && [ -d "$backup_freeze" ]; then
+        rm -rf "$backup_freeze"
+    fi
 
     exit "$status"
 }
@@ -468,6 +605,39 @@ trap 'on_failure $?' 0
 trap 'exit 129' 1
 trap 'exit 130' 2
 trap 'exit 143' 15
+
+# Package-only rollback is valid only after the matching signed native package
+# has been reinstalled. Package upgrades deliberately leave /opt unchanged, so
+# the live binary may still be the newer version at this boundary. Require the
+# service to be inactive, prove marker/package-DB/candidate parity without
+# accepting any other mismatch, then require the selected backup binary to be
+# byte-identical to that candidate before replacing /opt.
+[ "$(systemctl is-active "$service" 2>/dev/null || true)" = inactive ] \
+    || { echo "$service must be inactive before package-bound rollback" >&2; exit 1; }
+if [ ! -f "$runtime_guard" ] || [ -L "$runtime_guard" ] \
+    || [ "$(stat -c '%u:%g:%a' "$runtime_guard")" != 0:0:755 ]; then
+    echo "package runtime guard is missing or unsafe" >&2
+    exit 1
+fi
+if [ ! -f "$package_candidate" ] || [ -L "$package_candidate" ] \
+    || [ "$(stat -c '%u:%g:%a' "$package_candidate")" != 0:0:755 ]; then
+    echo "installed package candidate is missing or unsafe" >&2
+    exit 1
+fi
+if [ ! -f "$package_version_file" ] || [ -L "$package_version_file" ] \
+    || [ "$(stat -c '%u:%g:%a' "$package_version_file")" != 0:0:644 ]; then
+    echo "installed package version metadata is missing or unsafe" >&2
+    exit 1
+fi
+"$runtime_guard" --package-only \
+    || { echo "installed native package parity check failed" >&2; exit 1; }
+if [ "$(wc -l <"$package_version_file" | tr -d '[:space:]')" != 1 ]; then
+    echo "installed native package version metadata is not canonical" >&2
+    exit 1
+fi
+requested_version=$(cat "$package_version_file")
+cmp -s "$backup_dir/vaultlink" "$package_candidate" \
+    || { echo "rollback binary differs from the installed native package candidate" >&2; exit 1; }
 
 # Stage the complete requested rollback set on each destination filesystem.
 install -d -o root -g root -m 0700 "$backup_root"
@@ -538,5 +708,7 @@ wait_until_active
 wait_until_ready "$requested_health_body" "rollback readiness"
 sqlite3 "$data" ".timeout 10000" "PRAGMA integrity_check" | grep -qx ok
 
+rm -rf "$backup_freeze"
+backup_freeze=
 trap - 0 1 2 15
 echo "rollback completed; pre-rollback backup: $emergency_dir"

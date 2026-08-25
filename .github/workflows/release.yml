@@ -28,271 +28,259 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release_environment:
-    name: Resolve pinned release environment
-    runs-on: ubuntu-24.04-arm
-    env:
-      RELEASE_BUILDER_IMAGE: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
+  prepare:
+    name: Resolve exact package release inputs
+    runs-on: ubuntu-24.04
     outputs:
-      image: ${{ steps.image.outputs.image }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Validate pinned release image
-        id: image
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="$RELEASE_BUILDER_IMAGE"
-          locked_image=$(sed -n '1p' deploy/docker/release-builder-image.lock)
-          test "$(wc -l <deploy/docker/release-builder-image.lock)" -eq 1
-          if [[ "$locked_image" == UNPROVISIONED ]]; then
-            echo "release builder is UNPROVISIONED; commit its real manifest digest in a dependency-refresh change" >&2
-            exit 1
-          fi
-          case "$locked_image" in
-            ghcr.io/alexhaberl/vaultlink-release-builder@sha256:*) ;;
-            *) echo "checked-in release builder is not the fixed digest-pinned GHCR image" >&2; exit 1 ;;
-          esac
-          test "$image" = "$locked_image"
-          digest=${image##*@sha256:}
-          printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$'
-          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
-
-  build:
-    name: Native Debian 13 (${{ matrix.release_architecture }})
-    needs: release_environment
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - release_architecture: amd64
-            runs_on: ubuntu-24.04
-            expected_uname: x86_64
-            expected_rust_host: x86_64-unknown-linux-gnu
-          - release_architecture: arm64
-            runs_on: ubuntu-24.04-arm
-            expected_uname: aarch64
-            expected_rust_host: aarch64-unknown-linux-gnu
-    runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 90
-    container:
-      image: ${{ needs.release_environment.outputs.image }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    env:
-      CARGO_TERM_COLOR: always
-      SOURCE_DATE_EPOCH: "0"
-      RELEASE_ARCHITECTURE: ${{ matrix.release_architecture }}
-      EXPECTED_UNAME: ${{ matrix.expected_uname }}
-      EXPECTED_RUST_HOST: ${{ matrix.expected_rust_host }}
-      RELEASE_BUILDER_IMAGE: ${{ needs.release_environment.outputs.image }}
-      PREFLIGHT_MODE: ${{ inputs.preflight_mode || 'dry-run' }}
-      FULL_EVIDENCE_PREFLIGHT: "false"
+      candidate_commit: ${{ steps.release.outputs.candidate_commit }}
+      package_version: ${{ steps.release.outputs.package_version }}
+      packages_run: ${{ steps.release.outputs.packages_run }}
+      signing_image: ${{ steps.release.outputs.signing_image }}
+      release_stage: ${{ steps.release.outputs.release_stage }}
+      soak_binary_sha256: ${{ steps.release.outputs.soak_binary_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify prebuilt release environment
-        run: sh tools/verify-release-builder.sh
-      - name: Verify release inputs and native architecture
+      - name: Validate version, package locks, and exact-commit gates
+        id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PREFLIGHT_MODE: ${{ inputs.preflight_mode || 'tag' }}
+          REPOSITORY_VISIBILITY: ${{ github.repository_visibility }}
         run: |
           set -euo pipefail
-          append_github_env() {
-            printf '%s\n' "$1" >>"$GITHUB_ENV"
-          }
-          expected_rust_version=$(sh tools/rust-toolchain-channel.sh)
-          test "$(rustc --version | awk '{print $2}')" = "$expected_rust_version"
-          test "$(uname -m)" = "$EXPECTED_UNAME"
-          test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_RUST_HOST"
           package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          test -n "$package_version"
-          append_github_env "PACKAGE_VERSION=$package_version"
-          test "$PWD" = "$GITHUB_WORKSPACE"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          python3 tools/package-targets.py validate
+          signing_image=$(python3 tools/package-targets.py get debian13-amd64 builder_image)
           candidate_commit=$GITHUB_SHA
           release_stage=$PREFLIGHT_MODE
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             release_stage=tag
+            test "$REPOSITORY_VISIBILITY" = public
             test "$GITHUB_REF_NAME" = "v$package_version"
             test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
-            tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+            candidate_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
             main_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
-            test "$tag_commit" = "$main_commit"
-            candidate_commit=$tag_commit
+            test "$candidate_commit" = "$main_commit"
+            sh tools/check-version-consistency.sh --release-tag "$GITHUB_REF_NAME"
+          else
+            test "$GITHUB_REF" = refs/heads/main
+            test "$(git rev-parse HEAD)" = "$candidate_commit"
+            main_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+            test "$candidate_commit" = "$main_commit"
+            case "$release_stage" in
+              dry-run) sh tools/check-version-consistency.sh ;;
+              candidate | evidence) sh tools/check-version-consistency.sh --release-candidate ;;
+              *) exit 64 ;;
+            esac
           fi
-          case "$release_stage" in
-            dry-run) ;;
-            candidate|evidence)
-              test "$GITHUB_REF" = refs/heads/main
-              test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-              sh tools/check-version-consistency.sh --release-candidate
-              ;;
-            tag)
-              sh tools/check-version-consistency.sh --release-tag "$GITHUB_REF_NAME"
-              ;;
-            *) echo "unsupported release preflight mode: $release_stage" >&2; exit 64 ;;
-          esac
 
           validate_gate() {
             context=$1
             workflow_path=$2
             expected_title=${3:-}
             expected_event=${4:-}
-            status_lines=$(gh api --paginate \
+            lines=$(gh api --paginate \
               "repos/$GITHUB_REPOSITORY/commits/$candidate_commit/statuses?per_page=100" \
-              --jq ".[] | select(.context == \"$context\") | [.state, .target_url] | @tsv")
-            status_line=$(printf '%s\n' "$status_lines" | sed -n '1p')
-            test -n "$status_line"
-            IFS=$'\t' read -r state target_url <<<"$status_line"
+              --jq ".[] | select(.context == \"$context\") | [.state,.target_url] | @tsv")
+            line=$(printf '%s\n' "$lines" | sed -n '1p')
+            test -n "$line"
+            IFS=$'\t' read -r state target_url <<<"$line"
             test "$state" = success
             prefix="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/"
-            case "$target_url" in "$prefix"*) ;; *) echo "invalid Actions target for $context" >&2; return 1 ;; esac
+            case "$target_url" in "$prefix"*) ;; *) exit 77 ;; esac
             run_id=${target_url#"$prefix"}
             [[ "$run_id" =~ ^[0-9]+$ ]]
-            run_line=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
-              --jq '[.head_sha, .head_branch, .conclusion, .path, .display_title, .event] | @tsv')
-            IFS=$'\t' read -r run_sha run_branch conclusion run_path run_title run_event <<<"$run_line"
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+              --jq '[.head_sha,.head_branch,.conclusion,.path,.display_title,.event] | @tsv')
+            IFS=$'\t' read -r run_sha run_branch conclusion run_path run_title run_event <<<"$run"
             run_path=${run_path%%@*}
             test "$run_sha" = "$candidate_commit"
             test "$run_branch" = main
             test "$conclusion" = success
             test "$run_path" = "$workflow_path"
-            if [[ -n "$expected_title" ]]; then
-              test "$run_title" = "$expected_title"
-            fi
-            if [[ -n "$expected_event" ]]; then
-              test "$run_event" = "$expected_event"
-            fi
+            if [[ -n "$expected_title" ]]; then test "$run_title" = "$expected_title"; fi
+            if [[ -n "$expected_event" ]]; then test "$run_event" = "$expected_event"; fi
             VALIDATED_RUN_ID=$run_id
           }
 
-          if [[ "$release_stage" != dry-run ]]; then
-            validate_gate vaultlink/native-amd64 .github/workflows/ci.yml
-            validate_gate vaultlink/native-arm64 .github/workflows/ci.yml
-            validate_gate vaultlink/fuzz-600s-amd64 .github/workflows/fuzz.yml
-            validate_gate vaultlink/fuzz-600s-arm64 .github/workflows/fuzz.yml
-            validate_gate vaultlink/release-dry-run .github/workflows/release.yml
-            validate_gate vaultlink/reproducibility-amd64 .github/workflows/reproducibility.yml
-            validate_gate vaultlink/reproducibility-arm64 .github/workflows/reproducibility.yml
-          fi
+          validate_gate vaultlink/native-amd64 .github/workflows/ci.yml
+          validate_gate vaultlink/native-arm64 .github/workflows/ci.yml
+          validate_gate vaultlink/fuzz-600s-amd64 .github/workflows/fuzz.yml
+          validate_gate vaultlink/fuzz-600s-arm64 .github/workflows/fuzz.yml
+          validate_gate vaultlink/packages .github/workflows/packages.yml
+          packages_run=$VALIDATED_RUN_ID
 
+          if [[ "$release_stage" != dry-run ]]; then
+            validate_gate vaultlink/release-dry-run .github/workflows/release.yml
+            validate_gate vaultlink/package-reproducibility .github/workflows/reproducibility.yml
+            reproducibility_run=$VALIDATED_RUN_ID
+            binding_dir=$(mktemp -d)
+            gh run download "$reproducibility_run" --repo "$GITHUB_REPOSITORY" \
+              --name "package-reproducibility-binding-$candidate_commit" \
+              --dir "$binding_dir"
+            printf 'commit=%s\npackages_run=%s\n' \
+              "$candidate_commit" "$packages_run" >"$binding_dir/expected.env"
+            cmp "$binding_dir/expected.env" "$binding_dir/reproducibility-binding.env"
+            validate_gate vaultlink/distro-vms .github/workflows/distro-vms.yml \
+              "Distro VMs $candidate_commit" workflow_dispatch
+            distro_vm_run=$VALIDATED_RUN_ID
+            vm_binding_dir=$(mktemp -d)
+            gh run download "$distro_vm_run" --repo "$GITHUB_REPOSITORY" \
+              --name "distro-vm-binding-$candidate_commit" \
+              --dir "$vm_binding_dir"
+            cmp "$binding_dir/expected.env" "$vm_binding_dir/distro-vm-binding.env"
+          fi
           if [[ "$release_stage" == evidence || "$release_stage" == tag ]]; then
             validate_gate vaultlink/release-candidate-preflight .github/workflows/release.yml \
               "Release candidate $candidate_commit" workflow_dispatch
-            if [[ "$release_stage" == tag ]]; then
-              validate_gate vaultlink/release-evidence-preflight .github/workflows/release.yml \
-                "Release evidence $candidate_commit" workflow_dispatch
-            fi
             validate_gate vaultlink/72h-soak .github/workflows/soak-collect.yml
             soak_run=$VALIDATED_RUN_ID
             soak_dir=$(mktemp -d)
-            gh run download "$soak_run" \
-              --repo "$GITHUB_REPOSITORY" \
-              --name "soak-evidence-$candidate_commit" \
-              --dir "$soak_dir"
-            evidence_output=$(sh tools/check-soak-evidence.sh "$candidate_commit" "$soak_dir")
-            soak_binary_sha256=$(printf '%s\n' "$evidence_output" | sed -n 's/^binary_sha256=//p')
-            test "${#soak_binary_sha256}" -eq 64
-            append_github_env "SOAK_BINARY_SHA256=$soak_binary_sha256"
-
-            repro_context="vaultlink/reproducibility-$RELEASE_ARCHITECTURE"
-            validate_gate "$repro_context" .github/workflows/reproducibility.yml
-            repro_run=$VALIDATED_RUN_ID
-            repro_dir=$(mktemp -d)
-            gh run download "$repro_run" \
-              --repo "$GITHUB_REPOSITORY" \
-              --name "reproducibility-$candidate_commit-$RELEASE_ARCHITECTURE" \
-              --dir "$repro_dir"
-            repro_manifest="$repro_dir/manifest-$RELEASE_ARCHITECTURE.env"
-            repro_sums="$repro_dir/SHA256SUMS-$RELEASE_ARCHITECTURE"
-            grep -F -x -q "version=$package_version" "$repro_manifest"
-            grep -F -x -q "commit=$candidate_commit" "$repro_manifest"
-            grep -F -x -q "builder_image=$RELEASE_BUILDER_IMAGE" "$repro_manifest"
-            binary_hashes=$(awk '$2 ~ /repro\/(first|second)-dist\/vaultlink-.*-debian13-/ { print $1 }' "$repro_sums")
-            archive_hashes=$(awk '$2 ~ /repro\/(first|second)-dist\/VaultLink-.*\.tar\.gz$/ { print $1 }' "$repro_sums")
-            test "$(printf '%s\n' "$binary_hashes" | grep -c .)" -eq 2
-            test "$(printf '%s\n' "$binary_hashes" | sort -u | grep -c .)" -eq 1
-            test "$(printf '%s\n' "$archive_hashes" | grep -c .)" -eq 2
-            test "$(printf '%s\n' "$archive_hashes" | sort -u | grep -c .)" -eq 1
-            append_github_env "REPRO_BINARY_SHA256=$(printf '%s\n' "$binary_hashes" | head -n 1)"
-            append_github_env "REPRO_ARCHIVE_SHA256=$(printf '%s\n' "$archive_hashes" | head -n 1)"
-            append_github_env 'FULL_EVIDENCE_PREFLIGHT=true'
-          fi
-          sh tools/check-supply-chain-policy.sh
-      - name: Architecture-independent quality and dependency gates
-        if: matrix.release_architecture == 'arm64'
-        run: |
-          cargo fmt --all -- --check
-          shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
-          cargo audit --deny warnings --ignore RUSTSEC-2023-0071
-      - name: Native compilation and test gates
-        run: |
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo test --locked --all-targets
-          cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets
-      - name: Build and SBOM
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo build --locked --release
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            sh tools/check-version-consistency.sh \
-              --binary target/release/vaultlink \
-              --release-tag "$GITHUB_REF_NAME"
-          elif [[ "$PREFLIGHT_MODE" == candidate || "$PREFLIGHT_MODE" == evidence ]]; then
-            sh tools/check-version-consistency.sh \
-              --binary target/release/vaultlink \
-              --release-candidate
+            gh run download "$soak_run" --repo "$GITHUB_REPOSITORY" \
+              --name "soak-evidence-$candidate_commit" --dir "$soak_dir"
+            soak_output=$(sh tools/check-soak-evidence.sh "$candidate_commit" "$soak_dir")
+            soak_binary_sha256=$(printf '%s\n' "$soak_output" \
+              | sed -n 's/^binary_sha256=//p')
+            [[ "$soak_binary_sha256" =~ ^[0-9a-f]{64}$ ]]
           else
-            sh tools/check-version-consistency.sh --binary target/release/vaultlink
+            soak_binary_sha256=not-required
           fi
-          if [[ "$FULL_EVIDENCE_PREFLIGHT" == true && "$RELEASE_ARCHITECTURE" == amd64 ]]; then
-            test "$(sha256sum target/release/vaultlink | awk '{print $1}')" = "$SOAK_BINARY_SHA256"
+          if [[ "$release_stage" == tag ]]; then
+            validate_gate vaultlink/release-evidence-preflight .github/workflows/release.yml \
+              "Release evidence $candidate_commit" workflow_dispatch
           fi
-          if [[ "$FULL_EVIDENCE_PREFLIGHT" == true ]]; then
-            test "$(sha256sum target/release/vaultlink | awk '{print $1}')" = "$REPRO_BINARY_SHA256"
-          fi
-          cargo cyclonedx --format json
-          raw_sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print)
-          test "$(printf '%s\n' "$raw_sbom" | grep -c .)" -eq 1
-          python3 tools/normalize-cyclonedx-sbom.py "$raw_sbom" "$raw_sbom.normalized"
-          mv "$raw_sbom.normalized" "$raw_sbom"
-      - name: Assemble deterministic architecture-specific archive
+
+          printf '%s\n' \
+            "candidate_commit=$candidate_commit" \
+            "package_version=$package_version" \
+            "packages_run=$packages_run" \
+            "signing_image=$signing_image" \
+            "release_stage=$release_stage" \
+            "soak_binary_sha256=$soak_binary_sha256" \
+            >>"$GITHUB_OUTPUT"
+
+  assemble:
+    name: Assemble and verify unsigned package release
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.prepare.outputs.signing_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Restore host workspace ownership before checkout
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_commit }}
+          persist-credentials: false
+      - name: Verify protected package-builder selection
+        shell: bash
+        env:
+          EXPECTED_IMAGE: ${{ needs.prepare.outputs.signing_image }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python3 tools/package-targets.py validate
+          test "$EXPECTED_IMAGE" = "$(python3 tools/package-targets.py get debian13-amd64 builder_image)"
+          sh tools/verify-package-builder.sh debian13-amd64
+      - name: Download the exact nine package artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGES_RUN: ${{ needs.prepare.outputs.packages_run }}
+        run: |
+          set -euo pipefail
+          install -d -m 0755 package-input
+          while IFS=$'\t' read -r target asset; do
+            gh run download "$PACKAGES_RUN" --repo "$GITHUB_REPOSITORY" \
+              --name "vaultlink-package-$target" --dir package-input
+            test -s "package-input/$asset"
+            test -s "package-input/$target.cdx.json"
+          done < <(python3 tools/package-targets.py records '${{ needs.prepare.outputs.package_version }}')
+          test "$(find package-input -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 18
+      - name: Assemble deterministic unsigned asset set
         shell: bash
         run: |
           set -euo pipefail
-          version="$PACKAGE_VERSION"
-          arch="$RELEASE_ARCHITECTURE"
-          sbom=$(find . -maxdepth 1 -name '*.cdx.json' -type f -print -quit)
-          test -n "$sbom"
-          sh tools/assemble-release-archive.sh \
-            target/release/vaultlink "$sbom" dist "$version" "$arch"
-          if [[ "$FULL_EVIDENCE_PREFLIGHT" == true ]]; then
-            archive="dist/VaultLink-${version}-debian13-${arch}.tar.gz"
-            test "$(sha256sum "$archive" | awk '{print $1}')" = "$REPRO_ARCHIVE_SHA256"
-          fi
-      - name: Upload unsigned architecture-specific release inputs
+          sh tools/assemble-package-release.sh \
+            package-input dist '${{ needs.prepare.outputs.package_version }}'
+          sh tools/verify-package-release.sh \
+            dist '${{ needs.prepare.outputs.package_version }}'
+          test "$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 11
+      - name: Bind Debian soak evidence to the final DEB payload
+        if: needs.prepare.outputs.soak_binary_sha256 != 'not-required'
+        shell: bash
+        env:
+          SOAK_BINARY_SHA256: ${{ needs.prepare.outputs.soak_binary_sha256 }}
+        run: |
+          set -euo pipefail
+          deb=$(python3 tools/package-targets.py asset \
+            debian13-amd64 '${{ needs.prepare.outputs.package_version }}')
+          root=$(mktemp -d)
+          trap 'rm -rf "$root"' EXIT
+          dpkg-deb -x "dist/$deb" "$root"
+          test "$(sha256sum "$root/usr/lib/vaultlink/package/vaultlink" | awk '{print $1}')" \
+            = "$SOAK_BINARY_SHA256"
+      - name: Upload exact unsigned release set
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: vaultlink-release-${{ matrix.release_architecture }}
-          path: |
-            dist/VaultLink-*-debian13-${{ matrix.release_architecture }}.tar.gz
-            dist/vaultlink-*-debian13-${{ matrix.release_architecture }}
-            dist/vaultlink-*-debian13-${{ matrix.release_architecture }}.cdx.json
-            dist/SHA256SUMS-${{ matrix.release_architecture }}
+          name: vaultlink-release-unsigned-${{ needs.prepare.outputs.candidate_commit }}
+          path: dist/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
+      - name: Restore host workspace ownership
+        if: always()
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+
+  dry_run:
+    name: Verify combined package dry run
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    needs: [prepare, assemble]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.prepare.outputs.signing_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Restore host workspace ownership before checkout
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vaultlink-release-unsigned-${{ needs.prepare.outputs.candidate_commit }}
+          path: dist
+      - name: Verify exact unsigned contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sh tools/verify-package-builder.sh debian13-amd64
+          sh tools/verify-package-release.sh dist '${{ needs.prepare.outputs.package_version }}'
+      - name: Restore host workspace ownership
+        if: always()
+        shell: bash
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+
   publish:
-    name: Verify, sign, and publish
-    if: github.repository_visibility == 'public' && startsWith(github.ref, 'refs/tags/v')
-    needs: [release_environment, build]
+    name: Sign, draft, re-download, and publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, assemble]
     runs-on: ubuntu-24.04
     environment: release-signing
     timeout-minutes: 30
@@ -301,269 +289,172 @@ jobs:
       contents: write
       packages: read
     container:
-      # Resolve the secret-bearing job's image directly from GitHub configuration;
-      # never let another job select the environment that receives the key.
-      image: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
+      # The secret-bearing job selects its image directly from protected GitHub
+      # configuration and then checks exact equality with the target lock.
+      image: ${{ vars.VAULTLINK_PACKAGE_SIGNING_IMAGE }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
-      RELEASE_BUILDER_IMAGE: ${{ vars.VAULTLINK_RELEASE_BUILDER_IMAGE }}
+      PACKAGE_SIGNING_IMAGE: ${{ vars.VAULTLINK_PACKAGE_SIGNING_IMAGE }}
     steps:
       - name: Restore host workspace ownership before checkout
-        shell: bash
-        run: |
-          set -euo pipefail
-          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Trust checked-out release workspace
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Container and host runner UIDs differ. Keep Git's ownership guard
-          # enabled everywhere else while trusting this ephemeral checkout.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Verify prebuilt release environment
-        run: sh tools/verify-release-builder.sh
-      - name: Verify release inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          test -n "$package_version"
-          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            test "$GITHUB_REF_NAME" = "v$package_version"
-            test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
-            tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
-            main_commit=$(git rev-parse refs/remotes/origin/main)
-            test "$tag_commit" = "$main_commit"
-          fi
-          sh tools/check-supply-chain-policy.sh
-      - name: Download native build outputs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: vaultlink-release-*
+          name: vaultlink-release-unsigned-${{ needs.prepare.outputs.candidate_commit }}
           path: dist
-          merge-multiple: true
-      - name: Verify architecture-specific checksums
+      - name: Verify tag and secret-bearing builder
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ADMIN_READ_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
         run: |
           set -euo pipefail
-          test "$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 8
-          cd dist
-          for arch in amd64 arm64; do
-            root="VaultLink-${PACKAGE_VERSION}-debian13-${arch}"
-            binary="vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
-            sbom="vaultlink-${PACKAGE_VERSION}-debian13-${arch}.cdx.json"
-            checksums="SHA256SUMS-${arch}"
-            test -s "${root}.tar.gz"
-            test -s "$binary"
-            test -s "$sbom"
-            test -s "$checksums"
-            sha256sum -c "$checksums"
-          done
-      - name: Sign and verify architecture-specific assets
-        if: startsWith(github.ref, 'refs/tags/v')
+          test -n "$RELEASE_ADMIN_READ_TOKEN"
+          test "$(GH_TOKEN="$RELEASE_ADMIN_READ_TOKEN" gh api \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python3 tools/package-targets.py validate
+          expected=$(python3 tools/package-targets.py get debian13-amd64 builder_image)
+          test "$PACKAGE_SIGNING_IMAGE" = "$expected"
+          sh tools/verify-package-builder.sh debian13-amd64
+          test "$GITHUB_REF_NAME" = 'v${{ needs.prepare.outputs.package_version }}'
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+          test "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" = '${{ needs.prepare.outputs.candidate_commit }}'
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" \
+            = '${{ needs.prepare.outputs.candidate_commit }}'
+          sh tools/verify-package-release.sh dist '${{ needs.prepare.outputs.package_version }}'
+      - name: Sign exactly nine packages and the global checksum file
         shell: bash
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          test -s release/minisign.pub
           test -n "$MINISIGN_SECRET_KEY"
           test -n "$MINISIGN_PASSWORD"
           key=$(mktemp)
           trap 'rm -f "$key"' EXIT
           chmod 0600 "$key"
-          printf '%s' "$MINISIGN_SECRET_KEY" > "$key"
-          for arch in amd64 arm64; do
-            archive="dist/VaultLink-${PACKAGE_VERSION}-debian13-${arch}.tar.gz"
-            binary="dist/vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
-            checksums="dist/SHA256SUMS-${arch}"
-            for asset in "$archive" "$binary" "$checksums"; do
-              printf '%s\n' "$MINISIGN_PASSWORD" \
-                | minisign -S -s "$key" -m "$asset" -x "${asset}.minisig"
-              minisign -V -p release/minisign.pub -m "$asset" -x "${asset}.minisig"
-            done
-          done
-      - name: Create release
-        if: startsWith(github.ref, 'refs/tags/v')
+          printf '%s' "$MINISIGN_SECRET_KEY" >"$key"
+          while IFS=$'\t' read -r _target asset; do
+            printf '%s\n' "$MINISIGN_PASSWORD" \
+              | minisign -S -s "$key" -m "dist/$asset" -x "dist/$asset.minisig"
+            minisign -V -q -p release/minisign.pub \
+              -m "dist/$asset" -x "dist/$asset.minisig"
+          done < <(python3 tools/package-targets.py records '${{ needs.prepare.outputs.package_version }}')
+          printf '%s\n' "$MINISIGN_PASSWORD" \
+            | minisign -S -s "$key" -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
+          minisign -V -q -p release/minisign.pub \
+            -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
+          sh tools/verify-package-release.sh \
+            dist '${{ needs.prepare.outputs.package_version }}' --signed
+          test "$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 21
+      - name: Create draft, verify remote assets, then publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ADMIN_READ_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
         run: |
           set -euo pipefail
-          assets=()
-          for arch in amd64 arm64; do
-            archive="dist/VaultLink-${PACKAGE_VERSION}-debian13-${arch}.tar.gz"
-            binary="dist/vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
-            sbom="dist/vaultlink-${PACKAGE_VERSION}-debian13-${arch}.cdx.json"
-            checksums="dist/SHA256SUMS-${arch}"
-            assets+=("$archive" "${archive}.minisig" "$binary" "${binary}.minisig" "$sbom" "$checksums" "${checksums}.minisig")
-          done
-          remote_tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha')
-          local_tag_object=$(git rev-parse "$GITHUB_REF_NAME")
+          test -n "$RELEASE_ADMIN_READ_TOKEN"
+          local_tag_object=$(git rev-parse "$GITHUB_REF_NAME^{tag}")
+          local_tag_commit=$(git rev-parse "$GITHUB_REF_NAME^{commit}")
+          remote_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+            --jq '[.object.type,.object.sha] | @tsv')
+          IFS=$'\t' read -r remote_ref_type remote_tag_object <<<"$remote_ref"
+          test "$remote_ref_type" = tag
           test "$remote_tag_object" = "$local_tag_object"
-          tag_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
-          main_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
-          test "$tag_commit" = "$main_commit"
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "VaultLink $GITHUB_REF_NAME" --notes-file CHANGELOG.md "${assets[@]}"
+          remote_tag=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$remote_tag_object" \
+            --jq '[.tag,.object.type,.object.sha] | @tsv')
+          IFS=$'\t' read -r remote_tag_name remote_target_type remote_tag_commit \
+            <<<"$remote_tag"
+          test "$remote_tag_name" = "$GITHUB_REF_NAME"
+          test "$remote_target_type" = commit
+          test "$remote_tag_commit" = "$local_tag_commit"
+          test "$remote_tag_commit" = '${{ needs.prepare.outputs.candidate_commit }}'
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" \
+            = "$remote_tag_commit"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists" >&2
+            exit 73
+          fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
+            --title "VaultLink $GITHUB_REF_NAME" --notes-file CHANGELOG.md dist/*
+          remote=$(mktemp -d)
+          gh release download "$GITHUB_REF_NAME" --dir "$remote"
+          sh tools/verify-package-release.sh \
+            "$remote" '${{ needs.prepare.outputs.package_version }}' --signed
+          (
+            cd dist
+            find . -mindepth 1 -maxdepth 1 -type f -print0 \
+              | sort -z | xargs -0 sha256sum
+          ) >local-assets.sha256
+          (
+            cd "$remote"
+            find . -mindepth 1 -maxdepth 1 -type f -print0 \
+              | sort -z | xargs -0 sha256sum
+          ) >remote-assets.sha256
+          cmp local-assets.sha256 remote-assets.sha256
+          # Publishing is irreversible under the required repository policy.
+          # Prove the admin-only setting immediately before changing visibility;
+          # if the read-only policy token is absent or insufficient, the fully
+          # verified release remains a private draft.
+          test "$(GH_TOKEN="$RELEASE_ADMIN_READ_TOKEN" gh api \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.immutable')" = true
       - name: Restore host workspace ownership
         if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
-
-  dry_run:
-    name: Verify combined dry run
-    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-    needs: [release_environment, build]
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    container:
-      image: ${{ needs.release_environment.outputs.image }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    env:
-      RELEASE_BUILDER_IMAGE: ${{ needs.release_environment.outputs.image }}
-    steps:
-      - name: Restore host workspace ownership before checkout
-        shell: bash
-        run: |
-          set -euo pipefail
-          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Verify prebuilt release environment
-        run: sh tools/verify-release-builder.sh
-      - name: Read and verify package version
-        shell: bash
-        run: |
-          set -euo pipefail
-          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          test -n "$package_version"
-          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
-          sh tools/check-supply-chain-policy.sh
-      - name: Download native build outputs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: vaultlink-release-*
-          path: dist
-          merge-multiple: true
-      - name: Verify architecture-specific checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 8
-          cd dist
-          for arch in amd64 arm64; do
-            root="VaultLink-${PACKAGE_VERSION}-debian13-${arch}"
-            archive="${root}.tar.gz"
-            test -s "$archive"
-            test -s "vaultlink-${PACKAGE_VERSION}-debian13-${arch}"
-            test -s "vaultlink-${PACKAGE_VERSION}-debian13-${arch}.cdx.json"
-            test -s "SHA256SUMS-${arch}"
-            sha256sum -c "SHA256SUMS-${arch}"
-            archive_listing=$(tar -tzf "$archive")
-            for required_path in \
-              "$root/README.md" \
-              "$root/bin/vaultlink" \
-              "$root/config/production-reverse-proxy.toml" \
-              "$root/deploy/vaultlink-update.sh" \
-              "$root/deploy/vaultlink-update.conf.example" \
-              "$root/deploy/vaultlink-update.service" \
-              "$root/deploy/vaultlink-update.timer" \
-              "$root/deploy/vaultlink-upgrade.sh" \
-              "$root/deploy/vaultlink-rollback.sh" \
-              "$root/deploy/vaultlink-soak-remote.sh" \
-              "$root/deploy/vaultlink-soak@.service" \
-              "$root/docs/RELEASE-CHECKLIST.md" \
-              "$root/tools/collect-soak-evidence.sh" \
-              "$root/docs/UPGRADE-ROLLBACK.md" \
-              "$root/tools/check-soak-evidence.sh"; do
-              grep -F -x -q "$required_path" <<<"$archive_listing"
-            done
-            if grep -E -q '(^|/)vaultlink-(staging-deploy|cert-renew|cert-deploy)' <<<"$archive_listing"; then
-              echo "$archive contains a removed legacy deployment component" >&2
-              exit 1
-            fi
-          done
-      - name: Upload combined dry-run artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: vaultlink-release-dry-run
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 7
-      - name: Restore host workspace ownership
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
+        run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"
 
   publish_main_statuses:
     name: Publish exact-commit release preflight statuses
     if: ${{ always() && github.ref == 'refs/heads/main' }}
-    needs: [release_environment, build, dry_run]
-    runs-on: ubuntu-24.04-arm
+    needs: [prepare, assemble, dry_run]
+    runs-on: ubuntu-24.04
     permissions:
       statuses: write
-    env:
-      PREFLIGHT_MODE: ${{ inputs.preflight_mode || 'dry-run' }}
-      ENVIRONMENT_RESULT: ${{ needs.release_environment.result }}
-      BUILD_RESULT: ${{ needs.build.result }}
-      DRY_RUN_RESULT: ${{ needs.dry_run.result }}
     steps:
-      - name: Publish final run result for the exact main commit
+      - name: Publish final preflight result
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
+          PREFLIGHT_MODE: ${{ inputs.preflight_mode }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          ASSEMBLE_RESULT: ${{ needs.assemble.result }}
+          DRY_RUN_RESULT: ${{ needs.dry_run.result }}
         run: |
           set -euo pipefail
-          case "$PREFLIGHT_MODE" in dry-run|candidate|evidence) ;; *) exit 64 ;; esac
-          if [[ "$ENVIRONMENT_RESULT" == success && "$BUILD_RESULT" == success && "$DRY_RUN_RESULT" == success ]]; then
+          case "$PREFLIGHT_MODE" in dry-run | candidate | evidence) ;; *) exit 64 ;; esac
+          if [[ "$PREPARE_RESULT" == success && "$ASSEMBLE_RESULT" == success \
+              && "$DRY_RUN_RESULT" == success ]]; then
             state=success
-            description='Final release archives and SBOMs passed the dry run'
+            description='Nine-package release set and deterministic SBOM/checksum bundle passed'
           else
             state=failure
-            description='Release archive or SBOM dry run failed'
+            description='Package release assembly or preflight gate failed'
           fi
           publish_status() {
-            context=$1
-            detail=$2
-            curl --fail-with-body --silent --show-error \
-              --retry 5 \
-              --retry-delay 2 \
-              --retry-max-time 60 \
-              --request POST \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header 'Accept: application/vnd.github+json' \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-              --data "{\"state\":\"$state\",\"context\":\"$context\",\"description\":\"$detail\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+              -f state="$state" -f context="$1" -f description="$2" \
+              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           }
           publish_status vaultlink/release-dry-run "$description"
           case "$PREFLIGHT_MODE" in
             candidate)
               publish_status vaultlink/release-candidate-preflight \
-                "Pre-soak release candidate preflight: $state"
+                "Pre-soak package candidate preflight: $state"
               ;;
             evidence)
               publish_status vaultlink/release-evidence-preflight \
-                "Post-soak evidence and hash preflight: $state"
+                "Post-soak package evidence preflight: $state"
               ;;
             dry-run) ;;
           esac

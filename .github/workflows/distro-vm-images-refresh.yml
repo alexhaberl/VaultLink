@@ -1,0 +1,299 @@
+name: Refresh pinned distro VM image
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_id:
+        description: Exact package target to refresh
+        required: true
+        type: choice
+        options:
+          - debian13-amd64
+          - debian13-arm64
+          - ubuntu2404-amd64
+          - ubuntu2404-arm64
+          - ubuntu2604-amd64
+          - ubuntu2604-arm64
+          - fedora44-amd64
+          - fedora44-arm64
+          - archlinux-amd64
+      upstream_url:
+        description: Official raw QCOW2 cloud-image HTTPS URL
+        required: true
+        type: string
+      upstream_sha256:
+        description: Independently verified SHA-256 of the raw QCOW2 image
+        required: true
+        type: string
+      qemu_runner_refresh_run_id:
+        description: Exact successful same-commit QEMU refresh run, or 0 for committed locks
+        required: false
+        default: '0'
+        type: string
+      arch_snapshot_date:
+        description: YYYY-MM-DD for Arch; UNPROVISIONED for fixed releases
+        required: true
+        default: UNPROVISIONED
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: vaultlink-distro-vm-refresh-${{ inputs.target_id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      runner: ${{ steps.target.outputs.runner }}
+      architecture: ${{ steps.target.outputs.architecture }}
+      repository: ${{ steps.target.outputs.repository }}
+      qemu_runner_image: ${{ steps.target.outputs.qemu_runner_image }}
+      qemu_lock_source: ${{ steps.target.outputs.qemu_lock_source }}
+      qemu_refresh_run: ${{ steps.target.outputs.qemu_refresh_run }}
+      qemu_locks_sha256: ${{ steps.target.outputs.qemu_locks_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate exact target and QEMU runner lock
+        id: target
+        shell: bash
+        env:
+          TARGET_ID: ${{ inputs.target_id }}
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
+          UPSTREAM_SHA256: ${{ inputs.upstream_sha256 }}
+          QEMU_REFRESH_RUN: ${{ inputs.qemu_runner_refresh_run_id }}
+          ARCH_SNAPSHOT_DATE: ${{ inputs.arch_snapshot_date }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 tools/package-targets.py validate --allow-unprovisioned
+          case "$UPSTREAM_URL" in
+            https://*) ;;
+            *) echo 'guest image must use HTTPS' >&2; exit 64 ;;
+          esac
+          case "$UPSTREAM_URL" in *'@'*|*'?'*|*'#'*) exit 64 ;; esac
+          [[ "$UPSTREAM_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$QEMU_REFRESH_RUN" =~ ^(0|[1-9][0-9]*)$ ]]
+          qemu_lock_source=commit
+          qemu_lock_directory=deploy/docker
+          if [[ "$QEMU_REFRESH_RUN" != 0 ]]; then
+            qemu_run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QEMU_REFRESH_RUN" \
+              --jq '[.head_sha,.head_branch,.conclusion,.path,.event] | @tsv')
+            IFS=$'\t' read -r qemu_sha qemu_branch qemu_conclusion qemu_path qemu_event \
+              <<<"$qemu_run"
+            qemu_path=${qemu_path%%@*}
+            test "$qemu_sha" = "$GITHUB_SHA"
+            test "$qemu_branch" = main
+            test "$qemu_conclusion" = success
+            test "$qemu_path" = .github/workflows/qemu-runner-refresh.yml
+            test "$qemu_event" = workflow_dispatch
+            qemu_lock_directory="$RUNNER_TEMP/qemu-lock-candidate"
+            test ! -e "$qemu_lock_directory"
+            gh run download "$QEMU_REFRESH_RUN" --repo "$GITHUB_REPOSITORY" \
+              --name "qemu-runner-lock-$QEMU_REFRESH_RUN" \
+              --dir "$qemu_lock_directory"
+            test "$(find "$qemu_lock_directory" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 4
+            qemu_lock_source=artifact
+          elif [[ "$(cat deploy/docker/qemu-runner-image.lock)" == UNPROVISIONED ]]; then
+            echo 'Bootstrap VM refresh requires the exact successful QEMU refresh run ID.' >&2
+            exit 77
+          fi
+          for qemu_lock in \
+            qemu-runner-image.lock qemu-runner-base-image.lock \
+            qemu-runner-packages-amd64.lock qemu-runner-packages-arm64.lock; do
+            test -f "$qemu_lock_directory/$qemu_lock"
+            test ! -L "$qemu_lock_directory/$qemu_lock"
+          done
+          qemu_validation="$RUNNER_TEMP/qemu-lock-validation"
+          install -d "$qemu_validation/tools" "$qemu_validation/release" \
+            "$qemu_validation/deploy/docker"
+          install -m 0644 tools/package-targets.py "$qemu_validation/tools/"
+          install -m 0644 release/package-targets.json "$qemu_validation/release/"
+          install -m 0644 "$qemu_lock_directory"/qemu-runner-*.lock \
+            "$qemu_validation/deploy/docker/"
+          (cd "$qemu_validation" \
+            && python3 tools/package-targets.py validate --allow-unprovisioned)
+          qemu_runner_image=$(cat "$qemu_lock_directory/qemu-runner-image.lock")
+          [[ "$qemu_runner_image" =~ ^ghcr\.io/alexhaberl/vaultlink-qemu-runner@sha256:[0-9a-f]{64}$ ]]
+          qemu_locks_sha256=$(
+            cd "$qemu_lock_directory"
+            sha256sum \
+              qemu-runner-image.lock qemu-runner-base-image.lock \
+              qemu-runner-packages-amd64.lock qemu-runner-packages-arm64.lock \
+              | sha256sum | awk '{print $1}'
+          )
+          [[ "$qemu_locks_sha256" =~ ^[0-9a-f]{64}$ ]]
+          runner=$(python3 tools/package-targets.py get "$TARGET_ID" runner --allow-unprovisioned)
+          architecture=$(python3 tools/package-targets.py get "$TARGET_ID" architecture --allow-unprovisioned)
+          repository=$(python3 tools/package-targets.py get "$TARGET_ID" vm_repository --allow-unprovisioned)
+          if [[ "$TARGET_ID" == archlinux-* ]]; then
+            [[ "$ARCH_SNAPSHOT_DATE" =~ ^20[0-9]{2}-[01][0-9]-[0-3][0-9]$ ]]
+            python3 -c 'import datetime,os; value=os.environ["ARCH_SNAPSHOT_DATE"]; assert datetime.date.fromisoformat(value).isoformat() == value'
+          else
+            test "$ARCH_SNAPSHOT_DATE" = UNPROVISIONED
+          fi
+          printf 'runner=%s\narchitecture=%s\nrepository=%s\nqemu_runner_image=%s\nqemu_lock_source=%s\nqemu_refresh_run=%s\nqemu_locks_sha256=%s\n' \
+            "$runner" "$architecture" "$repository" "$qemu_runner_image" \
+            "$qemu_lock_source" "$QEMU_REFRESH_RUN" "$qemu_locks_sha256" \
+            >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ${{ needs.prepare.outputs.runner }}
+    environment: release-image-refresh
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Authenticate to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Download and verify upstream guest
+        shell: bash
+        env:
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
+          UPSTREAM_SHA256: ${{ inputs.upstream_sha256 }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 vm-build
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --fail --location --silent --show-error --retry 5 \
+            --max-filesize 10737418240 \
+            --output vm-build/upstream.qcow2 "$UPSTREAM_URL"
+          printf '%s  %s\n' "$UPSTREAM_SHA256" vm-build/upstream.qcow2 | sha256sum -c -
+      - name: Provision guest through native QEMU
+        shell: bash
+        env:
+          TARGET_ID: ${{ inputs.target_id }}
+          QEMU_RUNNER_IMAGE: ${{ needs.prepare.outputs.qemu_runner_image }}
+          QEMU_LOCK_SOURCE: ${{ needs.prepare.outputs.qemu_lock_source }}
+          QEMU_REFRESH_RUN: ${{ needs.prepare.outputs.qemu_refresh_run }}
+          QEMU_LOCKS_SHA256: ${{ needs.prepare.outputs.qemu_locks_sha256 }}
+          ARCHITECTURE: ${{ needs.prepare.outputs.architecture }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          qemu_lock_directory=deploy/docker
+          if [[ "$QEMU_LOCK_SOURCE" == artifact ]]; then
+            [[ "$QEMU_REFRESH_RUN" =~ ^[1-9][0-9]*$ ]]
+            qemu_lock_directory="$RUNNER_TEMP/qemu-lock-candidate"
+            test ! -e "$qemu_lock_directory"
+            gh run download "$QEMU_REFRESH_RUN" --repo "$GITHUB_REPOSITORY" \
+              --name "qemu-runner-lock-$QEMU_REFRESH_RUN" \
+              --dir "$qemu_lock_directory"
+            test "$(cat "$qemu_lock_directory/qemu-runner-image.lock")" \
+              = "$QEMU_RUNNER_IMAGE"
+          else
+            test "$QEMU_LOCK_SOURCE" = commit
+            test "$QEMU_REFRESH_RUN" = 0
+            test "$(cat deploy/docker/qemu-runner-image.lock)" = "$QEMU_RUNNER_IMAGE"
+          fi
+          actual_qemu_locks_sha256=$(
+            cd "$qemu_lock_directory"
+            sha256sum \
+              qemu-runner-image.lock qemu-runner-base-image.lock \
+              qemu-runner-packages-amd64.lock qemu-runner-packages-arm64.lock \
+              | sha256sum | awk '{print $1}'
+          )
+          test "$actual_qemu_locks_sha256" = "$QEMU_LOCKS_SHA256"
+          qemu_runner=$QEMU_RUNNER_IMAGE
+          docker pull "$qemu_runner"
+          docker run --rm --network none --user root \
+            --volume "$PWD:/work:ro" --workdir /work \
+            --volume "$qemu_lock_directory:/qemu-lock:ro" \
+            "$qemu_runner" \
+            sh tools/verify-qemu-runner.sh "$ARCHITECTURE" /qemu-lock \
+            >vm-build/qemu-runner-verification.env
+          kvm_args=()
+          if [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
+            kvm_args+=(--device /dev/kvm)
+          fi
+          docker run --rm \
+            --user root \
+            "${kvm_args[@]}" \
+            --volume "$PWD:/work" \
+            --workdir /work \
+            "$qemu_runner" \
+            sh tools/provision-distro-vm-image.sh \
+              "$TARGET_ID" vm-build/upstream.qcow2 vm-build/guest.qcow2 \
+              '${{ inputs.arch_snapshot_date }}'
+          test -s vm-build/guest.qcow2
+          test -s vm-build/guest.qcow2.packages.lock
+          packages_sha256=$(cat vm-build/guest.qcow2.packages.sha256)
+          [[ "$packages_sha256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum vm-build/guest.qcow2.packages.lock | awk '{print $1}')" \
+            = "$packages_sha256"
+          grep -E -x -q 'kvm|tcg' vm-build/guest.qcow2.acceleration
+          grep -F -x -q true vm-build/guest.qcow2.cold-boot-verified
+      - name: Publish immutable guest image
+        id: image
+        shell: bash
+        env:
+          TARGET_ID: ${{ inputs.target_id }}
+          UPSTREAM_SHA256: ${{ inputs.upstream_sha256 }}
+          ARCH_SNAPSHOT_DATE: ${{ inputs.arch_snapshot_date }}
+          QEMU_RUNNER_IMAGE: ${{ needs.prepare.outputs.qemu_runner_image }}
+          REPOSITORY: ${{ needs.prepare.outputs.repository }}
+          ARCHITECTURE: ${{ needs.prepare.outputs.architecture }}
+        run: |
+          set -euo pipefail
+          packages_sha256=$(cat vm-build/guest.qcow2.packages.sha256)
+          acceleration=$(cat vm-build/guest.qcow2.acceleration)
+          printf 'target_id=%s\nupstream_sha256=%s\npackages_sha256=%s\nqemu_runner_image=%s\nprovision_acceleration=%s\ncold_boot_verified=true\n' \
+            "$TARGET_ID" "$UPSTREAM_SHA256" "$packages_sha256" \
+            "$QEMU_RUNNER_IMAGE" "$acceleration" \
+            >vm-build/guest-image.env
+          metadata="$RUNNER_TEMP/vm-metadata.json"
+          docker buildx build \
+            --platform "linux/$ARCHITECTURE" \
+            --file deploy/docker/Dockerfile.distro-vm-image \
+            --build-arg "TARGET_ID=$TARGET_ID" \
+            --build-arg "UPSTREAM_SHA256=$UPSTREAM_SHA256" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --metadata-file "$metadata" \
+            --provenance=false \
+            --output "type=image,name=$REPOSITORY,push-by-digest=true,name-canonical=true,push=true" \
+            vm-build
+          digest=$(jq -r '."containerimage.digest" // empty' "$metadata")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'image=%s@%s\n' "$REPOSITORY" "$digest" >>"$GITHUB_OUTPUT"
+      - name: Render reviewed target-lock candidate
+        shell: bash
+        env:
+          TARGET_ID: ${{ inputs.target_id }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
+          UPSTREAM_SHA256: ${{ inputs.upstream_sha256 }}
+          ARCH_SNAPSHOT_DATE: ${{ inputs.arch_snapshot_date }}
+        run: |
+          set -euo pipefail
+          VM_PACKAGES_SHA256=$(cat vm-build/guest.qcow2.packages.sha256)
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$TARGET_ID" "$IMAGE" "$UPSTREAM_URL" "$UPSTREAM_SHA256" \
+            "$VM_PACKAGES_SHA256" "$ARCH_SNAPSHOT_DATE" >vm-image.tsv
+          python3 tools/update-package-target-images.py vm vm-image.tsv package-targets.json
+          printf 'This is a partial one-target VM lock. Combine all nine reviewed vm-image.tsv files and use --require-complete only after builder and VM provisioning are complete.\n' \
+            >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distro-vm-target-lock-${{ inputs.target_id }}-${{ github.run_id }}
+          path: |
+            package-targets.json
+            vm-image.tsv
+            vm-build/guest.qcow2.packages.lock
+            vm-build/guest-image.env
+            vm-build/qemu-runner-verification.env
+          if-no-files-found: error
+          retention-days: 30

@@ -1,3 +1,4 @@
-# The timer always checks the latest stable signed GitHub release. Keep this
-# false to report availability in the journal without changing the system.
+# The timer checks the latest stable, signed native package for this exact
+# distribution and architecture. Keep this false to report availability in the
+# journal without changing the package database or the running service.
 auto_install=false
