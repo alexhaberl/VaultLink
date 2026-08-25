@@ -937,6 +937,8 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q '"$ARCHITECTURE" == amd64' .github/workflows/distro-vm-images-refresh.yml \
     || ! grep -F -q 'VM provisioning QEMU exited with status' tools/provision-distro-vm-image.sh \
     || ! grep -F -q 'cold-boot QEMU exited with status' tools/provision-distro-vm-image.sh \
+    || ! grep -F -q -- '-device virtio-net-pci,netdev=net0,romfile=' tools/provision-distro-vm-image.sh \
+    || ! grep -F -q -- '-device virtio-net-pci,netdev=net0,romfile=' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'metadata_clients=100' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'cmp /usr/local/share/vaultlink-vm-packages.lock "$live_vm_packages"' tools/distro-vm-guest-smoke.sh \
     || ! grep -F -q 'cmp /usr/local/share/vaultlink-vm-packages.lock /run/vaultlink-vm-packages.live' tools/provision-distro-vm-image.sh \
