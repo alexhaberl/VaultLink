@@ -76,7 +76,10 @@ temporary override into its disposable overlay and verifies that cloud-init
 removed both the override and cleanup helper before any guest image or gate
 evidence is accepted. The arm64 libguestfs appliance is explicitly forced to
 TCG: this avoids an invalid KVM-only GIC fallback inside the container without
-granting the harness privileged mode, extra capabilities, or host devices.
+granting the harness privileged mode, extra capabilities, or host devices. A
+root-owned additive Supermin package fragment brings the pinned
+`policycoreutils` closure into that appliance so guest-policy SELinux relabeling
+is available without modifying Ubuntu's vendor-owned appliance inputs.
 
 Because standard runners have limited local SSD space, refresh and full-system
 jobs record both real and apparent guest-image usage. Once an immutable image

@@ -101,17 +101,39 @@ dpkg-query -W -f='${binary:Package}=${Version}\n' | LC_ALL=C sort \
 cmp "$packages_lock" "$work/live-packages.lock" >/dev/null \
     || fail "live QEMU runner package database differs from the commit"
 
-for required_command in base64 cloud-localds cmp dpkg-query qemu-img scp sha256sum \
-    ssh stat "$qemu_command"; do
+for required_command in base64 cloud-localds cmp dpkg-query python3 qemu-img scp \
+    sha256sum ssh stat "$qemu_command"; do
     command -v "$required_command" >/dev/null \
         || fail "required harness command is missing: $required_command"
 done
 if [ "$architecture" = arm64 ]; then
     command -v guestfish >/dev/null \
         || fail "arm64 QEMU runner is missing guestfish"
+    guestfs_path=$(guestfish get-path)
+    printf '%s' "$guestfs_path" | python3 -c \
+        'import re,sys; value=sys.stdin.read(); sys.exit(0 if re.fullmatch(r"/usr/lib/[A-Za-z0-9._+-]+/guestfs", value) else 1)' \
+        || fail "arm64 libguestfs path is unsafe"
+    [ -d "$guestfs_path" ] && [ ! -L "$guestfs_path" ] \
+        || fail "arm64 libguestfs path is missing or unsafe"
+    supermin_directory=$guestfs_path/supermin.d
+    [ -d "$supermin_directory" ] && [ ! -L "$supermin_directory" ] \
+        || fail "arm64 Supermin input directory is missing or unsafe"
+    selinux_fragment=$supermin_directory/packages-vaultlink-selinux
+    [ -f "$selinux_fragment" ] && [ ! -L "$selinux_fragment" ] \
+        && [ "$(stat -c '%u:%g:%a' "$selinux_fragment")" = 0:0:644 ] \
+        || fail "arm64 Supermin SELinux package fragment is missing or unsafe"
+    [ "$(wc -l <"$selinux_fragment" | tr -d '[:space:]')" -eq 1 ] \
+        && grep -F -x -q policycoreutils "$selinux_fragment" \
+        || fail "arm64 Supermin SELinux package fragment is invalid"
+    [ "$(dpkg-query -W -f='${Status}' policycoreutils)" \
+        = 'install ok installed' ] \
+        || fail "arm64 QEMU runner is missing policycoreutils"
     LIBGUESTFS_BACKEND=direct
     LIBGUESTFS_BACKEND_SETTINGS=force_tcg
-    export LIBGUESTFS_BACKEND LIBGUESTFS_BACKEND_SETTINGS
+    LIBGUESTFS_CACHEDIR=$work/libguestfs-cache
+    mkdir -m 0700 "$LIBGUESTFS_CACHEDIR"
+    export LIBGUESTFS_BACKEND LIBGUESTFS_BACKEND_SETTINGS \
+        LIBGUESTFS_CACHEDIR
     [ "$(guestfish get-backend)" = direct ] \
         || fail "arm64 libguestfs must use the direct backend"
     [ "$(guestfish get-backend-settings)" = force_tcg ] \

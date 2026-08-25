@@ -17,6 +17,21 @@ RUN set -eu \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates cloud-image-utils coreutils curl jq openssh-client openssl \
         python3 qemu-utils $qemu_packages \
+    && if [ "$TARGETARCH" = arm64 ]; then \
+         guestfs_path=$(guestfish get-path); \
+         printf '%s' "$guestfs_path" | python3 -c \
+           'import re,sys; value=sys.stdin.read(); sys.exit(0 if re.fullmatch(r"/usr/lib/[A-Za-z0-9._+-]+/guestfs", value) else 1)'; \
+         test -d "$guestfs_path" && test ! -L "$guestfs_path"; \
+         supermin_directory="$guestfs_path/supermin.d"; \
+         test -d "$supermin_directory" && test ! -L "$supermin_directory"; \
+         fragment="$supermin_directory/packages-vaultlink-selinux"; \
+         test ! -e "$fragment" && test ! -L "$fragment"; \
+         printf '%s\n' policycoreutils >"$fragment"; \
+         chmod 0644 "$fragment"; \
+         test "$(stat -c '%u:%g:%a' "$fragment")" = 0:0:644; \
+         test "$(wc -l <"$fragment" | tr -d '[:space:]')" -eq 1; \
+         grep -F -x -q policycoreutils "$fragment"; \
+       fi \
     && dpkg-query -W -f='${binary:Package}=${Version}\n' \
         | LC_ALL=C sort >/usr/local/share/vaultlink-qemu-runner-packages.lock \
     && printf 'base_image=%s\narchitecture=%s\n' "$BASE_IMAGE" "$TARGETARCH" \

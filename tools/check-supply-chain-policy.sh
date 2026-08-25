@@ -963,7 +963,14 @@ root_capacity_check=tools/check-vm-root-capacity.sh
 if ! grep -F -q 'libguestfs-tools' deploy/docker/Dockerfile.qemu-runner \
     || ! grep -F -q 'linux-image-virtual' deploy/docker/Dockerfile.qemu-runner \
     || ! grep -F -q 'policycoreutils' deploy/docker/Dockerfile.qemu-runner \
+    || ! grep -F -q 'guestfs_path=$(guestfish get-path)' deploy/docker/Dockerfile.qemu-runner \
+    || ! grep -F -q 'packages-vaultlink-selinux' deploy/docker/Dockerfile.qemu-runner \
+    || ! grep -F -q 'test ! -e "$fragment" && test ! -L "$fragment"' deploy/docker/Dockerfile.qemu-runner \
+    || ! grep -F -q "stat -c '%u:%g:%a' \"\$fragment\"" deploy/docker/Dockerfile.qemu-runner \
     || ! grep -F -q 'command -v guestfish' tools/verify-qemu-runner.sh \
+    || ! grep -F -q 'selinux_fragment=$supermin_directory/packages-vaultlink-selinux' tools/verify-qemu-runner.sh \
+    || ! grep -F -q 'LIBGUESTFS_CACHEDIR=$work/libguestfs-cache' tools/verify-qemu-runner.sh \
+    || ! grep -F -q "dpkg-query -W -f='\${Status}' policycoreutils" tools/verify-qemu-runner.sh \
     || ! grep -F -q 'guestfish-probe.img=fs:ext4:64M' tools/verify-qemu-runner.sh \
     || ! grep -F -q 'feature-available selinuxrelabel' tools/verify-qemu-runner.sh \
     || ! grep -F -q 'LIBGUESTFS_BACKEND_SETTINGS=force_tcg' tools/verify-qemu-runner.sh \
@@ -1017,6 +1024,10 @@ if ! grep -F -q 'libguestfs-tools' deploy/docker/Dockerfile.qemu-runner \
     || ! grep -F -q 'full-system QEMU exited with status' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'root filesystem is smaller than the reviewed minimum' "$root_capacity_check"; then
     report "guest images must enforce reviewed capacity and a removable Fedora arm64 TCG device-timeout override"
+fi
+if grep -F -q 'supermin.d/packages' deploy/docker/Dockerfile.qemu-runner \
+    || grep -F -q 'supermin.d/hostfiles' deploy/docker/Dockerfile.qemu-runner; then
+    report "the QEMU runner must extend Supermin additively instead of modifying vendor appliance inputs"
 fi
 if ! grep -F -q "arch_time_sync_command='systemctl mask systemd-time-wait-sync.service" "$vm_provisioner" \
     || ! grep -F -q "arch_time_sync_verify='test -L /etc/systemd/system/systemd-time-wait-sync.service" "$vm_provisioner" \
