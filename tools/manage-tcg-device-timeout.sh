@@ -6,7 +6,9 @@ CDPATH=
 LC_ALL=C
 LANG=C
 LIBGUESTFS_BACKEND=direct
-export PATH CDPATH LC_ALL LANG LIBGUESTFS_BACKEND
+LIBGUESTFS_BACKEND_SETTINGS=force_tcg
+export PATH CDPATH LC_ALL LANG LIBGUESTFS_BACKEND \
+    LIBGUESTFS_BACKEND_SETTINGS
 umask 077
 
 [ "$#" -eq 2 ] || {
@@ -22,6 +24,8 @@ image=$(cd -- "$(dirname -- "$image")" && pwd)/$(basename -- "$image")
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 cleanup_source=$script_dir/clear-tcg-device-timeout.sh
 [ -f "$cleanup_source" ] && [ ! -L "$cleanup_source" ] || exit 66
+[ "$(guestfish get-backend)" = direct ] || exit 70
+[ "$(guestfish get-backend-settings)" = force_tcg ] || exit 70
 override=/etc/systemd/system.conf.d/90-vaultlink-tcg-device-timeout.conf
 cleanup=/usr/local/sbin/vaultlink-clear-tcg-device-timeout
 directory_marker=/etc/systemd/system.conf.d/.vaultlink-tcg-created-directory

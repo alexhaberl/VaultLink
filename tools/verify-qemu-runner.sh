@@ -109,8 +109,15 @@ done
 if [ "$architecture" = arm64 ]; then
     command -v guestfish >/dev/null \
         || fail "arm64 QEMU runner is missing guestfish"
+    LIBGUESTFS_BACKEND=direct
+    LIBGUESTFS_BACKEND_SETTINGS=force_tcg
+    export LIBGUESTFS_BACKEND LIBGUESTFS_BACKEND_SETTINGS
+    [ "$(guestfish get-backend)" = direct ] \
+        || fail "arm64 libguestfs must use the direct backend"
+    [ "$(guestfish get-backend-settings)" = force_tcg ] \
+        || fail "arm64 libguestfs must be pinned to TCG"
     printf '%s\n' vaultlink-guestfish-probe >"$work/guestfish-probe.expected"
-    LIBGUESTFS_BACKEND=direct guestfish \
+    guestfish \
         -N "$work/guestfish-probe.img=fs:ext4:64M" -m /dev/sda1 \
         >"$work/guestfish-probe.features" <<EOF
 feature-available selinuxrelabel
