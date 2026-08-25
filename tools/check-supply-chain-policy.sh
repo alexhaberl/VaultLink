@@ -185,7 +185,10 @@ if ! grep -F -q 'test "${ID:-}" = ubuntu' "$qemu_builder" \
     report "QEMU harness must bind Ubuntu 24.04, its base digest, and its live native package closure"
 fi
 if ! grep -F -q 'pacman -Syyuu --noconfirm --needed' "$package_builder_dependencies" \
-    || ! grep -F -q 'pacman -Syyuu --noconfirm --needed' "$vm_provisioner"; then
+    || ! grep -F -q 'pacman -Syyuu --noconfirm --needed' "$vm_provisioner" \
+    || ! grep -F -q 'https://archive.archlinux.org/repos/{year}/{month}/{day}/$repo/os/$arch' "$target_manifest" \
+    || ! grep -F -q 'arch_snapshot_path=$(printf' "$package_builder_dependencies" \
+    || ! grep -F -q 'arch_snapshot_path=$(printf' "$vm_provisioner"; then
     report "Arch builder and guest provisioning must permit downgrades to the exact dated snapshot"
 fi
 

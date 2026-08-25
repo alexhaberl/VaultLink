@@ -84,6 +84,7 @@ value = sys.argv[1]
 if datetime.date.fromisoformat(value).isoformat() != value:
     raise SystemExit(64)
 PY
+        arch_snapshot_path=$(printf '%s\n' "$arch_snapshot_date" | tr '-' '/')
         cat >"$work/install-packages.sh" <<EOF
 #!/bin/sh
 set -eu
@@ -93,7 +94,7 @@ set -eu
     exit 77
 }
 cat >/etc/pacman.d/mirrorlist <<'MIRROR'
-Server = https://archive.archlinux.org/repos/$arch_snapshot_date/\$repo/os/\$arch
+Server = https://archive.archlinux.org/repos/$arch_snapshot_path/\$repo/os/\$arch
 MIRROR
 # A release snapshot is an exact upper and lower bound.  The second -u lets
 # pacman downgrade packages from a newer upstream cloud image to that date.
