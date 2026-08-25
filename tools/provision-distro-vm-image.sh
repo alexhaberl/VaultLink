@@ -157,7 +157,7 @@ capacity_script=tools/check-vm-root-capacity.sh
 capacity_script_b64=$(base64 -w0 "$capacity_script")
 tcg_cleanup_command=:
 if [ "$tcg_timeout_override" = true ]; then
-    tcg_cleanup_command=/usr/local/sbin/vaultlink-clear-tcg-device-timeout
+    tcg_cleanup_command=/usr/local/bin/vaultlink-clear-tcg-device-timeout
 fi
 
 cat >"$work/meta-data" <<EOF

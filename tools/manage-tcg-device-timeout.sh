@@ -27,7 +27,7 @@ cleanup_source=$script_dir/clear-tcg-device-timeout.sh
 [ "$(guestfish get-backend)" = direct ] || exit 70
 [ "$(guestfish get-backend-settings)" = force_tcg ] || exit 70
 override=/etc/systemd/system.conf.d/90-vaultlink-tcg-device-timeout.conf
-cleanup=/usr/local/sbin/vaultlink-clear-tcg-device-timeout
+cleanup=/usr/local/bin/vaultlink-clear-tcg-device-timeout
 directory_marker=/etc/systemd/system.conf.d/.vaultlink-tcg-created-directory
 selinux_policy=/etc/selinux/targeted/contexts/files/file_contexts
 state_file=$image.vaultlink-tcg-state
@@ -61,8 +61,8 @@ is-symlink /usr
 is-dir /usr
 is-symlink /usr/local
 is-dir /usr/local
-is-symlink /usr/local/sbin
-is-dir /usr/local/sbin
+is-symlink /usr/local/bin
+is-dir /usr/local/bin
 exists $override
 is-symlink $override
 exists $cleanup
@@ -76,6 +76,46 @@ EOF
 }
 
 inspect_paths >"$work/state"
+cat >"$work/state-labels" <<'EOF'
+etc_symlink
+etc_directory
+etc_systemd_symlink
+etc_systemd_directory
+etc_systemd_system_conf_d_symlink
+etc_systemd_system_conf_d_directory
+usr_symlink
+usr_directory
+usr_local_symlink
+usr_local_directory
+usr_local_bin_symlink
+usr_local_bin_directory
+timeout_override_exists
+timeout_override_symlink
+cleanup_helper_exists
+cleanup_helper_symlink
+directory_marker_exists
+directory_marker_symlink
+selinux_policy_exists
+selinux_policy_symlink
+selinuxrelabel_available
+EOF
+state_lines=$(wc -l <"$work/state" | tr -d '[:space:]')
+state_boolean_lines=$(grep -E -c '^(true|false)$' "$work/state" || true)
+if [ "$state_lines" -ne 21 ] || [ "$state_boolean_lines" -ne 21 ]; then
+    state_sha256=$(sha256sum "$work/state" | awk '{print $1}')
+    printf 'invalid Fedora systemd timeout path state: lines=%s boolean_lines=%s sha256=%s\n' \
+        "$state_lines" "$state_boolean_lines" "$state_sha256" >&2
+    exit 70
+fi
+report_unexpected_state() {
+    state_sha256=$(sha256sum "$work/state" | awk '{print $1}')
+    printf 'unexpected Fedora systemd timeout path state: sha256=%s\n' \
+        "$state_sha256" >&2
+    awk '
+        NR == FNR { labels[NR] = $0; next }
+        { print labels[FNR] "=" $0 }
+    ' "$work/state-labels" "$work/state" >&2
+}
 cat >"$work/clean-missing-directory" <<'EOF'
 false
 true
@@ -141,7 +181,7 @@ if [ "$action" = inject ]; then
     elif cmp -s "$work/clean-existing-directory" "$work/state"; then
         printf '%s\n' present >"$state_file"
     else
-        echo "unexpected Fedora systemd timeout path state" >&2
+        report_unexpected_state
         exit 70
     fi
     chmod 0600 "$state_file"
@@ -172,9 +212,13 @@ EOF
 else
     [ -f "$state_file" ] && [ ! -L "$state_file" ] || exit 70
     case "$(cat "$state_file")" in
-        absent) cmp "$work/clean-missing-directory" "$work/state" ;;
-        present) cmp "$work/clean-existing-directory" "$work/state" ;;
+        absent) expected_state=$work/clean-missing-directory ;;
+        present) expected_state=$work/clean-existing-directory ;;
         *) exit 70 ;;
     esac
+    if ! cmp -s "$expected_state" "$work/state"; then
+        report_unexpected_state
+        exit 70
+    fi
     rm -f -- "$state_file"
 fi
