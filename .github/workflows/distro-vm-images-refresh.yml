@@ -154,7 +154,7 @@ jobs:
       actions: read
       contents: read
       packages: write
-    timeout-minutes: ${{ inputs.target_id == 'fedora44-arm64' && 240 || 90 }}
+    timeout-minutes: ${{ inputs.target_id == 'fedora44-arm64' && 240 || inputs.target_id == 'ubuntu2604-arm64' && 150 || 90 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

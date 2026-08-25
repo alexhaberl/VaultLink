@@ -36,6 +36,11 @@ cold_boot_timeout=1200
 tcg_timeout_override=false
 arch_time_sync_command=:
 arch_time_sync_verify=:
+# Ubuntu 26.04 regenerates its initramfs while installing the reviewed package
+# closure, which needs a wider bound under the mandatory ARM64 TCG path.
+if [ "$target_id" = ubuntu2604-arm64 ]; then
+    provision_timeout=5400
+fi
 if [ "$target_id" = fedora44-arm64 ]; then
     provision_timeout=5400
     cold_boot_timeout=3600
