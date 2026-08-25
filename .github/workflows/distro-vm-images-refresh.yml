@@ -154,7 +154,7 @@ jobs:
       actions: read
       contents: read
       packages: write
-    timeout-minutes: 90
+    timeout-minutes: ${{ inputs.target_id == 'fedora44-arm64' && 240 || 90 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -241,6 +241,18 @@ jobs:
             = "$packages_sha256"
           grep -E -x -q 'kvm|tcg' vm-build/guest.qcow2.acceleration
           grep -F -x -q true vm-build/guest.qcow2.cold-boot-verified
+          grep -F -x -q 8589934592 vm-build/guest.qcow2.virtual-size
+          {
+            printf '%s\n' 'stage=before-qemu-runner-removal'
+            df -B1 "$PWD"
+            du -B1 vm-build/upstream.qcow2 vm-build/guest.qcow2
+            du -B1 --apparent-size vm-build/upstream.qcow2 vm-build/guest.qcow2
+          } >vm-build/host-storage.txt
+          docker image rm "$qemu_runner"
+          {
+            printf '%s\n' 'stage=after-qemu-runner-removal'
+            df -B1 "$PWD"
+          } >>vm-build/host-storage.txt
       - name: Preserve failed guest serial evidence
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -263,9 +275,11 @@ jobs:
           set -euo pipefail
           packages_sha256=$(cat vm-build/guest.qcow2.packages.sha256)
           acceleration=$(cat vm-build/guest.qcow2.acceleration)
-          printf 'target_id=%s\nupstream_sha256=%s\npackages_sha256=%s\nqemu_runner_image=%s\nprovision_acceleration=%s\ncold_boot_verified=true\n' \
+          virtual_size=$(cat vm-build/guest.qcow2.virtual-size)
+          test "$virtual_size" = 8589934592
+          printf 'target_id=%s\nupstream_sha256=%s\npackages_sha256=%s\nqemu_runner_image=%s\nprovision_acceleration=%s\ncold_boot_verified=true\nvirtual_size=%s\n' \
             "$TARGET_ID" "$UPSTREAM_SHA256" "$packages_sha256" \
-            "$QEMU_RUNNER_IMAGE" "$acceleration" \
+            "$QEMU_RUNNER_IMAGE" "$acceleration" "$virtual_size" \
             >vm-build/guest-image.env
           metadata="$RUNNER_TEMP/vm-metadata.json"
           builder="vaultlink-distro-vm-$TARGET_ID"
@@ -309,7 +323,9 @@ jobs:
           path: |
             package-targets.json
             vm-image.tsv
+            vm-build/host-storage.txt
             vm-build/guest.qcow2.packages.lock
+            vm-build/guest.qcow2.virtual-size
             vm-build/guest-image.env
             vm-build/qemu-runner-verification.env
           if-no-files-found: error

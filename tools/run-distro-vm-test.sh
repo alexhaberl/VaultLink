@@ -31,6 +31,15 @@ vm_packages_sha256=$(field vm_packages_sha256)
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
 expected_asset=$(python3 tools/package-targets.py asset "$target_id" "$version")
 [ "$(basename "$package")" = "$expected_asset" ] || exit 77
+ssh_timeout=1200
+tcg_timeout_override=false
+tcg_cleanup_command=:
+if [ "$target_id" = fedora44-arm64 ]; then
+    [ "$architecture" = arm64 ] || exit 77
+    ssh_timeout=3600
+    tcg_timeout_override=true
+    tcg_cleanup_command=/usr/local/sbin/vaultlink-clear-tcg-device-timeout
+fi
 
 work=$(mktemp -d)
 qemu_pid=
@@ -82,11 +91,14 @@ write_files:
     encoding: b64
     content: $host_public
 runcmd:
+  - [ sh, -c, "set -eu; $tcg_cleanup_command" ]
   - [ sh, -c, "systemctl restart sshd.service || systemctl restart ssh.service" ]
   - [ sh, -c, "echo VAULTLINK_VM_READY | tee /dev/console" ]
 EOF
 cloud-localds "$work/seed.img" "$work/user-data" "$work/meta-data"
 qemu-img check "$source_image"
+qemu-img info --output=json "$source_image" | python3 -c \
+    'import json,sys; d=json.load(sys.stdin); s=d.get("virtual-size"); sys.exit(0) if d.get("format") == "qcow2" and type(s) is int and s == 8589934592 else sys.exit(70)'
 qemu-img create -q -f qcow2 -F qcow2 -b "$source_image" "$work/overlay.qcow2"
 qemu-img create -q -f raw "$work/storage.raw" 20G
 
@@ -114,6 +126,10 @@ if [ "$architecture" = amd64 ] \
     && "$qemu" -accel help 2>/dev/null | grep -F -x -q 'kvm'; then
     acceleration=kvm
     acceleration_args='-accel kvm -cpu host'
+fi
+if [ "$tcg_timeout_override" = true ]; then
+    [ "$acceleration" = tcg ] || exit 77
+    sh tools/manage-tcg-device-timeout.sh inject "$work/overlay.qcow2"
 fi
 
 # KVM is an optional acceleration only. restrict=on blocks guest egress while
@@ -143,8 +159,12 @@ run_scp() {
         -o "UserKnownHostsFile=$work/known_hosts" -o ConnectTimeout=5 \
         -P 2222 "$@"
 }
-deadline=$(( $(date +%s) + 1200 ))
-while ! run_ssh vaultlink-ci@127.0.0.1 true 2>/dev/null; do
+deadline=$(( $(date +%s) + ssh_timeout ))
+while :; do
+    if run_ssh vaultlink-ci@127.0.0.1 true 2>/dev/null \
+        && grep -F -q VAULTLINK_VM_READY "$evidence/serial.log"; then
+        break
+    fi
     kill -0 "$qemu_pid" 2>/dev/null || {
         tail -n 200 "$evidence/serial.log" >&2 || true
         exit 70
@@ -152,11 +172,22 @@ while ! run_ssh vaultlink-ci@127.0.0.1 true 2>/dev/null; do
     [ "$(date +%s)" -lt "$deadline" ] || exit 70
     sleep 5
 done
+if [ "$target_id" = archlinux-amd64 ]; then
+    host_epoch=$(date +%s)
+    guest_epoch=$(run_ssh vaultlink-ci@127.0.0.1 date +%s)
+    case "$guest_epoch" in ''|*[!0-9]*) exit 70 ;; esac
+    clock_delta=$(( host_epoch - guest_epoch ))
+    [ "$clock_delta" -ge 0 ] || clock_delta=$(( -clock_delta ))
+    [ "$clock_delta" -le 300 ] || exit 70
+    printf 'clock_source=qemu-rtc\nhost_guest_delta_seconds=%s\n' \
+        "$clock_delta" >"$evidence/clock.env"
+fi
 
 run_scp \
     "$package" \
     tools/distro-vm-guest-smoke.sh \
     tools/distro-vm-runtime-smoke.sh \
+    tools/check-vm-root-capacity.sh \
     deploy/docker/api-smoke.sh \
     tools/load-test.sh \
     vaultlink-ci@127.0.0.1:/tmp/
@@ -204,6 +235,17 @@ grep -F -x -q 'metadata_clients=100' "$evidence/runtime/load/result.env"
 grep -F -x -q 'upload_integrity=server_readback' "$evidence/runtime/load/result.env"
 
 run_ssh vaultlink-ci@127.0.0.1 sudo poweroff || true
-wait "$qemu_pid" || true
+set +e
+wait "$qemu_pid"
+qemu_status=$?
+set -e
 qemu_pid=
+[ "$qemu_status" -eq 0 ] || {
+    tail -n 2000 "$evidence/serial.log" >&2 || true
+    echo "full-system QEMU exited with status $qemu_status" >&2
+    exit 70
+}
+if [ "$tcg_timeout_override" = true ]; then
+    sh tools/manage-tcg-device-timeout.sh assert-clean "$work/overlay.qcow2"
+fi
 echo "full-system distro VM test $target_id: OK"

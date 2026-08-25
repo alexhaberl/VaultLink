@@ -957,6 +957,73 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     report "all nine packages need offline lifecycle gates and restricted full-system QEMU/load/SELinux gates"
 fi
 
+tcg_timeout_manager=tools/manage-tcg-device-timeout.sh
+tcg_timeout_cleanup=tools/clear-tcg-device-timeout.sh
+root_capacity_check=tools/check-vm-root-capacity.sh
+if ! grep -F -q 'libguestfs-tools' deploy/docker/Dockerfile.qemu-runner \
+    || ! grep -F -q 'linux-image-virtual' deploy/docker/Dockerfile.qemu-runner \
+    || ! grep -F -q 'policycoreutils' deploy/docker/Dockerfile.qemu-runner \
+    || ! grep -F -q 'command -v guestfish' tools/verify-qemu-runner.sh \
+    || ! grep -F -q 'guestfish-probe.img=fs:ext4:64M' tools/verify-qemu-runner.sh \
+    || ! grep -F -q 'feature-available selinuxrelabel' tools/verify-qemu-runner.sh \
+    || ! grep -F -q 'DefaultDeviceTimeoutSec=5min' "$tcg_timeout_manager" \
+    || ! grep -F -q 'DefaultDeviceTimeoutSec=5min' "$tcg_timeout_cleanup" \
+    || ! grep -F -q 'rmdir -- /etc/systemd/system.conf.d' "$tcg_timeout_cleanup" \
+    || ! grep -F -q 'rm -f -- "$cleanup"' "$tcg_timeout_cleanup" \
+    || ! grep -F -q 'state_file=$image.vaultlink-tcg-state' "$tcg_timeout_manager" \
+    || ! grep -F -q 'clean-missing-directory' "$tcg_timeout_manager" \
+    || ! grep -F -q 'clean-existing-directory' "$tcg_timeout_manager" \
+    || ! grep -F -q 'feature-available selinuxrelabel' "$tcg_timeout_manager" \
+    || ! grep -F -q 'is-dir /etc/systemd' "$tcg_timeout_manager" \
+    || ! grep -F -q 'is-dir /usr/local/sbin' "$tcg_timeout_manager" \
+    || [ "$(grep -F -c -- '--format=qcow2' "$tcg_timeout_manager" || true)" -ne 2 ] \
+    || ! grep -F -q 'selinux-relabel $selinux_policy $override force:true' "$tcg_timeout_manager" \
+    || ! grep -F -q 'selinux-relabel $selinux_policy $cleanup force:true' "$tcg_timeout_manager" \
+    || ! grep -F -q 'selinux-relabel $selinux_policy /etc/systemd/system.conf.d force:true' "$tcg_timeout_manager" \
+    || ! grep -F -q 'getxattr /etc/systemd/system.conf.d security.selinux' "$tcg_timeout_manager" \
+    || ! grep -F -q 'getxattr $override security.selinux' "$tcg_timeout_manager" \
+    || [ "$(grep -F -c 'manage-tcg-device-timeout.sh inject' "$vm_provisioner" || true)" -ne 2 ] \
+    || [ "$(grep -F -c 'manage-tcg-device-timeout.sh assert-clean' "$vm_provisioner" || true)" -ne 2 ] \
+    || ! grep -F -q 'manage-tcg-device-timeout.sh inject' tools/run-distro-vm-test.sh \
+    || ! grep -F -q 'manage-tcg-device-timeout.sh assert-clean' tools/run-distro-vm-test.sh \
+    || ! grep -F -q 'reviewed_virtual_size=8589934592' "$vm_provisioner" \
+    || ! grep -F -q 's == 8589934592' tools/run-distro-vm-test.sh \
+    || ! grep -F -q 'growpart:' "$vm_provisioner" \
+    || ! grep -F -q 'resize_rootfs: true' "$vm_provisioner" \
+    || ! grep -F -q 'minimum_root_size=6979321856' "$vm_provisioner" \
+    || ! grep -F -q 'vaultlink-check-root-capacity $minimum_root_size $minimum_root_available' "$vm_provisioner" \
+    || ! grep -F -q '/tmp/check-vm-root-capacity.sh 6979321856 1073741824' tools/distro-vm-guest-smoke.sh \
+    || ! grep -F -q 'virtual_size=8589934592' .github/workflows/distro-vms.yml \
+    || ! grep -F -q 'test "$(wc -l <"vm-test/$TARGET_ID/guest-image.env")" -eq 7' .github/workflows/distro-vms.yml \
+    || ! grep -F -q 'cold_boot_verified=true' .github/workflows/distro-vms.yml \
+    || ! grep -F -q 'provision_acceleration=(kvm|tcg)' .github/workflows/distro-vms.yml \
+    || ! grep -F -q 'provision_acceleration=tcg' .github/workflows/distro-vms.yml \
+    || ! grep -F -q 'guest.qcow2.virtual-size' .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q 'virtual_size=$(cat vm-build/guest.qcow2.virtual-size)' .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q 'docker image rm "$qemu_runner"' .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q 'docker image rm "$VM_IMAGE"' .github/workflows/distro-vms.yml \
+    || ! grep -F -q 'host-storage.txt' .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q 'host-storage.txt' .github/workflows/distro-vms.yml \
+    || ! grep -F -q 'qemu-img check "$work/overlay.qcow2"' "$vm_provisioner" \
+    || ! grep -F -q "inputs.target_id == 'fedora44-arm64' && 240 || 90" .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q 'provision_timeout=5400' "$vm_provisioner" \
+    || ! grep -F -q 'cold_boot_timeout=3600' "$vm_provisioner" \
+    || ! grep -F -q 'ssh_timeout=3600' tools/run-distro-vm-test.sh \
+    || ! grep -F -q 'grep -F -q VAULTLINK_VM_READY "$evidence/serial.log"' tools/run-distro-vm-test.sh \
+    || ! grep -F -q 'full-system QEMU exited with status' tools/run-distro-vm-test.sh \
+    || ! grep -F -q 'root filesystem is smaller than the reviewed minimum' "$root_capacity_check"; then
+    report "guest images must enforce reviewed capacity and a removable Fedora arm64 TCG device-timeout override"
+fi
+if ! grep -F -q "arch_time_sync_command='systemctl mask systemd-time-wait-sync.service" "$vm_provisioner" \
+    || ! grep -F -q "arch_time_sync_verify='test -L /etc/systemd/system/systemd-time-wait-sync.service" "$vm_provisioner" \
+    || ! grep -F -q 'readlink /etc/systemd/system/systemd-time-wait-sync.service' tools/distro-vm-guest-smoke.sh \
+    || ! grep -F -q 'systemctl is-enabled systemd-time-wait-sync.service | grep -F -x -q masked' tools/distro-vm-guest-smoke.sh \
+    || ! grep -F -q 'systemctl show -p LoadState --value systemd-time-wait-sync.service' tools/distro-vm-guest-smoke.sh \
+    || ! grep -F -q 'systemctl is-enabled systemd-timesyncd.service' tools/distro-vm-guest-smoke.sh \
+    || ! grep -F -q 'clock_source=qemu-rtc' tools/run-distro-vm-test.sh; then
+    report "the egressless Arch test guest must not block indefinitely on external time synchronization"
+fi
+
 package_build_job=$(awk '
     $0 == "  build:" { selected = 1 }
     selected && /^  [[:alnum:]_-]+:$/ && $0 != "  build:" { exit }

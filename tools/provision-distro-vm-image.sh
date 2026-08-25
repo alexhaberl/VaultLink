@@ -27,6 +27,24 @@ done
 distribution=$(python3 tools/package-targets.py get "$target_id" distribution --allow-unprovisioned)
 distribution_version=$(python3 tools/package-targets.py get "$target_id" version --allow-unprovisioned)
 architecture=$(python3 tools/package-targets.py get "$target_id" architecture --allow-unprovisioned)
+reviewed_virtual_size=8589934592
+minimum_root_size=6979321856
+minimum_root_available=2147483648
+minimum_verified_available=1073741824
+provision_timeout=2700
+cold_boot_timeout=1200
+tcg_timeout_override=false
+arch_time_sync_command=:
+arch_time_sync_verify=:
+if [ "$target_id" = fedora44-arm64 ]; then
+    provision_timeout=5400
+    cold_boot_timeout=3600
+    tcg_timeout_override=true
+fi
+if [ "$target_id" = archlinux-amd64 ]; then
+    arch_time_sync_command='systemctl mask systemd-time-wait-sync.service; test -L /etc/systemd/system/systemd-time-wait-sync.service; readlink /etc/systemd/system/systemd-time-wait-sync.service | grep -F -x -q /dev/null; systemctl is-enabled systemd-time-wait-sync.service | grep -F -x -q masked; if systemctl is-enabled systemd-timesyncd.service 2>/dev/null | grep -F -x -q masked; then exit 70; fi'
+    arch_time_sync_verify='test -L /etc/systemd/system/systemd-time-wait-sync.service; readlink /etc/systemd/system/systemd-time-wait-sync.service | grep -F -x -q /dev/null; systemctl is-enabled systemd-time-wait-sync.service | grep -F -x -q masked; systemctl show -p LoadState --value systemd-time-wait-sync.service | grep -F -x -q masked; systemctl show -p ActiveState --value systemd-time-wait-sync.service | grep -F -x -q inactive; if systemctl --quiet is-failed systemd-time-wait-sync.service; then exit 70; fi; if systemctl is-enabled systemd-timesyncd.service 2>/dev/null | grep -F -x -q masked; then exit 70; fi'
+fi
 work=$(mktemp -d)
 qemu_pid=
 cleanup() {
@@ -53,6 +71,11 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+qcow2_virtual_size() {
+    qemu-img info --output=json "$1" | python3 -c \
+        'import json,sys; d=json.load(sys.stdin); s=d.get("virtual-size"); print(s) if d.get("format") == "qcow2" and type(s) is int and s > 0 else sys.exit(70)'
+}
 
 case "$distribution" in
     debian | ubuntu)
@@ -129,6 +152,13 @@ EOF
 esac
 chmod 0755 "$work/install-packages.sh"
 package_script_b64=$(base64 -w0 "$work/install-packages.sh")
+capacity_script=tools/check-vm-root-capacity.sh
+[ -f "$capacity_script" ] && [ ! -L "$capacity_script" ] || exit 66
+capacity_script_b64=$(base64 -w0 "$capacity_script")
+tcg_cleanup_command=:
+if [ "$tcg_timeout_override" = true ]; then
+    tcg_cleanup_command=/usr/local/sbin/vaultlink-clear-tcg-device-timeout
+fi
 
 cat >"$work/meta-data" <<EOF
 instance-id: vaultlink-image-$target_id
@@ -138,6 +168,11 @@ cat >"$work/user-data" <<EOF
 #cloud-config
 package_update: false
 package_upgrade: false
+growpart:
+  mode: auto
+  devices: ['/']
+  ignore_growroot_disabled: false
+resize_rootfs: true
 output:
   all: '| tee -a /var/log/cloud-init-output.log /dev/console'
 write_files:
@@ -150,8 +185,13 @@ write_files:
     permissions: '0700'
     encoding: b64
     content: '$package_script_b64'
+  - path: /usr/local/sbin/vaultlink-check-root-capacity
+    owner: root:root
+    permissions: '0700'
+    encoding: b64
+    content: '$capacity_script_b64'
 runcmd:
-  - [ sh, -c, "set -eu; /usr/local/sbin/vaultlink-provision-packages; if command -v dpkg-query >/dev/null; then dpkg-query -W -f='\${binary:Package}=\${Version}\\n' | LC_ALL=C sort >/usr/local/share/vaultlink-vm-packages.lock; elif command -v rpm >/dev/null; then rpm -qa --qf '%{NAME}=%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n' | LC_ALL=C sort >/usr/local/share/vaultlink-vm-packages.lock; else pacman -Q | LC_ALL=C sort >/usr/local/share/vaultlink-vm-packages.lock; fi; chmod 0644 /usr/local/share/vaultlink-vm-packages.lock; hash=\$(sha256sum /usr/local/share/vaultlink-vm-packages.lock | awk '{print \$1}'); lock=\$(base64 -w0 /usr/local/share/vaultlink-vm-packages.lock); echo \$hash >/usr/local/share/vaultlink-vm-packages.sha256; echo VAULTLINK_VM_PACKAGES_SHA256_$target_id=\$hash | tee /dev/console; echo VAULTLINK_VM_PACKAGES_LOCK_$target_id=\$lock | tee /dev/console; echo VAULTLINK_VM_PROVISIONED_$target_id | tee /dev/console" ]
+  - [ sh, -c, "set -eu; $tcg_cleanup_command; /usr/local/sbin/vaultlink-check-root-capacity $minimum_root_size $minimum_root_available; rm -f /usr/local/sbin/vaultlink-check-root-capacity; /usr/local/sbin/vaultlink-provision-packages; rm -f /usr/local/sbin/vaultlink-provision-packages; $arch_time_sync_command; if command -v dpkg-query >/dev/null; then dpkg-query -W -f='\${binary:Package}=\${Version}\\n' | LC_ALL=C sort >/usr/local/share/vaultlink-vm-packages.lock; elif command -v rpm >/dev/null; then rpm -qa --qf '%{NAME}=%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n' | LC_ALL=C sort >/usr/local/share/vaultlink-vm-packages.lock; else pacman -Q | LC_ALL=C sort >/usr/local/share/vaultlink-vm-packages.lock; fi; chmod 0644 /usr/local/share/vaultlink-vm-packages.lock; hash=\$(sha256sum /usr/local/share/vaultlink-vm-packages.lock | awk '{print \$1}'); lock=\$(base64 -w0 /usr/local/share/vaultlink-vm-packages.lock); echo \$hash >/usr/local/share/vaultlink-vm-packages.sha256; echo VAULTLINK_VM_PACKAGES_SHA256_$target_id=\$hash | tee /dev/console; echo VAULTLINK_VM_PACKAGES_LOCK_$target_id=\$lock | tee /dev/console; echo VAULTLINK_VM_PROVISIONED_$target_id | tee /dev/console" ]
   - [ sync ]
 power_state:
   delay: now
@@ -162,9 +202,22 @@ power_state:
 EOF
 
 cloud-localds "$work/seed.img" "$work/user-data" "$work/meta-data"
-qemu-img info --output=json "$source_image" | grep -F -q '"format": "qcow2"'
+source_virtual_size=$(qcow2_virtual_size "$source_image")
 qemu-img check "$source_image"
 qemu-img create -q -f qcow2 -F qcow2 -b "$source_image" "$work/overlay.qcow2"
+overlay_virtual_size=$(qcow2_virtual_size "$work/overlay.qcow2")
+case "$overlay_virtual_size" in ''|*[!0-9]*) exit 70 ;; esac
+[ "$overlay_virtual_size" -eq "$source_virtual_size" ] || exit 70
+[ "$overlay_virtual_size" -le "$reviewed_virtual_size" ] || {
+    echo "upstream guest exceeds the reviewed virtual size" >&2
+    exit 70
+}
+if [ "$overlay_virtual_size" -lt "$reviewed_virtual_size" ]; then
+    qemu-img resize -q "$work/overlay.qcow2" "$reviewed_virtual_size"
+fi
+[ "$(qcow2_virtual_size "$work/overlay.qcow2")" \
+    -eq "$reviewed_virtual_size" ]
+qemu-img check "$work/overlay.qcow2"
 
 case "$architecture" in
     amd64)
@@ -194,6 +247,10 @@ if [ "$architecture" = amd64 ] \
     acceleration=kvm
     acceleration_args='-accel kvm -cpu host'
 fi
+if [ "$tcg_timeout_override" = true ]; then
+    [ "$acceleration" = tcg ]
+    sh tools/manage-tcg-device-timeout.sh inject "$work/overlay.qcow2"
+fi
 
 # Word splitting is intentional only for the fixed QEMU arguments. Guests do
 # not network boot; romfile= disables only the unused PXE option ROM.
@@ -207,7 +264,7 @@ $qemu $machine_args $firmware_args $acceleration_args \
     >"$work/serial.log" 2>&1 &
 qemu_pid=$!
 
-deadline=$(( $(date +%s) + 2700 ))
+deadline=$(( $(date +%s) + provision_timeout ))
 while kill -0 "$qemu_pid" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
         tail -n 2000 "$work/serial.log" >&2 || true
@@ -231,6 +288,9 @@ grep -F -q "VAULTLINK_VM_PROVISIONED_$target_id" "$work/serial.log" || {
     echo "guest did not report successful provisioning" >&2
     exit 70
 }
+if [ "$tcg_timeout_override" = true ]; then
+    sh tools/manage-tcg-device-timeout.sh assert-clean "$work/overlay.qcow2"
+fi
 packages_sha256=$(sed -n \
     "s/^.*VAULTLINK_VM_PACKAGES_SHA256_$target_id=\([0-9a-f][0-9a-f]*\).*$/\1/p" \
     "$work/serial.log" | tail -n 1)
@@ -254,6 +314,7 @@ LC_ALL=C sort -c "$output_image.packages.lock"
 qemu-img convert -q -O qcow2 -o compat=1.1,lazy_refcounts=off \
     "$work/overlay.qcow2" "$output_image"
 qemu-img check "$output_image"
+[ "$(qcow2_virtual_size "$output_image")" -eq "$reviewed_virtual_size" ]
 
 # Cold-boot the converted image with QEMU's restricted user-mode network. Its
 # internal DHCP service lets distro wait-online units complete, while
@@ -296,8 +357,13 @@ write_files:
     permissions: '0700'
     encoding: b64
     content: '$verify_os_b64'
+  - path: /usr/local/sbin/vaultlink-check-root-capacity
+    owner: root:root
+    permissions: '0700'
+    encoding: b64
+    content: '$capacity_script_b64'
 runcmd:
-  - [ sh, -c, "set -eu; /usr/local/sbin/vaultlink-verify-os; test \"\$(cat /usr/local/share/vaultlink-vm-target)\" = \"$target_id\"; test \"\$(sha256sum /usr/local/share/vaultlink-vm-packages.lock | awk '{print \$1}')\" = \"$packages_sha256\"; LC_ALL=C sort -c /usr/local/share/vaultlink-vm-packages.lock; if command -v dpkg-query >/dev/null; then dpkg-query -W -f='\${binary:Package}=\${Version}\\n' | LC_ALL=C sort >/run/vaultlink-vm-packages.live; elif command -v rpm >/dev/null; then rpm -qa --qf '%{NAME}=%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n' | LC_ALL=C sort >/run/vaultlink-vm-packages.live; else pacman -Q | LC_ALL=C sort >/run/vaultlink-vm-packages.live; fi; cmp /usr/local/share/vaultlink-vm-packages.lock /run/vaultlink-vm-packages.live; rm -f /run/vaultlink-vm-packages.live; echo VAULTLINK_VM_COLD_BOOT_VERIFIED_$target_id | tee /dev/console" ]
+  - [ sh, -c, "set -eu; $tcg_cleanup_command; /usr/local/sbin/vaultlink-check-root-capacity $minimum_root_size $minimum_verified_available; rm -f /usr/local/sbin/vaultlink-check-root-capacity; /usr/local/sbin/vaultlink-verify-os; rm -f /usr/local/sbin/vaultlink-verify-os; $arch_time_sync_verify; test \"\$(cat /usr/local/share/vaultlink-vm-target)\" = \"$target_id\"; test \"\$(sha256sum /usr/local/share/vaultlink-vm-packages.lock | awk '{print \$1}')\" = \"$packages_sha256\"; LC_ALL=C sort -c /usr/local/share/vaultlink-vm-packages.lock; if command -v dpkg-query >/dev/null; then dpkg-query -W -f='\${binary:Package}=\${Version}\\n' | LC_ALL=C sort >/run/vaultlink-vm-packages.live; elif command -v rpm >/dev/null; then rpm -qa --qf '%{NAME}=%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n' | LC_ALL=C sort >/run/vaultlink-vm-packages.live; else pacman -Q | LC_ALL=C sort >/run/vaultlink-vm-packages.live; fi; cmp /usr/local/share/vaultlink-vm-packages.lock /run/vaultlink-vm-packages.live; rm -f /run/vaultlink-vm-packages.live; echo VAULTLINK_VM_COLD_BOOT_VERIFIED_$target_id | tee /dev/console" ]
   - [ sync ]
 power_state:
   delay: now
@@ -310,6 +376,9 @@ cloud-localds "$work/verify-seed.img" \
     "$work/verify-user-data" "$work/verify-meta-data"
 qemu-img create -q -f qcow2 -F qcow2 -b "$output_image" \
     "$work/verify-overlay.qcow2"
+if [ "$tcg_timeout_override" = true ]; then
+    sh tools/manage-tcg-device-timeout.sh inject "$work/verify-overlay.qcow2"
+fi
 # shellcheck disable=SC2086
 $qemu $machine_args $firmware_args $acceleration_args \
     -smp 4 -m 6144 -nographic -no-reboot \
@@ -319,7 +388,7 @@ $qemu $machine_args $firmware_args $acceleration_args \
     -device virtio-net-pci,netdev=verify-net,romfile= \
     >"$work/verify-serial.log" 2>&1 &
 qemu_pid=$!
-deadline=$(( $(date +%s) + 1200 ))
+deadline=$(( $(date +%s) + cold_boot_timeout ))
 while kill -0 "$qemu_pid" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
         tail -n 2000 "$work/verify-serial.log" >&2 || true
@@ -344,11 +413,17 @@ grep -F -q "VAULTLINK_VM_COLD_BOOT_VERIFIED_$target_id" \
         echo "converted guest failed cold-boot verification" >&2
         exit 70
     }
+if [ "$tcg_timeout_override" = true ]; then
+    sh tools/manage-tcg-device-timeout.sh assert-clean \
+        "$work/verify-overlay.qcow2"
+fi
 
 chmod 0644 "$output_image"
 printf '%s\n' "$packages_sha256" >"$output_image.packages.sha256"
 printf '%s\n' "$acceleration" >"$output_image.acceleration"
 printf '%s\n' true >"$output_image.cold-boot-verified"
+printf '%s\n' "$reviewed_virtual_size" >"$output_image.virtual-size"
 chmod 0644 "$output_image.packages.lock" "$output_image.packages.sha256" \
-    "$output_image.acceleration" "$output_image.cold-boot-verified"
+    "$output_image.acceleration" "$output_image.cold-boot-verified" \
+    "$output_image.virtual-size"
 echo "provisioned distro VM $target_id"

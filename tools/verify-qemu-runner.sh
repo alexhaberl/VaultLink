@@ -107,6 +107,20 @@ for required_command in base64 cloud-localds cmp dpkg-query qemu-img scp sha256s
         || fail "required harness command is missing: $required_command"
 done
 if [ "$architecture" = arm64 ]; then
+    command -v guestfish >/dev/null \
+        || fail "arm64 QEMU runner is missing guestfish"
+    printf '%s\n' vaultlink-guestfish-probe >"$work/guestfish-probe.expected"
+    LIBGUESTFS_BACKEND=direct guestfish \
+        -N "$work/guestfish-probe.img=fs:ext4:64M" -m /dev/sda1 \
+        >"$work/guestfish-probe.features" <<EOF
+feature-available selinuxrelabel
+upload $work/guestfish-probe.expected /vaultlink-probe
+download /vaultlink-probe $work/guestfish-probe.actual
+EOF
+    [ "$(cat "$work/guestfish-probe.features")" = true ] \
+        || fail "arm64 QEMU runner lacks guestfish SELinux relabel support"
+    cmp "$work/guestfish-probe.expected" "$work/guestfish-probe.actual" \
+        || fail "arm64 QEMU runner guestfish write/read probe failed"
     [ -r /usr/share/AAVMF/AAVMF_CODE.fd ] \
         || [ -r /usr/share/qemu-efi-aarch64/QEMU_EFI.fd ] \
         || fail "AArch64 UEFI firmware is missing"
