@@ -158,6 +158,8 @@ run_scp() {
 }
 ssh_readiness_error="$work/ssh-readiness.stderr"
 capture_readiness_diagnostic() {
+    install -m 0644 "$ssh_readiness_error" \
+        "$evidence/ssh-readiness-last.stderr"
     ssh_status=0
     run_ssh -vv vaultlink-ci@127.0.0.1 true \
         >/dev/null 2>"$evidence/ssh-readiness-diagnostic.stderr" \
@@ -173,10 +175,15 @@ capture_readiness_diagnostic() {
     printf 'ssh_status=%s\nready_marker_present=%s\nqemu_alive=%s\n' \
         "$ssh_status" "$ready_marker_present" "$qemu_alive" \
         >"$evidence/ssh-readiness.env"
-    if [ "$ssh_status" -eq 0 ] && [ "$ready_marker_present" = true ]; then
+    if [ "$ssh_status" -eq 0 ] && [ "$ready_marker_present" = true ] \
+        && [ "$qemu_alive" = true ]; then
         return 0
     fi
     echo "$1" >&2
+    if [ -s "$evidence/ssh-readiness-last.stderr" ]; then
+        echo "last SSH readiness probe:" >&2
+        cat "$evidence/ssh-readiness-last.stderr" >&2 || true
+    fi
     echo "SSH readiness diagnostic:" >&2
     cat "$evidence/ssh-readiness-diagnostic.stderr" >&2 || true
     echo "last 200 serial log lines:" >&2

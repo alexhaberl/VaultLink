@@ -975,14 +975,21 @@ if [ "$(grep -F -x -c 'ssh_deletekeys: true' "$vm_harness" || true)" -ne 1 ] \
     || [ "$(grep -F -x -c '  ed25519_public: |' "$vm_harness" || true)" -ne 1 ] \
     || ! grep -F -q 'host_private=$(sed '\''s/^/    /'\'' "$work/host-key")' "$vm_harness" \
     || ! grep -F -q 'host_public=$(sed '\''s/^/    /'\'' "$work/host-key.pub")' "$vm_harness" \
+    || [ "$(grep -F -x -c '$host_private' "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c '$host_public' "$vm_harness" || true)" -ne 1 ] \
+    || ! grep -F -q '$(cat "$work/host-key.pub")" >"$work/known_hosts"' "$vm_harness" \
     || [ "$(grep -F -c 'HostKeyAlgorithms=ssh-ed25519' "$vm_harness" || true)" -ne 2 ] \
     || [ "$(grep -F -c 'StrictHostKeyChecking=yes' "$vm_harness" || true)" -ne 2 ] \
     || [ "$(grep -F -c 'UserKnownHostsFile=$work/known_hosts' "$vm_harness" || true)" -ne 2 ] \
     || grep -F -q 'path: /etc/ssh/ssh_host_' "$vm_harness" \
+    || ! grep -F -q 'install -m 0644 "$ssh_readiness_error"' "$vm_harness" \
+    || ! grep -F -q 'cat "$evidence/ssh-readiness-last.stderr" >&2 || true' "$vm_harness" \
     || ! grep -F -q 'ssh-readiness-diagnostic.stderr' "$vm_harness" \
     || ! grep -F -q 'run_ssh -vv vaultlink-ci@127.0.0.1 true' "$vm_harness" \
     || ! grep -F -q 'ready_marker_present=' "$vm_harness" \
     || ! grep -F -q 'qemu_alive=' "$vm_harness" \
+    || ! grep -F -q '&& [ "$qemu_alive" = true ]; then' "$vm_harness" \
+    || ! grep -F -q 'tail -n 200 "$evidence/serial.log" >&2 || true' "$vm_harness" \
     || ! grep -F -q 'SSH readiness timed out after ${ssh_timeout}s' "$vm_harness" \
     || ! grep -F -q 'full-system QEMU exited before SSH readiness' "$vm_harness"; then
     report "distro VM SSH must use a cloud-init-managed ephemeral Ed25519 host key with fail-closed diagnostics"
