@@ -10,6 +10,7 @@
 - Enabled repository-level immutable releases and made the tag workflow verify the published immutable state, preventing future 0.6.0+ package assets from being replaced or individually deleted.
 - Fixed Git ownership validation for the containerized tag-publishing job and documented the controlled `v0.5.0` recovery publication.
 - Refreshed the shared Rust 1.97.1 Debian container base digest for subsequent development builds.
+- Preserved audit evidence below the retention cap by preventing negative SQLite deletion limits, and hardened package smoke cleanup so installed service identities survive its negative probes.
 
 ## 0.5.0 — 2026-08-24
 

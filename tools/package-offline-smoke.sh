@@ -39,6 +39,8 @@ cd "$repo_root"
 [ -f "$package" ] && [ ! -L "$package" ] || fail "package input is unsafe"
 sh tools/verify-package-builder.sh "$target_id"
 sh tools/package-container-smoke.sh "$target_id" "$version" "$package"
+id vaultlink >/dev/null 2>&1 \
+    || fail "package lifecycle smoke did not preserve the service identity"
 
 systemd-analyze verify \
     /usr/lib/systemd/system/vaultlink.service \

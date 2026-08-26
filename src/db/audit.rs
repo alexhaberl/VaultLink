@@ -93,7 +93,10 @@ impl Database {
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let count: i64 =
                 transaction.query_row("SELECT COUNT(*) FROM audit", [], |row| row.get(0))?;
-            let excess = count.saturating_sub(MAX_AUDIT_ROWS);
+            // `count` is signed because SQLite returns INTEGER. A signed
+            // saturating subtraction can still be negative below the cap,
+            // and SQLite treats a negative LIMIT as unlimited.
+            let excess = count.saturating_sub(MAX_AUDIT_ROWS).max(0);
             if excess == 0 {
                 transaction.commit()?;
                 break;
