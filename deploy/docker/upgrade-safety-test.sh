@@ -48,6 +48,15 @@ create_service_account() {
     fi
 }
 
+seed_inherited_nonfixture_binary() {
+    install -d -o root -g vaultlink -m 0750 /opt/vaultlink
+    # Deliberately invalid UTF-8 models the real ELF left by package smoke and
+    # makes the fixture fail if startup ever reads inherited live state again.
+    printf '\177ELF\377package-smoke\n' >/opt/vaultlink/vaultlink
+    chown root:vaultlink /opt/vaultlink/vaultlink
+    chmod 0755 /opt/vaultlink/vaultlink
+}
+
 create_mocks() {
     rm -rf "$TEST_ROOT"
     mkdir -p "$MOCK_BIN" "$MOCK_STATE_DIR"
@@ -1082,7 +1091,9 @@ test_rollback_recovery_stop_failure_stays_fail_closed() {
 
 create_service_account
 create_mocks
+seed_inherited_nonfixture_binary
 export PATH="$MOCK_BIN:$PATH"
+initialize_live original original
 start_health_server
 
 test_upgrade_success
