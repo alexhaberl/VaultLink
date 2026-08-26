@@ -39,3 +39,9 @@ MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETGID CAP_SETUID
+# NoNewPrivileges prevents a normal exec chain from repopulating capabilities
+# solely from the bounding set. Preserve exactly the bounded transaction set
+# across package-manager/scriptlet execs; runuser drops permitted, effective,
+# and ambient capabilities before executing the untrusted candidate as
+# vaultlink, which the full-system gate verifies.
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETGID CAP_SETUID

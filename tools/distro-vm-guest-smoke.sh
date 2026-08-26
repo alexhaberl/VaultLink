@@ -207,13 +207,102 @@ verify_install
 
 sh /tmp/distro-vm-runtime-smoke.sh "$target_id" /tmp/vaultlink-vm-evidence
 
-# Exercise the real systemd sandbox and distribution package hooks without
-# network access. The temporary drop-in replaces only ExecStart and performs a
-# same-package reinstall from a protected local copy; all other unit hardening
-# remains exactly as shipped.
+# Exercise the real systemd sandbox and first prove that its bounded ambient
+# transaction capabilities do not survive the runuser boundary. The candidate
+# still runs as the exact service identity with no permitted, effective, or
+# ambient capabilities and with no-new-privileges set.
 unit_probe_dir=/var/lib/vaultlink-backups/unit-package-probe
 unit_dropin=/etc/systemd/system/vaultlink-update.service.d/90-package-gate.conf
+unit_credential_probe=/usr/local/sbin/vaultlink-update-credential-probe
+unit_credential_state=/var/lib/vaultlink/update-unit-credential.env
 install -d -o root -g root -m 0700 "$unit_probe_dir"
+cat >"$unit_credential_probe" <<'EOF'
+#!/bin/sh
+set -eu
+LC_ALL=C
+LANG=C
+export LC_ALL LANG
+umask 077
+
+output=/var/lib/vaultlink/update-unit-credential.env
+[ ! -e "$output" ] && [ ! -L "$output" ] || exit 77
+service_uid=$(id -u vaultlink)
+service_gid=$(id -g vaultlink)
+[ "$(id -u)" = "$service_uid" ]
+[ "$(id -g)" = "$service_gid" ]
+[ "$(id -G)" = "$service_gid" ]
+status_field() {
+    field=$1
+    values=$(sed -n "s/^${field}:[[:space:]]*//p" /proc/self/status)
+    [ "$(printf '%s\n' "$values" | grep -c .)" -eq 1 ] || exit 77
+    printf '%s\n' "$values" | awk '{$1=$1; print}'
+}
+status_uid=$(status_field Uid)
+status_gid=$(status_field Gid)
+cap_inheritable=$(status_field CapInh)
+cap_permitted=$(status_field CapPrm)
+cap_effective=$(status_field CapEff)
+cap_bounding=$(status_field CapBnd)
+cap_ambient=$(status_field CapAmb)
+no_new_privileges=$(status_field NoNewPrivs)
+[ "$status_uid" = "$service_uid $service_uid $service_uid $service_uid" ]
+[ "$status_gid" = "$service_gid $service_gid $service_gid $service_gid" ]
+[ "$cap_inheritable" = 00000000000000cf ]
+[ "$cap_permitted" = 0000000000000000 ]
+[ "$cap_effective" = 0000000000000000 ]
+[ "$cap_bounding" = 00000000000000cf ]
+[ "$cap_ambient" = 0000000000000000 ]
+[ "$no_new_privileges" = 1 ]
+printf 'uid=%s\ngid=%s\ncap_inheritable=%s\ncap_permitted=%s\ncap_effective=%s\ncap_bounding=%s\ncap_ambient=%s\nno_new_privileges=%s\n' \
+    "$service_uid" "$service_gid" "$cap_inheritable" "$cap_permitted" \
+    "$cap_effective" "$cap_bounding" "$cap_ambient" \
+    "$no_new_privileges" >"$output"
+EOF
+chown root:root "$unit_credential_probe"
+chmod 0755 "$unit_credential_probe"
+install -d -o root -g root -m 0755 "$(dirname "$unit_dropin")"
+cat >"$unit_dropin" <<EOF
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/runuser -u vaultlink -- $unit_credential_probe
+EOF
+chown root:root "$unit_dropin"
+chmod 0644 "$unit_dropin"
+systemctl daemon-reload
+systemctl show vaultlink-update.service --no-pager \
+    -p NoNewPrivileges -p CapabilityBoundingSet -p AmbientCapabilities \
+    -p SecureBits \
+    > /tmp/vaultlink-vm-evidence/update-unit-sandbox.env
+grep -F -x -q 'NoNewPrivileges=yes' \
+    /tmp/vaultlink-vm-evidence/update-unit-sandbox.env
+grep -F -x -q \
+    'CapabilityBoundingSet=cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_setgid cap_setuid' \
+    /tmp/vaultlink-vm-evidence/update-unit-sandbox.env
+grep -F -x -q \
+    'AmbientCapabilities=cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_setgid cap_setuid' \
+    /tmp/vaultlink-vm-evidence/update-unit-sandbox.env
+grep -F -x -q 'SecureBits=0' \
+    /tmp/vaultlink-vm-evidence/update-unit-sandbox.env
+if ! systemctl start vaultlink-update.service; then
+    journalctl -u vaultlink-update.service --no-pager \
+        > /tmp/vaultlink-vm-evidence/update-unit-credential.journal
+    exit 77
+fi
+install -o root -g root -m 0644 "$unit_credential_state" \
+    /tmp/vaultlink-vm-evidence/update-unit-credential.env
+grep -F -x -q 'cap_permitted=0000000000000000' \
+    /tmp/vaultlink-vm-evidence/update-unit-credential.env
+grep -F -x -q 'cap_effective=0000000000000000' \
+    /tmp/vaultlink-vm-evidence/update-unit-credential.env
+grep -F -x -q 'cap_ambient=0000000000000000' \
+    /tmp/vaultlink-vm-evidence/update-unit-credential.env
+grep -F -x -q 'no_new_privileges=1' \
+    /tmp/vaultlink-vm-evidence/update-unit-credential.env
+rm -f "$unit_credential_state" "$unit_credential_probe"
+
+# Replace only ExecStart again and perform a same-package reinstall from a
+# protected local copy. All shipped sandboxing remains in force and the native
+# package manager plus its distro scriptlets must complete without network.
 unit_probe_package="$unit_probe_dir/$(basename "$package")"
 install -o root -g root -m 0600 "$package" "$unit_probe_package"
 case "$package_format" in
@@ -222,7 +311,6 @@ case "$package_format" in
     pkg.tar.zst) unit_probe_command="/usr/bin/pacman -U --noconfirm $unit_probe_package" ;;
     *) exit 65 ;;
 esac
-install -d -o root -g root -m 0755 "$(dirname "$unit_dropin")"
 cat >"$unit_dropin" <<EOF
 [Service]
 ExecStart=
@@ -251,7 +339,8 @@ rm -f "$unit_dropin"
 rm -rf "$unit_probe_dir"
 systemctl daemon-reload
 
-install -d -m 0750 /etc/vaultlink /var/lib/vaultlink /var/lib/vaultlink-backups
+install -d -m 0750 /etc/vaultlink /var/lib/vaultlink
+[ "$(stat -c '%u:%g:%a' /var/lib/vaultlink-backups)" = 0:0:700 ]
 printf preserved >/etc/vaultlink/vm-smoke-preserve
 printf preserved >/var/lib/vaultlink/vm-smoke-preserve
 printf preserved >/var/lib/vaultlink-backups/vm-smoke-preserve

@@ -118,6 +118,9 @@ package_workflow=.github/workflows/packages.yml
 real_package_smoke=tools/real-package-update-smoke.sh
 vm_harness=tools/run-distro-vm-test.sh
 vm_guest_smoke=tools/distro-vm-guest-smoke.sh
+vm_runtime_smoke=tools/distro-vm-runtime-smoke.sh
+load_test=tools/load-test.sh
+api_smoke=deploy/docker/api-smoke.sh
 vm_bootstrap_runcmd="  - [ /usr/local/sbin/vaultlink-vm-bootstrap, '\$tcg_cleanup_command' ]"
 
 if ! python3 tools/package-targets.py validate --allow-unprovisioned >/dev/null; then
@@ -399,6 +402,18 @@ if ! grep -F -q 'deb) dpkg --install' "$updater" \
     || ! grep -F -q 'auto_install=false' deploy/vaultlink-update.conf.example \
     || ! grep -F -x -q 'ConditionPathExists=/usr/share/vaultlink/install-method.env' deploy/vaultlink-update.service; then
     report "the updater must use each native package manager and remain opt-in/package-bound"
+fi
+update_service=deploy/vaultlink-update.service
+update_capabilities='CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETGID CAP_SETUID'
+if [ "$(grep -c '^NoNewPrivileges=' "$update_service" || true)" -ne 1 ] \
+    || ! grep -F -x -q 'NoNewPrivileges=true' "$update_service" \
+    || [ "$(grep -c '^CapabilityBoundingSet=' "$update_service" || true)" -ne 1 ] \
+    || ! grep -F -x -q "CapabilityBoundingSet=$update_capabilities" "$update_service" \
+    || [ "$(grep -c '^AmbientCapabilities=' "$update_service" || true)" -ne 1 ] \
+    || ! grep -F -x -q "AmbientCapabilities=$update_capabilities" "$update_service" \
+    || grep -q '^SecureBits=' "$update_service" \
+    || grep -F -x -q 'NoNewPrivileges=false' "$update_service"; then
+    report "the root update transaction must preserve only its bounded capabilities across exec while retaining no-new-privileges"
 fi
 
 arch_installer=packaging/vaultlink-package-install.sh
@@ -970,6 +985,118 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q 'kernel-audit.journal' tools/distro-vm-runtime-smoke.sh \
     || ! grep -F -q 'VaultLink-related AVC denial' tools/distro-vm-runtime-smoke.sh; then
     report "all nine packages need offline lifecycle gates and restricted full-system QEMU/load/SELinux gates"
+fi
+if ! grep -F -q 'section == "[reverse_proxy]" && $0 == "enabled = false"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'runtime_mount_base=/mnt/storage' "$vm_runtime_smoke" \
+    || ! grep -F -q 'runtime_root=$runtime_mount_base/shared' "$vm_runtime_smoke" \
+    || ! grep -F -q 'runtime_internal=$runtime_mount_base/.vaultlink-internal' "$vm_runtime_smoke" \
+    || ! grep -F -q 'install -d -o vaultlink -g vaultlink -m 0700 "$runtime_internal"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'chmod 0700 "$runtime_internal"' "$vm_runtime_smoke" \
+    || ! grep -F -q '"$runtime_root/vaultlink-load" "$runtime_root/vaultlink-load/uploads"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'root_mount_path = "/mnt/storage/shared"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'internal_directory = "/mnt/storage/.vaultlink-internal"' "$vm_runtime_smoke" \
+    || grep -F -q 'internal_directory = "/mnt/.vaultlink-internal"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'function finish_storage()' "$vm_runtime_smoke" \
+    || ! grep -F -q 'print "expected_filesystem_type = \"ext4\""' "$vm_runtime_smoke" \
+    || ! grep -F -q 'print "expected_mount_source = \"/dev/vdb\""' "$vm_runtime_smoke" \
+    || ! grep -F -q 'storage_filesystem != 1 || storage_source != 1' "$vm_runtime_smoke" \
+    || ! grep -F -q 'print "enabled = true"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'section == "[reverse_proxy]" && /^trusted_proxies = /' "$vm_runtime_smoke" \
+    || ! grep -F -q 'print "trusted_proxies = [\"127.0.0.1\"]"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'if ($0 == "trusted_proxies = [") skipping_proxies = 1' "$vm_runtime_smoke" \
+    || ! grep -F -q 'if ($0 == "]") skipping_proxies = 0' "$vm_runtime_smoke" \
+    || ! grep -F -q 'section == "[reverse_proxy]" && $0 == "trust_x_forwarded_headers = false"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'print "trust_x_forwarded_headers = true"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'if (skipping_proxies || rewritten_enabled != 1' "$vm_runtime_smoke" \
+    || ! grep -F -q 'rewritten_proxies != 1 || rewritten_forwarded != 1' "$vm_runtime_smoke" \
+    || ! grep -F -q 'section == "[reverse_proxy]" && /^enabled[[:space:]]*=/' "$vm_runtime_smoke" \
+    || ! grep -F -q 'enabled_ok += ($0 == "enabled = true")' "$vm_runtime_smoke" \
+    || ! grep -F -q 'proxies_ok += ($0 == "trusted_proxies = [\"127.0.0.1\"]")' "$vm_runtime_smoke" \
+    || ! grep -F -q 'forwarded_ok += ($0 == "trust_x_forwarded_headers = true")' "$vm_runtime_smoke" \
+    || ! grep -F -q 'section == "[tls]" && /^enabled[[:space:]]*=/' "$vm_runtime_smoke" \
+    || ! grep -F -q 'tls_ok += ($0 == "enabled = false")' "$vm_runtime_smoke"; then
+    report "the distro VM runtime gate must build and verify minimal storage and section-scoped reverse-proxy configuration"
+fi
+vm_evidence_upload=$(awk '
+    $0 == "      - name: Upload full-system evidence" { selected = 1 }
+    selected { print }
+    selected && /^          retention-days:/ { exit }
+' .github/workflows/distro-vms.yml)
+if ! grep -F -q 'runtime_status=$?' "$vm_runtime_smoke" \
+    || ! grep -F -q 'trap finalize_runtime_evidence EXIT' "$vm_runtime_smoke" \
+    || ! grep -F -q 'rm -f "$evidence/cookies.txt" || true' "$vm_runtime_smoke" \
+    || ! grep -F -q 'runtime-command.env' "$vm_runtime_smoke" \
+    || ! grep -F -q 'runtime-failure-systemd.env' "$vm_runtime_smoke" \
+    || ! grep -F -q 'runtime-failure.journal' "$vm_runtime_smoke" \
+    || ! grep -F -q '2>"$evidence/readiness-last.stderr"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'totp_wait_seconds=$((31 - totp_epoch % 30))' "$vm_runtime_smoke" \
+    || ! grep -F -q 'sleep "$totp_wait_seconds"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'VAULTLINK_HEALTH_URL=http://127.0.0.1:18081/api/v2/health/ready' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_tmp="$runtime_mount_base/.distro-vm-load-work"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'install -d -o root -g root -m 0700 "$load_tmp"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'TMPDIR="$load_tmp"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'rmdir "$load_tmp"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'find "$evidence" -type d -exec chmod 0755 {} +' "$vm_runtime_smoke" \
+    || ! grep -F -q 'find "$evidence" -type f -exec chmod 0644 {} +' "$vm_runtime_smoke" \
+    || ! grep -F -q 'exit "$runtime_status"' "$vm_runtime_smoke" \
+    || ! grep -F -q '|| guest_smoke_status=$?' "$vm_harness" \
+    || ! grep -F -q '|| runtime_evidence_status=$?' "$vm_harness" \
+    || ! grep -F -q '|| guest_system_status=$?' "$vm_harness" \
+    || ! grep -F -q '|| sqlite_status=$?' "$vm_harness" \
+    || ! grep -F -q 'sudo sqlite3 /var/lib/vaultlink/data.sqlite "PRAGMA integrity_check;"' "$vm_harness" \
+    || grep -F -q 'name "*.sqlite*"' "$vm_harness" \
+    || ! grep -F -q 'guest-commands.env' "$vm_harness" \
+    || ! grep -F -q 'runtime-evidence-scp.stderr' "$vm_harness" \
+    || ! grep -F -q 'sudo journalctl -u vaultlink.service --no-pager' "$vm_harness" \
+    || ! grep -F -q 'tail -n 200 "$evidence/serial.log" >&2 || true' "$vm_harness" \
+    || ! grep -F -q 'exit "$guest_smoke_status"' "$vm_harness" \
+    || ! grep -F -q 'unit_credential_probe=/usr/local/sbin/vaultlink-update-credential-probe' "$vm_guest_smoke" \
+    || ! grep -F -q '[ "$cap_inheritable" = 00000000000000cf ]' "$vm_guest_smoke" \
+    || ! grep -F -q '[ "$cap_permitted" = 0000000000000000 ]' "$vm_guest_smoke" \
+    || ! grep -F -q '[ "$cap_effective" = 0000000000000000 ]' "$vm_guest_smoke" \
+    || ! grep -F -q '[ "$cap_bounding" = 00000000000000cf ]' "$vm_guest_smoke" \
+    || ! grep -F -q '[ "$cap_ambient" = 0000000000000000 ]' "$vm_guest_smoke" \
+    || ! grep -F -q '[ "$no_new_privileges" = 1 ]' "$vm_guest_smoke" \
+    || ! grep -F -q -- '-p NoNewPrivileges -p CapabilityBoundingSet -p AmbientCapabilities' "$vm_guest_smoke" \
+    || ! grep -F -q "'AmbientCapabilities=cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_setgid cap_setuid'" "$vm_guest_smoke" \
+    || ! grep -F -q "'SecureBits=0'" "$vm_guest_smoke" \
+    || ! grep -F -q 'update-unit-credential.env' "$vm_guest_smoke" \
+    || ! grep -F -q 'stat -c '\''%u:%g:%a'\'' /var/lib/vaultlink-backups' "$vm_guest_smoke" \
+    || grep -F -q 'install -d -m 0750 /etc/vaultlink /var/lib/vaultlink /var/lib/vaultlink-backups' "$vm_guest_smoke" \
+    || ! grep -F -q "grep -F -x -q 'stage=complete'" "$vm_harness" \
+    || ! grep -F -q "grep -F -x -q 'exit_status=0'" "$vm_harness" \
+    || ! grep -F -q 'load_evidence=$evidence/runtime/load' "$vm_harness" \
+    || ! grep -F -q 'metadata_rows=2000' "$vm_harness" \
+    || ! grep -F -q 'range_rows=40' "$vm_harness" \
+    || ! grep -F -q 'upload_rows=10' "$vm_harness" \
+    || ! grep -F -q "find \"\$load_evidence\" -type f -name '*.partial.*'" "$vm_harness" \
+    || ! grep -F -q 'load_exit_status=$?' "$load_test" \
+    || ! grep -F -q 'trap cleanup EXIT' "$load_test" \
+    || ! grep -F -q "trap 'exit 129' HUP" "$load_test" \
+    || ! grep -F -q 'persist_load_evidence "$load_exit_status"' "$load_test" \
+    || ! grep -F -q 'rm -f "$work/upload.bin" "$work"/range-*.bin' "$load_test" \
+    || ! grep -F -q 'metadata-load.partial.csv' "$load_test" \
+    || ! grep -F -q 'range-results.partial.csv' "$load_test" \
+    || ! grep -F -q 'upload-results.partial.csv' "$load_test" \
+    || ! grep -F -q 'cat "$work"/metadata-*.csv >"$work/metadata.csv"' "$load_test" \
+    || ! grep -F -q 'profile-status.env' "$load_test" \
+    || ! grep -F -q 'metadata_status=$metadata_status' "$load_test" \
+    || ! grep -F -q 'metadata_observed_p95_seconds=$observed_p95' "$load_test" \
+    || ! grep -F -q 'tail -n 80 "$SETUP_LOG" | sed' "$api_smoke" \
+    || ! grep -F -q "sed '/#token=/d' >&2 || true" "$api_smoke" \
+    || ! grep -F -q '[ ! -e "$evidence/runtime/cookies.txt" ]' "$vm_harness" \
+    || ! printf '%s\n' "$vm_evidence_upload" | grep -F -q '        if: always()' \
+    || ! printf '%s\n' "$vm_evidence_upload" | grep -F -q '            vm-test/${{ matrix.id }}/evidence' \
+    || ! printf '%s\n' "$vm_evidence_upload" | grep -F -q '          if-no-files-found: error'; then
+    report "distro VM failures must preserve sanitized partial evidence without masking the original guest status"
+fi
+metadata_aggregate_line=$(grep -n -F 'cat "$work"/metadata-*.csv >"$work/metadata.csv"' "$load_test" \
+    | cut -d: -f1 | head -n 1)
+metadata_failure_line=$(grep -n -F '[ "$metadata_failed" -eq 0 ] || return 1' "$load_test" \
+    | cut -d: -f1 | head -n 1)
+if [ -z "$metadata_aggregate_line" ] || [ -z "$metadata_failure_line" ] \
+    || [ "$metadata_aggregate_line" -ge "$metadata_failure_line" ]; then
+    report "metadata load failures must aggregate completed client results before returning"
 fi
 if [ "$(grep -F -x -c 'ssh_deletekeys: true' "$vm_harness" || true)" -ne 1 ] \
     || [ "$(grep -F -x -c 'ssh_keys:' "$vm_harness" || true)" -ne 1 ] \

@@ -124,8 +124,13 @@ install the complete dependency set manually.
 sysusers, tmpfiles, SELinux, and transaction hooks whose write set cannot be
 represented safely by a VaultLink-only `ReadWritePaths` list. The signed
 package, exact metadata and payload allowlists, dependency preflight, locks,
-and final parity checks form that write boundary. All unrelated namespace,
-device, kernel, process, and network hardening remains enabled.
+and final parity checks form that write boundary. `NoNewPrivileges=true`
+remains active. The six capabilities in the unit's bounding set are also its
+exact ambient set so they survive the updater, package-manager, and scriptlet
+exec chain. Before a candidate runs as `vaultlink`, `runuser` removes all
+permitted, effective, and ambient capabilities; booted VM gates inspect
+`/proc/self/status` to enforce that invariant. All unrelated namespace, device,
+kernel, process, and network hardening remains enabled.
 
 ## Transaction and automatic recovery
 

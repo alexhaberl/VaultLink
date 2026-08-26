@@ -64,6 +64,7 @@ soak_curl() {
 }
 
 work=$(mktemp -d)
+load_stage=initialization
 admission_holders=""
 stop_admission_holders() {
     for holder_pid in $admission_holders; do
@@ -74,11 +75,54 @@ stop_admission_holders() {
     done
     admission_holders=""
 }
-cleanup() {
-    stop_admission_holders
-    rm -rf "$work"
+persist_load_evidence() {
+    persist_status=$1
+    [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ] || return 0
+    mkdir -p "$LOAD_TEST_EVIDENCE_DIR" || return 1
+    load_command_tmp="$LOAD_TEST_EVIDENCE_DIR/.load-command.env.$$"
+    printf 'stage=%s\nexit_status=%s\n' "$load_stage" "$persist_status" \
+        >"$load_command_tmp" || return 1
+    chmod 0640 "$load_command_tmp" || return 1
+    mv "$load_command_tmp" "$LOAD_TEST_EVIDENCE_DIR/load-command.env" || return 1
+    [ "$persist_status" -ne 0 ] || return 0
+
+    for partial_evidence in \
+        'metadata.csv:metadata-load.partial.csv' \
+        'ranges.csv:range-results.partial.csv' \
+        'uploads.csv:upload-results.partial.csv' \
+        'rss-samples.csv:rss-samples.partial.csv' \
+        'metadata.p95:metadata-p95.partial.txt' \
+        'rss-failure:rss-failure.txt'; do
+        partial_source=${partial_evidence%%:*}
+        partial_destination=${partial_evidence#*:}
+        if [ -f "$work/$partial_source" ] && [ ! -L "$work/$partial_source" ]; then
+            install -m 0640 "$work/$partial_source" \
+                "$LOAD_TEST_EVIDENCE_DIR/$partial_destination" || return 1
+        fi
+    done
 }
-trap cleanup EXIT HUP INT TERM
+cleanup() {
+    load_exit_status=$?
+    trap - EXIT HUP INT TERM
+    set +e
+    stop_admission_holders
+    # Release the bounded but multi-gigabyte transient payloads before writing
+    # small failure evidence. This also keeps diagnostics available if TMPDIR
+    # itself reached its capacity during the parallel profile.
+    rm -f "$work/upload.bin" "$work"/range-*.bin \
+        "$work"/upload-*.readback "$work/snapshot-health.json"
+    evidence_exit_status=0
+    persist_load_evidence "$load_exit_status" || evidence_exit_status=$?
+    rm -rf "$work"
+    if [ "$load_exit_status" -eq 0 ] && [ "$evidence_exit_status" -ne 0 ]; then
+        load_exit_status=$evidence_exit_status
+    fi
+    exit "$load_exit_status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # Generate one fresh, non-sparse payload per profile. Reusing it for the ten
 # parallel uploads keeps generation bounded while detecting zero/sparse damage.
 dd if=/dev/urandom of="$work/upload.bin" bs=1M count=64 status=none
@@ -143,6 +187,7 @@ verify_forwarded_admission_identity() {
     }
 }
 
+load_stage=admission-identity
 verify_forwarded_admission_identity
 
 pid=$(systemctl show -p MainPID --value vaultlink.service 2>/dev/null || true)
@@ -185,6 +230,7 @@ load_snapshot() {
         >"$destination"
 }
 
+load_stage=pre-load-snapshot
 if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     mkdir -p "$LOAD_TEST_EVIDENCE_DIR"
     load_snapshot "$LOAD_TEST_EVIDENCE_DIR/pre-load.env"
@@ -224,8 +270,10 @@ metadata_profile() {
     for wait_pid in $metadata_pids; do
         wait "$wait_pid" || metadata_failed=1
     done
-    [ "$metadata_failed" -eq 0 ] || return 1
+    # Aggregate every completed client result before returning a profile
+    # failure so the EXIT evidence retains the available partial measurements.
     cat "$work"/metadata-*.csv >"$work/metadata.csv"
+    [ "$metadata_failed" -eq 0 ] || return 1
     [ "$(wc -l <"$work/metadata.csv")" -eq 2000 ] || return 1
     awk -F, '
         $1 !~ /^198\.18\.1\.[0-9]+$/ || $2 !~ /^2[0-9][0-9]$/ { exit 1 }
@@ -239,8 +287,8 @@ metadata_profile() {
     p95=$(awk -F, '{ print $3 }' "$work/metadata.csv" \
         | sort -n | awk 'NR == 1900 { print; exit }')
     [ -n "$p95" ] || return 1
-    awk -v p95="$p95" 'BEGIN { exit !(p95 < 2.000) }' || return 1
     printf '%s\n' "$p95" >"$work/metadata.p95"
+    awk -v p95="$p95" 'BEGIN { exit !(p95 < 2.000) }' || return 1
 }
 
 download_profile() {
@@ -372,6 +420,7 @@ rss_profile() {
 
 # All three pressure profiles overlap: 100 metadata clients, 40 validated
 # range streams, and ten uploads are active in the same load window.
+load_stage=parallel-profiles
 load_marker="$work/load-active"
 : >"$load_marker"
 metadata_profile &
@@ -397,14 +446,52 @@ while [ ! -e "$work/metadata-ready" ] \
     sleep 0.05
 done
 : >"$work/profile-go"
-profile_failed=0
-wait "$metadata_pid" || profile_failed=1
-wait "$download_pid" || profile_failed=1
-wait "$upload_pid" || profile_failed=1
+metadata_status=0
+download_status=0
+upload_status=0
+rss_status=0
+wait "$metadata_pid" || metadata_status=$?
+wait "$download_pid" || download_status=$?
+wait "$upload_pid" || upload_status=$?
 rm -f "$load_marker"
-wait "$rss_pid" || profile_failed=1
+wait "$rss_pid" || rss_status=$?
+profile_failed=0
+for profile_status in \
+    "$metadata_status" "$download_status" "$upload_status" "$rss_status"; do
+    [ "$profile_status" -eq 0 ] || profile_failed=1
+done
 [ ! -e "$work/rss-failure" ] \
     || { echo "RSS load gate failed: $(cat "$work/rss-failure")" >&2; profile_failed=1; }
+if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
+    metadata_rows=0
+    range_rows=0
+    upload_rows=0
+    rss_rows=0
+    [ ! -f "$work/metadata.csv" ] || metadata_rows=$(wc -l <"$work/metadata.csv")
+    [ ! -f "$work/ranges.csv" ] || range_rows=$(wc -l <"$work/ranges.csv")
+    [ ! -f "$work/uploads.csv" ] || upload_rows=$(wc -l <"$work/uploads.csv")
+    [ ! -f "$work/rss-samples.csv" ] || rss_rows=$(wc -l <"$work/rss-samples.csv")
+    observed_p95=unavailable
+    if [ -s "$work/metadata.csv" ]; then
+        observed_p95=$(awk -F, '{ print $3 }' "$work/metadata.csv" \
+            | sort -n | awk 'NR == 1900 { print; exit }')
+        [ -n "$observed_p95" ] || observed_p95=unavailable
+    fi
+    profile_status_tmp="$LOAD_TEST_EVIDENCE_DIR/.profile-status.env.$$"
+    printf '%s\n' \
+        "metadata_status=$metadata_status" \
+        "download_status=$download_status" \
+        "upload_status=$upload_status" \
+        "rss_status=$rss_status" \
+        "metadata_rows=$metadata_rows" \
+        "range_rows=$range_rows" \
+        "upload_rows=$upload_rows" \
+        "rss_rows=$rss_rows" \
+        "metadata_observed_p95_seconds=$observed_p95" \
+        >"$profile_status_tmp"
+    chmod 0640 "$profile_status_tmp"
+    mv "$profile_status_tmp" "$LOAD_TEST_EVIDENCE_DIR/profile-status.env"
+fi
 [ "$profile_failed" -eq 0 ] || { echo "parallel load profile failed" >&2; exit 1; }
 p95=$(cat "$work/metadata.p95")
 max_rss_kib=$(awk -F, 'NR > 1 { if ($3 > maximum) maximum = $3 } END {
@@ -413,6 +500,7 @@ max_rss_kib=$(awk -F, 'NR > 1 { if ($3 > maximum) maximum = $3 } END {
 }' "$work/rss-samples.csv")
 [ "$max_rss_kib" -le 262144 ] || { echo "absolute RSS gate exceeded" >&2; exit 1; }
 
+load_stage=post-load-snapshot
 if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     load_snapshot "$LOAD_TEST_EVIDENCE_DIR/post-load.env"
 fi
@@ -424,6 +512,7 @@ if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
     echo "additional RSS: $added bytes"
 fi
 
+load_stage=evidence-finalization
 if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     install -m 0640 "$work/metadata.csv" "$LOAD_TEST_EVIDENCE_DIR/metadata-load.csv"
     install -m 0640 "$work/ranges.csv" "$LOAD_TEST_EVIDENCE_DIR/range-results.csv"
@@ -451,3 +540,4 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
 fi
 
 echo "Parallel load profile passed; metadata p95: $p95 seconds; max RSS: $max_rss_kib KiB."
+load_stage=complete

@@ -94,6 +94,25 @@ grep -F -x -q 'TimeoutStopSec=30min' deploy/vaultlink-update.service \
     || fail "the update service must allow bounded fail-closed recovery on stop"
 grep -F -x -q 'ProtectSystem=false' deploy/vaultlink-update.service \
     || fail "the package-manager update service must permit distribution transaction hooks"
+update_capabilities='CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETGID CAP_SETUID'
+if [ "$(grep -c '^NoNewPrivileges=' deploy/vaultlink-update.service)" -ne 1 ] \
+    || ! grep -F -x -q 'NoNewPrivileges=true' deploy/vaultlink-update.service; then
+    fail "the update service must set no-new-privileges exactly once"
+fi
+if [ "$(grep -c '^CapabilityBoundingSet=' deploy/vaultlink-update.service)" -ne 1 ] \
+    || ! grep -F -x -q "CapabilityBoundingSet=$update_capabilities" \
+        deploy/vaultlink-update.service; then
+    fail "the update service must expose only the reviewed transaction capabilities"
+fi
+if [ "$(grep -c '^AmbientCapabilities=' deploy/vaultlink-update.service)" -ne 1 ] \
+    || ! grep -F -x -q "AmbientCapabilities=$update_capabilities" \
+        deploy/vaultlink-update.service; then
+    fail "the update service must preserve exactly its bounded capabilities across package execs"
+fi
+if grep -q '^SecureBits=' deploy/vaultlink-update.service \
+    || grep -F -x -q 'NoNewPrivileges=false' deploy/vaultlink-update.service; then
+    fail "the update service must not weaken its credential boundary"
+fi
 if grep -F -q 'ReadWritePaths=' deploy/vaultlink-update.service; then
     fail "the package-manager update service must not claim a brittle filesystem allowlist"
 fi

@@ -303,19 +303,47 @@ remote_package=/tmp/$(basename "$package")
 # All expanded arguments are manifest-constrained and intentionally become
 # distinct remote argv entries.
 # shellcheck disable=SC2029
+guest_smoke_status=0
 run_ssh vaultlink-ci@127.0.0.1 \
     sudo /bin/sh /tmp/distro-vm-guest-smoke.sh \
     "$target_id" "$distribution" "$distribution_version" "$package_format" \
     "$package_arch" "$version" "$remote_package" "$vm_packages_sha256" \
-    >"$evidence/package.env"
+    >"$evidence/package.env" 2>"$evidence/guest-smoke.stderr" \
+    || guest_smoke_status=$?
+runtime_evidence_status=0
 run_scp -r vaultlink-ci@127.0.0.1:/tmp/vaultlink-vm-evidence \
-    "$evidence/runtime"
+    "$evidence/runtime" 2>"$evidence/runtime-evidence-scp.stderr" \
+    || runtime_evidence_status=$?
+guest_system_status=0
 run_ssh vaultlink-ci@127.0.0.1 \
-    'uname -a; cat /etc/os-release; systemctl show vaultlink.service --no-pager || true; journalctl -u vaultlink.service --no-pager || true' \
-    >"$evidence/guest-system.txt"
-if ! run_ssh vaultlink-ci@127.0.0.1 \
-    'sudo find /var/lib/vaultlink -type f -name "*.sqlite*" -exec sqlite3 {} "PRAGMA integrity_check;" \;' \
-    >"$evidence/sqlite-integrity.txt" 2>"$evidence/sqlite-integrity.stderr"; then
+    'uname -a; cat /etc/os-release; sudo systemctl show vaultlink.service --no-pager || true; sudo journalctl -u vaultlink.service --no-pager || true' \
+    >"$evidence/guest-system.txt" 2>"$evidence/guest-system.stderr" \
+    || guest_system_status=$?
+sqlite_status=0
+run_ssh vaultlink-ci@127.0.0.1 \
+    'sudo sqlite3 /var/lib/vaultlink/data.sqlite "PRAGMA integrity_check;"' \
+    >"$evidence/sqlite-integrity.txt" 2>"$evidence/sqlite-integrity.stderr" \
+    || sqlite_status=$?
+printf 'guest_smoke_status=%s\nruntime_evidence_status=%s\nguest_system_status=%s\nsqlite_status=%s\n' \
+    "$guest_smoke_status" "$runtime_evidence_status" "$guest_system_status" \
+    "$sqlite_status" >"$evidence/guest-commands.env"
+if [ "$guest_smoke_status" -ne 0 ]; then
+    cat "$evidence/guest-smoke.stderr" >&2 || true
+    cat "$evidence/runtime-evidence-scp.stderr" >&2 || true
+    cat "$evidence/guest-system.stderr" >&2 || true
+    cat "$evidence/sqlite-integrity.stderr" >&2 || true
+    tail -n 200 "$evidence/serial.log" >&2 || true
+    exit "$guest_smoke_status"
+fi
+if [ "$runtime_evidence_status" -ne 0 ]; then
+    cat "$evidence/runtime-evidence-scp.stderr" >&2 || true
+    exit "$runtime_evidence_status"
+fi
+if [ "$guest_system_status" -ne 0 ]; then
+    cat "$evidence/guest-system.stderr" >&2 || true
+    exit "$guest_system_status"
+fi
+if [ "$sqlite_status" -ne 0 ]; then
     cat "$evidence/sqlite-integrity.stderr" >&2
     exit 1
 fi
@@ -334,6 +362,28 @@ active_hash=$(sed -n 's/^active_binary_sha256=//p' "$evidence/package.env")
 grep -F -x -q 'service_enabled=disabled' "$evidence/package.env"
 grep -F -x -q 'update_timer_enabled=disabled' "$evidence/package.env"
 grep -F -x -q 'service_active=inactive' "$evidence/package.env"
+grep -F -x -q 'stage=complete' "$evidence/runtime/runtime-command.env"
+grep -F -x -q 'exit_status=0' "$evidence/runtime/runtime-command.env"
+[ ! -e "$evidence/runtime/cookies.txt" ]
+load_evidence=$evidence/runtime/load
+grep -F -x -q 'stage=complete' "$load_evidence/load-command.env"
+grep -F -x -q 'exit_status=0' "$load_evidence/load-command.env"
+for load_profile in metadata download upload rss; do
+    grep -F -x -q "${load_profile}_status=0" \
+        "$load_evidence/profile-status.env"
+done
+grep -F -x -q 'metadata_rows=2000' "$load_evidence/profile-status.env"
+grep -F -x -q 'range_rows=40' "$load_evidence/profile-status.env"
+grep -F -x -q 'upload_rows=10' "$load_evidence/profile-status.env"
+load_rss_rows=$(sed -n 's/^rss_rows=//p' "$load_evidence/profile-status.env")
+case "$load_rss_rows" in ''|*[!0-9]*|0) exit 77 ;; esac
+load_observed_p95=$(sed -n 's/^metadata_observed_p95_seconds=//p' \
+    "$load_evidence/profile-status.env")
+[ -n "$load_observed_p95" ]
+awk -v value="$load_observed_p95" 'BEGIN { exit !(value < 2.000) }'
+if find "$load_evidence" -type f -name '*.partial.*' -print | grep -q .; then
+    exit 77
+fi
 grep -F -q 'network=restricted-user-mode' "$evidence/harness.env"
 grep -F -x -q 'readiness=ok' "$evidence/runtime/runtime.env"
 grep -F -x -q 'upgrade=ok' "$evidence/runtime/runtime.env"
