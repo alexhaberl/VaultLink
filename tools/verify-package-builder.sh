@@ -2,9 +2,11 @@
 # Compound guards intentionally use `A && B || fail` for fail-closed exits.
 # shellcheck disable=SC2015
 set -eu
+PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CDPATH=
 LC_ALL=C
 LANG=C
-export LC_ALL LANG
+export PATH CDPATH LC_ALL LANG
 
 [ "$#" -eq 1 ] || {
     echo "usage: $0 TARGET_ID" >&2
@@ -48,6 +50,14 @@ fi
 
 expected_uname=$(manifest_value uname)
 expected_host=$(manifest_value rust_host)
+expected_rust_version=$(sh tools/rust-toolchain-channel.sh) || {
+    echo "repository-pinned Rust version is unavailable" >&2
+    exit 77
+}
+# The smoke gate has no network. Select the exact native toolchain baked into
+# the builder so rustup neither inherits caller state nor attempts a sync.
+RUSTUP_TOOLCHAIN="${expected_rust_version}-${expected_host}"
+export RUSTUP_TOOLCHAIN
 [ "$(uname -m)" = "$expected_uname" ] || {
     echo "package builder is running on the wrong native architecture" >&2
     exit 77
@@ -56,7 +66,7 @@ expected_host=$(manifest_value rust_host)
     echo "package builder Rust host does not match target" >&2
     exit 77
 }
-[ "$(rustc --version | awk '{print $2}')" = "$(sh tools/rust-toolchain-channel.sh)" ] || {
+[ "$(rustc --version | awk '{print $2}')" = "$expected_rust_version" ] || {
     echo "package builder Rust version is not repository-pinned" >&2
     exit 77
 }

@@ -173,9 +173,16 @@ if ! grep -F -q '/usr/local/share/vaultlink-builder-packages.lock' \
         "$package_builder_dependencies" \
     || ! grep -F -q 'builder_packages_sha256' tools/verify-package-builder.sh \
     || ! grep -F -q 'builder_base_image' tools/verify-package-builder.sh \
+    || ! grep -F -x -q \
+        'PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+        tools/verify-package-builder.sh \
+    || ! grep -F -x -q \
+        'RUSTUP_TOOLCHAIN="${expected_rust_version}-${expected_host}"' \
+        tools/verify-package-builder.sh \
+    || ! grep -F -x -q 'export RUSTUP_TOOLCHAIN' tools/verify-package-builder.sh \
     || ! grep -F -q 'rustc -vV' tools/verify-package-builder.sh \
     || ! grep -F -q 'cargo-audit cmp gh minisign readelf shellcheck ssh stat' tools/verify-package-builder.sh; then
-    report "native package builders must attest the complete package closure, base digest, and Rust host"
+    report "native package builders must attest their fixed toolchain, complete package closure, base digest, and Rust host"
 fi
 if ! grep -F -q 'test "${ID:-}" = ubuntu' "$qemu_builder" \
     || ! grep -F -q 'test "${VERSION_ID:-}" = 24.04' "$qemu_builder" \
