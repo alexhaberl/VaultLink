@@ -570,6 +570,11 @@ if ! grep -F -q "repos/\$GITHUB_REPOSITORY/git/ref/tags/\$GITHUB_REF_NAME" .gith
     || ! grep -F -q "repos/\$GITHUB_REPOSITORY/git/ref/heads/main" .github/workflows/release.yml; then
     report "release publish must revalidate the live remote tag object and main commit immediately before creation"
 fi
+if ! grep -F -q '.verification.verified,.verification.reason' .github/workflows/release.yml \
+    || ! grep -F -q 'test "$remote_tag_verified" = true' .github/workflows/release.yml \
+    || ! grep -F -q 'test "$remote_tag_verification_reason" = valid' .github/workflows/release.yml; then
+    report "release publish must require a cryptographically verified remote tag signature"
+fi
 
 if grep -R -n -E 'curl[^|]*\|[[:space:]]*(ba)?sh' .github/workflows; then
     report "workflows must not pipe remote scripts into a shell"

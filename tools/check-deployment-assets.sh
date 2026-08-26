@@ -64,6 +64,13 @@ for update_asset in \
 done
 [ "$(sed -n 's/^auto_install=//p' deploy/vaultlink-update.conf.example)" = false ] \
     || fail "automatic release installation must be opt-in"
+if ! grep -F -q "if sudo test ! -e /etc/vaultlink/update.conf && \\" README.md \
+    || ! grep -F -q 'sudo test ! -L /etc/vaultlink/update.conf; then' README.md \
+    || ! grep -F -q "sudo install -o root -g root -m 0644 \\" README.md \
+    || ! grep -F -q '/usr/share/vaultlink/update.conf.example /etc/vaultlink/update.conf' README.md \
+    || ! grep -F -q 'sudoedit /etc/vaultlink/update.conf' README.md; then
+    fail "README must bootstrap updater configuration from the packaged example without overwriting files or symlinks"
+fi
 grep -F -x -q 'repository=alexhaberl/VaultLink' deploy/vaultlink-update.sh \
     || fail "the updater repository must be fixed"
 grep -F -x -q 'public_key=/usr/share/vaultlink/minisign.pub' deploy/vaultlink-update.sh \
