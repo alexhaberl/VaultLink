@@ -420,7 +420,12 @@ disabled until the administrator explicitly opts in:
 sudo vaultlink-update check
 sudo vaultlink-update install
 
-# Optional unattended updates; first review /etc/vaultlink/update.conf.
+# Optional unattended updates: bootstrap the packaged example once, then review it.
+if sudo test ! -e /etc/vaultlink/update.conf && \
+   sudo test ! -L /etc/vaultlink/update.conf; then
+  sudo install -o root -g root -m 0644 \
+    /usr/share/vaultlink/update.conf.example /etc/vaultlink/update.conf
+fi
 sudoedit /etc/vaultlink/update.conf
 sudo systemctl enable --now vaultlink-update.timer
 ```

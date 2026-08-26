@@ -371,13 +371,15 @@ jobs:
           test "$remote_ref_type" = tag
           test "$remote_tag_object" = "$local_tag_object"
           remote_tag=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$remote_tag_object" \
-            --jq '[.tag,.object.type,.object.sha] | @tsv')
+            --jq '[.tag,.object.type,.object.sha,.verification.verified,.verification.reason] | @tsv')
           IFS=$'\t' read -r remote_tag_name remote_target_type remote_tag_commit \
-            <<<"$remote_tag"
+            remote_tag_verified remote_tag_verification_reason <<<"$remote_tag"
           test "$remote_tag_name" = "$GITHUB_REF_NAME"
           test "$remote_target_type" = commit
           test "$remote_tag_commit" = "$local_tag_commit"
           test "$remote_tag_commit" = '${{ needs.prepare.outputs.candidate_commit }}'
+          test "$remote_tag_verified" = true
+          test "$remote_tag_verification_reason" = valid
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" \
             = "$remote_tag_commit"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
