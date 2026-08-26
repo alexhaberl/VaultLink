@@ -15,6 +15,23 @@ fail() {
     exit 1
 }
 
+# Match dpkg-gencontrol and Debian Policy 5.6.20: round each regular file and
+# symlink separately, assign 1 KiB to other objects, and count hardlinks once.
+debian_installed_size() {
+    deb_size_root=$1
+    deb_size_inventory=$2
+    find "$deb_size_root" -printf '%y\t%s\t%D:%i\n' >"$deb_size_inventory" \
+        || return 1
+    awk -F '\t' '
+        $1 == "f" || $1 == "l" {
+            if (!seen[$3]++) total += int(($2 + 1023) / 1024)
+            next
+        }
+        { total += 1 }
+        END { print total + 0 }
+    ' "$deb_size_inventory"
+}
+
 [ "$#" -eq 5 ] || {
     echo "usage: build-native-package.sh TARGET_ID VERSION BINARY SBOM OUTPUT_DIR" >&2
     exit 64
@@ -266,7 +283,6 @@ build_deb() {
     command -v dpkg-deb >/dev/null || fail "dpkg-deb is required for DEB targets"
     debroot="$work/debroot"
     cp -a "$payload" "$debroot"
-    install -d -m 0755 "$debroot/DEBIAN"
     package_version="${version}-1"
     case "$os_id:$os_version" in
         debian:13) package_version="${package_version}+deb13" ;;
@@ -288,7 +304,10 @@ EOF
     chmod 0644 \
         "$debroot/usr/share/doc/vaultlink/copyright" \
         "$debroot/usr/share/doc/vaultlink/changelog.Debian.gz"
-    installed_size=$(du -sk "$debroot/usr" | awk '{ print $1 }')
+    installed_size=$(debian_installed_size "$debroot" \
+        "$work/deb-installed-size.inventory") \
+        || fail "failed to calculate Debian Installed-Size"
+    install -d -m 0755 "$debroot/DEBIAN"
     cat >"$debroot/DEBIAN/control" <<EOF
 Package: vaultlink
 Version: $package_version
