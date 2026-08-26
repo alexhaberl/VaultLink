@@ -444,8 +444,12 @@ Every service start first runs the root-owned package/runtime parity guard.
 `StartLimitIntervalSec=1h` and `StartLimitBurst=3` bound repeated fail-closed
 starts after a crash or power loss. The root updater needs
 `ProtectSystem=false` because native package-manager hooks have distro-owned
-write sets; all unrelated namespace, device, kernel, process, and network
-hardening remains enabled, and its oneshot is bounded by
+write sets. `NoNewPrivileges=true` remains active. Exactly the six bounded
+transaction capabilities are carried across package-manager and scriptlet
+execs; the `vaultlink` credential boundary drops all permitted, effective, and
+ambient capabilities before a candidate is executed. Full-system gates verify
+that boundary on every target. All unrelated namespace, device, kernel,
+process, and network hardening remains enabled, and the oneshot is bounded by
 `TimeoutStartSec=90min` and `TimeoutStopSec=30min`.
 
 ### Provision a CIFS mount safely

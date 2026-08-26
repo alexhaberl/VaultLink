@@ -32,7 +32,10 @@ fail() {
     echo "API smoke failed: $*" >&2
     if [[ -f "$SETUP_LOG" ]]; then
         echo "--- setup log ---" >&2
-        tail -n 80 "$SETUP_LOG" >&2 || true
+        # The setup log contains the one-time bootstrap URL. Keep the
+        # surrounding diagnostics, but never copy its bearer token into CI
+        # output or an uploaded failure artifact.
+        tail -n 80 "$SETUP_LOG" | sed '/#token=/d' >&2 || true
     fi
     if [[ -f "$APP_LOG" ]]; then
         echo "--- app log ---" >&2

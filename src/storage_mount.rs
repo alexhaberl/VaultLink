@@ -19,8 +19,6 @@ pub struct StorageMountError(String);
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MountInfo {
     mount_id: u64,
-    device_major: u32,
-    device_minor: u32,
     mount_point: PathBuf,
     read_write: bool,
     mount_options: Vec<String>,
@@ -412,37 +410,7 @@ fn validate_identity(
     let (root_path, root_identity) = (root.path, root.identity);
     let (internal_path, internal_identity) = (internal.path, internal.identity);
     let (data_path, data_identity) = (data.path, data.identity);
-    let mut matching_mounts = mounts
-        .iter()
-        .filter(|mount| mount.mount_id == root_identity.mount_id);
-    let mount = matching_mounts.next().ok_or_else(|| {
-        mount_error(format!(
-            "mount ID {} for {} is absent from {MOUNTINFO_PATH}",
-            root_identity.mount_id,
-            root_path.display()
-        ))
-    })?;
-    if matching_mounts.next().is_some() {
-        return Err(mount_error(format!(
-            "mount ID {} occurs more than once in {MOUNTINFO_PATH}",
-            root_identity.mount_id
-        )));
-    }
-    if mount.device_major != root_identity.device_major
-        || mount.device_minor != root_identity.device_minor
-    {
-        return Err(mount_error(format!(
-            "mount ID {} changed identity while it was being validated",
-            root_identity.mount_id
-        )));
-    }
-    if !root_path.starts_with(&mount.mount_point) {
-        return Err(mount_error(format!(
-            "{} is not below its validated active mount point {}",
-            root_path.display(),
-            mount.mount_point.display()
-        )));
-    }
+    let mount = unique_mount_for_identity(root_identity, mounts, root_path)?;
     if internal_identity != root_identity || !internal_path.starts_with(&mount.mount_point) {
         return Err(mount_error(format!(
             "internal_directory {} and root_mount_path {} must use the same validated mount identity",
@@ -538,13 +506,25 @@ fn unique_mount_for_identity<'a>(
             path.display()
         ))
     })?;
-    if matches.next().is_some()
-        || mount.device_major != identity.device_major
-        || mount.device_minor != identity.device_minor
-    {
+    if matches.next().is_some() {
         return Err(mount_error(format!(
-            "mount identity for {} changed while it was being validated",
-            path.display()
+            "mount ID {} for {} occurs more than once in {MOUNTINFO_PATH}",
+            identity.mount_id,
+            path.display(),
+        )));
+    }
+    // STATX_MNT_ID is the kernel-defined key for field 1 of mountinfo.  The
+    // device numbers are deliberately not cross-compared here: filesystems
+    // such as Btrfs return a per-subvolume ("cooked") st_dev from getattr,
+    // while mountinfo field 3 reports the superblock ("raw") device.  The
+    // opened directory capability pins the mount while this lookup runs, and
+    // the complete statx identity, st_dev, and inode are checked again when
+    // the configured path binding is handed off.
+    if !path.starts_with(&mount.mount_point) {
+        return Err(mount_error(format!(
+            "{} is not below its validated active mount point {}",
+            path.display(),
+            mount.mount_point.display()
         )));
     }
     Ok(mount)
@@ -760,7 +740,7 @@ fn parse_mountinfo(input: &[u8]) -> Result<Vec<MountInfo>, StorageMountError> {
         let mount_id = parse_ascii_u64(left[0]).ok_or_else(|| {
             malformed_mountinfo(line_number + 1, "mount ID is not an unsigned integer")
         })?;
-        let (device_major, device_minor) = parse_device(left[2])
+        parse_device(left[2])
             .ok_or_else(|| malformed_mountinfo(line_number + 1, "device ID is not major:minor"))?;
         let mount_point = PathBuf::from(OsString::from_vec(unescape_field(
             left[4],
@@ -775,8 +755,6 @@ fn parse_mountinfo(input: &[u8]) -> Result<Vec<MountInfo>, StorageMountError> {
         let super_options = parse_options(right[2], line_number + 1)?;
         mounts.push(MountInfo {
             mount_id,
-            device_major,
-            device_minor,
             mount_point,
             read_write,
             mount_options,
@@ -1010,7 +988,6 @@ mod tests {
     fn parses_escaped_mount_identity() {
         let mounts = mounts();
         assert_eq!(mounts[0].mount_id, 41);
-        assert_eq!((mounts[0].device_major, mounts[0].device_minor), (0, 42));
         assert_eq!(mounts[0].mount_point, Path::new("/mnt"));
         assert!(mounts[0].read_write);
         assert_eq!(mounts[0].filesystem_type, "cifs");
@@ -1079,6 +1056,60 @@ mod tests {
             &mounts(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn accepts_btrfs_cooked_device_for_an_exact_mount_id() {
+        let btrfs_mounts = parse_mountinfo(
+            b"41 23 253:16 / /mnt/storage rw,nosuid,nodev - ext4 /dev/vdb rw\n\
+              23 1 0:32 /var /var rw,relatime - btrfs /dev/vda3 rw,subvol=/var\n",
+        )
+        .unwrap();
+        let mut local = storage();
+        local.root_mount_path = "/mnt/storage/shared".into();
+        local.internal_directory = Some("/mnt/storage/.vaultlink-internal".into());
+        local.data_directory = "/var/lib/vaultlink".into();
+        local.external_writers = false;
+        local.expected_filesystem_type = Some("ext4".into());
+        local.expected_mount_source = Some("/dev/vdb".into());
+
+        validate_identity(
+            &local,
+            location("/mnt/storage/shared", 41, 253, 16),
+            location("/mnt/storage/.vaultlink-internal", 41, 253, 16),
+            // Btrfs reports a per-subvolume st_dev (0:50), while mountinfo
+            // reports the raw superblock device (0:32) for the same mount ID.
+            location("/var/lib/vaultlink", 23, 0, 50),
+            &btrfs_mounts,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mount_lookup_rejects_absent_duplicate_and_unrelated_mount_ids() {
+        let parsed = mounts();
+        let absent =
+            unique_mount_for_identity(identity(99, 8, 2), &parsed, Path::new("/var/lib/vaultlink"))
+                .unwrap_err();
+        assert!(absent.to_string().contains("is absent"));
+
+        let mut duplicate = parsed.clone();
+        duplicate.push(duplicate[1].clone());
+        let repeated = unique_mount_for_identity(
+            identity(23, 8, 2),
+            &duplicate,
+            Path::new("/var/lib/vaultlink"),
+        )
+        .unwrap_err();
+        assert!(repeated.to_string().contains("occurs more than once"));
+
+        let unrelated = unique_mount_for_identity(
+            identity(41, 0, 42),
+            &parsed,
+            Path::new("/srv/not-on-the-share"),
+        )
+        .unwrap_err();
+        assert!(unrelated.to_string().contains("not below"));
     }
 
     #[test]

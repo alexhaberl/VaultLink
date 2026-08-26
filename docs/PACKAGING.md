@@ -252,8 +252,12 @@ managers execute distribution-owned sysusers, tmpfiles, SELinux, and transaction
 hooks whose complete write set cannot be represented by a VaultLink-owned
 `ReadWritePaths` list. The signed package, complete metadata/payload allowlists,
 preflight, locks, and post-transaction parity checks are therefore the write
-boundary for this unit. Its unrelated namespace, device, kernel, process, and
-network hardening remains enabled. Booted distro-VM gates exercise the real
+boundary for this unit. `NoNewPrivileges=true` remains active. The exact six
+bounded transaction capabilities are ambient only across the root package
+execution chain; after the `vaultlink` UID/GID transition, permitted,
+effective, and ambient capability sets must all be empty. Its unrelated
+namespace, device, kernel, process, and network hardening remains enabled.
+Booted distro-VM gates inspect that credential boundary and exercise the real
 unit and package-manager hooks for every target.
 
 ## Deterministic build and release assets
