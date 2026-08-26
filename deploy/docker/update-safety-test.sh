@@ -456,7 +456,25 @@ cat >"$mock_dir/dpkg-deb" <<'EOF'
 #!/bin/sh
 set -eu
 read_meta=$VAULTLINK_UPDATE_TEST_ROOT/read-meta.sh
+debian_installed_size() {
+    deb_size_root=$1
+    deb_size_inventory=$2
+    find "$deb_size_root" -printf '%y\t%s\t%D:%i\n' >"$deb_size_inventory" \
+        || return 1
+    awk -F '\t' '
+        $1 == "f" || $1 == "l" {
+            if (!seen[$3]++) total += int(($2 + 1023) / 1024)
+            next
+        }
+        { total += 1 }
+        END { print total + 0 }
+    ' "$deb_size_inventory"
+}
 case "$1" in
+    --vaultlink-test-installed-size)
+        [ "$#" -eq 2 ] || exit 64
+        debian_installed_size "$2" "$2.installed-size.inventory"
+        ;;
     -f)
         [ "$#" -eq 3 ] || exit 64
         case "$3" in
@@ -504,7 +522,8 @@ case "$1" in
         trap 'rm -rf "$payload"' 0 1 2 15
         install -d "$payload"
         tar -xzf "$2" -C "$payload" usr
-        installed_size=$(du -sk "$payload/usr" | awk '{ print $1 }')
+        installed_size=$(debian_installed_size "$payload" \
+            "$payload.installed-size.inventory")
         db_version=$("$read_meta" "$2" DB_VERSION)
         arch=$("$read_meta" "$2" ARCH)
         depends='ca-certificates, curl, libc6, libgcc-s1, mawk, minisign, sqlite3, systemd'
@@ -539,6 +558,26 @@ CONTROL
 esac
 EOF
 chmod 0755 "$mock_dir/dpkg-deb"
+
+# Pin the Debian Policy 5.6.20 calculation independently of the updater. This
+# fixture distinguishes per-object rounding and hardlink handling from du(1).
+installed_size_fixture=$test_root/installed-size-fixture
+install -d "$installed_size_fixture/usr/lib/vaultlink-size-test"
+: >"$installed_size_fixture/usr/lib/vaultlink-size-test/empty"
+printf x >"$installed_size_fixture/usr/lib/vaultlink-size-test/one"
+truncate -s 1024 "$installed_size_fixture/usr/lib/vaultlink-size-test/exact"
+truncate -s 1025 "$installed_size_fixture/usr/lib/vaultlink-size-test/over"
+ln "$installed_size_fixture/usr/lib/vaultlink-size-test/over" \
+    "$installed_size_fixture/usr/lib/vaultlink-size-test/over-hardlink"
+truncate -s 1048577 "$installed_size_fixture/usr/lib/vaultlink-size-test/sparse"
+ln -s one "$installed_size_fixture/usr/lib/vaultlink-size-test/link"
+installed_size_reported=$(
+    VAULTLINK_UPDATE_TEST_ROOT=$test_root \
+        "$mock_dir/dpkg-deb" --vaultlink-test-installed-size \
+            "$installed_size_fixture"
+)
+[ "$installed_size_reported" = 1034 ] \
+    || fail "DEB Installed-Size does not follow Debian Policy 5.6.20"
 
 cat >"$mock_dir/dpkg-query" <<'EOF'
 #!/bin/sh

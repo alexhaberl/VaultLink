@@ -15,6 +15,23 @@ fail() {
     exit 1
 }
 
+# Keep this independent verifier aligned with dpkg-gencontrol's reproducible
+# Debian Policy 5.6.20 Installed-Size algorithm.
+debian_installed_size() {
+    deb_size_root=$1
+    deb_size_inventory=$2
+    find "$deb_size_root" -printf '%y\t%s\t%D:%i\n' >"$deb_size_inventory" \
+        || return 1
+    awk -F '\t' '
+        $1 == "f" || $1 == "l" {
+            if (!seen[$3]++) total += int(($2 + 1023) / 1024)
+            next
+        }
+        { total += 1 }
+        END { print total + 0 }
+    ' "$deb_size_inventory"
+}
+
 files_are_equal() {
     [ "$(sha256sum "$1" | awk '{ print $1 }')" = \
         "$(sha256sum "$2" | awk '{ print $1 }')" ]
@@ -670,7 +687,9 @@ EOF
             [ "$(stat -c '%a' "$work/control/$script")" = 755 ] \
                 || fail "Debian maintainer script $script must be mode 0755"
         done
-        installed_size=$(du -sk "$root/usr" | awk '{ print $1 }')
+        installed_size=$(debian_installed_size "$root" \
+            "$work/deb-installed-size.inventory") \
+            || fail "failed to calculate Debian Installed-Size"
         render_expected_deb_control "$work/expected-deb-control" \
             "$deb_version" "$installed_size"
         files_are_equal "$work/expected-deb-control" "$work/control/control" \

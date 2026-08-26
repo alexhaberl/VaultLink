@@ -56,6 +56,23 @@ fail() {
     exit 1
 }
 
+# Recompute DEB metadata with dpkg-gencontrol's reproducible Debian Policy
+# 5.6.20 algorithm instead of filesystem-dependent allocated blocks.
+debian_installed_size() {
+    deb_size_root=$1
+    deb_size_inventory=$2
+    find "$deb_size_root" -printf '%y\t%s\t%D:%i\n' >"$deb_size_inventory" \
+        || return 1
+    awk -F '\t' '
+        $1 == "f" || $1 == "l" {
+            if (!seen[$3]++) total += int(($2 + 1023) / 1024)
+            next
+        }
+        { total += 1 }
+        END { print total + 0 }
+    ' "$deb_size_inventory"
+}
+
 validate_lock_directory() {
     [ -d /run ] && [ ! -L /run ] \
         && [ "$(stat -Lc '%u:%g:%a' /run 2>/dev/null || true)" = 0:0:755 ] \
@@ -944,7 +961,8 @@ EOF
                     || return 1
             done
             metadata_deb_version=$(expected_database_version "$metadata_version") || return 1
-            metadata_installed_size=$(du -sk "$metadata_root/usr" | awk '{ print $1 }') \
+            metadata_installed_size=$(debian_installed_size "$metadata_root" \
+                "$metadata_root.deb-installed-size.inventory") \
                 || return 1
             cat >"$metadata_root.expected-deb-control" <<EOF
 Package: vaultlink
