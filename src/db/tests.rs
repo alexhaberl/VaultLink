@@ -1242,6 +1242,28 @@ fn audit_retention_falls_back_to_fifo_for_security_only_volume() {
 }
 
 #[test]
+fn background_audit_retention_preserves_rows_below_the_cap() {
+    let database = Database::open(":memory:").unwrap();
+    database
+        .audit_action_with_client_ip(
+            AuditAction::Upload,
+            "public",
+            Some("share-1"),
+            Some("file=evidence.txt"),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        database.cleanup_audit_retention().unwrap(),
+        AuditRetentionOutcome::default()
+    );
+    assert_eq!(database.count_audit(None).unwrap(), 1);
+    assert_eq!(database.count_audit(Some("upload")).unwrap(), 1);
+    assert_eq!(database.audit_priorities("upload").unwrap(), [100]);
+}
+
+#[test]
 fn audit_retention_caps_recent_events() {
     let database = Database::open(":memory:").unwrap();
     database
