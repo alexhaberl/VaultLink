@@ -103,8 +103,13 @@ a skipped, neutral, missing, stale, or wrong-commit result is not success.
 - [ ] Every target passes offline container installation, user/path/mode,
   no-autostart, setup, `systemd-analyze verify`, API smoke, upgrade, migration,
   backup, rollback, reinstall, and state-preserving remove tests.
-- [ ] Every target passes the 100-user profile with p95 `<2 s`, no 5xx response,
-  no corruption, and RSS within the approved limit.
+- [ ] Every target runs the unchanged 100-metadata-client, 40-range-stream, and
+  ten-upload/readback workload against the exact installed package payload in
+  its digest-pinned distribution builder on a native matching-architecture
+  GitHub runner. This native package run passes p95 `<2 s`, has no invalid
+  response or corruption, and remains within the approved RSS limit.
+- [ ] Managed `ubuntu-24.04-arm` jobs provide the authoritative arm64 p95
+  evidence; no private ARM host is part of the release boundary.
 - [ ] `vaultlink/package-reproducibility` is green and accounts for all nine
   target rows; two clean builds have byte-identical payload binaries, target
   SBOMs, and final packages.
@@ -114,7 +119,14 @@ a skipped, neutral, missing, stale, or wrong-commit result is not success.
   service/timer enablement, systemd status, journal, exact readiness response,
   SQLite integrity, and test result.
 - [ ] Guests receive the package only over the isolated host channel and have
-  no unrestricted Internet access; tests pass without KVM.
+  no unrestricted Internet access. The unchanged complete load workload and
+  every functional, security, integrity, RSS, upgrade, backup, migration, and
+  rollback assertion pass without KVM. Each of the nine commit-bound evidence
+  bundles records `acceleration_policy=force-tcg`, `acceleration=tcg`, and a
+  not-requested KVM probe; the workflow does not expose `/dev/kvm`.
+- [ ] Every QEMU guest records a numeric p95 and whether `<2 s` was met as
+  diagnostic evidence. QEMU timing does not replace
+  or override the authoritative native package p95 gate.
 - [ ] Fedora 44 reports SELinux `Enforcing` and no VaultLink-related AVC denial.
 - [ ] Arch builder and VM use the selected dated snapshot; the weekly current-
   rolling compatibility workflow is installed and read-only.

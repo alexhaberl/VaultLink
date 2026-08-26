@@ -25,13 +25,14 @@ fail() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "the offline package smoke must run as root"
-[ "$#" -eq 3 ] || {
-    echo "usage: $0 TARGET_ID VERSION PACKAGE" >&2
+[ "$#" -eq 4 ] || {
+    echo "usage: $0 TARGET_ID VERSION PACKAGE NATIVE_LOAD_EVIDENCE" >&2
     exit 64
 }
 target_id=$1
 version=$2
 package=$3
+native_load_evidence=$4
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 cd "$repo_root"
@@ -86,6 +87,13 @@ migration_pid=
     "SELECT priority FROM audit WHERE object_id='migration-probe';")" = 100 ]
 [ "$(sqlite3 "$database" 'PRAGMA integrity_check;')" = ok ]
 
+# The exact installed package payload is then exercised natively on the
+# target's same-architecture runner. This is the authoritative per-target
+# latency gate; the full-system VM gate remains authoritative for systemd and
+# distribution integration behavior.
+sh tools/package-native-load-smoke.sh \
+    "$target_id" "$version" "$package" "$api_work" "$native_load_evidence"
+
 # These fault-injection tests cover transactional migration, backup, start,
 # readiness, integrity, and rollback behavior without package repositories.
 bash deploy/docker/upgrade-safety-test.sh
@@ -93,3 +101,4 @@ bash deploy/docker/upgrade-safety-test.sh
 printf 'target=%s\nversion=%s\nnetwork=none\nlifecycle=ok\n' \
     "$target_id" "$version"
 printf 'systemd_analyze=ok\napi_smoke=ok\nreal_migration=ok\nupgrade_migration_backup_rollback=ok\n'
+printf 'native_package_load=ok\nmetadata_p95_limit_seconds=2.000\n'

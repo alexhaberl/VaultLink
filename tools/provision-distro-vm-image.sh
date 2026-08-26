@@ -13,6 +13,8 @@ target_id=$1
 source_image=$2
 output_image=$3
 arch_snapshot_date=$4
+acceleration_policy=${ACCELERATION_POLICY:-force-tcg}
+case "$acceleration_policy" in force-tcg|auto) ;; *) exit 64 ;; esac
 case "$target_id" in *[!a-z0-9-]*|'') exit 64 ;; esac
 [ -f "$source_image" ] && [ ! -L "$source_image" ] \
     && [ ! -e "$output_image" ] && [ ! -L "$output_image" ] || exit 66
@@ -244,14 +246,15 @@ case "$architecture" in
     *) exit 65 ;;
 esac
 
-acceleration=tcg
-acceleration_args='-accel tcg,thread=multi -cpu max'
-if [ "$architecture" = amd64 ] \
-    && [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] \
-    && "$qemu" -accel help 2>/dev/null | grep -F -x -q 'kvm'; then
-    acceleration=kvm
-    acceleration_args='-accel kvm -cpu host'
-fi
+acceleration=$(ACCELERATION_POLICY="$acceleration_policy" \
+    sh tools/select-qemu-acceleration.sh \
+    "$architecture" "$qemu" "$output_image.acceleration-selection.env")
+case "$acceleration" in
+    tcg) acceleration_args='-accel tcg,thread=multi -cpu max' ;;
+    kvm) acceleration_args='-accel kvm -cpu host' ;;
+    *) exit 70 ;;
+esac
+[ "$acceleration_policy" != force-tcg ] || [ "$acceleration" = tcg ]
 if [ "$tcg_timeout_override" = true ]; then
     [ "$acceleration" = tcg ]
     sh tools/manage-tcg-device-timeout.sh inject "$work/overlay.qcow2"

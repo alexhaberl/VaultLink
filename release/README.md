@@ -142,14 +142,29 @@ Each target compiles inside its own distribution on a native matching CPU
 runner. Two empty build roots use the same commit-derived
 `SOURCE_DATE_EPOCH`; payload binary, normalized target SBOM, and final package
 must be byte-identical. Format-specific lint and the common package allowlist
-run independently of the builder.
+run independently of the builder. The exact installed package payload also
+runs the unchanged overlapping workload of 100 metadata clients, 40 range
+streams, and ten upload/readback clients inside that digest-pinned distribution
+builder on the matching native GitHub runner. That run is authoritative for
+p95 `<2 s` for all nine targets, including arm64 on the managed arm64 runner;
+private ARM hardware is not required.
 
 The full-system gate boots the pinned target guest with QEMU on the same
 architecture. The guest receives its package over an isolated host channel,
 has no unrestricted Internet access, and records kernel/OS identity, package
 version, hashes, systemd state, journal, readiness, load result, and SQLite
 integrity. Fedora evidence is invalid unless SELinux remains `Enforcing` with
-no VaultLink-related AVC denial.
+no VaultLink-related AVC denial. Every guest runs the same complete load
+workload without lowering concurrency or transfer sizes. The QEMU result is
+authoritative for full-system functionality, security, integrity, RSS,
+package-manager operations, upgrade, backup, migration, rollback, and SELinux;
+its numeric p95 and `<2 s` comparison are diagnostic. The commit-bound
+nine-target workflow forces and records TCG for every target without a second
+matrix. Guest-image refreshes may use KVM on amd64 only after a bounded QMP
+probe reports it present and enabled; otherwise they select TCG.
+
+The dedicated Debian 13 amd64 72-hour soak remains a strict p95 `<2 s` gate
+against the binary extracted from the exact final DEB.
 
 The aggregate checks `vaultlink/packages`,
 `vaultlink/package-reproducibility`, and `vaultlink/distro-vms` account for

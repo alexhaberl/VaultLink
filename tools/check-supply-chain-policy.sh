@@ -112,9 +112,12 @@ qemu_base_lock=deploy/docker/qemu-runner-base-image.lock
 qemu_packages_amd64=deploy/docker/qemu-runner-packages-amd64.lock
 qemu_packages_arm64=deploy/docker/qemu-runner-packages-arm64.lock
 qemu_verifier=tools/verify-qemu-runner.sh
+qemu_acceleration_selector=tools/select-qemu-acceleration.sh
 package_builder_dependencies=deploy/docker/install-package-builder-dependencies.sh
 vm_provisioner=tools/provision-distro-vm-image.sh
 package_workflow=.github/workflows/packages.yml
+package_offline_smoke=tools/package-offline-smoke.sh
+package_native_load_smoke=tools/package-native-load-smoke.sh
 real_package_smoke=tools/real-package-update-smoke.sh
 vm_harness=tools/run-distro-vm-test.sh
 vm_guest_smoke=tools/distro-vm-guest-smoke.sh
@@ -794,12 +797,64 @@ if ! grep -F -q 'dd if=/dev/urandom' tools/load-test.sh \
     || ! grep -F -q 'at least 16 GiB' docs/SOAK-RUNNER.md; then
     report "soak uploads must use non-sparse payloads with documented quota reserve"
 fi
-if ! grep -F -q 'p95 < 2.000' tools/load-test.sh \
+if ! grep -F -x -q 'p95_limit=2.000' tools/load-test.sh \
+    || ! grep -F -q 'p95_policy=${LOAD_P95_POLICY:-strict}' tools/load-test.sh \
+    || ! grep -F -q "'BEGIN { exit !(p95 < limit) }'" tools/load-test.sh \
     || ! grep -F -q 'p95 < 2.000' tools/check-soak-evidence.sh \
-    || ! grep -F -q 'strictly below' docs/SOAK-RUNNER.md \
+    || ! grep -F -q 'strict performance gate' docs/SOAK-RUNNER.md \
     || ! grep -F -q '2 seconds' docs/SOAK-RUNNER.md \
     || ! grep -F -q 'p95 `<2 s`' docs/RELEASE-CHECKLIST-0.6.0.md; then
-    report "load execution, evidence verification, and release documentation must share the strict 2-second metadata p95 gate"
+    report "native/soak load execution, soak evidence verification, and release documentation must share the strict 2-second metadata p95 gate"
+fi
+if ! grep -F -q 'LOAD_P95_POLICY=strict' tools/soak-monitor.sh \
+    || ! grep -F -q 'LOAD_CONNECT_TIMEOUT_SECONDS=5' tools/soak-monitor.sh \
+    || ! grep -F -q 'LOAD_METADATA_MAX_TIME_SECONDS=30' tools/soak-monitor.sh \
+    || ! grep -F -q 'LOAD_TRANSFER_MAX_TIME_SECONDS=300' tools/soak-monitor.sh \
+    || ! grep -F -q 'LOAD_ADMISSION_READY_TIMEOUT_SECONDS=10' tools/soak-monitor.sh \
+    || ! grep -F -q 'LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS=30' tools/soak-monitor.sh \
+    || ! grep -F -q 'LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS=5' tools/soak-monitor.sh \
+    || ! grep -F -q 'LOAD_PROFILE_READY_TIMEOUT_SECONDS=10' tools/soak-monitor.sh \
+    || ! grep -F -q "VAULTLINK_PROCESS_PID='' \\" tools/soak-monitor.sh \
+    || ! grep -F -q "VAULTLINK_PROCESS_UID='' \\" tools/soak-monitor.sh \
+    || ! grep -F -q "VAULTLINK_EXPECTED_BINARY_PATH='' \\" tools/soak-monitor.sh \
+    || ! grep -F -q "VAULTLINK_EXPECTED_BINARY_SHA256='' \\" tools/soak-monitor.sh \
+    || [ "$(grep -F -c 'VAULTLINK_PROCESS_PID=' tools/soak-monitor.sh || true)" -ne 1 ] \
+    || [ "$(grep -F -c 'VAULTLINK_PROCESS_UID=' tools/soak-monitor.sh || true)" -ne 1 ] \
+    || [ "$(grep -F -c 'VAULTLINK_EXPECTED_BINARY_PATH=' tools/soak-monitor.sh || true)" -ne 1 ] \
+    || [ "$(grep -F -c 'VAULTLINK_EXPECTED_BINARY_SHA256=' tools/soak-monitor.sh || true)" -ne 1 ] \
+    || ! grep -F -q 'supervision_mode=systemd' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'metadata_p95_policy=strict' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'metadata_p95_limit_seconds=2.000' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'metadata_p95_within_limit=true' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'metadata_p95_enforced=true' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'process_starttime_ticks' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'process_starttime_ticks=5000' deploy/docker/soak-evidence-smoke.sh; then
+    report "the 72-hour soak must pin normal timeouts, systemd supervision, and strict p95 evidence"
+fi
+for soak_strict_file in \
+    .github/workflows/soak-start.yml \
+    .github/workflows/soak-collect.yml \
+    deploy/vaultlink-soak-control.sh \
+    deploy/vaultlink-soak-remote.sh \
+    deploy/vaultlink-soak@.service \
+    tools/soak-monitor.sh \
+    tools/collect-soak-evidence.sh; do
+    if grep -F -q 'LOAD_P95_POLICY=diagnostic' "$soak_strict_file"; then
+        report "$soak_strict_file must not opt the release soak into diagnostic p95"
+    fi
+    if [ "$soak_strict_file" != tools/soak-monitor.sh ] \
+        && grep -F -q 'VAULTLINK_PROCESS_PID' "$soak_strict_file"; then
+        report "$soak_strict_file must not opt the release soak into direct-PID supervision"
+    fi
+done
+if grep -R -F -q \
+        --exclude=check-supply-chain-policy.sh \
+        --exclude=load-test.sh \
+        --exclude=package-native-load-smoke.sh \
+        --exclude=soak-monitor.sh \
+        --exclude=distro-vm-runtime-smoke.sh \
+        'VAULTLINK_PROCESS_PID=' .github deploy tools; then
+    report "direct-PID load execution must remain confined to the native exact-package harness"
 fi
 for numeric_script in \
     tools/load-test.sh \
@@ -961,11 +1016,10 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q 'sh tools/verify-qemu-runner.sh "$ARCHITECTURE"' .github/workflows/distro-vm-images-refresh.yml \
     || ! grep -F -q 'restrict=on' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'restrict=on' tools/provision-distro-vm-image.sh \
-    || ! grep -F -q 'acceleration=tcg' tools/run-distro-vm-test.sh \
-    || ! grep -F -q '[ "$architecture" = amd64 ]' tools/run-distro-vm-test.sh \
-    || ! grep -F -q '[ "$architecture" = amd64 ]' tools/provision-distro-vm-image.sh \
-    || ! grep -F -q '"$ARCHITECTURE" == amd64' .github/workflows/distro-vms.yml \
-    || ! grep -F -q '"$ARCHITECTURE" == amd64' .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q 'sh tools/select-qemu-acceleration.sh' tools/run-distro-vm-test.sh \
+    || ! grep -F -q 'sh tools/select-qemu-acceleration.sh' tools/provision-distro-vm-image.sh \
+    || ! grep -F -q -- '--env ACCELERATION_POLICY=force-tcg' .github/workflows/distro-vms.yml \
+    || ! grep -F -q -- '--env ACCELERATION_POLICY=auto' .github/workflows/distro-vm-images-refresh.yml \
     || ! grep -F -q 'VM provisioning QEMU exited with status' tools/provision-distro-vm-image.sh \
     || ! grep -F -q 'cold-boot QEMU exited with status' tools/provision-distro-vm-image.sh \
     || [ "$(grep -F -c 'cloud-init-output.log /dev/console' tools/provision-distro-vm-image.sh || true)" -ne 2 ] \
@@ -985,6 +1039,130 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q 'kernel-audit.journal' tools/distro-vm-runtime-smoke.sh \
     || ! grep -F -q 'VaultLink-related AVC denial' tools/distro-vm-runtime-smoke.sh; then
     report "all nine packages need offline lifecycle gates and restricted full-system QEMU/load/SELinux gates"
+fi
+if [ ! -f "$qemu_acceleration_selector" ] \
+    || [ -L "$qemu_acceleration_selector" ] \
+    || ! grep -F -q 'acceleration_policy=${ACCELERATION_POLICY:-force-tcg}' \
+        "$qemu_acceleration_selector" \
+    || ! grep -F -q 'force-tcg | auto)' "$qemu_acceleration_selector" \
+    || ! grep -F -q 'for _probe_second in 1 2 3 4 5; do' \
+        "$qemu_acceleration_selector" \
+    || ! grep -F -q 'client.settimeout(3)' "$qemu_acceleration_selector" \
+    || ! grep -F -q '"execute":"query-kvm"' \
+        "$qemu_acceleration_selector" \
+    || ! grep -F -q 'state.get("present") is not True' \
+        "$qemu_acceleration_selector" \
+    || ! grep -F -q 'state.get("enabled") is not True' \
+        "$qemu_acceleration_selector" \
+    || ! grep -F -q 'if [ "$probe_status" -eq 0 ]; then' \
+        "$qemu_acceleration_selector" \
+    || ! grep -F -q 'selected_acceleration=kvm' \
+        "$qemu_acceleration_selector"; then
+    report "KVM may be selected only after a bounded QMP query proves it present and enabled"
+fi
+if grep -F -q -- '--device /dev/kvm' .github/workflows/distro-vms.yml \
+    || grep -F -q -- '--privileged' .github/workflows/distro-vms.yml \
+    || grep -F -q -- '--cap-add' .github/workflows/distro-vms.yml \
+    || [ "$(grep -F -c -- '--env ACCELERATION_POLICY=force-tcg' \
+        .github/workflows/distro-vms.yml || true)" -ne 1 ] \
+    || [ "$(grep -F -c 'sh tools/run-distro-vm-test.sh' \
+        .github/workflows/distro-vms.yml || true)" -ne 1 ] \
+    || ! grep -F -q "grep -F -x -q 'acceleration_policy=force-tcg'" \
+        .github/workflows/distro-vms.yml \
+    || ! grep -F -q "grep -F -x -q 'acceleration=tcg'" \
+        .github/workflows/distro-vms.yml \
+    || ! grep -F -q "grep -F -x -q 'selected_acceleration=tcg'" \
+        .github/workflows/distro-vms.yml \
+    || ! grep -F -q "grep -F -x -q 'kvm_probe_result=not-requested'" \
+        .github/workflows/distro-vms.yml; then
+    report "the single commit-bound nine-target VM matrix must force and prove TCG without exposing KVM"
+fi
+if [ "$(grep -F -c -- '--device /dev/kvm' \
+        .github/workflows/distro-vm-images-refresh.yml || true)" -ne 1 ] \
+    || ! grep -F -q 'kvm_args+=(--device /dev/kvm:/dev/kvm:rw)' \
+        .github/workflows/distro-vm-images-refresh.yml \
+    || ! grep -F -q '"$ARCHITECTURE" == amd64 && -c /dev/kvm' \
+        .github/workflows/distro-vm-images-refresh.yml \
+    || [ "$(grep -F -c -- '--env ACCELERATION_POLICY=auto' \
+        .github/workflows/distro-vm-images-refresh.yml || true)" -ne 1 ] \
+    || ! grep -F -q 'guest.qcow2.acceleration-selection.env' \
+        .github/workflows/distro-vm-images-refresh.yml \
+    || grep -F -q -- '--privileged' .github/workflows/distro-vm-images-refresh.yml \
+    || grep -F -q -- '--cap-add' .github/workflows/distro-vm-images-refresh.yml; then
+    report "guest-image refresh may expose only exact amd64 KVM and must use the bounded automatic probe"
+fi
+if ! grep -F -q 'forces TCG for every one of the nine matrix targets' \
+        docs/GITHUB-HOSTED-RUNNERS.md \
+    || ! grep -F -q 'bounded QMP probe reports KVM as both present and enabled' \
+        docs/GITHUB-HOSTED-RUNNERS.md \
+    || ! grep -F -q 'commit-bound nine-target workflow forces and records TCG' \
+        docs/PACKAGING.md \
+    || ! grep -F -q '`acceleration_policy=force-tcg`' \
+        docs/RELEASE-CHECKLIST-0.6.0.md \
+    || ! grep -F -q 'nine-target workflow forces and records TCG' \
+        release/README.md; then
+    report "runner, packaging, release, and checklist docs must distinguish forced-TCG gates from probed refresh acceleration"
+fi
+if [ "$(grep -F -c 'LOAD_P95_POLICY=diagnostic' "$vm_runtime_smoke" || true)" -ne 1 ] \
+    || grep -R -F -q --exclude=check-supply-chain-policy.sh \
+        --exclude=distro-vm-runtime-smoke.sh \
+        'LOAD_P95_POLICY=diagnostic' .github deploy tools \
+    || ! grep -F -q 'case "$acceleration" in kvm|tcg)' "$vm_runtime_smoke" \
+    || ! grep -F -q 'if [ "$acceleration" = tcg ]; then' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_connect_timeout_seconds=60' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_metadata_max_time_seconds=300' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_transfer_max_time_seconds=1800' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_admission_ready_timeout_seconds=600' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_admission_holder_max_time_seconds=1800' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_admission_probe_max_time_seconds=120' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_profile_ready_timeout_seconds=600' "$vm_runtime_smoke"; then
+    report "only the QEMU runtime gate may use diagnostic p95, with bounded TCG-only timeout allowances"
+fi
+if ! grep -F -q 'evidence_value "$p95_evidence" metadata_p95_policy)" = diagnostic' "$vm_runtime_smoke" \
+    || ! grep -F -q 'evidence_value "$p95_evidence" metadata_p95_limit_seconds)" = 2.000' "$vm_runtime_smoke" \
+    || ! grep -F -q 'evidence_value "$p95_evidence" metadata_p95_enforced)" = false' "$vm_runtime_smoke" \
+    || ! grep -F -q 'expected_p95_within_limit=$(awk -v value="$p95"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'print (value < 2.000) ? "true" : "false"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'evidence_value "$p95_evidence" metadata_p95_within_limit' "$vm_runtime_smoke" \
+    || ! grep -F -q 'evidence_value "$p95_evidence" supervision_mode)" = systemd' "$vm_runtime_smoke" \
+    || ! grep -F -q "VAULTLINK_PROCESS_PID='' \\" "$vm_runtime_smoke" \
+    || ! grep -F -q "VAULTLINK_PROCESS_UID='' \\" "$vm_runtime_smoke" \
+    || ! grep -F -q "VAULTLINK_EXPECTED_BINARY_PATH='' \\" "$vm_runtime_smoke" \
+    || ! grep -F -q "VAULTLINK_EXPECTED_BINARY_SHA256='' \\" "$vm_runtime_smoke" \
+    || ! grep -F -q 'metadata_p95_policy=diagnostic' "$vm_harness" \
+    || ! grep -F -q 'metadata_p95_limit_seconds=2.000' "$vm_harness" \
+    || ! grep -F -q 'metadata_p95_enforced=false' "$vm_harness" \
+    || ! grep -F -q 'expected_p95_within_limit=$(awk -v value="$load_result_p95"' "$vm_harness" \
+    || ! grep -F -q 'print (value < 2.000) ? "true" : "false"' "$vm_harness" \
+    || ! grep -F -q 'evidence_value "$p95_evidence" metadata_p95_within_limit' "$vm_harness" \
+    || ! grep -F -q 'evidence_value "$p95_evidence" supervision_mode)" = systemd' "$vm_harness" \
+    || ! grep -F -q 'metadata_rows=2000' "$vm_harness" \
+    || ! grep -F -q 'range_rows=40' "$vm_harness" \
+    || ! grep -F -q 'upload_rows=10' "$vm_harness" \
+    || ! grep -F -q 'upload_integrity=server_readback' "$vm_harness" \
+    || ! grep -F -q 'integrity=ok' "$vm_runtime_smoke" \
+    || ! grep -F -q 'sudo sqlite3 /var/lib/vaultlink/data.sqlite "PRAGMA integrity_check;"' "$vm_harness" \
+    || ! grep -F -q '$2 !~ /^2[0-9][0-9]$/' "$load_test" \
+    || ! grep -F -q '[ "$status" = 206 ]' "$load_test" \
+    || ! grep -F -q '[ "$hash" = "$expected_range_hash" ]' "$load_test" \
+    || ! grep -F -q '[ "$verify_status" = 200 ]' "$load_test" \
+    || ! grep -F -q '[ "$server_hash" = "$upload_hash" ]' "$load_test" \
+    || ! grep -F -q '[ "$current_pid" = "$pid" ] || return 1' "$load_test" \
+    || ! grep -F -q '[ "$rss_kib" -gt 262144 ]' "$load_test" \
+    || ! grep -F -q '[ "$integrity" = ok ] || return 1' "$load_test"; then
+    report "QEMU must record numeric diagnostic p95 while keeping 100/40/10, status, hash, RSS, PID, readiness, and SQLite checks hard"
+fi
+if grep -E -q '\[[^]]*p95[^]]*within[^]]*(=|!=)[^]]*true[^]]*\]' \
+        "$vm_runtime_smoke" "$vm_harness"; then
+    report "QEMU p95 threshold results must be recorded, not required to be true"
+fi
+harness_evidence_line=$(grep -n -F '>"$evidence/harness.env"' "$vm_harness" \
+    | cut -d: -f1 | head -n 1)
+qemu_start_line=$(grep -n -F '$qemu $machine_args $firmware_args $acceleration_args' \
+    "$vm_harness" | cut -d: -f1 | head -n 1)
+if [ -z "$harness_evidence_line" ] || [ -z "$qemu_start_line" ] \
+    || [ "$harness_evidence_line" -ge "$qemu_start_line" ]; then
+    report "QEMU harness policy and acceleration evidence must be persisted before guest launch"
 fi
 if ! grep -F -q 'section == "[reverse_proxy]" && $0 == "enabled = false"' "$vm_runtime_smoke" \
     || ! grep -F -q 'runtime_mount_base=/mnt/storage' "$vm_runtime_smoke" \
@@ -1276,6 +1454,185 @@ package_smoke_job=$(awk '
     selected && /^  [[:alnum:]_-]+:$/ && $0 != "  smoke:" { exit }
     selected { print }
 ' "$package_workflow")
+package_offline_evidence_upload=$(printf '%s\n' "$package_smoke_job" | awk '
+    $0 == "      - name: Upload offline smoke evidence" { selected = 1 }
+    selected { print }
+    selected && /^          retention-days:/ { exit }
+')
+if [ ! -f "$package_native_load_smoke" ] || [ -L "$package_native_load_smoke" ] \
+    || ! printf '%s\n' "$package_smoke_job" \
+        | grep -F -q 'runs-on: ${{ matrix.runner }}' \
+    || ! printf '%s\n' "$package_smoke_job" \
+        | grep -F -q 'timeout-minutes: 120' \
+    || ! printf '%s\n' "$package_smoke_job" \
+        | grep -F -q "test \"\$(uname -m)\" = '${literal_dollar}{{ matrix.uname }}'" \
+    || ! printf '%s\n' "$package_smoke_job" \
+        | grep -F -q 'BUILDER_IMAGE: ${{ matrix.builder_image }}' \
+    || ! printf '%s\n' "$package_smoke_job" \
+        | grep -F -q 'name: vaultlink-package-${{ matrix.id }}' \
+    || ! printf '%s\n' "$package_smoke_job" \
+        | grep -F -q 'docker run --rm --network none --user root' \
+    || ! printf '%s\n' "$package_smoke_job" \
+        | grep -F -q -- '--mount type=volume,destination=/mnt/storage' \
+    || ! printf '%s\n' "$package_smoke_job" \
+        | grep -F -q 'sh tools/package-offline-smoke.sh' \
+    || ! printf '%s\n' "$package_smoke_job" \
+        | grep -F -q '"/work/offline-smoke/$TARGET_ID/native-load"' \
+    || ! printf '%s\n' "$package_offline_evidence_upload" \
+        | grep -F -q 'offline-smoke/${{ matrix.id }}/native-load/**' \
+    || ! printf '%s\n' "$package_offline_evidence_upload" \
+        | grep -F -q '        if: always()' \
+    || ! printf '%s\n' "$package_offline_evidence_upload" \
+        | grep -F -q '          if-no-files-found: error' \
+    || ! grep -F -q 'sh tools/package-container-smoke.sh "$target_id" "$version" "$package"' \
+        "$package_offline_smoke" \
+    || ! grep -F -q 'sh tools/package-native-load-smoke.sh' "$package_offline_smoke" \
+    || ! grep -F -q '"$target_id" "$version" "$package" "$api_work" "$native_load_evidence"' \
+        "$package_offline_smoke"; then
+    report "all nine exact packages must run the strict native load gate offline on their matching managed architecture and upload full evidence"
+fi
+package_lifecycle_line=$(grep -n -F \
+    'sh tools/package-container-smoke.sh "$target_id" "$version" "$package"' \
+    "$package_offline_smoke" | cut -d: -f1 | head -n 1)
+package_native_load_line=$(grep -n -F 'sh tools/package-native-load-smoke.sh' \
+    "$package_offline_smoke" | cut -d: -f1 | head -n 1)
+if [ -z "$package_lifecycle_line" ] || [ -z "$package_native_load_line" ] \
+    || [ "$package_lifecycle_line" -ge "$package_native_load_line" ]; then
+    report "native load must execute the package payload only after the exact package lifecycle installation"
+fi
+if ! grep -F -q '[ "$evidence" = "/work/offline-smoke/$target_id/native-load" ]' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'python3 tools/package-targets.py validate' "$package_native_load_smoke" \
+    || ! grep -F -q 'package_database_snapshot "$evidence/package-database-before.env"' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'package_database_snapshot "$evidence/package-database-after.env"' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'cmp -s "$evidence/package-database-before.env"' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'cmp -s "$candidate" "$live_binary"' "$package_native_load_smoke" \
+    || ! grep -F -q 'sha256sum -c vaultlink.sha256' "$package_native_load_smoke" \
+    || ! grep -F -q 'setpriv --reuid="$vaultlink_uid" --regid="$vaultlink_gid" --init-groups' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q '[ "$(readlink "/proc/$service_pid/exe")" = "$live_binary" ]' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'VAULTLINK_PROCESS_PID="$service_pid"' "$package_native_load_smoke" \
+    || ! grep -F -q 'VAULTLINK_PROCESS_UID="$vaultlink_uid"' "$package_native_load_smoke" \
+    || ! grep -F -q 'VAULTLINK_EXPECTED_BINARY_PATH="$live_binary"' "$package_native_load_smoke" \
+    || ! grep -F -q 'VAULTLINK_EXPECTED_BINARY_SHA256="$live_sha256"' "$package_native_load_smoke" \
+    || ! grep -F -q 'LOAD_P95_POLICY=strict' "$package_native_load_smoke" \
+    || ! grep -F -q 'LOAD_CONNECT_TIMEOUT_SECONDS=5' "$package_native_load_smoke" \
+    || ! grep -F -q 'LOAD_METADATA_MAX_TIME_SECONDS=30' "$package_native_load_smoke" \
+    || ! grep -F -q 'LOAD_TRANSFER_MAX_TIME_SECONDS=300' "$package_native_load_smoke" \
+    || ! grep -F -q 'LOAD_PROFILE_READY_TIMEOUT_SECONDS=10' "$package_native_load_smoke" \
+    || ! grep -F -q 'LOAD_ADMISSION_READY_TIMEOUT_SECONDS=10' "$package_native_load_smoke" \
+    || ! grep -F -q 'LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS=30' "$package_native_load_smoke" \
+    || ! grep -F -q 'LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS=5' "$package_native_load_smoke"; then
+    report "native performance must use the exact installed package payload, package database, unprivileged PID, and normal strict timeouts"
+fi
+native_failure_service_line=$(grep -n -F \
+    'write_redacted_tail "$runtime_base/service.log"' \
+    "$package_native_load_smoke" | cut -d: -f1 | head -n 1)
+native_runtime_remove_line=$(grep -n -F 'rm -rf -- "$runtime_base"' \
+    "$package_native_load_smoke" | cut -d: -f1 | head -n 1)
+if ! grep -F -q 'if [ "$native_status" -ne 0 ]; then' "$package_native_load_smoke" \
+    || ! grep -F -q 'failure-status.env' "$package_native_load_smoke" \
+    || ! grep -F -q 'write_redacted_tail "$runtime_base/service.log"' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q '"$evidence/failure-service.log" 200' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'write_redacted_tail "$runtime_base/load.log"' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q '"$evidence/failure-load.log" 200' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'known_secrets = sorted(' "$package_native_load_smoke" \
+    || ! grep -F -q 'text = text.replace(secret, "[REDACTED]")' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'authorization\s*:\s*bearer' "$package_native_load_smoke" \
+    || ! grep -F -q '(?:set-)?cookie' "$package_native_load_smoke" \
+    || ! grep -F -q 'x-csrf-token' "$package_native_load_smoke" \
+    || ! grep -F -q '(?:token|preview_token|csrf_token)' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'runtime-policy.env' "$package_native_load_smoke" \
+    || grep -F -q '"$evidence/runtime-config.toml"' "$package_native_load_smoke" \
+    || [ -z "$native_failure_service_line" ] \
+    || [ -z "$native_runtime_remove_line" ] \
+    || [ "$native_failure_service_line" -ge "$native_runtime_remove_line" ]; then
+    report "native package failures must upload bounded secret-redacted diagnostics before deleting private runtime state"
+fi
+for native_result_line in \
+    'assert_field "$result" supervision_mode direct_pid' \
+    'assert_field "$result" metadata_p95_policy strict' \
+    'assert_field "$result" metadata_p95_limit_seconds 2.000' \
+    'assert_field "$result" metadata_p95_within_limit true' \
+    'assert_field "$result" metadata_p95_enforced true' \
+    'assert_field "$result" metadata_clients 100' \
+    'assert_field "$result" metadata_requests 2000' \
+    'assert_field "$result" range_streams 40' \
+    'assert_field "$result" uploads 10' \
+    'assert_field "$result" upload_integrity server_readback' \
+    'assert_field "$load_command" stage complete' \
+    'assert_field "$load_command" exit_status 0' \
+    'assert_field "$profile" metadata_status 0' \
+    'assert_field "$profile" download_status 0' \
+    'assert_field "$profile" upload_status 0' \
+    'assert_field "$profile" rss_status 0' \
+    'assert_field "$profile" metadata_rows 2000' \
+    'assert_field "$profile" range_rows 40' \
+    'assert_field "$profile" upload_rows 10' \
+    'assert_field "$profile" supervision_mode direct_pid' \
+    'assert_field "$profile" metadata_p95_policy strict' \
+    'assert_field "$profile" metadata_p95_limit_seconds 2.000' \
+    'assert_field "$profile" metadata_p95_within_limit true' \
+    'assert_field "$profile" metadata_p95_enforced true' \
+    'assert_field "$pre_load" supervision_mode direct_pid' \
+    'assert_field "$post_load" supervision_mode direct_pid' \
+    'assert_field "$pre_load" integrity ok' \
+    'assert_field "$post_load" integrity ok' \
+    'assert_field "$pre_load" pid "$service_pid"' \
+    'assert_field "$post_load" pid "$service_pid"' \
+    'assert_field "$pre_load" process_starttime_ticks "$service_starttime"' \
+    'assert_field "$post_load" process_starttime_ticks "$service_starttime"' \
+    'assert_field "$pre_load" binary_sha256 "$live_sha256"' \
+    'assert_field "$post_load" binary_sha256 "$live_sha256"' \
+    'assert_field "$pre_load" health_sha256 "$readiness_sha256"' \
+    'assert_field "$post_load" health_sha256 "$readiness_sha256"'; do
+    grep -F -q "$native_result_line" "$package_native_load_smoke" \
+        || report "native package load evidence is missing hard assertion: $native_result_line"
+done
+if ! grep -F -q 'value < 2.000' "$package_native_load_smoke" \
+    || ! grep -F -q 'NR != 2000' "$package_native_load_smoke" \
+    || ! grep -F -q '$2 !~ /^2[0-9][0-9]$/' "$package_native_load_smoke" \
+    || ! grep -F -q 'seen["198.18.1." client] != 20' "$package_native_load_smoke" \
+    || ! grep -F -q 'NR == 1900 { print; exit }' "$package_native_load_smoke" \
+    || ! grep -F -q '[ "$recomputed_p95" = "$p95" ]' "$package_native_load_smoke" \
+    || ! grep -F -q '[ "$max_rss_kib" -le 262144 ]' "$package_native_load_smoke" \
+    || ! grep -F -q '$2 != expected_pid || $3 !~ /^[0-9]+$/' "$package_native_load_smoke" \
+    || ! grep -F -q '[ "$recomputed_max_rss" = "$max_rss_kib" ]' "$package_native_load_smoke" \
+    || ! grep -F -q '$2 != "198.18.2." ($1 + 1) || $3 != 206 || $4 != 67108864' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q '$5 != expected_hash' "$package_native_load_smoke" \
+    || ! grep -F -q '$6 != expected_content_range || seen[$1]++' "$package_native_load_smoke" \
+    || ! grep -F -q 'if (NR != 40) exit 1' "$package_native_load_smoke" \
+    || ! grep -F -q '$2 != "198.18.3." ($1 + 1) || $3 != 303 || $4 != "created"' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q '$6 != 200 || $7 != expected_hash' "$package_native_load_smoke" \
+    || ! grep -F -q 'if (NR != 10) exit 1' "$package_native_load_smoke" \
+    || ! grep -F -q "sqlite3 \"\$runtime_data/data.sqlite\" 'PRAGMA integrity_check;'" \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'install -m 0644 "$runtime_base/readiness.json" "$evidence/readiness.json"' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q '[ "$(cat "$runtime_base/readiness.json")" = "$expected_health" ]' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'package service restarted during native load' "$package_native_load_smoke" \
+    || ! grep -F -q 'running package payload changed during native load' "$package_native_load_smoke" \
+    || ! grep -F -q 'load_profile=100_metadata_40_ranges_10_uploads' "$package_native_load_smoke" \
+    || ! grep -F -q 'package_database_parity=ok' "$package_native_load_smoke" \
+    || ! grep -F -q 'payload_integrity=ok' "$package_native_load_smoke" \
+    || ! grep -F -q 'readiness=ok' "$package_native_load_smoke" \
+    || ! grep -F -q 'readiness_sha256=$readiness_sha256' "$package_native_load_smoke" \
+    || ! grep -F -q 'sqlite_integrity=ok' "$package_native_load_smoke"; then
+    report "native exact-package evidence must independently enforce p95, status/hash, RSS, PID, readiness, SQLite, and 100/40/10 completeness"
+fi
 if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.6.1' "$package_workflow" \
     || ! printf '%s\n' "$package_build_job" \
         | grep -F -q 'git archive "$GITHUB_SHA" | tar -x -C "$fixture_source"' \

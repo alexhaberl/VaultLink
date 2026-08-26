@@ -168,6 +168,18 @@ run_load_loop() {
         mkdir -p "$run_dir"
         if ! LOAD_RUN_ID="$(printf '%03d' "$run")" \
             LOAD_TEST_EVIDENCE_DIR="$run_dir" \
+            LOAD_P95_POLICY=strict \
+            LOAD_CONNECT_TIMEOUT_SECONDS=5 \
+            LOAD_METADATA_MAX_TIME_SECONDS=30 \
+            LOAD_TRANSFER_MAX_TIME_SECONDS=300 \
+            LOAD_ADMISSION_READY_TIMEOUT_SECONDS=10 \
+            LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS=30 \
+            LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS=5 \
+            LOAD_PROFILE_READY_TIMEOUT_SECONDS=10 \
+            VAULTLINK_PROCESS_PID='' \
+            VAULTLINK_PROCESS_UID='' \
+            VAULTLINK_EXPECTED_BINARY_PATH='' \
+            VAULTLINK_EXPECTED_BINARY_SHA256='' \
             VAULTLINK_CONFIG="$config" \
             "$load_script" >>"$load_log" 2>&1; then
             printf 'load profile %s failed\n' "$run" >"$load_failure"

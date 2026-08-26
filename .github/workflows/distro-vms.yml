@@ -163,18 +163,21 @@ jobs:
           fi
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           asset=$(python3 tools/package-targets.py asset "$TARGET_ID" "$version")
-          kvm_args=()
-          if [[ "$ARCHITECTURE" == amd64 \
-              && -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
-            kvm_args+=(--device /dev/kvm)
-          fi
           docker run --rm --network none --user root \
-            "${kvm_args[@]}" \
+            --env ACCELERATION_POLICY=force-tcg \
             --volume "$PWD:/work" --workdir /work \
             "$qemu_runner" \
             sh tools/run-distro-vm-test.sh \
               "$TARGET_ID" "vm-test/$TARGET_ID/package/$asset" \
               "vm-test/$TARGET_ID/guest.qcow2" "vm-test/$TARGET_ID/evidence"
+          grep -F -x -q 'acceleration_policy=force-tcg' \
+            "vm-test/$TARGET_ID/evidence/harness.env"
+          grep -F -x -q 'acceleration=tcg' \
+            "vm-test/$TARGET_ID/evidence/harness.env"
+          grep -F -x -q 'selected_acceleration=tcg' \
+            "vm-test/$TARGET_ID/evidence/acceleration-selection.env"
+          grep -F -x -q 'kvm_probe_result=not-requested' \
+            "vm-test/$TARGET_ID/evidence/acceleration-selection.env"
           {
             printf '%s\n' 'stage=after-full-system-gate'
             df -B1 "$PWD"

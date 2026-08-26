@@ -12,6 +12,8 @@ target_id=$1
 package=$2
 source_image=$3
 evidence=$4
+acceleration_policy=${ACCELERATION_POLICY:-force-tcg}
+case "$acceleration_policy" in force-tcg|auto) ;; *) exit 64 ;; esac
 [ -f "$package" ] && [ ! -L "$package" ] \
     && [ -f "$source_image" ] && [ ! -L "$source_image" ] \
     && [ ! -e "$evidence" ] && [ ! -L "$evidence" ] || exit 66
@@ -21,6 +23,21 @@ evidence=$(cd -- "$(dirname -- "$evidence")" && pwd)/$(basename -- "$evidence")
 
 field() {
     python3 tools/package-targets.py get "$target_id" "$1"
+}
+evidence_value() {
+    evidence_file=$1
+    evidence_key=$2
+    [ -f "$evidence_file" ] && [ ! -L "$evidence_file" ] || exit 77
+    awk -F= -v key="$evidence_key" '
+        $1 == key {
+            matches++
+            value = substr($0, length(key) + 2)
+        }
+        END {
+            if (matches != 1) exit 77
+            print value
+        }
+    ' "$evidence_file"
 }
 distribution=$(field distribution)
 distribution_version=$(field version)
@@ -171,14 +188,28 @@ case "$architecture" in
     *) exit 65 ;;
 esac
 
-acceleration=tcg
-acceleration_args='-accel tcg,thread=multi -cpu max'
-if [ "$architecture" = amd64 ] \
-    && [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] \
-    && "$qemu" -accel help 2>/dev/null | grep -F -x -q 'kvm'; then
-    acceleration=kvm
-    acceleration_args='-accel kvm -cpu host'
-fi
+acceleration=$(ACCELERATION_POLICY="$acceleration_policy" \
+    sh tools/select-qemu-acceleration.sh \
+    "$architecture" "$qemu" "$evidence/acceleration-selection.env")
+case "$acceleration" in
+    tcg) acceleration_args='-accel tcg,thread=multi -cpu max' ;;
+    kvm) acceleration_args='-accel kvm -cpu host' ;;
+    *) exit 77 ;;
+esac
+[ "$acceleration_policy" != force-tcg ] || [ "$acceleration" = tcg ]
+# Persist the harness-selected acceleration before the VM starts so every
+# terminal boot/runtime failure still has runner-independent context. QEMU is
+# authoritative for functional behavior only; its p95 is always diagnostic.
+printf '%s\n' \
+    'network=restricted-user-mode' \
+    "acceleration_policy=$acceleration_policy" \
+    "acceleration=$acceleration" \
+    "target=$target_id" \
+    "architecture=$architecture" \
+    'metadata_p95_policy=diagnostic' \
+    'metadata_p95_limit_seconds=2.000' \
+    'metadata_p95_enforced=false' \
+    >"$evidence/harness.env"
 if [ "$tcg_timeout_override" = true ]; then
     [ "$acceleration" = tcg ] || exit 77
     sh tools/manage-tcg-device-timeout.sh inject "$work/overlay.qcow2"
@@ -308,6 +339,7 @@ run_ssh vaultlink-ci@127.0.0.1 \
     sudo /bin/sh /tmp/distro-vm-guest-smoke.sh \
     "$target_id" "$distribution" "$distribution_version" "$package_format" \
     "$package_arch" "$version" "$remote_package" "$vm_packages_sha256" \
+    "$acceleration" \
     >"$evidence/package.env" 2>"$evidence/guest-smoke.stderr" \
     || guest_smoke_status=$?
 runtime_evidence_status=0
@@ -352,8 +384,6 @@ awk 'NF != 1 || $0 != "ok" { exit 1 } END { if (NR < 1) exit 1 }' \
     "$evidence/sqlite-integrity.txt"
 [ "$(cat "$evidence/runtime/post-remove-sqlite-integrity.txt")" = ok ]
 [ "$(cat "$evidence/runtime/post-reinstall-sqlite-integrity.txt")" = ok ]
-printf 'network=restricted-user-mode\nacceleration=%s\ntarget=%s\n' "$acceleration" "$target_id" \
-    >"$evidence/harness.env"
 sha256sum "$package" "$source_image" >"$evidence/host-inputs.sha256"
 grep -F -q "target=$target_id" "$evidence/package.env"
 candidate_hash=$(sed -n 's/^binary_sha256=//p' "$evidence/package.env")
@@ -377,19 +407,45 @@ grep -F -x -q 'range_rows=40' "$load_evidence/profile-status.env"
 grep -F -x -q 'upload_rows=10' "$load_evidence/profile-status.env"
 load_rss_rows=$(sed -n 's/^rss_rows=//p' "$load_evidence/profile-status.env")
 case "$load_rss_rows" in ''|*[!0-9]*|0) exit 77 ;; esac
-load_observed_p95=$(sed -n 's/^metadata_observed_p95_seconds=//p' \
-    "$load_evidence/profile-status.env")
-[ -n "$load_observed_p95" ]
-awk -v value="$load_observed_p95" 'BEGIN { exit !(value < 2.000) }'
+load_observed_p95=$(evidence_value \
+    "$load_evidence/profile-status.env" metadata_observed_p95_seconds)
+load_result_p95=$(evidence_value \
+    "$load_evidence/result.env" metadata_p95_seconds)
+[ "$load_result_p95" = "$load_observed_p95" ]
+expected_p95_within_limit=$(awk -v value="$load_result_p95" 'BEGIN {
+    if (value !~ /^[0-9]+([.][0-9]+)?$/ || !(value > 0)) exit 77
+    print (value < 2.000) ? "true" : "false"
+}')
+for p95_evidence in \
+    "$load_evidence/profile-status.env" \
+    "$load_evidence/result.env"; do
+    [ "$(evidence_value "$p95_evidence" supervision_mode)" = systemd ]
+    [ "$(evidence_value "$p95_evidence" metadata_p95_policy)" = diagnostic ]
+    [ "$(evidence_value "$p95_evidence" metadata_p95_limit_seconds)" = 2.000 ]
+    [ "$(evidence_value "$p95_evidence" metadata_p95_enforced)" = false ]
+    [ "$(evidence_value "$p95_evidence" metadata_p95_within_limit)" \
+        = "$expected_p95_within_limit" ]
+done
 if find "$load_evidence" -type f -name '*.partial.*' -print | grep -q .; then
     exit 77
 fi
 grep -F -q 'network=restricted-user-mode' "$evidence/harness.env"
+grep -F -x -q "acceleration_policy=$acceleration_policy" "$evidence/harness.env"
+grep -F -x -q "acceleration=$acceleration" "$evidence/harness.env"
+grep -F -x -q "target=$target_id" "$evidence/harness.env"
+grep -F -x -q "architecture=$architecture" "$evidence/harness.env"
+grep -F -x -q 'metadata_p95_policy=diagnostic' "$evidence/harness.env"
+grep -F -x -q 'metadata_p95_limit_seconds=2.000' "$evidence/harness.env"
+grep -F -x -q 'metadata_p95_enforced=false' "$evidence/harness.env"
 grep -F -x -q 'readiness=ok' "$evidence/runtime/runtime.env"
+grep -F -x -q "acceleration=$acceleration" "$evidence/runtime/runtime.env"
 grep -F -x -q 'upgrade=ok' "$evidence/runtime/runtime.env"
 grep -F -x -q 'migration=ok' "$evidence/runtime/runtime.env"
 grep -F -x -q 'rollback=ok' "$evidence/runtime/runtime.env"
 grep -F -x -q 'metadata_clients=100' "$evidence/runtime/load/result.env"
+grep -F -x -q 'metadata_requests=2000' "$evidence/runtime/load/result.env"
+grep -F -x -q 'range_streams=40' "$evidence/runtime/load/result.env"
+grep -F -x -q 'uploads=10' "$evidence/runtime/load/result.env"
 grep -F -x -q 'upload_integrity=server_readback' "$evidence/runtime/load/result.env"
 
 run_ssh vaultlink-ci@127.0.0.1 sudo poweroff || true

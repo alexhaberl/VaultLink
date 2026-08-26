@@ -27,17 +27,24 @@ or inconsistent.
 | Phase | Execution environment | Network policy | Authority |
 | --- | --- | --- | --- |
 | Rust/package build | Target distro builder container on matching native CPU | immutable build inputs only | authoritative |
-| Fast package tests | Target distro container on matching native CPU | package installed offline; runtime network isolated | authoritative |
+| Fast package tests and 100-user performance gate | Target distro builder container on matching native CPU, using the exact installed package payload | package installed offline; runtime network isolated | authoritative for package lifecycle and p95 `<2 s` |
 | Reproducibility | two empty build roots using the same target builder | immutable build inputs only | authoritative |
-| Full-system test | target guest booted by QEMU on matching native CPU | isolated host package channel; no free guest Internet | authoritative |
+| Full-system test | target guest booted by QEMU on matching native CPU | isolated host package channel; no free guest Internet | authoritative for full-system functionality, security, integrity, SELinux, upgrade, and rollback; p95 is diagnostic |
 | Local Docker | all x86_64 distro builders/containers | isolated runtime | development evidence only |
-| 72-hour soak | dedicated Debian 13 amd64 system | controlled public application path plus collector bridge | final Debian reference evidence |
+| 72-hour soak | dedicated Debian 13 amd64 system | controlled public application path plus collector bridge | final Debian reference evidence, including strict p95 `<2 s` |
 
-QEMU never compiles a release binary. KVM may accelerate a job when GitHub
-exposes it, but workflows cannot depend on KVM and must pass under software
-emulation. The managed arm64 runner is always exercised with TCG because a
-visible `/dev/kvm` device does not guarantee usable nested virtualization;
-amd64 may use KVM when the runner exposes it. Guests never network boot, and
+QEMU never compiles a release binary. The commit-bound `distro-vms` workflow
+forces TCG for every one of the nine matrix targets and does not expose
+`/dev/kvm` to its containers. This makes a green aggregate gate direct evidence
+that the full functional and security workload passed under software
+emulation, without doubling the matrix. Its p95 measurement is always recorded
+as diagnostic evidence; VM execution speed is not accepted as the target's
+release-performance result. A reviewed guest-image refresh may use KVM for
+amd64 only after a bounded QMP probe reports KVM as both present and enabled;
+an absent, inaccessible, unsupported, or failed probe selects TCG. A visible
+`/dev/kvm` device alone is never treated as proof of usable virtualization.
+The managed arm64 runner is always exercised with TCG. Guests never network
+boot, and
 their VirtIO NICs disable the PXE option ROM instead of adding an unused ROM
 package to the QEMU harness. Fedora 44 guests keep SELinux `Enforcing`;
 disabling it invalidates the gate. The Arch guest and builder use the snapshot
@@ -121,14 +128,24 @@ Every one of the nine targets performs:
 - an offline fresh install with no service or timer autostart;
 - setup, systemd analysis, API smoke, migration, backup, upgrade, rollback,
   reinstall, and state-preserving remove tests;
+- the unchanged overlapping workload of 100 metadata clients, 40 range
+  streams, and ten upload/readback clients against the exact package payload
+  in its digest-pinned distribution builder on a native matching-architecture
+  GitHub runner; this is the authoritative p95 `<2 s` result; and
 - a full guest boot with OS, kernel, package database, active-binary hash,
-  systemd, journal, readiness, and SQLite evidence; and
-- the 100-user profile with p95 below two seconds, no 5xx response or
-  corruption, and the established RSS limit.
+  systemd, journal, readiness, SQLite, upgrade, rollback, and the same complete
+  load-workload evidence. The QEMU gate remains authoritative for request
+  counts and statuses, transfer and upload hashes, absence of corruption,
+  process and RSS limits, and all other functional and security assertions;
+  only its recorded p95 and threshold comparison are diagnostic. The
+  commit-bound workflow explicitly records `acceleration_policy=force-tcg` and
+  `acceleration=tcg` for every target.
 
 Native arm64 jobs are the only authoritative arm64 evidence. Architecture-
 independent security, policy, aggregation, signing, and publication work stays
-on `ubuntu-24.04`. Fuzz parallelism remains bounded by the runner resources.
+on `ubuntu-24.04`. The managed `ubuntu-24.04-arm` runner therefore supplies the
+authoritative arm64 performance evidence; private ARM hardware is not required.
+Fuzz parallelism remains bounded by the runner resources.
 
 Three aggregate, commit-bound checks are published:
 

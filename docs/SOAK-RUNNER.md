@@ -107,8 +107,11 @@ load it saturates one forwarded stream key and proves that a different
 forwarded identity still receives an independent admission slot. The benchmark
 then assigns separate RFC 2544 identities to all 100 metadata clients, 40 range
 streams, and ten upload clients; an untrusted public `X-Forwarded-For` shortcut
-is never used. Every profile requires metadata p95 to remain strictly below
-2 seconds while all three pressure groups overlap.
+is never used. The dedicated Debian 13 amd64 soak is a strict performance gate:
+every profile requires metadata p95 to remain below 2 seconds while all three
+pressure groups overlap. This is separate from the diagnostic p95 recorded by
+full-system QEMU gates; QEMU still runs the identical workload and enforces all
+of its functional, security, integrity, and RSS assertions.
 
 `UPLOAD_VERIFY_TOKEN` must be a staging-only download share rooted at exactly
 the same directory as `UPLOAD_TOKEN`, without a password or download limit.
@@ -126,7 +129,11 @@ commit; changing them afterwards invalidates the evidence.
 ## Start, collection, and release binding
 
 1. Run the complete native, Docker, fuzz, package, upgrade, reproducibility,
-   distro-VM, and per-target load gates for one exact commit.
+   distro-VM, and per-target load gates for one exact commit. For every target,
+   the authoritative p95 `<2 s` result comes from the exact package payload in
+   its digest-pinned distribution builder on a native matching-architecture
+   GitHub runner. The full QEMU run records p95 diagnostically while remaining
+   authoritative for the unchanged workload's functional and security results.
 2. Dispatch `Start 72-hour release soak` from `main` with the exact 40-character
    `origin/main` commit and SHA-256 of the already running amd64 binary. The
    supplied hash is only an explicit confirmation: the workflow downloads the
