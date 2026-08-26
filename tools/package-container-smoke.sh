@@ -481,6 +481,15 @@ identity_add_shadow '!*'
 assert_identity_rejected shadow-only 'vaultlink service identity is incomplete'
 
 identity_restore
+# The identity backup only belongs to the negative probes above. Retire it
+# before the real package lifecycle so EXIT cleanup cannot undo the service
+# account legitimately provisioned by the package.
+for identity_file in passwd group shadow gshadow; do
+    rm -f "$identity_backup_dir/$identity_file"
+done
+rmdir "$identity_backup_dir" \
+    || fail "identity backup could not be retired after negative probes"
+identity_backup_dir=
 
 # A fresh package must reject every markerless package-owned application tree,
 # not merely the old /opt runtime path. Prove the guard runs before unpacking

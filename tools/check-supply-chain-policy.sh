@@ -963,6 +963,12 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q 'VaultLink-related AVC denial' tools/distro-vm-runtime-smoke.sh; then
     report "all nine packages need offline lifecycle gates and restricted full-system QEMU/load/SELinux gates"
 fi
+if ! grep -F -q 'rm -f "$identity_backup_dir/$identity_file"' tools/package-container-smoke.sh \
+    || ! grep -F -q 'rmdir "$identity_backup_dir"' tools/package-container-smoke.sh \
+    || [ "$(grep -F -x -c 'identity_backup_dir=' tools/package-container-smoke.sh || true)" -ne 2 ] \
+    || ! grep -F -q 'package lifecycle smoke did not preserve the service identity' tools/package-offline-smoke.sh; then
+    report "package smoke must retire probe-only identity rollback before preserving the installed service account"
+fi
 
 tcg_timeout_manager=tools/manage-tcg-device-timeout.sh
 tcg_timeout_cleanup=tools/clear-tcg-device-timeout.sh
