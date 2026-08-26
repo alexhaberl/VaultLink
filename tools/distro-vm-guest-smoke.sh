@@ -40,6 +40,29 @@ fi
 [ "$(cat /usr/local/share/vaultlink-vm-target)" = "$target_id" ]
 [ "$(sha256sum /usr/local/share/vaultlink-vm-packages.lock | awk '{print $1}')" = "$vm_packages_sha256" ]
 /bin/sh /tmp/check-vm-root-capacity.sh 6979321856 1073741824
+storage_source=$(findmnt -n -o SOURCE --mountpoint /mnt 2>/dev/null || true)
+case "$storage_source" in
+    /dev/*) storage_source=$(readlink -f -- "$storage_source" || true) ;;
+esac
+storage_fstype=$(findmnt -n -o FSTYPE --mountpoint /mnt 2>/dev/null || true)
+storage_device_fstype=$(blkid -s TYPE -o value /dev/vdb 2>/dev/null || true)
+storage_label=$(blkid -s LABEL -o value /dev/vdb 2>/dev/null || true)
+printf 'storage_source=%s\nstorage_filesystem=%s\nstorage_device_filesystem=%s\nstorage_label=%s\n' \
+    "$storage_source" "$storage_fstype" "$storage_device_fstype" "$storage_label"
+if [ "$storage_source" != /dev/vdb ] \
+    || [ "$storage_fstype" != ext4 ] \
+    || [ "$storage_device_fstype" != ext4 ] \
+    || [ "$storage_label" != vaultlink-data ]; then
+    {
+        echo "expected /dev/vdb mounted as ext4 on /mnt with label vaultlink-data"
+        lsblk -o NAME,PATH,TYPE,FSTYPE,LABEL,MOUNTPOINTS || true
+        findmnt --raw -o SOURCE,TARGET,FSTYPE,OPTIONS || true
+        blkid || true
+        sed -n '1,200p' /etc/fstab || true
+        cloud-init status --long || true
+    } >&2
+    exit 70
+fi
 if [ "$distribution" = arch ]; then
     [ -L /etc/systemd/system/systemd-time-wait-sync.service ]
     [ "$(readlink /etc/systemd/system/systemd-time-wait-sync.service)" = /dev/null ]
@@ -77,8 +100,6 @@ esac
 cmp /usr/local/share/vaultlink-vm-packages.lock "$live_vm_packages"
 rm -f "$live_vm_packages"
 trap - EXIT HUP INT TERM
-[ "$(findmnt -n -o FSTYPE --target /mnt)" = ext4 ]
-[ "$(findmnt -n -o SOURCE --target /mnt)" = /dev/vdb ]
 
 install_package() {
     case "$package_format" in

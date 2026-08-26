@@ -70,8 +70,14 @@ therefore updates those four locks and all nine target records atomically.
 Provisioned guest disks are normalized to an 8 GiB virtual size. Cloud-init
 must grow the root partition and filesystem before package installation, and
 both provisioning and the full-system gate reject a root filesystem below the
-reviewed capacity. Fedora 44 arm64 needs a longer systemd device timeout only
-while its UEFI guest boots under slow TCG emulation. The harness injects that
+reviewed capacity. Each full-system gate also creates a fresh 20 GiB `/dev/vdb`,
+formats it as ext4 with a label that fits ext4's 16-byte limit, and mounts it on
+`/mnt`. The guest emits its ready marker only after the device, filesystem,
+label, and exact mount source have been verified. A failure emits the block
+device, mount, filesystem, `fstab`, and cloud-init diagnostics immediately so
+the host can stop without waiting for the normal SSH timeout. Fedora 44 arm64
+needs a longer systemd device timeout only while its UEFI guest boots under
+slow TCG emulation. The harness injects that
 temporary override into its disposable overlay and verifies that cloud-init
 removed both the override and cleanup helper before any guest image or gate
 evidence is accepted. The arm64 libguestfs appliance is explicitly forced to
