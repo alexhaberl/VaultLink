@@ -56,14 +56,20 @@ install -d -m 0755 "$evidence"
 ssh-keygen -q -t ed25519 -N '' -f "$work/client-key"
 ssh-keygen -q -t ed25519 -N '' -f "$work/host-key"
 client_public=$(cat "$work/client-key.pub")
-host_private=$(base64 -w0 "$work/host-key")
-host_public=$(base64 -w0 "$work/host-key.pub")
+host_private=$(sed 's/^/    /' "$work/host-key")
+host_public=$(sed 's/^/    /' "$work/host-key.pub")
 cat >"$work/meta-data" <<EOF
 instance-id: vaultlink-test-$target_id-$version
 local-hostname: vaultlink-$target_id
 EOF
 cat >"$work/user-data" <<EOF
 #cloud-config
+ssh_deletekeys: true
+ssh_keys:
+  ed25519_private: |
+$host_private
+  ed25519_public: |
+$host_public
 users:
   - name: vaultlink-ci
     sudo: ALL=(ALL) NOPASSWD:ALL
@@ -79,17 +85,6 @@ fs_setup:
     overwrite: false
 mounts:
   - [ 'LABEL=vaultlink-storage', '/mnt', 'ext4', 'defaults,nofail', '0', '2' ]
-write_files:
-  - path: /etc/ssh/ssh_host_ed25519_key
-    owner: root:root
-    permissions: '0600'
-    encoding: b64
-    content: $host_private
-  - path: /etc/ssh/ssh_host_ed25519_key.pub
-    owner: root:root
-    permissions: '0644'
-    encoding: b64
-    content: $host_public
 runcmd:
   - [ sh, -c, "set -eu; $tcg_cleanup_command" ]
   - [ sh, -c, "systemctl restart sshd.service || systemctl restart ssh.service" ]
@@ -150,26 +145,62 @@ printf '[127.0.0.1]:2222 %s\n' "$(cat "$work/host-key.pub")" >"$work/known_hosts
 run_ssh() {
     ssh -i "$work/client-key" \
         -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+        -o HostKeyAlgorithms=ssh-ed25519 \
         -o "UserKnownHostsFile=$work/known_hosts" -o ConnectTimeout=5 \
         -p 2222 "$@"
 }
 run_scp() {
     scp -i "$work/client-key" \
         -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+        -o HostKeyAlgorithms=ssh-ed25519 \
         -o "UserKnownHostsFile=$work/known_hosts" -o ConnectTimeout=5 \
         -P 2222 "$@"
 }
+ssh_readiness_error="$work/ssh-readiness.stderr"
+capture_readiness_diagnostic() {
+    ssh_status=0
+    run_ssh -vv vaultlink-ci@127.0.0.1 true \
+        >/dev/null 2>"$evidence/ssh-readiness-diagnostic.stderr" \
+        || ssh_status=$?
+    ready_marker_present=false
+    if grep -F -q VAULTLINK_VM_READY "$evidence/serial.log"; then
+        ready_marker_present=true
+    fi
+    qemu_alive=false
+    if kill -0 "$qemu_pid" 2>/dev/null; then
+        qemu_alive=true
+    fi
+    printf 'ssh_status=%s\nready_marker_present=%s\nqemu_alive=%s\n' \
+        "$ssh_status" "$ready_marker_present" "$qemu_alive" \
+        >"$evidence/ssh-readiness.env"
+    if [ "$ssh_status" -eq 0 ] && [ "$ready_marker_present" = true ]; then
+        return 0
+    fi
+    echo "$1" >&2
+    echo "SSH readiness diagnostic:" >&2
+    cat "$evidence/ssh-readiness-diagnostic.stderr" >&2 || true
+    echo "last 200 serial log lines:" >&2
+    tail -n 200 "$evidence/serial.log" >&2 || true
+    return 1
+}
 deadline=$(( $(date +%s) + ssh_timeout ))
 while :; do
-    if run_ssh vaultlink-ci@127.0.0.1 true 2>/dev/null \
+    if run_ssh vaultlink-ci@127.0.0.1 true 2>"$ssh_readiness_error" \
         && grep -F -q VAULTLINK_VM_READY "$evidence/serial.log"; then
         break
     fi
     kill -0 "$qemu_pid" 2>/dev/null || {
-        tail -n 200 "$evidence/serial.log" >&2 || true
+        capture_readiness_diagnostic \
+            "full-system QEMU exited before SSH readiness" || true
         exit 70
     }
-    [ "$(date +%s)" -lt "$deadline" ] || exit 70
+    [ "$(date +%s)" -lt "$deadline" ] || {
+        if capture_readiness_diagnostic \
+            "SSH readiness timed out after ${ssh_timeout}s for $target_id"; then
+            break
+        fi
+        exit 70
+    }
     sleep 5
 done
 if [ "$target_id" = archlinux-amd64 ]; then

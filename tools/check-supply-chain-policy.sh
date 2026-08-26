@@ -116,6 +116,7 @@ package_builder_dependencies=deploy/docker/install-package-builder-dependencies.
 vm_provisioner=tools/provision-distro-vm-image.sh
 package_workflow=.github/workflows/packages.yml
 real_package_smoke=tools/real-package-update-smoke.sh
+vm_harness=tools/run-distro-vm-test.sh
 
 if ! python3 tools/package-targets.py validate --allow-unprovisioned >/dev/null; then
     report "the declarative nine-target package manifest is invalid even in bootstrap mode"
@@ -967,6 +968,24 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q 'kernel-audit.journal' tools/distro-vm-runtime-smoke.sh \
     || ! grep -F -q 'VaultLink-related AVC denial' tools/distro-vm-runtime-smoke.sh; then
     report "all nine packages need offline lifecycle gates and restricted full-system QEMU/load/SELinux gates"
+fi
+if [ "$(grep -F -x -c 'ssh_deletekeys: true' "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c 'ssh_keys:' "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c '  ed25519_private: |' "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c '  ed25519_public: |' "$vm_harness" || true)" -ne 1 ] \
+    || ! grep -F -q 'host_private=$(sed '\''s/^/    /'\'' "$work/host-key")' "$vm_harness" \
+    || ! grep -F -q 'host_public=$(sed '\''s/^/    /'\'' "$work/host-key.pub")' "$vm_harness" \
+    || [ "$(grep -F -c 'HostKeyAlgorithms=ssh-ed25519' "$vm_harness" || true)" -ne 2 ] \
+    || [ "$(grep -F -c 'StrictHostKeyChecking=yes' "$vm_harness" || true)" -ne 2 ] \
+    || [ "$(grep -F -c 'UserKnownHostsFile=$work/known_hosts' "$vm_harness" || true)" -ne 2 ] \
+    || grep -F -q 'path: /etc/ssh/ssh_host_' "$vm_harness" \
+    || ! grep -F -q 'ssh-readiness-diagnostic.stderr' "$vm_harness" \
+    || ! grep -F -q 'run_ssh -vv vaultlink-ci@127.0.0.1 true' "$vm_harness" \
+    || ! grep -F -q 'ready_marker_present=' "$vm_harness" \
+    || ! grep -F -q 'qemu_alive=' "$vm_harness" \
+    || ! grep -F -q 'SSH readiness timed out after ${ssh_timeout}s' "$vm_harness" \
+    || ! grep -F -q 'full-system QEMU exited before SSH readiness' "$vm_harness"; then
+    report "distro VM SSH must use a cloud-init-managed ephemeral Ed25519 host key with fail-closed diagnostics"
 fi
 if ! grep -F -q 'rm -f "$identity_backup_dir/$identity_file"' tools/package-container-smoke.sh \
     || ! grep -F -q 'rmdir "$identity_backup_dir"' tools/package-container-smoke.sh \
