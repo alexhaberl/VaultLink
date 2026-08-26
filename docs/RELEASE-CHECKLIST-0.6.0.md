@@ -110,8 +110,9 @@ a skipped, neutral, missing, stale, or wrong-commit result is not success.
   SBOMs, and final packages.
 - [ ] `vaultlink/distro-vms` is green and accounts for all nine target rows.
 - [ ] Every guest evidence bundle records kernel, OS, package database version,
-  payload and active hashes, service/timer enablement, systemd status, journal,
-  exact readiness response, SQLite integrity, and test result.
+  verified `/dev/vdb` ext4 mount source and label, payload and active hashes,
+  service/timer enablement, systemd status, journal, exact readiness response,
+  SQLite integrity, and test result.
 - [ ] Guests receive the package only over the isolated host channel and have
   no unrestricted Internet access; tests pass without KVM.
 - [ ] Fedora 44 reports SELinux `Enforcing` and no VaultLink-related AVC denial.

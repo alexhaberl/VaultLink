@@ -117,6 +117,8 @@ vm_provisioner=tools/provision-distro-vm-image.sh
 package_workflow=.github/workflows/packages.yml
 real_package_smoke=tools/real-package-update-smoke.sh
 vm_harness=tools/run-distro-vm-test.sh
+vm_guest_smoke=tools/distro-vm-guest-smoke.sh
+vm_bootstrap_runcmd="  - [ /usr/local/sbin/vaultlink-vm-bootstrap, '\$tcg_cleanup_command' ]"
 
 if ! python3 tools/package-targets.py validate --allow-unprovisioned >/dev/null; then
     report "the declarative nine-target package manifest is invalid even in bootstrap mode"
@@ -993,6 +995,47 @@ if [ "$(grep -F -x -c 'ssh_deletekeys: true' "$vm_harness" || true)" -ne 1 ] \
     || ! grep -F -q 'SSH readiness timed out after ${ssh_timeout}s' "$vm_harness" \
     || ! grep -F -q 'full-system QEMU exited before SSH readiness' "$vm_harness"; then
     report "distro VM SSH must use a cloud-init-managed ephemeral Ed25519 host key with fail-closed diagnostics"
+fi
+if [ "$(grep -F -x -c '  - label: vaultlink-data' "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c "  - [ 'LABEL=vaultlink-data', '/mnt', 'ext4', 'defaults,nofail', '0', '2' ]" "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c '    filesystem: ext4' "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c '    device: /dev/vdb' "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c '    overwrite: false' "$vm_harness" || true)" -ne 1 ] \
+    || grep -F -q 'overwrite: true' "$vm_harness" \
+    || grep -F -q 'vaultlink-storage' "$vm_harness" \
+    || [ "$(grep -F -x -c '  - path: /usr/local/sbin/vaultlink-vm-bootstrap' "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c '    owner: root:root' "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c "    permissions: '0700'" "$vm_harness" || true)" -ne 1 ] \
+    || [ "$(grep -F -x -c "$vm_bootstrap_runcmd" "$vm_harness" || true)" -ne 1 ] \
+    || ! grep -F -q '[ "$storage_source" = /dev/vdb ] || mount_failure wrong_source' "$vm_harness" \
+    || ! grep -F -q '[ "$storage_fstype" = ext4 ] || mount_failure wrong_mount_fstype' "$vm_harness" \
+    || ! grep -F -q '[ "$storage_device_fstype" = ext4 ] || mount_failure wrong_device_fstype' "$vm_harness" \
+    || ! grep -F -q '[ "$storage_label" = vaultlink-data ] || mount_failure wrong_label' "$vm_harness" \
+    || ! grep -F -q 'findmnt -n -o SOURCE --mountpoint /mnt' "$vm_harness" \
+    || ! grep -F -q 'VAULTLINK_VM_MOUNT_FAILED reason=%s' "$vm_harness" \
+    || ! grep -F -q "grep -F -q 'VAULTLINK_VM_MOUNT_FAILED '" "$vm_harness" \
+    || ! grep -F -q 'echo VAULTLINK_VM_STORAGE_READY | tee /dev/console' "$vm_harness" \
+    || ! grep -F -q 'storage_ready_marker_present=' "$vm_harness" \
+    || ! grep -F -q 'lsblk -o NAME,PATH,TYPE,FSTYPE,LABEL,MOUNTPOINTS || true' "$vm_harness" \
+    || ! grep -F -q 'findmnt --raw -o SOURCE,TARGET,FSTYPE,OPTIONS || true' "$vm_harness" \
+    || ! grep -F -q 'blkid || true' "$vm_harness" \
+    || ! grep -F -q "sed -n '1,200p' /etc/fstab || true" "$vm_harness" \
+    || ! grep -F -q 'cloud-init status --long || true' "$vm_harness" \
+    || ! grep -F -q 'storage_source=%s\nstorage_filesystem=%s\nstorage_device_filesystem=%s\nstorage_label=%s' "$vm_guest_smoke" \
+    || ! grep -F -q 'findmnt -n -o SOURCE --mountpoint /mnt' "$vm_guest_smoke" \
+    || ! grep -F -q 'if [ "$storage_source" != /dev/vdb ]' "$vm_guest_smoke" \
+    || ! grep -F -q '|| [ "$storage_fstype" != ext4 ]' "$vm_guest_smoke" \
+    || ! grep -F -q '|| [ "$storage_device_fstype" != ext4 ]' "$vm_guest_smoke" \
+    || ! grep -F -q '[ "$storage_label" != vaultlink-data ]' "$vm_guest_smoke"; then
+    report "distro VM storage must use an ext4-safe label and fail closed with pre-install diagnostics"
+fi
+guest_storage_check_line=$(grep -n -F 'storage_source=$(findmnt -n -o SOURCE --mountpoint /mnt' "$vm_guest_smoke" \
+    | cut -d: -f1 | head -n 1)
+guest_package_inventory_line=$(grep -n -F 'live_vm_packages=$(mktemp)' "$vm_guest_smoke" \
+    | cut -d: -f1 | head -n 1)
+if [ -z "$guest_storage_check_line" ] || [ -z "$guest_package_inventory_line" ] \
+    || [ "$guest_storage_check_line" -ge "$guest_package_inventory_line" ]; then
+    report "distro VM storage identity must be verified before package inventory or mutation"
 fi
 if ! grep -F -q 'rm -f "$identity_backup_dir/$identity_file"' tools/package-container-smoke.sh \
     || ! grep -F -q 'rmdir "$identity_backup_dir"' tools/package-container-smoke.sh \

@@ -58,6 +58,59 @@ ssh-keygen -q -t ed25519 -N '' -f "$work/host-key"
 client_public=$(cat "$work/client-key.pub")
 host_private=$(sed 's/^/    /' "$work/host-key")
 host_public=$(sed 's/^/    /' "$work/host-key.pub")
+cat >"$work/guest-bootstrap.sh" <<'EOF'
+#!/bin/sh
+set -eu
+
+mount_failure() {
+    reason=$1
+    {
+        printf 'VAULTLINK_VM_MOUNT_FAILED reason=%s\n' "$reason"
+        printf '%s\n' '--- lsblk ---'
+        lsblk -o NAME,PATH,TYPE,FSTYPE,LABEL,MOUNTPOINTS || true
+        printf '%s\n' '--- findmnt ---'
+        findmnt --raw -o SOURCE,TARGET,FSTYPE,OPTIONS || true
+        printf '%s\n' '--- blkid ---'
+        blkid || true
+        printf '%s\n' '--- /etc/fstab ---'
+        sed -n '1,200p' /etc/fstab || true
+        printf '%s\n' '--- cloud-init ---'
+        cloud-init status --long || true
+    } | tee /dev/console >&2
+    exit 70
+}
+
+[ "$#" -eq 1 ] || mount_failure invalid_arguments
+cleanup_command=$1
+case "$cleanup_command" in
+    :) ;;
+    /usr/local/bin/vaultlink-clear-tcg-device-timeout)
+        "$cleanup_command" || mount_failure tcg_cleanup_failed
+        ;;
+    *) mount_failure invalid_cleanup_command ;;
+esac
+
+if ! systemctl restart sshd.service && ! systemctl restart ssh.service; then
+    mount_failure ssh_restart_failed
+fi
+[ -b /dev/vdb ] || mount_failure device_missing
+storage_source=$(findmnt -n -o SOURCE --mountpoint /mnt 2>/dev/null) \
+    || mount_failure not_mounted
+storage_source=$(readlink -f -- "$storage_source") \
+    || mount_failure invalid_source
+storage_fstype=$(findmnt -n -o FSTYPE --mountpoint /mnt 2>/dev/null) \
+    || mount_failure missing_mount_fstype
+storage_device_fstype=$(blkid -s TYPE -o value /dev/vdb 2>/dev/null || true)
+storage_label=$(blkid -s LABEL -o value /dev/vdb 2>/dev/null || true)
+[ "$storage_source" = /dev/vdb ] || mount_failure wrong_source
+[ "$storage_fstype" = ext4 ] || mount_failure wrong_mount_fstype
+[ "$storage_device_fstype" = ext4 ] || mount_failure wrong_device_fstype
+[ "$storage_label" = vaultlink-data ] || mount_failure wrong_label
+
+echo VAULTLINK_VM_STORAGE_READY | tee /dev/console
+echo VAULTLINK_VM_READY | tee /dev/console
+EOF
+guest_bootstrap=$(sed 's/^/      /' "$work/guest-bootstrap.sh")
 cat >"$work/meta-data" <<EOF
 instance-id: vaultlink-test-$target_id-$version
 local-hostname: vaultlink-$target_id
@@ -78,17 +131,21 @@ users:
       - $client_public
 ssh_pwauth: false
 disable_root: true
+write_files:
+  - path: /usr/local/sbin/vaultlink-vm-bootstrap
+    owner: root:root
+    permissions: '0700'
+    content: |
+$guest_bootstrap
 fs_setup:
-  - label: vaultlink-storage
+  - label: vaultlink-data
     filesystem: ext4
     device: /dev/vdb
     overwrite: false
 mounts:
-  - [ 'LABEL=vaultlink-storage', '/mnt', 'ext4', 'defaults,nofail', '0', '2' ]
+  - [ 'LABEL=vaultlink-data', '/mnt', 'ext4', 'defaults,nofail', '0', '2' ]
 runcmd:
-  - [ sh, -c, "set -eu; $tcg_cleanup_command" ]
-  - [ sh, -c, "systemctl restart sshd.service || systemctl restart ssh.service" ]
-  - [ sh, -c, "echo VAULTLINK_VM_READY | tee /dev/console" ]
+  - [ /usr/local/sbin/vaultlink-vm-bootstrap, '$tcg_cleanup_command' ]
 EOF
 cloud-localds "$work/seed.img" "$work/user-data" "$work/meta-data"
 qemu-img check "$source_image"
@@ -168,14 +225,21 @@ capture_readiness_diagnostic() {
     if grep -F -q VAULTLINK_VM_READY "$evidence/serial.log"; then
         ready_marker_present=true
     fi
+    storage_ready_marker_present=false
+    if grep -F -q VAULTLINK_VM_STORAGE_READY "$evidence/serial.log"; then
+        storage_ready_marker_present=true
+    fi
     qemu_alive=false
     if kill -0 "$qemu_pid" 2>/dev/null; then
         qemu_alive=true
     fi
-    printf 'ssh_status=%s\nready_marker_present=%s\nqemu_alive=%s\n' \
-        "$ssh_status" "$ready_marker_present" "$qemu_alive" \
+    printf 'ssh_status=%s\nstorage_ready_marker_present=%s\nready_marker_present=%s\nqemu_alive=%s\n' \
+        "$ssh_status" "$storage_ready_marker_present" \
+        "$ready_marker_present" "$qemu_alive" \
         >"$evidence/ssh-readiness.env"
-    if [ "$ssh_status" -eq 0 ] && [ "$ready_marker_present" = true ] \
+    if [ "$ssh_status" -eq 0 ] \
+        && [ "$storage_ready_marker_present" = true ] \
+        && [ "$ready_marker_present" = true ] \
         && [ "$qemu_alive" = true ]; then
         return 0
     fi
@@ -193,8 +257,14 @@ capture_readiness_diagnostic() {
 deadline=$(( $(date +%s) + ssh_timeout ))
 while :; do
     if run_ssh vaultlink-ci@127.0.0.1 true 2>"$ssh_readiness_error" \
+        && grep -F -q VAULTLINK_VM_STORAGE_READY "$evidence/serial.log" \
         && grep -F -q VAULTLINK_VM_READY "$evidence/serial.log"; then
         break
+    fi
+    if grep -F -q 'VAULTLINK_VM_MOUNT_FAILED ' "$evidence/serial.log"; then
+        capture_readiness_diagnostic \
+            "guest reported a terminal storage-mount failure" || true
+        exit 70
     fi
     kill -0 "$qemu_pid" 2>/dev/null || {
         capture_readiness_diagnostic \
