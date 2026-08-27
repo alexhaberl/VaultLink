@@ -58,6 +58,12 @@ if [ ! -f "$process_identity_helper" ] || [ -L "$process_identity_helper" ] \
     || [ ! -r "$process_identity_helper" ]; then
     fail "direct process identity helper is unavailable or unsafe"
 fi
+storage_qualification_helper=$repo_root/tools/qualify-native-load-storage.py
+if [ ! -f "$storage_qualification_helper" ] \
+    || [ -L "$storage_qualification_helper" ] \
+    || [ ! -r "$storage_qualification_helper" ]; then
+    fail "storage qualification helper is unavailable or unsafe"
+fi
 cd "$repo_root"
 python3 tools/package-targets.py validate >/dev/null
 target_get() {
@@ -370,12 +376,21 @@ package_sha256=$(sha256sum "$package" | awk '{ print $1 }')
 package_database_snapshot "$evidence/package-database-before.env" \
     || fail "package database does not match the target"
 
-native_stage=runtime_fixture
+native_stage=storage_qualification
 if [ ! -d /mnt/storage ] || [ -L /mnt/storage ]; then
     fail "isolated native-load volume is unavailable"
 fi
 [ -z "$(find /mnt/storage -mindepth 1 -maxdepth 1 -print -quit)" ] \
     || fail "isolated native-load volume is not empty"
+python3 "$storage_qualification_helper" \
+    /mnt/storage "$evidence/storage-qualification.env" \
+    || fail "native-load storage does not satisfy the SQLite WAL qualification"
+grep -F -x -q 'qualification=pass' "$evidence/storage-qualification.env" \
+    || fail "native-load storage qualification evidence is incomplete"
+[ -z "$(find /mnt/storage -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "storage qualification did not leave the native-load volume empty"
+
+native_stage=runtime_fixture
 runtime_base="/mnt/storage/vaultlink-native-load-$target_id"
 install -d -o root -g vaultlink -m 0750 "$runtime_base"
 chown root:vaultlink "$runtime_base"

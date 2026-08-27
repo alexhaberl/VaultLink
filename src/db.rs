@@ -37,7 +37,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicI64, Ordering},
-        Arc,
+        Arc, Mutex, MutexGuard,
     },
 };
 
@@ -315,6 +315,11 @@ pub struct Database(Arc<DatabaseInner>);
 
 struct DatabaseInner {
     pool: r2d2::Pool<SqliteConnectionManager>,
+    // SQLite admits one writer at a time. Transfer requests can otherwise
+    // occupy every pooled connection while waiting for that writer slot,
+    // starving unrelated metadata reads and readiness checks. Admission must
+    // therefore happen before a transfer writer checks out a connection.
+    transfer_write_admission: Mutex<()>,
     keyring: keyring::Keyring,
     session_idle_minutes: AtomicI64,
     // Keep the descriptor behind /proc/self/fd alive for the whole connection
@@ -875,6 +880,7 @@ impl Database {
         drop(conn);
         Ok(Self(Arc::new(DatabaseInner {
             pool,
+            transfer_write_admission: Mutex::new(()),
             keyring,
             session_idle_minutes: AtomicI64::new(30),
             _directory_capability: directory_capability,
@@ -1017,6 +1023,14 @@ impl Database {
 
     fn try_conn(&self) -> rusqlite::Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.0.pool.get().map_err(|error| pool_error(&error))
+    }
+
+    fn transfer_write_guard(&self) -> rusqlite::Result<MutexGuard<'_, ()>> {
+        self.0.transfer_write_admission.lock().map_err(|_| {
+            database_io_error(io::Error::other(
+                "transfer database writer admission is poisoned",
+            ))
+        })
     }
 
     #[cfg(test)]

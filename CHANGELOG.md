@@ -11,6 +11,7 @@
 - Fixed Git ownership validation for the containerized tag-publishing job and documented the controlled `v0.5.0` recovery publication.
 - Refreshed the shared Rust 1.97.1 Debian container base digest for subsequent development builds.
 - Preserved audit evidence below the retention cap by preventing negative SQLite deletion limits, and hardened package smoke cleanup so installed service identities survive its negative probes.
+- Prevented concurrent transfer writers from exhausting the SQLite connection pool while waiting for the single WAL writer slot, and added an evidenced fail-closed SQLite storage qualification before every authoritative native package load gate.
 
 ## 0.5.0 — 2026-08-24
 

@@ -195,6 +195,7 @@ impl Database {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let expires = (now + Duration::seconds(UPLOAD_RESERVATION_TTL_SECONDS)).to_rfc3339();
+        let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
@@ -285,6 +286,7 @@ impl Database {
         let now_text = now.to_rfc3339();
         let expires = (now + Duration::seconds(UPLOAD_RESERVATION_TTL_SECONDS)).to_rfc3339();
         let reservation_hash = token_hash(token);
+        let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
@@ -385,6 +387,7 @@ impl Database {
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
         let reservation_hash = token_hash(token);
         let now_text = Utc::now().to_rfc3339();
+        let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
@@ -459,6 +462,7 @@ impl Database {
     }
 
     pub fn cancel_upload_reservation(&self, token: &str) -> rusqlite::Result<bool> {
+        let _write_guard = self.transfer_write_guard()?;
         Ok(self.try_conn()?.execute(
             "DELETE FROM public_upload_reservations WHERE token_hash=?1",
             [token_hash(token)],
@@ -480,6 +484,7 @@ impl Database {
     #[cfg(test)]
     pub fn count_download(&self, id: i64) -> rusqlite::Result<bool> {
         let now = Utc::now().to_rfc3339();
+        let _write_guard = self.transfer_write_guard()?;
         Ok(self.try_conn()?.execute(
             "UPDATE shares
              SET download_count=download_count+1
@@ -514,6 +519,7 @@ impl Database {
         let (now, expires) = transfer_deadlines();
         let session_token_hash = token_hash(session_token);
         let lease_token_hash = token_hash(lease_token);
+        let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state(&transaction, &now)?;
@@ -591,6 +597,7 @@ impl Database {
     ) -> rusqlite::Result<TransferAvailabilityOutcome> {
         let (now, _) = transfer_deadlines();
         let session_token_hash = token_hash(session_token);
+        let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state(&transaction, &now)?;
@@ -645,6 +652,7 @@ impl Database {
     ) -> rusqlite::Result<TransferLeaseCompleteOutcome> {
         let (now, expires) = transfer_deadlines();
         let lease_token_hash = token_hash(lease_token);
+        let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state(&transaction, &now)?;
@@ -724,6 +732,7 @@ impl Database {
     ) -> rusqlite::Result<TransferLeaseCancelOutcome> {
         let (now, _) = transfer_deadlines();
         let lease_token_hash = token_hash(lease_token);
+        let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state(&transaction, &now)?;
@@ -782,6 +791,7 @@ impl Database {
         let now = now_datetime.to_rfc3339();
         let rolling_expiry = now_datetime + Duration::seconds(TRANSFER_SESSION_TTL_SECONDS);
         let lease_token_hash = token_hash(lease_token);
+        let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_transfer_state_before_heartbeat(&transaction, &now, &lease_token_hash)?;

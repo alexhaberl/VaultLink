@@ -118,6 +118,9 @@ vm_provisioner=tools/provision-distro-vm-image.sh
 package_workflow=.github/workflows/packages.yml
 package_offline_smoke=tools/package-offline-smoke.sh
 package_native_load_smoke=tools/package-native-load-smoke.sh
+native_storage_qualification=tools/qualify-native-load-storage.py
+database_source=src/db.rs
+transfer_database_source=src/db/transfers.rs
 direct_process_identity=tools/check-direct-process-identity.sh
 real_package_smoke=tools/real-package-update-smoke.sh
 vm_harness=tools/run-distro-vm-test.sh
@@ -1577,6 +1580,45 @@ if ! grep -F -q '[ "$evidence" = "/work/offline-smoke/$target_id/native-load" ]'
     || ! grep -F -q 'LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS=30' "$package_native_load_smoke" \
     || ! grep -F -q 'LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS=5' "$package_native_load_smoke"; then
     report "native performance must use the exact installed package payload, package database, unprivileged PID, and normal strict timeouts"
+fi
+if [ ! -f "$native_storage_qualification" ] \
+    || [ -L "$native_storage_qualification" ] \
+    || ! grep -F -q 'storage_qualification_helper=$repo_root/tools/qualify-native-load-storage.py' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'native_stage=storage_qualification' "$package_native_load_smoke" \
+    || ! grep -F -q '/mnt/storage "$evidence/storage-qualification.env"' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q "grep -F -x -q 'qualification=pass'" \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'STORAGE_ROOT = Path("/mnt/storage")' \
+        "$native_storage_qualification" \
+    || ! grep -F -q 'WRITER_THREADS = 4' "$native_storage_qualification" \
+    || ! grep -F -q 'TRANSACTIONS_PER_WRITER = 32' "$native_storage_qualification" \
+    || ! grep -F -q 'MINIMUM_READER_QUERIES = 256' "$native_storage_qualification" \
+    || ! grep -F -q 'WRITER_P95_LIMIT_MS = 1_000.0' "$native_storage_qualification" \
+    || ! grep -F -q 'WRITER_MAX_LIMIT_MS = 5_000.0' "$native_storage_qualification" \
+    || ! grep -F -q 'READER_P95_LIMIT_MS = 250.0' "$native_storage_qualification" \
+    || ! grep -F -q 'READER_MAX_LIMIT_MS = 2_000.0' "$native_storage_qualification" \
+    || ! grep -F -q 'CHECKPOINT_LIMIT_MS = 5_000.0' "$native_storage_qualification" \
+    || ! grep -F -q 'WALL_LIMIT_MS = 30_000.0' "$native_storage_qualification" \
+    || ! grep -F -q 'PRAGMA journal_mode=WAL' "$native_storage_qualification" \
+    || ! grep -F -q 'PRAGMA synchronous=FULL' "$native_storage_qualification" \
+    || ! grep -F -q 'synchronous_mode == 2' "$native_storage_qualification" \
+    || ! grep -F -q 'PRAGMA integrity_check' "$native_storage_qualification" \
+    || ! grep -F -q 'next(storage.iterdir(), None)' "$native_storage_qualification" \
+    || ! grep -F -q 'barrier.abort()' "$native_storage_qualification" \
+    || ! grep -F -q 'shutil.rmtree(probe)' "$native_storage_qualification"; then
+    report "native package timing must fail closed on an evidenced four-writer SQLite WAL and concurrent-reader storage qualification"
+fi
+if ! grep -F -q 'transfer_write_admission: Mutex<()>' "$database_source" \
+    || ! grep -F -q 'transfer_write_admission: Mutex::new(())' "$database_source" \
+    || ! grep -F -q 'fn transfer_write_guard(&self)' "$database_source" \
+    || ! grep -F -q 'self.0.transfer_write_admission.lock()' "$database_source" \
+    || [ "$(grep -F -c 'let _write_guard = self.transfer_write_guard()?;' \
+        "$transfer_database_source" || true)" -ne 10 ] \
+    || [ "$(grep -F -c 'transaction_with_behavior(TransactionBehavior::Immediate)' \
+        "$transfer_database_source" || true)" -ne 8 ]; then
+    report "transfer writers must serialize before checking out a SQLite pool connection so metadata reads retain capacity"
 fi
 for native_resource_contract_line in \
     'host_nproc=${VAULTLINK_NATIVE_HOST_NPROC:-}' \

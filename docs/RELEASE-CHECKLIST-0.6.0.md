@@ -110,12 +110,17 @@ a skipped, neutral, missing, stale, or wrong-commit result is not success.
   at least 8 GiB of host RAM, and a Docker cpuset of logical CPUs 0-3. It
   restricts the server to CPUs 0-1 and the load generator to CPUs 2-3, gives
   the clients a dedicated hardened 4-GiB tmpfs, and keeps server storage
-  separate. Its evidence records the qualification, resource placement, exact
-  workload counts, latency, RSS, and integrity results. A missing or different
-  layout is a gate failure. This is a reproducible harness contract, not a
-  claim of deterministic timing from arbitrary standard runners. The qualified
-  native package run passes strict p95 `<2 s`, has no invalid response or
-  corruption, and remains within the approved RSS limit.
+  separate. Before service startup, the empty server volume passes the
+  evidenced four-writer/128-transaction `synchronous=FULL` SQLite WAL probe
+  with a concurrent reader, `integrity_check=ok`, writer p95 `<1 s`, writer
+  maximum `<5 s`, reader p95 `<250 ms`, reader maximum `<2 s`, checkpoint
+  `<5 s`, and total runtime `<30 s`. Its evidence records both qualifications,
+  resource placement, exact workload counts, latency, RSS, and integrity
+  results. A missing or different layout is a gate failure. Qualification
+  failure is not automatically retried. This is a reproducible harness
+  contract, not a claim of deterministic timing from arbitrary standard
+  runners. The qualified native package run passes strict p95 `<2 s`, has no
+  invalid response or corruption, and remains within the approved RSS limit.
 - [ ] Managed `ubuntu-24.04-arm` jobs provide the authoritative arm64 p95
   evidence; no private ARM host is part of the release boundary.
 - [ ] `vaultlink/package-reproducibility` is green and accounts for all nine
