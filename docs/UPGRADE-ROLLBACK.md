@@ -139,8 +139,20 @@ was active. It creates and verifies the complete four-file backup before
 downtime. It then installs the verified package without repository access:
 
 - DEB: `dpkg -i`
-- RPM: `rpm -Uvh`
+- RPM: `rpm --nocontexts -Uvh`
 - Arch updater-driven update or authenticated recovery reinstall: `pacman -U`
+
+Fedora's RPM SELinux plugin normally places transaction scriptlets in a
+separate execution context. Linux rejects that domain transition when the
+calling service has `NoNewPrivileges=true`. For an updater-driven Fedora
+transaction only, VaultLink therefore disables RPM's transaction-context
+plugin with `--nocontexts`; SELinux itself remains `Enforcing`. This happens
+only after Minisign verification and exact allowlist validation of package
+metadata, payload paths, dependencies, and every scriptlet. Initial manual RPM
+installation still uses the normal SELinux transaction contexts, and the
+full-system Fedora gate verifies the updater transaction with
+`NoNewPrivileges=1`, no VaultLink-related AVC denial, and final package/runtime
+parity.
 
 An initial Arch installation is different: the administrator must execute the
 root-owned installer embedded in the already verified package. Direct initial
