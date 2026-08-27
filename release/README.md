@@ -145,9 +145,17 @@ must be byte-identical. Format-specific lint and the common package allowlist
 run independently of the builder. The exact installed package payload also
 runs the unchanged overlapping workload of 100 metadata clients, 40 range
 streams, and ten upload/readback clients inside that digest-pinned distribution
-builder on the matching native GitHub runner. That run is authoritative for
-p95 `<2 s` for all nine targets, including arm64 on the managed arm64 runner;
-private ARM hardware is not required.
+builder on the matching native GitHub runner. The job first qualifies its
+public hosted runner for four available vCPUs and at least 8 GiB of host RAM,
+then restricts Docker to logical CPUs 0-3. It restricts the server to CPUs 0-1
+and the load generator to CPUs 2-3, keeps server storage separate, and provides
+the clients a dedicated hardened 4-GiB tmpfs. Its evidence records the
+qualification, placement, exact workload, latency, RSS, and integrity results;
+inability to prove the layout fails the gate. That qualified run is
+authoritative for strict p95 `<2 s` for all nine targets, including arm64 on
+the managed arm64 runner; private ARM hardware is not required. The resource
+contract is reproducible, but it does not make arbitrary standard-runner
+timing deterministic.
 
 The full-system gate boots the pinned target guest with QEMU on the same
 architecture. The guest receives its package over an isolated host channel,

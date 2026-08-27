@@ -43,8 +43,9 @@ if [ ! -d "$api_work" ] || [ -L "$api_work" ]; then
     fail "API smoke fixture is unavailable"
 fi
 
-for command_name in awk cmp curl date find findmnt grep install kill \
-    python3 readlink sed seq setpriv sha256sum sleep sort sqlite3 stat truncate; do
+for command_name in awk cmp curl date df find findmnt grep install kill nproc \
+    python3 readlink sed seq setpriv sha256sum sleep sort sqlite3 stat taskset \
+    truncate; do
     command -v "$command_name" >/dev/null \
         || fail "required command is unavailable: $command_name"
 done
@@ -77,6 +78,9 @@ install -d -m 0755 "$evidence"
 native_stage=initialization
 service_pid=
 runtime_base=
+load_tmp=
+load_client_workspace=
+load_log=
 password=
 totp_secret=
 totp_code=
@@ -165,17 +169,27 @@ cleanup() {
         kill "$service_pid" 2>/dev/null || true
         wait "$service_pid" 2>/dev/null || true
     fi
+    if [ -n "$load_tmp" ]; then
+        case "$load_tmp" in
+            /mnt/load-client/tmp) rm -rf -- "$load_tmp" ;;
+        esac
+    fi
     if [ -n "$runtime_base" ]; then
         case "$runtime_base" in
             /mnt/storage/vaultlink-native-load-*)
                 if [ "$native_status" -ne 0 ]; then
                     write_redacted_tail "$runtime_base/service.log" \
                         "$evidence/failure-service.log" 200 || true
-                    write_redacted_tail "$runtime_base/load.log" \
+                    write_redacted_tail "$load_log" \
                         "$evidence/failure-load.log" 200 || true
                 fi
                 rm -rf -- "$runtime_base"
                 ;;
+        esac
+    fi
+    if [ -n "$load_client_workspace" ]; then
+        case "$load_client_workspace" in
+            /mnt/load-client/work) rm -rf -- "$load_client_workspace" ;;
         esac
     fi
     printf 'stage=%s\nexit_status=%s\n' "$native_stage" "$native_status" \
@@ -188,6 +202,83 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+native_stage=resource_isolation
+container_cpu_set=0-3
+service_cpu_set=0-1
+load_client_cpu_set=2-3
+host_nproc=${VAULTLINK_NATIVE_HOST_NPROC:-}
+host_mem_total_kib=${VAULTLINK_NATIVE_HOST_MEM_TOTAL_KIB:-}
+docker_nproc=${VAULTLINK_NATIVE_DOCKER_NPROC:-}
+requested_container_cpu_set=${VAULTLINK_NATIVE_CONTAINER_CPUSET:-}
+case "$host_nproc:$host_mem_total_kib:$docker_nproc" in
+    *[!0-9:]*|:*|*::*|*:) fail "runner resource qualification is invalid" ;;
+esac
+[ "$host_nproc" -ge 4 ] \
+    || fail "native load runner has fewer than four CPUs"
+[ "$host_mem_total_kib" -ge 8388608 ] \
+    || fail "native load runner has less than 8 GiB memory"
+[ "$docker_nproc" -ge 4 ] \
+    || fail "Docker reports fewer than four CPUs"
+[ "$requested_container_cpu_set" = "$container_cpu_set" ] \
+    || fail "requested container CPU set must be exactly $container_cpu_set"
+container_nproc=$(nproc)
+case "$container_nproc" in *[!0-9]*|'') fail "container CPU count is invalid" ;; esac
+[ "$container_nproc" -eq 4 ] \
+    || fail "native load container must expose exactly four CPUs"
+container_effective_cpu_set=$(sed -n \
+    's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status)
+[ "$container_effective_cpu_set" = "$container_cpu_set" ] \
+    || fail "native load container CPU set must be exactly $container_cpu_set"
+taskset --cpu-list "$service_cpu_set" true \
+    || fail "service CPU set is unavailable"
+load_client_probe_cpu_set=$(taskset --cpu-list "$load_client_cpu_set" sh -c \
+    "sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status")
+[ "$load_client_probe_cpu_set" = "$load_client_cpu_set" ] \
+    || fail "load-generator CPU set is unavailable"
+
+load_client_mount=/mnt/load-client
+if [ ! -d "$load_client_mount" ] || [ -L "$load_client_mount" ]; then
+    fail "dedicated load-client tmpfs is unavailable or unsafe"
+fi
+[ "$(stat -c '%u:%g:%a' "$load_client_mount")" = 0:0:700 ] \
+    || fail "load-client tmpfs must be root:root mode 0700"
+[ -z "$(find "$load_client_mount" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "load-client tmpfs must be empty before the profile"
+load_client_mount_target=$(findmnt -n -o TARGET --target "$load_client_mount")
+[ "$load_client_mount_target" = "$load_client_mount" ] \
+    || fail "load-client path is not a dedicated mount"
+load_client_mount_fstype=$(findmnt -n -o FSTYPE --target "$load_client_mount")
+[ "$load_client_mount_fstype" = tmpfs ] \
+    || fail "load-client mount must use tmpfs"
+load_client_mount_source=$(findmnt -n -o SOURCE --target "$load_client_mount")
+[ "$load_client_mount_source" = tmpfs ] \
+    || fail "load-client tmpfs source is unexpected"
+load_client_mount_options=$(findmnt -n -o OPTIONS --target "$load_client_mount")
+case "$load_client_mount_options" in *[!A-Za-z0-9,._%:=+-]*)
+    fail "load-client tmpfs options are unsafe"
+    ;;
+esac
+for required_mount_option in rw nosuid nodev noexec; do
+    case ",$load_client_mount_options," in
+        *",$required_mount_option,"*) ;;
+        *) fail "load-client tmpfs lacks $required_mount_option" ;;
+    esac
+done
+load_client_capacity=$(df -B1 --output=size,avail "$load_client_mount" \
+    | awk 'NR == 2 { print $1 ":" $2; exit }')
+load_client_capacity_bytes=${load_client_capacity%%:*}
+load_client_available_bytes=${load_client_capacity#*:}
+case "$load_client_capacity_bytes:$load_client_available_bytes" in
+    *[!0-9:]*|:*|*::*) fail "load-client tmpfs capacity is invalid" ;;
+esac
+[ "$load_client_capacity_bytes" -ge 4294967296 ] \
+    || fail "load-client tmpfs is smaller than 4 GiB"
+[ "$load_client_available_bytes" -ge 4294967296 ] \
+    || fail "load-client tmpfs does not have 4 GiB available"
+load_client_workspace=$load_client_mount/work
+install -d -o root -g root -m 0700 "$load_client_workspace"
+load_log=$load_client_workspace/load.log
 
 expected_package_version=
 case "$target_id:$package_format" in
@@ -421,7 +512,8 @@ verify_service_identity() {
         "$service_pid" "$vaultlink_uid" "$vaultlink_gid" "$live_binary" \
         "$live_sha256" "$expected_starttime"
 }
-setpriv --reuid="$vaultlink_uid" --regid="$vaultlink_gid" --init-groups -- \
+taskset --cpu-list "$service_cpu_set" \
+    setpriv --reuid="$vaultlink_uid" --regid="$vaultlink_gid" --init-groups -- \
     "$live_binary" --config "$runtime_config" \
     >"$runtime_base/service.log" 2>&1 &
 service_pid=$!
@@ -445,9 +537,35 @@ install -m 0644 "$runtime_base/readiness.json" "$evidence/readiness.json"
 readiness_sha256=$(sha256sum "$evidence/readiness.json" | awk '{ print $1 }')
 [ "$(verify_service_identity "$service_starttime")" = "$service_starttime" ] \
     || fail "service PID does not execute the exact active package payload"
+service_effective_cpu_set=$(sed -n \
+    's/^Cpus_allowed_list:[[:space:]]*//p' "/proc/$service_pid/status")
+[ "$service_effective_cpu_set" = "$service_cpu_set" ] \
+    || fail "package service is not isolated to CPUs $service_cpu_set"
+printf '%s\n' \
+    "host_nproc=$host_nproc" \
+    "host_mem_total_kib=$host_mem_total_kib" \
+    "docker_nproc=$docker_nproc" \
+    "requested_container_cpu_set=$requested_container_cpu_set" \
+    "container_nproc=$container_nproc" \
+    "container_cpu_set=$container_effective_cpu_set" \
+    "service_cpu_set=$service_effective_cpu_set" \
+    "load_generator_cpu_set=$load_client_probe_cpu_set" \
+    "load_client_mount_target=$load_client_mount_target" \
+    "load_client_mount_source=$load_client_mount_source" \
+    "load_client_mount_fstype=$load_client_mount_fstype" \
+    "load_client_mount_options=$load_client_mount_options" \
+    "load_client_capacity_bytes=$load_client_capacity_bytes" \
+    "load_client_available_bytes=$load_client_available_bytes" \
+    'load_client_initial_state=empty' \
+    'load_client_owner=0:0' \
+    'load_client_mode=700' \
+    'load_client_tmpdir=/mnt/load-client/tmp' \
+    'load_client_cookie_path=/mnt/load-client/work/cookies.txt' \
+    'server_storage_parent=/mnt/storage' \
+    >"$evidence/resource-isolation.env"
 
 native_stage=authenticated_load_setup
-cookie=$runtime_base/cookies.txt
+cookie=$load_client_workspace/cookies.txt
 password='VaultLink api smoke password 123!'
 totp_secret=$(grep -Eo '[A-Z2-7]{32}' "$api_work/setup-response.html" | head -n 1)
 [ -n "$totp_secret" ] || fail "API fixture TOTP secret is unavailable"
@@ -498,7 +616,7 @@ for secret_value in "$download_token" "$upload_token" "$verify_token"; do
 done
 
 native_stage=authoritative_load
-load_tmp=$runtime_base/load-work
+load_tmp=$load_client_mount/tmp
 install -d -o root -g root -m 0700 "$load_tmp"
 load_status=0
 VAULTLINK_BASE_URL=http://127.0.0.1:18081 \
@@ -526,7 +644,8 @@ VAULTLINK_EXPECTED_BINARY_PATH="$live_binary" \
 VAULTLINK_EXPECTED_BINARY_SHA256="$live_sha256" \
 LOAD_TEST_EVIDENCE_DIR="$evidence/load" \
 TMPDIR="$load_tmp" \
-sh tools/load-test.sh >"$runtime_base/load.log" 2>&1 || load_status=$?
+taskset --cpu-list "$load_client_cpu_set" sh tools/load-test.sh \
+    >"$load_log" 2>&1 || load_status=$?
 [ "$load_status" -eq 0 ] \
     || fail "authoritative 100/40/10 native load profile failed (status $load_status)"
 rmdir "$load_tmp"
@@ -675,6 +794,9 @@ awk -F, -v expected_hash="$upload_sha256" -v target="$target_id" '
 kill -0 "$service_pid" 2>/dev/null || fail "package service exited during native load"
 [ "$(verify_service_identity "$service_starttime")" = "$service_starttime" ] \
     || fail "package service identity or payload changed during native load"
+[ "$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' \
+    "/proc/$service_pid/status")" = "$service_cpu_set" ] \
+    || fail "package service CPU isolation changed during native load"
 if [ "$(sha256sum "$candidate" | awk '{ print $1 }')" != "$candidate_sha256" ] \
     || [ "$(sha256sum "$live_binary" | awk '{ print $1 }')" != "$live_sha256" ]; then
     fail "installed package payload changed during native load"
@@ -694,6 +816,11 @@ printf '%s\n' \
     "candidate_sha256=$candidate_sha256" \
     "active_binary_sha256=$live_sha256" \
     "service_uid=$vaultlink_uid" \
+    "container_cpu_set=$container_effective_cpu_set" \
+    "service_cpu_set=$service_effective_cpu_set" \
+    "load_generator_cpu_set=$load_client_probe_cpu_set" \
+    "load_client_mount_fstype=$load_client_mount_fstype" \
+    "load_client_capacity_bytes=$load_client_capacity_bytes" \
     "service_starttime_ticks=$service_starttime" \
     "metadata_p95_seconds=$p95" \
     'metadata_p95_policy=strict' \

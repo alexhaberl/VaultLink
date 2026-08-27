@@ -250,7 +250,23 @@ jobs:
           asset=$(python3 tools/package-targets.py asset "$TARGET_ID" "$version")
           package="offline-smoke/$TARGET_ID/$asset"
           test -s "$package"
+          host_nproc=$(nproc)
+          [[ "$host_nproc" =~ ^[0-9]+$ && "$host_nproc" -ge 4 ]]
+          host_mem_total_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+          [[ "$host_mem_total_kib" =~ ^[0-9]+$ \
+            && "$host_mem_total_kib" -ge 8388608 ]]
+          taskset --cpu-list 0-3 true
+          docker_nproc=$(docker info --format '{{.NCPU}}')
+          [[ "$docker_nproc" =~ ^[0-9]+$ && "$docker_nproc" -ge 4 ]]
+          printf 'host_nproc=%s\nhost_mem_total_kib=%s\ndocker_nproc=%s\nnative_container_cpuset=0-3\n' \
+            "$host_nproc" "$host_mem_total_kib" "$docker_nproc"
           docker run --rm --network none --user root \
+            --cpuset-cpus 0-3 \
+            --tmpfs /mnt/load-client:rw,nosuid,nodev,noexec,size=4g,mode=0700 \
+            --env VAULTLINK_NATIVE_HOST_NPROC="$host_nproc" \
+            --env VAULTLINK_NATIVE_HOST_MEM_TOTAL_KIB="$host_mem_total_kib" \
+            --env VAULTLINK_NATIVE_DOCKER_NPROC="$docker_nproc" \
+            --env VAULTLINK_NATIVE_CONTAINER_CPUSET=0-3 \
             --mount type=volume,destination=/mnt/storage \
             --volume "$PWD:/work" --workdir /work \
             "$BUILDER_IMAGE" \

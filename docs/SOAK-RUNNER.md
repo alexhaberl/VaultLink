@@ -132,8 +132,10 @@ commit; changing them afterwards invalidates the evidence.
    distro-VM, and per-target load gates for one exact commit. For every target,
    the authoritative p95 `<2 s` result comes from the exact package payload in
    its digest-pinned distribution builder on a native matching-architecture
-   GitHub runner. The full QEMU run records p95 diagnostically while remaining
-   authoritative for the unchanged workload's functional and security results.
+   GitHub runner after the native job proves its documented 4-vCPU, host-memory,
+   CPU-affinity, and separated client/server-storage contract. The full QEMU
+   run records p95 diagnostically while remaining authoritative for the
+   unchanged workload's functional and security results.
 2. Dispatch `Start 72-hour release soak` from `main` with the exact 40-character
    `origin/main` commit and SHA-256 of the already running amd64 binary. The
    supplied hash is only an explicit confirmation: the workflow downloads the

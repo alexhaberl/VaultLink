@@ -304,10 +304,21 @@ reinstallation, and state-preserving removal. For each of the nine targets,
 the same gate runs the unchanged overlapping workload of 100 metadata clients,
 40 range streams, and ten upload/readback clients against the exact installed
 package payload. It executes inside the target's digest-pinned distribution
-builder on a native matching-architecture GitHub runner and is authoritative
-for p95 below two seconds. The native run also fails on invalid response
-statuses, corruption, or exceeding the RSS ceiling. The managed arm64 GitHub
-runner supplies this evidence for arm64; private ARM hardware is not required.
+builder on a native matching-architecture GitHub runner. Before its timing is
+accepted, the job qualifies the public hosted runner for four available vCPUs
+and at least 8 GiB of host RAM, then restricts its Docker container to logical
+CPUs 0-3. The server is restricted to CPUs 0-1 and uses a separate server-
+storage mount; the load generator is restricted to CPUs 2-3 and uses a
+dedicated hardened 4-GiB client tmpfs. Evidence records the qualification,
+container and process CPU placement, memory and storage separation, exact
+workload counts, latency, RSS, and integrity results. A runner that cannot
+prove this resource layout fails the gate. The qualified native run is
+authoritative for p95 strictly below two seconds and also fails on invalid
+response statuses, corruption, or exceeding the RSS ceiling. The harness's
+resource contract is reproducible, but it does not assert deterministic timing
+for arbitrary GitHub standard-runner executions. The managed arm64 GitHub
+runner supplies the same qualified evidence for arm64; private ARM hardware is
+not required.
 
 Full-system gates boot digest-pinned target images on a same-architecture
 GitHub runner. Guests receive packages over an isolated host channel and have

@@ -106,8 +106,16 @@ a skipped, neutral, missing, stale, or wrong-commit result is not success.
 - [ ] Every target runs the unchanged 100-metadata-client, 40-range-stream, and
   ten-upload/readback workload against the exact installed package payload in
   its digest-pinned distribution builder on a native matching-architecture
-  GitHub runner. This native package run passes p95 `<2 s`, has no invalid
-  response or corruption, and remains within the approved RSS limit.
+  GitHub runner. The job qualifies the public runner for four available vCPUs,
+  at least 8 GiB of host RAM, and a Docker cpuset of logical CPUs 0-3. It
+  restricts the server to CPUs 0-1 and the load generator to CPUs 2-3, gives
+  the clients a dedicated hardened 4-GiB tmpfs, and keeps server storage
+  separate. Its evidence records the qualification, resource placement, exact
+  workload counts, latency, RSS, and integrity results. A missing or different
+  layout is a gate failure. This is a reproducible harness contract, not a
+  claim of deterministic timing from arbitrary standard runners. The qualified
+  native package run passes strict p95 `<2 s`, has no invalid response or
+  corruption, and remains within the approved RSS limit.
 - [ ] Managed `ubuntu-24.04-arm` jobs provide the authoritative arm64 p95
   evidence; no private ARM host is part of the release boundary.
 - [ ] `vaultlink/package-reproducibility` is green and accounts for all nine

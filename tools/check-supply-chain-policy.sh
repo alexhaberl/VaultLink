@@ -1459,6 +1459,16 @@ package_smoke_job=$(awk '
     selected && /^  [[:alnum:]_-]+:$/ && $0 != "  smoke:" { exit }
     selected { print }
 ' "$package_workflow")
+package_native_smoke_step=$(printf '%s\n' "$package_smoke_job" | awk '
+    $0 == "      - name: Run lifecycle, API, migration, rollback, and native load gates offline" {
+        selected = 1
+    }
+    selected && /^      - name:/ \
+        && $0 != "      - name: Run lifecycle, API, migration, rollback, and native load gates offline" {
+        exit
+    }
+    selected { print }
+')
 package_offline_evidence_upload=$(printf '%s\n' "$package_smoke_job" | awk '
     $0 == "      - name: Upload offline smoke evidence" { selected = 1 }
     selected { print }
@@ -1495,6 +1505,41 @@ if [ ! -f "$package_native_load_smoke" ] || [ -L "$package_native_load_smoke" ] 
     || ! grep -F -q '"$target_id" "$version" "$package" "$api_work" "$native_load_evidence"' \
         "$package_offline_smoke"; then
     report "all nine exact packages must run the strict native load gate offline on their matching managed architecture and upload full evidence"
+fi
+if ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q 'host_nproc=$(nproc)' \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q '[[ "$host_nproc" =~ ^[0-9]+$ && "$host_nproc" -ge 4 ]]' \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q "host_mem_total_kib=\$(awk '/^MemTotal:/ { print \$2; exit }' /proc/meminfo)" \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q '&& "$host_mem_total_kib" -ge 8388608 ]]' \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q 'taskset --cpu-list 0-3 true' \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q "docker_nproc=\$(docker info --format '{{.NCPU}}')" \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q '[[ "$docker_nproc" =~ ^[0-9]+$ && "$docker_nproc" -ge 4 ]]' \
+    || [ "$(printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -c -- '--cpuset-cpus 0-3' || true)" -ne 1 ] \
+    || [ "$(printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -c -- '--cpuset-cpus' || true)" -ne 1 ] \
+    || [ "$(printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -c -- '--tmpfs /mnt/load-client:rw,nosuid,nodev,noexec,size=4g,mode=0700' \
+        || true)" -ne 1 ] \
+    || [ "$(printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -c -- '--tmpfs' || true)" -ne 1 ] \
+    || [ "$(printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -c -- '--env VAULTLINK_NATIVE_' || true)" -ne 4 ] \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q -- '--env VAULTLINK_NATIVE_HOST_NPROC="$host_nproc"' \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q -- '--env VAULTLINK_NATIVE_HOST_MEM_TOTAL_KIB="$host_mem_total_kib"' \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q -- '--env VAULTLINK_NATIVE_DOCKER_NPROC="$docker_nproc"' \
+    || ! printf '%s\n' "$package_native_smoke_step" \
+        | grep -F -q -- '--env VAULTLINK_NATIVE_CONTAINER_CPUSET=0-3'; then
+    report "the native package Docker gate must qualify at least four CPUs and 8 GiB RAM, use exactly CPUs 0-3 and one hardened dedicated 4-GiB client tmpfs, and pass the qualification into evidence"
 fi
 package_lifecycle_line=$(grep -n -F \
     'sh tools/package-container-smoke.sh "$target_id" "$version" "$package"' \
@@ -1533,6 +1578,82 @@ if ! grep -F -q '[ "$evidence" = "/work/offline-smoke/$target_id/native-load" ]'
     || ! grep -F -q 'LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS=5' "$package_native_load_smoke"; then
     report "native performance must use the exact installed package payload, package database, unprivileged PID, and normal strict timeouts"
 fi
+for native_resource_contract_line in \
+    'host_nproc=${VAULTLINK_NATIVE_HOST_NPROC:-}' \
+    'host_mem_total_kib=${VAULTLINK_NATIVE_HOST_MEM_TOTAL_KIB:-}' \
+    'docker_nproc=${VAULTLINK_NATIVE_DOCKER_NPROC:-}' \
+    'requested_container_cpu_set=${VAULTLINK_NATIVE_CONTAINER_CPUSET:-}' \
+    '[ "$host_nproc" -ge 4 ]' \
+    '[ "$host_mem_total_kib" -ge 8388608 ]' \
+    '[ "$docker_nproc" -ge 4 ]' \
+    '[ "$requested_container_cpu_set" = "$container_cpu_set" ]' \
+    'container_cpu_set=0-3' \
+    'service_cpu_set=0-1' \
+    'load_client_cpu_set=2-3' \
+    '[ "$container_nproc" -eq 4 ]' \
+    "'s/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status" \
+    '[ "$container_effective_cpu_set" = "$container_cpu_set" ]' \
+    'taskset --cpu-list "$service_cpu_set" true' \
+    'load_client_probe_cpu_set=$(taskset --cpu-list "$load_client_cpu_set" sh -c' \
+    '[ "$load_client_probe_cpu_set" = "$load_client_cpu_set" ]' \
+    'load_client_mount=/mnt/load-client' \
+    '[ ! -d "$load_client_mount" ] || [ -L "$load_client_mount" ]' \
+    '[ "$(stat -c '\''%u:%g:%a'\'' "$load_client_mount")" = 0:0:700 ]' \
+    '[ -z "$(find "$load_client_mount" -mindepth 1 -maxdepth 1 -print -quit)" ]' \
+    'findmnt -n -o TARGET --target "$load_client_mount"' \
+    '[ "$load_client_mount_target" = "$load_client_mount" ]' \
+    'findmnt -n -o FSTYPE --target "$load_client_mount"' \
+    '[ "$load_client_mount_fstype" = tmpfs ]' \
+    'findmnt -n -o SOURCE --target "$load_client_mount"' \
+    '[ "$load_client_mount_source" = tmpfs ]' \
+    'findmnt -n -o OPTIONS --target "$load_client_mount"' \
+    'for required_mount_option in rw nosuid nodev noexec; do' \
+    'df -B1 --output=size,avail "$load_client_mount"' \
+    '[ "$load_client_capacity_bytes" -ge 4294967296 ]' \
+    '[ "$load_client_available_bytes" -ge 4294967296 ]' \
+    'runtime_base="/mnt/storage/vaultlink-native-load-$target_id"' \
+    'load_client_workspace=$load_client_mount/work' \
+    'load_log=$load_client_workspace/load.log' \
+    'cookie=$load_client_workspace/cookies.txt' \
+    'load_tmp=$load_client_mount/tmp' \
+    'TMPDIR="$load_tmp"' \
+    'taskset --cpu-list "$load_client_cpu_set" sh tools/load-test.sh' \
+    '>"$evidence/resource-isolation.env"' \
+    '"host_nproc=$host_nproc"' \
+    '"host_mem_total_kib=$host_mem_total_kib"' \
+    '"docker_nproc=$docker_nproc"' \
+    '"requested_container_cpu_set=$requested_container_cpu_set"' \
+    '"container_nproc=$container_nproc"' \
+    '"container_cpu_set=$container_effective_cpu_set"' \
+    '"service_cpu_set=$service_effective_cpu_set"' \
+    '"load_generator_cpu_set=$load_client_probe_cpu_set"' \
+    '"load_client_mount_target=$load_client_mount_target"' \
+    '"load_client_mount_source=$load_client_mount_source"' \
+    '"load_client_mount_fstype=$load_client_mount_fstype"' \
+    '"load_client_mount_options=$load_client_mount_options"' \
+    '"load_client_capacity_bytes=$load_client_capacity_bytes"' \
+    '"load_client_available_bytes=$load_client_available_bytes"' \
+    "'load_client_initial_state=empty'" \
+    "'load_client_owner=0:0'" \
+    "'load_client_mode=700'" \
+    "'load_client_tmpdir=/mnt/load-client/tmp'" \
+    "'load_client_cookie_path=/mnt/load-client/work/cookies.txt'" \
+    "'server_storage_parent=/mnt/storage'"; do
+    grep -F -q "$native_resource_contract_line" "$package_native_load_smoke" \
+        || report "native package resource isolation is missing hard contract: $native_resource_contract_line"
+done
+if ! grep -F -A1 "taskset --cpu-list \"\$service_cpu_set\" \\" \
+        "$package_native_load_smoke" \
+        | grep -F -q 'setpriv --reuid="$vaultlink_uid" --regid="$vaultlink_gid" --init-groups --' \
+    || [ "$(grep -F -c 'sh tools/load-test.sh' "$package_native_load_smoke" || true)" -ne 1 ] \
+    || [ "$(grep -F -c 'TMPDIR=' "$package_native_load_smoke" || true)" -ne 1 ] \
+    || grep -F -q 'load_tmp=$runtime_base' "$package_native_load_smoke" \
+    || grep -F -q 'cookie=$runtime_base' "$package_native_load_smoke" \
+    || grep -F -q '>"$runtime_base/load.log"' "$package_native_load_smoke" \
+    || ! grep -F -q 'package service CPU isolation changed during native load' \
+        "$package_native_load_smoke"; then
+    report "native package timing must pin the server to CPUs 0-1, pin the load client to CPUs 2-3, keep client temporary I/O off server storage, and recheck service affinity"
+fi
 if [ ! -f "$direct_process_identity" ] || [ -L "$direct_process_identity" ] \
     || ! grep -F -q 'setpriv --reuid="$direct_process_uid" --regid="$direct_process_gid"' \
         "$load_test" \
@@ -1559,14 +1680,18 @@ if [ ! -f "$direct_process_identity" ] || [ -L "$direct_process_identity" ] \
     || ! grep -F -q '[ "$starttime_after" = "$starttime_before" ]' "$direct_process_identity"; then
     report "direct-PID package verification must use the fixed fail-closed same-UID/GID helper with no supplementary groups"
 fi
-if grep -E -q -- '--privileged|--cap-add([=[:space:]]|$)|--pid([=[:space:]]+)host|/proc:/proc|source=/proc([,[:space:]]|$)' \
+if grep -E -q -- '--privileged|--cap-add([=[:space:]]|$)|--pid([=[:space:]]+)host|/proc:/proc|source=/proc([,[:space:]]|$)|destination=/proc([,[:space:]]|$)|target=/proc([,[:space:]]|$)|:/proc([/:,[:space:]]|$)' \
         "$package_workflow"; then
     report "the package gate must not gain privilege, capabilities, host PID access, or a host proc bind"
 fi
 native_failure_service_line=$(grep -n -F \
     'write_redacted_tail "$runtime_base/service.log"' \
     "$package_native_load_smoke" | cut -d: -f1 | head -n 1)
+native_failure_load_line=$(grep -n -F 'write_redacted_tail "$load_log"' \
+    "$package_native_load_smoke" | cut -d: -f1 | head -n 1)
 native_runtime_remove_line=$(grep -n -F 'rm -rf -- "$runtime_base"' \
+    "$package_native_load_smoke" | cut -d: -f1 | head -n 1)
+native_client_workspace_remove_line=$(grep -n -F 'rm -rf -- "$load_client_workspace"' \
     "$package_native_load_smoke" | cut -d: -f1 | head -n 1)
 if ! grep -F -q 'if [ "$native_status" -ne 0 ]; then' "$package_native_load_smoke" \
     || ! grep -F -q 'failure-status.env' "$package_native_load_smoke" \
@@ -1574,7 +1699,7 @@ if ! grep -F -q 'if [ "$native_status" -ne 0 ]; then' "$package_native_load_smok
         "$package_native_load_smoke" \
     || ! grep -F -q '"$evidence/failure-service.log" 200' \
         "$package_native_load_smoke" \
-    || ! grep -F -q 'write_redacted_tail "$runtime_base/load.log"' \
+    || ! grep -F -q 'write_redacted_tail "$load_log"' \
         "$package_native_load_smoke" \
     || ! grep -F -q '"$evidence/failure-load.log" 200' \
         "$package_native_load_smoke" \
@@ -1589,8 +1714,11 @@ if ! grep -F -q 'if [ "$native_status" -ne 0 ]; then' "$package_native_load_smok
     || ! grep -F -q 'runtime-policy.env' "$package_native_load_smoke" \
     || grep -F -q '"$evidence/runtime-config.toml"' "$package_native_load_smoke" \
     || [ -z "$native_failure_service_line" ] \
+    || [ -z "$native_failure_load_line" ] \
     || [ -z "$native_runtime_remove_line" ] \
-    || [ "$native_failure_service_line" -ge "$native_runtime_remove_line" ]; then
+    || [ -z "$native_client_workspace_remove_line" ] \
+    || [ "$native_failure_service_line" -ge "$native_runtime_remove_line" ] \
+    || [ "$native_failure_load_line" -ge "$native_client_workspace_remove_line" ]; then
     report "native package failures must upload bounded secret-redacted diagnostics before deleting private runtime state"
 fi
 for native_result_line in \
