@@ -1364,6 +1364,45 @@ if [ -z "$guest_storage_check_line" ] || [ -z "$guest_package_inventory_line" ] 
     || [ "$guest_storage_check_line" -ge "$guest_package_inventory_line" ]; then
     report "distro VM storage identity must be verified before package inventory or mutation"
 fi
+guest_package_quiescence_line=$(grep -n -F '    quiesce_deb_package_maintenance' \
+    "$vm_guest_smoke" | cut -d: -f1 | head -n 1)
+if [ -z "$guest_package_quiescence_line" ] \
+    || [ "$guest_package_quiescence_line" -ge "$guest_package_inventory_line" ] \
+    || ! grep -F -q 'timeout 60 systemctl mask --runtime "$unit"' \
+        "$vm_guest_smoke" \
+    || ! grep -F -q 'timeout 60 systemctl stop "$timer"' \
+        "$vm_guest_smoke" \
+    || ! grep -F -q 'for unit in $automatic_services; do' \
+        "$vm_guest_smoke" \
+    || grep -E -q 'systemctl stop .*\.service' "$vm_guest_smoke" \
+    || ! grep -F -q 'timeout 30 dpkg --audit' "$vm_guest_smoke" \
+    || ! grep -F -q '[ ! -s "$audit_stdout" ] && [ ! -s "$audit_stderr" ]' \
+        "$vm_guest_smoke" \
+    || ! grep -F -q 'policy=runtime-mask-and-drain' "$vm_guest_smoke" \
+    || ! grep -F -q 'lock_files_removed=false' "$vm_guest_smoke" \
+    || grep -E -q 'rm[[:space:]].*/var/lib/dpkg/(lock|lock-frontend)' \
+        "$vm_guest_smoke" \
+    || ! grep -F -q 'package_quiescence=$evidence/runtime/package-manager-quiescence.env' \
+        "$vm_harness" \
+    || ! grep -F -q '= runtime-mask-and-drain ]' "$vm_harness" \
+    || ! grep -F -q 'lock_files_removed)" = false ]' "$vm_harness"; then
+    report "Debian and Ubuntu VM package tests must runtime-mask and drain automatic maintenance without deleting locks"
+fi
+if grep -F -q 'sleep 31' "$vm_runtime_smoke" \
+    || ! grep -F -q 'guard_wait_seconds=240' "$vm_runtime_smoke" \
+    || ! grep -F -q 'runtime-guard-stability.env' "$vm_runtime_smoke" \
+    || ! grep -F -q '[ "$guard_restarts_after" -le 3 ]' "$vm_runtime_smoke" \
+    || ! grep -F -q '[ "$guard_settled" = true ]' "$vm_runtime_smoke" \
+    || ! grep -F -q 'runtime_guard_wait=$evidence/runtime/runtime-guard-wait.env' \
+        "$vm_harness" \
+    || ! grep -F -q 'runtime_guard_elapsed" -le 240' "$vm_harness" \
+    || ! grep -F -q 'Runtime-integrity restart-limit evidence is' \
+        docs/GITHUB-HOSTED-RUNNERS.md \
+    || ! grep -F -q 'fixed 240-second ceiling' docs/PACKAGING.md \
+    || ! grep -F -q 'restart limit reached a stable terminal state' \
+        docs/RELEASE-CHECKLIST-0.6.0.md; then
+    report "the runtime-integrity VM gate must prove a bounded stable restart-limit failure without assuming emulator speed"
+fi
 if ! grep -F -q 'rm -f "$identity_backup_dir/$identity_file"' tools/package-container-smoke.sh \
     || ! grep -F -q 'rmdir "$identity_backup_dir"' tools/package-container-smoke.sh \
     || [ "$(grep -F -x -c 'identity_backup_dir=' tools/package-container-smoke.sh || true)" -ne 2 ] \

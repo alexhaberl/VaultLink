@@ -167,7 +167,13 @@ Every one of the nine targets performs:
   transfers have a bounded 60-minute request deadline without changing any
   concurrency, byte-count, status, or integrity assertion. The
   commit-bound workflow explicitly records `acceleration_policy=force-tcg` and
-  `acceleration=tcg` for every target.
+  `acceleration=tcg` for every target. Debian and Ubuntu test guests runtime-
+  mask their automatic apt/dpkg timers and services only for the disposable
+  boot, stop the timers, drain any already-running service, and require a clean `dpkg --audit`
+  before package inspection or mutation. They never remove package-manager
+  locks or terminate their owners. Runtime-integrity restart-limit evidence is
+  collected with a bounded state-and-stability poll so slow TCG execution does
+  not become an implicit wall-clock requirement.
 
 Native arm64 jobs are the only authoritative arm64 evidence. Architecture-
 independent security, policy, aggregation, signing, and publication work stays

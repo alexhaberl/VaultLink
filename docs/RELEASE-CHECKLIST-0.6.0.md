@@ -131,6 +131,10 @@ a skipped, neutral, missing, stale, or wrong-commit result is not success.
   verified `/dev/vdb` ext4 mount source and label, payload and active hashes,
   service/timer enablement, systemd status, journal, exact readiness response,
   SQLite integrity, and test result.
+- [ ] Debian and Ubuntu guest evidence proves automatic apt/dpkg maintenance
+  was runtime-masked and drained before a successful `dpkg --audit`; no lock
+  file was removed. Runtime-integrity evidence proves the three-attempt systemd
+  restart limit reached a stable terminal state within the bounded wait.
 - [ ] Guests receive the package only over the isolated host channel and have
   no unrestricted Internet access. The unchanged complete load workload and
   every functional, security, integrity, RSS, upgrade, backup, migration, and

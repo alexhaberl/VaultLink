@@ -414,23 +414,63 @@ if systemctl start vaultlink.service \
     echo "runtime parity guard accepted a divergent live binary" >&2
     exit 77
 fi
-sleep 31
-systemctl show vaultlink.service --no-pager \
-    -p ActiveState -p SubState -p Result -p NRestarts \
-    -p StartLimitBurst -p StartLimitIntervalUSec \
-    >"$evidence/runtime-guard-start-limit.env"
-guard_active_state=$(sed -n 's/^ActiveState=//p' \
-    "$evidence/runtime-guard-start-limit.env")
-case "$guard_active_state" in failed|inactive) ;; *) exit 77 ;; esac
-grep -F -x -q 'StartLimitBurst=3' "$evidence/runtime-guard-start-limit.env"
-guard_restarts_before=$(sed -n 's/^NRestarts=//p' \
-    "$evidence/runtime-guard-start-limit.env")
-case "$guard_restarts_before" in ''|*[!0-9]*) exit 77 ;; esac
-[ "$guard_restarts_before" -le 3 ]
-[ ! -e /var/lib/vaultlink/runtime-guard-bypass ]
-sleep 6
-guard_restarts_after=$(systemctl show vaultlink.service -p NRestarts --value)
-[ "$guard_restarts_after" = "$guard_restarts_before" ]
+guard_wait_seconds=240
+guard_wait_started=$(date +%s)
+guard_wait_deadline=$((guard_wait_started + guard_wait_seconds))
+guard_poll_count=0
+guard_settled=false
+while [ "$(date +%s)" -lt "$guard_wait_deadline" ]; do
+    guard_poll_count=$((guard_poll_count + 1))
+    systemctl show vaultlink.service --no-pager \
+        -p ActiveState -p SubState -p Result -p NRestarts \
+        -p StartLimitBurst -p StartLimitIntervalUSec \
+        >"$evidence/runtime-guard-start-limit.env"
+    guard_active_state=$(sed -n 's/^ActiveState=//p' \
+        "$evidence/runtime-guard-start-limit.env")
+    grep -F -x -q 'StartLimitBurst=3' \
+        "$evidence/runtime-guard-start-limit.env"
+    guard_restarts_before=$(sed -n 's/^NRestarts=//p' \
+        "$evidence/runtime-guard-start-limit.env")
+    case "$guard_restarts_before" in ''|*[!0-9]*) exit 77 ;; esac
+    [ "$guard_restarts_before" -le 3 ]
+    [ ! -e /var/lib/vaultlink/runtime-guard-bypass ]
+    case "$guard_active_state" in
+        failed | inactive)
+            [ $(( $(date +%s) + 6 )) -le "$guard_wait_deadline" ] || break
+            sleep 6
+            systemctl show vaultlink.service --no-pager \
+                -p ActiveState -p SubState -p Result -p NRestarts \
+                -p StartLimitBurst -p StartLimitIntervalUSec \
+                >"$evidence/runtime-guard-stability.env"
+            guard_active_state_after=$(sed -n 's/^ActiveState=//p' \
+                "$evidence/runtime-guard-stability.env")
+            guard_restarts_after=$(sed -n 's/^NRestarts=//p' \
+                "$evidence/runtime-guard-stability.env")
+            case "$guard_restarts_after" in ''|*[!0-9]*) exit 77 ;; esac
+            grep -F -x -q 'StartLimitBurst=3' \
+                "$evidence/runtime-guard-stability.env"
+            [ "$guard_restarts_after" -le 3 ]
+            [ ! -e /var/lib/vaultlink/runtime-guard-bypass ]
+            case "$guard_active_state_after" in
+                failed | inactive)
+                    if [ "$guard_restarts_after" = "$guard_restarts_before" ]; then
+                        guard_settled=true
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+    [ "$guard_settled" != true ] || break
+    sleep 2
+done
+guard_wait_elapsed=$(( $(date +%s) - guard_wait_started ))
+printf 'timeout_seconds=%s\nelapsed_seconds=%s\npolls=%s\nsettled=%s\n' \
+    "$guard_wait_seconds" "$guard_wait_elapsed" "$guard_poll_count" \
+    "$guard_settled" >"$evidence/runtime-guard-wait.env"
+[ "$guard_settled" = true ] || {
+    echo "runtime parity guard did not reach a stable bounded failure" >&2
+    exit 77
+}
 install -o root -g root -m 0755 /usr/lib/vaultlink/package/vaultlink \
     /opt/vaultlink/vaultlink
 systemctl reset-failed vaultlink.service
