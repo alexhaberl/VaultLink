@@ -189,6 +189,11 @@ while [ "$run" -le 12 ]; do
         'concurrency_barrier=passed' \
         'admission_same_identity_status=503' \
         'admission_distinct_identity_status=206' \
+        'supervision_mode=systemd' \
+        'metadata_p95_policy=strict' \
+        'metadata_p95_limit_seconds=2.000' \
+        'metadata_p95_within_limit=true' \
+        'metadata_p95_enforced=true' \
         'metadata_p95_seconds=0.100000' \
         'metadata_clients=100' \
         'metadata_requests=2000' \
@@ -201,6 +206,26 @@ while [ "$run" -le 12 ]; do
         'upload_integrity=server_readback' \
         'max_rss_kib=101000' \
         >"$load/result.env"
+    printf '%s\n' \
+        'metadata_status=0' \
+        'download_status=0' \
+        'upload_status=0' \
+        'rss_status=0' \
+        'metadata_rows=2000' \
+        'range_rows=40' \
+        'upload_rows=10' \
+        'rss_rows=2' \
+        'metadata_observed_p95_seconds=0.100000' \
+        'supervision_mode=systemd' \
+        'metadata_p95_policy=strict' \
+        'metadata_p95_limit_seconds=2.000' \
+        'metadata_p95_within_limit=true' \
+        'metadata_p95_enforced=true' \
+        >"$load/profile-status.env"
+    printf '%s\n' \
+        'stage=complete' \
+        'exit_status=0' \
+        >"$load/load-command.env"
     load_epoch=$((start + ((run - 1) * 21600)))
     printf '%s\n' \
         'epoch,pid,rss_kib' \
@@ -210,18 +235,22 @@ while [ "$run" -le 12 ]; do
     printf '%s\n' \
         "epoch=$load_epoch" \
         'pid=1234' \
+        'process_starttime_ticks=5000' \
         'rss_kib=100000' \
         "binary_sha256=$binary_hash" \
         "health_sha256=$health_hash" \
         'integrity=ok' \
+        'supervision_mode=systemd' \
         >"$load/pre-load.env"
     printf '%s\n' \
         "epoch=$((load_epoch + 1))" \
         'pid=1234' \
+        'process_starttime_ticks=5000' \
         'rss_kib=101000' \
         "binary_sha256=$binary_hash" \
         "health_sha256=$health_hash" \
         'integrity=ok' \
+        'supervision_mode=systemd' \
         >"$load/post-load.env"
     run=$((run + 1))
 done
@@ -240,15 +269,44 @@ cp -R "$destination" "$latency_evidence"
 sed -i 's/,0\.100000$/,1.999999/' "$latency_evidence/load-1/metadata-load.csv"
 sed -i 's/^metadata_p95_seconds=0\.100000$/metadata_p95_seconds=1.999999/' \
     "$latency_evidence/load-1/result.env"
+sed -i 's/^metadata_observed_p95_seconds=0\.100000$/metadata_observed_p95_seconds=1.999999/' \
+    "$latency_evidence/load-1/profile-status.env"
 refresh_evidence_manifest "$latency_evidence"
 sh tools/check-soak-evidence.sh "$commit" "$latency_evidence" >/dev/null \
     || fail "evidence verifier rejected metadata p95 below 2 seconds"
 sed -i 's/,1\.999999$/,2.000000/' "$latency_evidence/load-1/metadata-load.csv"
 sed -i 's/^metadata_p95_seconds=1\.999999$/metadata_p95_seconds=2.000000/' \
     "$latency_evidence/load-1/result.env"
+sed -i 's/^metadata_observed_p95_seconds=1\.999999$/metadata_observed_p95_seconds=2.000000/' \
+    "$latency_evidence/load-1/profile-status.env"
 refresh_evidence_manifest "$latency_evidence"
 if sh tools/check-soak-evidence.sh "$commit" "$latency_evidence" >/dev/null 2>&1; then
     fail "evidence verifier accepted metadata p95 at the strict 2-second boundary"
+fi
+
+diagnostic_evidence="$work/diagnostic-evidence"
+cp -R "$destination" "$diagnostic_evidence"
+sed -i 's/^metadata_p95_policy=strict$/metadata_p95_policy=diagnostic/' \
+    "$diagnostic_evidence/load-1/result.env" \
+    "$diagnostic_evidence/load-1/profile-status.env"
+sed -i 's/^metadata_p95_enforced=true$/metadata_p95_enforced=false/' \
+    "$diagnostic_evidence/load-1/result.env" \
+    "$diagnostic_evidence/load-1/profile-status.env"
+refresh_evidence_manifest "$diagnostic_evidence"
+if sh tools/check-soak-evidence.sh "$commit" "$diagnostic_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted diagnostic p95 policy for the release soak"
+fi
+
+direct_evidence="$work/direct-evidence"
+cp -R "$destination" "$direct_evidence"
+sed -i 's/^supervision_mode=systemd$/supervision_mode=direct_pid/' \
+    "$direct_evidence/load-1/result.env" \
+    "$direct_evidence/load-1/profile-status.env" \
+    "$direct_evidence/load-1/pre-load.env" \
+    "$direct_evidence/load-1/post-load.env"
+refresh_evidence_manifest "$direct_evidence"
+if sh tools/check-soak-evidence.sh "$commit" "$direct_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted direct-PID supervision for the release soak"
 fi
 
 warm_boundary_evidence="$work/warm-boundary-evidence"

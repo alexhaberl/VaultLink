@@ -27,17 +27,24 @@ or inconsistent.
 | Phase | Execution environment | Network policy | Authority |
 | --- | --- | --- | --- |
 | Rust/package build | Target distro builder container on matching native CPU | immutable build inputs only | authoritative |
-| Fast package tests | Target distro container on matching native CPU | package installed offline; runtime network isolated | authoritative |
+| Fast package tests and 100-user performance gate | Target distro builder container on a qualified public 4-vCPU matching-architecture runner with at least 8 GiB host RAM, using the exact installed package payload | package installed offline; runtime network isolated; hardened client tmpfs and server storage separated | authoritative for package lifecycle and p95 `<2 s` when resource qualification succeeds |
 | Reproducibility | two empty build roots using the same target builder | immutable build inputs only | authoritative |
-| Full-system test | target guest booted by QEMU on matching native CPU | isolated host package channel; no free guest Internet | authoritative |
+| Full-system test | target guest booted by QEMU on matching native CPU | isolated host package channel; no free guest Internet | authoritative for full-system functionality, security, integrity, SELinux, upgrade, and rollback; p95 is diagnostic |
 | Local Docker | all x86_64 distro builders/containers | isolated runtime | development evidence only |
-| 72-hour soak | dedicated Debian 13 amd64 system | controlled public application path plus collector bridge | final Debian reference evidence |
+| 72-hour soak | dedicated Debian 13 amd64 system | controlled public application path plus collector bridge | final Debian reference evidence, including strict p95 `<2 s` |
 
-QEMU never compiles a release binary. KVM may accelerate a job when GitHub
-exposes it, but workflows cannot depend on KVM and must pass under software
-emulation. The managed arm64 runner is always exercised with TCG because a
-visible `/dev/kvm` device does not guarantee usable nested virtualization;
-amd64 may use KVM when the runner exposes it. Guests never network boot, and
+QEMU never compiles a release binary. The commit-bound `distro-vms` workflow
+forces TCG for every one of the nine matrix targets and does not expose
+`/dev/kvm` to its containers. This makes a green aggregate gate direct evidence
+that the full functional and security workload passed under software
+emulation, without doubling the matrix. Its p95 measurement is always recorded
+as diagnostic evidence; VM execution speed is not accepted as the target's
+release-performance result. A reviewed guest-image refresh may use KVM for
+amd64 only after a bounded QMP probe reports KVM as both present and enabled;
+an absent, inaccessible, unsupported, or failed probe selects TCG. A visible
+`/dev/kvm` device alone is never treated as proof of usable virtualization.
+The managed arm64 runner is always exercised with TCG. Guests never network
+boot, and
 their VirtIO NICs disable the PXE option ROM instead of adding an unused ROM
 package to the QEMU harness. Fedora 44 guests keep SELinux `Enforcing`;
 disabling it invalidates the gate. The Arch guest and builder use the snapshot
@@ -113,6 +120,24 @@ at runtime.
 
 ## Package, VM, and load gates
 
+The native package performance phase qualifies its public hosted runner for
+four available vCPUs and at least 8 GiB of host RAM before accepting a timing
+result. Docker restricts the builder container to logical CPUs 0-3. Inside that
+container, the VaultLink server is restricted to CPUs 0-1 and uses its own
+server-storage mount. The load generator is restricted to CPUs 2-3 and uses a
+dedicated hardened 4-GiB client tmpfs, so its payload, cookie, and response I/O
+does not contend with the server-storage path. The evidence bundle records the
+runner qualification, container and process CPU placement, memory and storage
+separation, workload counts, latency result, RSS result, and integrity result.
+A runner that cannot provide and prove this layout fails the native
+performance gate.
+
+This qualification and placement make the harness's resource contract
+reproducible and limit in-job client/server contention; they are not a claim
+that arbitrary GitHub standard-runner timings are deterministic across
+machines or runs. The exact workload and strict threshold, rather than a
+general runner-performance guarantee, define the release gate.
+
 Every one of the nine targets performs:
 
 - two clean native builds with byte-identical payload, SBOM, and package;
@@ -121,14 +146,25 @@ Every one of the nine targets performs:
 - an offline fresh install with no service or timer autostart;
 - setup, systemd analysis, API smoke, migration, backup, upgrade, rollback,
   reinstall, and state-preserving remove tests;
+- the unchanged overlapping workload of 100 metadata clients, 40 range
+  streams, and ten upload/readback clients against the exact package payload
+  in its digest-pinned distribution builder with the qualified 4-vCPU resource
+  layout above on a native matching-architecture GitHub runner; this is the
+  authoritative p95 `<2 s` result; and
 - a full guest boot with OS, kernel, package database, active-binary hash,
-  systemd, journal, readiness, and SQLite evidence; and
-- the 100-user profile with p95 below two seconds, no 5xx response or
-  corruption, and the established RSS limit.
+  systemd, journal, readiness, SQLite, upgrade, rollback, and the same complete
+  load-workload evidence. The QEMU gate remains authoritative for request
+  counts and statuses, transfer and upload hashes, absence of corruption,
+  process and RSS limits, and all other functional and security assertions;
+  only its recorded p95 and threshold comparison are diagnostic. The
+  commit-bound workflow explicitly records `acceleration_policy=force-tcg` and
+  `acceleration=tcg` for every target.
 
 Native arm64 jobs are the only authoritative arm64 evidence. Architecture-
 independent security, policy, aggregation, signing, and publication work stays
-on `ubuntu-24.04`. Fuzz parallelism remains bounded by the runner resources.
+on `ubuntu-24.04`. The managed `ubuntu-24.04-arm` runner therefore supplies the
+authoritative arm64 performance evidence; private ARM hardware is not required.
+Fuzz parallelism remains bounded by the runner resources.
 
 Three aggregate, commit-bound checks are published:
 

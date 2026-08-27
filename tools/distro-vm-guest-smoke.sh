@@ -5,8 +5,8 @@ LANG=C
 export LC_ALL LANG
 
 [ "$(id -u)" -eq 0 ] || exit 77
-[ "$#" -eq 8 ] || {
-    echo "usage: $0 TARGET_ID DISTRO DISTRO_VERSION FORMAT PACKAGE_ARCH VERSION PACKAGE VM_PACKAGES_SHA256" >&2
+[ "$#" -eq 9 ] || {
+    echo "usage: $0 TARGET_ID DISTRO DISTRO_VERSION FORMAT PACKAGE_ARCH VERSION PACKAGE VM_PACKAGES_SHA256 ACCELERATION" >&2
     exit 64
 }
 target_id=$1
@@ -17,6 +17,8 @@ package_arch=$5
 version=$6
 package=$7
 vm_packages_sha256=$8
+acceleration=$9
+case "$acceleration" in kvm|tcg) ;; *) exit 64 ;; esac
 [ -f "$package" ] || exit 66
 package_copy=/var/tmp/$(basename "$package")
 install -o root -g root -m 0600 "$package" "$package_copy"
@@ -205,7 +207,8 @@ verify_install
 upgrade_package
 verify_install
 
-sh /tmp/distro-vm-runtime-smoke.sh "$target_id" /tmp/vaultlink-vm-evidence
+sh /tmp/distro-vm-runtime-smoke.sh \
+    "$target_id" /tmp/vaultlink-vm-evidence "$acceleration"
 
 # Exercise the real systemd sandbox and first prove that its bounded ambient
 # transaction capabilities do not survive the runuser boundary. The candidate

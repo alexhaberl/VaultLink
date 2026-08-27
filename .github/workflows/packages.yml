@@ -221,7 +221,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       TARGET_ID: ${{ matrix.id }}
       BUILDER_IMAGE: ${{ matrix.builder_image }}
@@ -237,29 +237,52 @@ jobs:
         with:
           name: vaultlink-real-package-update-fixture-${{ matrix.id }}
           path: real-update-smoke/${{ matrix.id }}
-      - name: Run lifecycle, systemd, API, migration, and rollback smoke offline
+      - name: Run lifecycle, API, migration, rollback, and native load gates offline
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          test "$(uname -m)" = '${{ matrix.uname }}'
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker pull "$BUILDER_IMAGE"
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           asset=$(python3 tools/package-targets.py asset "$TARGET_ID" "$version")
           package="offline-smoke/$TARGET_ID/$asset"
           test -s "$package"
+          host_nproc=$(nproc)
+          [[ "$host_nproc" =~ ^[0-9]+$ && "$host_nproc" -ge 4 ]]
+          host_mem_total_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+          [[ "$host_mem_total_kib" =~ ^[0-9]+$ \
+            && "$host_mem_total_kib" -ge 8388608 ]]
+          taskset --cpu-list 0-3 true
+          docker_nproc=$(docker info --format '{{.NCPU}}')
+          [[ "$docker_nproc" =~ ^[0-9]+$ && "$docker_nproc" -ge 4 ]]
+          printf 'host_nproc=%s\nhost_mem_total_kib=%s\ndocker_nproc=%s\nnative_container_cpuset=0-3\n' \
+            "$host_nproc" "$host_mem_total_kib" "$docker_nproc"
           docker run --rm --network none --user root \
+            --cpuset-cpus 0-3 \
+            --tmpfs /mnt/load-client:rw,nosuid,nodev,noexec,size=4g,mode=0700 \
+            --env VAULTLINK_NATIVE_HOST_NPROC="$host_nproc" \
+            --env VAULTLINK_NATIVE_HOST_MEM_TOTAL_KIB="$host_mem_total_kib" \
+            --env VAULTLINK_NATIVE_DOCKER_NPROC="$docker_nproc" \
+            --env VAULTLINK_NATIVE_CONTAINER_CPUSET=0-3 \
+            --mount type=volume,destination=/mnt/storage \
             --volume "$PWD:/work" --workdir /work \
             "$BUILDER_IMAGE" \
             sh tools/package-offline-smoke.sh \
               "$TARGET_ID" "$version" "$package" \
+              "/work/offline-smoke/$TARGET_ID/native-load" \
             | tee "offline-smoke/$TARGET_ID/offline-smoke.env"
           grep -F -x -q 'network=none' \
             "offline-smoke/$TARGET_ID/offline-smoke.env"
           grep -F -x -q 'real_migration=ok' \
             "offline-smoke/$TARGET_ID/offline-smoke.env"
           grep -F -x -q 'upgrade_migration_backup_rollback=ok' \
+            "offline-smoke/$TARGET_ID/offline-smoke.env"
+          grep -F -x -q 'native_package_load=ok' \
+            "offline-smoke/$TARGET_ID/offline-smoke.env"
+          grep -F -x -q 'metadata_p95_limit_seconds=2.000' \
             "offline-smoke/$TARGET_ID/offline-smoke.env"
       - name: Run signed real-package update and recovery smoke offline
         shell: bash
@@ -302,7 +325,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vaultlink-package-offline-smoke-${{ matrix.id }}
-          path: offline-smoke/${{ matrix.id }}/offline-smoke.env
+          path: |
+            offline-smoke/${{ matrix.id }}/offline-smoke.env
+            offline-smoke/${{ matrix.id }}/native-load/**
           if-no-files-found: error
           retention-days: 30
       - name: Upload real package update evidence
@@ -334,10 +359,10 @@ jobs:
           if [[ "$PREPARE_RESULT" == success && "$BUILD_RESULT" == success \
             && "$SMOKE_RESULT" == success ]]; then
             state=success
-            description='All nine packages passed native offline lifecycle and real update/recovery gates'
+            description='All nine packages passed offline lifecycle, native p95, and update/recovery gates'
           else
             state=failure
-            description='Native package matrix failed or package images are unprovisioned'
+            description='Native package, p95, or update/recovery matrix failed'
           fi
           gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
             -f state="$state" \

@@ -208,52 +208,128 @@ done
 
 load_runs=$(find "$evidence" -mindepth 2 -maxdepth 2 -path '*/load-*/result.env' -type f | wc -l)
 [ "$load_runs" -ge 12 ] || { echo "soak evidence has too few successful load profiles" >&2; exit 1; }
+evidence_field_value() {
+    field_file=$1
+    field_key=$2
+    if [ ! -f "$field_file" ] || [ -L "$field_file" ]; then
+        echo "load evidence field source is missing or unsafe" >&2
+        exit 1
+    fi
+    field_values=$(sed -n "s/^${field_key}=//p" "$field_file")
+    [ "$(printf '%s\n' "$field_values" | grep -c .)" -eq 1 ] \
+        || { echo "load evidence must define $field_key exactly once" >&2; exit 1; }
+    printf '%s\n' "$field_values"
+}
 for load_result in "$evidence"/load-*/result.env; do
     load_dir=${load_result%/result.env}
-    [ "$(sed -n 's/^namespace=//p' "$load_result")" = "$namespace" ] \
+    load_command="$load_dir/load-command.env"
+    profile_status="$load_dir/profile-status.env"
+    if [ ! -s "$load_command" ] || [ -L "$load_command" ] \
+        || [ ! -s "$profile_status" ] || [ -L "$profile_status" ] \
+        || [ "$(evidence_field_value "$load_command" stage)" != complete ] \
+        || [ "$(evidence_field_value "$load_command" exit_status)" != 0 ]; then
+        echo "soak load evidence is missing a successful command or profile report" >&2
+        exit 1
+    fi
+    load_value() {
+        load_key=$1
+        evidence_field_value "$load_result" "$load_key"
+    }
+    [ "$(load_value namespace)" = "$namespace" ] \
         || { echo "load namespace does not match the soak namespace" >&2; exit 1; }
-    if [ "$(sed -n 's/^identity_mode=//p' "$load_result")" != trusted_proxy_xff ] \
-        || [ "$(sed -n 's/^concurrency_barrier=//p' "$load_result")" != passed ] \
-        || [ "$(sed -n 's/^admission_same_identity_status=//p' "$load_result")" != 503 ] \
-        || [ "$(sed -n 's/^admission_distinct_identity_status=//p' "$load_result")" != 206 ]; then
+    if [ "$(load_value identity_mode)" != trusted_proxy_xff ] \
+        || [ "$(load_value concurrency_barrier)" != passed ] \
+        || [ "$(load_value admission_same_identity_status)" != 503 ] \
+        || [ "$(load_value admission_distinct_identity_status)" != 206 ]; then
         echo "load evidence did not prove trusted forwarded admission identities" >&2
         exit 1
     fi
+    if [ "$(load_value supervision_mode)" != systemd ] \
+        || [ "$(load_value metadata_p95_policy)" != strict ] \
+        || [ "$(load_value metadata_p95_limit_seconds)" != 2.000 ] \
+        || [ "$(load_value metadata_p95_within_limit)" != true ] \
+        || [ "$(load_value metadata_p95_enforced)" != true ]; then
+        echo "soak load evidence is not systemd-supervised with the strict p95 gate" >&2
+        exit 1
+    fi
+    if [ "$(load_value metadata_clients)" != 100 ] \
+        || [ "$(load_value metadata_requests)" != 2000 ] \
+        || [ "$(load_value range_streams)" != 40 ] \
+        || [ "$(load_value uploads)" != 10 ]; then
+        echo "soak load result does not retain the full 100/40/10 workload" >&2
+        exit 1
+    fi
+    for profile_line in \
+        'metadata_status=0' \
+        'download_status=0' \
+        'upload_status=0' \
+        'rss_status=0' \
+        'metadata_rows=2000' \
+        'range_rows=40' \
+        'upload_rows=10' \
+        'supervision_mode=systemd' \
+        'metadata_p95_policy=strict' \
+        'metadata_p95_limit_seconds=2.000' \
+        'metadata_p95_within_limit=true' \
+        'metadata_p95_enforced=true'; do
+        profile_key=${profile_line%%=*}
+        profile_expected=${profile_line#*=}
+        [ "$(evidence_field_value "$profile_status" "$profile_key")" = \
+            "$profile_expected" ] \
+            || { echo "soak load profile report violates $profile_line" >&2; exit 1; }
+    done
+    profile_rss_rows=$(evidence_field_value "$profile_status" rss_rows)
+    case "$profile_rss_rows" in
+        ''|*[!0-9]*|0) echo "soak load profile has no RSS samples" >&2; exit 1 ;;
+    esac
     for phase in pre-load post-load; do
         snapshot="$load_dir/$phase.env"
-        [ -s "$snapshot" ] || { echo "load evidence is missing $phase report" >&2; exit 1; }
-        snapshot_epoch=$(sed -n 's/^epoch=//p' "$snapshot")
-        snapshot_pid=$(sed -n 's/^pid=//p' "$snapshot")
-        snapshot_rss=$(sed -n 's/^rss_kib=//p' "$snapshot")
-        snapshot_binary=$(sed -n 's/^binary_sha256=//p' "$snapshot")
-        snapshot_health=$(sed -n 's/^health_sha256=//p' "$snapshot")
-        snapshot_integrity=$(sed -n 's/^integrity=//p' "$snapshot")
-        case "$snapshot_epoch:$snapshot_pid:$snapshot_rss" in
+        if [ ! -s "$snapshot" ] || [ -L "$snapshot" ]; then
+            echo "load evidence is missing $phase report" >&2
+            exit 1
+        fi
+        snapshot_epoch=$(evidence_field_value "$snapshot" epoch)
+        snapshot_pid=$(evidence_field_value "$snapshot" pid)
+        snapshot_starttime=$(evidence_field_value "$snapshot" process_starttime_ticks)
+        snapshot_rss=$(evidence_field_value "$snapshot" rss_kib)
+        snapshot_binary=$(evidence_field_value "$snapshot" binary_sha256)
+        snapshot_health=$(evidence_field_value "$snapshot" health_sha256)
+        snapshot_integrity=$(evidence_field_value "$snapshot" integrity)
+        snapshot_supervision=$(evidence_field_value "$snapshot" supervision_mode)
+        case "$snapshot_epoch:$snapshot_pid:$snapshot_starttime:$snapshot_rss" in
             *[!0-9:]*|:*|*::*|*:*:) echo "load $phase report contains invalid numeric state" >&2; exit 1 ;;
         esac
         if [ "$snapshot_rss" -gt 262144 ] \
             || [ "$snapshot_binary" != "$binary_sha256" ] \
             || [ "$snapshot_health" != "$health_sha256" ] \
-            || [ "$snapshot_integrity" != ok ]; then
+            || [ "$snapshot_integrity" != ok ] \
+            || [ "$snapshot_supervision" != systemd ]; then
             echo "load $phase report violates PID/hash/RSS/integrity state" >&2
             exit 1
         fi
         if [ "$phase" = pre-load ]; then
             pre_epoch=$snapshot_epoch
             pre_pid=$snapshot_pid
+            pre_starttime=$snapshot_starttime
         else
-            if [ "$snapshot_epoch" -lt "$pre_epoch" ] || [ "$snapshot_pid" != "$pre_pid" ]; then
-                echo "load PID changed or post-load predates pre-load" >&2
+            if [ "$snapshot_epoch" -lt "$pre_epoch" ] \
+                || [ "$snapshot_pid" != "$pre_pid" ] \
+                || [ "$snapshot_starttime" != "$pre_starttime" ]; then
+                echo "load process identity changed or post-load predates pre-load" >&2
                 exit 1
             fi
         fi
     done
     printf '%s\n' "$pre_epoch" >>"$load_epochs"
-    reported_p95=$(sed -n 's/^metadata_p95_seconds=//p' "$load_result")
+    reported_p95=$(load_value metadata_p95_seconds)
+    printf '%s\n' "$reported_p95" | grep -E -x -q '[0-9]+([.][0-9]+)?' \
+        || { echo "load metadata p95 is not numeric" >&2; exit 1; }
     calculated_p95=$(awk -F, '{ print $3 }' "$load_dir/metadata-load.csv" \
         | sort -n | awk 'NR == 1900 { print; exit }')
     if [ "$(wc -l <"$load_dir/metadata-load.csv")" -ne 2000 ] \
-        || [ "$reported_p95" != "$calculated_p95" ]; then
+        || [ "$reported_p95" != "$calculated_p95" ] \
+        || ! grep -F -x -q "metadata_observed_p95_seconds=$calculated_p95" \
+            "$profile_status"; then
         echo "load metadata sample or p95 mismatch" >&2
         exit 1
     fi
@@ -270,9 +346,9 @@ for load_result in "$evidence"/load-*/result.env; do
     awk -v p95="$calculated_p95" 'BEGIN { exit !(p95 < 2.000) }' \
         || { echo "recomputed metadata p95 is not below 2 seconds" >&2; exit 1; }
 
-    range_bytes=$(sed -n 's/^range_bytes=//p' "$load_result")
-    fixture_bytes=$(sed -n 's/^fixture_bytes=//p' "$load_result")
-    range_hash=$(sed -n 's/^range_sha256=//p' "$load_result")
+    range_bytes=$(load_value range_bytes)
+    fixture_bytes=$(load_value fixture_bytes)
+    range_hash=$(load_value range_sha256)
     case "$range_bytes:$fixture_bytes" in
         *[!0-9:]*|:*|*::*) echo "load evidence contains invalid range sizes" >&2; exit 1 ;;
     esac
@@ -285,12 +361,12 @@ for load_result in "$evidence"/load-*/result.env; do
     ' "$load_dir/range-results.csv" \
         || { echo "range status, length, hash, or Content-Range mismatch" >&2; exit 1; }
 
-    upload_hash=$(sed -n 's/^upload_sha256=//p' "$load_result")
+    upload_hash=$(load_value upload_sha256)
     case "$upload_hash" in *[!0-9a-f]*|'') echo "load upload hash is invalid" >&2; exit 1 ;; esac
     [ "${#upload_hash}" -eq 64 ] || { echo "load upload hash is invalid" >&2; exit 1; }
-    [ "$(sed -n 's/^upload_integrity=//p' "$load_result")" = server_readback ] \
+    [ "$(load_value upload_integrity)" = server_readback ] \
         || { echo "load upload integrity mode is not server readback" >&2; exit 1; }
-    run_id=$(sed -n 's/^run_id=//p' "$load_result")
+    run_id=$(load_value run_id)
     [ "$(wc -l <"$load_dir/upload-results.csv")" -eq 10 ] \
         || { echo "load upload sample count mismatch" >&2; exit 1; }
     awk -F, -v hash="$upload_hash" -v soak_namespace="$namespace" -v run_id="$run_id" '
@@ -303,7 +379,7 @@ for load_result in "$evidence"/load-*/result.env; do
 
     [ -s "$load_dir/rss-samples.csv" ] \
         || { echo "load RSS samples are missing" >&2; exit 1; }
-    reported_max_rss=$(sed -n 's/^max_rss_kib=//p' "$load_result")
+    reported_max_rss=$(load_value max_rss_kib)
     calculated_max_rss=$(awk -F, '
         NR == 1 {
             if ($0 != "epoch,pid,rss_kib") exit 1

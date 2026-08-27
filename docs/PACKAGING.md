@@ -300,16 +300,44 @@ Local Docker covers the complete x86_64 package matrix. Native GitHub arm64
 results are authoritative for arm64. Fast container gates install packages
 without network access and exercise ownership, modes, no-autostart, setup,
 systemd analysis, API smoke, upgrade, migration, backup, rollback,
-reinstallation, and state-preserving removal.
+reinstallation, and state-preserving removal. For each of the nine targets,
+the same gate runs the unchanged overlapping workload of 100 metadata clients,
+40 range streams, and ten upload/readback clients against the exact installed
+package payload. It executes inside the target's digest-pinned distribution
+builder on a native matching-architecture GitHub runner. Before its timing is
+accepted, the job qualifies the public hosted runner for four available vCPUs
+and at least 8 GiB of host RAM, then restricts its Docker container to logical
+CPUs 0-3. The server is restricted to CPUs 0-1 and uses a separate server-
+storage mount; the load generator is restricted to CPUs 2-3 and uses a
+dedicated hardened 4-GiB client tmpfs. Evidence records the qualification,
+container and process CPU placement, memory and storage separation, exact
+workload counts, latency, RSS, and integrity results. A runner that cannot
+prove this resource layout fails the gate. The qualified native run is
+authoritative for p95 strictly below two seconds and also fails on invalid
+response statuses, corruption, or exceeding the RSS ceiling. The harness's
+resource contract is reproducible, but it does not assert deterministic timing
+for arbitrary GitHub standard-runner executions. The managed arm64 GitHub
+runner supplies the same qualified evidence for arm64; private ARM hardware is
+not required.
 
 Full-system gates boot digest-pinned target images on a same-architecture
 GitHub runner. Guests receive packages over an isolated host channel and have
 no unrestricted Internet access. Fedora must remain SELinux `Enforcing` and
-must produce no VaultLink-related AVC denial. Every target also runs the
-100-user profile with p95 below two seconds, no 5xx responses, no corruption,
-and the established RSS ceiling.
+must produce no VaultLink-related AVC denial. Every guest runs the exact same
+100-user/range/upload workload without reducing its concurrency or transfer
+sizes. QEMU remains authoritative for full-system functionality, request
+counts and statuses, hashes and absence of corruption, RSS, process health,
+package-manager behavior, migration, upgrade, backup, rollback, readiness,
+SQLite integrity, systemd confinement, and Fedora SELinux assertions. Its p95
+and `<2 s` threshold comparison are recorded as diagnostic evidence regardless
+of acceleration; emulation speed is not a release-performance gate. The
+commit-bound nine-target workflow forces and records TCG for every target, so
+its aggregate result proves the complete workload passed without KVM. A guest-
+image refresh may select KVM on amd64 only after a bounded QMP query proves it
+is present and enabled; every failed or unavailable probe selects TCG.
 
 Only Debian 13 amd64 runs the 72-hour soak. Its runtime binary must be extracted
-from the exact final DEB and hash-bound to the candidate commit. Arch is built
-and boot-tested against the release-date snapshot; a weekly read-only job
-checks the current rolling image without changing published support claims.
+from the exact final DEB and hash-bound to the candidate commit. Every soak
+load profile continues to enforce p95 strictly below two seconds. Arch is
+built and boot-tested against the release-date snapshot; a weekly read-only
+job checks the current rolling image without changing published support claims.

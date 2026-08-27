@@ -12,6 +12,49 @@ export LC_ALL LANG
 : "${VAULTLINK_CONFIG:?set VAULTLINK_CONFIG}"
 command -v curl >/dev/null
 
+p95_limit=2.000
+p95_policy=${LOAD_P95_POLICY:-strict}
+case "$p95_policy" in
+    strict) p95_enforced=true ;;
+    diagnostic) p95_enforced=false ;;
+    *) echo "LOAD_P95_POLICY must be strict or diagnostic" >&2; exit 64 ;;
+esac
+
+validate_timeout() {
+    timeout_name=$1
+    timeout_value=$2
+    timeout_max=$3
+    case "$timeout_value" in
+        *[!0-9]*|'')
+            echo "$timeout_name must be a positive decimal integer" >&2
+            exit 64
+            ;;
+    esac
+    if [ "$timeout_value" -le 0 ] || [ "$timeout_value" -gt "$timeout_max" ]; then
+        echo "$timeout_name is outside its allowed range" >&2
+        exit 64
+    fi
+}
+
+connect_timeout=${LOAD_CONNECT_TIMEOUT_SECONDS:-5}
+metadata_max_time=${LOAD_METADATA_MAX_TIME_SECONDS:-30}
+transfer_max_time=${LOAD_TRANSFER_MAX_TIME_SECONDS:-300}
+profile_ready_timeout=${LOAD_PROFILE_READY_TIMEOUT_SECONDS:-10}
+admission_ready_timeout=${LOAD_ADMISSION_READY_TIMEOUT_SECONDS:-10}
+admission_holder_max_time=${LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS:-30}
+admission_probe_max_time=${LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS:-5}
+validate_timeout LOAD_CONNECT_TIMEOUT_SECONDS "$connect_timeout" 300
+validate_timeout LOAD_METADATA_MAX_TIME_SECONDS "$metadata_max_time" 3600
+validate_timeout LOAD_TRANSFER_MAX_TIME_SECONDS "$transfer_max_time" 7200
+validate_timeout LOAD_PROFILE_READY_TIMEOUT_SECONDS "$profile_ready_timeout" 900
+validate_timeout LOAD_ADMISSION_READY_TIMEOUT_SECONDS "$admission_ready_timeout" 900
+validate_timeout LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS "$admission_holder_max_time" 7200
+validate_timeout LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS "$admission_probe_max_time" 300
+[ "$admission_holder_max_time" -gt "$admission_ready_timeout" ] || {
+    echo "LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS must exceed the admission readiness timeout" >&2
+    exit 64
+}
+
 case "$SOAK_NAMESPACE" in
     *[!A-Za-z0-9._-]*|'') echo "SOAK_NAMESPACE contains unsafe characters" >&2; exit 64 ;;
 esac
@@ -57,6 +100,121 @@ case "$trusted_proxies" in
     *) echo "soak local peer is not an explicit trusted proxy" >&2; exit 77 ;;
 esac
 
+supervision_mode=systemd
+pid=
+direct_process_uid=
+direct_process_gid=
+direct_binary_path=
+direct_binary_sha256=
+direct_process_starttime=
+if [ -n "${VAULTLINK_PROCESS_PID:-}" ]; then
+    supervision_mode=direct_pid
+    pid=$VAULTLINK_PROCESS_PID
+    : "${VAULTLINK_PROCESS_UID:?direct PID mode requires VAULTLINK_PROCESS_UID}"
+    : "${VAULTLINK_PROCESS_GID:?direct PID mode requires VAULTLINK_PROCESS_GID}"
+    : "${VAULTLINK_EXPECTED_BINARY_PATH:?direct PID mode requires VAULTLINK_EXPECTED_BINARY_PATH}"
+    : "${VAULTLINK_EXPECTED_BINARY_SHA256:?direct PID mode requires VAULTLINK_EXPECTED_BINARY_SHA256}"
+    direct_process_uid=$VAULTLINK_PROCESS_UID
+    direct_process_gid=$VAULTLINK_PROCESS_GID
+    direct_binary_path=$VAULTLINK_EXPECTED_BINARY_PATH
+    direct_binary_sha256=$VAULTLINK_EXPECTED_BINARY_SHA256
+    case "$pid" in *[!0-9]*|'') echo "direct PID must be a positive decimal integer" >&2; exit 64 ;; esac
+    case "$direct_process_uid" in *[!0-9]*|'') echo "direct UID must be a positive decimal integer" >&2; exit 64 ;; esac
+    case "$direct_process_gid" in *[!0-9]*|'') echo "direct GID must be a positive decimal integer" >&2; exit 64 ;; esac
+    if [ "$pid" -le 1 ] || [ "$direct_process_uid" -le 0 ] \
+        || [ "$direct_process_gid" -le 0 ]; then
+        echo "direct PID mode received an invalid process identity" >&2
+        exit 64
+    fi
+    case "$direct_binary_path" in
+        /*) ;;
+        *) echo "direct PID mode requires an absolute expected binary path" >&2; exit 64 ;;
+    esac
+    case "$direct_binary_sha256" in
+        *[!0-9a-f]*|'')
+            echo "direct PID mode requires a lowercase SHA-256 digest" >&2
+            exit 64
+            ;;
+    esac
+    [ "${#direct_binary_sha256}" -eq 64 ] || {
+        echo "direct PID mode requires a 64-character SHA-256 digest" >&2
+        exit 64
+    }
+    if [ ! -f "$direct_binary_path" ] || [ -L "$direct_binary_path" ] \
+        || [ ! -x "$direct_binary_path" ]; then
+        echo "direct PID mode expected binary is unsafe" >&2
+        exit 66
+    fi
+    direct_identity_helper=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/check-direct-process-identity.sh
+    if [ ! -f "$direct_identity_helper" ] || [ -L "$direct_identity_helper" ] \
+        || [ ! -r "$direct_identity_helper" ]; then
+        echo "direct PID identity helper is unavailable or unsafe" >&2
+        exit 66
+    fi
+    command -v setpriv >/dev/null \
+        || { echo "direct PID mode requires setpriv" >&2; exit 69; }
+elif [ -n "${VAULTLINK_PROCESS_UID:-}${VAULTLINK_PROCESS_GID:-}${VAULTLINK_EXPECTED_BINARY_PATH:-}${VAULTLINK_EXPECTED_BINARY_SHA256:-}" ]; then
+    echo "direct PID verification inputs require VAULTLINK_PROCESS_PID" >&2
+    exit 64
+fi
+
+direct_pid_identity() {
+    expected_starttime=$1
+    setpriv --reuid="$direct_process_uid" --regid="$direct_process_gid" \
+        --clear-groups --no-new-privs -- sh "$direct_identity_helper" \
+        "$pid" "$direct_process_uid" "$direct_process_gid" \
+        "$direct_binary_path" "$direct_binary_sha256" "$expected_starttime"
+}
+
+direct_pid_is_live() {
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ -r "/proc/$pid/status" ] || return 1
+    awk -v expected_uid="$direct_process_uid" \
+        -v expected_gid="$direct_process_gid" '
+        /^Uid:/ { uid_rows++; if ($2 != expected_uid) invalid = 1 }
+        /^Gid:/ { gid_rows++; if ($2 != expected_gid) invalid = 1 }
+        END { exit !(uid_rows == 1 && gid_rows == 1 && !invalid) }
+    ' "/proc/$pid/status" || return 1
+    observed_starttime=$(direct_pid_identity "$direct_process_starttime") \
+        || return 1
+    case "$observed_starttime" in *[!0-9]*|'') return 1 ;; esac
+    if [ -n "$direct_process_starttime" ]; then
+        [ "$observed_starttime" = "$direct_process_starttime" ] || return 1
+    fi
+}
+
+load_current_pid() {
+    if [ "$supervision_mode" = direct_pid ]; then
+        direct_pid_is_live || return 1
+        printf '%s\n' "$pid"
+        return 0
+    fi
+    systemctl --quiet is-active vaultlink.service || return 1
+    supervised_pid=$(systemctl show -p MainPID --value vaultlink.service 2>/dev/null || true)
+    case "$supervised_pid" in *[!0-9]*|'') return 1 ;; esac
+    [ "$supervised_pid" -gt 0 ] || return 1
+    printf '%s\n' "$supervised_pid"
+}
+
+if [ "$supervision_mode" = direct_pid ]; then
+    direct_process_starttime=$(direct_pid_identity '') || {
+        echo "direct PID identity is unavailable" >&2
+        exit 69
+    }
+    case "$direct_process_starttime" in
+        *[!0-9]*|'') echo "direct PID start time is unavailable" >&2; exit 69 ;;
+    esac
+    direct_pid_is_live || {
+        echo "direct PID mode requires the expected live VaultLink process" >&2
+        exit 69
+    }
+    if [ "$(sha256sum "$direct_binary_path" | awk '{print $1}')" != \
+        "$direct_binary_sha256" ]; then
+        echo "direct PID mode binary integrity check failed" >&2
+        exit 69
+    fi
+fi
+
 soak_curl() {
     identity=$1
     shift
@@ -92,6 +250,7 @@ persist_load_evidence() {
         'uploads.csv:upload-results.partial.csv' \
         'rss-samples.csv:rss-samples.partial.csv' \
         'metadata.p95:metadata-p95.partial.txt' \
+        'metadata.p95-within-limit:metadata-p95-within-limit.partial.txt' \
         'rss-failure:rss-failure.txt'; do
         partial_source=${partial_evidence%%:*}
         partial_destination=${partial_evidence#*:}
@@ -155,25 +314,51 @@ verify_forwarded_admission_identity() {
     holder=0
     while [ "$holder" -lt 16 ]; do
         curl --interface 127.0.0.1 --header "X-Forwarded-For: $identity" \
-            --silent --show-error --max-time 30 \
+            --silent --show-error --max-time "$admission_holder_max_time" \
             --limit-rate 1024 --range "0-$admission_range_end" \
             --dump-header "$work/admission-$holder.headers" --output /dev/null \
             "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download" &
         admission_holders="$admission_holders $!"
         holder=$((holder + 1))
     done
-    sleep 2
-    for header in "$work"/admission-*.headers; do
-        grep -E -q '^HTTP/[0-9.]+ 206([[:space:]]|$)' "$header" || {
+    admission_started=$(date +%s)
+    while :; do
+        ready_holders=0
+        for header in "$work"/admission-*.headers; do
+            if [ -f "$header" ] \
+                && grep -E -q '^HTTP/[0-9.]+ 206([[:space:]]|$)' "$header"; then
+                ready_holders=$((ready_holders + 1))
+            fi
+        done
+        [ "$ready_holders" -eq 16 ] && break
+        for holder_pid in $admission_holders; do
+            kill -0 "$holder_pid" 2>/dev/null || {
+                stop_admission_holders
+                echo "an admission holder exited before saturation" >&2
+                return 1
+            }
+        done
+        admission_now=$(date +%s)
+        if [ $((admission_now - admission_started)) -ge "$admission_ready_timeout" ]; then
             stop_admission_holders
             echo "could not saturate the forwarded stream admission key" >&2
             return 1
+        fi
+        sleep 1
+    done
+    for holder_pid in $admission_holders; do
+        kill -0 "$holder_pid" 2>/dev/null || {
+            stop_admission_holders
+            echo "an admission holder exited before the admission probes" >&2
+            return 1
         }
     done
-    same_status=$(soak_curl "$identity" --silent --show-error --max-time 5 \
+    same_status=$(soak_curl "$identity" --silent --show-error \
+        --max-time "$admission_probe_max_time" \
         --range 0-0 --output /dev/null --write-out '%{http_code}' \
         "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download")
-    distinct_status=$(soak_curl 198.18.255.2 --silent --show-error --max-time 5 \
+    distinct_status=$(soak_curl 198.18.255.2 --silent --show-error \
+        --max-time "$admission_probe_max_time" \
         --range 0-0 --output /dev/null --write-out '%{http_code}' \
         "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download")
     stop_admission_holders
@@ -190,13 +375,17 @@ verify_forwarded_admission_identity() {
 load_stage=admission-identity
 verify_forwarded_admission_identity
 
-pid=$(systemctl show -p MainPID --value vaultlink.service 2>/dev/null || true)
 rss_before=0
-if [ -z "$pid" ] || ! [ "$pid" -gt 0 ] 2>/dev/null \
-    || ! systemctl --quiet is-active vaultlink.service; then
-    echo "load profile requires an active systemd-managed VaultLink process" >&2
+current_pid=$(load_current_pid 2>/dev/null || true)
+if [ -z "$current_pid" ]; then
+    echo "load profile requires the expected active VaultLink process" >&2
     exit 69
 fi
+if [ -n "$pid" ] && [ "$current_pid" != "$pid" ]; then
+    echo "load profile observed an unexpected VaultLink PID" >&2
+    exit 69
+fi
+pid=$current_pid
 rss_before=$(awk '/VmRSS:/ { print $2 * 1024 }' "/proc/$pid/status")
 
 load_snapshot() {
@@ -205,11 +394,22 @@ load_snapshot() {
         echo "soak load evidence requires an active VaultLink PID" >&2
         return 1
     fi
-    systemctl --quiet is-active vaultlink.service
-    current_pid=$(systemctl show -p MainPID --value vaultlink.service)
+    current_pid=$(load_current_pid)
     [ "$current_pid" = "$pid" ] || return 1
+    process_starttime=$(sed 's/^[^)]*) //' "/proc/$current_pid/stat" \
+        | awk '{ print $20; exit }')
+    case "$process_starttime" in *[!0-9]*|'') return 1 ;; esac
+    if [ "$supervision_mode" = direct_pid ]; then
+        [ "$process_starttime" = "$direct_process_starttime" ] || return 1
+    fi
     rss_kib=$(awk '/VmRSS:/ { print $2 }' "/proc/$current_pid/status")
-    binary_sha256=$(sha256sum "/proc/$current_pid/exe" | awk '{print $1}')
+    if [ "$supervision_mode" = direct_pid ]; then
+        binary_sha256=$direct_binary_sha256
+        [ "$(sha256sum "$direct_binary_path" | awk '{print $1}')" = \
+            "$direct_binary_sha256" ] || return 1
+    else
+        binary_sha256=$(sha256sum "/proc/$current_pid/exe" | awk '{print $1}')
+    fi
     health_body="$work/snapshot-health.json"
     curl --fail --silent --show-error \
         "${VAULTLINK_HEALTH_URL:-http://127.0.0.1:8080/api/v2/health/ready}" \
@@ -222,7 +422,9 @@ load_snapshot() {
     [ "$integrity" = ok ] || return 1
     printf '%s\n' \
         "epoch=$(date +%s)" \
+        "supervision_mode=$supervision_mode" \
         "pid=$current_pid" \
+        "process_starttime_ticks=$process_starttime" \
         "rss_kib=$rss_kib" \
         "binary_sha256=$binary_sha256" \
         "health_sha256=$health_sha256" \
@@ -238,9 +440,10 @@ fi
 
 wait_for_profile_go() {
     attempts=0
+    max_attempts=$((profile_ready_timeout * 20))
     while [ ! -e "$work/profile-go" ]; do
         attempts=$((attempts + 1))
-        [ "$attempts" -le 200 ] || return 1
+        [ "$attempts" -le "$max_attempts" ] || return 1
         sleep 0.05
     done
 }
@@ -255,7 +458,8 @@ metadata_profile() {
             request=0
             while [ "$request" -lt 20 ]; do
                 soak_curl "$identity" --silent --show-error \
-                    --connect-timeout 5 --max-time 30 -o /dev/null \
+                    --connect-timeout "$connect_timeout" \
+                    --max-time "$metadata_max_time" -o /dev/null \
                     -w "$identity,%{http_code},%{time_total}\n" \
                     "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN"
                 request=$((request + 1))
@@ -287,8 +491,16 @@ metadata_profile() {
     p95=$(awk -F, '{ print $3 }' "$work/metadata.csv" \
         | sort -n | awk 'NR == 1900 { print; exit }')
     [ -n "$p95" ] || return 1
+    awk -v value="$p95" 'BEGIN {
+        exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value + 0 > 0)
+    }' || return 1
     printf '%s\n' "$p95" >"$work/metadata.p95"
-    awk -v p95="$p95" 'BEGIN { exit !(p95 < 2.000) }' || return 1
+    p95_within_limit=false
+    if awk -v p95="$p95" -v limit="$p95_limit" \
+        'BEGIN { exit !(p95 < limit) }'; then
+        p95_within_limit=true
+    fi
+    printf '%s\n' "$p95_within_limit" >"$work/metadata.p95-within-limit"
 }
 
 download_profile() {
@@ -301,7 +513,8 @@ download_profile() {
             headers="$work/range-$download.headers"
             body="$work/range-$download.bin"
             status=$(soak_curl "$identity" --silent --show-error \
-                --connect-timeout 5 --max-time 300 \
+                --connect-timeout "$connect_timeout" \
+                --max-time "$transfer_max_time" \
                 --range "0-$range_end" \
                 --dump-header "$headers" \
                 --output "$body" \
@@ -348,7 +561,8 @@ upload_profile() {
             headers="$work/upload-$upload.headers"
             filename="load-$SOAK_NAMESPACE-$run_id-$upload.bin"
             status=$(soak_curl "$identity" --silent --show-error \
-                --connect-timeout 5 --max-time 300 \
+                --connect-timeout "$connect_timeout" \
+                --max-time "$transfer_max_time" \
                 --form "file=@$work/upload.bin;filename=$filename" \
                 --dump-header "$headers" \
                 --output /dev/null \
@@ -366,7 +580,8 @@ upload_profile() {
             [ "$outcome" = created ]
             verify_body="$work/upload-$upload.readback"
             verify_status=$(soak_curl "$identity" --silent --show-error \
-                --connect-timeout 5 --max-time 300 \
+                --connect-timeout "$connect_timeout" \
+                --max-time "$transfer_max_time" \
                 --output "$verify_body" --write-out '%{http_code}' \
                 "$VAULTLINK_BASE_URL/v/$UPLOAD_VERIFY_TOKEN/download?path=$filename")
             server_hash=$(sha256sum "$verify_body" | awk '{print $1}')
@@ -395,7 +610,7 @@ rss_profile() {
     shift
     printf 'epoch,pid,rss_kib\n' >"$work/rss-samples.csv"
     while [ -e "$marker" ]; do
-        current_pid=$(systemctl show -p MainPID --value vaultlink.service 2>/dev/null || true)
+        current_pid=$(load_current_pid 2>/dev/null || true)
         if [ "$current_pid" != "$pid" ] || [ ! -r "/proc/$pid/status" ]; then
             printf '%s\n' pid_changed >"$work/rss-failure"
             kill "$@" 2>/dev/null || true
@@ -432,11 +647,12 @@ upload_pid=$!
 rss_profile "$load_marker" "$metadata_pid" "$download_pid" "$upload_pid" &
 rss_pid=$!
 ready_attempts=0
+ready_max_attempts=$((profile_ready_timeout * 20))
 while [ ! -e "$work/metadata-ready" ] \
     || [ ! -e "$work/download-ready" ] \
     || [ ! -e "$work/upload-ready" ]; do
     ready_attempts=$((ready_attempts + 1))
-    if [ "$ready_attempts" -gt 200 ]; then
+    if [ "$ready_attempts" -gt "$ready_max_attempts" ]; then
         kill "$metadata_pid" "$download_pid" "$upload_pid" 2>/dev/null || true
         rm -f "$load_marker"
         wait "$rss_pid" 2>/dev/null || true
@@ -472,13 +688,18 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     [ ! -f "$work/uploads.csv" ] || upload_rows=$(wc -l <"$work/uploads.csv")
     [ ! -f "$work/rss-samples.csv" ] || rss_rows=$(wc -l <"$work/rss-samples.csv")
     observed_p95=unavailable
+    observed_p95_within_limit=unavailable
     if [ -s "$work/metadata.csv" ]; then
         observed_p95=$(awk -F, '{ print $3 }' "$work/metadata.csv" \
             | sort -n | awk 'NR == 1900 { print; exit }')
         [ -n "$observed_p95" ] || observed_p95=unavailable
     fi
+    if [ -s "$work/metadata.p95-within-limit" ]; then
+        observed_p95_within_limit=$(cat "$work/metadata.p95-within-limit")
+    fi
     profile_status_tmp="$LOAD_TEST_EVIDENCE_DIR/.profile-status.env.$$"
     printf '%s\n' \
+        "supervision_mode=$supervision_mode" \
         "metadata_status=$metadata_status" \
         "download_status=$download_status" \
         "upload_status=$upload_status" \
@@ -488,12 +709,17 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         "upload_rows=$upload_rows" \
         "rss_rows=$rss_rows" \
         "metadata_observed_p95_seconds=$observed_p95" \
+        "metadata_p95_policy=$p95_policy" \
+        "metadata_p95_limit_seconds=$p95_limit" \
+        "metadata_p95_within_limit=$observed_p95_within_limit" \
+        "metadata_p95_enforced=$p95_enforced" \
         >"$profile_status_tmp"
     chmod 0640 "$profile_status_tmp"
     mv "$profile_status_tmp" "$LOAD_TEST_EVIDENCE_DIR/profile-status.env"
 fi
 [ "$profile_failed" -eq 0 ] || { echo "parallel load profile failed" >&2; exit 1; }
 p95=$(cat "$work/metadata.p95")
+p95_within_limit=$(cat "$work/metadata.p95-within-limit")
 max_rss_kib=$(awk -F, 'NR > 1 { if ($3 > maximum) maximum = $3 } END {
     if (NR <= 1) exit 1
     print maximum
@@ -521,11 +747,16 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     printf '%s\n' \
         "run_id=$run_id" \
         "namespace=$SOAK_NAMESPACE" \
+        "supervision_mode=$supervision_mode" \
         'identity_mode=trusted_proxy_xff' \
         'concurrency_barrier=passed' \
         "admission_same_identity_status=$same_status" \
         "admission_distinct_identity_status=$distinct_status" \
         "metadata_p95_seconds=$p95" \
+        "metadata_p95_policy=$p95_policy" \
+        "metadata_p95_limit_seconds=$p95_limit" \
+        "metadata_p95_within_limit=$p95_within_limit" \
+        "metadata_p95_enforced=$p95_enforced" \
         'metadata_clients=100' \
         'metadata_requests=2000' \
         'range_streams=40' \
@@ -539,5 +770,11 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         >"$LOAD_TEST_EVIDENCE_DIR/result.env"
 fi
 
-echo "Parallel load profile passed; metadata p95: $p95 seconds; max RSS: $max_rss_kib KiB."
+load_stage=performance-gate
+if [ "$p95_enforced" = true ] && [ "$p95_within_limit" != true ]; then
+    echo "metadata p95 gate failed: $p95 seconds is not below $p95_limit seconds" >&2
+    exit 1
+fi
+
+echo "Parallel load profile passed; metadata p95: $p95 seconds (limit $p95_limit, within limit: $p95_within_limit, enforced: $p95_enforced); max RSS: $max_rss_kib KiB."
 load_stage=complete

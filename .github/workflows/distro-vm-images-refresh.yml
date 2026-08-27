@@ -220,13 +220,15 @@ jobs:
             sh tools/verify-qemu-runner.sh "$ARCHITECTURE" /qemu-lock \
             >vm-build/qemu-runner-verification.env
           kvm_args=()
-          if [[ "$ARCHITECTURE" == amd64 \
-              && -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]; then
-            kvm_args+=(--device /dev/kvm)
+          # Expose only the exact KVM device. The provisioner selects KVM only
+          # after a bounded QMP probe proves that QEMU actually enabled it.
+          if [[ "$ARCHITECTURE" == amd64 && -c /dev/kvm ]]; then
+            kvm_args+=(--device /dev/kvm:/dev/kvm:rw)
           fi
           docker run --rm \
             --user root \
             "${kvm_args[@]}" \
+            --env ACCELERATION_POLICY=auto \
             --volume "$PWD:/work" \
             --workdir /work \
             "$qemu_runner" \
@@ -240,6 +242,12 @@ jobs:
           test "$(sha256sum vm-build/guest.qcow2.packages.lock | awk '{print $1}')" \
             = "$packages_sha256"
           grep -E -x -q 'kvm|tcg' vm-build/guest.qcow2.acceleration
+          grep -F -x -q 'acceleration_policy=auto' \
+            vm-build/guest.qcow2.acceleration-selection.env
+          selected_acceleration=$(sed -n \
+            's/^selected_acceleration=//p' \
+            vm-build/guest.qcow2.acceleration-selection.env)
+          test "$selected_acceleration" = "$(cat vm-build/guest.qcow2.acceleration)"
           grep -F -x -q true vm-build/guest.qcow2.cold-boot-verified
           grep -F -x -q 8589934592 vm-build/guest.qcow2.virtual-size
           {
@@ -258,7 +266,10 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: distro-vm-failure-${{ inputs.target_id }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: vm-build/*.serial.log
+          path: |
+            vm-build/*.serial.log
+            vm-build/*.acceleration-selection.env
+            vm-build/*.kvm-probe.log
           if-no-files-found: warn
           retention-days: 7
       - name: Publish immutable guest image
@@ -325,6 +336,8 @@ jobs:
             vm-image.tsv
             vm-build/host-storage.txt
             vm-build/guest.qcow2.packages.lock
+            vm-build/guest.qcow2.acceleration-selection.env
+            vm-build/*.kvm-probe.log
             vm-build/guest.qcow2.virtual-size
             vm-build/guest-image.env
             vm-build/qemu-runner-verification.env
