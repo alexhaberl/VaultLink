@@ -118,6 +118,16 @@ those root-owned copies, and pass that exact staged package to `dpkg`, `rpm`,
 or the Arch wrapper. Verifying a user-writable pathname and later reopening it
 as root is unsupported because it creates a source-swap race.
 
+On Fedora, updater-driven RPM transactions add `--nocontexts`. RPM's SELinux
+plugin otherwise requests a scriptlet domain transition that Linux rejects
+under the update unit's retained `NoNewPrivileges=true` boundary. This option
+does not disable SELinux: the host remains `Enforcing`, initial manual package
+installation uses RPM's normal context handling, and the exception is reached
+only after the candidate's Minisign signature, complete metadata, fixed payload
+allowlist, dependencies, and exact reviewed scriptlets have all been verified.
+The Fedora full-system gate exercises that exact path and requires no
+VaultLink-related AVC denials plus final package/runtime parity.
+
 For Debian and Ubuntu, read `Depends` from that exact verified, root-owned DEB
 with `dpkg-deb -f`. Version 0.6.0 requires the exact field
 `ca-certificates, curl, libc6, libgcc-s1, mawk, minisign, sqlite3, systemd`.

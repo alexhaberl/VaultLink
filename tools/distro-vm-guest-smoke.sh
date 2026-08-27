@@ -218,6 +218,8 @@ unit_probe_dir=/var/lib/vaultlink-backups/unit-package-probe
 unit_dropin=/etc/systemd/system/vaultlink-update.service.d/90-package-gate.conf
 unit_credential_probe=/usr/local/sbin/vaultlink-update-credential-probe
 unit_credential_state=/var/lib/vaultlink/update-unit-credential.env
+unit_package_probe=/usr/local/sbin/vaultlink-update-package-probe
+unit_package_probe_state=/var/lib/vaultlink/update-unit-package-manager-launcher.env
 install -d -o root -g root -m 0700 "$unit_probe_dir"
 cat >"$unit_credential_probe" <<'EOF'
 #!/bin/sh
@@ -304,20 +306,40 @@ grep -F -x -q 'no_new_privileges=1' \
 rm -f "$unit_credential_state" "$unit_credential_probe"
 
 # Replace only ExecStart again and perform a same-package reinstall from a
-# protected local copy. All shipped sandboxing remains in force and the native
-# package manager plus its distro scriptlets must complete without network.
+# protected local copy. Start through a root-owned generic launcher just as the
+# real unit starts vaultlink-update before it spawns the package manager. A
+# direct ExecStart=/usr/bin/rpm would instead test init_t's RPM transition under
+# no-new-privileges, which is not the production execution path on Fedora.
+# All shipped sandboxing remains in force and the native package manager plus
+# its distro scriptlets must complete without network.
 unit_probe_package="$unit_probe_dir/$(basename "$package")"
 install -o root -g root -m 0600 "$package" "$unit_probe_package"
 case "$package_format" in
     deb) unit_probe_command="/usr/bin/dpkg --install $unit_probe_package" ;;
-    rpm) unit_probe_command="/usr/bin/rpm --upgrade --replacepkgs $unit_probe_package" ;;
+    rpm) unit_probe_command="/usr/bin/rpm --nocontexts --upgrade --replacepkgs $unit_probe_package" ;;
     pkg.tar.zst) unit_probe_command="/usr/bin/pacman -U --noconfirm $unit_probe_package" ;;
     *) exit 65 ;;
 esac
+cat >"$unit_package_probe" <<EOF
+#!/bin/sh
+set -eu
+launcher_context=unavailable
+if [ -r /proc/self/attr/current ]; then
+    launcher_context=\$(tr -d '\\000' </proc/self/attr/current)
+fi
+launcher_no_new_privileges=\$(awk '/^NoNewPrivs:/ { print \$2 }' /proc/self/status)
+[ "\$launcher_no_new_privileges" = 1 ]
+printf 'selinux_context=%s\nno_new_privileges=%s\n' \
+    "\$launcher_context" "\$launcher_no_new_privileges" \
+    >"$unit_package_probe_state"
+exec $unit_probe_command
+EOF
+chown root:root "$unit_package_probe"
+chmod 0755 "$unit_package_probe"
 cat >"$unit_dropin" <<EOF
 [Service]
 ExecStart=
-ExecStart=$unit_probe_command
+ExecStart=$unit_package_probe
 EOF
 chown root:root "$unit_dropin"
 chmod 0644 "$unit_dropin"
@@ -336,9 +358,20 @@ grep -F -x -q 'Result=success' \
     /tmp/vaultlink-vm-evidence/update-unit-package-manager.env
 grep -F -x -q 'ExecMainStatus=0' \
     /tmp/vaultlink-vm-evidence/update-unit-package-manager.env
+install -o root -g root -m 0644 "$unit_package_probe_state" \
+    /tmp/vaultlink-vm-evidence/update-unit-package-manager-launcher.env
+grep -F -x -q 'no_new_privileges=1' \
+    /tmp/vaultlink-vm-evidence/update-unit-package-manager-launcher.env
+case "$target_id" in
+    fedora44-*)
+        grep -E -x -q \
+            'selinux_context=[^:]+:[^:]+:unconfined_service_t:.*' \
+            /tmp/vaultlink-vm-evidence/update-unit-package-manager-launcher.env
+        ;;
+esac
 journalctl -u vaultlink-update.service --no-pager \
     > /tmp/vaultlink-vm-evidence/update-unit-package-manager.journal
-rm -f "$unit_dropin"
+rm -f "$unit_dropin" "$unit_package_probe" "$unit_package_probe_state"
 rm -rf "$unit_probe_dir"
 systemctl daemon-reload
 

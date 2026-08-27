@@ -1610,9 +1610,9 @@ package_dry_run() {
             ;;
         rpm)
             if [ "$dry_is_old" = 1 ]; then
-                rpm --test --upgrade --oldpackage --replacepkgs "$dry_file" >/dev/null
+                rpm --nocontexts --test --upgrade --oldpackage --replacepkgs "$dry_file" >/dev/null
             else
-                rpm --test --upgrade --replacepkgs "$dry_file" >/dev/null
+                rpm --nocontexts --test --upgrade --replacepkgs "$dry_file" >/dev/null
             fi
             ;;
         pkg.tar.zst)
@@ -1634,10 +1634,18 @@ package_install_native() {
     case "$marker_format" in
         deb) dpkg --install "$install_file" >/dev/null ;;
         rpm)
+            # Fedora's RPM SELinux plugin assigns a scriptlet execution
+            # context that requires a domain transition. The kernel rejects
+            # that transition under NoNewPrivileges even though SELinux stays
+            # Enforcing. The updater has already verified the signed package,
+            # its exact scriptlets, metadata, payload paths, and dependencies;
+            # suppress only RPM's transaction context plugin so the reviewed
+            # scriptlets execute in the existing updater domain without
+            # weakening the systemd no-new-privileges boundary.
             if [ "$install_is_old" = 1 ]; then
-                rpm --upgrade --oldpackage --replacepkgs "$install_file" >/dev/null
+                rpm --nocontexts --upgrade --oldpackage --replacepkgs "$install_file" >/dev/null
             else
-                rpm --upgrade --replacepkgs "$install_file" >/dev/null
+                rpm --nocontexts --upgrade --replacepkgs "$install_file" >/dev/null
             fi
             ;;
         pkg.tar.zst) pacman --upgrade --noconfirm "$install_file" >/dev/null ;;

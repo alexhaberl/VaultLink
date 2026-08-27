@@ -404,7 +404,8 @@ if ! grep -F -x -q 'github_origin=https://github.com' "$updater" \
     report "the updater must remain package-only, repository-bound, doubly signed, offline, and recoverable"
 fi
 if ! grep -F -q 'deb) dpkg --install' "$updater" \
-    || ! grep -F -q 'rpm --upgrade' "$updater" \
+    || ! grep -F -q 'rpm --nocontexts --upgrade' "$updater" \
+    || grep -E -q 'rpm --(test |upgrade )' "$updater" \
     || ! grep -F -q 'pkg.tar.zst) pacman --upgrade' "$updater" \
     || ! grep -F -q 'auto_install=false' deploy/vaultlink-update.conf.example \
     || ! grep -F -x -q 'ConditionPathExists=/usr/share/vaultlink/install-method.env' deploy/vaultlink-update.service; then
@@ -1237,6 +1238,7 @@ if ! grep -F -q 'runtime_status=$?' "$vm_runtime_smoke" \
     || ! grep -F -q 'tail -n 200 "$evidence/serial.log" >&2 || true' "$vm_harness" \
     || ! grep -F -q 'exit "$guest_smoke_status"' "$vm_harness" \
     || ! grep -F -q 'unit_credential_probe=/usr/local/sbin/vaultlink-update-credential-probe' "$vm_guest_smoke" \
+    || ! grep -F -q 'unit_package_probe=/usr/local/sbin/vaultlink-update-package-probe' "$vm_guest_smoke" \
     || ! grep -F -q '[ "$cap_inheritable" = 00000000000000cf ]' "$vm_guest_smoke" \
     || ! grep -F -q '[ "$cap_permitted" = 0000000000000000 ]' "$vm_guest_smoke" \
     || ! grep -F -q '[ "$cap_effective" = 0000000000000000 ]' "$vm_guest_smoke" \
@@ -1244,6 +1246,13 @@ if ! grep -F -q 'runtime_status=$?' "$vm_runtime_smoke" \
     || ! grep -F -q '[ "$cap_ambient" = 0000000000000000 ]' "$vm_guest_smoke" \
     || ! grep -F -q '[ "$no_new_privileges" = 1 ]' "$vm_guest_smoke" \
     || ! grep -F -q -- '-p NoNewPrivileges -p CapabilityBoundingSet -p AmbientCapabilities' "$vm_guest_smoke" \
+    || ! grep -F -q "'NoNewPrivileges=yes'" "$vm_guest_smoke" \
+    || ! grep -F -q 'launcher_no_new_privileges=\$(awk' "$vm_guest_smoke" \
+    || ! grep -F -q 'ExecStart=$unit_package_probe' "$vm_guest_smoke" \
+    || grep -F -q 'ExecStart=$unit_probe_command' "$vm_guest_smoke" \
+    || ! grep -F -q '/usr/bin/rpm --nocontexts --upgrade --replacepkgs' "$vm_guest_smoke" \
+    || ! grep -F -q 'unconfined_service_t' "$vm_guest_smoke" \
+    || ! grep -F -q 'update-unit-package-manager-launcher.env' "$vm_guest_smoke" \
     || ! grep -F -q "'AmbientCapabilities=cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_setgid cap_setuid'" "$vm_guest_smoke" \
     || ! grep -F -q "'SecureBits=0'" "$vm_guest_smoke" \
     || ! grep -F -q 'update-unit-credential.env' "$vm_guest_smoke" \
@@ -1870,12 +1879,15 @@ if ! grep -F -q '[ -f /.dockerenv ]' "$real_package_smoke" \
     || ! grep -F -q 'minisign -G -W' "$real_package_smoke" \
     || ! grep -F -q 'exec "$real_manager" "$@"' "$real_package_smoke" \
     || ! grep -F -q 'real_manager_directory/$native_manager' "$real_package_smoke" \
+    || ! grep -F -q 'rpm:--upgrade) mutation=1' "$real_package_smoke" \
+    || [ "$(grep -F -c '^MUTATE rpm --nocontexts --upgrade ' \
+        "$real_package_smoke" || true)" -ne 2 ] \
     || ! grep -F -q 'sh "$repo_root/deploy/vaultlink-update.sh" install' \
         "$real_package_smoke" \
     || ! grep -F -q 'missing_dependency_zero_mutation=ok' "$real_package_smoke" \
     || ! grep -F -q 'success_parity=ok' "$real_package_smoke" \
     || ! grep -F -q 'activation_old_package_reinstall=ok' "$real_package_smoke"; then
-    report "real package update smoke must stay Docker-only and delegate to the production updater and native package manager"
+    report "real package update smoke must stay Docker-only, audit position-independent RPM upgrades with --nocontexts, and delegate to the production updater and native package manager"
 fi
 if ! grep -F -q "cron: '23 4 * * 1'" .github/workflows/arch-compatibility.yml \
     || ! grep -F -q 'workflow_dispatch:' .github/workflows/arch-compatibility.yml \

@@ -452,6 +452,15 @@ that boundary on every target. All unrelated namespace, device, kernel,
 process, and network hardening remains enabled, and the oneshot is bounded by
 `TimeoutStartSec=90min` and `TimeoutStopSec=30min`.
 
+Fedora updater transactions use RPM's `--nocontexts` option because RPM's
+scriptlet-specific SELinux domain transition is incompatible with the retained
+`NoNewPrivileges=true` boundary. SELinux itself remains `Enforcing`; this
+narrow transaction mode is entered only after the signed RPM, exact reviewed
+scriptlets, metadata, payload allowlist, and dependencies have passed the
+updater's fail-closed validation. Initial manual RPM installation continues to
+use normal SELinux context handling, and the booted Fedora gate verifies the
+actual update-unit path with no VaultLink-related AVC denial.
+
 ### Provision a CIFS mount safely
 
 First create `.vaultlink-internal/{uploads,tombstones}` on the SMB server with the ACLs described above. Then provision the mount as root; the password is read interactively from the terminal and is never a CLI argument:
