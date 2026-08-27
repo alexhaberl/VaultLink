@@ -1119,11 +1119,13 @@ if [ "$(grep -F -c 'LOAD_P95_POLICY=diagnostic' "$vm_runtime_smoke" || true)" -n
     || ! grep -F -q 'if [ "$acceleration" = tcg ]; then' "$vm_runtime_smoke" \
     || ! grep -F -q 'load_connect_timeout_seconds=60' "$vm_runtime_smoke" \
     || ! grep -F -q 'load_metadata_max_time_seconds=300' "$vm_runtime_smoke" \
-    || ! grep -F -q 'load_transfer_max_time_seconds=1800' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_transfer_max_time_seconds=3600' "$vm_runtime_smoke" \
     || ! grep -F -q 'load_admission_ready_timeout_seconds=600' "$vm_runtime_smoke" \
     || ! grep -F -q 'load_admission_holder_max_time_seconds=1800' "$vm_runtime_smoke" \
     || ! grep -F -q 'load_admission_probe_max_time_seconds=120' "$vm_runtime_smoke" \
-    || ! grep -F -q 'load_profile_ready_timeout_seconds=600' "$vm_runtime_smoke"; then
+    || ! grep -F -q 'load_profile_ready_timeout_seconds=600' "$vm_runtime_smoke" \
+    || ! grep -F -q 'bounded 60-minute request deadline' \
+        docs/GITHUB-HOSTED-RUNNERS.md; then
     report "only the QEMU runtime gate may use diagnostic p95, with bounded TCG-only timeout allowances"
 fi
 if ! grep -F -q 'evidence_value "$p95_evidence" metadata_p95_policy)" = diagnostic' "$vm_runtime_smoke" \
@@ -1248,6 +1250,9 @@ if ! grep -F -q 'runtime_status=$?' "$vm_runtime_smoke" \
     || ! grep -F -q -- '-p NoNewPrivileges -p CapabilityBoundingSet -p AmbientCapabilities' "$vm_guest_smoke" \
     || ! grep -F -q "'NoNewPrivileges=yes'" "$vm_guest_smoke" \
     || ! grep -F -q 'launcher_no_new_privileges=\$(awk' "$vm_guest_smoke" \
+    || ! grep -F -q 'if launcher_context_value=\$(tr -d' "$vm_guest_smoke" \
+    || ! grep -F -q '</proc/self/attr/current 2>/dev/null); then' "$vm_guest_smoke" \
+    || ! grep -F -q '|| launcher_context=\$launcher_context_value' "$vm_guest_smoke" \
     || ! grep -F -q 'ExecStart=$unit_package_probe' "$vm_guest_smoke" \
     || grep -F -q 'ExecStart=$unit_probe_command' "$vm_guest_smoke" \
     || ! grep -F -q '/usr/bin/rpm --nocontexts --upgrade --replacepkgs' "$vm_guest_smoke" \

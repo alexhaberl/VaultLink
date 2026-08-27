@@ -325,7 +325,11 @@ cat >"$unit_package_probe" <<EOF
 set -eu
 launcher_context=unavailable
 if [ -r /proc/self/attr/current ]; then
-    launcher_context=\$(tr -d '\\000' </proc/self/attr/current)
+    if launcher_context_value=\$(tr -d '\\000' \
+        </proc/self/attr/current 2>/dev/null); then
+        [ -z "\$launcher_context_value" ] \
+            || launcher_context=\$launcher_context_value
+    fi
 fi
 launcher_no_new_privileges=\$(awk '/^NoNewPrivs:/ { print \$2 }' /proc/self/status)
 [ "\$launcher_no_new_privileges" = 1 ]
