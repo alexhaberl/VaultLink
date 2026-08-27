@@ -442,6 +442,29 @@ grep -F -x -q "acceleration=$acceleration" "$evidence/runtime/runtime.env"
 grep -F -x -q 'upgrade=ok' "$evidence/runtime/runtime.env"
 grep -F -x -q 'migration=ok' "$evidence/runtime/runtime.env"
 grep -F -x -q 'rollback=ok' "$evidence/runtime/runtime.env"
+runtime_guard_wait=$evidence/runtime/runtime-guard-wait.env
+[ "$(evidence_value "$runtime_guard_wait" timeout_seconds)" = 240 ]
+[ "$(evidence_value "$runtime_guard_wait" settled)" = true ]
+runtime_guard_elapsed=$(evidence_value "$runtime_guard_wait" elapsed_seconds)
+runtime_guard_polls=$(evidence_value "$runtime_guard_wait" polls)
+case "$runtime_guard_elapsed" in ''|*[!0-9]*) exit 77 ;; esac
+case "$runtime_guard_polls" in ''|*[!0-9]*|0) exit 77 ;; esac
+[ "$runtime_guard_elapsed" -le 240 ]
+grep -E -q '^ActiveState=(failed|inactive)$' \
+    "$evidence/runtime/runtime-guard-start-limit.env"
+grep -E -q '^ActiveState=(failed|inactive)$' \
+    "$evidence/runtime/runtime-guard-stability.env"
+if [ "$package_format" = deb ]; then
+    package_quiescence=$evidence/runtime/package-manager-quiescence.env
+    [ "$(evidence_value "$package_quiescence" policy)" \
+        = runtime-mask-and-drain ]
+    [ "$(evidence_value "$package_quiescence" package_database)" \
+        = available ]
+    [ "$(evidence_value "$package_quiescence" lock_files_removed)" = false ]
+    quiescence_wait=$(evidence_value "$package_quiescence" wait_seconds)
+    case "$quiescence_wait" in ''|*[!0-9]*) exit 77 ;; esac
+    [ "$quiescence_wait" -le 900 ]
+fi
 grep -F -x -q 'metadata_clients=100' "$evidence/runtime/load/result.env"
 grep -F -x -q 'metadata_requests=2000' "$evidence/runtime/load/result.env"
 grep -F -x -q 'range_streams=40' "$evidence/runtime/load/result.env"

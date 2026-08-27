@@ -270,6 +270,16 @@ namespace, device, kernel, process, and network hardening remains enabled.
 Booted distro-VM gates inspect that credential boundary and exercise the real
 unit and package-manager hooks for every target.
 
+The Debian and Ubuntu full-system guests isolate those package tests from
+unrelated boot-time maintenance by runtime-masking the automatic apt/dpkg
+timers and services only for the disposable guest boot. The timers are stopped;
+any already-running transaction service is allowed to drain, and `dpkg --audit` must then acquire and validate the
+database before VaultLink's package inventory or transaction begins. The gate
+never deletes lock files or kills their owners. Likewise, the deliberately
+divergent-runtime test waits within a fixed 240-second ceiling for systemd's
+three-attempt restart limit to reach a stable failed or inactive state instead
+of assuming a fixed emulator speed.
+
 ## Deterministic build and release assets
 
 Every target uses a digest-pinned, source-independent builder with a fixed Rust

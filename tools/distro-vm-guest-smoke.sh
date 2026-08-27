@@ -26,6 +26,7 @@ package=$package_copy
 arch_initial_installer=
 fedora_audit_marker=
 fedora_audit_start_line=
+package_manager_quiescence_evidence=
 
 # shellcheck disable=SC1091
 . /etc/os-release
@@ -78,6 +79,109 @@ if [ "$distribution" = arch ]; then
         | grep -F -x -q masked; then
         exit 70
     fi
+fi
+
+# Debian and Ubuntu guests may start their automatic apt/dpkg maintenance
+# after boot while this isolated full-system gate is already running. Prevent
+# new automatic jobs for this disposable boot, allow any in-flight job to
+# finish normally, and prove the package database is available before the
+# package inventory or first mutation. Never remove a package-manager lock or
+# terminate its owner: either would hide a real interrupted transaction.
+quiesce_deb_package_maintenance() {
+    automatic_timers='apt-daily.timer apt-daily-upgrade.timer dpkg-db-backup.timer update-notifier-download.timer'
+    automatic_services='apt-daily.service apt-daily-upgrade.service dpkg-db-backup.service update-notifier-download.service'
+    automatic_units="$automatic_timers $automatic_services"
+    package_manager_quiescence_evidence=/var/tmp/vaultlink-package-manager-quiescence.env
+    mask_stdout=/var/tmp/vaultlink-package-manager-mask.stdout
+    mask_stderr=/var/tmp/vaultlink-package-manager-mask.stderr
+    audit_stdout=/var/tmp/vaultlink-dpkg-audit.stdout
+    audit_stderr=/var/tmp/vaultlink-dpkg-audit.stderr
+    : >"$mask_stdout"
+    : >"$mask_stderr"
+    masked_units=
+    for unit in $automatic_units; do
+        load_state=$(systemctl show "$unit" -p LoadState --value 2>/dev/null || true)
+        [ "$load_state" != not-found ] || continue
+        if ! timeout 60 systemctl mask --runtime "$unit" \
+            >>"$mask_stdout" 2>>"$mask_stderr"; then
+            cat "$mask_stderr" >&2 || true
+            exit 70
+        fi
+        masked_units="${masked_units}${masked_units:+ }$unit"
+    done
+    [ -n "$masked_units" ] || exit 70
+    for timer in $automatic_timers; do
+        case " $masked_units " in
+            *" $timer "*)
+                if ! timeout 60 systemctl stop "$timer" \
+                    >>"$mask_stdout" 2>>"$mask_stderr"; then
+                    timer_state=$(systemctl is-active "$timer" 2>/dev/null || true)
+                    case "$timer_state" in
+                        inactive | failed) ;;
+                        *) cat "$mask_stderr" >&2 || true; exit 70 ;;
+                    esac
+                fi
+                timer_state=$(systemctl is-active "$timer" 2>/dev/null || true)
+                case "$timer_state" in inactive | failed) ;; *) exit 70 ;; esac
+                ;;
+        esac
+    done
+
+    quiescence_started=$(date +%s)
+    quiescence_deadline=$((quiescence_started + 900))
+    quiescence_attempts=0
+    while :; do
+        quiescence_attempts=$((quiescence_attempts + 1))
+        busy_units=
+        for unit in $automatic_services; do
+            case " $masked_units " in *" $unit "*) ;; *) continue ;; esac
+            unit_state=$(systemctl is-active "$unit" 2>/dev/null || true)
+            case "$unit_state" in
+                active | activating | deactivating | reloading)
+                    busy_units="${busy_units}${busy_units:+ }$unit"
+                    ;;
+            esac
+        done
+        audit_status=0
+        timeout 30 dpkg --audit >"$audit_stdout" 2>"$audit_stderr" \
+            || audit_status=$?
+        if [ -z "$busy_units" ] && [ "$audit_status" -eq 0 ] \
+            && [ ! -s "$audit_stdout" ] && [ ! -s "$audit_stderr" ]; then
+            break
+        fi
+        if [ "$(date +%s)" -ge "$quiescence_deadline" ]; then
+            quiescence_wait_seconds=$(( $(date +%s) - quiescence_started ))
+            printf 'policy=runtime-mask-and-drain\nmasked_units=%s\nwait_attempts=%s\nwait_seconds=%s\npackage_database=unavailable\nlock_files_removed=false\n' \
+                "$masked_units" "$quiescence_attempts" \
+                "$quiescence_wait_seconds" \
+                >"$package_manager_quiescence_evidence"
+            install -d -m 0755 /tmp/vaultlink-vm-evidence
+            install -o root -g root -m 0644 \
+                "$package_manager_quiescence_evidence" \
+                /tmp/vaultlink-vm-evidence/package-manager-quiescence.env
+            cat "$audit_stderr" >&2 || true
+            printf 'automatic package maintenance did not quiesce: %s\n' \
+                "$busy_units" >&2
+            exit 75
+        fi
+        sleep 2
+    done
+    quiescence_wait_seconds=$(( $(date +%s) - quiescence_started ))
+    printf 'policy=runtime-mask-and-drain\nmasked_units=%s\nwait_attempts=%s\nwait_seconds=%s\npackage_database=available\nlock_files_removed=false\n' \
+        "$masked_units" "$quiescence_attempts" "$quiescence_wait_seconds" \
+        >"$package_manager_quiescence_evidence"
+    install -d -m 0755 /tmp/vaultlink-vm-evidence
+    install -o root -g root -m 0644 \
+        "$package_manager_quiescence_evidence" \
+        /tmp/vaultlink-vm-evidence/package-manager-quiescence.env
+    install -o root -g root -m 0644 "$audit_stdout" \
+        /tmp/vaultlink-vm-evidence/dpkg-audit.stdout
+    install -o root -g root -m 0644 "$audit_stderr" \
+        /tmp/vaultlink-vm-evidence/dpkg-audit.stderr
+}
+
+if [ "$package_format" = deb ]; then
+    quiesce_deb_package_maintenance
 fi
 
 # Prove that the immutable guest still has the complete package closure that
@@ -207,8 +311,20 @@ verify_install
 upgrade_package
 verify_install
 
+runtime_smoke_status=0
 sh /tmp/distro-vm-runtime-smoke.sh \
-    "$target_id" /tmp/vaultlink-vm-evidence "$acceleration"
+    "$target_id" /tmp/vaultlink-vm-evidence "$acceleration" \
+    || runtime_smoke_status=$?
+if [ -n "$package_manager_quiescence_evidence" ]; then
+    install -o root -g root -m 0644 \
+        "$package_manager_quiescence_evidence" \
+        /tmp/vaultlink-vm-evidence/package-manager-quiescence.env
+    install -o root -g root -m 0644 /var/tmp/vaultlink-dpkg-audit.stdout \
+        /tmp/vaultlink-vm-evidence/dpkg-audit.stdout
+    install -o root -g root -m 0644 /var/tmp/vaultlink-dpkg-audit.stderr \
+        /tmp/vaultlink-vm-evidence/dpkg-audit.stderr
+fi
+[ "$runtime_smoke_status" -eq 0 ] || exit "$runtime_smoke_status"
 
 # Exercise the real systemd sandbox and first prove that its bounded ambient
 # transaction capabilities do not survive the runuser boundary. The candidate
