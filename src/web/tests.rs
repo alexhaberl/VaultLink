@@ -6976,12 +6976,16 @@ async fn public_upload_uses_the_policy_that_wins_before_finalization() {
             &UploadConflictStrategy::OverwriteAllowed,
         )
         .unwrap();
+    let hook = PublicUploadTestHook::blocking("policy-first", PublicUploadTestPhase::Finalizer);
+    let hook_guard = install_public_upload_test_hook(hook.clone());
     let app = router(state.clone());
     let (upload, sender) =
         controlled_multipart_request("/v/policy-first/upload", "existing.txt", b"new", true);
     let upload_app = app.clone();
     let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
     wait_for_upload_fragment(root.path()).await;
+    finish_controlled_multipart(sender).await;
+    hook.wait_until_entered().await;
 
     let policy = app
         .clone()
@@ -6994,7 +6998,7 @@ async fn public_upload_uses_the_policy_that_wins_before_finalization() {
         .await
         .unwrap();
     assert_eq!(policy.status(), StatusCode::OK);
-    finish_controlled_multipart(sender).await;
+    hook.release();
 
     let upload = upload.await.unwrap();
     assert_eq!(upload.status(), StatusCode::CONFLICT);
@@ -7010,6 +7014,7 @@ async fn public_upload_uses_the_policy_that_wins_before_finalization() {
     );
     assert_eq!(share.uploaded_bytes, 0);
     assert_eq!(share.uploaded_files, 0);
+    drop(hook_guard);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7126,12 +7131,17 @@ async fn public_upload_uses_the_html_policy_that_wins_before_finalization() {
             &UploadConflictStrategy::OverwriteAllowed,
         )
         .unwrap();
+    let hook =
+        PublicUploadTestHook::blocking("html-policy-first", PublicUploadTestPhase::Finalizer);
+    let hook_guard = install_public_upload_test_hook(hook.clone());
     let app = router(state.clone());
     let (upload, sender) =
         controlled_multipart_request("/v/html-policy-first/upload", "existing.txt", b"new", true);
     let upload_app = app.clone();
     let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
     wait_for_upload_fragment(root.path()).await;
+    finish_controlled_multipart(sender).await;
+    hook.wait_until_entered().await;
 
     let policy = app
         .clone()
@@ -7144,7 +7154,7 @@ async fn public_upload_uses_the_html_policy_that_wins_before_finalization() {
         .await
         .unwrap();
     assert_eq!(policy.status(), StatusCode::SEE_OTHER);
-    finish_controlled_multipart(sender).await;
+    hook.release();
 
     let upload = upload.await.unwrap();
     assert_eq!(upload.status(), StatusCode::CONFLICT);
@@ -7164,6 +7174,7 @@ async fn public_upload_uses_the_html_policy_that_wins_before_finalization() {
     );
     assert_eq!(share.uploaded_bytes, 0);
     assert_eq!(share.uploaded_files, 0);
+    drop(hook_guard);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
