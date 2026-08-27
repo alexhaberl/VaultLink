@@ -118,6 +118,7 @@ vm_provisioner=tools/provision-distro-vm-image.sh
 package_workflow=.github/workflows/packages.yml
 package_offline_smoke=tools/package-offline-smoke.sh
 package_native_load_smoke=tools/package-native-load-smoke.sh
+direct_process_identity=tools/check-direct-process-identity.sh
 real_package_smoke=tools/real-package-update-smoke.sh
 vm_harness=tools/run-distro-vm-test.sh
 vm_guest_smoke=tools/distro-vm-guest-smoke.sh
@@ -816,10 +817,12 @@ if ! grep -F -q 'LOAD_P95_POLICY=strict' tools/soak-monitor.sh \
     || ! grep -F -q 'LOAD_PROFILE_READY_TIMEOUT_SECONDS=10' tools/soak-monitor.sh \
     || ! grep -F -q "VAULTLINK_PROCESS_PID='' \\" tools/soak-monitor.sh \
     || ! grep -F -q "VAULTLINK_PROCESS_UID='' \\" tools/soak-monitor.sh \
+    || ! grep -F -q "VAULTLINK_PROCESS_GID='' \\" tools/soak-monitor.sh \
     || ! grep -F -q "VAULTLINK_EXPECTED_BINARY_PATH='' \\" tools/soak-monitor.sh \
     || ! grep -F -q "VAULTLINK_EXPECTED_BINARY_SHA256='' \\" tools/soak-monitor.sh \
     || [ "$(grep -F -c 'VAULTLINK_PROCESS_PID=' tools/soak-monitor.sh || true)" -ne 1 ] \
     || [ "$(grep -F -c 'VAULTLINK_PROCESS_UID=' tools/soak-monitor.sh || true)" -ne 1 ] \
+    || [ "$(grep -F -c 'VAULTLINK_PROCESS_GID=' tools/soak-monitor.sh || true)" -ne 1 ] \
     || [ "$(grep -F -c 'VAULTLINK_EXPECTED_BINARY_PATH=' tools/soak-monitor.sh || true)" -ne 1 ] \
     || [ "$(grep -F -c 'VAULTLINK_EXPECTED_BINARY_SHA256=' tools/soak-monitor.sh || true)" -ne 1 ] \
     || ! grep -F -q 'supervision_mode=systemd' tools/check-soak-evidence.sh \
@@ -858,6 +861,7 @@ if grep -R -F -q \
 fi
 for numeric_script in \
     tools/load-test.sh \
+    tools/check-direct-process-identity.sh \
     tools/soak-monitor.sh \
     tools/check-soak-evidence.sh \
     tools/collect-soak-evidence.sh \
@@ -1127,6 +1131,7 @@ if ! grep -F -q 'evidence_value "$p95_evidence" metadata_p95_policy)" = diagnost
     || ! grep -F -q 'evidence_value "$p95_evidence" supervision_mode)" = systemd' "$vm_runtime_smoke" \
     || ! grep -F -q "VAULTLINK_PROCESS_PID='' \\" "$vm_runtime_smoke" \
     || ! grep -F -q "VAULTLINK_PROCESS_UID='' \\" "$vm_runtime_smoke" \
+    || ! grep -F -q "VAULTLINK_PROCESS_GID='' \\" "$vm_runtime_smoke" \
     || ! grep -F -q "VAULTLINK_EXPECTED_BINARY_PATH='' \\" "$vm_runtime_smoke" \
     || ! grep -F -q "VAULTLINK_EXPECTED_BINARY_SHA256='' \\" "$vm_runtime_smoke" \
     || ! grep -F -q 'metadata_p95_policy=diagnostic' "$vm_harness" \
@@ -1513,10 +1518,9 @@ if ! grep -F -q '[ "$evidence" = "/work/offline-smoke/$target_id/native-load" ]'
     || ! grep -F -q 'sha256sum -c vaultlink.sha256' "$package_native_load_smoke" \
     || ! grep -F -q 'setpriv --reuid="$vaultlink_uid" --regid="$vaultlink_gid" --init-groups' \
         "$package_native_load_smoke" \
-    || ! grep -F -q '[ "$(readlink "/proc/$service_pid/exe")" = "$live_binary" ]' \
-        "$package_native_load_smoke" \
     || ! grep -F -q 'VAULTLINK_PROCESS_PID="$service_pid"' "$package_native_load_smoke" \
     || ! grep -F -q 'VAULTLINK_PROCESS_UID="$vaultlink_uid"' "$package_native_load_smoke" \
+    || ! grep -F -q 'VAULTLINK_PROCESS_GID="$vaultlink_gid"' "$package_native_load_smoke" \
     || ! grep -F -q 'VAULTLINK_EXPECTED_BINARY_PATH="$live_binary"' "$package_native_load_smoke" \
     || ! grep -F -q 'VAULTLINK_EXPECTED_BINARY_SHA256="$live_sha256"' "$package_native_load_smoke" \
     || ! grep -F -q 'LOAD_P95_POLICY=strict' "$package_native_load_smoke" \
@@ -1528,6 +1532,36 @@ if ! grep -F -q '[ "$evidence" = "/work/offline-smoke/$target_id/native-load" ]'
     || ! grep -F -q 'LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS=30' "$package_native_load_smoke" \
     || ! grep -F -q 'LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS=5' "$package_native_load_smoke"; then
     report "native performance must use the exact installed package payload, package database, unprivileged PID, and normal strict timeouts"
+fi
+if [ ! -f "$direct_process_identity" ] || [ -L "$direct_process_identity" ] \
+    || ! grep -F -q 'setpriv --reuid="$direct_process_uid" --regid="$direct_process_gid"' \
+        "$load_test" \
+    || ! grep -F -q -- '--clear-groups --no-new-privs -- sh "$direct_identity_helper"' \
+        "$load_test" \
+    || ! grep -F -q 'VAULTLINK_PROCESS_GID' "$load_test" \
+    || ! grep -F -q 'setpriv --reuid="$vaultlink_uid" --regid="$vaultlink_gid"' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q -- '--clear-groups --no-new-privs -- sh "$process_identity_helper"' \
+        "$package_native_load_smoke" \
+    || grep -F -q 'readlink "/proc/$service_pid/exe"' "$package_native_load_smoke" \
+    || grep -F -q 'sha256sum "/proc/$service_pid/exe"' "$package_native_load_smoke" \
+    || ! grep -F -q '[ "$(id -u)" = "$expected_uid" ]' "$direct_process_identity" \
+    || ! grep -F -q '[ "$(id -g)" = "$expected_gid" ]' "$direct_process_identity" \
+    || ! grep -F -q 'target process UID/GID does not match' "$direct_process_identity" \
+    || ! grep -F -q 'identity helper retained supplementary groups' "$direct_process_identity" \
+    || ! grep -F -q 'identity helper retained privileges' "$direct_process_identity" \
+    || ! grep -F -q '$2 != "0000000000000000"' "$direct_process_identity" \
+    || ! grep -F -q '$2 != "1"' "$direct_process_identity" \
+    || ! grep -F -q 'starttime_before=$(process_starttime)' "$direct_process_identity" \
+    || ! grep -F -q 'observed_path=$(readlink "/proc/$pid/exe")' "$direct_process_identity" \
+    || ! grep -F -q 'observed_sha256=$(sha256sum "/proc/$pid/exe"' "$direct_process_identity" \
+    || ! grep -F -q 'starttime_after=$(process_starttime)' "$direct_process_identity" \
+    || ! grep -F -q '[ "$starttime_after" = "$starttime_before" ]' "$direct_process_identity"; then
+    report "direct-PID package verification must use the fixed fail-closed same-UID/GID helper with no supplementary groups"
+fi
+if grep -E -q -- '--privileged|--cap-add([=[:space:]]|$)|--pid([=[:space:]]+)host|/proc:/proc|source=/proc([,[:space:]]|$)' \
+        "$package_workflow"; then
+    report "the package gate must not gain privilege, capabilities, host PID access, or a host proc bind"
 fi
 native_failure_service_line=$(grep -n -F \
     'write_redacted_tail "$runtime_base/service.log"' \
@@ -1623,8 +1657,10 @@ if ! grep -F -q 'value < 2.000' "$package_native_load_smoke" \
         "$package_native_load_smoke" \
     || ! grep -F -q '[ "$(cat "$runtime_base/readiness.json")" = "$expected_health" ]' \
         "$package_native_load_smoke" \
-    || ! grep -F -q 'package service restarted during native load' "$package_native_load_smoke" \
-    || ! grep -F -q 'running package payload changed during native load' "$package_native_load_smoke" \
+    || ! grep -F -q 'service PID does not execute the exact active package payload' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'package service identity or payload changed during native load' \
+        "$package_native_load_smoke" \
     || ! grep -F -q 'load_profile=100_metadata_40_ranges_10_uploads' "$package_native_load_smoke" \
     || ! grep -F -q 'package_database_parity=ok' "$package_native_load_smoke" \
     || ! grep -F -q 'payload_integrity=ok' "$package_native_load_smoke" \

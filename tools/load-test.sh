@@ -103,6 +103,7 @@ esac
 supervision_mode=systemd
 pid=
 direct_process_uid=
+direct_process_gid=
 direct_binary_path=
 direct_binary_sha256=
 direct_process_starttime=
@@ -110,14 +111,18 @@ if [ -n "${VAULTLINK_PROCESS_PID:-}" ]; then
     supervision_mode=direct_pid
     pid=$VAULTLINK_PROCESS_PID
     : "${VAULTLINK_PROCESS_UID:?direct PID mode requires VAULTLINK_PROCESS_UID}"
+    : "${VAULTLINK_PROCESS_GID:?direct PID mode requires VAULTLINK_PROCESS_GID}"
     : "${VAULTLINK_EXPECTED_BINARY_PATH:?direct PID mode requires VAULTLINK_EXPECTED_BINARY_PATH}"
     : "${VAULTLINK_EXPECTED_BINARY_SHA256:?direct PID mode requires VAULTLINK_EXPECTED_BINARY_SHA256}"
     direct_process_uid=$VAULTLINK_PROCESS_UID
+    direct_process_gid=$VAULTLINK_PROCESS_GID
     direct_binary_path=$VAULTLINK_EXPECTED_BINARY_PATH
     direct_binary_sha256=$VAULTLINK_EXPECTED_BINARY_SHA256
     case "$pid" in *[!0-9]*|'') echo "direct PID must be a positive decimal integer" >&2; exit 64 ;; esac
     case "$direct_process_uid" in *[!0-9]*|'') echo "direct UID must be a positive decimal integer" >&2; exit 64 ;; esac
-    if [ "$pid" -le 1 ] || [ "$direct_process_uid" -le 0 ]; then
+    case "$direct_process_gid" in *[!0-9]*|'') echo "direct GID must be a positive decimal integer" >&2; exit 64 ;; esac
+    if [ "$pid" -le 1 ] || [ "$direct_process_uid" -le 0 ] \
+        || [ "$direct_process_gid" -le 0 ]; then
         echo "direct PID mode received an invalid process identity" >&2
         exit 64
     fi
@@ -140,19 +145,38 @@ if [ -n "${VAULTLINK_PROCESS_PID:-}" ]; then
         echo "direct PID mode expected binary is unsafe" >&2
         exit 66
     fi
-elif [ -n "${VAULTLINK_PROCESS_UID:-}${VAULTLINK_EXPECTED_BINARY_PATH:-}${VAULTLINK_EXPECTED_BINARY_SHA256:-}" ]; then
+    direct_identity_helper=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/check-direct-process-identity.sh
+    if [ ! -f "$direct_identity_helper" ] || [ -L "$direct_identity_helper" ] \
+        || [ ! -r "$direct_identity_helper" ]; then
+        echo "direct PID identity helper is unavailable or unsafe" >&2
+        exit 66
+    fi
+    command -v setpriv >/dev/null \
+        || { echo "direct PID mode requires setpriv" >&2; exit 69; }
+elif [ -n "${VAULTLINK_PROCESS_UID:-}${VAULTLINK_PROCESS_GID:-}${VAULTLINK_EXPECTED_BINARY_PATH:-}${VAULTLINK_EXPECTED_BINARY_SHA256:-}" ]; then
     echo "direct PID verification inputs require VAULTLINK_PROCESS_PID" >&2
     exit 64
 fi
 
+direct_pid_identity() {
+    expected_starttime=$1
+    setpriv --reuid="$direct_process_uid" --regid="$direct_process_gid" \
+        --clear-groups --no-new-privs -- sh "$direct_identity_helper" \
+        "$pid" "$direct_process_uid" "$direct_process_gid" \
+        "$direct_binary_path" "$direct_binary_sha256" "$expected_starttime"
+}
+
 direct_pid_is_live() {
     kill -0 "$pid" 2>/dev/null || return 1
     [ -r "/proc/$pid/status" ] || return 1
-    [ "$(awk '/^Uid:/ { print $2; exit }' "/proc/$pid/status")" = \
-        "$direct_process_uid" ] || return 1
-    [ "$(readlink "/proc/$pid/exe")" = "$direct_binary_path" ] || return 1
-    observed_starttime=$(sed 's/^[^)]*) //' "/proc/$pid/stat" \
-        | awk '{ print $20; exit }')
+    awk -v expected_uid="$direct_process_uid" \
+        -v expected_gid="$direct_process_gid" '
+        /^Uid:/ { uid_rows++; if ($2 != expected_uid) invalid = 1 }
+        /^Gid:/ { gid_rows++; if ($2 != expected_gid) invalid = 1 }
+        END { exit !(uid_rows == 1 && gid_rows == 1 && !invalid) }
+    ' "/proc/$pid/status" || return 1
+    observed_starttime=$(direct_pid_identity "$direct_process_starttime") \
+        || return 1
     case "$observed_starttime" in *[!0-9]*|'') return 1 ;; esac
     if [ -n "$direct_process_starttime" ]; then
         [ "$observed_starttime" = "$direct_process_starttime" ] || return 1
@@ -173,8 +197,10 @@ load_current_pid() {
 }
 
 if [ "$supervision_mode" = direct_pid ]; then
-    direct_process_starttime=$(sed 's/^[^)]*) //' "/proc/$pid/stat" \
-        | awk '{ print $20; exit }')
+    direct_process_starttime=$(direct_pid_identity '') || {
+        echo "direct PID identity is unavailable" >&2
+        exit 69
+    }
     case "$direct_process_starttime" in
         *[!0-9]*|'') echo "direct PID start time is unavailable" >&2; exit 69 ;;
     esac
@@ -183,9 +209,7 @@ if [ "$supervision_mode" = direct_pid ]; then
         exit 69
     }
     if [ "$(sha256sum "$direct_binary_path" | awk '{print $1}')" != \
-        "$direct_binary_sha256" ] \
-        || [ "$(sha256sum "/proc/$pid/exe" | awk '{print $1}')" != \
-            "$direct_binary_sha256" ]; then
+        "$direct_binary_sha256" ]; then
         echo "direct PID mode binary integrity check failed" >&2
         exit 69
     fi
@@ -379,11 +403,12 @@ load_snapshot() {
         [ "$process_starttime" = "$direct_process_starttime" ] || return 1
     fi
     rss_kib=$(awk '/VmRSS:/ { print $2 }' "/proc/$current_pid/status")
-    binary_sha256=$(sha256sum "/proc/$current_pid/exe" | awk '{print $1}')
     if [ "$supervision_mode" = direct_pid ]; then
-        [ "$binary_sha256" = "$direct_binary_sha256" ] || return 1
+        binary_sha256=$direct_binary_sha256
         [ "$(sha256sum "$direct_binary_path" | awk '{print $1}')" = \
             "$direct_binary_sha256" ] || return 1
+    else
+        binary_sha256=$(sha256sum "/proc/$current_pid/exe" | awk '{print $1}')
     fi
     health_body="$work/snapshot-health.json"
     curl --fail --silent --show-error \

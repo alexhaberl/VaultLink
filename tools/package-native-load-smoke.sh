@@ -52,6 +52,11 @@ done
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 [ "$repo_root" = /work ] || fail "native package gate must run from /work"
+process_identity_helper=$repo_root/tools/check-direct-process-identity.sh
+if [ ! -f "$process_identity_helper" ] || [ -L "$process_identity_helper" ] \
+    || [ ! -r "$process_identity_helper" ]; then
+    fail "direct process identity helper is unavailable or unsafe"
+fi
 cd "$repo_root"
 python3 tools/package-targets.py validate >/dev/null
 target_get() {
@@ -409,10 +414,20 @@ case "$vaultlink_gid" in *[!0-9]*|'') fail "unsafe service GID" ;; esac
 if [ "$vaultlink_uid" -le 0 ] || [ "$vaultlink_gid" -le 0 ]; then
     fail "service identity must be unprivileged"
 fi
+verify_service_identity() {
+    expected_starttime=$1
+    setpriv --reuid="$vaultlink_uid" --regid="$vaultlink_gid" \
+        --clear-groups --no-new-privs -- sh "$process_identity_helper" \
+        "$service_pid" "$vaultlink_uid" "$vaultlink_gid" "$live_binary" \
+        "$live_sha256" "$expected_starttime"
+}
 setpriv --reuid="$vaultlink_uid" --regid="$vaultlink_gid" --init-groups -- \
     "$live_binary" --config "$runtime_config" \
     >"$runtime_base/service.log" 2>&1 &
 service_pid=$!
+service_starttime=$(sed 's/^.*) //' "/proc/$service_pid/stat" \
+    | awk '{ print $20; exit }')
+case "$service_starttime" in *[!0-9]*|'') fail "service start time is unavailable" ;; esac
 for attempt in $(seq 1 120); do
     kill -0 "$service_pid" 2>/dev/null || fail "package service exited during readiness"
     if curl --fail --silent --show-error \
@@ -428,13 +443,8 @@ expected_health="{\"ok\":true,\"version\":\"$version\"}"
     || fail "package service readiness response is unexpected"
 install -m 0644 "$runtime_base/readiness.json" "$evidence/readiness.json"
 readiness_sha256=$(sha256sum "$evidence/readiness.json" | awk '{ print $1 }')
-[ "$(readlink "/proc/$service_pid/exe")" = "$live_binary" ] \
-    || fail "service PID does not execute the exact active package path"
-[ "$(sha256sum "/proc/$service_pid/exe" | awk '{ print $1 }')" = "$live_sha256" ] \
-    || fail "service PID does not execute the exact package payload"
-service_starttime=$(sed 's/^[^)]*) //' "/proc/$service_pid/stat" \
-    | awk '{ print $20; exit }')
-case "$service_starttime" in *[!0-9]*|'') fail "service start time is unavailable" ;; esac
+[ "$(verify_service_identity "$service_starttime")" = "$service_starttime" ] \
+    || fail "service PID does not execute the exact active package payload"
 
 native_stage=authenticated_load_setup
 cookie=$runtime_base/cookies.txt
@@ -511,6 +521,7 @@ VAULTLINK_DATABASE="$runtime_data/data.sqlite" \
 SOAK_EXPECTED_VERSION="$version" \
 VAULTLINK_PROCESS_PID="$service_pid" \
 VAULTLINK_PROCESS_UID="$vaultlink_uid" \
+VAULTLINK_PROCESS_GID="$vaultlink_gid" \
 VAULTLINK_EXPECTED_BINARY_PATH="$live_binary" \
 VAULTLINK_EXPECTED_BINARY_SHA256="$live_sha256" \
 LOAD_TEST_EVIDENCE_DIR="$evidence/load" \
@@ -662,10 +673,8 @@ awk -F, -v expected_hash="$upload_sha256" -v target="$target_id" '
 [ "$(sqlite3 "$runtime_data/data.sqlite" 'PRAGMA integrity_check;')" = ok ] \
     || fail "native load database integrity check failed"
 kill -0 "$service_pid" 2>/dev/null || fail "package service exited during native load"
-[ "$(sed 's/^[^)]*) //' "/proc/$service_pid/stat" | awk '{ print $20; exit }')" = \
-    "$service_starttime" ] || fail "package service restarted during native load"
-[ "$(sha256sum "/proc/$service_pid/exe" | awk '{ print $1 }')" = "$live_sha256" ] \
-    || fail "running package payload changed during native load"
+[ "$(verify_service_identity "$service_starttime")" = "$service_starttime" ] \
+    || fail "package service identity or payload changed during native load"
 if [ "$(sha256sum "$candidate" | awk '{ print $1 }')" != "$candidate_sha256" ] \
     || [ "$(sha256sum "$live_binary" | awk '{ print $1 }')" != "$live_sha256" ]; then
     fail "installed package payload changed during native load"

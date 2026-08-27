@@ -178,6 +178,7 @@ run_load_loop() {
             LOAD_PROFILE_READY_TIMEOUT_SECONDS=10 \
             VAULTLINK_PROCESS_PID='' \
             VAULTLINK_PROCESS_UID='' \
+            VAULTLINK_PROCESS_GID='' \
             VAULTLINK_EXPECTED_BINARY_PATH='' \
             VAULTLINK_EXPECTED_BINARY_SHA256='' \
             VAULTLINK_CONFIG="$config" \
