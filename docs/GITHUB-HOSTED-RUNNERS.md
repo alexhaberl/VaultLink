@@ -126,17 +126,24 @@ result. Docker restricts the builder container to logical CPUs 0-3. Inside that
 container, the VaultLink server is restricted to CPUs 0-1 and uses its own
 server-storage mount. The load generator is restricted to CPUs 2-3 and uses a
 dedicated hardened 4-GiB client tmpfs, so its payload, cookie, and response I/O
-does not contend with the server-storage path. The evidence bundle records the
-runner qualification, container and process CPU placement, memory and storage
-separation, workload counts, latency result, RSS result, and integrity result.
-A runner that cannot provide and prove this layout fails the native
-performance gate.
+does not contend with the server-storage path. Before the service starts, that
+empty server volume must pass a four-writer SQLite WAL probe consisting of 128
+`synchronous=FULL` commits alongside a concurrent reader. The fail-closed
+limits are writer p95 `<1 s`, writer maximum `<5 s`, reader p95 `<250 ms`,
+reader maximum `<2 s`, checkpoint `<5 s`, total runtime `<30 s`, no SQLite
+error, and `integrity_check=ok`. The probe state is removed before the runtime
+fixture. The evidence bundle records the runner and storage qualifications,
+container and process CPU placement, memory and storage separation, workload
+counts, latency result, RSS result, and integrity result. A runner that cannot
+provide and prove this layout fails the native performance gate.
 
 This qualification and placement make the harness's resource contract
 reproducible and limit in-job client/server contention; they are not a claim
 that arbitrary GitHub standard-runner timings are deterministic across
 machines or runs. The exact workload and strict threshold, rather than a
 general runner-performance guarantee, define the release gate.
+Qualification failures are reported as such and are not automatically rerun
+until a favorable runner produces a pass.
 
 Every one of the nine targets performs:
 

@@ -71,6 +71,51 @@ fn persistent_database_uses_four_connections_and_memory_uses_one() {
 }
 
 #[test]
+fn queued_transfer_writers_do_not_exhaust_persistent_read_pool() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("data.sqlite")).unwrap();
+    let write_guard = database.transfer_write_guard().unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(17));
+    let (started_sender, started_receiver) = std::sync::mpsc::channel();
+    let mut writers = Vec::new();
+
+    for index in 0..16 {
+        let writer_database = database.clone();
+        let writer_barrier = barrier.clone();
+        let writer_started = started_sender.clone();
+        writers.push(std::thread::spawn(move || {
+            writer_barrier.wait();
+            writer_started.send(()).unwrap();
+            writer_database
+                .cancel_upload_reservation(&format!("queued-writer-{index}"))
+                .unwrap()
+        }));
+    }
+    drop(started_sender);
+    barrier.wait();
+    for _ in 0..16 {
+        started_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+    }
+
+    // Give every writer enough time to reach admission. If connection checkout
+    // happened first, four blocked writers would consume the complete pool.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    for _ in 0..20 {
+        database.readiness_check().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let pool_state = database.0.pool.state();
+    assert_eq!(pool_state.connections, pool_state.idle_connections);
+
+    drop(write_guard);
+    for writer in writers {
+        assert!(!writer.join().unwrap());
+    }
+}
+
+#[test]
 fn required_audit_failure_rolls_back_admin_share_session_and_settings_mutations() {
     let db = Database::open(":memory:").unwrap();
     db.create_admin("admin", "old-hash", "secret").unwrap();

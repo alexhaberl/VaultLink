@@ -309,16 +309,25 @@ accepted, the job qualifies the public hosted runner for four available vCPUs
 and at least 8 GiB of host RAM, then restricts its Docker container to logical
 CPUs 0-3. The server is restricted to CPUs 0-1 and uses a separate server-
 storage mount; the load generator is restricted to CPUs 2-3 and uses a
-dedicated hardened 4-GiB client tmpfs. Evidence records the qualification,
-container and process CPU placement, memory and storage separation, exact
-workload counts, latency, RSS, and integrity results. A runner that cannot
-prove this resource layout fails the gate. The qualified native run is
+dedicated hardened 4-GiB client tmpfs. Before VaultLink starts, the otherwise
+empty server-storage volume must also pass a fail-closed SQLite WAL probe with
+four writers, 128 `synchronous=FULL` transactions, and a concurrent reader.
+The probe rejects SQLite errors or failed integrity, writer p95 at or above one
+second, writer maximum at or above five seconds, reader p95 at or above 250 ms,
+reader maximum at or above two seconds, a checkpoint at or above five seconds,
+or a total runtime at or above 30 seconds. Its evidence is retained separately
+from the application result and the probe directory is removed before the
+runtime fixture is created. Evidence records both qualifications, container
+and process CPU placement, memory and storage separation, exact workload
+counts, latency, RSS, and integrity results. A runner that cannot prove this
+resource and storage layout fails the gate. The qualified native run is
 authoritative for p95 strictly below two seconds and also fails on invalid
 response statuses, corruption, or exceeding the RSS ceiling. The harness's
 resource contract is reproducible, but it does not assert deterministic timing
-for arbitrary GitHub standard-runner executions. The managed arm64 GitHub
-runner supplies the same qualified evidence for arm64; private ARM hardware is
-not required.
+for arbitrary GitHub standard-runner executions. A failed qualification is not
+automatically retried into a passing result. The managed arm64 GitHub runner
+supplies the same qualified evidence for arm64; private ARM hardware is not
+required.
 
 Full-system gates boot digest-pinned target images on a same-architecture
 GitHub runner. Guests receive packages over an isolated host channel and have
