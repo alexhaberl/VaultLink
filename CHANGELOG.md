@@ -13,6 +13,7 @@
 - Preserved audit evidence below the retention cap by preventing negative SQLite deletion limits, and hardened package smoke cleanup so installed service identities survive its negative probes.
 - Prevented concurrent transfer writers from exhausting the SQLite connection pool while waiting for the single WAL writer slot, and added an evidenced fail-closed SQLite storage qualification before every authoritative native package load gate.
 - Corrected Fedora updater transactions and their full-system probe to retain `NoNewPrivileges=true` and SELinux `Enforcing` while avoiding RPM's incompatible scriptlet domain transition.
+- Made the full-system gate tolerate unavailable non-Fedora LSM context attributes while still requiring Fedora's SELinux launcher context, and bounded forced-TCG transfers at 60 minutes without reducing the workload.
 
 ## 0.5.0 — 2026-08-24
 

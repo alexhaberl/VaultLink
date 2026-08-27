@@ -163,7 +163,9 @@ Every one of the nine targets performs:
   load-workload evidence. The QEMU gate remains authoritative for request
   counts and statuses, transfer and upload hashes, absence of corruption,
   process and RSS limits, and all other functional and security assertions;
-  only its recorded p95 and threshold comparison are diagnostic. The
+  only its recorded p95 and threshold comparison are diagnostic. Forced-TCG
+  transfers have a bounded 60-minute request deadline without changing any
+  concurrency, byte-count, status, or integrity assertion. The
   commit-bound workflow explicitly records `acceleration_policy=force-tcg` and
   `acceleration=tcg` for every target.
 
