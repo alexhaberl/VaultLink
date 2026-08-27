@@ -1879,12 +1879,15 @@ if ! grep -F -q '[ -f /.dockerenv ]' "$real_package_smoke" \
     || ! grep -F -q 'minisign -G -W' "$real_package_smoke" \
     || ! grep -F -q 'exec "$real_manager" "$@"' "$real_package_smoke" \
     || ! grep -F -q 'real_manager_directory/$native_manager' "$real_package_smoke" \
+    || ! grep -F -q 'rpm:--upgrade) mutation=1' "$real_package_smoke" \
+    || [ "$(grep -F -c '^MUTATE rpm --nocontexts --upgrade ' \
+        "$real_package_smoke" || true)" -ne 2 ] \
     || ! grep -F -q 'sh "$repo_root/deploy/vaultlink-update.sh" install' \
         "$real_package_smoke" \
     || ! grep -F -q 'missing_dependency_zero_mutation=ok' "$real_package_smoke" \
     || ! grep -F -q 'success_parity=ok' "$real_package_smoke" \
     || ! grep -F -q 'activation_old_package_reinstall=ok' "$real_package_smoke"; then
-    report "real package update smoke must stay Docker-only and delegate to the production updater and native package manager"
+    report "real package update smoke must stay Docker-only, audit position-independent RPM upgrades with --nocontexts, and delegate to the production updater and native package manager"
 fi
 if ! grep -F -q "cron: '23 4 * * 1'" .github/workflows/arch-compatibility.yml \
     || ! grep -F -q 'workflow_dispatch:' .github/workflows/arch-compatibility.yml \

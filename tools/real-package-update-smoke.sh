@@ -689,10 +689,13 @@ audit_log=@AUDIT@
 mutation=0
 dry_run=0
 case "$manager_name:${1:-}" in
-    dpkg:--install|rpm:--upgrade|pacman:--upgrade) mutation=1 ;;
+    dpkg:--install|pacman:--upgrade) mutation=1 ;;
 esac
 for manager_argument do
-    case "$manager_argument" in --test|--print|--dry-run) dry_run=1 ;; esac
+    case "$manager_name:$manager_argument" in
+        rpm:--upgrade) mutation=1 ;;
+        *:--test|*:--print|*:--dry-run) dry_run=1 ;;
+    esac
 done
 if [ "$mutation" -eq 1 ] && [ "$dry_run" -eq 0 ]; then
     printf 'MUTATE %s' "$manager_name" >>"$audit_log"
@@ -926,6 +929,11 @@ grep -F -x -q 'update_installed=true' "$work/success.stdout" \
 [ "$(grep -c '^MUTATE ' "$work/package-manager.log")" -eq 1 ] \
     && grep '^MUTATE ' "$work/package-manager.log" | grep -F -q "$new_asset" \
     || fail "success did not execute exactly one real new-package transaction"
+if [ "$package_format" = rpm ]; then
+    [ "$(grep -c '^MUTATE rpm --nocontexts --upgrade ' \
+        "$work/package-manager.log")" -eq 1 ] \
+        || fail "successful RPM update did not retain the reviewed --nocontexts transaction mode"
+fi
 assert_parity "$new_version"
 assert_mutables_unchanged
 success_backup=$(sed -n 's/^backup_directory=//p' "$work/success.stdout")
@@ -975,6 +983,11 @@ if grep -F -q 'CRITICAL:' "$work/activation.stderr"; then
 fi
 [ "$(grep -c '^MUTATE ' "$work/package-manager.log")" -eq 2 ] \
     || fail "activation recovery did not execute exactly new+old real transactions"
+if [ "$package_format" = rpm ]; then
+    [ "$(grep -c '^MUTATE rpm --nocontexts --upgrade ' \
+        "$work/package-manager.log")" -eq 2 ] \
+        || fail "RPM activation recovery did not retain the reviewed --nocontexts transaction mode"
+fi
 first_mutation=$(grep '^MUTATE ' "$work/package-manager.log" | sed -n '1p')
 second_mutation=$(grep '^MUTATE ' "$work/package-manager.log" | sed -n '2p')
 printf '%s\n' "$first_mutation" | grep -F -q "$new_asset" \
