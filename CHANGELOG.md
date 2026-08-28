@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 — 2026-08-31
+## 0.6.0 — 2026-09-01
 
 - Withdrew the public `v0.5.0` release and archive assets on 2026-08-25 while retaining its annotated tag, commit, workflow evidence, and historical checklist. Version 0.5.0 is unsupported and has no in-place migration path to 0.6.0.
 - Replaced archive distribution with nine native packages: Debian 13 and Ubuntu 24.04/26.04 LTS DEBs on amd64/arm64, Fedora 44 RPMs on x86_64/aarch64, and one x86_64 Arch package built against the release-date snapshot.
@@ -15,6 +15,7 @@
 - Corrected Fedora updater transactions and their full-system probe to retain `NoNewPrivileges=true` and SELinux `Enforcing` while avoiding RPM's incompatible scriptlet domain transition.
 - Made the full-system gate tolerate unavailable non-Fedora LSM context attributes while still requiring Fedora's SELinux launcher context, and bounded forced-TCG transfers at 60 minutes without reducing the workload.
 - Isolated Debian and Ubuntu full-system package tests from boot-time apt/dpkg maintenance without removing locks, replaced the runtime-integrity guard's fixed emulator-speed assumption with bounded stable-state polling, and synchronized policy-versus-upload tests at the actual finalizer boundary.
+- Made the package-builder-based soak start trust only its exact ephemeral checkout before resolving commit-bound release gates.
 
 ## 0.5.0 — 2026-08-24
 

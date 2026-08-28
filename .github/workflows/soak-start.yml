@@ -53,6 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           [[ "$APPROVED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$APPROVED_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]]
           test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"

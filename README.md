@@ -2,7 +2,7 @@
 
 VaultLink is a server-rendered Rust web application that securely exposes an already mounted Linux directory through public download and upload links. Supported host platforms are Linux x86_64 and aarch64; Windows host support was removed in 0.4.1. Windows, macOS, and Linux clients remain interoperable through an external standard SMB server.
 
-Status: `0.6.0` is the current package-only release candidate, planned for 2026-08-31, for Debian 13, Ubuntu 24.04/26.04 LTS, Fedora 44, and an Arch Linux release snapshot. The `v0.5.0` GitHub release and its archive assets were withdrawn on 2026-08-25 and are unsupported; its annotated tag, commit, workflow evidence, and [historical checklist](docs/RELEASE-CHECKLIST.md) remain for audit purposes. There is currently no supported public VaultLink release until the signed `v0.6.0` release is published. See the [package contract](docs/PACKAGING.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), and [changelog](CHANGELOG.md).
+Status: `0.6.0` is the current package-only release candidate, planned for 2026-09-01, for Debian 13, Ubuntu 24.04/26.04 LTS, Fedora 44, and an Arch Linux release snapshot. The `v0.5.0` GitHub release and its archive assets were withdrawn on 2026-08-25 and are unsupported; its annotated tag, commit, workflow evidence, and [historical checklist](docs/RELEASE-CHECKLIST.md) remain for audit purposes. There is currently no supported public VaultLink release until the signed `v0.6.0` release is published. See the [package contract](docs/PACKAGING.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), and [changelog](CHANGELOG.md).
 
 ## 1. Security model
 
