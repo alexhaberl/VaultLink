@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 — Unreleased
+## 0.6.0 — 2026-08-31
 
 - Withdrew the public `v0.5.0` release and archive assets on 2026-08-25 while retaining its annotated tag, commit, workflow evidence, and historical checklist. Version 0.5.0 is unsupported and has no in-place migration path to 0.6.0.
 - Replaced archive distribution with nine native packages: Debian 13 and Ubuntu 24.04/26.04 LTS DEBs on amd64/arm64, Fedora 44 RPMs on x86_64/aarch64, and one x86_64 Arch package built against the release-date snapshot.

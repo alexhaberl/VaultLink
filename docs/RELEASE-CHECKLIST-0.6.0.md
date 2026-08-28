@@ -1,7 +1,8 @@
 # v0.6.0 native-package release checklist
 
-Status: unreleased. No release date is selected and no candidate commit is
-frozen until every pre-soak gate below is green.
+Status: unreleased release candidate planned for 2026-08-31. The frozen
+candidate is the exact clean `main` commit for which every pre-soak gate below
+is green.
 
 Goal: a signed, package-only GitHub release for the exact nine targets in
 `release/package-targets.json`. Every checkbox is fail-closed release evidence;
@@ -152,8 +153,8 @@ a skipped, neutral, missing, stale, or wrong-commit result is not success.
 
 - [ ] All three new aggregate gates are required by candidate, soak-start, and
   tag workflows in addition to existing exact-commit gates.
-- [ ] Choose the release date only now and update every release-facing document
-  in the final candidate commit.
+- [x] Selected 2026-08-31 as the release date and updated every release-facing
+  document in the final candidate commit.
 - [ ] Freeze one clean `main` commit; record its SHA, the Debian 13 amd64 DEB
   hash, package-extracted binary hash, target manifest hash, and gate run URLs.
 - [ ] The staging deploy and soak install the exact final Debian 13 amd64 DEB;
