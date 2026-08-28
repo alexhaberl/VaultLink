@@ -7,7 +7,7 @@ operational requirements, advisory exceptions, and vulnerability reporting.
 
 ## Supported versions
 
-Release line: `0.6.0` is unreleased. There is currently no supported public release: the `v0.5.0` archive release was withdrawn on 2026-08-25, while its annotated tag and evidence remain public for auditability. The 0.6.0 support target is native packages for Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported.
+Release line: `0.6.0` is an unreleased candidate planned for 2026-08-31. There is currently no supported public release: the `v0.5.0` archive release was withdrawn on 2026-08-25, while its annotated tag and evidence remain public for auditability. The 0.6.0 support target is native packages for Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported.
 
 ## Build and release security
 
