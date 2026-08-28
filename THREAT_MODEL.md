@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Last reviewed | 2026-08-28 |
-| Baseline commit | 0.6.0 release candidate planned for 2026-08-31; the exact final commit is recorded before the soak |
+| Baseline commit | 0.6.0 release candidate planned for 2026-09-01; the exact final commit is recorded before the soak |
 | Applies to | VaultLink 0.6.0 native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
 | Companion documents | [Security policy](SECURITY.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
 

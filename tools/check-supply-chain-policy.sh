@@ -491,8 +491,9 @@ if ! printf '%s\n' "$dry_run_job" | grep -F -q 'image: ${{ needs.prepare.outputs
     || ! printf '%s\n' "$dry_run_job" | grep -F -q 'sh tools/verify-package-builder.sh debian13-amd64' \
     || ! grep -F -q 'image: ${{ vars.VAULTLINK_PACKAGE_SIGNING_IMAGE }}' .github/workflows/soak-start.yml \
     || ! grep -F -q 'test "$SOAK_TOOL_IMAGE" =' .github/workflows/soak-start.yml \
+    || [ "$(grep -F -c "$safe_directory_reference" .github/workflows/soak-start.yml || true)" -ne 1 ] \
     || ! grep -F -q 'sh tools/verify-package-builder.sh debian13-amd64' .github/workflows/soak-start.yml; then
-    report "release verification and soak start must use and verify the pinned complete package-tool image"
+    report "release verification and soak start must use the pinned complete package-tool image and trust only the checked-out workspace"
 fi
 for workflow in .github/workflows/packages.yml .github/workflows/reproducibility.yml; do
     if ! grep -F -q 'image: ${{ matrix.builder_image }}' "$workflow" \
