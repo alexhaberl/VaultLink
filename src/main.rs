@@ -1,3 +1,5 @@
+#![cfg_attr(all(not(test), not(debug_assertions)), forbid(unsafe_code))]
+
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::{
@@ -378,6 +380,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
         return rotate_secrets(&options);
     }
+    if args
+        .get(1)
+        .is_some_and(|value| value == "verify-backup-database")
+    {
+        let options = VerifyBackupDatabaseOptions::parse(&args).map_err(std::io::Error::other)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .init();
+        return verify_backup_database(&options);
+    }
     if args.get(1).is_some_and(|value| value == "provision-cifs") {
         let options = vaultlink::cifs_provision::CifsProvisionOptions::parse(&args)
             .map_err(std::io::Error::other)?;
@@ -634,6 +646,29 @@ struct RotateSecretsOptions {
     source: RecoveryDatabaseSource,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifyBackupDatabaseOptions {
+    database_path: PathBuf,
+}
+
+impl VerifyBackupDatabaseOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        if args.get(1).map(String::as_str) != Some("verify-backup-database") {
+            return Err("verify-backup-database parser requires its command".into());
+        }
+        if args.len() != 4 || args.get(2).map(String::as_str) != Some("--database") {
+            return Err("verify-backup-database requires exactly --database DATABASE_PATH".into());
+        }
+        let database_path = args[3].as_str();
+        if database_path.is_empty() || database_path.starts_with('-') {
+            return Err("--database requires one non-option value".into());
+        }
+        Ok(Self {
+            database_path: PathBuf::from(database_path),
+        })
+    }
+}
+
 impl RotateSecretsOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         if args.get(1).map(String::as_str) != Some("rotate-secrets") {
@@ -806,6 +841,24 @@ fn rotate_secrets(options: &RotateSecretsOptions) -> Result<(), Box<dyn std::err
     }
     Database::rotate_secrets(&database_path)?;
     tracing::info!(database = %database_path.display(), "secret rotation completed");
+    Ok(())
+}
+
+fn verify_backup_database(
+    options: &VerifyBackupDatabaseOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !options.database_path.is_file() {
+        return Err(format!(
+            "backup database does not exist or is not a regular file: {}",
+            options.database_path.display()
+        )
+        .into());
+    }
+    Database::verify_backup(&options.database_path)?;
+    println!(
+        "backup database and adjacent secrets.keyring verified: {}",
+        options.database_path.display()
+    );
     Ok(())
 }
 
@@ -1108,6 +1161,81 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn verify_backup_database_parser_is_exact() {
+        assert_eq!(
+            VerifyBackupDatabaseOptions::parse(&arguments(&[
+                "vaultlink",
+                "verify-backup-database",
+                "--database",
+                "backup/data.sqlite",
+            ]))
+            .unwrap(),
+            VerifyBackupDatabaseOptions {
+                database_path: "backup/data.sqlite".into(),
+            }
+        );
+        for invalid in [
+            vec!["vaultlink", "verify-backup-database"],
+            vec![
+                "vaultlink",
+                "verify-backup-database",
+                "--config",
+                "config.toml",
+            ],
+            vec![
+                "vaultlink",
+                "verify-backup-database",
+                "--database",
+                "--other",
+            ],
+            vec![
+                "vaultlink",
+                "verify-backup-database",
+                "--database",
+                "one.sqlite",
+                "extra",
+            ],
+        ] {
+            assert!(VerifyBackupDatabaseOptions::parse(&arguments(&invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn verify_backup_database_authenticates_encrypted_state() {
+        let valid = tempfile::tempdir().unwrap();
+        let valid_database = valid.path().join("data.sqlite");
+        let database = Database::open(&valid_database).unwrap();
+        database
+            .create_admin_and_audit(
+                "admin",
+                "password-hash",
+                "JBSWY3DPEHPK3PXP",
+                &AuditContext::new("backup-verification-test", None),
+            )
+            .unwrap();
+        drop(database);
+        std::fs::remove_file(valid.path().join("secrets.keyring.lock")).unwrap();
+
+        let database_before = std::fs::read(&valid_database).unwrap();
+        let keyring_path = valid.path().join("secrets.keyring");
+        let keyring_before = std::fs::read(&keyring_path).unwrap();
+
+        let options = VerifyBackupDatabaseOptions {
+            database_path: valid_database.clone(),
+        };
+        verify_backup_database(&options).unwrap();
+        assert_eq!(std::fs::read(&valid_database).unwrap(), database_before);
+        assert_eq!(std::fs::read(&keyring_path).unwrap(), keyring_before);
+        assert!(!valid.path().join("secrets.keyring.lock").exists());
+
+        let unrelated = tempfile::tempdir().unwrap();
+        let unrelated_database = unrelated.path().join("data.sqlite");
+        drop(Database::open(&unrelated_database).unwrap());
+        std::fs::copy(unrelated.path().join("secrets.keyring"), &keyring_path).unwrap();
+        assert!(verify_backup_database(&options).is_err());
     }
 
     #[test]

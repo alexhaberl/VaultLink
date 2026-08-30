@@ -38,6 +38,33 @@ struct StoredKeyring {
 }
 
 impl Keyring {
+    pub(super) fn open_read_only(database_path: &Path) -> rusqlite::Result<Self> {
+        let directory = database_path.parent().ok_or_else(|| {
+            keyring_error("database path has no parent directory for secrets.keyring")
+        })?;
+        let path = directory.join("secrets.keyring");
+        let path_metadata = std::fs::symlink_metadata(&path).map_err(io_error)?;
+        if path_metadata.file_type().is_symlink() {
+            return Err(keyring_error("secrets.keyring must not be a symbolic link"));
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(io_error)?;
+        validate_private_regular_file(&path, &file)?;
+        let opened_metadata = file.metadata().map_err(io_error)?;
+        if path_metadata.dev() != opened_metadata.dev()
+            || path_metadata.ino() != opened_metadata.ino()
+        {
+            return Err(keyring_error("secrets.keyring changed while it was opened"));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(io_error)?;
+        let stored = serde_json::from_slice::<StoredKeyring>(&bytes)
+            .map_err(|error| keyring_error(format!("invalid secrets.keyring: {error}")))?;
+        Self::from_stored(stored, None)
+    }
+
     pub(super) fn open(
         database_path: &Path,
         persistent: bool,

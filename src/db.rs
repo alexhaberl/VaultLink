@@ -784,6 +784,29 @@ impl Database {
         keyring::rotate_database(path.as_ref()).map_err(Into::into)
     }
 
+    pub fn verify_backup(path: impl AsRef<Path>) -> DatabaseResult<()> {
+        let path = path.as_ref();
+        let metadata = std::fs::symlink_metadata(path).map_err(database_io_error)?;
+        validate_database_metadata(path, &metadata, true)?;
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let opened_metadata = std::fs::symlink_metadata(path).map_err(database_io_error)?;
+        validate_database_metadata(path, &opened_metadata, true)?;
+        if metadata.dev() != opened_metadata.dev() || metadata.ino() != opened_metadata.ino() {
+            return Err(DatabaseError::from(invalid_database_file(
+                path,
+                "file changed while it was opened",
+            )));
+        }
+        schema::validate_current(&connection)?;
+        let keyring = keyring::Keyring::open_read_only(path)?;
+        validate_encrypted_secrets(&connection, &keyring)?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> DatabaseResult<Self> {
         Self::open_inner(path.as_ref(), None)
     }

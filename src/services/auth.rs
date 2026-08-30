@@ -153,6 +153,7 @@ impl AuthService {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use std::time::{Duration as StdDuration, Instant};
 
     fn service() -> (AuthService, String) {
         let database = Database::open(":memory:").unwrap();
@@ -206,5 +207,89 @@ mod tests {
         assert_eq!(outcome, PasswordLoginOutcome::InvalidCredentials);
         assert!(service.database.session("session").unwrap().is_none());
         assert_eq!(service.database.count_audit(None).unwrap(), 0);
+    }
+
+    fn invalid_login_duration(service: &AuthService, username: &str) -> StdDuration {
+        let started = Instant::now();
+        let outcome = service
+            .login_with_password(PasswordLoginCommand {
+                username: username.into(),
+                password: SecretString::from("deliberately incorrect timing password"),
+                session_token: "timing-session".into(),
+                csrf_token: "timing-csrf".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+                audit_client_ip: None,
+            })
+            .unwrap();
+        assert_eq!(outcome, PasswordLoginOutcome::InvalidCredentials);
+        started.elapsed()
+    }
+
+    fn percentile(
+        samples: &mut [StdDuration],
+        numerator: usize,
+        denominator: usize,
+    ) -> StdDuration {
+        samples.sort_unstable();
+        let index = samples
+            .len()
+            .saturating_mul(numerator)
+            .div_ceil(denominator)
+            .saturating_sub(1)
+            .min(samples.len() - 1);
+        samples[index]
+    }
+
+    #[test]
+    #[ignore = "diagnostic timing probe; run explicitly on an otherwise idle release host"]
+    fn known_and_unknown_admin_login_timing_is_reported() {
+        const WARMUP_PAIRS: usize = 2;
+        const SAMPLE_PAIRS: usize = 24;
+
+        let (service, _) = service();
+        for _ in 0..WARMUP_PAIRS {
+            invalid_login_duration(&service, "admin");
+            invalid_login_duration(&service, "missing-admin");
+        }
+
+        let mut known = Vec::with_capacity(SAMPLE_PAIRS);
+        let mut unknown = Vec::with_capacity(SAMPLE_PAIRS);
+        for sample in 0..SAMPLE_PAIRS {
+            // Alternate the order so thermal drift does not consistently favor
+            // one path. This is diagnostic evidence, not a timing assertion:
+            // shared CI runners are too noisy for a stable pass/fail threshold.
+            if sample % 2 == 0 {
+                known.push(invalid_login_duration(&service, "admin"));
+                unknown.push(invalid_login_duration(&service, "missing-admin"));
+            } else {
+                unknown.push(invalid_login_duration(&service, "missing-admin"));
+                known.push(invalid_login_duration(&service, "admin"));
+            }
+        }
+
+        let mut known_for_median = known.clone();
+        let mut unknown_for_median = unknown.clone();
+        let known_median = percentile(&mut known_for_median, 1, 2);
+        let unknown_median = percentile(&mut unknown_for_median, 1, 2);
+        let known_p95 = percentile(&mut known, 95, 100);
+        let unknown_p95 = percentile(&mut unknown, 95, 100);
+        let median_delta = known_median.abs_diff(unknown_median);
+        let slower_median = known_median.max(unknown_median).as_secs_f64();
+        let relative_delta = if slower_median == 0.0 {
+            0.0
+        } else {
+            median_delta.as_secs_f64() / slower_median
+        };
+
+        eprintln!(
+            "login timing diagnostic: samples={SAMPLE_PAIRS} \
+             known_median_ms={:.3} unknown_median_ms={:.3} \
+             known_p95_ms={:.3} unknown_p95_ms={:.3} median_delta_pct={:.2}",
+            known_median.as_secs_f64() * 1_000.0,
+            unknown_median.as_secs_f64() * 1_000.0,
+            known_p95.as_secs_f64() * 1_000.0,
+            unknown_p95.as_secs_f64() * 1_000.0,
+            relative_delta * 100.0,
+        );
     }
 }

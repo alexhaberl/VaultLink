@@ -203,6 +203,14 @@ require_service_user() {
         grep -qx "# config-marker:$MARKER" "$3" || exit 1
         printf '%s\n' "$READINESS_URL" "$READINESS_CONNECT_TO" "$READINESS_INSECURE"
         ;;
+    verify-backup-database)
+        require_service_user
+        [ "$#" -eq 3 ] && [ "${2:-}" = "--database" ] \
+            && [ -f "${3:-}" ] && [ -r "${3:-}" ] \
+            && [ -s "$(dirname -- "$3")/secrets.keyring" ] || exit 1
+        "$REAL_SQLITE3" "$3" "PRAGMA integrity_check" | grep -qx ok
+        printf '%s\n' "mock backup database authenticated"
+        ;;
     *)
         printf '%s\n' "binary-marker:$MARKER"
         ;;
@@ -962,6 +970,43 @@ prepare_rollback_case() {
     printf '%s\n' "$source_backup"
 }
 
+test_rollback_verify_only_preserves_active_service() {
+    initialize_live original original
+    source_backup=$(make_source_backup)
+    prepare_package_rollback_target "$source_backup"
+
+    output=$("$ROLLBACK" --verify-only "$source_backup")
+    printf '%s\n' "$output" | grep -q 'backup verified for VaultLink 0.3.0:' \
+        || fail "verify-only did not report the verified backup"
+    printf '%s\n' "$output" | grep -q '^mock backup database authenticated$' \
+        || fail "verify-only did not authenticate the copied database/keyring pair"
+    assert_binary original
+    assert_config original
+    assert_database original
+    assert_service_active
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "verify-only stopped the active service"
+    [[ -z "$(find /var/lib/vaultlink -maxdepth 1 -name '.backup-verify.*' -print -quit)" ]] \
+        || fail "verify-only left its private database copy behind"
+    echo "rollback verify-only preserved the active service"
+}
+
+test_rollback_verify_only_rejects_corrupt_database() {
+    initialize_live original original
+    source_backup=$(make_source_backup)
+    prepare_package_rollback_target "$source_backup"
+    printf '%s\n' 'not a SQLite database' >"$source_backup/data.sqlite"
+
+    expect_failure rollback-verify-corrupt "$ROLLBACK" --verify-only "$source_backup"
+    assert_binary original
+    assert_config original
+    assert_database original
+    assert_service_active
+    [[ "$(grep -c '^stop vaultlink.service$' "$MOCK_STATE_DIR/systemctl.log" || true)" -eq 0 ]] \
+        || fail "failed verify-only stopped the active service"
+    echo "rollback verify-only rejected a corrupt database without service mutation"
+}
+
 test_rollback_success() {
     source_backup=$(prepare_rollback_case)
     output=$("$ROLLBACK" "$source_backup")
@@ -1113,6 +1158,8 @@ test_upgrade_health_wrong_version
 test_upgrade_health_timeout
 test_upgrade_health_failure_restores_candidate_write
 test_upgrade_recovery_stop_failure_requires_manual_recovery
+test_rollback_verify_only_preserves_active_service
+test_rollback_verify_only_rejects_corrupt_database
 test_rollback_success
 test_rollback_start_failure
 test_rollback_rejects_incomplete_backup_before_stop
