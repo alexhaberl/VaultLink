@@ -2,10 +2,10 @@
 
 | Field | Value |
 | --- | --- |
-| Last reviewed | 2026-08-28 |
-| Baseline commit | 0.6.0 release candidate planned for 2026-09-01; the exact final commit is recorded before the soak |
-| Applies to | VaultLink 0.6.0 native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
-| Companion documents | [Security policy](SECURITY.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
+| Last reviewed | 2026-08-30 |
+| Baseline commit | Unreleased 0.7.0 monitoring implementation; the exact final commit is recorded before release qualification |
+| Applies to | VaultLink 0.7.0 native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
+| Companion documents | [Security policy](SECURITY.md), [0.7.0 release checklist](docs/RELEASE-CHECKLIST-0.7.0.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
 
 ## Purpose
 
@@ -23,7 +23,8 @@ vulnerability reporting.
 ## Scope and security objectives
 
 VaultLink is a single-process, Linux-only service that exposes an existing
-mounted directory through administrator sessions and public bearer links. It
+mounted directory through administrator sessions and public bearer links, plus
+strictly redacted read-only monitoring through instance-wide service tokens. It
 stores policy and security state in a local SQLite database and protects stored
 application secrets with an adjacent keyring. It supports a service-owned local
 storage mode and a narrowly defined CIFS/SMB external-writer mode.
@@ -74,7 +75,7 @@ not assumed equivalent.
 | --- | --- |
 | Visible storage content and names | Access only through the configured root, Share capability, and mutation policy |
 | Administrator credentials and MFA state | Confidentiality, replay resistance, and authenticated lifecycle changes |
-| Sessions, CSRF values, Share tokens, and preview/unlock state | Unpredictability, bounded lifetime, correct binding, and revocation |
+| Sessions, CSRF values, Share tokens, service tokens, and preview/unlock state | Unpredictability, correct binding, least privilege, protected transport, and revocation |
 | SQLite policy and accounting state | Transactional integrity, schema authenticity, and bounded resource use |
 | `secrets.keyring` and encrypted database fields | Confidentiality, exact database/keyring pairing, and atomic rotation |
 | Configuration, mount identity, and internal storage | Fail-closed validation and service-only modification |
@@ -90,6 +91,7 @@ not assumed equivalent.
 | --- | --- | --- |
 | Unauthenticated network client | Send malformed, slow, parallel, and spoofed requests; guess credentials and bearer links | Host, proxy, or database access |
 | Public Share holder | Exercise every operation permitted by a leaked or intentionally shared bearer link | Administrator privileges or access outside that Share |
+| Monitoring service-token holder | Read the two redacted instance-monitoring resources at the fixed `monitoring:read` scope | Existing Share/file/admin/session/public/HTML routes, mutations, paths, capability tokens, URLs, aliases, or password hashes |
 | Malicious uploader | Choose filenames, metadata, multipart framing, sizes, timing, and cancellation behavior | Direct access to protected internal staging |
 | Authenticated administrator | Use all documented administrator operations and see all visible storage | Host root, keyring plaintext, arbitrary audit deletion, or release authority |
 | Compromised administrator browser | Reuse browser-visible responses and submit requests within cookie and CSP constraints | Reading `HttpOnly` cookies without another browser compromise |
@@ -108,6 +110,7 @@ flowchart LR
     Internet["Internet clients"] --> Proxy["TLS / reverse proxy"]
     Proxy --> App["VaultLink process"]
     Admin["Administrator browser"] --> Proxy
+    Monitor["Home Assistant / monitoring client"] --> Proxy
     App --> DB["Local SQLite + keyring"]
     App --> Storage["Mounted visible storage"]
     SMB["External SMB writers"] --> Storage
@@ -127,7 +130,7 @@ flowchart LR
 | --- | --- |
 | TB-01 Internet to TLS endpoint | The proxy/network layer handles volumetric defense and transport security; VaultLink still validates every application request |
 | TB-02 Reverse proxy to VaultLink | Forwarding headers are trusted only from exact configured TCP peers and only after full chain validation |
-| TB-03 Bearer or administrator state to an operation | Session, Share, CSRF, MFA, expiry, permission, and quota checks are performed before protected work |
+| TB-03 Bearer or administrator state to an operation | Session, Share, service-token scope, CSRF, MFA, expiry, permission, quota, mixed-auth, and route-isolation checks are performed before protected work |
 | TB-04 VaultLink to SQLite/keyring | Local permissions, schema checks, keyring pairing, transactions, and required audit protect application state |
 | TB-05 VaultLink to mounted storage | Descriptor-relative capabilities, mount identity, internal namespaces, and atomic publication confine filesystem effects |
 | TB-06 External SMB writer to visible storage | External writers are trusted publishers but remain excluded from internal storage and local security state |
@@ -158,6 +161,7 @@ A change that weakens one requires an explicit threat-model review.
 | INV-13 | All 21 signed assets correspond to the exact approved commit and complete native package/reproducibility/VM evidence | release workflow gates, global checksums, all-target SBOM bundle, soak evidence, exact tag-to-`main` equality |
 | INV-14 | Missing Minisign material, target image provisioning, matrix evidence, release evidence, or immutable-release policy proof blocks publication | fail-closed aggregate gates, admin-read pre-publication checks, and unchecked release checklist gates |
 | INV-15 | A package update cannot silently mix package database, candidate, active binary, or runtime state versions | root-only staged inputs and pinned Minisign key, exact install marker, signed new and old packages, offline dependency preflight and transaction, canonical frozen backup sources, authenticated package reinstall, preserved updater-config identity, post-recovery parity checks, and a root package/runtime `ExecStartPre` guard with bounded restart attempts before every service start |
+| INV-16 | A service token authorizes only redacted monitoring reads and no credential-bearing or mutating route | strict single-header/mixed-auth parser, fixed `monitoring:read` scope, dedicated redacted SQL/DTOs, negative route inventory, response/log/diagnostics redaction tests |
 
 ## Threat register
 
@@ -173,10 +177,11 @@ test evidence against which each case is reviewed.
 | ID | Abuse case | Controls | Residual risk and review trigger |
 | --- | --- | --- | --- |
 | TM-AUTH-01 | Credential stuffing or brute force against administrators or password-protected Shares | Argon2id, MFA, per-account/per-origin limits, fixed-size unknown-identity buckets, upstream connection limits | Process-local counters reset on restart and are not volumetric defense. Reassess if deployment omits proxy/network limits or restart behavior becomes remotely triggerable. |
-| TM-AUTH-02 | Theft or replay of an administrator session, Share token, unlock cookie, or preview state | Random bearer values, hashed/encrypted persistence, bounded expiry, idle timeout, revocation, `HttpOnly`, `Secure`, `SameSite=Strict` | A bearer value intentionally exposed to a recipient or compromised endpoint can be used until expiry/revocation. Reassess for new token types or browser storage. |
-| TM-AUTH-03 | CSRF or cross-session state substitution | Session-bound CSRF values, Share-unlock CSRF, strict cookies, constant-time comparison, WebAuthn ceremony binding and single use | A fully compromised same-origin browser context remains authoritative. Reassess when adding cross-origin clients or API tokens. |
+| TM-AUTH-02 | Theft or replay of an administrator session, Share token, service token, unlock cookie, or preview state | Random bearer values, hash-only or encrypted persistence, expiry where configured, idle timeout where applicable, revocation, `HttpOnly`, `Secure`, `SameSite=Strict`, and HTTPS operational policy | A bearer value intentionally exposed to a recipient or compromised endpoint can be used until expiry/revocation; explicitly unlimited service tokens increase that window. Reassess token formats, clients, or browser storage. |
+| TM-AUTH-03 | CSRF or cross-session state substitution | Session-bound CSRF values, Share-unlock CSRF, strict cookies, constant-time comparison, WebAuthn ceremony binding and single use; service credentials are header-only, CORS-disabled, read-only, and rejected when combined with a cookie | A fully compromised same-origin browser context remains authoritative. Reassess cross-origin behavior, accepted credential locations, or write scopes. |
 | TM-AUTH-04 | Username enumeration or overload differences reveal valid administrators | Equal admission class for known/unknown users, dummy Argon2, bounded limiter state, normalized errors | Network timing cannot be made perfectly identical. Reassess after authentication-flow or Argon2 changes. |
 | TM-AUTH-05 | An RSA WebAuthn path reaches the affected `rsa` implementation | RS256 is not advertised; persisted and runtime credential state is centrally rejected before use | The exception is valid only for the current relying-party behavior. Apply the mandatory triggers in `SECURITY.md`. |
+| TM-AUTH-06 | A monitoring token reaches a privileged route or redacted monitoring data leaks Share capabilities | Exactly two mixed-auth routes, fixed scope bit, strict Authorization grammar, dedicated SQL projections and DTOs that omit token/ciphertext/path/alias/URL/password fields, complete negative route matrix | Monitoring still reveals operational counts and selected non-secret Share metadata. Reassess every new field, scope, route, or CORS behavior. |
 | TM-NET-01 | Spoofed `Forwarded` or `X-Forwarded-For` changes rate-limit or audit identity | Exact trusted-peer allowlist, right-to-left validation, malformed-chain rejection, direct-peer fallback | A compromised allowlisted proxy can assert the identity it is trusted to provide. Reassess proxy topology and Docker NAT boundaries. |
 | TM-NET-02 | Cleartext traffic, TLS downgrade, or unsafe public binding exposes credentials | Production HTTPS validation, secure cookies, HSTS option, loopback defaults, documented proxy/standalone modes | TLS endpoint operation is outside VaultLink when a proxy terminates TLS. Reassess certificate source, bind mode, or proxy ownership. |
 
@@ -198,8 +203,8 @@ test evidence against which each case is reviewed.
 | TM-DATA-01 | Theft of SQLite, keyring, configuration, or a complete backup exposes credentials and policy | Service-only ownership/modes, local-filesystem requirement, encrypted fields, protected backup procedures | Database plus matching keyring is a production credential. Host/disk encryption and backup custody remain operator responsibilities. |
 | TM-DATA-02 | Power loss or concurrent operation corrupts key rotation or creates mixed secret state | Keyring locking, write-before-reencrypt sequencing, transactional row updates, startup decryption validation, rotation tests | Filesystem durability and host integrity are trusted. Reassess keyring format or rotation algorithm. |
 | TM-DATA-03 | An administrator suppresses or rewrites evidence | Required audit is atomic with protected mutations; events mirror to journald; local retention is bounded and priority-aware | Host/root/log administrators can tamper with local evidence. Independently administered append-only or WORM forwarding is required for stronger assurance. |
-| TM-DATA-04 | An old binary, mismatched configuration, swapped rollback input, or partial backup is activated after migration | Forward-only schema validation, inseparable four-file backup unit, canonical symlink-free `root:root` mode-`0700` backup subtree, exact `0700`/`0600` source modes, identity-and-hash freezing before use, maintenance lock, transactional upgrade/rollback, exact health/version checks | Manual recovery by a trusted host administrator remains possible and powerful. Reassess schema, backup layout, or deployment tooling changes. |
-| TM-DATA-05 | Unbounded database or audit growth causes denial of service | Bounded audit rows and retention, upload/transfer accounting, connection pool, busy timeout, bounded limiter state | Storage capacity still requires monitoring. Reassess after load tests or schema growth. |
+| TM-DATA-04 | An old binary, mismatched configuration, swapped rollback input, or partial backup is activated after migration, or an older restore revives a revoked service token | Forward-only schema validation, inseparable four-file backup unit, canonical symlink-free `root:root` mode-`0700` backup subtree, exact `0700`/`0600` source modes, identity-and-hash freezing before use, maintenance lock, transactional upgrade/rollback, exact health/version checks; manual-restore runbook requires stopped-service revoke-all and reissue before traffic | Manual recovery by a trusted host administrator remains possible and powerful. Skipping the token step can restore bearer access. Reassess schema, backup layout, or deployment tooling changes. |
+| TM-DATA-05 | Unbounded database, token, or audit growth causes denial of service | Bounded audit rows and retention, 64-entry service-token cap including expired rows, upload/transfer accounting, connection pool, busy timeout, bounded limiter state | Storage capacity still requires monitoring. Reassess after load tests or schema growth. |
 
 ### Build, dependency, and release supply chain
 
@@ -259,7 +264,7 @@ this document alone:
   key rotation, and concurrency;
 - exact-commit nine-target package reproducibility, full-system VM, per-target
   load, staging, hardware-FIDO2, SMB, and Debian 72-hour soak gates in
-  `docs/RELEASE-CHECKLIST-0.6.0.md`.
+  `docs/RELEASE-CHECKLIST-0.7.0.md`.
 
 Passing CI validates tested controls but does not close unchecked release
 checklist items or change an accepted residual risk.
@@ -271,6 +276,7 @@ checklist items or change an accepted residual risk.
 | 2026-08-02 | `c11c5d2b7e61e4b30b20d4921315fcf31a86390e` | Initial 0.5.0 application, storage, deployment, CI, and release model | Trust boundaries, invariants, abuse cases, and accepted risks documented; open release gates remain fail closed |
 | 2026-08-09 | `5efa3fdf6045753d7754cc98ef9192dfc1373cfa` | Public-repository release and migration from persistent self-hosted CI to ephemeral GitHub-hosted runners | Public visibility is explicitly not release authorization; publication requires public visibility, an authorized exact-main tag, the protected signing environment, pinned inputs, and complete evidence |
 | 2026-08-25 | Unreleased 0.6.0 package implementation | Nine-target native-package distribution, package-bound authenticated updater, per-distro builders and full-system guests, 21-asset release, and withdrawal of 0.5.0 | Archive installation is removed from support; target identity, package database, old/new signed packages, runtime state, and commit-bound package/VM evidence become release and recovery boundaries |
+| 2026-08-30 | Unreleased 0.7.0 monitoring implementation | Instance-wide `monitoring:read` tokens, redacted monitoring routes, schema 7, administrator lifecycle, local revoke-all recovery, and Home Assistant trust boundary | Bearer authentication is confined to two read-only projections; token plaintext and privileged Share fields remain excluded, and older manual restores require global token revocation/reissue before traffic |
 
 ## Review triggers
 

@@ -32,7 +32,7 @@ value() {
 [ "$(value architecture)" = amd64 ] || { echo "soak architecture must be amd64" >&2; exit 1; }
 [ "$(value os_id)" = debian ] || { echo "soak OS must be Debian" >&2; exit 1; }
 [ "$(value os_version_id)" = 13 ] || { echo "soak OS must be Debian 13" >&2; exit 1; }
-[ "$(value expected_version)" = 0.6.0 ] || { echo "soak did not exercise VaultLink 0.6.0" >&2; exit 1; }
+[ "$(value expected_version)" = 0.7.0 ] || { echo "soak did not exercise VaultLink 0.7.0" >&2; exit 1; }
 namespace=$(value namespace)
 case "$namespace" in *[!A-Za-z0-9._-]*|'') echo "soak namespace is unsafe" >&2; exit 1 ;; esac
 namespace_tail=${namespace#"$expected_commit-"}
@@ -106,7 +106,7 @@ if ! grep -F -x -q "SOAK_COMMIT_SHA=$expected_commit" "$unit_env" \
     || ! grep -F -x -q 'SOAK_SECONDS=259200' "$unit_env" \
     || ! grep -F -x -q 'SOAK_INTERVAL_SECONDS=300' "$unit_env" \
     || ! grep -F -x -q 'SOAK_LOAD_INTERVAL_SECONDS=21600' "$unit_env" \
-    || ! grep -F -x -q 'SOAK_EXPECTED_VERSION=0.6.0' "$unit_env" \
+    || ! grep -F -x -q 'SOAK_EXPECTED_VERSION=0.7.0' "$unit_env" \
     || ! grep -F -x -q 'architecture=amd64' "$evidence/candidate.env" \
     || ! grep -F -x -q 'os_id=debian' "$evidence/candidate.env" \
     || ! grep -F -x -q 'os_version_id=13' "$evidence/candidate.env"; then
@@ -132,7 +132,7 @@ for candidate_line in \
     "binary_sha256=$binary_sha256" \
     "orchestration_sha256=$orchestration_sha256" \
     "config_sha256=$config_sha256" \
-    'expected_version=0.6.0' \
+    'expected_version=0.7.0' \
     "health_sha256=$health_sha256"; do
     grep -F -x -q "$candidate_line" "$evidence/candidate.env" \
         || { echo "candidate evidence does not match the soak result" >&2; exit 1; }
@@ -156,7 +156,7 @@ awk -F, -v start="$start" -v end="$unit_deadline" \
     END { if (NR < 2 || end - previous > 360) exit 1 }
 ' "$evidence/metrics.csv" \
     || { echo "soak metrics violate PID, hash, restart, RSS, or integrity thresholds" >&2; exit 1; }
-[ "$(cat "$evidence/health.json")" = '{"ok":true,"version":"0.6.0"}' ] \
+[ "$(cat "$evidence/health.json")" = '{"ok":true,"version":"0.7.0"}' ] \
     || { echo "soak health response is not exact" >&2; exit 1; }
 [ "$(sha256sum "$evidence/health.json" | awk '{print $1}')" = "$health_sha256" ] \
     || { echo "soak health hash mismatch" >&2; exit 1; }

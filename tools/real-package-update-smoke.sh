@@ -773,11 +773,34 @@ cmp -s "$repo_root/deploy/vaultlink-update.sh" "$installed_updater" \
 if ! runuser -u vaultlink -- env \
     VAULTLINK_BIN=/opt/vaultlink/vaultlink \
     VAULTLINK_SMOKE_DIR="$api_work" \
+    VAULTLINK_SMOKE_PRESERVE_SERVICE_TOKEN=1 \
     bash "$repo_root/deploy/docker/api-smoke.sh" \
     >"$work/api-smoke.stdout" 2>"$work/api-smoke.stderr"; then
     tail -n 100 "$work/api-smoke.stderr" >&2
     fail "the installed old package failed the real API smoke"
 fi
+preserved_service_token_file=$api_work/preserved-service-token.secret
+preserved_service_token_id_file=$api_work/preserved-service-token.id
+for preserved_file in "$preserved_service_token_file" \
+    "$preserved_service_token_id_file"; do
+    [ -f "$preserved_file" ] && [ ! -L "$preserved_file" ] \
+        && [ "$(stat -c '%a' "$preserved_file")" = 600 ] \
+        || fail "API smoke did not leave a private service-token preservation fixture"
+done
+IFS= read -r preserved_service_token <"$preserved_service_token_file"
+IFS= read -r preserved_service_token_id <"$preserved_service_token_id_file"
+printf '%s' "$preserved_service_token" \
+    | grep -E -q '^vlk_st_v1_[A-Za-z0-9_-]{43}$' \
+    || fail "service-token preservation fixture has an invalid format"
+case "$preserved_service_token_id" in
+    ''|*[!0-9]*) fail "service-token preservation fixture has an invalid ID" ;;
+esac
+preserved_service_token_hash="$(
+    sqlite3 "$api_work/data/data.sqlite" \
+        "SELECT token_hash FROM service_tokens WHERE id=$preserved_service_token_id;"
+)"
+printf '%s' "$preserved_service_token_hash" | grep -E -q '^[0-9a-f]{64}$' \
+    || fail "service-token preservation fixture has an invalid stored hash"
 install -d -o root -g vaultlink -m 0750 /etc/vaultlink
 install -d -o vaultlink -g vaultlink -m 0750 /var/lib/vaultlink
 sed "s|$api_work/data|/var/lib/vaultlink|g" "$api_work/config.toml" \
@@ -814,6 +837,32 @@ native_database_version() {
     esac
 }
 
+assert_service_token_preserved() {
+    expected_version=$1
+    actual_hash="$(
+        sqlite3 /var/lib/vaultlink/data.sqlite \
+            "SELECT token_hash FROM service_tokens WHERE id=$preserved_service_token_id;"
+    )"
+    [ "$actual_hash" = "$preserved_service_token_hash" ] \
+        || fail "service-token hash changed or disappeared at $expected_version parity"
+    token_status="$(
+        curl --silent --show-error \
+            --output "$work/service-token-parity.json" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $preserved_service_token" \
+            http://127.0.0.1:18081/api/v2/monitoring/summary
+    )"
+    [ "$token_status" = 200 ] \
+        || fail "service token was not authorized at $expected_version parity"
+    grep -F -q "\"version\":\"$expected_version\"" \
+        "$work/service-token-parity.json" \
+        || fail "service-token parity response reported the wrong version"
+    ! grep -aFq -- "$preserved_service_token" "$work/service-token-parity.json" \
+        || fail "service-token parity response echoed the credential"
+    ! grep -aiFq -- 'authorization:' "$work/service-token-parity.json" \
+        || fail "service-token parity response echoed the Authorization header"
+}
+
 assert_parity() {
     parity_version=$1
     [ "$(native_database_version)" = "$(expected_database_version "$parity_version")" ] \
@@ -830,6 +879,7 @@ assert_parity() {
         || fail "service is not active at $parity_version parity"
     [ "$(sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check;')" = ok ] \
         || fail "SQLite integrity failed at $parity_version parity"
+    assert_service_token_preserved "$parity_version"
 }
 
 config_hash=$(sha256sum /etc/vaultlink/config.toml | awk '{ print $1 }')

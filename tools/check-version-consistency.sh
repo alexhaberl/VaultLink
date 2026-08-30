@@ -38,7 +38,7 @@ package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p
     echo "Cargo.toml package version is missing" >&2
     exit 1
 }
-release_version=0.6.0
+release_version=0.7.0
 if [ "$release_candidate" -eq 1 ] || [ -n "$release_tag" ]; then
     [ "$package_version" = "$release_version" ] || {
         echo "release preflight is fixed to $release_version, not $package_version" >&2

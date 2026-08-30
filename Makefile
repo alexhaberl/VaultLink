@@ -13,7 +13,7 @@ PACKAGE_SBOM ?= target/vaultlink.cdx.json
 PACKAGE_OUTPUT ?= dist
 REAL_PACKAGE_TARGET ?= $(PACKAGE_TARGET)
 REAL_PACKAGE_OLD_VERSION ?= $(PACKAGE_VERSION)
-REAL_PACKAGE_NEW_VERSION ?= 0.6.1
+REAL_PACKAGE_NEW_VERSION ?= 0.7.1
 REAL_PACKAGE_BUILDER_IMAGE ?= $(shell $(PYTHON) tools/package-targets.py get "$(REAL_PACKAGE_TARGET)" builder_image 2>/dev/null)
 REAL_PACKAGE_OLD_PACKAGE ?= $(PACKAGE_OUTPUT)/$(shell $(PYTHON) tools/package-targets.py asset "$(REAL_PACKAGE_TARGET)" "$(REAL_PACKAGE_OLD_VERSION)" --allow-unprovisioned 2>/dev/null)
 REAL_PACKAGE_NEW_PACKAGE ?= $(PACKAGE_OUTPUT)/$(shell $(PYTHON) tools/package-targets.py asset "$(REAL_PACKAGE_TARGET)" "$(REAL_PACKAGE_NEW_VERSION)" --allow-unprovisioned 2>/dev/null)
@@ -34,7 +34,17 @@ security-test:
 	cargo test path_security
 	cargo test secure_fs
 	cargo test range
-	cargo test db::tests::fresh_database_is_exactly_schema_four_without_plaintext_secret_columns
+	@set -eu; \
+		fresh_schema_test='db::tests::fresh_database_is_exactly_schema_seven_without_plaintext_secret_columns'; \
+		listed_tests=$$(mktemp); \
+		trap 'rm -f "$$listed_tests"' EXIT HUP INT TERM; \
+		cargo test -- --list >"$$listed_tests"; \
+		match_count=$$(grep -F -x -c "$$fresh_schema_test: test" "$$listed_tests" || true); \
+		test "$$match_count" -eq 1 || { \
+			echo "security-test requires exactly one $$fresh_schema_test test, found $$match_count" >&2; \
+			exit 1; \
+		}; \
+		cargo test "$$fresh_schema_test" -- --exact
 	cargo test proxy
 	cargo test auth
 	@if command -v shellcheck >/dev/null; then shellcheck deploy/*.sh deploy/docker/*.sh packaging/*.sh tools/*.sh; else echo "shellcheck is not installed; skipping script checks"; fi

@@ -159,6 +159,12 @@ pub(super) fn admin_shell(
             super::rendering::NavSection::Admins,
         ),
         (
+            "/admin/service-tokens",
+            i18n::NAV_SERVICE_TOKENS,
+            crate::ui::Icon::Lock,
+            super::rendering::NavSection::ServiceTokens,
+        ),
+        (
             "/admin/settings",
             i18n::NAV_SETTINGS,
             crate::ui::Icon::Settings,

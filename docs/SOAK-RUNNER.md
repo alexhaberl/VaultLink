@@ -168,7 +168,7 @@ commit; changing them afterwards invalidates the evidence.
    amd64 DEB. A status from another commit, an expired/missing artifact, or any
    package/payload/live hash mismatch blocks release.
 
-The monitor rejects restarts, inactive health, non-0.6.0 health responses,
+The monitor rejects restarts, inactive health, non-0.7.0 health responses,
 SQLite integrity failures, error-priority service journal entries, RSS over
 256 MiB, failed load profiles, and a changed executable hash. RSS retention must
 also pass both independent growth checks: the final-hour median may grow from

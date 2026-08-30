@@ -1,4 +1,5 @@
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use std::{
     collections::HashMap,
     future::Future,
@@ -19,6 +20,7 @@ pub const SESSION_COOKIE: &str = "vaultlink_session";
 pub const SECURE_SESSION_COOKIE: &str = "__Host-vaultlink_session";
 pub(crate) const AUDIT_UNAVAILABLE_MESSAGE: &str = "Security audit log temporarily unavailable";
 pub(crate) const ARGON2_BUSY_MESSAGE: &str = "Password processing temporarily unavailable";
+pub(crate) const SERVICE_TOKEN_PREFIX: &str = "vlk_st_v1_";
 const TRANSFER_COOKIE_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 
 tokio::task_local! {
@@ -139,6 +141,8 @@ pub enum HttpAuthErrorKind {
     Request,
     AuditUnavailable,
     CapacityUnavailable,
+    AmbiguousAuthentication,
+    InsufficientScope,
 }
 
 impl HttpAuthError {
@@ -504,6 +508,133 @@ fn session_cookie_name(state: &AppState) -> &'static str {
     }
 }
 
+enum ExactHeader<'a> {
+    Missing,
+    One(&'a str),
+    Malformed,
+    Ambiguous,
+}
+
+fn exact_session_cookie<'a>(state: &AppState, headers: &'a HeaderMap) -> ExactHeader<'a> {
+    let name = session_cookie_name(state);
+    let mut found = None;
+    for header_value in headers.get_all(header::COOKIE) {
+        let Ok(value) = header_value.to_str() else {
+            return ExactHeader::Malformed;
+        };
+        for pair in value.split(';') {
+            let Some((key, value)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            if key != name {
+                continue;
+            }
+            if found.is_some() {
+                return ExactHeader::Ambiguous;
+            }
+            found = Some(value);
+        }
+    }
+    found.map_or(ExactHeader::Missing, ExactHeader::One)
+}
+
+fn exact_authorization(headers: &HeaderMap) -> ExactHeader<'_> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return ExactHeader::Missing;
+    };
+    if values.next().is_some() {
+        return ExactHeader::Ambiguous;
+    }
+    let Ok(value) = value.to_str() else {
+        return ExactHeader::Malformed;
+    };
+    if value.contains(',') {
+        return ExactHeader::Ambiguous;
+    }
+    ExactHeader::One(value)
+}
+
+fn strict_service_token(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 7 || !bytes[..6].eq_ignore_ascii_case(b"Bearer") || bytes[6] != b' ' {
+        return None;
+    }
+    let token = &value[7..];
+    let encoded = token.strip_prefix(SERVICE_TOKEN_PREFIX)?;
+    if encoded.len() != 43
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    let decoded = zeroize::Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded.as_bytes()).ok()?);
+    if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(decoded.as_slice()) != encoded {
+        return None;
+    }
+    Some(token)
+}
+
+/// Authorizes the deliberately narrow monitoring API with exactly one
+/// authentication mechanism. All other administrator routes remain cookie-only.
+pub(crate) async fn authorize_monitoring(state: &AppState, headers: &HeaderMap) -> Result<()> {
+    let cookie = exact_session_cookie(state, headers);
+    let authorization = exact_authorization(headers);
+    match (cookie, authorization) {
+        (ExactHeader::One(_), ExactHeader::One(_) | ExactHeader::Malformed)
+        | (ExactHeader::One(_), ExactHeader::Ambiguous)
+        | (ExactHeader::Ambiguous, _)
+        | (_, ExactHeader::Ambiguous) => Err(HttpAuthError::with_kind(
+            StatusCode::BAD_REQUEST,
+            "Ambiguous authentication",
+            HttpAuthErrorKind::AmbiguousAuthentication,
+        )),
+        (ExactHeader::Malformed, _) | (_, ExactHeader::Malformed) => Err(HttpAuthError::status(
+            StatusCode::UNAUTHORIZED,
+            "Invalid authentication",
+        )),
+        (ExactHeader::One(_), ExactHeader::Missing) => {
+            session(state, headers, true, MissingSession::Unauthorized)
+                .await
+                .map(drop)
+        }
+        (ExactHeader::Missing, ExactHeader::One(value)) => {
+            let token = zeroize::Zeroizing::new(
+                strict_service_token(value)
+                    .ok_or_else(|| {
+                        HttpAuthError::status(StatusCode::UNAUTHORIZED, "Invalid authentication")
+                    })?
+                    .to_owned(),
+            );
+            let outcome = database(state.db.clone(), move |database| {
+                database.authorize_service_token(
+                    token.as_str(),
+                    crate::db::SERVICE_TOKEN_SCOPE_MONITORING_READ,
+                )
+            })
+            .await?;
+            match outcome {
+                crate::db::ServiceTokenAuthorizationOutcome::Authorized { .. } => Ok(()),
+                crate::db::ServiceTokenAuthorizationOutcome::Unauthorized => Err(
+                    HttpAuthError::status(StatusCode::UNAUTHORIZED, "Invalid authentication"),
+                ),
+                crate::db::ServiceTokenAuthorizationOutcome::InsufficientScope => {
+                    Err(HttpAuthError::with_kind(
+                        StatusCode::FORBIDDEN,
+                        "Insufficient token scope",
+                        HttpAuthErrorKind::InsufficientScope,
+                    ))
+                }
+            }
+        }
+        (ExactHeader::Missing, ExactHeader::Missing) => Err(HttpAuthError::status(
+            StatusCode::UNAUTHORIZED,
+            "Authentication required",
+        )),
+    }
+}
+
 pub fn session_cookie<'a>(state: &AppState, headers: &'a HeaderMap) -> Option<&'a str> {
     named_cookie(headers, session_cookie_name(state))
 }
@@ -752,6 +883,54 @@ mod tests {
             HeaderValue::from_static("session=one; other=x"),
         );
         assert_eq!(named_cookie(&single, "session"), Some("one"));
+    }
+
+    #[test]
+    fn service_token_authorization_parser_is_exact_and_canonical() {
+        let encoded = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let token = format!("{SERVICE_TOKEN_PREFIX}{encoded}");
+        let authorization = format!("Bearer {token}");
+        assert_eq!(strict_service_token(&authorization), Some(token.as_str()));
+        assert_eq!(
+            strict_service_token(&format!("bEaReR {token}")),
+            Some(token.as_str())
+        );
+
+        for invalid in [
+            format!("Bearer  {token}"),
+            format!("Bearer {token}="),
+            format!("Bearer {SERVICE_TOKEN_PREFIX}{}", &encoded[..42]),
+            format!("Bearer {SERVICE_TOKEN_PREFIX}{}!", &encoded[..42]),
+        ] {
+            assert_eq!(strict_service_token(&invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn duplicate_authorization_headers_are_invalid() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer one"),
+        );
+        headers.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer two"),
+        );
+        assert!(matches!(
+            exact_authorization(&headers),
+            ExactHeader::Ambiguous
+        ));
+
+        let mut joined = HeaderMap::new();
+        joined.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer one, Bearer two"),
+        );
+        assert!(matches!(
+            exact_authorization(&joined),
+            ExactHeader::Ambiguous
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
