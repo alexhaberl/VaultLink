@@ -59,7 +59,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$APPROVED_COMMIT"
           main_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
           test "$main_commit" = "$APPROVED_COMMIT"
-          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" = 0.6.0
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" = 0.7.0
           python3 tools/package-targets.py validate
           test "$SOAK_TOOL_IMAGE" = \
             "$(python3 tools/package-targets.py get debian13-amd64 builder_image)"
@@ -115,9 +115,9 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --name "vaultlink-release-unsigned-$APPROVED_COMMIT" \
             --dir "$candidate_artifact"
-          sh tools/verify-package-release.sh "$candidate_artifact" 0.6.0
+          sh tools/verify-package-release.sh "$candidate_artifact" 0.7.0
           test "$(find "$candidate_artifact" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 11
-          deb=$(python3 tools/package-targets.py asset debian13-amd64 0.6.0)
+          deb=$(python3 tools/package-targets.py asset debian13-amd64 0.7.0)
           extracted="$RUNNER_TEMP/release-candidate-deb"
           test ! -e "$extracted"
           dpkg-deb -x "$candidate_artifact/$deb" "$extracted"

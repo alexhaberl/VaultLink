@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0 — Unreleased
+
+- Added instance-wide, hash-only `monitoring:read` service tokens with one-time credential display, optional expiry, bounded inventory, throttled last-use tracking, atomic security audits, administrator UI/API management, and a local revoke-all recovery command.
+- Added bearer-authenticated, read-only monitoring endpoints for an instance summary and strictly redacted Share metadata while keeping every existing Share, file, administration, session, public, and HTML route outside the service-token trust boundary.
+- Added schema 7 with transactional migration and validation, monitoring authentication/rate-limit/redaction coverage, and restore guidance requiring token revocation and reissue after an older manual database restore.
+
 ## 0.6.0 — 2026-09-01
 
 - Withdrew the public `v0.5.0` release and archive assets on 2026-08-25 while retaining its annotated tag, commit, workflow evidence, and historical checklist. Version 0.5.0 is unsupported and has no in-place migration path to 0.6.0.

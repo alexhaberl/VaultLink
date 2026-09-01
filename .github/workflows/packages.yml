@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REAL_UPDATE_NEW_VERSION: 0.6.1
+  REAL_UPDATE_NEW_VERSION: 0.7.1
 
 jobs:
   prepare:
@@ -122,8 +122,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$PACKAGE_VERSION" = 0.6.0
-          test "$REAL_UPDATE_NEW_VERSION" = 0.6.1
+          test "$PACKAGE_VERSION" = 0.7.0
+          test "$REAL_UPDATE_NEW_VERSION" = 0.7.1
           test "$(target/release/vaultlink --version)" = "$PACKAGE_VERSION"
           old_binary_sha256=$(sha256sum target/release/vaultlink | awk '{print $1}')
           fixture_source=$(mktemp -d "$RUNNER_TEMP/vaultlink-real-update-source.XXXXXXXX")
@@ -290,8 +290,8 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = '${{ matrix.uname }}'
           old_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          test "$old_version" = 0.6.0
-          test "$REAL_UPDATE_NEW_VERSION" = 0.6.1
+          test "$old_version" = 0.7.0
+          test "$REAL_UPDATE_NEW_VERSION" = 0.7.1
           old_asset=$(python3 tools/package-targets.py asset \
             "$TARGET_ID" "$old_version")
           new_asset=$(python3 tools/package-targets.py asset \

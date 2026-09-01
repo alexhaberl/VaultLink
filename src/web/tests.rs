@@ -1838,7 +1838,7 @@ fn assert_no_mojibake(label: &str, text: &str) {
     }
 }
 
-fn web_production_sources() -> [(&'static str, &'static str); 16] {
+fn web_production_sources() -> [(&'static str, &'static str); 17] {
     [
         ("src/web.rs", include_str!("../web.rs")),
         ("src/web/account.rs", include_str!("account.rs")),
@@ -1854,6 +1854,10 @@ fn web_production_sources() -> [(&'static str, &'static str); 16] {
             include_str!("public_preview.rs"),
         ),
         ("src/web/rendering.rs", include_str!("rendering.rs")),
+        (
+            "src/web/service_tokens.rs",
+            include_str!("service_tokens.rs"),
+        ),
         (
             "src/web/settings_audit.rs",
             include_str!("settings_audit.rs"),
@@ -1985,6 +1989,10 @@ fn post_locale_return_targets_are_get_safe() {
     assert_eq!(
         locale_return_to(&Method::POST, &uri("/admin/admins/42/totp")),
         "/admin/admins"
+    );
+    assert_eq!(
+        locale_return_to(&Method::POST, &uri("/admin/service-tokens/42/revoke")),
+        "/admin/service-tokens"
     );
     assert_eq!(
         locale_return_to(&Method::POST, &uri("/admin/files/delete")),
@@ -2126,11 +2134,18 @@ async fn admin_shell_renders_nav_icons_and_system_panel() {
     })
     .await;
     assert!(html.contains("<title>Dateien · VaultLink</title>"));
-    for label in ["Dateien", "Links", "Admins", "Einstellungen", "Audit"] {
+    for label in [
+        "Dateien",
+        "Links",
+        "Admins",
+        "Service-Tokens",
+        "Einstellungen",
+        "Audit",
+    ] {
         assert!(html.contains(&format!("<span>{label}</span>")));
     }
     assert!(html.contains("vl-icon"));
-    assert_eq!(html.matches(r#"class="vl-nav-link""#).count(), 5);
+    assert_eq!(html.matches(r#"class="vl-nav-link""#).count(), 6);
     assert_eq!(html.matches(r#"aria-current="page""#).count(), 1);
     assert!(!html.contains('📁'));
     assert!(html.contains("VaultLink erreichbar"));
@@ -2456,6 +2471,7 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
         ("/admin/account", true),
         ("/admin/shares", true),
         ("/admin/admins", true),
+        ("/admin/service-tokens", true),
         ("/admin/settings", true),
         ("/admin/audit", true),
         ("/v/locale-public", false),
@@ -2676,7 +2692,14 @@ async fn versioned_assets_are_immutable_and_app_javascript_is_cached_per_locale(
         lang: Some("en".into()),
     }))
     .await;
-    assert!(response_text(english).await.contains("Copied"));
+    let english = response_text(english).await;
+    assert!(english.contains("Copied"));
+    assert!(english.contains("await navigator.clipboard.writeText(b.dataset.copy)"));
+    assert!(english.contains("b.textContent='Copied'"));
+    assert!(english.contains("catch(_){b.textContent='Copy failed'"));
+    assert!(english.contains("addLocalCalendarMonths(new Date(),defaultMonths)"));
+    assert!(english.contains("result.setDate(1);result.setMonth"));
+    assert!(!english.contains("new Date(`${expiry.defaultValue}Z`)"));
 }
 
 #[tokio::test]
@@ -4656,6 +4679,227 @@ async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
         let events = state.db.list_audit(Some(action), 10, 0).unwrap();
         assert_eq!(events[0].client_ip.as_deref(), Some("127.0.0.1"));
     }
+}
+
+#[tokio::test]
+async fn service_token_ui_requires_mfa_reauth_and_shows_secret_only_once() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    let current_password = "current-admin-password";
+    let password_hash = auth::hash_password(current_password).unwrap();
+    state
+        .db
+        .create_admin("admin", &password_hash, "secret")
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "service-token-session",
+            1,
+            "service-token-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    let app = router(state.clone());
+    let cookie =
+        HeaderValue::from_static("vaultlink_locale=en; vaultlink_session=service-token-session");
+
+    let mut before_mfa = request(Method::GET, "/admin/service-tokens", "");
+    before_mfa
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    assert_eq!(
+        app.clone().oneshot(before_mfa).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    state.db.verify_mfa("service-token-session").unwrap();
+    let mut initial_page = request(Method::GET, "/admin/service-tokens", "");
+    initial_page
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let initial_response = app.clone().oneshot(initial_page).await.unwrap();
+    assert_eq!(initial_response.status(), StatusCode::OK);
+    let initial_html = response_text(initial_response).await;
+    assert!(initial_html.contains("Service tokens"));
+    assert!(initial_html.contains("monitoring:read"));
+    assert!(initial_html.contains(r#"type="datetime-local" value="20"#));
+    assert!(initial_html.contains(r#"data-default-expiry-months="12""#));
+    assert!(initial_html.contains(r#"name="no_expiry""#));
+    assert!(initial_html.contains("Without expiration, the token remains valid"));
+
+    let create_body = concat!(
+        "csrf=service-token-csrf&current_password=current-admin-password",
+        "&name=Home+Assistant+%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
+        "&no_expiry=1"
+    );
+    let mut wrong_csrf = request(
+        Method::POST,
+        "/admin/service-tokens",
+        &create_body.replace("service-token-csrf", "wrong-csrf"),
+    );
+    wrong_csrf
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    assert_eq!(
+        app.clone().oneshot(wrong_csrf).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(state.db.list_service_tokens().unwrap().is_empty());
+
+    let mut padded_name = request(
+        Method::POST,
+        "/admin/service-tokens",
+        "csrf=service-token-csrf&current_password=current-admin-password&name=%20Home+Assistant%20&no_expiry=1",
+    );
+    padded_name
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    assert_eq!(
+        app.clone().oneshot(padded_name).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert!(state.db.list_service_tokens().unwrap().is_empty());
+
+    let mut wrong_password = request(
+        Method::POST,
+        "/admin/service-tokens",
+        &create_body.replace("current-admin-password", "wrong-password"),
+    );
+    wrong_password
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    assert_eq!(
+        app.clone().oneshot(wrong_password).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(state.db.list_service_tokens().unwrap().is_empty());
+
+    let mut create = request(Method::POST, "/admin/service-tokens", create_body);
+    create.headers_mut().insert(header::COOKIE, cookie.clone());
+    let created_response = app.clone().oneshot(create).await.unwrap();
+    assert_eq!(created_response.status(), StatusCode::OK);
+    assert_eq!(
+        created_response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+    let created_html = response_text(created_response).await;
+    assert!(created_html.contains("This token is shown only now"));
+    assert!(created_html.contains("Home Assistant"));
+    assert!(created_html.contains("alert(1)"));
+    assert!(!created_html.contains("<script>alert(1)</script>"));
+    assert!(!created_html.contains(r#"action="/locale""#));
+    let token_start = created_html.find("vlk_st_v1_").unwrap();
+    let token_end = created_html[token_start..].find('<').unwrap() + token_start;
+    let plaintext_token = &created_html[token_start..token_end];
+    assert_eq!(plaintext_token.len(), "vlk_st_v1_".len() + 43);
+    assert!(created_html.contains(&format!(r#"data-copy="{plaintext_token}""#)));
+    assert_eq!(
+        state.db.count_audit(Some("service_token_created")).unwrap(),
+        1
+    );
+
+    let tokens = state.db.list_service_tokens().unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].name, "Home Assistant <script>alert(1)</script>");
+    assert!(tokens[0].expires_at.is_none());
+    let token_id = tokens[0].id;
+
+    let mut listing = request(Method::GET, "/admin/service-tokens", "");
+    listing.headers_mut().insert(header::COOKIE, cookie.clone());
+    let listing_html = response_text(app.clone().oneshot(listing).await.unwrap()).await;
+    assert!(listing_html.contains("Home Assistant"));
+    assert!(listing_html.contains("alert(1)"));
+    assert!(listing_html.contains(&format!(r#"data-label="ID">{token_id}</td>"#)));
+    assert!(listing_html.contains("No expiration"));
+    assert!(listing_html.contains(r#"<span class="vl-badge vl-badge--success">Active</span>"#));
+    assert!(!listing_html.contains(plaintext_token));
+    assert!(!listing_html.contains("<script>alert(1)</script>"));
+
+    state.db.expire_service_token_for_test(token_id).unwrap();
+    let mut expired_listing = request(Method::GET, "/admin/service-tokens", "");
+    expired_listing
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let expired_html = response_text(app.clone().oneshot(expired_listing).await.unwrap()).await;
+    assert!(expired_html.contains(r#"<span class="vl-badge vl-badge--warning">Expired</span>"#));
+    assert!(!expired_html.contains(r#"<span class="vl-badge vl-badge--success">Active</span>"#));
+    assert!(!expired_html.contains(plaintext_token));
+
+    let german_cookie =
+        HeaderValue::from_static("vaultlink_locale=de; vaultlink_session=service-token-session");
+    let mut german_listing = request(Method::GET, "/admin/service-tokens", "");
+    german_listing
+        .headers_mut()
+        .insert(header::COOKIE, german_cookie);
+    let german_html = response_text(app.clone().oneshot(german_listing).await.unwrap()).await;
+    assert!(german_html.contains("Instanzweite API-Zugänge"));
+    assert!(german_html.contains("Ohne Ablauf bleibt das Token"));
+    assert!(german_html.contains("Home Assistant"));
+    assert!(german_html.contains("alert(1)"));
+    assert!(!german_html.contains("Without expiration, the token remains valid"));
+    assert!(!german_html.contains("<vl-i18n"));
+
+    state
+        .db
+        .create_admin("revoking-admin", &password_hash, "revoking-secret")
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "revoking-admin-session",
+            2,
+            "revoking-admin-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("revoking-admin-session").unwrap();
+    let revoking_admin_cookie =
+        HeaderValue::from_static("vaultlink_locale=en; vaultlink_session=revoking-admin-session");
+
+    let mut wrong_revoke_csrf = request(
+        Method::POST,
+        &format!("/admin/service-tokens/{token_id}/revoke"),
+        "csrf=wrong-csrf",
+    );
+    wrong_revoke_csrf
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    assert_eq!(
+        app.clone()
+            .oneshot(wrong_revoke_csrf)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(state.db.list_service_tokens().unwrap().len(), 1);
+
+    let mut revoke = request(
+        Method::POST,
+        &format!("/admin/service-tokens/{token_id}/revoke"),
+        "csrf=revoking-admin-csrf",
+    );
+    revoke
+        .headers_mut()
+        .insert(header::COOKIE, revoking_admin_cookie);
+    let revoked = app.clone().oneshot(revoke).await.unwrap();
+    assert_eq!(revoked.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        revoked.headers().get(header::LOCATION).unwrap(),
+        "/admin/service-tokens?notice=revoked"
+    );
+    assert!(state.db.list_service_tokens().unwrap().is_empty());
+    assert_eq!(
+        state.db.count_audit(Some("service_token_revoked")).unwrap(),
+        1
+    );
+    let revoke_events = state
+        .db
+        .list_audit(Some("service_token_revoked"), 10, 0)
+        .unwrap();
+    assert_eq!(revoke_events[0].actor, "revoking-admin");
 }
 
 #[tokio::test]

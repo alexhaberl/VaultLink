@@ -2,7 +2,7 @@
 
 VaultLink is a server-rendered Rust web application that securely exposes an already mounted Linux directory through public download and upload links. Supported host platforms are Linux x86_64 and aarch64; Windows host support was removed in 0.4.1. Windows, macOS, and Linux clients remain interoperable through an external standard SMB server.
 
-Status: `0.6.0` is the current package-only release candidate, planned for 2026-09-01, for Debian 13, Ubuntu 24.04/26.04 LTS, Fedora 44, and an Arch Linux release snapshot. The `v0.5.0` GitHub release and its archive assets were withdrawn on 2026-08-25 and are unsupported; its annotated tag, commit, workflow evidence, and [historical checklist](docs/RELEASE-CHECKLIST.md) remain for audit purposes. There is currently no supported public VaultLink release until the signed `v0.6.0` release is published. See the [package contract](docs/PACKAGING.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), and [changelog](CHANGELOG.md).
+Status: `0.7.0` is the unreleased development line for read-only monitoring integrations and must not be merged or published before the package-only `v0.6.0` candidate planned for 2026-09-01 has been released. There is currently no supported public VaultLink release. The `v0.5.0` GitHub release and its archive assets were withdrawn on 2026-08-25 and are unsupported; its annotated tag, commit, workflow evidence, and [historical checklist](docs/RELEASE-CHECKLIST.md) remain for audit purposes. See the [package contract](docs/PACKAGING.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), and [changelog](CHANGELOG.md).
 
 ## 1. Security model
 
@@ -21,6 +21,7 @@ Application-owned password, TOTP, and Share-secret buffers use a zeroizing wrapp
 - Uploads are written to random `0600` temporary files in protected internal staging, flushed and synced, then atomically published with `renameat2(RENAME_NOREPLACE)`. With `external_writers = true`, overwrite remains disabled by default in the UI, API, and upload path. The separate `allow_external_writer_replace = true` opt-in accepts last-writer-wins behavior and its risk of losing a newer parallel SMB change.
 - Abandoned upload fragments and only committed delete tombstones are removed in resumable background batches. Uncommitted deletes and rollback conflicts remain recovery entries instead of risking data loss at restart.
 - Administrator passwords use Argon2id. Password verification is followed by TOTP or a registered WebAuthn/FIDO2 security key such as a YubiKey. Sessions are random server-side bearer tokens whose hashes are stored in SQLite; `session_hours` is the absolute cap and `session_idle_minutes` defaults to a 30-minute inactivity limit.
+- Instance-wide service tokens are restricted to the fixed `monitoring:read` scope. VaultLink stores only a SHA-256 hash, displays the random token once, accepts it only in the `Authorization` header on the two monitoring routes, and never grants it access to existing Share, file, administration, session, public, or HTML routes.
 - Cookies are `HttpOnly`, `SameSite=Strict`, and `Secure` in production.
 - Mutating administrator actions require CSRF. Login and Share unlock are rate-limited. Login counters are process-local; reverse-proxy or network limits are still required for volumetric attacks.
 - In reverse-proxy mode, `trusted_proxies` is an exact TCP-peer allowlist. Forwarded headers are evaluated only for those peers.
@@ -72,11 +73,11 @@ VaultLink/
 
 ## 3. Data and persistence
 
-SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and crash-safe transactions. WAL is enabled. Core tables include `admins`, `sessions`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `public_upload_usage`, `public_upload_reservations`, `runtime_settings`, `audit`, `transfer_monthly_counts`, `transfer_statistics`, `admin_mfa_enrollments`, `admin_webauthn_credentials`, `admin_totp_replay`, `vaultlink_schema`, and `vaultlink_schema_migrations`.
+SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and crash-safe transactions. WAL is enabled. Core tables include `admins`, `sessions`, `service_tokens`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `public_upload_usage`, `public_upload_reservations`, `runtime_settings`, `audit`, `transfer_monthly_counts`, `transfer_statistics`, `admin_mfa_enrollments`, `admin_webauthn_credentials`, `admin_totp_replay`, `vaultlink_schema`, and `vaultlink_schema_migrations`.
 
 `shares.max_upload_size` is the optional per-file limit; `NULL` uses the global runtime limit. Upload shares also have cumulative `max_upload_total_size` and `max_upload_files` limits, with baseline defaults of 100,000,000,000 bytes and 1,000 fail-closed accounted files. Byte and file usage is recorded atomically before visible publication; if publication later fails, quota use deliberately remains so a visible file can never be unaccounted.
 
-Fresh installations create schema 6 and version-2 through version-6 migration records. Valid schema-1 through schema-5 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, and schema 6 applies the centralized audit policy to existing upload-related records. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
+Fresh installations create schema 7 and version-2 through version-7 migration records. Valid schema-1 through schema-6 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, and schema 7 adds hash-only monitoring service tokens. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
 
 The database defaults to `/var/lib/vaultlink/data.sqlite`; its required matching keyring is `/var/lib/vaultlink/secrets.keyring`. Both must be owned by `vaultlink:vaultlink` with mode `0600`. The database contains encrypted secrets, but the matching keyring can decrypt them, so the pair and every complete backup are production credentials.
 
@@ -157,7 +158,7 @@ Audited co-writer mode requires:
 - `allow_external_writer_replace = true` explicitly accepts last-writer-wins lost-update risk.
 - The SMB server must require SMB 3.1.1 signing and encryption for every direct client session; VaultLink's `seal` protects only its own Linux mount.
 
-Other network filesystems with external writers are not approved in 0.6.0. Runtime-editable settings under `/admin/settings` include `public_base_url`, upload limits, blocked extensions, Share-password policy, unlock duration, ZIP/search/text/media preview limits and extensions, and PDF-preview status. Server mode, bind address, TLS paths, trusted proxies, storage paths, and ACME mode remain file/restart based.
+Other network filesystems with external writers are not approved in 0.7.0. Runtime-editable settings under `/admin/settings` include `public_base_url`, upload limits, blocked extensions, Share-password policy, unlock duration, ZIP/search/text/media preview limits and extensions, and PDF-preview status. Server mode, bind address, TLS paths, trusted proxies, storage paths, and ACME mode remain file/restart based.
 
 ## 5. Routes and API design
 
@@ -173,6 +174,7 @@ Other network filesystems with external writers are not approved in 0.6.0. Runti
 | `/admin/preview`, `/admin/preview/raw` | GET/HEAD | administrator preview page/raw media |
 | `/admin/shares` | GET/POST | list and create Shares |
 | `/admin/admins` | GET/POST | list and create administrators |
+| `/admin/service-tokens` | GET/POST | list/create monitoring tokens and revoke them through the per-token POST route |
 | `/admin/settings`, `/admin/audit` | GET/POST | runtime settings and audit |
 | `/v/:token`, `/s/:alias` | GET | public Share landing page |
 | `/v/:token/unlock` | POST | unlock a password-protected Share |
@@ -181,7 +183,9 @@ Other network filesystems with external writers are not approved in 0.6.0. Runti
 
 `max_downloads` counts completed content transfers (download, ZIP, counted preview), not public metadata/landing requests or uploads. `HEAD` returns metadata only when the equivalent `GET` could begin under the current transfer session and does not itself consume quota.
 
-The session-based JSON API under `/api/v2` uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Version 0.6.0 intentionally has no API tokens. Mutating administrator API routes require `X-CSRF-Token`. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
+The JSON API under `/api/v2` normally uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Mutating administrator API routes require `X-CSRF-Token`. The only bearer-token exception is read-only access to `/api/v2/monitoring/summary` and `/api/v2/monitoring/shares` with an instance-wide `monitoring:read` token. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
+
+Bearer authentication is deliberately narrow: send exactly one `Authorization: Bearer <token>` header, never a query parameter or cookie. Supplying both an administrator session cookie and a bearer credential is rejected as ambiguous. Unknown, expired, and revoked credentials share the same `401 unauthorized` response; missing scope is `403 insufficient_scope`; the monitoring limit is 120 requests per effective client IP per minute and `429` includes `Retry-After`. VaultLink does not enable CORS for these routes. Successful polling reads are not written to the audit log.
 
 After `/api/v2/session/mfa`, clients must retain both the rotated `Set-Cookie` value and returned `csrf_token`; the pre-MFA token becomes invalid. Before a password-protected Share is unlocked, public metadata returns only `{"locked":true}`. The unlock response returns an upload CSRF token sent as multipart field `csrf` by browser forms or `X-VaultLink-Upload-CSRF` by API clients.
 
@@ -195,6 +199,9 @@ Important API routes:
 | `/api/v2/session/login`, `/mfa`, `/logout`, `/me` | GET/POST | session lifecycle |
 | `/api/v2/files` | GET/PATCH/DELETE | JSON file browser and mutations |
 | `/api/v2/shares`, `/api/v2/shares/:id` | GET/POST/PATCH/DELETE | Share lifecycle |
+| `/api/v2/monitoring/summary` | GET | redacted instance, Share, transfer, and storage summary; MFA session or `monitoring:read` token |
+| `/api/v2/monitoring/shares` | GET | redacted, cursor-paginated Share monitoring data; MFA session or `monitoring:read` token |
+| `/api/v2/service-tokens`, `/api/v2/service-tokens/:id` | GET/POST/DELETE | MFA/CSRF administrator-only token lifecycle; plaintext is returned only by create |
 | `/api/v2/admins` | GET/POST | administrator lifecycle |
 | `/api/v2/settings` | GET/PUT | runtime settings |
 | `/api/v2/audit` | GET | paginated audit events |
@@ -218,6 +225,8 @@ JSON errors have this envelope:
 ```
 
 Internal absolute paths, password hashes, session/unlock/preview/transfer hashes, and TOTP secrets are not returned. TOTP secrets are shown once after administrator creation or MFA reset.
+
+Create service tokens from **Administration → Service tokens**. Names are trimmed and unique, the inventory is capped at 64 entries including expired entries, and the default UI expiry is one year. An unlimited token requires the explicit no-expiry warning option. Store the one-time value in the monitoring client's secret store and rotate it by creating a replacement, updating the client, and revoking the old entry. The complete response and authentication contract is in [docs/MONITORING-API.md](docs/MONITORING-API.md). Home Assistant belongs in the separate `alexhaberl/vaultlink-home-assistant` HACS repository; no integration code is bundled with VaultLink.
 
 All three health routes are unauthenticated. Liveness does not touch SQLite or storage. Readiness returns `503` with `{"ok":false,"version":"..."}` when either dependency is unavailable, while details are written only to structured logs. Operators and orchestrators should use `/health/live` for liveness and `/health/ready` for traffic admission and upgrade checks.
 
@@ -297,7 +306,7 @@ Test first with `letsencrypt_staging = true` and `hsts_enabled = false`. For pro
 
 ## 8. Native package deployment
 
-VaultLink 0.6.0 supports only the exact native packages listed in
+VaultLink 0.7.0 supports only the exact native packages listed in
 [docs/PACKAGING.md](docs/PACKAGING.md): Debian 13 and Ubuntu 24.04/26.04 on
 amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch snapshot on
 x86_64. Install the matching package from the GitHub release after verifying
@@ -306,10 +315,10 @@ both its direct Minisign signature and its digest in the signed global
 
 ```sh
 # Set PACKAGE to exactly one matching release asset, for example
-# vaultlink_0.6.0-1+deb13_amd64.deb,
-# vaultlink_0.6.0-1+ubuntu24.04_arm64.deb,
-# vaultlink-0.6.0-1.fc44.x86_64.rpm, or
-# vaultlink-0.6.0-1-x86_64.pkg.tar.zst.
+# vaultlink_0.7.0-1+deb13_amd64.deb,
+# vaultlink_0.7.0-1+ubuntu24.04_arm64.deb,
+# vaultlink-0.7.0-1.fc44.x86_64.rpm, or
+# vaultlink-0.7.0-1-x86_64.pkg.tar.zst.
 : "${PACKAGE:?set PACKAGE to the exact asset for this host}"
 # Obtain minisign.pub through a separately trusted copy of this repository;
 # its key ID is EC6AEC772F7CDDEC.
@@ -318,7 +327,7 @@ PUBLIC_KEY=/path/to/trusted/minisign.pub
 # Freeze every input in one root-only staging directory *before* verification.
 # PACKAGE must be a basename, not a path containing '/'.
 case "$PACKAGE" in */*|'') exit 64 ;; esac
-STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.6.0.XXXXXXXX)
+STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.7.0.XXXXXXXX)
 test "$(sudo stat -c '%u:%g:%a' "$STAGE")" = 0:0:700
 sudo install -o root -g root -m 0600 \
   "$PACKAGE" "$PACKAGE.minisig" SHA256SUMS SHA256SUMS.minisig \
@@ -405,7 +414,7 @@ package-bound installation marker, and places the initial runtime under
 `/opt/vaultlink`. It never creates or overwrites a production `config.toml` and
 does not enable or start the service or updater timer. Existing markerless
 archive installations are rejected; the withdrawn 0.5.0 archive has no
-supported in-place upgrade path to 0.6.0.
+supported in-place adoption path into the native 0.6.0-and-newer release line.
 
 Adjust `ReadWritePaths=/mnt/storage` with a systemd drop-in when using another
 validated mount base. Packaged examples include the equivalent of
@@ -554,6 +563,18 @@ sudo -u vaultlink /opt/vaultlink/vaultlink recover-admin \
 ```
 
 Recovery revokes the administrator's sessions and pending MFA enrollments and writes an audit event without credentials. It does not reactivate a deactivated administrator. There is intentionally no public password/MFA reset endpoint.
+
+### Service-token recovery
+
+With VaultLink stopped, a host administrator can atomically revoke every monitoring token. The mandatory `--all` flag prevents accidental invocation; stdout contains only the revoked count:
+
+```sh
+sudo -u vaultlink /opt/vaultlink/vaultlink revoke-all-service-tokens \
+  --config /etc/vaultlink/config.toml \
+  --all
+```
+
+Use `--database /var/lib/vaultlink/data.sqlite` instead of `--config` only when configuration resolution is unavailable. An older manual database restore can resurrect a token that was revoked after the backup: keep traffic stopped, run this command, issue replacement tokens, update every monitoring client, and only then reopen traffic. Normal verified upgrade rollback does not revoke tokens automatically.
 
 ## 9. Linux development
 

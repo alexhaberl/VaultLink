@@ -111,7 +111,7 @@ if [ ! -s "$destination/result.env" ]; then
         "architecture=$architecture" \
         "os_id=$os_id" \
         "os_version_id=$os_version_id" \
-        'expected_version=0.6.0' \
+        'expected_version=0.7.0' \
         "start_epoch=$start_epoch" \
         "end_epoch=$end_epoch" \
         "duration_seconds=$duration_seconds" \

@@ -94,6 +94,10 @@ const pad=n=>String(n).padStart(2,'0');
 function fillSelect(select,from,to,current){select.innerHTML='';for(let i=from;i<=to;i++){const o=document.createElement('option');o.value=String(i);o.textContent=String(i).padStart(select.dataset.pad||0,'0');if(i===current)o.selected=true;select.appendChild(o);}}
 function daysInMonth(y,m){return new Date(y,m,0).getDate();}
 function initDateTimePicker(picker){const input=picker.querySelector('[data-datetime-input]');const pop=picker.querySelector('[data-datetime-popover]');const toggle=picker.querySelector('[data-datetime-toggle]');const year=picker.querySelector('[data-dt-year]');const month=picker.querySelector('[data-dt-month]');const day=picker.querySelector('[data-dt-day]');const hour=picker.querySelector('[data-dt-hour]');const minute=picker.querySelector('[data-dt-minute]');const now=new Date();fillSelect(year,now.getFullYear(),now.getFullYear()+5,now.getFullYear());fillSelect(month,1,12,now.getMonth()+1);fillSelect(hour,0,23,23);fillSelect(minute,0,59,0);function syncDays(){const selected=Number(day.value)||now.getDate();fillSelect(day,1,daysInMonth(Number(year.value),Number(month.value)),Math.min(selected,daysInMonth(Number(year.value),Number(month.value))))}function setOpen(open){pop.hidden=!open;toggle.setAttribute('aria-expanded',String(open));if(open)year.focus();}syncDays();[year,month].forEach(s=>s.addEventListener('change',syncDays));toggle.addEventListener('click',()=>setOpen(pop.hidden));picker.addEventListener('keydown',e=>{if(e.key==='Escape'){setOpen(false);toggle.focus();}});picker.querySelector('[data-datetime-apply]').addEventListener('click',()=>{const date=document.documentElement.lang==='de'?`${pad(day.value)}.${pad(month.value)}.${year.value}`:`${year.value}-${pad(month.value)}-${pad(day.value)}`;input.value=`${date} ${pad(hour.value)}:${pad(minute.value)}`;setOpen(false);});picker.querySelector('[data-datetime-clear]').addEventListener('click',()=>{input.value='';setOpen(false);});}
+function localDateTimeValue(date){return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;}
+function addLocalCalendarMonths(date,months){const result=new Date(date.getTime());const originalDay=result.getDate();result.setDate(1);result.setMonth(result.getMonth()+months);result.setDate(Math.min(originalDay,daysInMonth(result.getFullYear(),result.getMonth()+1)));return result;}
+function selectedLocalOffset(input){const value=input?.value.trim()||'';let match=value.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2})?$/);let parts;if(match)parts=match.slice(1).map(Number);else{match=value.match(/^(\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2})$/);if(match)parts=[Number(match[3]),Number(match[2]),Number(match[1]),Number(match[4]),Number(match[5])];}if(!parts)return new Date().getTimezoneOffset();const [year,month,day,hour,minute]=parts;const selected=new Date(year,month-1,day,hour,minute);if(selected.getFullYear()!==year||selected.getMonth()!==month-1||selected.getDate()!==day||selected.getHours()!==hour||selected.getMinutes()!==minute)return new Date().getTimezoneOffset();return selected.getTimezoneOffset();}
+function initOptionalExpiry(form){const noExpiry=form.querySelector('[data-no-expiry]');const expiry=form.querySelector('[data-expiry-input]');if(!noExpiry||!expiry)return;const defaultMonths=Number(expiry.dataset.defaultExpiryMonths);if(expiry.value===expiry.defaultValue&&Number.isInteger(defaultMonths)&&defaultMonths>0)expiry.value=localDateTimeValue(addLocalCalendarMonths(new Date(),defaultMonths));const sync=()=>{expiry.disabled=noExpiry.checked;expiry.required=!noExpiry.checked;};noExpiry.addEventListener('change',sync);sync();}
 function initDeleteConfirmation(form){const input=form.querySelector('[data-confirm-input]');const button=form.querySelector('[data-confirm-delete]');if(!input||!button)return;const sync=()=>{button.disabled=input.value!==form.dataset.requiredName;};input.addEventListener('input',sync);sync();input.focus();}
 document.addEventListener('click',e=>{document.querySelectorAll('[data-datetime-picker]').forEach(p=>{if(!p.contains(e.target)){const pop=p.querySelector('[data-datetime-popover]');const toggle=p.querySelector('[data-datetime-toggle]');if(pop)pop.hidden=true;if(toggle)toggle.setAttribute('aria-expanded','false');}});});
 function initFileSelection(){const bar=document.querySelector('[data-selection-bar]');const link=bar?.querySelector('[data-selection-share]');const name=bar?.querySelector('[data-selection-name]');if(!bar||!link||!name)return;document.querySelectorAll('[data-file-select]').forEach(input=>input.addEventListener('change',()=>{if(!input.checked)return;name.textContent=`${input.value||'/'} <vl-i18n key="files.selected"/>`;link.href=`/admin/shares/new?path=${encodeURIComponent(input.value)}`;bar.hidden=false;}));}
@@ -109,8 +113,8 @@ function initSecurityKeyLogin(){const button=document.querySelector('[data-secur
 function initSecurityKeyRegistration(){const form=document.querySelector('[data-security-key-register]');if(!form)return;const status=form.querySelector('[data-security-key-status]');form.addEventListener('submit',async event=>{event.preventDefault();const button=form.querySelector('button');button.disabled=true;status.textContent='<vl-i18n key="auth.security_key_wait"/>';const label=form.elements.label.value.trim();try{ensureWebauthnAvailable();const options=webauthnOptions(await webauthnPost('/admin/account/security-keys/register/start',{csrf:form.dataset.csrf,current_password:form.elements.current_password.value,label}));const credential=await navigator.credentials.create(options);const result=await webauthnPost('/admin/account/security-keys/register/finish',{csrf:form.dataset.csrf,label,credential:webauthnCredential(credential)});location.assign(result.redirect);}catch(error){status.textContent=webauthnFailureMessage(error);button.disabled=false;}});}
 function initFieldInfoTooltips(){const triggers=[...document.querySelectorAll('.vl-field-info')];if(triggers.length===0)return;const position=trigger=>{const tooltip=trigger.querySelector('.vl-field-tooltip');if(!tooltip)return;const triggerRect=trigger.getBoundingClientRect();const tooltipRect=tooltip.getBoundingClientRect();const margin=16;const halfWidth=tooltipRect.width/2;const left=Math.max(margin+halfWidth,Math.min(window.innerWidth-margin-halfWidth,triggerRect.left+triggerRect.width/2));let top=triggerRect.bottom+8;if(top+tooltipRect.height>window.innerHeight-margin&&triggerRect.top-tooltipRect.height-8>=margin)top=triggerRect.top-tooltipRect.height-8;tooltip.style.setProperty('--vl-tooltip-left',`${left}px`);tooltip.style.setProperty('--vl-tooltip-top',`${top}px`);};const close=except=>{for(const trigger of triggers){if(trigger===except)continue;trigger.classList.remove('is-open');trigger.setAttribute('aria-expanded','false');}};for(const trigger of triggers){trigger.setAttribute('aria-expanded','false');trigger.addEventListener('pointerenter',()=>position(trigger));trigger.addEventListener('focus',()=>position(trigger));trigger.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();position(trigger);const open=!trigger.classList.contains('is-open');close(trigger);trigger.classList.toggle('is-open',open);trigger.setAttribute('aria-expanded',String(open));trigger.focus();});trigger.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();trigger.click();}else if(event.key==='Escape'){trigger.classList.remove('is-open');trigger.setAttribute('aria-expanded','false');trigger.blur();}});trigger.addEventListener('blur',()=>{trigger.classList.remove('is-open');trigger.setAttribute('aria-expanded','false');});}document.addEventListener('click',()=>close());window.addEventListener('resize',()=>triggers.filter(trigger=>trigger.matches(':hover, :focus')||trigger.classList.contains('is-open')).forEach(position));window.addEventListener('scroll',()=>triggers.filter(trigger=>trigger.matches(':hover, :focus')||trigger.classList.contains('is-open')).forEach(position),true);}
 function initLocalTimes(){const locale=document.documentElement.lang||undefined;const formatter=new Intl.DateTimeFormat(locale,{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});document.querySelectorAll('time[data-local-time]').forEach(time=>{const date=new Date(time.dateTime);if(!Number.isNaN(date.getTime()))time.textContent=formatter.format(date);});}
-document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);initFileSelection();initShareReview();initSecurityKeyLogin();initSecurityKeyRegistration();initFieldInfoTooltips();initLocalTimes();});
-document.addEventListener('submit',e=>{e.target.querySelectorAll('[data-tz-offset]').forEach(i=>{i.value=String(new Date().getTimezoneOffset())})});"#,
+document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-datetime-picker]').forEach(initDateTimePicker);document.querySelectorAll('[data-optional-expiry]').forEach(initOptionalExpiry);document.querySelectorAll('[data-delete-confirmation]').forEach(initDeleteConfirmation);initFileSelection();initShareReview();initSecurityKeyLogin();initSecurityKeyRegistration();initFieldInfoTooltips();initLocalTimes();});
+document.addEventListener('submit',e=>{const source=e.target.querySelector('[data-expiry-input],[data-datetime-input]');const offset=selectedLocalOffset(source);e.target.querySelectorAll('[data-tz-offset]').forEach(i=>{i.value=String(offset)})});"#,
         crate::ui::UPLOAD_QUEUE_JAVASCRIPT
     );
         [
@@ -248,6 +252,7 @@ pub(super) enum NavSection {
     Files,
     Links,
     Admins,
+    ServiceTokens,
     Settings,
     Audit,
 }
@@ -263,6 +268,8 @@ pub(super) enum PageId {
     Admins,
     AdminCreated,
     MfaReset,
+    ServiceTokens,
+    ServiceTokenCreated,
     Settings,
     AuditSecurity,
 }
@@ -279,6 +286,8 @@ impl PageId {
             Self::Admins => i18n::NAV_ADMINS,
             Self::AdminCreated => i18n::TITLE_ADMIN_CREATED,
             Self::MfaReset => i18n::TITLE_MFA_RESET,
+            Self::ServiceTokens => i18n::NAV_SERVICE_TOKENS,
+            Self::ServiceTokenCreated => i18n::SERVICE_TOKEN_CREATED_TITLE,
             Self::Settings => i18n::NAV_SETTINGS,
             Self::AuditSecurity => i18n::TITLE_AUDIT_SECURITY,
         }
@@ -290,6 +299,7 @@ impl PageId {
             Self::Files | Self::Preview | Self::DeleteConfirm => Some(NavSection::Files),
             Self::Links | Self::CreateLink => Some(NavSection::Links),
             Self::Admins | Self::AdminCreated | Self::MfaReset => Some(NavSection::Admins),
+            Self::ServiceTokens | Self::ServiceTokenCreated => Some(NavSection::ServiceTokens),
             Self::Settings => Some(NavSection::Settings),
             Self::AuditSecurity => Some(NavSection::Audit),
         }

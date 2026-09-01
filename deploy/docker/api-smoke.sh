@@ -15,6 +15,9 @@ SETUP_LOG="$WORK_DIR/setup.log"
 APP_LOG="$WORK_DIR/app.log"
 SETUP_RESPONSE="$WORK_DIR/setup-response.html"
 ADMIN_PASSWORD="VaultLink api smoke password 123!"
+PRESERVE_SERVICE_TOKEN="${VAULTLINK_SMOKE_PRESERVE_SERVICE_TOKEN:-0}"
+[[ "$PRESERVE_SERVICE_TOKEN" == "0" || "$PRESERVE_SERVICE_TOKEN" == "1" ]] \
+    || { echo "VAULTLINK_SMOKE_PRESERVE_SERVICE_TOKEN must be 0 or 1" >&2; exit 64; }
 
 cleanup() {
     if [[ -n "${SETUP_PID:-}" ]] && kill -0 "$SETUP_PID" 2>/dev/null; then
@@ -28,18 +31,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
+redact_failure_log() {
+    python3 -c '
+import re
+import sys
+
+service_token = re.compile(r"vlk_st_v1_[A-Za-z0-9_-]{43}")
+setup_token = re.compile(r"(?i)([#?&]token=)[^&#\s\"<>]+")
+bearer_value = re.compile(r"(?i)\bBearer[ \t]+[A-Za-z0-9._~+/-]+=*")
+for line in sys.stdin:
+    if re.search(r"authorization", line, re.IGNORECASE):
+        sys.stdout.write("[REDACTED AUTHORIZATION LOG LINE]\n")
+        continue
+    line = service_token.sub("[REDACTED SERVICE TOKEN]", line)
+    line = setup_token.sub(r"\1[REDACTED]", line)
+    line = bearer_value.sub("Bearer [REDACTED]", line)
+    sys.stdout.write(line)
+'
+}
+
 fail() {
-    echo "API smoke failed: $*" >&2
+    printf 'API smoke failed: %s\n' "$*" | redact_failure_log >&2
     if [[ -f "$SETUP_LOG" ]]; then
         echo "--- setup log ---" >&2
-        # The setup log contains the one-time bootstrap URL. Keep the
-        # surrounding diagnostics, but never copy its bearer token into CI
-        # output or an uploaded failure artifact.
-        tail -n 80 "$SETUP_LOG" | sed '/#token=/d' >&2 || true
+        tail -n 80 "$SETUP_LOG" | redact_failure_log >&2 || true
     fi
     if [[ -f "$APP_LOG" ]]; then
         echo "--- app log ---" >&2
-        tail -n 120 "$APP_LOG" >&2 || true
+        tail -n 120 "$APP_LOG" | redact_failure_log >&2 || true
     fi
     exit 1
 }
@@ -118,6 +137,90 @@ expected = "{\"ok\":true,\"version\":" + json.dumps(
 if raw != expected:
     raise SystemExit("health JSON is not in the handler compact response form")
 '
+}
+
+assert_monitoring_summary_json() {
+    python3 -c '
+import json
+import sys
+
+response = json.load(sys.stdin)
+if set(response) != {"generated_at", "version", "shares", "transfers", "storage"}:
+    raise SystemExit("monitoring summary has unexpected top-level fields")
+if response["version"] != "0.7.0":
+    raise SystemExit("monitoring summary returned the wrong version")
+if set(response["shares"]) != {
+    "total", "available", "inactive", "expired",
+    "download_limit_reached", "protected",
+}:
+    raise SystemExit("monitoring summary has unexpected Share fields")
+if set(response["transfers"]) != {
+    "month", "download", "zip_download", "preview", "statistics_started_at",
+}:
+    raise SystemExit("monitoring summary has unexpected transfer fields")
+if response["storage"] is not None and set(response["storage"]) != {
+    "free_bytes", "total_bytes",
+}:
+    raise SystemExit("monitoring summary has unexpected storage fields")
+if response["shares"]["total"] < 1:
+    raise SystemExit("monitoring summary did not count created Shares")
+'
+}
+
+assert_monitoring_shares_json() {
+    python3 -c '
+import json
+import sys
+
+response = json.load(sys.stdin)
+if set(response) != {"generated_at", "shares", "next_cursor"}:
+    raise SystemExit("monitoring Share page has unexpected top-level fields")
+allowed = {
+    "id", "status", "permission", "is_directory", "password_protected",
+    "created_at", "expires_at", "download_count", "max_downloads",
+    "max_upload_size_bytes", "uploaded_bytes", "max_upload_total_size_bytes",
+    "uploaded_files", "max_upload_files",
+}
+if not response["shares"]:
+    raise SystemExit("monitoring Share page is empty after Share creation")
+for share in response["shares"]:
+    if set(share) != allowed:
+        raise SystemExit("monitoring Share contains missing or unredacted fields")
+'
+}
+
+assert_monitoring_secrets_redacted() {
+    local artifact payload secret
+    local -a artifacts
+    shopt -s nullglob
+    artifacts=(
+        "$WORK_DIR"/*.json
+        "$WORK_DIR"/*.headers
+        "$WORK_DIR"/*.html
+        "$SETUP_LOG"
+        "$APP_LOG"
+    )
+    shopt -u nullglob
+    for artifact in "${artifacts[@]}"; do
+        [[ -f "$artifact" ]] || continue
+        for secret in "$SERVICE_TOKEN" "$INVALID_SERVICE_TOKEN" \
+            "${PRESERVED_SERVICE_TOKEN:-}"; do
+            [[ -z "$secret" ]] || ! grep -aFq -- "$secret" "$artifact" \
+                || fail "monitoring credential leaked into $(basename "$artifact")"
+        done
+        ! grep -aiFq -- 'authorization:' "$artifact" \
+            || fail "Authorization header marker leaked into $(basename "$artifact")"
+    done
+    for payload in "${SERVICE_TOKEN_LIST:-}" "${MONITORING_SUMMARY:-}" \
+        "${MONITORING_SHARES:-}" "${PRESERVED_MONITORING_SUMMARY:-}"; do
+        for secret in "$SERVICE_TOKEN" "$INVALID_SERVICE_TOKEN" \
+            "${PRESERVED_SERVICE_TOKEN:-}"; do
+            [[ -z "$secret" ]] || [[ "$payload" != *"$secret"* ]] \
+                || fail "monitoring response echoed a credential"
+        done
+        [[ "${payload,,}" != *"authorization:"* ]] \
+            || fail "monitoring response echoed an Authorization header marker"
+    done
 }
 
 rm -rf "$WORK_DIR"
@@ -359,9 +462,104 @@ UPLOAD_STATUS="$(
 [[ "$UPLOAD_STATUS" == "415" ]] || fail "blocked upload returned $UPLOAD_STATUS instead of 415"
 assert_json_error "$WORK_DIR/upload-error.json" "unsupported_media_type"
 
+SERVICE_TOKEN_RESULT="$(
+    curl -sS -D "$WORK_DIR/service-token-create.headers" -w $'\n%{http_code}' \
+        -b "$COOKIE_JAR" \
+        -H "content-type: application/json" \
+        -H "x-csrf-token: $CSRF" \
+        -X POST "http://$APP_ADDR/api/v2/service-tokens" \
+        -d "{\"name\":\"Home Assistant smoke\",\"expires_at\":null,\"current_password\":\"$ADMIN_PASSWORD\"}"
+)"
+SERVICE_TOKEN_CREATE_STATUS="${SERVICE_TOKEN_RESULT##*$'\n'}"
+SERVICE_TOKEN_JSON="${SERVICE_TOKEN_RESULT%$'\n'*}"
+[[ "$SERVICE_TOKEN_CREATE_STATUS" == "201" ]] \
+    || fail "service-token create returned $SERVICE_TOKEN_CREATE_STATUS instead of 201"
+grep -qi '^cache-control: no-store' "$WORK_DIR/service-token-create.headers" \
+    || fail "one-time service-token response was cacheable"
+SERVICE_TOKEN="$(printf '%s' "$SERVICE_TOKEN_JSON" | json_get token)"
+SERVICE_TOKEN_ID="$(printf '%s' "$SERVICE_TOKEN_JSON" | json_get id)"
+[[ -n "$SERVICE_TOKEN" && "$SERVICE_TOKEN_ID" =~ ^[1-9][0-9]*$ ]] \
+    || fail "service-token create did not return one-time token metadata"
+
+SERVICE_TOKEN_LIST="$(
+    curl -sS -f -b "$COOKIE_JAR" \
+        "http://$APP_ADDR/api/v2/service-tokens"
+)"
+printf '%s' "$SERVICE_TOKEN_LIST" | grep -q '"scope":"monitoring:read"' \
+    || fail "service-token list omitted the monitoring scope"
+if printf '%s' "$SERVICE_TOKEN_LIST" | grep -Fq "$SERVICE_TOKEN" \
+    || printf '%s' "$SERVICE_TOKEN_LIST" | grep -q '"token"[[:space:]]*:'; then
+    fail "service-token list disclosed token plaintext"
+fi
+
+MONITORING_SUMMARY="$(
+    curl -sS -f -H "Authorization: bEaReR $SERVICE_TOKEN" \
+        "http://$APP_ADDR/api/v2/monitoring/summary"
+)"
+printf '%s' "$MONITORING_SUMMARY" | assert_monitoring_summary_json \
+    || fail "monitoring summary contract failed"
+MONITORING_SHARES="$(
+    curl -sS -f -H "Authorization: Bearer $SERVICE_TOKEN" \
+        "http://$APP_ADDR/api/v2/monitoring/shares?limit=200&status=all"
+)"
+printf '%s' "$MONITORING_SHARES" | assert_monitoring_shares_json \
+    || fail "redacted monitoring Share contract failed"
+
+MIXED_AUTH_STATUS="$(
+    curl -sS -o "$WORK_DIR/mixed-auth.json" -w '%{http_code}' \
+        -b "$COOKIE_JAR" -H "Authorization: Bearer $SERVICE_TOKEN" \
+        "http://$APP_ADDR/api/v2/monitoring/summary"
+)"
+[[ "$MIXED_AUTH_STATUS" == "400" ]] \
+    || fail "mixed monitoring authentication returned $MIXED_AUTH_STATUS instead of 400"
+assert_json_error "$WORK_DIR/mixed-auth.json" "ambiguous_authentication"
+
+DUPLICATE_AUTH_STATUS="$(
+    curl -sS -o "$WORK_DIR/duplicate-auth.json" -w '%{http_code}' \
+        -H "Authorization: Bearer $SERVICE_TOKEN" \
+        -H "Authorization: Bearer $SERVICE_TOKEN" \
+        "http://$APP_ADDR/api/v2/monitoring/summary"
+)"
+[[ "$DUPLICATE_AUTH_STATUS" == "400" ]] \
+    || fail "duplicate Authorization returned $DUPLICATE_AUTH_STATUS instead of 400"
+assert_json_error "$WORK_DIR/duplicate-auth.json" "ambiguous_authentication"
+
+COMMA_AUTH_STATUS="$(
+    curl -sS -o "$WORK_DIR/comma-auth.json" -w '%{http_code}' \
+        -H "Authorization: Bearer $SERVICE_TOKEN, Bearer $SERVICE_TOKEN" \
+        "http://$APP_ADDR/api/v2/monitoring/summary"
+)"
+[[ "$COMMA_AUTH_STATUS" == "400" ]] \
+    || fail "comma-joined Authorization returned $COMMA_AUTH_STATUS instead of 400"
+assert_json_error "$WORK_DIR/comma-auth.json" "ambiguous_authentication"
+
+PRIVATE_BEARER_STATUS="$(
+    curl -sS -o "$WORK_DIR/private-bearer.json" -w '%{http_code}' \
+        -H "Authorization: Bearer $SERVICE_TOKEN" \
+        "http://$APP_ADDR/api/v2/shares"
+)"
+[[ "$PRIVATE_BEARER_STATUS" == "401" ]] \
+    || fail "service token reached private Shares API with HTTP $PRIVATE_BEARER_STATUS"
+assert_json_error "$WORK_DIR/private-bearer.json" "unauthorized"
+
+INVALID_SERVICE_TOKEN="${SERVICE_TOKEN%?}"
+case "${SERVICE_TOKEN: -1}" in
+    A) INVALID_SERVICE_TOKEN="${INVALID_SERVICE_TOKEN}B" ;;
+    *) INVALID_SERVICE_TOKEN="${INVALID_SERVICE_TOKEN}A" ;;
+esac
+INVALID_TOKEN_STATUS="$(
+    curl -sS -o "$WORK_DIR/invalid-service-token.json" -w '%{http_code}' \
+        -H "Authorization: Bearer $INVALID_SERVICE_TOKEN" \
+        "http://$APP_ADDR/api/v2/monitoring/summary"
+)"
+[[ "$INVALID_TOKEN_STATUS" == "401" ]] \
+    || fail "invalid service token returned $INVALID_TOKEN_STATUS instead of 401"
+assert_json_error "$WORK_DIR/invalid-service-token.json" "unauthorized"
+
 if grep -Fq "$ADMIN_PASSWORD" "$SETUP_LOG" "$APP_LOG"; then
     fail "logs contain sensitive setup data"
 fi
+assert_monitoring_secrets_redacted
 
 TOMBSTONE="$ROOT_DIR/.vaultlink-internal/tombstones/.vaultlink-delete-AAAAAAAAAAAAAAAAAAAAAAAA.tombstone"
 mkdir -p "$TOMBSTONE/nested"
@@ -373,6 +571,56 @@ unset APP_PID
 "$BIN" --config "$CONFIG_PATH" >>"$APP_LOG" 2>&1 &
 APP_PID="$!"
 wait_http "http://$APP_ADDR/login" "200"
+curl -sS -f -H "Authorization: Bearer $SERVICE_TOKEN" \
+    "http://$APP_ADDR/api/v2/monitoring/summary" >/dev/null \
+    || fail "service token did not survive restart"
+
+REVOKE_TOKEN_STATUS="$(
+    curl -sS -o /dev/null -w '%{http_code}' -b "$COOKIE_JAR" \
+        -H "x-csrf-token: $CSRF" \
+        -X DELETE "http://$APP_ADDR/api/v2/service-tokens/$SERVICE_TOKEN_ID"
+)"
+[[ "$REVOKE_TOKEN_STATUS" == "204" ]] \
+    || fail "service-token revoke returned $REVOKE_TOKEN_STATUS instead of 204"
+REVOKED_TOKEN_STATUS="$(
+    curl -sS -o "$WORK_DIR/revoked-service-token.json" -w '%{http_code}' \
+        -H "Authorization: Bearer $SERVICE_TOKEN" \
+        "http://$APP_ADDR/api/v2/monitoring/summary"
+)"
+[[ "$REVOKED_TOKEN_STATUS" == "401" ]] \
+    || fail "revoked service token returned $REVOKED_TOKEN_STATUS instead of 401"
+assert_json_error "$WORK_DIR/revoked-service-token.json" "unauthorized"
+if [[ "$PRESERVE_SERVICE_TOKEN" == "1" ]]; then
+    PRESERVED_SERVICE_TOKEN_RESULT="$(
+        curl -sS -w $'\n%{http_code}' \
+            -b "$COOKIE_JAR" \
+            -H "content-type: application/json" \
+            -H "x-csrf-token: $CSRF" \
+            -X POST "http://$APP_ADDR/api/v2/service-tokens" \
+            -d "{\"name\":\"Rollback preservation smoke\",\"expires_at\":null,\"current_password\":\"$ADMIN_PASSWORD\"}"
+    )"
+    PRESERVED_SERVICE_TOKEN_STATUS="${PRESERVED_SERVICE_TOKEN_RESULT##*$'\n'}"
+    PRESERVED_SERVICE_TOKEN_JSON="${PRESERVED_SERVICE_TOKEN_RESULT%$'\n'*}"
+    [[ "$PRESERVED_SERVICE_TOKEN_STATUS" == "201" ]] \
+        || fail "preserved service-token create returned $PRESERVED_SERVICE_TOKEN_STATUS instead of 201"
+    PRESERVED_SERVICE_TOKEN="$(printf '%s' "$PRESERVED_SERVICE_TOKEN_JSON" | json_get token)"
+    PRESERVED_SERVICE_TOKEN_ID="$(printf '%s' "$PRESERVED_SERVICE_TOKEN_JSON" | json_get id)"
+    [[ -n "$PRESERVED_SERVICE_TOKEN" && "$PRESERVED_SERVICE_TOKEN_ID" =~ ^[1-9][0-9]*$ ]] \
+        || fail "preserved service-token create omitted one-time metadata"
+    printf '%s\n' "$PRESERVED_SERVICE_TOKEN" \
+        >"$WORK_DIR/preserved-service-token.secret"
+    printf '%s\n' "$PRESERVED_SERVICE_TOKEN_ID" \
+        >"$WORK_DIR/preserved-service-token.id"
+    chmod 0600 "$WORK_DIR/preserved-service-token.secret" \
+        "$WORK_DIR/preserved-service-token.id"
+    PRESERVED_MONITORING_SUMMARY="$(
+        curl -sS -f -H "Authorization: Bearer $PRESERVED_SERVICE_TOKEN" \
+            "http://$APP_ADDR/api/v2/monitoring/summary"
+    )"
+    printf '%s' "$PRESERVED_MONITORING_SUMMARY" | assert_monitoring_summary_json \
+        || fail "preserved service token could not read monitoring summary"
+fi
+assert_monitoring_secrets_redacted
 for _ in $(seq 1 100); do
     [[ -e "$TOMBSTONE" ]] || break
     sleep 0.02

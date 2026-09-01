@@ -416,6 +416,7 @@ pub(super) fn locale_return_to(method: &Method, uri: &Uri) -> String {
         | "/mfa"
         | "/admin/shares"
         | "/admin/admins"
+        | "/admin/service-tokens"
         | "/admin/settings"
         | "/admin/settings/audit-ips/delete" => current.to_string(),
         "/admin/files/delete" => "/admin".to_string(),
@@ -424,6 +425,7 @@ pub(super) fn locale_return_to(method: &Method, uri: &Uri) -> String {
         path if path.starts_with("/admin/files/") => "/admin".to_string(),
         path if path.starts_with("/admin/shares/") => "/admin/shares".to_string(),
         path if path.starts_with("/admin/admins/") => "/admin/admins".to_string(),
+        path if path.starts_with("/admin/service-tokens/") => "/admin/service-tokens".to_string(),
         path if path.starts_with("/v/") => {
             let token = path
                 .strip_prefix("/v/")

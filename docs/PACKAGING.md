@@ -1,6 +1,6 @@
 # Native package support
 
-VaultLink 0.6.0 is distributed only as a native, signed operating-system
+VaultLink 0.7.0 is distributed only as a native, signed operating-system
 package. GitHub's automatically generated source archives are source material,
 not supported installation artifacts. VaultLink does not publish a package
 repository, a standalone binary, or a project tar archive.
@@ -21,19 +21,19 @@ than repeat target lists in workflow YAML.
 | Fedora 44 | x86_64, aarch64 | RPM |
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
-For version 0.6.0 the manifest resolves those targets to these exact assets:
+For version 0.7.0 the manifest resolves those targets to these exact assets:
 
 | Target | Release asset |
 | --- | --- |
-| Debian 13 amd64 | `vaultlink_0.6.0-1+deb13_amd64.deb` |
-| Debian 13 arm64 | `vaultlink_0.6.0-1+deb13_arm64.deb` |
-| Ubuntu 24.04 amd64 | `vaultlink_0.6.0-1+ubuntu24.04_amd64.deb` |
-| Ubuntu 24.04 arm64 | `vaultlink_0.6.0-1+ubuntu24.04_arm64.deb` |
-| Ubuntu 26.04 amd64 | `vaultlink_0.6.0-1+ubuntu26.04_amd64.deb` |
-| Ubuntu 26.04 arm64 | `vaultlink_0.6.0-1+ubuntu26.04_arm64.deb` |
-| Fedora 44 x86_64 | `vaultlink-0.6.0-1.fc44.x86_64.rpm` |
-| Fedora 44 aarch64 | `vaultlink-0.6.0-1.fc44.aarch64.rpm` |
-| Arch Linux x86_64 | `vaultlink-0.6.0-1-x86_64.pkg.tar.zst` |
+| Debian 13 amd64 | `vaultlink_0.7.0-1+deb13_amd64.deb` |
+| Debian 13 arm64 | `vaultlink_0.7.0-1+deb13_arm64.deb` |
+| Ubuntu 24.04 amd64 | `vaultlink_0.7.0-1+ubuntu24.04_amd64.deb` |
+| Ubuntu 24.04 arm64 | `vaultlink_0.7.0-1+ubuntu24.04_arm64.deb` |
+| Ubuntu 26.04 amd64 | `vaultlink_0.7.0-1+ubuntu26.04_amd64.deb` |
+| Ubuntu 26.04 arm64 | `vaultlink_0.7.0-1+ubuntu26.04_arm64.deb` |
+| Fedora 44 x86_64 | `vaultlink-0.7.0-1.fc44.x86_64.rpm` |
+| Fedora 44 aarch64 | `vaultlink-0.7.0-1.fc44.aarch64.rpm` |
+| Arch Linux x86_64 | `vaultlink-0.7.0-1-x86_64.pkg.tar.zst` |
 
 Each binary is compiled inside its target distribution on a native runner of
 the same CPU architecture. Arch Linux ARM, distributions derived from the
@@ -108,7 +108,7 @@ an unbound markerless installation.
 ### Trusted staging and DEB initial-install boundary
 
 First create a new root-owned mode-`0700` staging directory with
-`sudo mktemp -d /var/tmp/vaultlink-release-0.6.0.XXXXXXXX`; never reuse a fixed
+`sudo mktemp -d /var/tmp/vaultlink-release-0.7.0.XXXXXXXX`; never reuse a fixed
 or pre-existing path. Copy the package, its direct signature, `SHA256SUMS`, its
 signature, and the separately trusted public key into it. Bind the staged key
 to SHA-256
@@ -129,7 +129,7 @@ The Fedora full-system gate exercises that exact path and requires no
 VaultLink-related AVC denials plus final package/runtime parity.
 
 For Debian and Ubuntu, read `Depends` from that exact verified, root-owned DEB
-with `dpkg-deb -f`. Version 0.6.0 requires the exact field
+with `dpkg-deb -f`. Version 0.7.0 requires the exact field
 `ca-certificates, curl, libc6, libgcc-s1, mawk, minisign, sqlite3, systemd`.
 Before running `dpkg -i`, query every one of those package names with
 `dpkg-query` and require the state `installed`; this is an offline preflight

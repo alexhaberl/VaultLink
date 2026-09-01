@@ -21,8 +21,8 @@ fi
 if ! sh tools/check-version-consistency.sh; then
     report "package, documentation, and health version policy failed"
 fi
-if ! grep -F -x -q 'release_version=0.6.0' tools/check-version-consistency.sh; then
-    report "candidate and tag version policy must be fixed to the 0.6.0 release line"
+if ! grep -F -x -q 'release_version=0.7.0' tools/check-version-consistency.sh; then
+    report "candidate and tag version policy must be fixed to the 0.7.0 release line"
 fi
 if ! awk '
     $0 == "[profile.release]" { release_profile = 1; profiles++; next }
@@ -134,8 +134,8 @@ if ! python3 tools/package-targets.py validate --allow-unprovisioned >/dev/null;
     report "the declarative nine-target package manifest is invalid even in bootstrap mode"
 fi
 if [ "$(python3 tools/package-targets.py ids --allow-unprovisioned 2>/dev/null | wc -l)" -ne 9 ] \
-    || [ "$(python3 tools/package-targets.py assets 0.6.0 --allow-unprovisioned 2>/dev/null | wc -l)" -ne 9 ]; then
-    report "the package manifest must render exactly nine target IDs and nine unique 0.6.0 assets"
+    || [ "$(python3 tools/package-targets.py assets 0.7.0 --allow-unprovisioned 2>/dev/null | wc -l)" -ne 9 ]; then
+    report "the package manifest must render exactly nine target IDs and nine unique 0.7.0 assets"
 fi
 if ! grep -F -q '"builder_image": "UNPROVISIONED"' "$target_manifest" \
     || ! grep -F -q '"vm_image": "UNPROVISIONED"' "$target_manifest"; then
@@ -979,8 +979,8 @@ for workflow in .github/workflows/release.yml .github/workflows/soak-start.yml; 
     fi
 done
 if ! grep -F -q -- '--name "vaultlink-release-unsigned-$APPROVED_COMMIT"' .github/workflows/soak-start.yml \
-    || ! grep -F -q 'tools/verify-package-release.sh "$candidate_artifact" 0.6.0' .github/workflows/soak-start.yml \
-    || ! grep -F -q 'package-targets.py asset debian13-amd64 0.6.0' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'tools/verify-package-release.sh "$candidate_artifact" 0.7.0' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'package-targets.py asset debian13-amd64 0.7.0' .github/workflows/soak-start.yml \
     || ! grep -F -q 'dpkg-deb -x "$candidate_artifact/$deb" "$extracted"' .github/workflows/soak-start.yml \
     || ! grep -F -q 'usr/lib/vaultlink/package/vaultlink' .github/workflows/soak-start.yml \
     || ! grep -F -q 'candidate_binary_sha256' .github/workflows/soak-start.yml \
@@ -1283,8 +1283,14 @@ if ! grep -F -q 'runtime_status=$?' "$vm_runtime_smoke" \
     || ! grep -F -q 'profile-status.env' "$load_test" \
     || ! grep -F -q 'metadata_status=$metadata_status' "$load_test" \
     || ! grep -F -q 'metadata_observed_p95_seconds=$observed_p95' "$load_test" \
-    || ! grep -F -q 'tail -n 80 "$SETUP_LOG" | sed' "$api_smoke" \
-    || ! grep -F -q "sed '/#token=/d' >&2 || true" "$api_smoke" \
+    || ! grep -F -q 'redact_failure_log() {' "$api_smoke" \
+    || ! grep -F -q 'service_token = re.compile(r"vlk_st_v1_[A-Za-z0-9_-]{43}")' "$api_smoke" \
+    || ! grep -F -q 'if re.search(r"authorization", line, re.IGNORECASE):' "$api_smoke" \
+    || ! grep -F -q 'setup_token.sub(r"\1[REDACTED]", line)' "$api_smoke" \
+    || ! grep -F -q 'tail -n 80 "$SETUP_LOG" | redact_failure_log >&2 || true' "$api_smoke" \
+    || ! grep -F -q 'tail -n 120 "$APP_LOG" | redact_failure_log >&2 || true' "$api_smoke" \
+    || ! grep -F -q "printf 'API smoke failed: %s\\n' \"\$*\" | redact_failure_log >&2" "$api_smoke" \
+    || grep -F -q 'tail -n 120 "$APP_LOG" >&2' "$api_smoke" \
     || ! grep -F -q '[ ! -e "$evidence/runtime/cookies.txt" ]' "$vm_harness" \
     || ! printf '%s\n' "$vm_evidence_upload" | grep -F -q '        if: always()' \
     || ! printf '%s\n' "$vm_evidence_upload" | grep -F -q '            vm-test/${{ matrix.id }}/evidence' \
@@ -1893,7 +1899,8 @@ if ! grep -F -q 'value < 2.000' "$package_native_load_smoke" \
     || ! grep -F -q 'sqlite_integrity=ok' "$package_native_load_smoke"; then
     report "native exact-package evidence must independently enforce p95, status/hash, RSS, PID, readiness, SQLite, and 100/40/10 completeness"
 fi
-if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.6.1' "$package_workflow" \
+if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.7.1' "$package_workflow" \
+    || ! grep -F -x -q 'REAL_PACKAGE_NEW_VERSION ?= 0.7.1' Makefile \
     || ! printf '%s\n' "$package_build_job" \
         | grep -F -q 'git archive "$GITHUB_SHA" | tar -x -C "$fixture_source"' \
     || ! printf '%s\n' "$package_build_job" \
@@ -1919,6 +1926,13 @@ if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.6.1' "$package_workflow" \
     || ! grep -F -q -- '--volume "$(CURDIR):/work:ro"' Makefile \
     || ! grep -F -q 'sh tools/real-package-update-smoke.sh' Makefile; then
     report "all native package targets must run the same-commit real package-manager update/recovery gate and upload evidence"
+fi
+fresh_schema_security_test='db::tests::fresh_database_is_exactly_schema_seven_without_plaintext_secret_columns'
+if ! grep -F -q "fresh_schema_test='$fresh_schema_security_test'" Makefile \
+    || ! grep -F -q 'cargo test -- --list >"$$listed_tests"' Makefile \
+    || ! grep -F -q 'test "$$match_count" -eq 1' Makefile \
+    || ! grep -F -q 'cargo test "$$fresh_schema_test" -- --exact' Makefile; then
+    report "security-test must fail closed unless the exact fresh schema-7 secret-column test exists and runs"
 fi
 if ! grep -F -q '[ -f /.dockerenv ]' "$real_package_smoke" \
     || ! grep -F -q 'minisign -G -W' "$real_package_smoke" \

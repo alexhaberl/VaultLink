@@ -373,6 +373,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
         return recover_admin(&options);
     }
+    if args
+        .get(1)
+        .is_some_and(|value| value == "revoke-all-service-tokens")
+    {
+        let options = RevokeAllServiceTokensOptions::parse(&args).map_err(std::io::Error::other)?;
+        let revoked = revoke_all_service_tokens(&options)?;
+        println!("{revoked}");
+        return Ok(());
+    }
     if args.get(1).is_some_and(|value| value == "rotate-secrets") {
         let options = RotateSecretsOptions::parse(&args).map_err(std::io::Error::other)?;
         tracing_subscriber::fmt()
@@ -647,6 +656,11 @@ struct RotateSecretsOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct RevokeAllServiceTokensOptions {
+    source: RecoveryDatabaseSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifyBackupDatabaseOptions {
     database_path: PathBuf,
 }
@@ -710,6 +724,76 @@ impl RotateSecretsOptions {
             }
             (Some(_), Some(_)) => {
                 return Err("rotate-secrets accepts only one of --config or --database".into())
+            }
+        };
+        Ok(Self { source })
+    }
+}
+
+impl RevokeAllServiceTokensOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        if args.get(1).map(String::as_str) != Some("revoke-all-service-tokens") {
+            return Err("revoke-all-service-tokens parser requires its command".into());
+        }
+        let mut config_path = None;
+        let mut database_path = None;
+        let mut confirmed = false;
+        let mut index = 2;
+        while index < args.len() {
+            let option = args[index].as_str();
+            match option {
+                "--config" | "--database" => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| format!("{option} requires one non-option value"))?;
+                    if value.is_empty() || value.starts_with('-') {
+                        return Err(format!("{option} requires one non-option value"));
+                    }
+                    let duplicate = if option == "--config" {
+                        config_path.replace(PathBuf::from(value)).is_some()
+                    } else {
+                        database_path.replace(PathBuf::from(value)).is_some()
+                    };
+                    if duplicate {
+                        return Err(format!("{option} may only be provided once"));
+                    }
+                    index += 2;
+                }
+                "--all" => {
+                    if confirmed {
+                        return Err("--all may only be provided once".into());
+                    }
+                    confirmed = true;
+                    index += 1;
+                }
+                option if option.starts_with('-') => {
+                    return Err(format!(
+                        "unknown revoke-all-service-tokens option: {option}"
+                    ));
+                }
+                positional => {
+                    return Err(format!(
+                        "unexpected revoke-all-service-tokens positional argument: {positional}"
+                    ));
+                }
+            }
+        }
+        if !confirmed {
+            return Err("revoke-all-service-tokens requires --all".into());
+        }
+        let source = match (config_path, database_path) {
+            (Some(path), None) => RecoveryDatabaseSource::Config(path),
+            (None, Some(path)) => RecoveryDatabaseSource::Database(path),
+            (None, None) => {
+                return Err(
+                    "revoke-all-service-tokens requires exactly one of --config or --database"
+                        .into(),
+                )
+            }
+            (Some(_), Some(_)) => {
+                return Err(
+                    "revoke-all-service-tokens accepts only one of --config or --database".into(),
+                )
             }
         };
         Ok(Self { source })
@@ -842,6 +926,23 @@ fn rotate_secrets(options: &RotateSecretsOptions) -> Result<(), Box<dyn std::err
     Database::rotate_secrets(&database_path)?;
     tracing::info!(database = %database_path.display(), "secret rotation completed");
     Ok(())
+}
+
+fn revoke_all_service_tokens(
+    options: &RevokeAllServiceTokensOptions,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let database_path = recovery_database_path(&options.source)?;
+    if !database_path.is_file() {
+        return Err(format!(
+            "VaultLink database not found at {}",
+            database_path.display()
+        )
+        .into());
+    }
+    let database = Database::open(database_path)?;
+    let revoked =
+        database.revoke_all_service_tokens_and_audit(&AuditContext::new("local_recovery", None))?;
+    Ok(revoked)
 }
 
 fn verify_backup_database(
@@ -1161,6 +1262,217 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn seed_service_token_database(path: &std::path::Path, name: &str) {
+        let database = Database::open(path).unwrap();
+        let audit_context = AuditContext::new("recovery-test-admin", None);
+        assert_eq!(
+            database
+                .create_initial_admin_and_audit(
+                    "recovery-test-admin",
+                    "password-hash",
+                    &auth::new_totp_secret(),
+                    &audit_context,
+                )
+                .unwrap(),
+            InitialAdminOutcome::Created
+        );
+        assert_eq!(
+            database
+                .create_session_for_verified_password_and_audit(
+                    "recovery-test-pre-mfa-session",
+                    1,
+                    "password-hash",
+                    "recovery-test-pre-mfa-csrf",
+                    chrono::Utc::now() + chrono::Duration::hours(1),
+                    &audit_context,
+                )
+                .unwrap(),
+            vaultlink::db::PasswordSessionCreationOutcome::Created
+        );
+        assert!(database
+            .verify_mfa_with_totp_step_and_audit(
+                "recovery-test-pre-mfa-session",
+                "recovery-test-session",
+                "recovery-test-csrf",
+                1,
+                1,
+                &audit_context,
+            )
+            .unwrap());
+        let plaintext = format!("vlk_st_v1_{}", auth::random_token(32));
+        let outcome = database
+            .create_service_token_for_verified_admin_and_audit(
+                "recovery-test-session",
+                1,
+                "password-hash",
+                name,
+                &plaintext,
+                None,
+                &audit_context,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            vaultlink::db::ServiceTokenCreationOutcome::Created(_)
+        ));
+    }
+
+    fn assert_revoke_all_audit(path: &std::path::Path) {
+        let database = Database::open(path).unwrap();
+        let events = database
+            .list_audit(Some("service_tokens_revoked_all"), 10, 0)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "local_recovery");
+        assert_eq!(events[0].object_id, None);
+        assert_eq!(events[0].detail.as_deref(), Some("count=1"));
+    }
+
+    #[test]
+    fn revoke_all_service_tokens_parser_requires_confirmation_and_one_source() {
+        assert_eq!(
+            RevokeAllServiceTokensOptions::parse(&arguments(&[
+                "vaultlink",
+                "revoke-all-service-tokens",
+                "--config",
+                "config.toml",
+                "--all",
+            ]))
+            .unwrap(),
+            RevokeAllServiceTokensOptions {
+                source: RecoveryDatabaseSource::Config("config.toml".into()),
+            }
+        );
+        assert_eq!(
+            RevokeAllServiceTokensOptions::parse(&arguments(&[
+                "vaultlink",
+                "revoke-all-service-tokens",
+                "--all",
+                "--database",
+                "data.sqlite",
+            ]))
+            .unwrap(),
+            RevokeAllServiceTokensOptions {
+                source: RecoveryDatabaseSource::Database("data.sqlite".into()),
+            }
+        );
+
+        for invalid in [
+            vec![
+                "vaultlink",
+                "revoke-all-service-tokens",
+                "--database",
+                "data.sqlite",
+            ],
+            vec!["vaultlink", "revoke-all-service-tokens", "--all"],
+            vec![
+                "vaultlink",
+                "revoke-all-service-tokens",
+                "--config",
+                "config.toml",
+                "--database",
+                "data.sqlite",
+                "--all",
+            ],
+            vec![
+                "vaultlink",
+                "revoke-all-service-tokens",
+                "--database",
+                "data.sqlite",
+                "--all",
+                "--all",
+            ],
+            vec![
+                "vaultlink",
+                "revoke-all-service-tokens",
+                "--database",
+                "--all",
+            ],
+            vec![
+                "vaultlink",
+                "revoke-all-service-tokens",
+                "--database",
+                "data.sqlite",
+                "--unknown",
+                "--all",
+            ],
+        ] {
+            assert!(RevokeAllServiceTokensOptions::parse(&arguments(&invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn revoke_all_service_tokens_targets_only_the_selected_database_and_audits_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let direct_database = directory.path().join("direct.sqlite");
+        let untouched_database = directory.path().join("untouched.sqlite");
+        let config_data_directory = directory.path().join("configured-data");
+        std::fs::create_dir(&config_data_directory).unwrap();
+        let configured_database = config_data_directory.join("data.sqlite");
+        seed_service_token_database(&direct_database, "Direct target");
+        seed_service_token_database(&untouched_database, "Untouched target");
+        seed_service_token_database(&configured_database, "Config target");
+
+        let direct_options = RevokeAllServiceTokensOptions {
+            source: RecoveryDatabaseSource::Database(direct_database.clone()),
+        };
+        assert_eq!(revoke_all_service_tokens(&direct_options).unwrap(), 1);
+        assert!(Database::open(&direct_database)
+            .unwrap()
+            .list_service_tokens()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            Database::open(&untouched_database)
+                .unwrap()
+                .list_service_tokens()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            Database::open(&configured_database)
+                .unwrap()
+                .list_service_tokens()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_revoke_all_audit(&direct_database);
+
+        let config_path = directory.path().join("recovery.toml");
+        let serialized_data_directory =
+            toml::Value::String(config_data_directory.to_string_lossy().into_owned()).to_string();
+        std::fs::write(
+            &config_path,
+            format!("[storage]\ndata_directory = {serialized_data_directory}\n"),
+        )
+        .unwrap();
+        let config_options = RevokeAllServiceTokensOptions {
+            source: RecoveryDatabaseSource::Config(config_path),
+        };
+        assert_eq!(revoke_all_service_tokens(&config_options).unwrap(), 1);
+        assert!(Database::open(&configured_database)
+            .unwrap()
+            .list_service_tokens()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            Database::open(&untouched_database)
+                .unwrap()
+                .list_service_tokens()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_revoke_all_audit(&configured_database);
+        assert!(Database::open(&untouched_database)
+            .unwrap()
+            .list_audit(Some("service_tokens_revoked_all"), 10, 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

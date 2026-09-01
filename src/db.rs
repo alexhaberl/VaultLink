@@ -5,6 +5,7 @@ mod public_sessions;
 mod required_audit;
 mod runtime_settings;
 mod schema;
+mod service_tokens;
 mod shares;
 mod transfers;
 
@@ -91,6 +92,9 @@ pub(crate) enum AuditAction {
     PathRenamed,
     Preview,
     SecurityKeyReauthFailed,
+    ServiceTokenCreated,
+    ServiceTokenRevoked,
+    ServiceTokensRevokedAll,
     SettingsUpdated,
     ShareActivated,
     ShareCreated,
@@ -148,6 +152,9 @@ impl AuditAction {
             Self::PathRenamed => "path_renamed",
             Self::Preview => "preview",
             Self::SecurityKeyReauthFailed => "security_key_reauth_failed",
+            Self::ServiceTokenCreated => "service_token_created",
+            Self::ServiceTokenRevoked => "service_token_revoked",
+            Self::ServiceTokensRevokedAll => "service_tokens_revoked_all",
             Self::SettingsUpdated => "settings_updated",
             Self::ShareActivated => "share_activated",
             Self::ShareCreated => "share_created",
@@ -207,6 +214,9 @@ impl AuditAction {
             | Self::PathDeleted
             | Self::PathRenamed
             | Self::SecurityKeyReauthFailed
+            | Self::ServiceTokenCreated
+            | Self::ServiceTokenRevoked
+            | Self::ServiceTokensRevokedAll
             | Self::SettingsUpdated
             | Self::ShareActivated
             | Self::ShareCreated
@@ -262,6 +272,9 @@ impl AuditAction {
         Self::PathRenamed,
         Self::Preview,
         Self::SecurityKeyReauthFailed,
+        Self::ServiceTokenCreated,
+        Self::ServiceTokenRevoked,
+        Self::ServiceTokensRevokedAll,
         Self::SettingsUpdated,
         Self::ShareActivated,
         Self::ShareCreated,
@@ -309,6 +322,10 @@ const MAX_ACTIVE_PREVIEW_SESSIONS_GLOBAL: i64 = 10_000;
 pub const TRANSFER_SESSION_TTL_SECONDS: i64 = 15 * 60;
 pub const TRANSFER_LEASE_MAX_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
 pub const ADMIN_MFA_ENROLLMENT_TTL_SECONDS: i64 = 10 * 60;
+pub const SERVICE_TOKEN_SCOPE_MONITORING_READ: i64 = 1;
+pub const MAX_SERVICE_TOKENS: usize = 64;
+pub const SERVICE_TOKEN_NAME_MIN_CHARACTERS: usize = 1;
+pub const SERVICE_TOKEN_NAME_MAX_CHARACTERS: usize = 80;
 
 #[derive(Clone)]
 pub struct Database(Arc<DatabaseInner>);
@@ -756,6 +773,130 @@ pub struct ShareSummary {
     pub protected: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceToken {
+    pub id: i64,
+    pub name: String,
+    pub scope_mask: i64,
+    pub created_by: i64,
+    pub created_by_username: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceTokenCreationOutcome {
+    Created(ServiceToken),
+    ReauthenticationRejected,
+    CapacityReached,
+    NameConflict,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceTokenAuthorizationOutcome {
+    Authorized { token_id: i64 },
+    Unauthorized,
+    InsufficientScope,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MonitoringShareListStatus {
+    #[default]
+    All,
+    Available,
+    Inactive,
+    Expired,
+    DownloadLimitReached,
+}
+
+impl MonitoringShareListStatus {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "available" => Some(Self::Available),
+            "inactive" => Some(Self::Inactive),
+            "expired" => Some(Self::Expired),
+            "download_limit_reached" => Some(Self::DownloadLimitReached),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Available => "available",
+            Self::Inactive => "inactive",
+            Self::Expired => "expired",
+            Self::DownloadLimitReached => "download_limit_reached",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitoringShareStatus {
+    Available,
+    Inactive,
+    Expired,
+    DownloadLimitReached,
+}
+
+impl MonitoringShareStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Inactive => "inactive",
+            Self::Expired => "expired",
+            Self::DownloadLimitReached => "download_limit_reached",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MonitoringShareListOptions {
+    pub status: MonitoringShareListStatus,
+    pub cursor: Option<i64>,
+    pub limit: usize,
+    pub now: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitoringShare {
+    pub id: i64,
+    pub status: MonitoringShareStatus,
+    pub permission: Permission,
+    pub is_directory: bool,
+    pub password_protected: bool,
+    pub created_at: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub download_count: u64,
+    pub max_downloads: Option<u64>,
+    pub max_upload_size_bytes: Option<u64>,
+    pub uploaded_bytes: u64,
+    pub max_upload_total_size_bytes: Option<u64>,
+    pub uploaded_files: u64,
+    pub max_upload_files: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitoringSharePage {
+    pub shares: Vec<MonitoringShare>,
+    pub next_cursor: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitoringSummary {
+    pub total: u64,
+    pub available: u64,
+    pub inactive: u64,
+    pub expired: u64,
+    pub download_limit_reached: u64,
+    pub protected: u64,
+    pub transfers: TransferMonthlyCounts,
+    pub statistics_started_at: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct AuditEvent {
     pub occurred_at: String,
@@ -774,9 +915,16 @@ pub struct TransferMonthlyCounts {
     pub preview: u64,
 }
 
-fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     data_encoding::HEXLOWER.encode(digest.as_ref())
+}
+
+pub fn valid_service_token_name(name: &str) -> bool {
+    name == name.trim()
+        && (SERVICE_TOKEN_NAME_MIN_CHARACTERS..=SERVICE_TOKEN_NAME_MAX_CHARACTERS)
+            .contains(&name.chars().count())
+        && !name.chars().any(char::is_control)
 }
 
 impl Database {

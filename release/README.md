@@ -1,6 +1,6 @@
 # Release signing and immutable package inputs
 
-VaultLink 0.6.0 publishes only the nine native packages declared in
+VaultLink 0.7.0 publishes only the nine native packages declared in
 `package-targets.json`. The release workflow must not publish project tar
 archives or standalone binaries. GitHub's automatic source archives are
 unsupported source material.

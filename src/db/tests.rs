@@ -1193,7 +1193,7 @@ fn audit_retention_keeps_only_the_newest_rows() {
 #[test]
 fn audit_action_policy_has_unique_names_and_explicit_priorities() {
     let mut names = std::collections::HashSet::new();
-    assert_eq!(AuditAction::ALL.len(), 52);
+    assert_eq!(AuditAction::ALL.len(), 55);
     for action in AuditAction::ALL {
         assert!(
             names.insert(action.as_str()),
@@ -2065,7 +2065,7 @@ fn rejects_unknown_newer_schema() {
 }
 
 #[test]
-fn fresh_database_is_exactly_schema_six_without_plaintext_secret_columns() {
+fn fresh_database_is_exactly_schema_seven_without_plaintext_secret_columns() {
     let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
     assert_eq!(
@@ -2076,12 +2076,29 @@ fn fresh_database_is_exactly_schema_six_without_plaintext_secret_columns() {
     );
     let migration_records: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3,4,5,6) AND length(applied_at)>0",
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3,4,5,6,7) AND length(applied_at)>0",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migration_records, 5);
+    assert_eq!(migration_records, 6);
+    let service_token_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('service_tokens')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(service_token_columns, 8);
+    let service_token_capacity_trigger: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+             WHERE type='trigger' AND name='trg_service_tokens_capacity')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(service_token_capacity_trigger);
     for index in ["idx_shares_active_id", "idx_shares_active_expires"] {
         let exists: bool = connection
             .query_row(
@@ -2142,9 +2159,10 @@ fn fresh_database_is_exactly_schema_six_without_plaintext_secret_columns() {
 fn downgrade_audit_to_schema_four(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP INDEX idx_audit_priority_id;
+            "DROP TABLE service_tokens;
+             DROP INDEX idx_audit_priority_id;
              ALTER TABLE audit DROP COLUMN priority;
-             DELETE FROM vaultlink_schema_migrations WHERE target_version IN (5,6);",
+             DELETE FROM vaultlink_schema_migrations WHERE target_version IN (5,6,7);",
         )
         .unwrap();
     connection
@@ -2161,6 +2179,12 @@ fn schema_five_fixture() -> (tempfile::TempDir, PathBuf) {
     let path = directory.path().join("schema-five.sqlite");
     drop(Database::open(&path).unwrap());
     let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE service_tokens;
+             DELETE FROM vaultlink_schema_migrations WHERE target_version=7;",
+        )
+        .unwrap();
     connection
         .execute(
             "DELETE FROM vaultlink_schema_migrations WHERE target_version=6",
@@ -2196,6 +2220,32 @@ fn schema_five_fixture() -> (tempfile::TempDir, PathBuf) {
             )
             .unwrap();
     }
+    drop(connection);
+    (directory, path)
+}
+
+fn schema_six_fixture() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("schema-six.sqlite");
+    let database = Database::open(&path).unwrap();
+    database
+        .create_admin("schema-six-admin", "password-hash", "TOTP-SECRET")
+        .unwrap();
+    drop(database);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE service_tokens;
+             DELETE FROM vaultlink_schema_migrations WHERE target_version=7;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+            [schema::SCHEMA_6_FINGERPRINT],
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 6).unwrap();
     drop(connection);
     (directory, path)
 }
@@ -2407,7 +2457,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let applied_at: Vec<(i64, String)> = connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3,4,5,6) ORDER BY target_version",
+             WHERE target_version IN (2,3,4,5,6,7) ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -2422,7 +2472,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let reopened_applied_at: Vec<(i64, String)> = reopened_connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3,4,5,6) ORDER BY target_version",
+             WHERE target_version IN (2,3,4,5,6,7) ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -2433,7 +2483,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
 }
 
 #[test]
-fn schema_two_migrates_to_six_with_expected_indexes() {
+fn schema_two_migrates_to_seven_with_expected_indexes() {
     let (_directory, path) = schema_two_fixture();
     let database = Database::open(path).unwrap();
     let connection = database.conn();
@@ -2503,6 +2553,32 @@ fn schema_five_migration_reclassifies_file_mutations_and_preserves_rows() {
 }
 
 #[test]
+fn schema_six_migrates_to_seven_and_preserves_admins() {
+    let (_directory, path) = schema_six_fixture();
+    let database = Database::open(path).unwrap();
+    assert_eq!(
+        database.active_admin_usernames().unwrap(),
+        ["schema-six-admin"]
+    );
+    let connection = database.conn();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    let table_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+             WHERE type='table' AND name='service_tokens')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(table_exists);
+}
+
+#[test]
 fn schema_three_migration_revokes_sessions_and_preserves_other_data() {
     let (_directory, path) = schema_three_fixture();
     let database = Database::open(path).unwrap();
@@ -2546,6 +2622,206 @@ fn corrupt_schema_fingerprint_is_rejected() {
         Database::open(path),
         Err(DatabaseError::Schema(_))
     ));
+}
+
+#[test]
+fn corrupt_schema_seven_service_token_shape_and_history_are_rejected() {
+    let index_directory = tempfile::tempdir().unwrap();
+    let index_path = index_directory.path().join("missing-token-index.sqlite");
+    drop(Database::open(&index_path).unwrap());
+    let connection = Connection::open(&index_path).unwrap();
+    connection
+        .execute_batch("DROP INDEX idx_service_tokens_expires")
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        Database::open(index_path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let history_directory = tempfile::tempdir().unwrap();
+    let history_path = history_directory
+        .path()
+        .join("missing-token-history.sqlite");
+    drop(Database::open(&history_path).unwrap());
+    let connection = Connection::open(&history_path).unwrap();
+    connection
+        .execute(
+            "DELETE FROM vaultlink_schema_migrations WHERE target_version=7",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        Database::open(history_path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let constraint_directory = tempfile::tempdir().unwrap();
+    let constraint_path = constraint_directory
+        .path()
+        .join("missing-token-constraint.sqlite");
+    drop(Database::open(&constraint_path).unwrap());
+    let connection = Connection::open(&constraint_path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE service_tokens;
+             CREATE TABLE service_tokens(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                 token_hash TEXT NOT NULL UNIQUE,
+                 scope_mask INTEGER NOT NULL DEFAULT 1,
+                 created_by INTEGER NOT NULL REFERENCES admins(id),
+                 created_at TEXT NOT NULL,
+                 expires_at TEXT,
+                 last_used_at TEXT
+             );
+             CREATE INDEX idx_service_tokens_expires ON service_tokens(expires_at);
+             CREATE TRIGGER trg_service_tokens_capacity
+             BEFORE INSERT ON service_tokens
+             WHEN (SELECT COUNT(*) FROM service_tokens)>=64
+             BEGIN
+                 SELECT RAISE(ABORT,'service token capacity reached');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        Database::open(constraint_path),
+        Err(DatabaseError::Schema(_))
+    ));
+}
+
+fn assert_schema_seven_service_token_corruption_rejected(
+    database_name: &str,
+    corruption_sql: &str,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(database_name);
+    drop(Database::open(&path).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch(corruption_sql).unwrap();
+    drop(connection);
+    assert!(matches!(
+        Database::open(path),
+        Err(DatabaseError::Schema(_))
+    ));
+}
+
+#[test]
+fn corrupt_schema_seven_service_token_index_and_trigger_definitions_are_rejected() {
+    assert_schema_seven_service_token_corruption_rejected(
+        "wrong-token-index-column.sqlite",
+        "DROP INDEX idx_service_tokens_expires;
+         CREATE INDEX idx_service_tokens_expires ON service_tokens(created_at);",
+    );
+    assert_schema_seven_service_token_corruption_rejected(
+        "ineffective-token-capacity-trigger.sqlite",
+        "DROP TRIGGER trg_service_tokens_capacity;
+         CREATE TRIGGER trg_service_tokens_capacity
+         BEFORE INSERT ON service_tokens
+         WHEN (SELECT COUNT(*) FROM service_tokens)>=64
+         BEGIN
+             SELECT 1;
+         END;",
+    );
+}
+
+#[test]
+fn corrupt_schema_seven_extra_service_token_index_and_trigger_are_rejected() {
+    assert_schema_seven_service_token_corruption_rejected(
+        "extra-token-index.sqlite",
+        "CREATE INDEX idx_service_tokens_created_at ON service_tokens(created_at);",
+    );
+    assert_schema_seven_service_token_corruption_rejected(
+        "extra-token-trigger.sqlite",
+        "CREATE TRIGGER trg_service_tokens_noop
+         AFTER UPDATE ON service_tokens
+         BEGIN
+             SELECT 1;
+         END;",
+    );
+}
+
+#[test]
+fn corrupt_schema_seven_service_token_unique_autoindex_columns_are_rejected() {
+    assert_schema_seven_service_token_corruption_rejected(
+        "wrong-token-unique-autoindex-columns.sqlite",
+        "DROP TABLE service_tokens;
+         CREATE TABLE service_tokens(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                 CHECK(name=trim(name) AND length(name) BETWEEN 1 AND 80),
+             token_hash TEXT NOT NULL
+                 CHECK(length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
+             scope_mask INTEGER NOT NULL DEFAULT 1 CHECK(scope_mask=1),
+             created_by INTEGER NOT NULL REFERENCES admins(id),
+             created_at TEXT NOT NULL UNIQUE,
+             expires_at TEXT,
+             last_used_at TEXT
+         );
+         CREATE INDEX idx_service_tokens_expires ON service_tokens(expires_at);
+         CREATE TRIGGER trg_service_tokens_capacity
+         BEFORE INSERT ON service_tokens
+         WHEN (SELECT COUNT(*) FROM service_tokens)>=64
+         BEGIN
+             SELECT RAISE(ABORT,'service token capacity reached');
+         END;",
+    );
+}
+
+#[test]
+fn corrupt_schema_seven_service_token_constraint_comments_are_rejected() {
+    assert_schema_seven_service_token_corruption_rejected(
+        "decoy-token-constraint-comments.sqlite",
+        "DROP TABLE service_tokens;
+         CREATE TABLE service_tokens(
+             id INTEGER PRIMARY KEY /* PRIMARY KEY AUTOINCREMENT */,
+             name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                 /* CHECK(name=trim(name) AND length(name) BETWEEN 1 AND 80) */,
+             token_hash TEXT NOT NULL UNIQUE
+                 /* CHECK(length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*') */,
+             scope_mask INTEGER NOT NULL DEFAULT 1 /* CHECK(scope_mask=1) */,
+             created_by INTEGER NOT NULL /* REFERENCES admins(id) */,
+             created_at TEXT NOT NULL,
+             expires_at TEXT,
+             last_used_at TEXT
+         );
+         CREATE INDEX idx_service_tokens_expires ON service_tokens(expires_at);
+         CREATE TRIGGER trg_service_tokens_capacity
+         BEFORE INSERT ON service_tokens
+         WHEN (SELECT COUNT(*) FROM service_tokens)>=64
+         BEGIN
+             SELECT RAISE(ABORT,'service token capacity reached');
+         END;",
+    );
+}
+
+#[test]
+fn corrupt_schema_seven_service_token_constraint_literal_case_is_rejected() {
+    assert_schema_seven_service_token_corruption_rejected(
+        "weakened-token-hash-glob.sqlite",
+        "DROP TABLE service_tokens;
+         CREATE TABLE service_tokens(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                 CHECK(name=trim(name) AND length(name) BETWEEN 1 AND 80),
+             token_hash TEXT NOT NULL UNIQUE
+                 CHECK(length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9A-f]*'),
+             scope_mask INTEGER NOT NULL DEFAULT 1 CHECK(scope_mask=1),
+             created_by INTEGER NOT NULL REFERENCES admins(id),
+             created_at TEXT NOT NULL,
+             expires_at TEXT,
+             last_used_at TEXT
+         );
+         CREATE INDEX idx_service_tokens_expires ON service_tokens(expires_at);
+         CREATE TRIGGER trg_service_tokens_capacity
+         BEFORE INSERT ON service_tokens
+         WHEN (SELECT COUNT(*) FROM service_tokens)>=64
+         BEGIN
+             SELECT RAISE(ABORT,'service token capacity reached');
+         END;",
+    );
 }
 
 #[test]
@@ -2738,6 +3014,50 @@ fn failed_schema_five_migration_restores_priorities_and_metadata() {
 }
 
 #[test]
+fn failed_schema_six_migration_rolls_back_service_token_schema_and_metadata() {
+    let (_directory, path) = schema_six_fixture();
+    schema::fail_next_schema_6_to_7_migration();
+    assert!(matches!(
+        Database::open(&path),
+        Err(DatabaseError::Schema(_))
+    ));
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        6
+    );
+    let fingerprint: String = connection
+        .query_row(
+            "SELECT fingerprint FROM vaultlink_schema WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fingerprint, schema::SCHEMA_6_FINGERPRINT);
+    let artifacts: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE name IN ('service_tokens','idx_service_tokens_expires',
+                            'trg_service_tokens_capacity')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(artifacts, 0);
+    let migration_record: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version=7",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migration_record, 0);
+}
+
+#[test]
 fn persistent_secrets_survive_restart_and_key_rotation_without_plaintext_columns() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("data.sqlite");
@@ -2745,6 +3065,30 @@ fn persistent_secrets_survive_restart_and_key_rotation_without_plaintext_columns
     database
         .create_admin("admin", "password-hash", "TOTP-SECRET")
         .unwrap();
+    database
+        .create_session(
+            "rotation-session",
+            1,
+            "csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(database.verify_mfa("rotation-session").unwrap());
+    let service_token = format!("vlk_st_v1_{}", crate::auth::random_token(32));
+    let ServiceTokenCreationOutcome::Created(service_token_metadata) = database
+        .create_service_token_for_verified_admin_and_audit(
+            "rotation-session",
+            1,
+            "password-hash",
+            "Rotation invariant",
+            &service_token,
+            None,
+            &AuditContext::new("admin", None),
+        )
+        .unwrap()
+    else {
+        panic!("service token was not created")
+    };
     database
         .create_share(
             "share-token",
@@ -2770,6 +3114,14 @@ fn persistent_secrets_survive_restart_and_key_rotation_without_plaintext_columns
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
+    let service_token_hash_before: String = database
+        .conn()
+        .query_row(
+            "SELECT token_hash FROM service_tokens WHERE id=?1",
+            [service_token_metadata.id],
+            |row| row.get(0),
+        )
+        .unwrap();
     drop(database);
 
     Database::rotate_secrets(&path).unwrap();
@@ -2791,6 +3143,23 @@ fn persistent_secrets_survive_restart_and_key_rotation_without_plaintext_columns
             .expose_secret(),
         "TOTP-SECRET"
     );
+    assert_eq!(
+        reopened
+            .authorize_service_token(&service_token, SERVICE_TOKEN_SCOPE_MONITORING_READ)
+            .unwrap(),
+        ServiceTokenAuthorizationOutcome::Authorized {
+            token_id: service_token_metadata.id
+        }
+    );
+    let service_token_hash_after: String = reopened
+        .conn()
+        .query_row(
+            "SELECT token_hash FROM service_tokens WHERE id=?1",
+            [service_token_metadata.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(service_token_hash_after, service_token_hash_before);
     let after: (u64, Vec<u8>, u64, Vec<u8>) = reopened
         .conn()
         .query_row(

@@ -156,6 +156,14 @@ fn web_route_inventory_is_explicit_and_complete() {
         ),
         ("/admin/admins/{id}/totp", "post(admin::reset_admin_totp)"),
         (
+            "/admin/service-tokens",
+            "get(service_tokens::service_tokens_page).post(service_tokens::create_service_token)",
+        ),
+        (
+            "/admin/service-tokens/{id}/revoke",
+            "post(service_tokens::revoke_service_token)",
+        ),
+        (
             "/admin/settings",
             "get(settings_audit::settings_page).post(settings_audit::update_settings)",
         ),
@@ -193,7 +201,7 @@ fn web_route_inventory_is_explicit_and_complete() {
         ("/favicon.ico", "get(rendering::favicon_png)"),
     ];
 
-    assert_eq!(expected.len(), 53);
+    assert_eq!(expected.len(), 55);
     assert_eq!(occurrences(&router, ".route("), expected.len());
     for (path, methods) in expected {
         assert_route(&router, path, methods);
@@ -211,6 +219,14 @@ fn api_route_inventory_is_explicit_and_complete() {
         ("/session/mfa", "post(mfa)"),
         ("/session/logout", "post(logout)"),
         ("/session/me", "get(me)"),
+        (
+            "/monitoring/summary",
+            "get(monitoring_summary).head(monitoring_method_not_allowed)",
+        ),
+        (
+            "/monitoring/shares",
+            "get(monitoring_share_page).head(monitoring_method_not_allowed)",
+        ),
         (
             "/files",
             "get(files).patch(rename_file_entry).delete(delete_file_entry)",
@@ -235,6 +251,11 @@ fn api_route_inventory_is_explicit_and_complete() {
         ("/settings", "get(get_settings).put(update_settings)"),
         ("/audit", "get(list_audit)"),
         ("/audit/client-ips", "delete(delete_audit_client_ips)"),
+        (
+            "/service-tokens",
+            "get(list_service_tokens).post(create_service_token)",
+        ),
+        ("/service-tokens/{id}", "delete(revoke_service_token)"),
         ("/public/shares/{token}", "get(public_share)"),
         ("/public/shares/{token}/unlock", "post(unlock_share)"),
         (
@@ -259,7 +280,7 @@ fn api_route_inventory_is_explicit_and_complete() {
         ),
     ];
 
-    assert_eq!(expected.len(), 29);
+    assert_eq!(expected.len(), 33);
     assert_eq!(occurrences(&router, ".route("), expected.len());
     for (path, methods) in expected {
         assert_route(&router, path, methods);
@@ -275,17 +296,17 @@ fn approved_source_level_registration_counts_include_test_fixtures() {
     let web_router = router_registration_block(WEB_SOURCE);
     let api_router = router_registration_block(API_SOURCE);
 
-    assert_eq!(occurrences(&web, ".route("), 53);
+    assert_eq!(occurrences(&web, ".route("), 55);
     assert_eq!(occurrences(&web_tests, ".route("), 4);
     assert_eq!(
         occurrences(&web, ".route(") + occurrences(&web_tests, ".route("),
-        57
+        59
     );
-    assert_eq!(occurrences(&api, ".route("), 29);
+    assert_eq!(occurrences(&api, ".route("), 33);
     assert_eq!(occurrences(&api_tests, ".route("), 1);
     assert_eq!(
         occurrences(&api, ".route(") + occurrences(&api_tests, ".route("),
-        30
+        34
     );
     assert_eq!(
         occurrences(&web, ".route("),
@@ -324,6 +345,14 @@ fn head_and_upload_routes_keep_their_explicit_guards() {
         assert_route(&web, path, methods);
     }
     for (path, methods) in [
+        (
+            "/monitoring/summary",
+            "get(monitoring_summary).head(monitoring_method_not_allowed)",
+        ),
+        (
+            "/monitoring/shares",
+            "get(monitoring_share_page).head(monitoring_method_not_allowed)",
+        ),
         (
             "/public/shares/{token}/download",
             "get(crate::web::download).head(crate::web::download)",

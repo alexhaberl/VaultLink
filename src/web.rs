@@ -27,6 +27,7 @@ mod preview_zip;
 mod public;
 mod public_preview;
 mod rendering;
+mod service_tokens;
 mod settings_audit;
 mod shares;
 pub(crate) mod templates;
@@ -257,6 +258,14 @@ pub fn router(state: AppState) -> Router {
             post(admin::reset_admin_password),
         )
         .route("/admin/admins/{id}/totp", post(admin::reset_admin_totp))
+        .route(
+            "/admin/service-tokens",
+            get(service_tokens::service_tokens_page).post(service_tokens::create_service_token),
+        )
+        .route(
+            "/admin/service-tokens/{id}/revoke",
+            post(service_tokens::revoke_service_token),
+        )
         .route(
             "/admin/settings",
             get(settings_audit::settings_page).post(settings_audit::update_settings),

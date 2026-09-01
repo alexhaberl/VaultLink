@@ -59,15 +59,16 @@ database="$api_work/data/data.sqlite"
 sqlite3 "$database" <<'SQL'
 BEGIN IMMEDIATE;
 INSERT INTO audit(occurred_at,actor,action,object_id,detail,priority)
-VALUES('2026-08-25T00:00:00Z','container-gate','upload','migration-probe','preserve',0);
-DELETE FROM vaultlink_schema_migrations WHERE target_version=6;
+VALUES('2026-08-30T00:00:00Z','container-gate','upload','migration-probe','preserve',100);
+DROP TABLE service_tokens;
+DELETE FROM vaultlink_schema_migrations WHERE target_version=7;
 UPDATE vaultlink_schema
-SET fingerprint='vaultlink-schema-5-audit-priority-2026-07-19'
+SET fingerprint='vaultlink-schema-6-typed-audit-policy-2026-07-20'
 WHERE singleton=1;
-PRAGMA user_version=5;
+PRAGMA user_version=6;
 COMMIT;
 SQL
-[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 5 ]
+[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 6 ]
 runuser -u vaultlink -- /opt/vaultlink/vaultlink \
     --config "$api_work/config.toml" >"$api_work/migration.log" 2>&1 &
 migration_pid=$!
@@ -82,7 +83,11 @@ done
 kill "$migration_pid"
 wait "$migration_pid" || true
 migration_pid=
-[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 6 ]
+[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 7 ]
+[ "$(sqlite3 "$database" \
+    'SELECT COUNT(*) FROM service_tokens;')" = 0 ]
+[ "$(sqlite3 "$database" \
+    'SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version=7;')" = 1 ]
 [ "$(sqlite3 "$database" \
     "SELECT priority FROM audit WHERE object_id='migration-probe';")" = 100 ]
 [ "$(sqlite3 "$database" 'PRAGMA integrity_check;')" = ok ]

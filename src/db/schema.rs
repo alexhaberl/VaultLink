@@ -1,14 +1,16 @@
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub(super) const SCHEMA_VERSION: i64 = 6;
+pub(super) const SCHEMA_VERSION: i64 = 7;
 pub(super) const SCHEMA_1_FINGERPRINT: &str = "vaultlink-schema-1-encrypted-secrets-2026-07-17";
 pub(super) const SCHEMA_2_FINGERPRINT: &str = "vaultlink-schema-2-migration-history-2026-07-17";
 pub(super) const SCHEMA_3_FINGERPRINT: &str = "vaultlink-schema-3-share-indexes-2026-07-17";
 pub(super) const SCHEMA_4_FINGERPRINT: &str =
     "vaultlink-schema-4-admin-session-activity-2026-07-18";
 pub(super) const SCHEMA_5_FINGERPRINT: &str = "vaultlink-schema-5-audit-priority-2026-07-19";
-const SCHEMA_6_FINGERPRINT: &str = "vaultlink-schema-6-typed-audit-policy-2026-07-20";
+pub(super) const SCHEMA_6_FINGERPRINT: &str = "vaultlink-schema-6-typed-audit-policy-2026-07-20";
+pub(super) const SCHEMA_7_FINGERPRINT: &str =
+    "vaultlink-schema-7-monitoring-service-tokens-2026-08-30";
 
 #[cfg(test)]
 thread_local! {
@@ -17,6 +19,7 @@ thread_local! {
     static FAIL_NEXT_SCHEMA_3_TO_4_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_SCHEMA_4_TO_5_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_SCHEMA_5_TO_6_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_SCHEMA_6_TO_7_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -28,27 +31,35 @@ pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             migrate_schema_2_to_3(conn)?;
             migrate_schema_3_to_4(conn)?;
             migrate_schema_4_to_5(conn)?;
-            migrate_schema_5_to_6(conn)
+            migrate_schema_5_to_6(conn)?;
+            migrate_schema_6_to_7(conn)
         }
         2 => {
             migrate_schema_2_to_3(conn)?;
             migrate_schema_3_to_4(conn)?;
             migrate_schema_4_to_5(conn)?;
-            migrate_schema_5_to_6(conn)
+            migrate_schema_5_to_6(conn)?;
+            migrate_schema_6_to_7(conn)
         }
         3 => {
             migrate_schema_3_to_4(conn)?;
             migrate_schema_4_to_5(conn)?;
-            migrate_schema_5_to_6(conn)
+            migrate_schema_5_to_6(conn)?;
+            migrate_schema_6_to_7(conn)
         }
         4 => {
             migrate_schema_4_to_5(conn)?;
-            migrate_schema_5_to_6(conn)
+            migrate_schema_5_to_6(conn)?;
+            migrate_schema_6_to_7(conn)
         }
-        5 => migrate_schema_5_to_6(conn),
-        SCHEMA_VERSION => validate_schema_6(conn).and_then(|()| validate_database(conn)),
+        5 => {
+            migrate_schema_5_to_6(conn)?;
+            migrate_schema_6_to_7(conn)
+        }
+        6 => migrate_schema_6_to_7(conn),
+        SCHEMA_VERSION => validate_schema_7(conn).and_then(|()| validate_database(conn)),
         _ => Err(schema_error(format!(
-            "unsupported VaultLink database schema {version}; this build accepts schemas 1, 2, 3, 4, 5, and {SCHEMA_VERSION}"
+            "unsupported VaultLink database schema {version}; this build accepts schemas 1, 2, 3, 4, 5, 6, and {SCHEMA_VERSION}"
         ))),
     }
 }
@@ -60,7 +71,7 @@ pub(super) fn validate_current(conn: &Connection) -> rusqlite::Result<()> {
             "backup schema {version} does not match this VaultLink binary's schema {SCHEMA_VERSION}"
         )));
     }
-    validate_schema_6(conn)?;
+    validate_schema_7(conn)?;
     validate_database(conn)
 }
 
@@ -84,7 +95,7 @@ CREATE TABLE vaultlink_schema(
     fingerprint TEXT NOT NULL
 );
 INSERT INTO vaultlink_schema(singleton,fingerprint)
-VALUES(1,'vaultlink-schema-6-typed-audit-policy-2026-07-20');
+VALUES(1,'vaultlink-schema-7-monitoring-service-tokens-2026-08-30');
 
 CREATE TABLE vaultlink_schema_migrations(
     target_version INTEGER PRIMARY KEY CHECK(target_version > 0),
@@ -113,6 +124,26 @@ CREATE TABLE sessions(
 );
 CREATE INDEX idx_sessions_exp ON sessions(expires_at);
 CREATE INDEX idx_sessions_admin ON sessions(admin_id);
+
+CREATE TABLE service_tokens(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+        CHECK(name=trim(name) AND length(name) BETWEEN 1 AND 80),
+    token_hash TEXT NOT NULL UNIQUE
+        CHECK(length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
+    scope_mask INTEGER NOT NULL DEFAULT 1 CHECK(scope_mask=1),
+    created_by INTEGER NOT NULL REFERENCES admins(id),
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    last_used_at TEXT
+);
+CREATE INDEX idx_service_tokens_expires ON service_tokens(expires_at);
+CREATE TRIGGER trg_service_tokens_capacity
+BEFORE INSERT ON service_tokens
+WHEN (SELECT COUNT(*) FROM service_tokens)>=64
+BEGIN
+    SELECT RAISE(ABORT,'service token capacity reached');
+END;
 
 CREATE TABLE shares(
     id INTEGER PRIMARY KEY,
@@ -289,8 +320,12 @@ CREATE INDEX idx_upload_reservations_share_epoch
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(6,?1)",
         [Utc::now().to_rfc3339()],
     )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(7,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    validate_schema_6(&tx)?;
+    validate_schema_7(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }
@@ -467,8 +502,55 @@ fn migrate_schema_5_to_6(conn: &mut Connection) -> rusqlite::Result<()> {
         return Err(schema_error("injected schema 5 to 6 migration failure"));
     }
 
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", 6)?;
     validate_schema_6(&tx)?;
+    validate_database(&tx)?;
+    tx.commit()
+}
+
+fn migrate_schema_6_to_7(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_schema_6(&tx)?;
+    validate_database(&tx)?;
+    tx.execute_batch(
+        "CREATE TABLE service_tokens(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                 CHECK(name=trim(name) AND length(name) BETWEEN 1 AND 80),
+             token_hash TEXT NOT NULL UNIQUE
+                 CHECK(length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
+             scope_mask INTEGER NOT NULL DEFAULT 1 CHECK(scope_mask=1),
+             created_by INTEGER NOT NULL REFERENCES admins(id),
+             created_at TEXT NOT NULL,
+             expires_at TEXT,
+             last_used_at TEXT
+         );
+         CREATE INDEX idx_service_tokens_expires ON service_tokens(expires_at);
+         CREATE TRIGGER trg_service_tokens_capacity
+         BEFORE INSERT ON service_tokens
+         WHEN (SELECT COUNT(*) FROM service_tokens)>=64
+         BEGIN
+             SELECT RAISE(ABORT,'service token capacity reached');
+         END;",
+    )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(7,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+        [SCHEMA_7_FINGERPRINT],
+    )?;
+
+    #[cfg(test)]
+    if FAIL_NEXT_SCHEMA_6_TO_7_MIGRATION.with(|flag| flag.replace(false)) {
+        return Err(schema_error("injected schema 6 to 7 migration failure"));
+    }
+
+    // Keep the version bump as the final mutation. A failed migration must
+    // remain a self-consistent schema-6 database without service-token state.
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    validate_schema_7(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }
@@ -643,6 +725,321 @@ fn validate_schema_6(conn: &Connection) -> rusqlite::Result<()> {
     validate_encrypted_shape(conn)
 }
 
+fn validate_schema_7(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_7_FINGERPRINT)?;
+    for target_version in [2, 3, 4, 5, 6, 7] {
+        let migration_record = conn
+            .query_row(
+                "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=?1",
+                [target_version],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if migration_record.as_deref().is_none_or(str::is_empty) {
+            return Err(schema_error(format!(
+                "schema {target_version} migration record is missing or invalid"
+            )));
+        }
+    }
+    let priority_not_null: Option<i64> = conn
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('audit') WHERE name='priority'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if priority_not_null != Some(1) {
+        return Err(schema_error(
+            "schema 7 audit.priority is missing or nullable",
+        ));
+    }
+    let priority_index: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='idx_audit_priority_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !priority_index {
+        return Err(schema_error("schema 7 audit priority index is missing"));
+    }
+    validate_service_tokens_shape(conn)?;
+    validate_encrypted_shape(conn)
+}
+
+fn validate_service_tokens_shape(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = conn
+        .prepare(
+            "SELECT name,type,\"notnull\",pk
+             FROM pragma_table_info('service_tokens') ORDER BY cid",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected = [
+        ("id", "INTEGER", 0, 1),
+        ("name", "TEXT", 1, 0),
+        ("token_hash", "TEXT", 1, 0),
+        ("scope_mask", "INTEGER", 1, 0),
+        ("created_by", "INTEGER", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+        ("expires_at", "TEXT", 0, 0),
+        ("last_used_at", "TEXT", 0, 0),
+    ];
+    if columns.len() != expected.len()
+        || columns.iter().zip(expected).any(|(actual, expected)| {
+            actual.0 != expected.0
+                || !actual.1.eq_ignore_ascii_case(expected.1)
+                || actual.2 != expected.2
+                || actual.3 != expected.3
+        })
+    {
+        return Err(schema_error(
+            "schema 7 service_tokens table has an unexpected column shape",
+        ));
+    }
+
+    let table_sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='service_tokens'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(table_sql) = table_sql else {
+        return Err(schema_error("schema 7 service_tokens table is missing"));
+    };
+    let expected_table_sql = normalize_schema_sql(
+        "CREATE TABLE service_tokens(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                 CHECK(name=trim(name) AND length(name) BETWEEN 1 AND 80),
+             token_hash TEXT NOT NULL UNIQUE
+                 CHECK(length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
+             scope_mask INTEGER NOT NULL DEFAULT 1 CHECK(scope_mask=1),
+             created_by INTEGER NOT NULL REFERENCES admins(id),
+             created_at TEXT NOT NULL,
+             expires_at TEXT,
+             last_used_at TEXT
+         )",
+    );
+    if normalize_schema_sql(&table_sql) != expected_table_sql {
+        return Err(schema_error(
+            "schema 7 service_tokens table definition is missing or invalid",
+        ));
+    }
+
+    // UNIQUE constraints are represented as SQLite-owned origin='u'
+    // autoindexes with a NULL sql definition. Validate their actual key
+    // columns so an unrelated UNIQUE constraint cannot stand in for the
+    // required name or token-hash constraint.
+    let index_metadata = conn
+        .prepare(
+            "SELECT name,\"unique\",origin,partial
+             FROM pragma_index_list('service_tokens') ORDER BY name",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut unique_constraint_indexes = Vec::new();
+    for (name, unique, origin, partial) in &index_metadata {
+        match origin.as_str() {
+            "c" if name == "idx_service_tokens_expires" && *unique == 0 && *partial == 0 => {}
+            "u" if *unique == 1 && *partial == 0 => {
+                unique_constraint_indexes.push(name.as_str());
+            }
+            _ => {
+                return Err(schema_error(
+                    "schema 7 service_tokens index metadata is unexpected",
+                ));
+            }
+        }
+    }
+    if index_metadata.len() != 3 || unique_constraint_indexes.len() != 2 {
+        return Err(schema_error(
+            "schema 7 service_tokens unique-constraint indexes are missing or invalid",
+        ));
+    }
+    let mut unique_constraint_shapes = Vec::new();
+    for index_name in unique_constraint_indexes {
+        let key_columns = index_key_columns(conn, index_name)?;
+        let [key_column] = key_columns.as_slice() else {
+            return Err(schema_error(
+                "schema 7 service_tokens unique-constraint index is not single-column",
+            ));
+        };
+        if key_column.sequence != 0 || key_column.descending {
+            return Err(schema_error(
+                "schema 7 service_tokens unique-constraint index has invalid ordering",
+            ));
+        }
+        unique_constraint_shapes.push((
+            key_column.column_id,
+            key_column.name.clone().unwrap_or_default(),
+            key_column
+                .collation
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        ));
+    }
+    unique_constraint_shapes.sort_unstable();
+    if unique_constraint_shapes
+        != [
+            (1, "name".to_owned(), "nocase".to_owned()),
+            (2, "token_hash".to_owned(), "binary".to_owned()),
+        ]
+    {
+        return Err(schema_error(
+            "schema 7 service_tokens unique-constraint indexes target unexpected columns",
+        ));
+    }
+
+    let user_indexes = conn
+        .prepare(
+            "SELECT name,sql FROM sqlite_schema
+             WHERE type='index' AND tbl_name='service_tokens' AND sql IS NOT NULL
+             ORDER BY name",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected_index_sql = normalize_schema_sql(
+        "CREATE INDEX idx_service_tokens_expires ON service_tokens(expires_at)",
+    );
+    if user_indexes.len() != 1
+        || user_indexes[0].0 != "idx_service_tokens_expires"
+        || normalize_schema_sql(&user_indexes[0].1) != expected_index_sql
+    {
+        return Err(schema_error(
+            "schema 7 service_tokens user-defined index set is missing or invalid",
+        ));
+    }
+    let expires_index_columns = index_key_columns(conn, "idx_service_tokens_expires")?;
+    if expires_index_columns
+        != [IndexKeyColumn {
+            sequence: 0,
+            column_id: 6,
+            name: Some("expires_at".to_owned()),
+            descending: false,
+            collation: Some("BINARY".to_owned()),
+        }]
+    {
+        return Err(schema_error(
+            "schema 7 service_tokens expiry index has an unexpected column shape",
+        ));
+    }
+
+    let triggers = conn
+        .prepare(
+            "SELECT name,sql FROM sqlite_schema
+             WHERE type='trigger' AND tbl_name='service_tokens'
+             ORDER BY name",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected_trigger_sql = normalize_schema_sql(
+        "CREATE TRIGGER trg_service_tokens_capacity
+         BEFORE INSERT ON service_tokens
+         WHEN (SELECT COUNT(*) FROM service_tokens)>=64
+         BEGIN
+             SELECT RAISE(ABORT,'service token capacity reached');
+         END",
+    );
+    if triggers.len() != 1
+        || triggers[0].0 != "trg_service_tokens_capacity"
+        || normalize_schema_sql(&triggers[0].1) != expected_trigger_sql
+    {
+        return Err(schema_error(
+            "schema 7 service_tokens capacity trigger is missing or invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut characters = sql.chars().peekable();
+    let mut quote = None;
+    let mut pending_space = false;
+
+    while let Some(character) = characters.next() {
+        if let Some(delimiter) = quote {
+            normalized.push(character);
+            if character == delimiter {
+                if characters.peek() == Some(&delimiter) {
+                    normalized.push(
+                        characters
+                            .next()
+                            .expect("peeked escaped quote must remain available"),
+                    );
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+
+        if character == '\'' || character == '"' {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            pending_space = false;
+            quote = Some(character);
+            normalized.push(character);
+        } else if character.is_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            pending_space = false;
+            normalized.push(character.to_ascii_lowercase());
+        }
+    }
+
+    normalized
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct IndexKeyColumn {
+    sequence: i64,
+    column_id: i64,
+    name: Option<String>,
+    descending: bool,
+    collation: Option<String>,
+}
+
+fn index_key_columns(conn: &Connection, index_name: &str) -> rusqlite::Result<Vec<IndexKeyColumn>> {
+    conn.prepare(
+        "SELECT seqno,cid,name,\"desc\",coll
+         FROM pragma_index_xinfo(?1) WHERE \"key\"=1 ORDER BY seqno",
+    )?
+    .query_map([index_name], |row| {
+        Ok(IndexKeyColumn {
+            sequence: row.get(0)?,
+            column_id: row.get(1)?,
+            name: row.get(2)?,
+            descending: row.get::<_, i64>(3)? != 0,
+            collation: row.get(4)?,
+        })
+    })?
+    .collect()
+}
+
 fn validate_fingerprint(conn: &Connection, expected: &str) -> rusqlite::Result<()> {
     let fingerprint = conn
         .query_row(
@@ -719,6 +1116,11 @@ pub(super) fn fail_next_schema_4_to_5_migration() {
 #[cfg(test)]
 pub(super) fn fail_next_schema_5_to_6_migration() {
     FAIL_NEXT_SCHEMA_5_TO_6_MIGRATION.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_schema_6_to_7_migration() {
+    FAIL_NEXT_SCHEMA_6_TO_7_MIGRATION.with(|flag| flag.set(true));
 }
 
 #[derive(Debug)]

@@ -1,6 +1,6 @@
 # Upgrade, backup, and rollback
 
-VaultLink 0.6.0 supports upgrades only between native packages for the exact
+VaultLink 0.7.0 supports upgrades only between native packages for the exact
 same distribution, release, and architecture. There is no supported adoption,
 upgrade, or migration path from the withdrawn 0.5.0 archive installation. A
 markerless or mismatched installation fails closed before package files or
@@ -49,7 +49,8 @@ Treat these four files as one security and recovery unit:
 - `/var/lib/vaultlink/data.sqlite`
 - `/var/lib/vaultlink/secrets.keyring`
 
-The SQLite database contains encrypted Share tokens and TOTP secrets and is
+The SQLite database contains encrypted Share tokens and TOTP secrets as well
+as hashes of monitoring service tokens, and is
 unusable without its matching keyring. The live keyring must remain
 `vaultlink:vaultlink`, mode `0600`. Every rollback source must be inside a
 canonical, absolute, symlink-free subtree of `/var/lib/vaultlink-backups`;
@@ -241,6 +242,29 @@ Do not use the normal forward-upgrade helper to force a downgrade. A terminal
 recovery error warrants preserving the reported workspace and journal before
 making further changes.
 
+### Older manual restores and service tokens
+
+An older database may contain the hash of a monitoring token that was revoked
+after the backup. A manual restore can therefore make that credential valid
+again. Before replacing any database, close external ingress, stop VaultLink,
+and keep both traffic and the service stopped throughout the restore. Only
+after the older database is in place, with VaultLink still stopped, run:
+
+```sh
+sudo -u vaultlink /opt/vaultlink/vaultlink revoke-all-service-tokens \
+  --database /var/lib/vaultlink/data.sqlite \
+  --all
+```
+
+The command atomically writes the `service_tokens_revoked_all` security audit
+as actor `local_recovery`, deletes every token, and prints only the count. Do
+not restart VaultLink if it fails. After a successful revocation, restart with
+external ingress still closed, issue replacement credentials from the
+administrator-only service-token page, update every monitoring client, and
+reopen ingress only after the old credentials have been rejected. This
+procedure is mandatory for an older manual restore. The normal verified
+upgrade rollback preserves service tokens and does not invoke this command.
+
 ## Secret rotation
 
 Rotate Share-token and TOTP encryption keys with exactly one database source:
@@ -254,6 +278,8 @@ Alternatively pass `--config /etc/vaultlink/config.toml`. Rotation requires
 exclusive access to `secrets.keyring`; stop the service first. The new key is
 made durable before ciphertexts are rewritten in an `IMMEDIATE` transaction,
 and the previous key is removed only after the database commit.
+Service-token hashes do not use the keyring and remain bit-for-bit unchanged by
+rotation; existing monitoring tokens continue to work.
 
 ## Recovery rules
 
@@ -264,5 +290,8 @@ and the previous key is removed only after the database commit.
   key, wrong key, modified nonce/AAD, or corrupt ciphertext aborts startup.
 - `recover-admin --database /var/lib/vaultlink/data.sqlite` loads the adjacent
   keyring automatically.
+- After an older manual restore, revoke all service tokens with the service
+  stopped, replace them, update clients, and reopen traffic only afterwards.
+  Do not apply this rule automatically to a normal verified upgrade rollback.
 - Protect packages, backups, and retained recovery workspaces as production
   credentials and remove temporary recovery material only after acceptance.

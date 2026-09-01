@@ -15,7 +15,9 @@ mod admins;
 mod auth;
 mod common;
 mod files;
+mod monitoring;
 mod public;
+mod service_tokens;
 mod settings_audit;
 mod shares;
 
@@ -25,7 +27,9 @@ use admins::{
 };
 use auth::{login, logout, me, mfa};
 use files::{create_directory, delete_file_entry, files, rename_file_entry};
+use monitoring::{monitoring_share_page, monitoring_summary};
 use public::{public_share, unlock_share};
+use service_tokens::{create_service_token, list_service_tokens, revoke_service_token};
 use settings_audit::{delete_audit_client_ips, get_settings, list_audit, update_settings};
 use shares::{
     activate_share, create_share, deactivate_share, delete_share, list_shares,
@@ -101,6 +105,11 @@ impl ApiError {
             "Internal error",
         )
     }
+    fn rate_limited(message: &'static str, retry_after_seconds: u64) -> Self {
+        let mut error = Self::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", message);
+        error.retry_after_seconds = Some(retry_after_seconds);
+        error
+    }
 }
 
 impl From<crate::http_auth::HttpAuthError> for ApiError {
@@ -108,6 +117,10 @@ impl From<crate::http_auth::HttpAuthError> for ApiError {
         let code = match value.kind {
             crate::http_auth::HttpAuthErrorKind::AuditUnavailable => "audit_unavailable",
             crate::http_auth::HttpAuthErrorKind::CapacityUnavailable => "request_failed",
+            crate::http_auth::HttpAuthErrorKind::AmbiguousAuthentication => {
+                "ambiguous_authentication"
+            }
+            crate::http_auth::HttpAuthErrorKind::InsufficientScope => "insufficient_scope",
             crate::http_auth::HttpAuthErrorKind::Request => match value.status {
                 StatusCode::UNAUTHORIZED => "unauthorized",
                 StatusCode::FORBIDDEN => "forbidden",
@@ -121,6 +134,12 @@ impl From<crate::http_auth::HttpAuthError> for ApiError {
             }
             crate::http_auth::HttpAuthErrorKind::CapacityUnavailable => {
                 "Request processing capacity is temporarily unavailable"
+            }
+            crate::http_auth::HttpAuthErrorKind::AmbiguousAuthentication => {
+                "Ambiguous authentication"
+            }
+            crate::http_auth::HttpAuthErrorKind::InsufficientScope => {
+                "Service token scope is insufficient"
             }
             crate::http_auth::HttpAuthErrorKind::Request => match value.status {
                 StatusCode::BAD_REQUEST => "Invalid request",
@@ -184,6 +203,14 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/session/logout", post(logout))
         .route("/session/me", get(me))
         .route(
+            "/monitoring/summary",
+            get(monitoring_summary).head(monitoring_method_not_allowed),
+        )
+        .route(
+            "/monitoring/shares",
+            get(monitoring_share_page).head(monitoring_method_not_allowed),
+        )
+        .route(
             "/files",
             get(files)
                 .patch(rename_file_entry)
@@ -206,6 +233,11 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/settings", get(get_settings).put(update_settings))
         .route("/audit", get(list_audit))
         .route("/audit/client-ips", delete(delete_audit_client_ips))
+        .route(
+            "/service-tokens",
+            get(list_service_tokens).post(create_service_token),
+        )
+        .route("/service-tokens/{id}", delete(revoke_service_token))
         .route("/public/shares/{token}", get(public_share))
         .route("/public/shares/{token}/unlock", post(unlock_share))
         .route(
@@ -234,6 +266,12 @@ pub fn router(state: AppState) -> Router<AppState> {
         )
         .layer(middleware::from_fn(normalize_api_errors))
         .with_state(state)
+}
+
+async fn monitoring_method_not_allowed() -> StatusCode {
+    // Axum normally lets HEAD fall back to GET. Monitoring authentication is
+    // deliberately exposed on the two documented GET methods only.
+    StatusCode::METHOD_NOT_ALLOWED
 }
 
 async fn normalize_api_errors(request: Request, next: Next) -> Response {
