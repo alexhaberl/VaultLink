@@ -1,4 +1,4 @@
-.PHONY: dev-setup sample-data test security-test secret-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check package-manifest-bootstrap package-manifest-check native-package verify-native-package docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test docker-update-safety-test docker-real-package-update-smoke
+.PHONY: dev-setup sample-data test login-timing-check security-test secret-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check package-manifest-bootstrap package-manifest-check native-package verify-native-package docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test docker-update-safety-test docker-real-package-update-smoke
 
 CONFIG ?= config/development.toml
 DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
@@ -29,6 +29,9 @@ sample-data:
 
 test:
 	cargo test --all-targets
+
+login-timing-check:
+	cargo test --release --locked services::auth::tests::known_and_unknown_admin_login_timing_is_reported -- --ignored --nocapture
 
 security-test:
 	cargo test path_security

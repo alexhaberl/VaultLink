@@ -198,6 +198,30 @@ binary parity. It blocks a mixed state after an interrupted transaction or
 power loss. `StartLimitIntervalSec=1h` and `StartLimitBurst=3` bound repeated
 guard failures rather than creating an unbounded restart loop.
 
+## Backup verification without rollback
+
+Verify a protected rollback backup without stopping VaultLink or replacing any
+live file:
+
+```sh
+sudo /usr/lib/vaultlink/package/deploy/vaultlink-rollback.sh \
+  --verify-only /var/lib/vaultlink-backups/<backup-directory>
+```
+
+The helper takes the normal maintenance lock, freezes and rechecks the original
+four-file backup, verifies its ownership, modes and hashes, and requires the
+backup binary to match the currently installed native package candidate. It
+then validates the binary/configuration pair, SQLite integrity, and the
+database/keyring pair as the `vaultlink` user from a private temporary copy.
+Opening that copy authenticates every persisted encrypted secret. The active
+service is not stopped and live binary, configuration, database, and keyring
+files are never replaced; temporary verification files are removed on exit.
+
+This mode is intended for periodic verification of backups made for the
+currently installed package. Verifying a backup from another version remains a
+package-bound recovery operation: first obtain and verify its matching native
+package on an isolated recovery host or during an authorized restore.
+
 ## Manual restore
 
 `vaultlink-rollback.sh` accepts only the canonical protected backup subtree and

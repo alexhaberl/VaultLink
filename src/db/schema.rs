@@ -64,6 +64,17 @@ pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     }
 }
 
+pub(super) fn validate_current(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Err(schema_error(format!(
+            "backup schema {version} does not match this VaultLink binary's schema {SCHEMA_VERSION}"
+        )));
+    }
+    validate_schema_7(conn)?;
+    validate_database(conn)
+}
+
 fn initialize_empty_database(conn: &mut Connection) -> rusqlite::Result<()> {
     let existing: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",

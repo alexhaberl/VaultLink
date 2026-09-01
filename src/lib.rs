@@ -1,3 +1,5 @@
+#![cfg_attr(all(not(test), not(debug_assertions)), forbid(unsafe_code))]
+
 #[cfg(not(target_os = "linux"))]
 compile_error!("VaultLink supports Linux only");
 
