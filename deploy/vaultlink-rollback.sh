@@ -24,18 +24,29 @@ package_candidate=/usr/lib/vaultlink/package/vaultlink
 package_version_file=/usr/lib/vaultlink/package/version
 runtime_guard=/usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh
 backup_freeze=
+verification_directory=
+verify_only=0
 readiness_attempts=${VAULTLINK_READINESS_ATTEMPTS:-30}
 readiness_timeout_seconds=${VAULTLINK_READINESS_TIMEOUT_SECONDS:-60}
 readiness_interval_seconds=${VAULTLINK_READINESS_INTERVAL_SECONDS:-1}
 readiness_connect_timeout_seconds=${VAULTLINK_READINESS_CONNECT_TIMEOUT_SECONDS:-2}
 readiness_max_time_seconds=${VAULTLINK_READINESS_MAX_TIME_SECONDS:-3}
 
-if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
-    echo "usage (as root): vaultlink-rollback.sh BACKUP_DIRECTORY" >&2
+if [ "$(id -u)" -ne 0 ]; then
+    echo "usage (as root): vaultlink-rollback.sh [--verify-only] BACKUP_DIRECTORY" >&2
     exit 64
 fi
-
-backup_argument=$1
+case "$#:${1:-}" in
+    1:*) backup_argument=$1 ;;
+    2:--verify-only)
+        verify_only=1
+        backup_argument=$2
+        ;;
+    *)
+        echo "usage (as root): vaultlink-rollback.sh [--verify-only] BACKUP_DIRECTORY" >&2
+        exit 64
+        ;;
+esac
 [ -x "$live_binary" ] || { echo "installed VaultLink binary is missing or not executable" >&2; exit 1; }
 [ -f "$config_path" ] || { echo "live VaultLink configuration is missing" >&2; exit 1; }
 [ -f "$data" ] || { echo "live VaultLink database is missing" >&2; exit 1; }
@@ -91,6 +102,9 @@ cleanup_frozen_input() {
     trap '' 1 2 15
     if [ -n "$backup_freeze" ] && [ -d "$backup_freeze" ]; then
         rm -rf "$backup_freeze"
+    fi
+    if [ -n "$verification_directory" ] && [ -d "$verification_directory" ]; then
+        rm -rf "$verification_directory"
     fi
     exit "$frozen_status"
 }
@@ -597,6 +611,9 @@ on_failure() {
     if [ -n "$backup_freeze" ] && [ -d "$backup_freeze" ]; then
         rm -rf "$backup_freeze"
     fi
+    if [ -n "$verification_directory" ] && [ -d "$verification_directory" ]; then
+        rm -rf "$verification_directory"
+    fi
 
     exit "$status"
 }
@@ -612,8 +629,10 @@ trap 'exit 143' 15
 # service to be inactive, prove marker/package-DB/candidate parity without
 # accepting any other mismatch, then require the selected backup binary to be
 # byte-identical to that candidate before replacing /opt.
-[ "$(systemctl is-active "$service" 2>/dev/null || true)" = inactive ] \
-    || { echo "$service must be inactive before package-bound rollback" >&2; exit 1; }
+if [ "$verify_only" -eq 0 ]; then
+    [ "$(systemctl is-active "$service" 2>/dev/null || true)" = inactive ] \
+        || { echo "$service must be inactive before package-bound rollback" >&2; exit 1; }
+fi
 if [ ! -f "$runtime_guard" ] || [ -L "$runtime_guard" ] \
     || [ "$(stat -c '%u:%g:%a' "$runtime_guard")" != 0:0:755 ]; then
     echo "package runtime guard is missing or unsafe" >&2
@@ -655,6 +674,20 @@ readiness_connect_to=$(printf '%s\n' "$requested_readiness_target" | sed -n '2p'
 [ "$readiness_connect_to" != "-" ] || readiness_connect_to=
 readiness_insecure=$(printf '%s\n' "$requested_readiness_target" | sed -n '3p')
 requested_health_body='{"ok":true,"version":"'"$requested_version"'"}'
+
+if [ "$verify_only" -eq 1 ]; then
+    verification_directory=$(mktemp -d "$data_dir/.backup-verify.XXXXXXXX")
+    chown vaultlink:vaultlink "$verification_directory"
+    chmod 0700 "$verification_directory"
+    install -o vaultlink -g vaultlink -m 0600 \
+        "$backup_dir/data.sqlite" "$verification_directory/data.sqlite"
+    install -o vaultlink -g vaultlink -m 0600 \
+        "$backup_dir/secrets.keyring" "$verification_directory/secrets.keyring"
+    runuser -u vaultlink -- "$staged_binary" verify-backup-database \
+        --database "$verification_directory/data.sqlite"
+    echo "backup verified for VaultLink $requested_version: $backup_argument"
+    exit 0
+fi
 
 current_version=$(read_bounded_version "$live_binary" "installed binary")
 current_readiness_target=$(derive_readiness_target \
