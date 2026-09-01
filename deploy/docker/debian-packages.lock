@@ -32,5 +32,5 @@ shellcheck=0.10.0-1
 sqlite3=3.46.1-7+deb13u1
 strace=6.13+ds-1
 systemd=257.13-1~deb13u1
-util-linux=2.41-5
+util-linux=2.41.5-0+deb13u1
 xz-utils=5.8.1-1+deb13u1

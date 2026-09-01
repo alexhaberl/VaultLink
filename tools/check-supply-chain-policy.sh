@@ -133,16 +133,27 @@ vm_bootstrap_runcmd="  - [ /usr/local/sbin/vaultlink-vm-bootstrap, '\$tcg_cleanu
 if ! python3 tools/package-targets.py validate --allow-unprovisioned >/dev/null; then
     report "the declarative nine-target package manifest is invalid even in bootstrap mode"
 fi
+if ! python3 tools/check-package-target-lock-policy.py; then
+    report "package target bootstrap lock truth table failed"
+fi
 if [ "$(python3 tools/package-targets.py ids --allow-unprovisioned 2>/dev/null | wc -l)" -ne 9 ] \
     || [ "$(python3 tools/package-targets.py assets 0.7.0 --allow-unprovisioned 2>/dev/null | wc -l)" -ne 9 ]; then
     report "the package manifest must render exactly nine target IDs and nine unique 0.7.0 assets"
 fi
 if ! grep -F -q '"builder_image": "UNPROVISIONED"' "$target_manifest" \
-    || ! grep -F -q '"vm_image": "UNPROVISIONED"' "$target_manifest"; then
-    # A fully provisioned follow-up PR is valid; this branch merely documents
-    # that bootstrap placeholders are an intentional, validated state.
+    && ! grep -F -q '"vm_image": "UNPROVISIONED"' "$target_manifest"; then
+    # Builder and VM output locks are independent all-nine atomic families.
+    # Strict validation applies only when both families are fully provisioned.
     python3 tools/package-targets.py validate >/dev/null 2>&1 \
         || report "target pins must be either reviewed digests or explicit UNPROVISIONED bootstrap values"
+fi
+if ! grep -F -q 'image locks must be pinned or UNPROVISIONED' tools/package-targets.py \
+    || ! grep -F -q 'pinned builder image without pinned inputs' tools/package-targets.py \
+    || ! grep -F -q 'pinned VM image without pinned inputs' tools/package-targets.py \
+    || ! grep -F -q 'pinned image without a pinned Arch snapshot' tools/package-targets.py \
+    || ! grep -F -q 'pinned VM images require pinned QEMU runner supply-chain locks' \
+        tools/package-targets.py; then
+    report "builder and VM locks must remain independent all-nine atomic families with pinned inputs"
 fi
 if [ "$(wc -l <"$qemu_lock")" -ne 1 ]; then
     report "QEMU runner lock must contain exactly one line"

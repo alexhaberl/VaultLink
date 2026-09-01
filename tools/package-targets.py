@@ -140,7 +140,7 @@ def read_qemu_package_lock(path: Path, architecture: str) -> bool:
     return True
 
 
-def validate_qemu_runner_lock(allow_unprovisioned: bool) -> None:
+def validate_qemu_runner_lock(allow_unprovisioned: bool) -> bool:
     image = read_single_line_lock(QEMU_RUNNER_LOCK, "QEMU runner image lock")
     base = read_single_line_lock(QEMU_RUNNER_BASE_LOCK, "QEMU runner base-image lock")
     image_provisioned = image != "UNPROVISIONED"
@@ -155,21 +155,23 @@ def validate_qemu_runner_lock(allow_unprovisioned: bool) -> None:
     if not all(states):
         if not allow_unprovisioned:
             die("QEMU runner supply-chain locks are UNPROVISIONED")
-        return
+        return False
     if not QEMU_RUNNER_IMAGE.fullmatch(image):
         die("QEMU runner lock is not an immutable project GHCR digest")
     if not BASE_IMAGE.fullmatch(base):
         die("QEMU runner base-image lock is not an immutable image digest")
+    return True
 
 
 def validate(allow_unprovisioned: bool) -> dict:
-    validate_qemu_runner_lock(allow_unprovisioned)
+    qemu_runner_provisioned = validate_qemu_runner_lock(allow_unprovisioned)
     data = read_manifest()
     targets = data["targets"]
     ids = [target.get("id") for target in targets if isinstance(target, dict)]
     if ids != list(EXPECTED) or len(ids) != len(EXPECTED):
         die("targets must contain the nine expected IDs in release order")
     assets = set()
+    image_states = {"builder": [], "vm": []}
     for target in targets:
         target_id = target["id"]
         if set(target) != FIELDS or not ID.fullmatch(target_id):
@@ -213,6 +215,8 @@ def validate(allow_unprovisioned: bool) -> dict:
         for kind in ("builder", "vm"):
             repository = target[f"{kind}_repository"]
             image = target[f"{kind}_image"]
+            image_provisioned = image != "UNPROVISIONED"
+            image_states[kind].append(image_provisioned)
             expected_prefix = repository + "@sha256:"
             expected_repository = (
                 EXPECTED_BUILDERS[target_id]
@@ -223,26 +227,37 @@ def validate(allow_unprovisioned: bool) -> dict:
                 die(f"{target_id} has an invalid {kind} repository")
             if repository != expected_repository:
                 die(f"{target_id} has an unexpected {kind} repository")
-            if image == "UNPROVISIONED":
+            if not image_provisioned:
                 if not allow_unprovisioned:
                     die(f"{target_id} {kind} image is UNPROVISIONED")
             elif not IMAGE.fullmatch(image) or not image.startswith(expected_prefix):
                 die(f"{target_id} has an invalid {kind} image lock")
         builder_base = target["builder_base_image"]
         package_hash = target["builder_packages_sha256"]
-        if builder_base == "UNPROVISIONED" or package_hash == "UNPROVISIONED":
+        builder_input_states = [
+            builder_base != "UNPROVISIONED",
+            package_hash != "UNPROVISIONED",
+        ]
+        if any(builder_input_states) and not all(builder_input_states):
+            die(f"{target_id} builder base and package closure must be pinned atomically")
+        if not all(builder_input_states):
             if not allow_unprovisioned:
                 die(f"{target_id} builder inputs are UNPROVISIONED")
         elif not BASE_IMAGE.fullmatch(builder_base) or not SHA256.fullmatch(package_hash):
             die(f"{target_id} has invalid builder base/package locks")
+        if target["builder_image"] != "UNPROVISIONED" and not all(builder_input_states):
+            die(f"{target_id} has a pinned builder image without pinned inputs")
         upstream_url = target["vm_upstream_url"]
         upstream_hash = target["vm_upstream_sha256"]
         vm_packages_hash = target["vm_packages_sha256"]
-        if (
-            upstream_url == "UNPROVISIONED"
-            or upstream_hash == "UNPROVISIONED"
-            or vm_packages_hash == "UNPROVISIONED"
-        ):
+        vm_input_states = [
+            upstream_url != "UNPROVISIONED",
+            upstream_hash != "UNPROVISIONED",
+            vm_packages_hash != "UNPROVISIONED",
+        ]
+        if any(vm_input_states) and not all(vm_input_states):
+            die(f"{target_id} VM upstream and package closure must be pinned atomically")
+        if not all(vm_input_states):
             if not allow_unprovisioned:
                 die(f"{target_id} VM upstream is UNPROVISIONED")
         elif (
@@ -251,6 +266,25 @@ def validate(allow_unprovisioned: bool) -> dict:
             or not SHA256.fullmatch(vm_packages_hash)
         ):
             die(f"{target_id} has an invalid VM upstream lock")
+        if target["vm_image"] != "UNPROVISIONED" and not all(vm_input_states):
+            die(f"{target_id} has a pinned VM image without pinned inputs")
+        if (
+            target["distribution"] == "arch"
+            and target["snapshot_date"] == "UNPROVISIONED"
+            and (
+                target["builder_image"] != "UNPROVISIONED"
+                or target["vm_image"] != "UNPROVISIONED"
+            )
+        ):
+            die(f"{target_id} has a pinned image without a pinned Arch snapshot")
+    for kind, states in image_states.items():
+        if any(states) and not all(states):
+            die(
+                f"{kind} image locks must be pinned or UNPROVISIONED "
+                "for all nine targets atomically"
+            )
+    if any(image_states["vm"]) and not qemu_runner_provisioned:
+        die("pinned VM images require pinned QEMU runner supply-chain locks")
     targets_by_id = {target["id"]: target for target in targets}
     for first_id, second_id in MULTIARCH_BUILDERS:
         first = targets_by_id[first_id]
