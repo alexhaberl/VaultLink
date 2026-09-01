@@ -71,7 +71,7 @@ struct PublicUploadIntent {
 }
 
 enum PublicUploadPhaseError {
-    Response(Response),
+    Response(Box<Response>),
     App(AppError),
 }
 
@@ -89,7 +89,12 @@ fn public_upload_rejection(
     status: StatusCode,
     message: &'static str,
 ) -> PublicUploadPhaseError {
-    PublicUploadPhaseError::Response(public_upload_error(token, upload_subdir, status, message))
+    PublicUploadPhaseError::Response(Box::new(public_upload_error(
+        token,
+        upload_subdir,
+        status,
+        message,
+    )))
 }
 
 /// Owns every durable and filesystem resource from the moment staging starts.
@@ -1455,7 +1460,7 @@ pub(crate) async fn upload(
     };
     let upload = match form_phase.run(multipart).await {
         Ok(upload) => upload,
-        Err(PublicUploadPhaseError::Response(response)) => return Ok(response),
+        Err(PublicUploadPhaseError::Response(response)) => return Ok(*response),
         Err(PublicUploadPhaseError::App(error)) => return Err(error),
     };
 

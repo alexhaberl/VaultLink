@@ -255,7 +255,7 @@ jobs:
           python3 tools/update-package-target-images.py \
             builder "$mapping" package-targets.json
           python3 tools/package-targets.py validate --allow-unprovisioned
-          printf 'Review the uploaded complete package closures, then combine this partial builder lock with all nine VM locks in one pinning PR.\n' \
+          printf 'Review the uploaded complete package closures. When reviewed VM locks remain unchanged, pin this generated candidate unchanged, validate it strictly, merge that pinning PR, and only then set VAULTLINK_PACKAGE_SIGNING_IMAGE to its Debian 13 amd64 builder_image; otherwise combine it with all nine refreshed VM locks.\n' \
             >>"$GITHUB_STEP_SUMMARY"
       - name: Upload reviewed target-lock candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

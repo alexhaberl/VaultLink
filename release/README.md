@@ -70,7 +70,7 @@ install mutable distro or Cargo tools.
 
 ## Refresh procedure
 
-Image refresh is a protected two-pull-request operation:
+A full builder-and-VM image refresh is a protected two-pull-request operation:
 
 1. merge reviewed recipe/manifest changes with image fields still
    `UNPROVISIONED`;
@@ -125,6 +125,26 @@ Image refresh is a protected two-pull-request operation:
    same-commit run-ID path permits the initial nine guest images to be built
    before that atomic pinning pull request; it never permits an unprovisioned
    harness to run.
+
+Builder and VM image references are independent all-nine atomic lock families:
+within either family, all targets use reviewed digests or all targets use
+`UNPROVISIONED`. A refresh that changes only the shared Rust stage or native
+package-builder recipe invalidates all builder-image references but preserves
+the reviewed VM and QEMU locks. After that recipe pull request lands:
+
+1. dispatch `package-builders-refresh.yml` from that exact `main` commit with
+   the reviewed distro base digests and the committed Arch snapshot date;
+2. review all nine emitted package-closure locks and the generated
+   `package-targets.json` artifact;
+3. verify that the candidate changes only builder image/base/package evidence,
+   then pin that generated file unchanged in a second reviewed pull request;
+4. run strict target validation, policy, the full package matrix, package
+   reproducibility, and distro-VM gates; and
+5. update `VAULTLINK_PACKAGE_SIGNING_IMAGE` to the newly pinned Debian 13 amd64
+   builder reference.
+
+The old builder digests must never be copied across a Rust-toolchain change,
+and builder generation remains restricted to the protected `main` workflow.
 
 Refresh workflows push immutable images and emit proposed pins but never modify
 `main`. After pinning, run `make policy-check`, the full package matrix,
