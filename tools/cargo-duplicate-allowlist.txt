@@ -20,6 +20,11 @@ sha2
 thiserror
 thiserror-impl
 
+# Proc-macro dependencies temporarily span syn 2 and 3: futures-macro,
+# serde_derive, and thiserror-impl 2.x have moved to syn 3 while remaining
+# macro crates still require syn 2. Remove once the proc-macro graph converges.
+syn
+
 # The ACME/TLS dependency graph still spans two webpki-roots generations.
 # Re-evaluate after the next stable rustls-acme/rustls upgrade.
 webpki-roots
