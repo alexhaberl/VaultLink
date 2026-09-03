@@ -1,4 +1,3 @@
-use argon2::password_hash::SaltString;
 use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use data_encoding::BASE32_NOPAD;
@@ -57,9 +56,8 @@ fn fill_random(bytes: &mut [u8]) {
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
     let mut salt_bytes = [0u8; 16];
     fill_random(&mut salt_bytes);
-    let salt = SaltString::encode_b64(&salt_bytes)?;
     password_argon2()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt_bytes)
         .map(|h| h.to_string())
 }
 
@@ -637,6 +635,26 @@ impl LoginLimiter {
 mod tests {
     use super::*;
 
+    // Generated with argon2 0.5.3/password-hash 0.5.0. Keep these fixed so
+    // compatibility is tested against hashes created by the previous version.
+    const ARGON2_0_5_ALTERNATE_PARAMS_FIXTURE: &str =
+        "$argon2id$v=19$m=4096,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$ZIgZc5Em9MHrC+H07onKRLx1wU3GrciA1ragq7pWz6o";
+    const ARGON2_0_5_CURRENT_PARAMS_FIXTURE: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$MDEyMzQ1Njc4OWFiY2RlZg$gy5SuVm5Z7Vw7keB9se9p87QGcomaseB/S2U1OhTsM0";
+    const TAMPERED_ARGON2_0_5_FIXTURE: &str =
+        "$argon2id$v=19$m=4096,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$ZIgZc5Em9MHrC+H07onKRLx1wU3GrciA1ragq7pWz6s";
+
+    fn assert_current_password_hash_shape(hash: &str) {
+        let parsed = PasswordHash::new(hash).unwrap();
+        assert_eq!(parsed.algorithm.as_str(), "argon2id");
+        assert_eq!(parsed.version, Some(19));
+        assert_eq!(parsed.params.get_decimal("m"), Some(19_456));
+        assert_eq!(parsed.params.get_decimal("t"), Some(2));
+        assert_eq!(parsed.params.get_decimal("p"), Some(1));
+        assert_eq!(parsed.salt.as_ref().map(|salt| salt.len()), Some(16));
+        assert_eq!(parsed.hash.as_ref().map(|output| output.len()), Some(32));
+    }
+
     #[test]
     fn constant_time_token_comparison_handles_equal_different_and_mismatched_lengths() {
         assert!(constant_time_eq("same-token", "same-token"));
@@ -648,7 +666,8 @@ mod tests {
     fn password_round_trip() {
         let first = hash_password("correct horse battery staple").unwrap();
         let second = hash_password("correct horse battery staple").unwrap();
-        assert!(first.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
+        assert_current_password_hash_shape(&first);
+        assert_current_password_hash_shape(&second);
         assert_ne!(first, second);
         assert!(verify_password(&first, "correct horse battery staple"));
         assert!(verify_password(&second, "correct horse battery staple"));
@@ -660,18 +679,30 @@ mod tests {
     }
 
     #[test]
-    fn password_verification_accepts_existing_argon2id_parameter_sets() {
-        let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
-        let legacy = Argon2::new(
-            Algorithm::Argon2id,
-            Version::V0x13,
-            Params::new(4_096, 3, 1, None).unwrap(),
-        )
-        .hash_password(b"legacy password", &salt)
-        .unwrap()
-        .to_string();
-        assert!(legacy.contains("m=4096,t=3,p=1"));
-        assert!(verify_password(&legacy, "legacy password"));
+    fn password_verification_accepts_argon2_0_5_fixtures() {
+        assert!(verify_password(
+            ARGON2_0_5_ALTERNATE_PARAMS_FIXTURE,
+            "legacy password"
+        ));
+        assert!(verify_password(
+            ARGON2_0_5_CURRENT_PARAMS_FIXTURE,
+            "correct horse battery staple"
+        ));
+        assert!(!verify_password(
+            ARGON2_0_5_ALTERNATE_PARAMS_FIXTURE,
+            "wrong"
+        ));
+        assert!(!verify_password(ARGON2_0_5_CURRENT_PARAMS_FIXTURE, "wrong"));
+    }
+
+    #[test]
+    fn password_verification_rejects_tampered_or_invalid_hashes() {
+        assert!(PasswordHash::new(TAMPERED_ARGON2_0_5_FIXTURE).is_ok());
+        assert!(!verify_password(
+            TAMPERED_ARGON2_0_5_FIXTURE,
+            "legacy password"
+        ));
+        assert!(!verify_password("not-a-phc-string", "legacy password"));
     }
 
     #[test]
