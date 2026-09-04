@@ -1,4 +1,4 @@
-.PHONY: dev-setup sample-data test login-timing-check security-test secret-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check package-manifest-bootstrap package-manifest-check native-package verify-native-package docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test docker-update-safety-test docker-real-package-update-smoke
+.PHONY: dev-setup sample-data test login-timing-check security-test secret-check web-assets-check architecture-check performance-evidence-check refactoring-contracts-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check package-manifest-bootstrap package-manifest-check native-package verify-native-package docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test docker-update-safety-test docker-real-package-update-smoke
 
 CONFIG ?= config/development.toml
 DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
@@ -38,7 +38,7 @@ security-test:
 	cargo test secure_fs
 	cargo test range
 	@set -eu; \
-		fresh_schema_test='db::tests::fresh_database_is_exactly_schema_seven_without_plaintext_secret_columns'; \
+		fresh_schema_test='db::tests::fresh_database_is_exactly_schema_eight_without_plaintext_secret_columns'; \
 		listed_tests=$$(mktemp); \
 		trap 'rm -f "$$listed_tests"' EXIT HUP INT TERM; \
 		cargo test -- --list >"$$listed_tests"; \
@@ -56,6 +56,20 @@ security-test:
 secret-check:
 	sh tools/check-secrets.sh
 
+web-assets-check:
+	sh tools/check-web-assets.sh
+
+architecture-check:
+	$(PYTHON) tools/test-architecture.py
+	$(PYTHON) tools/check-architecture.py --root .
+
+performance-evidence-check:
+	$(PYTHON) tools/test-performance-evidence.py
+
+refactoring-contracts-check:
+	$(PYTHON) tools/test-refactoring-contracts.py
+	$(PYTHON) tools/check-refactoring-contracts.py --root .
+
 fuzz: fuzz-parallel
 
 fuzz-parallel:
@@ -66,6 +80,8 @@ fuzz-sequential:
 	@$(MAKE) fuzz-parallel FUZZ_JOBS=1
 
 lint:
+	sh tools/check-web-assets.sh
+	$(MAKE) architecture-check performance-evidence-check refactoring-contracts-check
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
 

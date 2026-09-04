@@ -8,18 +8,23 @@ checker=tools/check-supply-chain-policy.sh
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT HUP INT TERM
 base="$work/base"
-mkdir -p "$base/.github/workflows" "$base/deploy/docker" "$base/src"
+mkdir -p \
+    "$base/.github/workflows" \
+    "$base/assets/web" \
+    "$base/deploy/docker" \
+    "$base/src/setup"
 
 for fixture in \
     .github/workflows/ci.yml \
     .github/workflows/package-builders-refresh.yml \
     .github/workflows/qemu-runner-refresh.yml \
     .github/workflows/distro-vm-images-refresh.yml \
+    assets/web/setup.js \
     deploy/docker/Dockerfile.package-builder \
     deploy/docker/Dockerfile.qemu-runner \
     deploy/docker/Dockerfile.distro-vm-image \
     README.md \
-    src/setup.rs; do
+    src/setup/routes.rs; do
     cp "$fixture" "$base/$fixture"
 done
 

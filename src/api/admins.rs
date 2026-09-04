@@ -9,11 +9,18 @@ use crate::{
     db::{AdminDeactivationOutcome, AdminSummary, AuditContext},
     http_auth::{
         csrf_header, database, enabled_audit_client_ip, hash_password_admitted, mfa_session,
-        required_database, session, MissingSession,
+        required_session_service_database, session, MissingSession,
     },
+    internal_reporting::InternalOperation,
     sensitive::SecretString,
-    services::admin::{AdminActivationResult, AdminService, AdminServiceError, CreateAdminCommand},
-    AppState,
+    services::{
+        admin::{
+            AdminActivationResult, AdminService, AdminServiceError, AdminValidationError,
+            CreateAdminCommand,
+        },
+        error::ServiceError,
+    },
+    AdminRouteState,
 };
 
 use super::{session_bound, ApiError, ApiResult, PasswordRequest, SimpleResponse};
@@ -36,11 +43,11 @@ fn admin_response(admin: AdminSummary) -> AdminResponse {
 }
 
 pub(super) async fn list_admins(
-    State(state): State<AppState>,
+    State(state): State<AdminRouteState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<AdminResponse>>> {
     session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    let admins = database(state.db.clone(), |db| db.list_admins()).await?;
+    let admins = database(state.db().clone(), |db| db.list_admins()).await?;
     Ok(Json(admins.into_iter().map(admin_response).collect()))
 }
 
@@ -59,13 +66,13 @@ pub(super) struct CreatedAdminResponse {
 }
 
 pub(super) async fn create_admin(
-    State(state): State<AppState>,
+    State(state): State<AdminRouteState>,
     headers: HeaderMap,
     Json(request): Json<CreateAdminRequest>,
 ) -> ApiResult<Json<CreatedAdminResponse>> {
     let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
     csrf_header(&authenticated, &headers)?;
-    let service = AdminService::new(state.db.clone());
+    let service = AdminService::new(state.db().clone());
     let validated = service
         .prepare_create(CreateAdminCommand {
             username: request.username,
@@ -75,32 +82,37 @@ pub(super) async fn create_admin(
         .map_err(admin_validation_error)?;
     let (prepared, password) = validated.into_hash_input();
     let password_hash = hash_password_admitted(&state, password).await?;
-    let proof = authenticated.proof().clone();
     let audit_actor = authenticated.username.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
-    let login_limiter = state.admin_login_limiter.clone();
+    let login_limiter = state.admin_login_limiter().clone();
     let created = session_bound(
-        required_database(state.db.clone(), move |_| {
-            let outcome = service
-                .create_for_mfa_session(
-                    &proof,
+        required_session_service_database(
+            state.db().clone(),
+            move |_| {
+                let outcome = service.create_for_mfa_session(
+                    authenticated,
                     &prepared,
                     &password_hash,
                     &audit_context,
                     |active_admins| login_limiter.publish_active_admins(active_admins),
-                )
-                .map_err(admin_database_error)?;
-            match outcome {
-                crate::db::SessionBound::Authorized((created, publication)) => {
-                    drop(publication);
-                    Ok(crate::db::SessionBound::Authorized(created))
+                )?;
+                match outcome {
+                    crate::db::SessionBound::Authorized(audited) => {
+                        Ok(crate::db::SessionBound::Authorized(audited.map(
+                            |(created, publication)| {
+                                drop(publication);
+                                created
+                            },
+                        )))
+                    }
+                    crate::db::SessionBound::SessionUnavailable => {
+                        Ok(crate::db::SessionBound::SessionUnavailable)
+                    }
                 }
-                crate::db::SessionBound::SessionUnavailable => {
-                    Ok(crate::db::SessionBound::SessionUnavailable)
-                }
-            }
-        })
+            },
+            InternalOperation::ApiAdminServiceDatabaseFailure,
+        )
         .await?,
     )?;
     let response_secret = created.totp_secret.into_one_time_response();
@@ -117,7 +129,7 @@ pub(super) async fn create_admin(
 }
 
 pub(super) async fn activate_admin(
-    State(state): State<AppState>,
+    State(state): State<AdminRouteState>,
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<SimpleResponse>> {
@@ -125,7 +137,7 @@ pub(super) async fn activate_admin(
 }
 
 pub(super) async fn deactivate_admin(
-    State(state): State<AppState>,
+    State(state): State<AdminRouteState>,
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<SimpleResponse>> {
@@ -133,7 +145,7 @@ pub(super) async fn deactivate_admin(
 }
 
 async fn set_admin_active_api(
-    state: AppState,
+    state: AdminRouteState,
     headers: HeaderMap,
     id: i64,
     active: bool,
@@ -148,26 +160,35 @@ async fn set_admin_active_api(
     let audit_actor = authenticated.username.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
-    let service = AdminService::new(state.db.clone());
-    let proof = authenticated.proof().clone();
-    let login_limiter = state.admin_login_limiter.clone();
+    let service = AdminService::new(state.db().clone());
+    let login_limiter = state.admin_login_limiter().clone();
     let outcome = session_bound(
-        required_database(state.db.clone(), move |_| {
-            let outcome = service
-                .set_active_for_mfa_session(&proof, id, active, &audit_context, |active_admins| {
-                    login_limiter.publish_active_admins(active_admins)
-                })
-                .map_err(admin_database_error)?;
-            match outcome {
-                crate::db::SessionBound::Authorized((outcome, publication)) => {
-                    drop(publication);
-                    Ok(crate::db::SessionBound::Authorized(outcome))
+        required_session_service_database(
+            state.db().clone(),
+            move |_| {
+                let outcome = service.set_active_for_mfa_session(
+                    authenticated,
+                    id,
+                    active,
+                    &audit_context,
+                    |active_admins| login_limiter.publish_active_admins(active_admins),
+                )?;
+                match outcome {
+                    crate::db::SessionBound::Authorized(audited) => {
+                        Ok(crate::db::SessionBound::Authorized(audited.map(
+                            |(outcome, publication)| {
+                                drop(publication);
+                                outcome
+                            },
+                        )))
+                    }
+                    crate::db::SessionBound::SessionUnavailable => {
+                        Ok(crate::db::SessionBound::SessionUnavailable)
+                    }
                 }
-                crate::db::SessionBound::SessionUnavailable => {
-                    Ok(crate::db::SessionBound::SessionUnavailable)
-                }
-            }
-        })
+            },
+            InternalOperation::ApiAdminServiceDatabaseFailure,
+        )
         .await?,
     )?;
     match outcome {
@@ -191,7 +212,7 @@ async fn set_admin_active_api(
 }
 
 pub(super) async fn reset_admin_password(
-    State(state): State<AppState>,
+    State(state): State<AdminRouteState>,
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
     Json(request): Json<PasswordRequest>,
@@ -203,7 +224,7 @@ pub(super) async fn reset_admin_password(
             "Change your own password through My account",
         ));
     }
-    let service = AdminService::new(state.db.clone());
+    let service = AdminService::new(state.db().clone());
     let password = service
         .prepare_password(request.password, None)
         .map_err(admin_validation_error)?;
@@ -211,13 +232,14 @@ pub(super) async fn reset_admin_password(
     let audit_actor = authenticated.username.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
-    let proof = authenticated.proof().clone();
     let changed = session_bound(
-        required_database(state.db.clone(), move |_| {
-            service
-                .reset_password_for_mfa_session(&proof, id, &hash, &audit_context)
-                .map_err(admin_database_error)
-        })
+        required_session_service_database(
+            state.db().clone(),
+            move |_| {
+                service.reset_password_for_mfa_session(authenticated, id, &hash, &audit_context)
+            },
+            InternalOperation::ApiAdminServiceDatabaseFailure,
+        )
         .await?,
     )?;
     if !changed {
@@ -227,7 +249,7 @@ pub(super) async fn reset_admin_password(
 }
 
 pub(super) async fn reset_admin_totp(
-    State(state): State<AppState>,
+    State(state): State<AdminRouteState>,
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<CreatedAdminResponse>> {
@@ -241,18 +263,19 @@ pub(super) async fn reset_admin_totp(
     let audit_actor = authenticated.username.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
-    let service = AdminService::new(state.db.clone());
-    let proof = authenticated.proof().clone();
-    let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
+    let service = AdminService::new(state.db().clone());
+    let security_settings_guard = state.acquire_security_settings_mutation().await;
     let reset = session_bound(
-        required_database(state.db.clone(), move |_| {
-            // A TOTP reset removes every WebAuthn credential. Keep that
-            // credential-count change ordered with runtime/settings updates.
-            let _security_settings_guard = security_settings_guard;
-            service
-                .reset_totp_for_mfa_session(&proof, id, &audit_context)
-                .map_err(admin_database_error)
-        })
+        required_session_service_database(
+            state.db().clone(),
+            move |_| {
+                // A TOTP reset removes every WebAuthn credential. Keep that
+                // credential-count change ordered with runtime/settings updates.
+                let _security_settings_guard = security_settings_guard;
+                service.reset_totp_for_mfa_session(authenticated, id, &audit_context)
+            },
+            InternalOperation::ApiAdminServiceDatabaseFailure,
+        )
         .await?,
     )?
     .ok_or_else(|| ApiError::not_found("Administrator not found"))?;
@@ -270,21 +293,18 @@ pub(super) async fn reset_admin_totp(
 
 fn admin_validation_error(error: AdminServiceError) -> ApiError {
     match error {
-        AdminServiceError::InvalidUsername => {
+        ServiceError::Validation(AdminValidationError::InvalidUsername) => {
             ApiError::bad_request("Invalid administrator username")
         }
-        AdminServiceError::InvalidPassword => {
+        ServiceError::Validation(AdminValidationError::InvalidPassword) => {
             ApiError::bad_request("Invalid administrator password")
         }
-        AdminServiceError::PasswordConfirmationMismatch => {
+        ServiceError::Validation(AdminValidationError::PasswordConfirmationMismatch) => {
             ApiError::bad_request("Passwords do not match")
         }
-        AdminServiceError::Database(error) => ApiError::internal(error),
+        error => ApiError::from(crate::http_auth::service_error(
+            error,
+            InternalOperation::ApiAdminServiceDatabaseFailure,
+        )),
     }
-}
-
-fn admin_database_error(error: AdminServiceError) -> rusqlite::Error {
-    error
-        .into_database_error()
-        .unwrap_or(rusqlite::Error::InvalidQuery)
 }

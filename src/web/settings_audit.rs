@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, Redirect},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     common::{display_limit_unit_floor, format_audit_time, parse_unit_to_bytes},
@@ -80,6 +80,8 @@ struct AuditPageTemplate {
     client_ip_enabled: bool,
     previous_page: Option<usize>,
     next_page: Option<usize>,
+    previous_cursor: Option<String>,
+    next_cursor: Option<String>,
     page_number: usize,
     total_pages: usize,
     server_mode: String,
@@ -90,15 +92,16 @@ struct AuditPageTemplate {
 use crate::{
     config::MAX_TEXT_PREVIEW_SIZE,
     db::{
-        AuditClientIpDeletionOutcome, AuditContext, AuditSortColumn, AuditSortDirection, Session,
+        AuditClientIpDeletionOutcome, AuditContext, AuditCursor, AuditEvent, AuditKeysetPosition,
+        AuditSortColumn, AuditSortDirection, Session,
     },
     http_auth::{
         commit_runtime_settings, csrf, database, enabled_audit_client_ip, mfa_session,
-        required_database, runtime_settings, session, MissingSession,
+        required_mfa_audit_database, runtime_settings, session, MissingSession,
     },
     i18n::{self},
     runtime::RuntimeSettings,
-    AppState,
+    SettingsRouteState,
 };
 
 #[derive(Deserialize)]
@@ -123,14 +126,14 @@ pub(super) struct SettingsForm {
 }
 
 pub(super) async fn settings_page(
-    State(state): State<AppState>,
+    State(state): State<SettingsRouteState>,
     headers: HeaderMap,
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let settings = runtime_settings(&state);
-    let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
-    let public_url_locked = state.config.server.mode == crate::config::ServerMode::StandaloneTls
-        && state.config.tls.certificate_source == crate::config::CertificateSource::LetsEncrypt;
+    let ip_count = database(state.db().clone(), |db| db.count_audit_client_ips()).await?;
+    let public_url_locked = state.config().server.mode == crate::config::ServerMode::StandaloneTls
+        && state.config().tls.certificate_source == crate::config::CertificateSource::LetsEncrypt;
     let body = settings_form_template(&session, &settings, ip_count, "", public_url_locked);
     Ok(Html(templates::admin_page(
         &state,
@@ -186,7 +189,7 @@ pub(super) fn settings_form_template(
 }
 
 pub(super) async fn update_settings(
-    State(state): State<AppState>,
+    State(state): State<SettingsRouteState>,
     headers: HeaderMap,
     Form(form): Form<SettingsForm>,
 ) -> Result<Html<String>> {
@@ -252,7 +255,7 @@ pub(super) async fn update_settings(
     ];
     next.apply_many(entries)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid setting"))?;
-    if state.config.server.production_mode
+    if state.config().server.production_mode
         && url::Url::parse(&next.public_base_url)
             .ok()
             .is_none_or(|url| url.scheme() != "https")
@@ -262,35 +265,36 @@ pub(super) async fn update_settings(
             "Production public_base_url must use HTTPS",
         ));
     }
-    let proof = session.proof().clone();
     let previous = runtime_settings(&state);
     let actor = session.username.clone();
+    let response_session = (*session).clone();
     let changed = previous.changed_keys(&next);
-    super::session_bound(
+    super::session_bound(crate::db::release_session_audited(
         commit_runtime_settings(
             &state,
-            proof,
+            session,
             next.clone(),
             actor,
             format!("changed_keys={}", changed.join(",")),
         )
         .await?,
-    )?;
-    let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
+    ))?;
+    let ip_count = database(state.db().clone(), |db| db.count_audit_client_ips()).await?;
     let body = settings_form_template(
-        &session,
+        &response_session,
         &next,
         ip_count,
         "Settings saved.",
-        state.config.server.mode == crate::config::ServerMode::StandaloneTls
-            && state.config.tls.certificate_source == crate::config::CertificateSource::LetsEncrypt,
+        state.config().server.mode == crate::config::ServerMode::StandaloneTls
+            && state.config().tls.certificate_source
+                == crate::config::CertificateSource::LetsEncrypt,
     );
     Ok(Html(templates::admin_page(
         &state,
         PageId::Settings,
         &body,
         false,
-        &session.csrf_token,
+        &response_session.csrf_token,
         true,
     )?))
 }
@@ -302,7 +306,7 @@ pub(super) struct DeleteAuditIpsForm {
 }
 
 pub(super) async fn audit_ips_delete_confirmation(
-    State(state): State<AppState>,
+    State(state): State<SettingsRouteState>,
     headers: HeaderMap,
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
@@ -312,7 +316,7 @@ pub(super) async fn audit_ips_delete_confirmation(
             "IP capture must be disabled before deletion",
         ));
     }
-    let count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
+    let count = database(state.db().clone(), |db| db.count_audit_client_ips()).await?;
     let body = DeleteAuditIpsTemplate {
         count,
         csrf_token: &session.csrf_token,
@@ -328,7 +332,7 @@ pub(super) async fn audit_ips_delete_confirmation(
 }
 
 pub(super) async fn delete_audit_ips_ui(
-    State(state): State<AppState>,
+    State(state): State<SettingsRouteState>,
     headers: HeaderMap,
     Form(form): Form<DeleteAuditIpsForm>,
 ) -> Result<Redirect> {
@@ -341,14 +345,17 @@ pub(super) async fn delete_audit_ips_ui(
         ));
     }
     let fallback_logging_enabled = runtime_settings(&state).audit_client_ip_enabled;
-    let proof = session.proof().clone();
-    let audit_actor = session.username.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
-    let audit_context = AuditContext::new(audit_actor, audit_client_ip);
-    let outcome = required_database(state.db.clone(), move |db| {
-        db.delete_audit_client_ips_for_mfa_session(&proof, fallback_logging_enabled, &audit_context)
-    })
-    .await?;
+    let outcome =
+        required_mfa_audit_database(state.db().clone(), session, move |db, session, proof| {
+            let audit_context = AuditContext::new(session.username, audit_client_ip);
+            db.delete_audit_client_ips_for_mfa_session(
+                &proof,
+                fallback_logging_enabled,
+                &audit_context,
+            )
+        })
+        .await?;
     let outcome = super::session_bound(outcome)?;
     let AuditClientIpDeletionOutcome::Deleted(_) = outcome else {
         return Err(AppError(
@@ -460,16 +467,186 @@ fn audit_sort_header(
     }
 }
 
+fn audit_headers(
+    current_column: AuditSortColumn,
+    current_direction: AuditSortDirection,
+    action: &str,
+    include_client_ip: bool,
+) -> Vec<AuditHeaderView> {
+    let definitions = [
+        (
+            "vl-audit-time",
+            Some("common.time"),
+            "",
+            AuditSortColumn::Time,
+        ),
+        ("vl-audit-user", None, "User", AuditSortColumn::Actor),
+        (
+            "vl-audit-action",
+            Some("common.action"),
+            "",
+            AuditSortColumn::Action,
+        ),
+        (
+            "vl-audit-object",
+            Some("common.object"),
+            "",
+            AuditSortColumn::Object,
+        ),
+        (
+            "vl-audit-detail",
+            Some("common.detail"),
+            "",
+            AuditSortColumn::Detail,
+        ),
+    ];
+    let mut headers = definitions
+        .into_iter()
+        .map(|(class_name, label_key, label, column)| {
+            audit_sort_header(
+                class_name,
+                label_key,
+                label,
+                column,
+                current_column,
+                current_direction,
+                action,
+            )
+        })
+        .collect::<Vec<_>>();
+    if include_client_ip {
+        headers.push(audit_sort_header(
+            "vl-audit-ip",
+            None,
+            "Client-IP",
+            AuditSortColumn::ClientIp,
+            current_column,
+            current_direction,
+            action,
+        ));
+    }
+    headers
+}
+
 #[derive(Default, Deserialize)]
 pub(super) struct AuditQuery {
     page: Option<usize>,
     action: Option<String>,
     sort: Option<String>,
     direction: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AuditCursorToken {
+    value: String,
+    id: i64,
+    position: String,
+    action: String,
+    sort: String,
+    direction: String,
+}
+
+fn encode_audit_cursor(
+    cursor: AuditCursor,
+    position: AuditKeysetPosition,
+    action: &str,
+    sort: AuditSortColumn,
+    direction: AuditSortDirection,
+) -> Option<String> {
+    let token = AuditCursorToken {
+        value: cursor.value,
+        id: cursor.id,
+        position: match position {
+            AuditKeysetPosition::After => "after",
+            AuditKeysetPosition::Before => "before",
+        }
+        .to_owned(),
+        action: action.to_owned(),
+        sort: audit_sort_column_value(sort).to_owned(),
+        direction: audit_sort_direction_value(direction).to_owned(),
+    };
+    serde_json::to_vec(&token)
+        .ok()
+        .map(|json| data_encoding::BASE64URL_NOPAD.encode(&json))
+}
+
+fn decode_audit_cursor(
+    encoded: &str,
+    action: &str,
+    sort: AuditSortColumn,
+    direction: AuditSortDirection,
+) -> Option<(AuditCursor, AuditKeysetPosition)> {
+    if encoded.len() > 8_192 {
+        return None;
+    }
+    let json = data_encoding::BASE64URL_NOPAD
+        .decode(encoded.as_bytes())
+        .ok()?;
+    let token = serde_json::from_slice::<AuditCursorToken>(&json).ok()?;
+    if token.action != action
+        || token.sort != audit_sort_column_value(sort)
+        || token.direction != audit_sort_direction_value(direction)
+    {
+        return None;
+    }
+    let position = match token.position.as_str() {
+        "after" => AuditKeysetPosition::After,
+        "before" => AuditKeysetPosition::Before,
+        _ => return None,
+    };
+    Some((
+        AuditCursor {
+            value: token.value,
+            id: token.id,
+        },
+        position,
+    ))
+}
+
+struct AuditPagination {
+    previous_page: Option<usize>,
+    next_page: Option<usize>,
+    previous_cursor: Option<String>,
+    next_cursor: Option<String>,
+}
+
+fn audit_pagination(
+    events: &[AuditEvent],
+    page_number: usize,
+    total_pages: usize,
+    action: &str,
+    sort: AuditSortColumn,
+    direction: AuditSortDirection,
+) -> AuditPagination {
+    let previous_page = page_number.checked_sub(1);
+    let next_page = (page_number + 1 < total_pages).then_some(page_number + 1);
+    let previous_cursor = previous_page.and_then(|_| {
+        events
+            .first()
+            .map(|event| event.cursor(sort))
+            .and_then(|cursor| {
+                encode_audit_cursor(cursor, AuditKeysetPosition::Before, action, sort, direction)
+            })
+    });
+    let next_cursor = next_page.and_then(|_| {
+        events
+            .last()
+            .map(|event| event.cursor(sort))
+            .and_then(|cursor| {
+                encode_audit_cursor(cursor, AuditKeysetPosition::After, action, sort, direction)
+            })
+    });
+    AuditPagination {
+        previous_page,
+        next_page,
+        previous_cursor,
+        next_cursor,
+    }
 }
 
 pub(super) async fn audit_page(
-    State(state): State<AppState>,
+    State(state): State<SettingsRouteState>,
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> Result<Html<String>> {
@@ -483,23 +660,55 @@ pub(super) async fn audit_page(
         .action
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_string());
+    let cursor = query.cursor.as_deref().and_then(|encoded| {
+        decode_audit_cursor(
+            encoded,
+            action.as_deref().unwrap_or(""),
+            sort_column,
+            sort_direction,
+        )
+    });
     let action_for_db = action.clone();
-    let (events, total, page_number) = database(state.db.clone(), move |db| {
+    let (events, total, page_number) = database(state.db().clone(), move |db| {
         let total = db.count_audit(action_for_db.as_deref())?;
         let total_pages = total.div_ceil(100).max(1);
         let page_number = requested_page.min(total_pages - 1);
-        let events = db.list_audit_sorted(
+        let (cursor, position) = if let Some((cursor, position)) = cursor {
+            (Some(cursor), position)
+        } else if page_number > 0 {
+            (
+                db.audit_cursor_at_offset(
+                    action_for_db.as_deref(),
+                    page_number.saturating_mul(100).saturating_sub(1),
+                    sort_column,
+                    sort_direction,
+                )?,
+                AuditKeysetPosition::After,
+            )
+        } else {
+            (None, AuditKeysetPosition::After)
+        };
+        let events = db.list_audit_keyset(
             action_for_db.as_deref(),
             100,
-            page_number * 100,
             sort_column,
             sort_direction,
+            cursor.as_ref(),
+            position,
         )?;
         Ok((events, total, page_number))
     })
     .await?;
     let total_pages = total.div_ceil(100).max(1);
-    let has_next = page_number + 1 < total_pages;
+    let filter_value = action.unwrap_or_default();
+    let pagination = audit_pagination(
+        &events,
+        page_number,
+        total_pages,
+        &filter_value,
+        sort_column,
+        sort_direction,
+    );
     let rows = events
         .into_iter()
         .map(|event| AuditRowView {
@@ -511,74 +720,19 @@ pub(super) async fn audit_page(
             client_ip: event.client_ip.unwrap_or_default(),
         })
         .collect();
-    let filter_value = action.unwrap_or_default();
-    let previous_page = page_number.checked_sub(1);
-    let next_page = has_next.then_some(page_number + 1);
-    let mut headers = vec![
-        audit_sort_header(
-            "vl-audit-time",
-            Some("common.time"),
-            "",
-            AuditSortColumn::Time,
-            sort_column,
-            sort_direction,
-            &filter_value,
-        ),
-        audit_sort_header(
-            "vl-audit-user",
-            None,
-            "User",
-            AuditSortColumn::Actor,
-            sort_column,
-            sort_direction,
-            &filter_value,
-        ),
-        audit_sort_header(
-            "vl-audit-action",
-            Some("common.action"),
-            "",
-            AuditSortColumn::Action,
-            sort_column,
-            sort_direction,
-            &filter_value,
-        ),
-        audit_sort_header(
-            "vl-audit-object",
-            Some("common.object"),
-            "",
-            AuditSortColumn::Object,
-            sort_column,
-            sort_direction,
-            &filter_value,
-        ),
-        audit_sort_header(
-            "vl-audit-detail",
-            Some("common.detail"),
-            "",
-            AuditSortColumn::Detail,
-            sort_column,
-            sort_direction,
-            &filter_value,
-        ),
-    ];
-    if client_ip_enabled {
-        headers.push(audit_sort_header(
-            "vl-audit-ip",
-            None,
-            "Client-IP",
-            AuditSortColumn::ClientIp,
-            sort_column,
-            sort_direction,
-            &filter_value,
-        ));
-    }
+    let headers = audit_headers(
+        sort_column,
+        sort_direction,
+        &filter_value,
+        client_ip_enabled,
+    );
     let sort_value = audit_sort_column_value(sort_column);
     let direction_value = audit_sort_direction_value(sort_direction);
     let url_scheme = url::Url::parse(&settings.public_base_url)
         .ok()
         .map(|url| url.scheme().to_uppercase())
         .unwrap_or_else(|| i18n::text(i18n::current_locale(), i18n::UNKNOWN).into());
-    let trusted_proxy_count = state.config.reverse_proxy.trusted_proxies.len();
+    let trusted_proxy_count = state.config().reverse_proxy.trusted_proxies.len();
     let filter_encoded =
         percent_encoding::utf8_percent_encode(&filter_value, percent_encoding::NON_ALPHANUMERIC)
             .to_string();
@@ -590,11 +744,13 @@ pub(super) async fn audit_page(
         headers,
         rows,
         client_ip_enabled,
-        previous_page,
-        next_page,
+        previous_page: pagination.previous_page,
+        next_page: pagination.next_page,
+        previous_cursor: pagination.previous_cursor,
+        next_cursor: pagination.next_cursor,
         page_number: page_number + 1,
         total_pages,
-        server_mode: format!("{:?}", state.config.server.mode),
+        server_mode: format!("{:?}", state.config().server.mode),
         url_scheme,
         trusted_proxy_count,
         ip_capture_label: if client_ip_enabled {

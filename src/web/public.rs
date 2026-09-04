@@ -12,30 +12,37 @@ use serde::Deserialize;
 use crate::{
     auth,
     db::{AuditAction, AuditContext, Permission, Share},
+    directory_cache::{DirectoryCacheLookup, DirectorySnapshotKey},
     file_ops,
     http_auth::{
         audit_observation, current_client_limit_key, database, enabled_audit_client_ip,
-        make_unlock_cookie, redirect_with_cookie, required_database, runtime_settings,
-        share_is_unlocked, share_unlock_csrf, try_acquire_client_activity,
-        verify_password_admitted, UnlockCookieScope,
+        make_unlock_cookie, redirect_with_cookie, required_audited_database, runtime_settings,
+        share_is_unlocked, share_unlock_csrf, verify_password_admitted, UnlockCookieScope,
     },
-    i18n, path_security,
+    i18n,
+    internal_reporting::{report_internal, InternalOperation},
+    path_security,
     policy::{self, ShareAvailability},
     sensitive::SecretString,
-    AppState,
+    PublicRouteState,
 };
 
 use super::{
     common::{
-        encoded, file_sort_column, file_sort_column_value, file_sort_direction,
-        file_sort_direction_value, format_public_date, human, internal, list_directory_cursor_page,
-        parent_path, preview_allowed, search_tree, sort_search_hits, BrowseQuery, FileSortColumn,
+        build_directory_snapshot, encoded, file_sort_column, file_sort_column_value,
+        file_sort_direction, file_sort_direction_value, format_public_date, human,
+        list_directory_cursor_page, list_directory_snapshot_cursor_page, parent_path,
+        preview_allowed, search_tree, sort_search_hits, BrowseQuery, FileSortColumn,
     },
     shares::share_permission_label,
     storage_recovery_app_error,
     templates::{self, TrustedMarkup},
     AppError, Result, MAX_SEARCH_QUERY_BYTES,
 };
+
+#[path = "public/page.rs"]
+mod page;
+pub(in crate::web) use page::public_page;
 
 #[derive(Template)]
 #[template(
@@ -220,59 +227,24 @@ pub(super) fn usable(sh: &Share) -> Result<()> {
     }
 }
 
-fn usable_for_transfer(sh: &Share) -> Result<()> {
-    match policy::share_availability(sh, Utc::now()) {
-        ShareAvailability::Available | ShareAvailability::LimitReached => Ok(()),
-        ShareAvailability::Inactive | ShareAvailability::Expired => {
-            Err(AppError(StatusCode::GONE, "This link is no longer active"))
-        }
-    }
-}
-
-pub(super) async fn get_share(state: &AppState, token: &str) -> Result<Share> {
+pub(super) async fn get_share(state: &PublicRouteState, token: &str) -> Result<Share> {
     let token = token.to_string();
-    let sh = database(state.db.clone(), move |db| db.share_by_token(&token))
+    let sh = database(state.db().clone(), move |db| db.share_by_token(&token))
         .await?
         .ok_or(AppError(StatusCode::NOT_FOUND, "Link not found"))?;
     usable(&sh)?;
     Ok(sh)
 }
 
-pub(super) async fn get_share_for_transfer(state: &AppState, token: &str) -> Result<Share> {
-    let token = token.to_string();
-    let sh = database(state.db.clone(), move |db| db.share_by_token(&token))
-        .await?
-        .ok_or(AppError(StatusCode::NOT_FOUND, "Link not found"))?;
-    usable_for_transfer(&sh)?;
-    Ok(sh)
-}
-
 pub(super) async fn get_storage_share(
-    state: &AppState,
+    state: &PublicRouteState,
     token: &str,
     expected_id: i64,
-) -> Result<(Share, tokio::sync::OwnedMutexGuard<()>)> {
-    let guard = state.storage_mutation.clone().lock_owned().await;
-    let guard = file_ops::recover_pending_file_operations_with_guard(state, guard)
+) -> Result<(Share, crate::storage_authority::StorageReadGuard)> {
+    let guard = file_ops::acquire_storage_read(state)
         .await
         .map_err(storage_recovery_app_error)?;
     let share = get_share(state, token).await?;
-    if share.id != expected_id {
-        return Err(AppError(StatusCode::GONE, "Share changed in the meantime"));
-    }
-    Ok((share, guard))
-}
-
-pub(super) async fn get_storage_share_for_transfer(
-    state: &AppState,
-    token: &str,
-    expected_id: i64,
-) -> Result<(Share, tokio::sync::OwnedMutexGuard<()>)> {
-    let guard = state.storage_mutation.clone().lock_owned().await;
-    let guard = file_ops::recover_pending_file_operations_with_guard(state, guard)
-        .await
-        .map_err(storage_recovery_app_error)?;
-    let share = get_share_for_transfer(state, token).await?;
     if share.id != expected_id {
         return Err(AppError(StatusCode::GONE, "Share changed in the meantime"));
     }
@@ -285,7 +257,7 @@ pub(super) struct UnlockForm {
 }
 
 pub(super) async fn unlock_share(
-    State(state): State<AppState>,
+    State(state): State<PublicRouteState>,
     ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     AxPath(token): AxPath<String>,
@@ -301,7 +273,7 @@ pub(super) async fn unlock_share(
     let global_key = format!("share-unlock-ip:{ip}");
     let share_key = format!("share-unlock:{}:{ip}", share.id);
     if !state
-        .share_limiter
+        .share_limiter()
         .check_and_record_attempts(&[&global_key, &share_key])
     {
         return Err(AppError(
@@ -342,8 +314,8 @@ pub(super) async fn unlock_share(
     let share_id = share.id;
     let expires = Utc::now() + Duration::minutes(runtime_settings(&state).share_unlock_minutes);
     let audit_context = AuditContext::new("public", enabled_audit_client_ip(&state));
-    let created = required_database(state.db.clone(), move |db| {
-        db.create_unlock_session_for_verified_password_and_audit(
+    let created = required_audited_database(state.db().clone(), move |db| {
+        db.create_unlock_session_for_verified_password_and_audit_audited(
             &stored_unlock_token,
             share_id,
             &expected_password_hash,
@@ -382,8 +354,10 @@ fn protected_share_page(token: &str) -> Html<String> {
     )
 }
 
-pub(super) async fn public_page(
-    State(state): State<AppState>,
+#[cfg(test)]
+#[cfg(any())]
+async fn public_page_reference(
+    State(state): State<PublicRouteState>,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
     Query(q): Query<BrowseQuery>,
@@ -400,16 +374,26 @@ pub(super) async fn public_page(
     let settings = runtime_settings(&state);
     let upload_csrf = share_unlock_csrf(&state, &headers, &sh).await?;
     let share_scope = if sh.is_directory && sh.permission.can_download() {
+        let scope_root = state.secure_root().clone();
+        let scope_path = sh.relative_path.clone();
         Some(
-            state
-                .secure_root
-                .bind_directory(&sh.relative_path)
-                .map_err(|_| AppError(StatusCode::NOT_FOUND, "Share target unavailable"))?,
+            tokio::task::spawn_blocking(move || {
+                let _storage_guard = storage_guard;
+                scope_root.bind_directory(&scope_path)
+            })
+            .await
+            .map_err(|error| {
+                AppError::from(report_internal(
+                    InternalOperation::WebPublicDirectoryListTaskJoin,
+                    error,
+                ))
+            })?
+            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Share target unavailable"))?,
         )
     } else {
+        drop(storage_guard);
         None
     };
-    drop(storage_guard);
     let display_name = if sh.permission == Permission::UploadOnly {
         i18n::text(i18n::current_locale(), i18n::UPLOAD_FILE).to_string()
     } else {
@@ -492,25 +476,18 @@ pub(super) async fn public_page(
             .replace('\\', "/");
         let relative_dir = clean_sub.clone();
         let share_scope = share_scope.expect("downloadable directory share is bound");
-        let _scan_peer_permit = try_acquire_client_activity(
-            state.expensive_peer_admission.clone(),
-            current_client_limit_key(),
-            crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT,
-        )
-        .ok_or(AppError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent expensive operations from this client",
-        ))?;
-        let _scan_permit = state
-            .search_admission
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                AppError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Too many concurrent file searches",
-                )
-            })?;
+        let _scan_peer_permit = state
+            .try_acquire_expensive_peer(current_client_limit_key())
+            .ok_or(AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many concurrent expensive operations from this client",
+            ))?;
+        let _scan_permit = state.try_acquire_search().map_err(|_| {
+            AppError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Too many concurrent file searches",
+            )
+        })?;
         let secure_root = share_scope;
         let mut rows = Vec::new();
         let mut truncated = false;
@@ -522,7 +499,12 @@ pub(super) async fn public_page(
                 search_tree(&secure_root, &relative_dir, &search, &search_settings)
             })
             .await
-            .map_err(internal)?
+            .map_err(|error| {
+                AppError::from(report_internal(
+                    InternalOperation::WebPublicSearchTaskJoin,
+                    error,
+                ))
+            })?
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::InvalidInput {
                     AppError(StatusCode::BAD_REQUEST, "Invalid directory cursor")
@@ -586,19 +568,76 @@ pub(super) async fn public_page(
             let scan_limit = settings.max_search_entries;
             let cursor_after = after_cursor.clone();
             let cursor_before = before_cursor.clone();
-            let listing_page = tokio::task::spawn_blocking(move || {
-                list_directory_cursor_page(
-                    &secure_root,
-                    &relative_dir,
+            let snapshot_guard = file_ops::acquire_storage_read(&state)
+                .await
+                .map_err(storage_recovery_app_error)?;
+            let storage_generation = snapshot_guard.generation();
+            let snapshot_root = secure_root.clone();
+            let snapshot_path = relative_dir.clone();
+            let snapshot_cache = state.directory_snapshot_cache().clone();
+            let snapshot_key = DirectorySnapshotKey {
+                scope: format!("share:{}:{}", sh.id, sh.relative_path),
+                directory: relative_dir.clone(),
+                sort: file_sort_column_value(sort_column),
+                direction: file_sort_direction_value(sort_direction),
+                scan_limit,
+                storage_generation,
+            };
+            let snapshot = snapshot_cache
+                .get_or_try_load(snapshot_key, || async move {
+                    tokio::task::spawn_blocking(move || {
+                        let _storage_guard = snapshot_guard;
+                        build_directory_snapshot(
+                            &snapshot_root,
+                            &snapshot_path,
+                            scan_limit,
+                            sort_column,
+                            sort_direction,
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        AppError::from(report_internal(
+                            InternalOperation::WebPublicDirectoryListTaskJoin,
+                            error,
+                        ))
+                    })?
+                    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Share target unavailable"))
+                })
+                .await?;
+            let listing_page = match snapshot {
+                DirectoryCacheLookup::Snapshot(snapshot) => list_directory_snapshot_cursor_page(
+                    &snapshot,
                     cursor_after.as_deref(),
                     cursor_before.as_deref(),
-                    scan_limit,
                     sort_column,
                     sort_direction,
-                )
-            })
-            .await
-            .map_err(internal)?
+                ),
+                DirectoryCacheLookup::Bypass => {
+                    let fallback_guard = file_ops::acquire_storage_read(&state)
+                        .await
+                        .map_err(storage_recovery_app_error)?;
+                    tokio::task::spawn_blocking(move || {
+                        let _storage_guard = fallback_guard;
+                        list_directory_cursor_page(
+                            &secure_root,
+                            &relative_dir,
+                            cursor_after.as_deref(),
+                            cursor_before.as_deref(),
+                            scan_limit,
+                            sort_column,
+                            sort_direction,
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        AppError::from(report_internal(
+                            InternalOperation::WebPublicDirectoryListTaskJoin,
+                            error,
+                        ))
+                    })?
+                }
+            }
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::InvalidInput {
                     AppError(StatusCode::BAD_REQUEST, "Invalid directory cursor")
@@ -690,12 +729,23 @@ pub(super) async fn public_page(
             search_encoded,
         });
     } else if !sh.is_directory && sh.permission.can_download() {
-        let secure_root = state.secure_root.clone();
+        let secure_root = state.secure_root().clone();
         let metadata_path = sh.relative_path.clone();
-        let metadata = tokio::task::spawn_blocking(move || secure_root.metadata(&metadata_path))
+        let storage_guard = file_ops::acquire_storage_read(&state)
             .await
-            .map_err(internal)?
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Shared file unavailable"))?;
+            .map_err(storage_recovery_app_error)?;
+        let metadata = tokio::task::spawn_blocking(move || {
+            let _storage_guard = storage_guard;
+            secure_root.metadata(&metadata_path)
+        })
+        .await
+        .map_err(|error| {
+            AppError::from(report_internal(
+                InternalOperation::WebPublicFileMetadataTaskJoin,
+                error,
+            ))
+        })?
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "Shared file unavailable"))?;
         let modified = metadata.modified().ok().map(public_file_time);
         let (modified_datetime, modified_label) = if let Some((datetime, label)) = modified {
             (Some(datetime), label)
@@ -732,7 +782,7 @@ pub(super) async fn public_page(
             queue_url: format!("/v/{token}/upload/queue"),
             csrf: upload_csrf.unwrap_or_default(),
             allow_overwrite: sh.upload_conflict_strategy.can_overwrite()
-                && state.config.storage.replacements_allowed(),
+                && state.config().storage.replacements_allowed(),
             upload_icon: TrustedMarkup::static_icon(crate::ui::Icon::Upload),
             folder_icon: TrustedMarkup::static_icon(crate::ui::Icon::Folder),
         });
@@ -769,14 +819,14 @@ fn joined_relative(base: &str, child: &str) -> Result<String> {
 }
 
 pub(super) async fn short_redirect(
-    State(state): State<AppState>,
+    State(state): State<PublicRouteState>,
     ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     AxPath(alias): AxPath<String>,
 ) -> Result<Redirect> {
     let ip = current_client_limit_key();
     if !state
-        .alias_limiter
+        .alias_limiter()
         .check_and_record_attempt(&format!("alias:{ip}"))
     {
         return Err(AppError(
@@ -787,7 +837,7 @@ pub(super) async fn short_redirect(
     if path_security::validate_share_alias(&alias).is_err() {
         return Err(AppError(StatusCode::NOT_FOUND, "Alias not found"));
     }
-    let sh = database(state.db.clone(), move |db| db.share_by_alias(&alias))
+    let sh = database(state.db().clone(), move |db| db.share_by_alias(&alias))
         .await?
         .ok_or(AppError(StatusCode::NOT_FOUND, "Alias not found"))?;
     usable(&sh)?;

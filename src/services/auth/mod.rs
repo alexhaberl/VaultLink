@@ -1,0 +1,314 @@
+use std::convert::Infallible;
+
+use chrono::{DateTime, Utc};
+
+use crate::{
+    auth,
+    db::{AuditContext, Audited, Database, PasswordSessionCreationOutcome},
+    sensitive::SecretString,
+    services::error::ServiceError,
+};
+
+pub(crate) type AuthServiceError = ServiceError<Infallible>;
+
+/// Transport-neutral input for password authentication and pre-MFA session
+/// creation. HTTP adapters remain responsible for rate limiting and cookies.
+pub(crate) struct PasswordLoginCommand {
+    pub(crate) username: String,
+    pub(crate) password: SecretString,
+    pub(crate) session_token: String,
+    pub(crate) csrf_token: String,
+    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) audit_client_ip: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PasswordLoginOutcome {
+    Created { admin_id: i64, username: String },
+    InvalidCredentials,
+}
+
+pub(crate) struct TotpLoginCommand {
+    pub(crate) username: String,
+    pub(crate) admin_id: i64,
+    pub(crate) current_session_token: String,
+    pub(crate) code: SecretString,
+    pub(crate) rotated_session_token: String,
+    pub(crate) rotated_csrf_token: String,
+    pub(crate) audit_client_ip: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TotpLoginOutcome {
+    Created,
+    InvalidCode,
+    ReplayedOrStale,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthService {
+    database: Database,
+}
+
+impl AuthService {
+    pub(crate) fn new(database: Database) -> Self {
+        Self { database }
+    }
+
+    /// Verifies the password and creates the audited pre-MFA session as one
+    /// domain operation. The DB method rechecks the password hash in its
+    /// transaction so a concurrent password reset cannot mint a stale session.
+    pub(crate) fn login_with_password(
+        &self,
+        command: PasswordLoginCommand,
+    ) -> Result<PasswordLoginOutcome, AuthServiceError> {
+        if command.password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
+            return Ok(PasswordLoginOutcome::InvalidCredentials);
+        }
+
+        let admin = if auth::valid_admin_username(&command.username) {
+            self.database
+                .admin(&command.username)
+                .map_err(AuthServiceError::from_database)?
+        } else {
+            None
+        };
+        let Some(admin) = admin else {
+            // Keep unknown accounts on one admitted Argon2 job too. The caller
+            // runs this whole service operation behind the shared admission
+            // semaphore, so overload behavior stays identical for both paths.
+            let _ = auth::hash_secret_password(&command.password);
+            return Ok(PasswordLoginOutcome::InvalidCredentials);
+        };
+        let expected_password_hash = admin.password_hash.clone();
+        if !auth::verify_secret_password(&admin.password_hash, &command.password) {
+            return Ok(PasswordLoginOutcome::InvalidCredentials);
+        }
+
+        let context = AuditContext::new(admin.username.clone(), command.audit_client_ip);
+        let outcome = self
+            .database
+            .create_session_for_verified_password_and_audit(
+                &command.session_token,
+                admin.id,
+                &expected_password_hash,
+                &command.csrf_token,
+                command.expires_at,
+                &context,
+            )
+            .map_err(AuthServiceError::from_database)?;
+        if outcome == PasswordSessionCreationOutcome::Created {
+            Ok(PasswordLoginOutcome::Created {
+                admin_id: admin.id,
+                username: admin.username,
+            })
+        } else {
+            Ok(PasswordLoginOutcome::InvalidCredentials)
+        }
+    }
+
+    /// Validates TOTP and rotates the session through the replay-safe audited
+    /// DB operation. No HTTP status, cookie, redirect, or JSON type enters the
+    /// service boundary.
+    pub(crate) fn login_with_totp(
+        &self,
+        command: TotpLoginCommand,
+    ) -> Result<TotpLoginOutcome, AuthServiceError> {
+        let Some(admin) = self
+            .database
+            .admin(&command.username)
+            .map_err(AuthServiceError::from_database)?
+        else {
+            return Ok(TotpLoginOutcome::InvalidCode);
+        };
+        if admin.id != command.admin_id {
+            return Ok(TotpLoginOutcome::InvalidCode);
+        }
+        if !admin.totp_enabled {
+            return Ok(TotpLoginOutcome::InvalidCode);
+        }
+        let Some(step) = auth::matching_totp_step_now(
+            admin.totp_secret.expose_secret(),
+            command.code.expose_secret(),
+        ) else {
+            return Ok(TotpLoginOutcome::InvalidCode);
+        };
+
+        let context = AuditContext::new(command.username, command.audit_client_ip);
+        let accepted = self
+            .database
+            .verify_mfa_with_totp_step_and_audit(
+                &command.current_session_token,
+                &command.rotated_session_token,
+                &command.rotated_csrf_token,
+                command.admin_id,
+                step,
+                &context,
+            )
+            .map_err(AuthServiceError::from_database)?;
+        Ok(if accepted {
+            TotpLoginOutcome::Created
+        } else {
+            TotpLoginOutcome::ReplayedOrStale
+        })
+    }
+
+    pub(crate) fn logout(
+        &self,
+        session_token: &str,
+        actor: String,
+        audit_client_ip: Option<String>,
+    ) -> Result<Audited<()>, AuthServiceError> {
+        self.database
+            .delete_session_and_audit_audited(
+                session_token,
+                &AuditContext::new(actor, audit_client_ip),
+            )
+            .map_err(AuthServiceError::from_database)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use std::time::{Duration as StdDuration, Instant};
+
+    fn service() -> (AuthService, String) {
+        let database = Database::open(":memory:").unwrap();
+        let password = "correct horse battery staple";
+        let hash = auth::hash_password(password).unwrap();
+        database
+            .create_admin("admin", &hash, "JBSWY3DPEHPK3PXP")
+            .unwrap();
+        (AuthService::new(database), password.into())
+    }
+
+    #[test]
+    fn password_login_creates_session_and_required_audit() {
+        let (service, password) = service();
+        let outcome = service
+            .login_with_password(PasswordLoginCommand {
+                username: "admin".into(),
+                password: SecretString::from(password),
+                session_token: "session".into(),
+                csrf_token: "csrf".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+                audit_client_ip: Some("192.0.2.1".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PasswordLoginOutcome::Created {
+                admin_id: 1,
+                username: "admin".into()
+            }
+        );
+        assert!(service.database.session("session").unwrap().is_some());
+        let events = service.database.list_audit(None, 10, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, "password_verified");
+    }
+
+    #[test]
+    fn invalid_password_has_no_mutation_or_required_audit() {
+        let (service, _) = service();
+        let outcome = service
+            .login_with_password(PasswordLoginCommand {
+                username: "admin".into(),
+                password: SecretString::from("definitely incorrect"),
+                session_token: "session".into(),
+                csrf_token: "csrf".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+                audit_client_ip: None,
+            })
+            .unwrap();
+        assert_eq!(outcome, PasswordLoginOutcome::InvalidCredentials);
+        assert!(service.database.session("session").unwrap().is_none());
+        assert_eq!(service.database.count_audit(None).unwrap(), 0);
+    }
+
+    fn invalid_login_duration(service: &AuthService, username: &str) -> StdDuration {
+        let started = Instant::now();
+        let outcome = service
+            .login_with_password(PasswordLoginCommand {
+                username: username.into(),
+                password: SecretString::from("deliberately incorrect timing password"),
+                session_token: "timing-session".into(),
+                csrf_token: "timing-csrf".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+                audit_client_ip: None,
+            })
+            .unwrap();
+        assert_eq!(outcome, PasswordLoginOutcome::InvalidCredentials);
+        started.elapsed()
+    }
+
+    fn percentile(
+        samples: &mut [StdDuration],
+        numerator: usize,
+        denominator: usize,
+    ) -> StdDuration {
+        samples.sort_unstable();
+        let index = samples
+            .len()
+            .saturating_mul(numerator)
+            .div_ceil(denominator)
+            .saturating_sub(1)
+            .min(samples.len() - 1);
+        samples[index]
+    }
+
+    #[test]
+    #[ignore = "diagnostic timing probe; run explicitly on an otherwise idle release host"]
+    fn known_and_unknown_admin_login_timing_is_reported() {
+        const WARMUP_PAIRS: usize = 2;
+        const SAMPLE_PAIRS: usize = 24;
+
+        let (service, _) = service();
+        for _ in 0..WARMUP_PAIRS {
+            invalid_login_duration(&service, "admin");
+            invalid_login_duration(&service, "missing-admin");
+        }
+
+        let mut known = Vec::with_capacity(SAMPLE_PAIRS);
+        let mut unknown = Vec::with_capacity(SAMPLE_PAIRS);
+        for sample in 0..SAMPLE_PAIRS {
+            // Alternate the order so thermal drift does not consistently favor
+            // one path. This is diagnostic evidence, not a timing assertion:
+            // shared CI runners are too noisy for a stable pass/fail threshold.
+            if sample % 2 == 0 {
+                known.push(invalid_login_duration(&service, "admin"));
+                unknown.push(invalid_login_duration(&service, "missing-admin"));
+            } else {
+                unknown.push(invalid_login_duration(&service, "missing-admin"));
+                known.push(invalid_login_duration(&service, "admin"));
+            }
+        }
+
+        let mut known_for_median = known.clone();
+        let mut unknown_for_median = unknown.clone();
+        let known_median = percentile(&mut known_for_median, 1, 2);
+        let unknown_median = percentile(&mut unknown_for_median, 1, 2);
+        let known_p95 = percentile(&mut known, 95, 100);
+        let unknown_p95 = percentile(&mut unknown, 95, 100);
+        let median_delta = known_median.abs_diff(unknown_median);
+        let slower_median = known_median.max(unknown_median).as_secs_f64();
+        let relative_delta = if slower_median == 0.0 {
+            0.0
+        } else {
+            median_delta.as_secs_f64() / slower_median
+        };
+
+        eprintln!(
+            "login timing diagnostic: samples={SAMPLE_PAIRS} \
+             known_median_ms={:.3} unknown_median_ms={:.3} \
+             known_p95_ms={:.3} unknown_p95_ms={:.3} median_delta_pct={:.2}",
+            known_median.as_secs_f64() * 1_000.0,
+            unknown_median.as_secs_f64() * 1_000.0,
+            known_p95.as_secs_f64() * 1_000.0,
+            unknown_p95.as_secs_f64() * 1_000.0,
+            relative_delta * 100.0,
+        );
+    }
+}

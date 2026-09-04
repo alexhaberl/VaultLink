@@ -6,7 +6,7 @@ use std::sync::{
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 
-use crate::secure_fs::SecureRoot;
+use crate::{file_ops, log_safety::EscapedLogValue, AppState};
 
 pub(crate) const CLEANUP_BATCH_ENTRIES: usize = 4096;
 #[cfg(not(test))]
@@ -53,6 +53,38 @@ enum CleanupPassError {
     Cancelled,
     Io(std::io::Error),
     Join(tokio::task::JoinError),
+    Recovery(file_ops::FileOperationError),
+}
+
+fn report_successful_cleanup(stats: &CleanupStats) {
+    if stats.removed > 0 {
+        tracing::info!(
+            scanned = stats.scanned,
+            removed = stats.removed,
+            "storage cleanup completed"
+        );
+    }
+}
+
+fn report_cleanup_error(error: &CleanupPassError) {
+    match error {
+        CleanupPassError::Io(error) => {
+            tracing::warn!(
+                error = %EscapedLogValue::new(error),
+                "storage cleanup failed; retrying"
+            );
+        }
+        CleanupPassError::Join(error) => {
+            tracing::warn!(%error, "storage cleanup blocking task failed; retrying");
+        }
+        CleanupPassError::Recovery(error) => {
+            tracing::warn!(
+                error = %EscapedLogValue::new(error),
+                "storage cleanup could not acquire a clean namespace; retrying"
+            );
+        }
+        CleanupPassError::Cancelled => {}
+    }
 }
 
 impl StorageCleanupCoordinator {
@@ -80,9 +112,9 @@ impl StorageCleanupCoordinator {
         self.inner.notify.notify_one();
     }
 
-    pub fn start_worker(
+    pub(crate) fn start_worker(
         &self,
-        secure_root: SecureRoot,
+        state: AppState,
     ) -> Result<StorageCleanupWorker, StorageCleanupStartError> {
         if self.inner.shutdown.load(Ordering::Acquire) {
             return Err(StorageCleanupStartError::ShuttingDown);
@@ -96,7 +128,7 @@ impl StorageCleanupCoordinator {
         let task_coordinator = coordinator.clone();
         let task = tokio::spawn(async move {
             let _active = ActiveWorkerGuard(task_coordinator.inner.clone());
-            task_coordinator.run(secure_root).await;
+            task_coordinator.run(state).await;
         });
         Ok(StorageCleanupWorker {
             coordinator,
@@ -111,58 +143,58 @@ impl StorageCleanupCoordinator {
         self.inner.notify.notify_one();
     }
 
-    async fn run(&self, secure_root: SecureRoot) {
-        loop {
-            if self.inner.shutdown.load(Ordering::Acquire) {
-                return;
-            }
-            if !self.inner.dirty.swap(false, Ordering::AcqRel) {
-                self.wait_for_work().await;
-                continue;
-            }
-
+    async fn run(&self, state: AppState) {
+        while self.wait_for_cleanup_pass().await {
             #[cfg(test)]
             self.inner.pass_count.fetch_add(1, Ordering::Relaxed);
 
-            match self.run_pass(secure_root.clone()).await {
-                Ok(stats) if stats.failed == 0 => {
-                    if stats.removed > 0 {
-                        tracing::info!(
-                            scanned = stats.scanned,
-                            removed = stats.removed,
-                            "storage cleanup completed"
-                        );
-                    }
-                }
-                Ok(stats) => {
-                    tracing::warn!(
-                        scanned = stats.scanned,
-                        removed = stats.removed,
-                        failed = stats.failed,
-                        "storage cleanup left entries behind; retrying"
-                    );
-                    self.inner.dirty.store(true, Ordering::Release);
-                    if !self.wait_for_retry_or_shutdown().await {
-                        return;
-                    }
-                }
-                Err(CleanupPassError::Cancelled) => return,
-                Err(CleanupPassError::Io(error)) => {
-                    tracing::warn!(%error, "storage cleanup failed; retrying");
-                    self.inner.dirty.store(true, Ordering::Release);
-                    if !self.wait_for_retry_or_shutdown().await {
-                        return;
-                    }
-                }
-                Err(CleanupPassError::Join(error)) => {
-                    tracing::warn!(%error, "storage cleanup blocking task failed; retrying");
-                    self.inner.dirty.store(true, Ordering::Release);
-                    if !self.wait_for_retry_or_shutdown().await {
-                        return;
-                    }
-                }
+            if !self
+                .handle_pass_result(self.run_pass(state.clone()).await)
+                .await
+            {
+                return;
             }
         }
+    }
+
+    async fn wait_for_cleanup_pass(&self) -> bool {
+        loop {
+            if self.inner.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+            if self.inner.dirty.swap(false, Ordering::AcqRel) {
+                return true;
+            }
+            self.wait_for_work().await;
+        }
+    }
+
+    async fn handle_pass_result(&self, result: Result<CleanupStats, CleanupPassError>) -> bool {
+        match result {
+            Ok(stats) if stats.failed == 0 => {
+                report_successful_cleanup(&stats);
+                true
+            }
+            Ok(stats) => {
+                tracing::warn!(
+                    scanned = stats.scanned,
+                    removed = stats.removed,
+                    failed = stats.failed,
+                    "storage cleanup left entries behind; retrying"
+                );
+                self.schedule_retry().await
+            }
+            Err(CleanupPassError::Cancelled) => false,
+            Err(error) => {
+                report_cleanup_error(&error);
+                self.schedule_retry().await
+            }
+        }
+    }
+
+    async fn schedule_retry(&self) -> bool {
+        self.inner.dirty.store(true, Ordering::Release);
+        self.wait_for_retry_or_shutdown().await
     }
 
     async fn wait_for_work(&self) {
@@ -194,15 +226,31 @@ impl StorageCleanupCoordinator {
         }
     }
 
-    async fn run_pass(&self, secure_root: SecureRoot) -> Result<CleanupStats, CleanupPassError> {
+    async fn run_pass(&self, state: AppState) -> Result<CleanupStats, CleanupPassError> {
         let cleanup_guard = self.acquire_serialization().await?;
+        let acquire_authority = file_ops::acquire_storage_mutation(&state);
+        tokio::pin!(acquire_authority);
+        let authority_guard = loop {
+            tokio::select! {
+                result = &mut acquire_authority => {
+                    break result.map_err(CleanupPassError::Recovery)?;
+                }
+                _ = self.inner.notify.notified() => {
+                    if self.inner.shutdown.load(Ordering::Acquire) {
+                        return Err(CleanupPassError::Cancelled);
+                    }
+                }
+            }
+        };
+        let secure_root = state.secure_root().clone();
         let start_root = secure_root.clone();
-        let (cleanup, mut cleanup_guard) = tokio::task::spawn_blocking(move || {
-            let cleanup = start_root.start_upload_fragment_cleanup();
-            (cleanup, cleanup_guard)
-        })
-        .await
-        .map_err(CleanupPassError::Join)?;
+        let (cleanup, mut cleanup_guard, mut authority_guard) =
+            tokio::task::spawn_blocking(move || {
+                let cleanup = start_root.start_upload_fragment_cleanup();
+                (cleanup, cleanup_guard, authority_guard)
+            })
+            .await
+            .map_err(CleanupPassError::Join)?;
         let mut cleanup = cleanup.map_err(CleanupPassError::Io)?;
         let mut stats = CleanupStats::default();
 
@@ -215,13 +263,14 @@ impl StorageCleanupCoordinator {
             }
             let result = tokio::task::spawn_blocking(move || {
                 let batch = cleanup.run_batch(CLEANUP_BATCH_ENTRIES);
-                (cleanup, cleanup_guard, batch)
+                (cleanup, cleanup_guard, authority_guard, batch)
             })
             .await
             .map_err(CleanupPassError::Join)?;
             cleanup = result.0;
             cleanup_guard = result.1;
-            let batch = result.2.map_err(CleanupPassError::Io)?;
+            authority_guard = result.2;
+            let batch = result.3.map_err(CleanupPassError::Io)?;
             stats.scanned = stats.scanned.saturating_add(batch.scanned);
             stats.removed = stats.removed.saturating_add(batch.removed);
             stats.failed = stats.failed.saturating_add(batch.failed);
@@ -229,6 +278,7 @@ impl StorageCleanupCoordinator {
                 return Err(CleanupPassError::Cancelled);
             }
             if batch.complete {
+                authority_guard.finish_clean();
                 return Ok(stats);
             }
             tokio::task::yield_now().await;

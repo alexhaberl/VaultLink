@@ -357,33 +357,45 @@ done
 
 runtime_stage=upgrade-migration-rollback
 database=/var/lib/vaultlink/data.sqlite
-# Downgrade the live database metadata to the valid schema-6 shape while the
+# Downgrade the live database metadata to the valid schema-7 shape while the
 # idle service still owns its connection. The immediately following upgrade
 # stops the service before copying it, then the packaged binary must perform
-# the real 6->7 migration during readiness startup.
+# the real 7->8 migration during readiness startup.
 sqlite3 "$database" <<'SQL'
 BEGIN IMMEDIATE;
 INSERT INTO audit(occurred_at,actor,action,object_id,detail,priority)
 VALUES('2026-08-30T00:00:00Z','vm-gate','upload','migration-probe','preserve',100);
-DROP TABLE service_tokens;
-DELETE FROM vaultlink_schema_migrations WHERE target_version=7;
+DROP TRIGGER trg_share_search_insert;
+DROP TRIGGER trg_share_search_delete;
+DROP TRIGGER trg_share_search_update;
+DROP TABLE share_search_fts;
+DROP INDEX idx_audit_time_id;
+DROP INDEX idx_audit_action_id;
+DROP INDEX idx_audit_actor_id;
+DROP INDEX idx_audit_object_id_id;
+DROP INDEX idx_audit_detail_id;
+DROP INDEX idx_audit_client_ip_id;
+DROP INDEX idx_audit_action_time_id;
+ALTER TABLE shares DROP COLUMN path_search_key;
+ALTER TABLE shares DROP COLUMN alias_search_key;
+DELETE FROM vaultlink_schema_migrations WHERE target_version=8;
 UPDATE vaultlink_schema
-SET fingerprint='vaultlink-schema-6-typed-audit-policy-2026-07-20'
+SET fingerprint='vaultlink-schema-7-monitoring-service-tokens-2026-08-30'
 WHERE singleton=1;
-PRAGMA user_version=6;
+PRAGMA user_version=7;
 COMMIT;
 SQL
-[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 6 ]
+[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 7 ]
 
 backup=$(/usr/lib/vaultlink/package/deploy/vaultlink-upgrade.sh \
     /usr/lib/vaultlink/package/vaultlink /etc/vaultlink/config.toml)
 [ -d "$backup" ]
 printf '%s\n' "$backup" >"$evidence/upgrade-backup.txt"
-[ "$(sqlite3 "$backup/data.sqlite" 'PRAGMA user_version;')" = 6 ]
-[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 7 ]
+[ "$(sqlite3 "$backup/data.sqlite" 'PRAGMA user_version;')" = 7 ]
+[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 8 ]
 [ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM service_tokens;')" = 0 ]
 [ "$(sqlite3 "$database" \
-    'SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version=7;')" = 1 ]
+    'SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version=8;')" = 1 ]
 [ "$(sqlite3 "$database" \
     "SELECT priority FROM audit WHERE object_id='migration-probe';")" = 100 ]
 systemctl stop vaultlink.service
@@ -393,7 +405,7 @@ systemctl stop vaultlink.service
 systemctl --quiet is-active vaultlink.service
 curl --fail --silent --show-error \
     http://127.0.0.1:18081/api/v2/health/ready >"$evidence/post-rollback-readiness.json"
-[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 7 ]
+[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 8 ]
 [ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM service_tokens;')" = 0 ]
 [ "$(sqlite3 "$database" \
     "SELECT priority FROM audit WHERE object_id='migration-probe';")" = 100 ]

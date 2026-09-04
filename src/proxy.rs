@@ -120,6 +120,7 @@ mod tests {
                 secure_cookie: false,
                 ..Default::default()
             },
+            admission: Admission::default(),
             logging: Logging::default(),
         }
     }

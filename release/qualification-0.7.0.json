@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "release_version": "0.7.0",
+  "release_status": "unreleased",
+  "updated_at": "2026-09-04",
+  "allowed_statuses": [
+    "open",
+    "closed",
+    "accepted"
+  ],
+  "findings": [
+    {
+      "id": "QUAL-001",
+      "title": "Pinned performance baseline and compatibility fixtures",
+      "status": "open",
+      "evidence": [
+        "tools/load-test.sh",
+        "tools/check-performance-evidence.py",
+        "tools/test-performance-evidence.py",
+        "release/performance/README.md"
+      ]
+    },
+    {
+      "id": "REL-001",
+      "title": "Authoritative release state and historical v0.6.0 evidence",
+      "status": "closed",
+      "evidence": [
+        "release/release-state.json",
+        "release/qualification-findings-0.7.0.json",
+        "tools/check-release-state.py",
+        "tools/verify-supported-release.py"
+      ]
+    },
+    {
+      "id": "SEC-001",
+      "title": "Typed route manifest and MFA mutation context",
+      "status": "closed",
+      "evidence": [
+        "src/routing.rs",
+        "src/db/model.rs",
+        "src/route-manifest.snapshot",
+        "src/route_inventory_tests.rs",
+        "src/setup/tests.rs"
+      ]
+    },
+    {
+      "id": "CI-001",
+      "title": "Pinned Actionlint, Arch helper, and constrained RSA exception",
+      "status": "closed",
+      "evidence": [
+        "tools/run-actionlint.sh",
+        "tools/arch-rolling-compatibility.sh",
+        "tools/check-supply-chain-policy.sh",
+        ".github/workflows/ci.yml",
+        ".github/workflows/arch-compatibility.yml"
+      ]
+    },
+    {
+      "id": "SEC-002",
+      "title": "Hierarchical admission and slow-client defence",
+      "status": "closed",
+      "evidence": [
+        "src/config/model.rs",
+        "src/config/defaults.rs",
+        "src/config/validation.rs",
+        "src/state/admissions.rs",
+        "src/http_auth/admission.rs",
+        "src/web/admission.rs",
+        "src/public_upload_transport/multipart.rs",
+        "src/web/transfer_runtime/stream.rs",
+        "src/web/tests/streaming_admission.rs",
+        "src/web/tests/public_upload_policy.rs"
+      ]
+    },
+    {
+      "id": "SEC-003",
+      "title": "Descriptor-safe TLS loading and reload",
+      "status": "closed",
+      "evidence": [
+        "src/tls_files.rs",
+        "src/server/tls.rs",
+        "src/config/tls.rs"
+      ]
+    },
+    {
+      "id": "SEC-004",
+      "title": "Log injection defence and single internal-error reporting",
+      "status": "closed",
+      "evidence": [
+        "src/log_safety.rs",
+        "src/internal_reporting.rs",
+        "src/http_auth/database.rs"
+      ]
+    },
+    {
+      "id": "PERF-001",
+      "title": "Bounded database executor and hot paths",
+      "status": "closed",
+      "evidence": [
+        "src/db/executor.rs",
+        "src/db/database.rs",
+        "src/db/auth/sessions.rs",
+        "src/monitoring_cache.rs",
+        "src/db/tests/auth_sessions.rs",
+        "src/db/tests/secrets.rs",
+        "src/api/tests/uploads.rs"
+      ]
+    },
+    {
+      "id": "PERF-002",
+      "title": "Storage authority coordinator",
+      "status": "closed",
+      "evidence": [
+        "src/storage_authority.rs",
+        "src/state/storage.rs",
+        "src/file_ops.rs",
+        "src/file_ops/tests/recovery.rs"
+      ]
+    },
+    {
+      "id": "PERF-003",
+      "title": "64 KiB streaming and bounded direct ZIP generation",
+      "status": "closed",
+      "evidence": [
+        "src/http_contract.rs",
+        "src/services/public_transfer/stream.rs",
+        "src/services/public_transfer/zip.rs",
+        "src/web/transfer/zip.rs",
+        "src/api/public_transfer/zip.rs",
+        "src/web/tests/zip_format.rs",
+        "src/web/tests/zip_planning.rs",
+        "src/web/tests/zip_directories.rs"
+      ]
+    },
+    {
+      "id": "PERF-004",
+      "title": "Directory snapshot and disk-stat caches",
+      "status": "closed",
+      "evidence": [
+        "src/directory_cache.rs",
+        "src/disk_stats.rs",
+        "src/web/common.rs",
+        "src/web/common/directory_cursor_tests.rs",
+        "src/services/public_transfer/zip.rs"
+      ]
+    },
+    {
+      "id": "PERF-005",
+      "title": "Schema 8 share search and keyset audit pagination",
+      "status": "closed",
+      "evidence": [
+        "src/db/schema/migrations.rs",
+        "src/db/schema/validation.rs",
+        "src/db/shares/query.rs",
+        "src/db/audit.rs",
+        "src/web/settings_audit.rs",
+        "src/db/tests/schema_migrations.rs",
+        "src/db/tests/schema_fixtures.rs",
+        "src/db/tests/audit.rs"
+      ]
+    },
+    {
+      "id": "REL-002",
+      "title": "Bounded runtime and shutdown",
+      "status": "closed",
+      "evidence": [
+        "src/server/acceptor.rs",
+        "src/server/runtime.rs",
+        "src/server/shutdown.rs",
+        "deploy/vaultlink.service",
+        "tools/check-deployment-assets.sh"
+      ]
+    },
+    {
+      "id": "QUAL-002",
+      "title": "Extracted web assets and domain test suites",
+      "status": "closed",
+      "evidence": [
+        "assets/web",
+        "tools/check-web-assets.sh",
+        "tools/lint-css.mjs",
+        "src/api/tests",
+        "src/db/tests",
+        "src/secure_fs/tests",
+        "src/web/tests"
+      ]
+    },
+    {
+      "id": "QUAL-003",
+      "title": "Mechanical module splits with byte-stable contracts",
+      "status": "closed",
+      "evidence": [
+        "release/refactoring-contracts-0.7.0.json",
+        "tools/check-refactoring-contracts.py",
+        "tools/test-refactoring-contracts.py",
+        ".github/workflows/ci.yml"
+      ]
+    },
+    {
+      "id": "QUAL-004",
+      "title": "Private AppState and service boundaries",
+      "status": "closed",
+      "evidence": [
+        "src/state/mod.rs",
+        "src/state/routes.rs",
+        "src/state/services.rs",
+        "src/services/error.rs",
+        "tools/check-architecture.py",
+        "tools/test-architecture.py"
+      ]
+    },
+    {
+      "id": "SEC-005",
+      "title": "Required-audit type contract",
+      "status": "closed",
+      "evidence": [
+        "src/db/audit_model.rs",
+        "src/db/required_audit.rs",
+        "src/db/model.rs",
+        "src/db/auth/sessions.rs",
+        "src/http_auth/database.rs",
+        "src/db/tests/required_audit.rs",
+        "src/services/admin"
+      ]
+    },
+    {
+      "id": "SEC-006",
+      "title": "Non-clonable upload state machines",
+      "status": "closed",
+      "evidence": [
+        "src/public_upload_transport/mod.rs",
+        "src/public_upload_transport/finalizer.rs",
+        "src/web/files/admin_upload_flow.rs",
+        "src/web/files/admin_upload.rs",
+        "src/web/tests/public_upload.rs",
+        "src/web/tests/admin_mutations.rs",
+        "src/web/tests/admin_settings.rs",
+        "src/web/tests/admin_revocation_support.rs",
+        "src/api/tests/uploads.rs"
+      ]
+    },
+    {
+      "id": "QUAL-005",
+      "title": "Transport-neutral public transfer service",
+      "status": "closed",
+      "evidence": [
+        "src/services/public_transfer/mod.rs",
+        "src/services/public_transfer/prepare.rs",
+        "src/services/public_transfer/preview.rs",
+        "src/services/public_transfer/stream.rs",
+        "src/services/public_transfer/zip.rs",
+        "src/api/public_transfer.rs",
+        "src/api/public_transfer/presentation.rs",
+        "src/web/transfer.rs",
+        "tools/check-architecture.py",
+        "tools/test-architecture.py"
+      ]
+    },
+    {
+      "id": "CI-002",
+      "title": "Architecture and module-size gates",
+      "status": "closed",
+      "evidence": [
+        "tools/check-architecture.py",
+        "tools/test-architecture.py",
+        "tools/architecture-allowlist.json",
+        "clippy.toml",
+        ".github/workflows/ci.yml",
+        "Makefile"
+      ]
+    },
+    {
+      "id": "QUAL-006",
+      "title": "Nine-target, CIFS, fuzz, load, and 72-hour final qualification",
+      "status": "open",
+      "evidence": []
+    }
+  ]
+}

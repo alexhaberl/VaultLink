@@ -1,4 +1,5 @@
 #![cfg_attr(all(not(test), not(debug_assertions)), forbid(unsafe_code))]
+#![warn(clippy::cognitive_complexity)]
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("VaultLink supports Linux only");
@@ -9,44 +10,68 @@ pub mod cifs_provision;
 pub mod config;
 pub mod container_proxy;
 pub mod db;
+mod directory_cache;
 mod disk_stats;
 pub mod file_ops;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
 pub mod http_auth;
+pub(crate) mod http_contract;
 pub mod i18n;
+pub(crate) mod internal_reporting;
+pub(crate) mod log_safety;
+mod monitoring_cache;
 pub mod multipart_guard;
 pub mod path_security;
 pub mod policy;
 pub mod proxy;
+pub(crate) mod public_upload_transport;
 pub mod range;
 mod readiness;
 #[cfg(test)]
 mod route_inventory_tests;
+pub mod routing;
 pub mod runtime;
 pub mod secure_fs;
 pub(crate) mod sensitive;
 pub(crate) mod services;
 pub mod setup;
+mod state;
+mod storage_authority;
 pub mod storage_cleanup;
+mod storage_contract;
 pub mod storage_mount;
 #[cfg(test)]
 mod template_policy_tests;
+#[cfg(test)]
+mod test_support;
+pub mod tls_files;
 pub mod ui;
 pub mod web;
 pub mod webauthn;
 
+pub use state::AppState;
+pub(crate) use state::{
+    AccountRouteState, AdminRouteState, AdmissionRouteState, AuthRouteState, FileRouteState,
+    MonitoringRouteState, PublicRouteState, PublicTransferRouteState, PublicUploadRouteState,
+    RenderingRouteState, ServiceTokenRouteState, SettingsRouteState, ShareRouteState,
+};
+
+/// Installs VaultLink's payload-blind, stable-operation panic reporting hook.
+///
+/// The server binary calls this before constructing its runtime. Applications
+/// embedding the router receive the same hook when a VaultLink router is built.
+pub fn install_safe_panic_reporting() {
+    internal_reporting::install_safe_panic_hook();
+}
+
 use std::{
-    collections::HashMap,
     fs::File,
-    net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
 };
 
 use config::{CertificateSource, Config, ServerMode, Storage, DEFAULT_INTERNAL_DIRECTORY_NAME};
-use db::Database;
 use runtime::RuntimeSettings;
 use rustix::fs::{FlockOperation, Mode, OFlags, ResolveFlags};
 use thiserror::Error;
@@ -57,6 +82,7 @@ const STORAGE_INSTANCE_LOCK_NAME: &str = ".vaultlink-instance.lock";
 pub(crate) type BlockingTestBarrier = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 pub const MAX_IN_FLIGHT_RESPONSES: usize = 256;
+pub const MAX_IN_FLIGHT_UPLOADS: usize = 32;
 pub const MAX_IN_FLIGHT_STREAMS: usize = 128;
 pub const TEXT_PREVIEW_RENDER_BUDGET_PERMITS: usize = 64;
 pub const MAX_CONCURRENT_ZIP_GENERATIONS: usize = 4;
@@ -67,54 +93,6 @@ pub const MAX_IN_FLIGHT_UPLOADS_PER_CLIENT: usize = 4;
 pub const MAX_IN_FLIGHT_BUFFERED_RESPONSES: usize = 128;
 pub const MAX_IN_FLIGHT_BUFFERED_RESPONSES_PER_CLIENT: usize = 16;
 pub const MAX_EXPENSIVE_OPERATIONS_PER_CLIENT: usize = 2;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub config: Arc<Config>,
-    pub db: Database,
-    pub secure_root: secure_fs::SecureRoot,
-    pub admin_login_limiter: auth::AdminLoginLimiter,
-    pub limiter: auth::LoginLimiter,
-    pub share_limiter: auth::LoginLimiter,
-    pub alias_limiter: auth::LoginLimiter,
-    pub public_transfer_limiter: auth::LoginLimiter,
-    pub preview_token_limiter: auth::LoginLimiter,
-    pub monitoring_limiter: auth::LoginLimiter,
-    pub runtime: Arc<RwLock<RuntimeSettings>>,
-    pub webauthn: Arc<RwLock<webauthn::WebAuthnService>>,
-    // Global mutation order is security-settings -> runtime/WebAuthn -> DB.
-    // Never await this or another Tokio lock from inside a SQLite transaction.
-    pub security_settings_mutation: Arc<tokio::sync::Mutex<()>>,
-    // Storage-authority operations acquire storage -> DB. The owned guard is
-    // moved into non-cancellable blocking finalizers before BEGIN IMMEDIATE.
-    pub storage_mutation: Arc<tokio::sync::Mutex<()>>,
-    pub storage_cleanup: storage_cleanup::StorageCleanupCoordinator,
-    pub upload_admission: Arc<tokio::sync::Semaphore>,
-    pub response_admission: Arc<tokio::sync::Semaphore>,
-    pub stream_admission: Arc<tokio::sync::Semaphore>,
-    pub preview_render_admission: Arc<tokio::sync::Semaphore>,
-    pub zip_generation_admission: Arc<tokio::sync::Semaphore>,
-    pub search_admission: Arc<tokio::sync::Semaphore>,
-    pub argon2_admission: Arc<tokio::sync::Semaphore>,
-    pub stream_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
-    pub upload_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
-    pub buffered_response_admission: Arc<tokio::sync::Semaphore>,
-    pub buffered_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
-    pub expensive_peer_admission: Arc<Mutex<HashMap<IpAddr, usize>>>,
-    pub(crate) disk_stats_cache: disk_stats::DiskStatsCache,
-    pub(crate) readiness: readiness::ReadinessProbe,
-    // The descriptor owns the kernel lock. Keeping it in every AppState clone
-    // prevents another serving process from entering storage recovery or
-    // cleanup for this private storage domain.
-    _storage_instance_lock: Arc<StorageInstanceLock>,
-    #[cfg(test)]
-    pub upload_directory_sync_failure: Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>,
-    #[cfg(test)]
-    pub(crate) settings_publication_barrier: Arc<std::sync::Mutex<Option<BlockingTestBarrier>>>,
-    #[cfg(test)]
-    pub(crate) upload_directory_creation_barrier:
-        Arc<std::sync::Mutex<Option<BlockingTestBarrier>>>,
-}
 
 #[derive(Debug)]
 struct StorageInstanceLock {
@@ -151,107 +129,6 @@ enum StorageInstanceLockError {
     },
 }
 
-impl AppState {
-    pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
-        config.validate()?;
-        if !config.storage.require_mount {
-            std::fs::create_dir_all(&config.storage.data_directory)?;
-        }
-        let validated_storage = storage_mount::validate_and_open(&config.storage)?;
-        validated_storage.verify_path_bindings(&config.storage)?;
-        // SecureRoot startup performs mutation probes and recovery. Acquire the
-        // cross-process lifetime lock first so two instances can never process
-        // the same upload fragments or journals concurrently.
-        let storage_instance_lock = Arc::new(acquire_storage_instance_lock(
-            &config.storage,
-            &validated_storage,
-        )?);
-        validated_storage.verify_path_bindings(&config.storage)?;
-        let secure_root = secure_fs::SecureRoot::open_configured_with_locked_internal(
-            &config.storage.root_mount_path,
-            config.storage.internal_directory.as_deref(),
-            config.storage.require_mount,
-            config.storage.forbid_user_symlinks(),
-            config.storage.replacements_allowed(),
-            storage_instance_lock.clone(),
-        )
-        .map_err(|error| {
-            format!(
-                "cannot initialize secure storage access (openat2 is required on Linux): {error}"
-            )
-        })?;
-        validated_storage.verify_path_bindings(&config.storage)?;
-        let db = Database::open_in_directory(validated_storage.data_file()?)?;
-        db.configure_session_idle_timeout(config.security.session_idle_minutes);
-        let active_admin_usernames = db.active_admin_usernames()?;
-        let persisted_runtime = db.runtime_settings()?;
-        let runtime = runtime_settings_from_persisted(&config, &persisted_runtime)
-            .map_err(|error| format!("invalid persisted runtime settings: {error}"))?;
-        let webauthn = webauthn::WebAuthnService::from_public_base_url(&runtime.public_base_url)
-            .map_err(|error| format!("invalid WebAuthn configuration: {error}"))?;
-        Ok(Self {
-            admin_login_limiter: auth::AdminLoginLimiter::new(
-                active_admin_usernames,
-                config.security.login_attempts,
-                config.security.account_login_attempts,
-                std::time::Duration::from_secs(config.security.login_window_seconds),
-            ),
-            limiter: auth::LoginLimiter::new(
-                config.security.login_attempts,
-                std::time::Duration::from_secs(config.security.login_window_seconds),
-            ),
-            share_limiter: auth::LoginLimiter::new(
-                config.security.share_password_attempts,
-                std::time::Duration::from_secs(300),
-            ),
-            alias_limiter: auth::LoginLimiter::new(120, std::time::Duration::from_secs(60)),
-            public_transfer_limiter: auth::LoginLimiter::new(
-                120,
-                std::time::Duration::from_secs(60),
-            ),
-            preview_token_limiter: auth::LoginLimiter::new(60, std::time::Duration::from_secs(60)),
-            monitoring_limiter: auth::LoginLimiter::new(120, std::time::Duration::from_secs(60)),
-            config: Arc::new(config),
-            db,
-            secure_root,
-            runtime: Arc::new(RwLock::new(runtime)),
-            webauthn: Arc::new(RwLock::new(webauthn)),
-            security_settings_mutation: Arc::new(tokio::sync::Mutex::new(())),
-            storage_mutation: Arc::new(tokio::sync::Mutex::new(())),
-            storage_cleanup: storage_cleanup::StorageCleanupCoordinator::new(),
-            upload_admission: Arc::new(tokio::sync::Semaphore::new(32)),
-            response_admission: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_RESPONSES)),
-            stream_admission: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_STREAMS)),
-            preview_render_admission: Arc::new(tokio::sync::Semaphore::new(
-                TEXT_PREVIEW_RENDER_BUDGET_PERMITS,
-            )),
-            zip_generation_admission: Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_ZIP_GENERATIONS,
-            )),
-            search_admission: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SEARCHES)),
-            argon2_admission: Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_ARGON2_OPERATIONS,
-            )),
-            stream_peer_admission: Arc::new(Mutex::new(HashMap::new())),
-            upload_peer_admission: Arc::new(Mutex::new(HashMap::new())),
-            buffered_response_admission: Arc::new(tokio::sync::Semaphore::new(
-                MAX_IN_FLIGHT_BUFFERED_RESPONSES,
-            )),
-            buffered_peer_admission: Arc::new(Mutex::new(HashMap::new())),
-            expensive_peer_admission: Arc::new(Mutex::new(HashMap::new())),
-            disk_stats_cache: disk_stats::DiskStatsCache::new(),
-            readiness: readiness::ReadinessProbe::new(),
-            _storage_instance_lock: storage_instance_lock,
-            #[cfg(test)]
-            upload_directory_sync_failure: Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(test)]
-            settings_publication_barrier: Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(test)]
-            upload_directory_creation_barrier: Arc::new(std::sync::Mutex::new(None)),
-        })
-    }
-}
-
 fn acquire_storage_instance_lock(
     storage: &Storage,
     validated_storage: &storage_mount::ValidatedStorage,
@@ -266,62 +143,13 @@ fn acquire_storage_instance_lock(
             source,
         })?;
     let internal_path = canonical_storage_lock_domain(storage, &display_root)?;
-    let internal = if storage.require_mount {
-        let validated_internal_path =
-            validated_storage
-                .internal_path()
-                .ok_or_else(|| StorageInstanceLockError::Unsafe {
-                    path: internal_path.clone(),
-                    reason: "required mount has no validated internal_directory capability".into(),
-                })?;
-        if validated_internal_path != internal_path {
-            return Err(StorageInstanceLockError::Unsafe {
-                path: validated_internal_path.to_path_buf(),
-                reason: format!(
-                    "validated internal_directory does not resolve to canonical lock domain {}",
-                    internal_path.display()
-                ),
-            });
-        }
-        validated_storage
-            .internal_file()
-            .map_err(|source| StorageInstanceLockError::Open {
-                path: internal_path.clone(),
-                source,
-            })?
-            .ok_or_else(|| StorageInstanceLockError::Unsafe {
-                path: internal_path.clone(),
-                reason: "required mount has no validated internal_directory capability".into(),
-            })?
-    } else {
-        match rustix::fs::mkdirat(&root, DEFAULT_INTERNAL_DIRECTORY_NAME, Mode::RWXU) {
-            Ok(()) => root
-                .sync_all()
-                .map_err(|source| StorageInstanceLockError::Prepare {
-                    path: display_root.clone(),
-                    source,
-                })?,
-            Err(error) if error == rustix::io::Errno::EXIST => {}
-            Err(error) => {
-                return Err(StorageInstanceLockError::Prepare {
-                    path: internal_path,
-                    source: errno_error(error),
-                });
-            }
-        }
-        rustix::fs::openat2(
-            &root,
-            DEFAULT_INTERNAL_DIRECTORY_NAME,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
-        )
-        .map(File::from)
-        .map_err(|error| StorageInstanceLockError::Open {
-            path: internal_path.clone(),
-            source: errno_error(error),
-        })?
-    };
+    let internal = open_internal_lock_directory(
+        storage,
+        validated_storage,
+        &root,
+        &display_root,
+        &internal_path,
+    )?;
     let internal_metadata =
         internal
             .metadata()
@@ -410,6 +238,71 @@ fn acquire_storage_instance_lock(
         _file: lock_file,
         root,
         internal,
+    })
+}
+
+fn open_internal_lock_directory(
+    storage: &Storage,
+    validated_storage: &storage_mount::ValidatedStorage,
+    root: &File,
+    display_root: &Path,
+    internal_path: &Path,
+) -> Result<File, StorageInstanceLockError> {
+    if storage.require_mount {
+        let validated_internal_path =
+            validated_storage
+                .internal_path()
+                .ok_or_else(|| StorageInstanceLockError::Unsafe {
+                    path: internal_path.to_path_buf(),
+                    reason: "required mount has no validated internal_directory capability".into(),
+                })?;
+        if validated_internal_path != internal_path {
+            return Err(StorageInstanceLockError::Unsafe {
+                path: validated_internal_path.to_path_buf(),
+                reason: format!(
+                    "validated internal_directory does not resolve to canonical lock domain {}",
+                    internal_path.display()
+                ),
+            });
+        }
+        return validated_storage
+            .internal_file()
+            .map_err(|source| StorageInstanceLockError::Open {
+                path: internal_path.to_path_buf(),
+                source,
+            })?
+            .ok_or_else(|| StorageInstanceLockError::Unsafe {
+                path: internal_path.to_path_buf(),
+                reason: "required mount has no validated internal_directory capability".into(),
+            });
+    }
+
+    match rustix::fs::mkdirat(root, DEFAULT_INTERNAL_DIRECTORY_NAME, Mode::RWXU) {
+        Ok(()) => root
+            .sync_all()
+            .map_err(|source| StorageInstanceLockError::Prepare {
+                path: display_root.to_path_buf(),
+                source,
+            })?,
+        Err(error) if error == rustix::io::Errno::EXIST => {}
+        Err(error) => {
+            return Err(StorageInstanceLockError::Prepare {
+                path: internal_path.to_path_buf(),
+                source: errno_error(error),
+            });
+        }
+    }
+    rustix::fs::openat2(
+        root,
+        DEFAULT_INTERNAL_DIRECTORY_NAME,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+    )
+    .map(File::from)
+    .map_err(|error| StorageInstanceLockError::Open {
+        path: internal_path.to_path_buf(),
+        source: errno_error(error),
     })
 }
 
@@ -529,7 +422,9 @@ pub(crate) fn runtime_settings_from_persisted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Logging, ReverseProxy, Security, Server, Storage, Tls};
+    use crate::config::{Admission, Logging, ReverseProxy, Security, Server, Storage, Tls};
+    use crate::db::Database;
+    use std::sync::Arc;
 
     const LOCK_CHILD_ROOT: &str = "VAULTLINK_TEST_STORAGE_LOCK_CHILD_ROOT";
 
@@ -565,6 +460,7 @@ mod tests {
             reverse_proxy: ReverseProxy::default(),
             tls: Tls::default(),
             security: Security::default(),
+            admission: Admission::default(),
             logging: Logging::default(),
         }
     }
@@ -630,7 +526,7 @@ mod tests {
         drop(database);
 
         let state = AppState::new(config).unwrap();
-        let runtime = state.runtime.read().unwrap();
+        let runtime = state.runtime_settings_snapshot();
         assert_eq!(runtime.share_password_min_length, 8);
         assert_eq!(runtime.share_password_max_length, 8);
     }
@@ -702,7 +598,7 @@ mod tests {
         let first_data = tempfile::tempdir().unwrap();
         let second_data = tempfile::tempdir().unwrap();
         let state = AppState::new(config(root.path(), first_data.path())).unwrap();
-        let cleanup = state.secure_root.start_upload_fragment_cleanup().unwrap();
+        let cleanup = state.secure_root().start_upload_fragment_cleanup().unwrap();
         let second_config = config(root.path(), second_data.path());
 
         // Model a cleanup batch already inside spawn_blocking after its router
@@ -729,7 +625,7 @@ mod tests {
         let first_data = tempfile::tempdir().unwrap();
         let second_data = tempfile::tempdir().unwrap();
         let state = AppState::new(config(root.path(), first_data.path())).unwrap();
-        let upload = state.secure_root.begin_upload("").unwrap();
+        let upload = state.secure_root().begin_upload("").unwrap();
         let second_config = config(root.path(), second_data.path());
 
         // A PendingUpload can be inside a non-cancellable publication task

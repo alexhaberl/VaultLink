@@ -247,9 +247,9 @@ check_audit_remediation_policy() {
             "$audit_root/README.md" \
         || grep -F -q '?token=' "$audit_root/README.md" \
         || ! grep -F -q 'http://127.0.0.1:{port}/#token={token}' \
-            "$audit_root/src/setup.rs" \
+            "$audit_root/src/setup/routes.rs" \
         || ! grep -F -q 'new URLSearchParams(location.hash.slice(1))' \
-            "$audit_root/src/setup.rs"; then
+            "$audit_root/assets/web/setup.js"; then
         report "setup documentation and implementation must use the URL fragment token"
     fi
 }
@@ -280,8 +280,29 @@ fi
 if ! sh tools/check-version-consistency.sh; then
     report "package, documentation, and health version policy failed"
 fi
-if ! grep -F -x -q 'release_version=0.7.0' tools/check-version-consistency.sh; then
-    report "candidate and tag version policy must be fixed to the 0.7.0 release line"
+if ! python3 tools/check-release-state.py >/dev/null; then
+    report "release-state and qualification policy failed"
+fi
+if ! grep -F -x -q 'release_version=$development_version' tools/check-version-consistency.sh \
+    || ! grep -F -q 'tools/check-release-state.py --require-ready' \
+        tools/check-version-consistency.sh \
+    || ! grep -F -q 'tools/check-performance-evidence.py compare' \
+        tools/check-version-consistency.sh \
+    || ! grep -F -q -- '--baseline release/performance/baseline.json' \
+        tools/check-version-consistency.sh \
+    || ! grep -F -q -- '--candidate release/performance/candidate.json' \
+        tools/check-version-consistency.sh; then
+    report "candidate and tag version policy must use release-state and require complete qualification"
+fi
+if ! grep -F -q 'tools/check-version-consistency.sh --binary target/release/vaultlink' \
+        .github/workflows/packages.yml \
+    || ! grep -F -q 'tools/check-version-consistency.sh --release-candidate' \
+        .github/workflows/soak-start.yml \
+    || ! grep -F -q 'tools/check-version-consistency.sh --release-candidate' \
+        .github/workflows/release.yml \
+    || ! grep -F -q -- '--release-tag "$GITHUB_REF_NAME"' \
+        .github/workflows/release.yml; then
+    report "package, soak, candidate, and tag workflows must consume release-state and qualification through the version gate"
 fi
 if ! awk '
     $0 == "[profile.release]" { release_profile = 1; profiles++; next }
@@ -289,11 +310,13 @@ if ! awk '
     release_profile && $0 == "panic = \"unwind\"" { unwind_settings++ }
     END { exit !(profiles == 1 && unwind_settings == 1) }
 ' Cargo.toml \
-    || [ "$(grep -F -c '#[cfg(panic = "unwind")]' src/web.rs || true)" -ne 2 ] \
-    || [ "$(grep -F -c 'CatchPanicLayer' src/web.rs || true)" -ne 2 ] \
-    || ! grep -F -q 'use tower_http::catch_panic::CatchPanicLayer;' src/web.rs \
-    || ! grep -F -q 'let router = router.layer(CatchPanicLayer::new());' src/web.rs; then
-    report "release builds must use panic=unwind and keep CatchPanicLayer active"
+    || ! grep -F -q 'CatchPanicLayer::custom(web_panic_response)' src/web.rs \
+    || ! grep -F -q 'CatchPanicLayer::custom(api_panic_response)' src/api.rs \
+    || ! grep -F -q 'CatchPanicLayer::custom(setup_panic_response)' src/setup/routes.rs \
+    || grep -R -F -q 'CatchPanicLayer::new()' src \
+    || ! grep -F -q 'vaultlink::install_safe_panic_reporting();' src/server/runtime.rs \
+    || ! grep -F -q 'Self::HttpRequestPanic => "http.request.panic"' src/internal_reporting.rs; then
+    report "release builds must use panic=unwind and payload-blind HTTP panic boundaries"
 fi
 if ! grep -F -q 'sh tools/check-version-consistency.sh --binary target/debug/vaultlink' .github/workflows/ci.yml \
     || ! grep -F -q -- '--release-candidate' .github/workflows/release.yml \
@@ -324,6 +347,65 @@ bad_uses=$(printf '%s\n' "$uses_lines" | grep -E -v 'uses:[[:space:]]+\./|@[0-9a
 if [ -n "$bad_uses" ]; then
     printf '%s\n' "$bad_uses" >&2
     report "external actions must use a full 40-character commit SHA"
+fi
+
+actionlint_script=tools/run-actionlint.sh
+if ! grep -F -x -q 'actionlint_version=1.7.12' "$actionlint_script" \
+    || ! grep -F -x -q \
+        '        actionlint_sha256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' \
+        "$actionlint_script" \
+    || ! grep -F -x -q \
+        '        actionlint_sha256=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6' \
+        "$actionlint_script" \
+    || ! grep -F -q 'sha256sum -c -' "$actionlint_script" \
+    || ! grep -F -x -q '"$work/actionlint" -shellcheck shellcheck' "$actionlint_script" \
+    || [ "$(grep -F -c 'run: sh tools/run-actionlint.sh' .github/workflows/ci.yml || true)" -ne 1 ]; then
+    report "native CI must run Actionlint 1.7.12 with the official amd64/arm64 archive checksums"
+fi
+
+web_assets_check=tools/check-web-assets.sh
+css_linter=tools/lint-css.mjs
+for web_asset in \
+    assets/web/vaultlink.css \
+    assets/web/app.js \
+    assets/web/upload-queue.js \
+    assets/web/setup.js \
+    "$web_assets_check" \
+    "$css_linter"; do
+    if [ ! -f "$web_asset" ] || [ -L "$web_asset" ]; then
+        report "embedded web asset or lint gate is missing or unsafe: $web_asset"
+    fi
+done
+if ! grep -F -x -q '    node --check "$javascript_asset"' "$web_assets_check" \
+    || ! grep -F -x -q 'node "$css_linter" "$asset_directory/vaultlink.css"' \
+        "$web_assets_check" \
+    || [ "$(grep -F -c 'run: sh tools/check-web-assets.sh' .github/workflows/ci.yml || true)" -ne 1 ] \
+    || ! grep -F -x -q \
+        'pub const STYLESHEET: &str = include_str!("../assets/web/vaultlink.css");' \
+        src/ui.rs \
+    || ! grep -F -q 'include_str!("../assets/web/upload-queue.js");' src/ui.rs \
+    || ! grep -F -x -q \
+        'const SETUP_JAVASCRIPT: &str = include_str!("../../assets/web/setup.js");' \
+        src/setup/views.rs \
+    || ! grep -F -x -q \
+        'const APP_JAVASCRIPT: &str = include_str!("../../assets/web/app.js");' \
+        src/web/rendering.rs \
+    || grep -F -q 'r#"function closeActionDetails' src/web/rendering.rs; then
+    report "native CI must syntax-check and CSS-lint the four include_str-bound web assets"
+fi
+
+if [ ! -f clippy.toml ] \
+    || ! grep -F -x -q 'cognitive-complexity-threshold = 25' clippy.toml \
+    || ! grep -F -x -q '#![warn(clippy::cognitive_complexity)]' src/lib.rs \
+    || ! grep -F -x -q '#![warn(clippy::cognitive_complexity)]' src/main.rs \
+    || ! grep -F -q 'python3 tools/test-architecture.py' .github/workflows/ci.yml \
+    || ! grep -F -q 'python3 tools/check-architecture.py --root .' .github/workflows/ci.yml \
+    || ! grep -F -q 'python3 tools/test-release-state.py' .github/workflows/ci.yml \
+    || ! grep -F -q 'python3 tools/test-performance-evidence.py' .github/workflows/ci.yml \
+    || ! grep -F -q 'python3 tools/test-refactoring-contracts.py' .github/workflows/ci.yml \
+    || ! grep -F -q 'python3 tools/check-refactoring-contracts.py --root .' .github/workflows/ci.yml \
+    || ! grep -F -q '$(MAKE) architecture-check performance-evidence-check refactoring-contracts-check' Makefile; then
+    report "CI must enforce module/function/import architecture and cognitive-complexity policy"
 fi
 
 gitleaks_ignore=.gitleaksignore
@@ -377,8 +459,6 @@ package_workflow=.github/workflows/packages.yml
 package_offline_smoke=tools/package-offline-smoke.sh
 package_native_load_smoke=tools/package-native-load-smoke.sh
 native_storage_qualification=tools/qualify-native-load-storage.py
-database_source=src/db.rs
-transfer_database_source=src/db/transfers.rs
 direct_process_identity=tools/check-direct-process-identity.sh
 real_package_smoke=tools/real-package-update-smoke.sh
 vm_harness=tools/run-distro-vm-test.sh
@@ -627,8 +707,41 @@ if [ "$(printf '%s\n' "$audit_commands" | grep -c . || true)" -ne 2 ] \
     || [ "$audit_exceptions" != "$audit_exception" ]; then
     report "RUSTSEC-2023-0071 must be the only explicit cargo-audit exception"
 fi
+if ! python3 - <<'PY'
+import pathlib
+import tomllib
 
-if ! grep -E -q '^COPY Cargo\.toml Cargo\.lock rust-toolchain\.toml Makefile \.dockerignore \.gitleaksignore \./$' "$smoke_dockerfile" \
+packages = tomllib.loads(pathlib.Path("Cargo.lock").read_text(encoding="utf-8"))["package"]
+by_name = {}
+for package in packages:
+    by_name.setdefault(package["name"], []).append(package)
+assert len(by_name.get("rsa", [])) == 1
+rsa = by_name["rsa"][0]
+assert rsa["version"] == "0.9.10"
+assert len(by_name.get("webauthn_rp", [])) == 1
+webauthn = by_name["webauthn_rp"][0]
+assert webauthn["version"] == "0.3.0"
+assert "rsa" in webauthn.get("dependencies", [])
+assert len(by_name.get("vaultlink", [])) == 1
+assert "webauthn_rp" in by_name["vaultlink"][0].get("dependencies", [])
+parents = sorted(
+    package["name"]
+    for package in packages
+    if any(dependency.split(" ", 1)[0] == "rsa" for dependency in package.get("dependencies", []))
+)
+assert parents == ["webauthn_rp"]
+PY
+then
+    report "RUSTSEC-2023-0071 must remain confined to vaultlink -> webauthn_rp 0.3.0 -> rsa 0.9.10"
+fi
+if [ "$(grep -F -c 'fn registration_never_advertises_the_unpatched_rs256_path()' src/webauthn.rs || true)" -ne 1 ] \
+    || [ "$(grep -F -c 'fn authentication_rejects_persisted_rs256_credentials()' src/webauthn.rs || true)" -ne 1 ] \
+    || ! grep -F -q 'remove(CoseAlgorithmIdentifier::Rs256)' src/webauthn.rs \
+    || ! grep -F -q 'CompressedPubKey::Rsa(_)' src/webauthn.rs; then
+    report "the RSA audit exception must retain registration and persisted/authentication RS256 negative tests"
+fi
+
+if ! grep -E -q '^COPY Cargo\.toml Cargo\.lock rust-toolchain\.toml Makefile clippy\.toml \.dockerignore \.gitleaksignore \./$' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY .cargo ./.cargo' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY .github ./.github' "$smoke_dockerfile" \
     || ! grep -F -x -q 'COPY deploy ./deploy' "$smoke_dockerfile" \
@@ -719,7 +832,7 @@ if ! grep -F -q 'packaging/vaultlink-package-install.sh' tools/build-native-pack
     || ! grep -F -q 'usr/lib/vaultlink/package/deploy/vaultlink-package-install.sh' \
         tools/verify-native-package.sh \
     || ! grep -F -q 'vaultlink-package-install.sh "/var/tmp/$ASSET"' \
-        .github/workflows/arch-compatibility.yml; then
+        tools/arch-rolling-compatibility.sh; then
     report "Arch package inventory, verifier, and rolling gate must enforce wrapper-only initial installation"
 fi
 
@@ -1553,6 +1666,10 @@ if ! grep -F -q 'runtime_status=$?' "$vm_runtime_smoke" \
     || ! grep -F -q 'profile-status.env' "$load_test" \
     || ! grep -F -q 'metadata_status=$metadata_status' "$load_test" \
     || ! grep -F -q 'metadata_observed_p95_seconds=$observed_p95' "$load_test" \
+    || ! grep -F -q '%{time_starttransfer},%{speed_download},%{time_total}' "$load_test" \
+    || ! grep -F -q 'range_ttfb_observed_p95_seconds=$observed_range_ttfb_p95' "$load_test" \
+    || ! grep -F -q 'range_throughput_median_bytes_per_second=$observed_range_throughput_median' "$load_test" \
+    || ! grep -F -q 'range_duration_observed_p95_seconds=$observed_range_duration_p95' "$load_test" \
     || ! grep -F -q 'redact_failure_log() {' "$api_smoke" \
     || ! grep -F -q 'service_token = re.compile(r"vlk_st_v1_[A-Za-z0-9_-]{43}")' "$api_smoke" \
     || ! grep -F -q 'if re.search(r"authorization", line, re.IGNORECASE):' "$api_smoke" \
@@ -1940,15 +2057,10 @@ if [ ! -f "$native_storage_qualification" ] \
     || ! grep -F -q 'shutil.rmtree(probe)' "$native_storage_qualification"; then
     report "native package timing must fail closed on an evidenced four-writer SQLite WAL and concurrent-reader storage qualification"
 fi
-if ! grep -F -q 'transfer_write_admission: Mutex<()>' "$database_source" \
-    || ! grep -F -q 'transfer_write_admission: Mutex::new(())' "$database_source" \
-    || ! grep -F -q 'fn transfer_write_guard(&self)' "$database_source" \
-    || ! grep -F -q 'self.0.transfer_write_admission.lock()' "$database_source" \
-    || [ "$(grep -F -c 'let _write_guard = self.transfer_write_guard()?;' \
-        "$transfer_database_source" || true)" -ne 10 ] \
-    || [ "$(grep -F -c 'transaction_with_behavior(TransactionBehavior::Immediate)' \
-        "$transfer_database_source" || true)" -ne 8 ]; then
-    report "transfer writers must serialize before checking out a SQLite pool connection so metadata reads retain capacity"
+if ! grep -F -q 'fn queued_transfer_writers_do_not_exhaust_persistent_read_pool()' \
+        src/db/tests/required_audit.rs \
+    || ! grep -F -q 'cargo test --locked --all-targets' .github/workflows/ci.yml; then
+    report "CI must execute the behavioral transfer-writer fairness and read-capacity regression test"
 fi
 for native_resource_contract_line in \
     'host_nproc=${VAULTLINK_NATIVE_HOST_NPROC:-}' \
@@ -2197,12 +2309,12 @@ if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.7.1' "$package_workflow" \
     || ! grep -F -q 'sh tools/real-package-update-smoke.sh' Makefile; then
     report "all native package targets must run the same-commit real package-manager update/recovery gate and upload evidence"
 fi
-fresh_schema_security_test='db::tests::fresh_database_is_exactly_schema_seven_without_plaintext_secret_columns'
+fresh_schema_security_test='db::tests::fresh_database_is_exactly_schema_eight_without_plaintext_secret_columns'
 if ! grep -F -q "fresh_schema_test='$fresh_schema_security_test'" Makefile \
     || ! grep -F -q 'cargo test -- --list >"$$listed_tests"' Makefile \
     || ! grep -F -q 'test "$$match_count" -eq 1' Makefile \
     || ! grep -F -q 'cargo test "$$fresh_schema_test" -- --exact' Makefile; then
-    report "security-test must fail closed unless the exact fresh schema-7 secret-column test exists and runs"
+    report "security-test must fail closed unless the exact fresh schema-8 secret-column test exists and runs"
 fi
 if ! grep -F -q '[ -f /.dockerenv ]' "$real_package_smoke" \
     || ! grep -F -q 'minisign -G -W' "$real_package_smoke" \
@@ -2224,7 +2336,15 @@ if ! grep -F -q "cron: '23 4 * * 1'" .github/workflows/arch-compatibility.yml \
         .github/workflows/arch-compatibility.yml \
     || ! grep -F -q 'docker pull archlinux:base' .github/workflows/arch-compatibility.yml \
     || ! grep -F -q "RepoDigests" .github/workflows/arch-compatibility.yml \
-    || ! grep -F -q 'vaultlink-package-install.sh' .github/workflows/arch-compatibility.yml; then
+    || ! grep -F -q 'tools/check-release-state.py --print-supported-version' \
+        .github/workflows/arch-compatibility.yml \
+    || ! grep -F -q 'tools/verify-supported-release.py' \
+        .github/workflows/arch-compatibility.yml \
+    || ! grep -F -q 'sh tools/arch-rolling-compatibility.sh' \
+        .github/workflows/arch-compatibility.yml \
+    || grep -F -q 'sh -c' .github/workflows/arch-compatibility.yml \
+    || ! grep -F -q 'vaultlink-package-install.sh' \
+        tools/arch-rolling-compatibility.sh; then
     report "the weekly read-only Arch rolling gate must record the current image and use the initial-install wrapper"
 fi
 if ! grep -F -q 'unsigned_asset_count=11' tools/assemble-package-release.sh \
@@ -2290,6 +2410,9 @@ fi
 
 if ! grep -F -x -q 'LimitNOFILE=4096' deploy/vaultlink.service; then
     report "vaultlink.service must retain its explicit file-descriptor ceiling"
+fi
+if ! grep -F -x -q 'TimeoutStopSec=45s' deploy/vaultlink.service; then
+    report "vaultlink.service must allow the bounded 35-second shutdown within a 45-second stop timeout"
 fi
 if ! grep -F -x -q 'LimitCORE=0' deploy/vaultlink.service; then
     report "vaultlink.service must disable core dumps"

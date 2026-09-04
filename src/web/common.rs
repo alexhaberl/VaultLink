@@ -19,7 +19,13 @@ use super::{
     AppError, Result,
 };
 use crate::{
+    directory_cache::{
+        DirectoryEntrySortKey, DirectoryEntrySortPrimary, DirectorySnapshot,
+        DirectorySnapshotBuilder,
+    },
     i18n::{self, Locale},
+    internal_reporting::{report_internal, InternalOperation},
+    log_safety::EscapedLogPath,
     policy::{self, PreviewKind},
     runtime,
     runtime::RuntimeSettings,
@@ -51,161 +57,56 @@ pub(super) fn webauthn_start_response<T: Serialize>(
     }
 }
 
-#[cfg(test)]
-mod webauthn_response_tests {
-    use super::*;
+include!("common/webauthn_response_tests.rs");
+include!("common/model.rs");
 
-    #[test]
-    fn capacity_exhaustion_returns_retryable_service_unavailable() {
-        let response = webauthn_start_response::<serde_json::Value>(Err(
-            WebAuthnServiceError::CapacityExceeded,
-        ))
-        .unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers().get(header::RETRY_AFTER),
-            Some(&HeaderValue::from_static("60"))
-        );
-    }
-
-    #[test]
-    fn ceremony_errors_keep_the_existing_bad_request_contract() {
-        let error = webauthn_start_response::<serde_json::Value>(Err(
-            WebAuthnServiceError::Ceremony("invalid challenge".into()),
-        ))
-        .unwrap_err();
-
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(!error.1.is_empty());
-    }
-}
-
-pub(super) fn format_audit_time(value: &str) -> String {
-    DateTime::parse_from_rfc3339(value)
-        .map(|dt| {
-            let utc = dt.with_timezone(&Utc);
-            match i18n::current_locale() {
-                Locale::De => utc.format("%d.%m.%Y %H:%M:%S").to_string(),
-                Locale::En => utc.format("%Y-%m-%d %H:%M:%S").to_string(),
-            }
-        })
-        .unwrap_or_else(|_| value.to_string())
-}
-
-pub(super) fn format_utc_minute(value: DateTime<Utc>) -> String {
-    match i18n::current_locale() {
-        Locale::De => value.format("%d.%m.%Y %H:%M UTC").to_string(),
-        Locale::En => value.format("%Y-%m-%d %H:%M UTC").to_string(),
-    }
-}
-
-pub(super) fn format_public_date(value: DateTime<Utc>) -> String {
-    match i18n::current_locale() {
-        Locale::De => value.format("%d.%m.%Y").to_string(),
-        Locale::En => value.format("%Y-%m-%d").to_string(),
-    }
-}
-
-pub(super) fn internal<T>(_: T) -> AppError {
-    AppError(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
-}
-pub(super) fn decode_security_keys(
-    rows: &[crate::db::AdminWebauthnCredential],
-) -> Result<Vec<crate::webauthn::StoredCredential>> {
-    rows.iter()
-        .map(|row| {
-            crate::webauthn::StoredCredential::from_blob(&row.credential_blob).map_err(internal)
-        })
-        .collect()
-}
-
-#[derive(Deserialize)]
-pub(super) struct CsrfForm {
-    pub(super) csrf: String,
-}
-#[derive(Default, Deserialize)]
-pub(crate) struct BrowseQuery {
-    pub(super) path: Option<String>,
-    pub(super) after: Option<String>,
-    pub(super) before: Option<String>,
-    pub(super) q: Option<String>,
-    pub(super) sort: Option<String>,
-    pub(super) direction: Option<String>,
-    pub(super) upload: Option<String>,
-    pub(super) notice: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum FileSortColumn {
-    Name,
-    Type,
-    Size,
-    Modified,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum FileSortDirection {
-    Ascending,
-    Descending,
-}
-
-pub(super) fn file_sort_column(value: Option<&str>) -> FileSortColumn {
-    match value {
-        Some("type") => FileSortColumn::Type,
-        Some("size") => FileSortColumn::Size,
-        Some("modified") => FileSortColumn::Modified,
-        _ => FileSortColumn::Name,
-    }
-}
-
-pub(super) fn file_sort_column_value(column: FileSortColumn) -> &'static str {
-    match column {
-        FileSortColumn::Name => "name",
-        FileSortColumn::Type => "type",
-        FileSortColumn::Size => "size",
-        FileSortColumn::Modified => "modified",
-    }
-}
-
-pub(super) fn file_sort_direction(value: Option<&str>) -> FileSortDirection {
-    match value {
-        Some("desc") => FileSortDirection::Descending,
-        _ => FileSortDirection::Ascending,
-    }
-}
-
-pub(super) fn file_sort_direction_value(direction: FileSortDirection) -> &'static str {
-    match direction {
-        FileSortDirection::Ascending => "asc",
-        FileSortDirection::Descending => "desc",
-    }
-}
-
-fn compare_entries(left: &Entry, right: &Entry, column: FileSortColumn) -> Ordering {
-    let by_name = || {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
+fn entry_sort_key(entry: &Entry, column: FileSortColumn) -> DirectoryEntrySortKey {
+    let primary = match column {
+        FileSortColumn::Name => DirectoryEntrySortPrimary::Name,
+        FileSortColumn::Type => DirectoryEntrySortPrimary::Type(!entry.is_dir),
+        FileSortColumn::Size => DirectoryEntrySortPrimary::Size(entry.len),
+        FileSortColumn::Modified => DirectoryEntrySortPrimary::Modified(entry.modified),
     };
-    match column {
-        FileSortColumn::Name => by_name(),
-        FileSortColumn::Type => (!left.is_dir).cmp(&(!right.is_dir)).then_with(by_name),
-        FileSortColumn::Size => left.len.cmp(&right.len).then_with(by_name),
-        FileSortColumn::Modified => left.modified.cmp(&right.modified).then_with(by_name),
+    DirectoryEntrySortKey {
+        primary,
+        folded_name: entry.name.to_lowercase(),
+        original_name: entry.name.clone(),
     }
 }
 
-fn compare_entries_directed(
-    left: &Entry,
-    right: &Entry,
-    column: FileSortColumn,
+#[derive(Debug, Eq, PartialEq)]
+struct DirectedEntrySortKey {
+    key: DirectoryEntrySortKey,
+    direction: FileSortDirection,
+}
+
+impl DirectedEntrySortKey {
+    fn new(entry: &Entry, column: FileSortColumn, direction: FileSortDirection) -> Self {
+        Self {
+            key: entry_sort_key(entry, column),
+            direction,
+        }
+    }
+}
+
+impl Ord for DirectedEntrySortKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        directed_key_order(&self.key, &other.key, self.direction)
+    }
+}
+
+impl PartialOrd for DirectedEntrySortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn directed_key_order(
+    left: &DirectoryEntrySortKey,
+    right: &DirectoryEntrySortKey,
     direction: FileSortDirection,
 ) -> Ordering {
-    let order = compare_entries(left, right, column);
+    let order = left.cmp(right);
     if direction == FileSortDirection::Descending {
         order.reverse()
     } else {
@@ -213,19 +114,13 @@ fn compare_entries_directed(
     }
 }
 
+#[cfg(test)]
 pub(super) fn sort_entries(
     entries: &mut [Entry],
     column: FileSortColumn,
     direction: FileSortDirection,
 ) {
-    entries.sort_by(|left, right| {
-        let order = compare_entries(left, right, column);
-        if direction == FileSortDirection::Descending {
-            order.reverse()
-        } else {
-            order
-        }
-    });
+    entries.sort_by_cached_key(|entry| DirectedEntrySortKey::new(entry, column, direction));
 }
 
 pub(super) fn sort_search_hits(
@@ -233,14 +128,7 @@ pub(super) fn sort_search_hits(
     column: FileSortColumn,
     direction: FileSortDirection,
 ) {
-    hits.sort_by(|left, right| {
-        let order = compare_entries(&left.entry, &right.entry, column);
-        if direction == FileSortDirection::Descending {
-            order.reverse()
-        } else {
-            order
-        }
-    });
+    hits.sort_by_cached_key(|hit| DirectedEntrySortKey::new(&hit.entry, column, direction));
 }
 
 pub(super) fn human(n: u64) -> String {
@@ -335,6 +223,7 @@ pub(super) fn extension_is_blocked(name: &str, blocked: &[String]) -> bool {
     runtime::extension_is_blocked(name, blocked)
 }
 
+#[cfg(test)]
 pub(super) fn add_upload_bytes(total: u64, chunk: usize, maximum: u64) -> Option<u64> {
     policy::add_upload_bytes(total, chunk as u64, maximum).ok()
 }
@@ -354,7 +243,9 @@ pub(super) fn otpauth_url(username: &str, secret: &str) -> SecretString {
 }
 
 pub(super) fn qr_svg(data: &str) -> Result<super::templates::TrustedMarkup> {
-    super::templates::TrustedMarkup::generated_qr(data).map_err(internal)
+    super::templates::TrustedMarkup::generated_qr(data).map_err(|error| {
+        AppError::from(report_internal(InternalOperation::WebCommonQrRender, error))
+    })
 }
 
 pub(super) fn join_display(base: &str, child: &str) -> String {
@@ -408,7 +299,6 @@ pub(super) struct SearchHit {
 pub(super) trait DirectoryAccess: Clone + Send + 'static {
     fn scan_entries(&self, relative: &str) -> io::Result<DirectoryScan>;
     fn open_regular_file(&self, relative: &str) -> io::Result<std::fs::File>;
-    fn entry_metadata(&self, relative: &str) -> io::Result<std::fs::Metadata>;
 }
 
 impl DirectoryAccess for SecureRoot {
@@ -419,10 +309,6 @@ impl DirectoryAccess for SecureRoot {
     fn open_regular_file(&self, relative: &str) -> io::Result<std::fs::File> {
         self.open_file(relative)
     }
-
-    fn entry_metadata(&self, relative: &str) -> io::Result<std::fs::Metadata> {
-        self.metadata(relative)
-    }
 }
 
 impl DirectoryAccess for SecureDirectory {
@@ -432,10 +318,6 @@ impl DirectoryAccess for SecureDirectory {
 
     fn open_regular_file(&self, relative: &str) -> io::Result<std::fs::File> {
         self.open_file(relative).map(SecureFile::into_file)
-    }
-
-    fn entry_metadata(&self, relative: &str) -> io::Result<std::fs::Metadata> {
-        self.metadata(relative)
     }
 }
 
@@ -564,7 +446,7 @@ fn decode_directory_cursor(
 #[derive(Debug)]
 struct RankedEntry {
     entry: Entry,
-    column: FileSortColumn,
+    key: DirectoryEntrySortKey,
     direction: FileSortDirection,
     reverse: bool,
 }
@@ -585,8 +467,7 @@ impl PartialOrd for RankedEntry {
 
 impl Ord for RankedEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        let order =
-            compare_entries_directed(&self.entry, &other.entry, self.column, self.direction);
+        let order = directed_key_order(&self.key, &other.key, self.direction);
         if self.reverse {
             order.reverse()
         } else {
@@ -598,13 +479,13 @@ impl Ord for RankedEntry {
 fn retain_ranked_entry(
     heap: &mut BinaryHeap<RankedEntry>,
     entry: Entry,
-    column: FileSortColumn,
+    key: DirectoryEntrySortKey,
     direction: FileSortDirection,
     backwards: bool,
 ) {
     heap.push(RankedEntry {
         entry,
-        column,
+        key,
         direction,
         reverse: backwards,
     });
@@ -642,6 +523,7 @@ pub(super) fn list_directory_cursor_page<D: DirectoryAccess>(
         .or(before)
         .map(|cursor| decode_directory_cursor(cursor, column, direction))
         .transpose()?;
+    let boundary_key = boundary.as_ref().map(|entry| entry_sort_key(entry, column));
     let backwards = before.is_some();
     let mut heap = BinaryHeap::with_capacity(DIRECTORY_PAGE_SIZE + 1);
     let mut scanned = 0usize;
@@ -657,8 +539,9 @@ pub(super) fn list_directory_cursor_page<D: DirectoryAccess>(
         let batch = scan.run_batch(remaining.min(256))?;
         scanned = scanned.saturating_add(batch.scanned);
         for entry in batch.entries {
-            let include = boundary.as_ref().is_none_or(|boundary| {
-                let order = compare_entries_directed(&entry, boundary, column, direction);
+            let key = entry_sort_key(&entry, column);
+            let include = boundary_key.as_ref().is_none_or(|boundary| {
+                let order = directed_key_order(&key, boundary, direction);
                 if backwards {
                     order.is_lt()
                 } else {
@@ -668,7 +551,7 @@ pub(super) fn list_directory_cursor_page<D: DirectoryAccess>(
             if !include {
                 continue;
             }
-            retain_ranked_entry(&mut heap, entry, column, direction, backwards);
+            retain_ranked_entry(&mut heap, entry, key, direction, backwards);
         }
         if batch.complete {
             break;
@@ -676,11 +559,12 @@ pub(super) fn list_directory_cursor_page<D: DirectoryAccess>(
     }
     #[cfg(test)]
     let peak_retained = heap.len();
-    let mut entries = heap
+    let mut ranked = heap.into_vec();
+    ranked.sort_by(|left, right| directed_key_order(&left.key, &right.key, direction));
+    let mut entries = ranked
         .into_iter()
         .map(|ranked| ranked.entry)
         .collect::<Vec<_>>();
-    sort_entries(&mut entries, column, direction);
     let has_more = entries.len() > DIRECTORY_PAGE_SIZE;
     if has_more {
         if backwards {
@@ -705,7 +589,7 @@ pub(super) fn list_directory_cursor_page<D: DirectoryAccess>(
     };
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(
-        directory = relative,
+        directory = %EscapedLogPath::new(relative),
         scanned,
         returned = entries.len(),
         truncated,
@@ -721,6 +605,157 @@ pub(super) fn list_directory_cursor_page<D: DirectoryAccess>(
         truncated,
         #[cfg(test)]
         peak_retained,
+    })
+}
+
+/// Captures and sorts one point-in-time directory view for short-lived cursor
+/// pagination. Returning `None` means that the 8 MiB snapshot ceiling was hit;
+/// callers must use `list_directory_cursor_page`'s bounded 101-entry heap.
+pub(super) fn build_directory_snapshot<D: DirectoryAccess>(
+    directory: &D,
+    relative: &str,
+    scan_limit: usize,
+    column: FileSortColumn,
+    direction: FileSortDirection,
+) -> io::Result<Option<DirectorySnapshot>> {
+    let started = Instant::now();
+    let mut builder = DirectorySnapshotBuilder::new();
+    let mut scanned = 0usize;
+    let mut truncated = false;
+    let mut scan = directory.scan_entries(relative)?;
+    loop {
+        let remaining = scan_limit.saturating_sub(scanned);
+        if remaining == 0 {
+            let sentinel = scan.run_batch(1)?;
+            truncated = sentinel.scanned != 0 || !sentinel.complete;
+            break;
+        }
+        let batch = scan.run_batch(remaining.min(256))?;
+        scanned = scanned.saturating_add(batch.scanned);
+        for entry in batch.entries {
+            let sort_key = entry_sort_key(&entry, column);
+            if builder.push(entry, sort_key).is_err() {
+                tracing::info!(
+                    directory = %EscapedLogPath::new(relative),
+                    scanned,
+                    cacheable = false,
+                    "directory snapshot exceeded its memory ceiling"
+                );
+                return Ok(None);
+            }
+        }
+        if batch.complete {
+            break;
+        }
+    }
+    let mut snapshot = builder.finish(truncated);
+    snapshot
+        .entries
+        .sort_by(|left, right| directed_key_order(&left.sort_key, &right.sort_key, direction));
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        directory = %EscapedLogPath::new(relative),
+        scanned,
+        retained = snapshot.entries.len(),
+        truncated,
+        elapsed_ms,
+        cacheable = true,
+        "directory snapshot scan completed"
+    );
+    Ok(Some(snapshot))
+}
+
+fn clone_entry(entry: &Entry) -> Entry {
+    Entry {
+        name: entry.name.clone(),
+        is_dir: entry.is_dir,
+        len: entry.len,
+        modified: entry.modified,
+    }
+}
+
+/// Pages a snapshot that is already sorted for `column` and `direction`.
+pub(super) fn list_directory_snapshot_cursor_page(
+    snapshot: &DirectorySnapshot,
+    after: Option<&str>,
+    before: Option<&str>,
+    column: FileSortColumn,
+    direction: FileSortDirection,
+) -> io::Result<DirectoryCursorPage> {
+    if after.is_some() && before.is_some() {
+        return Err(invalid_cursor());
+    }
+    let boundary = after
+        .or(before)
+        .map(|cursor| decode_directory_cursor(cursor, column, direction))
+        .transpose()?;
+    let boundary_key = boundary.as_ref().map(|entry| entry_sort_key(entry, column));
+    let entries = snapshot.entries.as_ref();
+    let (start, end, backwards) = if before.is_some() {
+        let end = boundary_key.as_ref().map_or(entries.len(), |boundary| {
+            entries.partition_point(|entry| {
+                entry
+                    .compare_key(boundary, direction == FileSortDirection::Descending)
+                    .is_lt()
+            })
+        });
+        (end.saturating_sub(DIRECTORY_PAGE_SIZE + 1), end, true)
+    } else {
+        let start = boundary_key.as_ref().map_or(0usize, |boundary| {
+            entries.partition_point(|entry| {
+                !entry
+                    .compare_key(boundary, direction == FileSortDirection::Descending)
+                    .is_gt()
+            })
+        });
+        (
+            start,
+            start
+                .saturating_add(DIRECTORY_PAGE_SIZE + 1)
+                .min(entries.len()),
+            false,
+        )
+    };
+    let mut page_entries = entries[start..end]
+        .iter()
+        .map(|entry| clone_entry(&entry.entry))
+        .collect::<Vec<_>>();
+    let has_more = page_entries.len() > DIRECTORY_PAGE_SIZE;
+    if has_more {
+        if backwards {
+            page_entries.remove(0);
+        } else {
+            page_entries.pop();
+        }
+    }
+    let previous_cursor = if !page_entries.is_empty() && (has_more && backwards || after.is_some())
+    {
+        Some(encode_directory_cursor(
+            &page_entries[0],
+            column,
+            direction,
+        )?)
+    } else {
+        None
+    };
+    let next_cursor = if !page_entries.is_empty() && (has_more && !backwards || before.is_some()) {
+        Some(encode_directory_cursor(
+            page_entries.last().expect("non-empty page"),
+            column,
+            direction,
+        )?)
+    } else {
+        None
+    };
+    Ok(DirectoryCursorPage {
+        entries: page_entries,
+        previous_cursor,
+        next_cursor,
+        #[cfg(test)]
+        scanned: 0,
+        truncated: snapshot.truncated,
+        #[cfg(test)]
+        peak_retained: 0,
     })
 }
 
@@ -773,87 +808,4 @@ pub(super) fn search_tree<D: DirectoryAccess>(
     Ok(results)
 }
 
-#[cfg(test)]
-mod directory_cursor_tests {
-    use super::*;
-
-    fn entry(index: usize) -> Entry {
-        Entry {
-            name: format!("entry-{index:05}.txt"),
-            is_dir: index.is_multiple_of(7),
-            len: (50_000 - index) as u64,
-            modified: Some(UNIX_EPOCH + std::time::Duration::from_secs((index % 997) as u64)),
-        }
-    }
-
-    fn identity(entry: &Entry) -> (&str, bool, u64, Option<std::time::SystemTime>) {
-        (&entry.name, entry.is_dir, entry.len, entry.modified)
-    }
-
-    #[test]
-    fn fifty_thousand_entry_reference_sort_retains_at_most_101_candidates() {
-        for column in [
-            FileSortColumn::Name,
-            FileSortColumn::Type,
-            FileSortColumn::Size,
-            FileSortColumn::Modified,
-        ] {
-            for direction in [FileSortDirection::Ascending, FileSortDirection::Descending] {
-                let mut expected = (0..50_000).map(entry).collect::<Vec<_>>();
-                sort_entries(&mut expected, column, direction);
-                for backwards in [false, true] {
-                    let mut heap = BinaryHeap::new();
-                    for candidate in (0..50_000).map(entry) {
-                        retain_ranked_entry(&mut heap, candidate, column, direction, backwards);
-                        assert!(heap.len() <= 101);
-                    }
-                    let mut actual = heap
-                        .into_iter()
-                        .map(|ranked| ranked.entry)
-                        .collect::<Vec<_>>();
-                    sort_entries(&mut actual, column, direction);
-                    let reference = if backwards {
-                        &expected[expected.len() - 101..]
-                    } else {
-                        &expected[..101]
-                    };
-                    assert_eq!(
-                        actual.iter().map(identity).collect::<Vec<_>>(),
-                        reference.iter().map(identity).collect::<Vec<_>>()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn directory_cursor_is_versioned_bounded_and_bound_to_sorting() {
-        let boundary = entry(42);
-        let cursor = encode_directory_cursor(
-            &boundary,
-            FileSortColumn::Modified,
-            FileSortDirection::Descending,
-        )
-        .unwrap();
-        assert!(cursor.len() <= DIRECTORY_CURSOR_MAX_BYTES);
-        let decoded = decode_directory_cursor(
-            &cursor,
-            FileSortColumn::Modified,
-            FileSortDirection::Descending,
-        )
-        .unwrap();
-        assert_eq!(identity(&decoded), identity(&boundary));
-        assert!(decode_directory_cursor(
-            &cursor,
-            FileSortColumn::Name,
-            FileSortDirection::Descending
-        )
-        .is_err());
-        assert!(decode_directory_cursor(
-            &"x".repeat(DIRECTORY_CURSOR_MAX_BYTES + 1),
-            FileSortColumn::Name,
-            FileSortDirection::Ascending
-        )
-        .is_err());
-    }
-}
+include!("common/directory_cursor_tests.rs");

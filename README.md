@@ -2,7 +2,7 @@
 
 VaultLink is a server-rendered Rust web application that securely exposes an already mounted Linux directory through public download and upload links. Supported host platforms are Linux x86_64 and aarch64; Windows host support was removed in 0.4.1. Windows, macOS, and Linux clients remain interoperable through an external standard SMB server.
 
-Status: `0.7.0` is the unreleased development line for read-only monitoring integrations and must not be merged or published before the package-only `v0.6.0` candidate planned for 2026-09-01 has been released. There is currently no supported public VaultLink release. The `v0.5.0` GitHub release and its archive assets were withdrawn on 2026-08-25 and are unsupported; its annotated tag, commit, workflow evidence, and [historical checklist](docs/RELEASE-CHECKLIST.md) remain for audit purposes. See the [package contract](docs/PACKAGING.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), and [changelog](CHANGELOG.md).
+Status: `0.7.0` is unreleased development. The currently supported release is `v0.6.0`. The `v0.5.0` GitHub release and its archive assets were withdrawn on 2026-08-25 and are unsupported; its annotated tag, commit, workflow evidence, and [historical checklist](docs/RELEASE-CHECKLIST.md) remain for audit purposes. [`release/release-state.json`](release/release-state.json) is the authoritative lifecycle and release-evidence manifest. See the [package contract](docs/PACKAGING.md), [0.6.0 release checklist](docs/RELEASE-CHECKLIST-0.6.0.md), [0.7.0 qualification ledger](release/qualification-0.7.0.json), and [changelog](CHANGELOG.md).
 
 ## 1. Security model
 
@@ -77,7 +77,7 @@ SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and
 
 `shares.max_upload_size` is the optional per-file limit; `NULL` uses the global runtime limit. Upload shares also have cumulative `max_upload_total_size` and `max_upload_files` limits, with baseline defaults of 100,000,000,000 bytes and 1,000 fail-closed accounted files. Byte and file usage is recorded atomically before visible publication; if publication later fails, quota use deliberately remains so a visible file can never be unaccounted.
 
-Fresh installations create schema 7 and version-2 through version-7 migration records. Valid schema-1 through schema-6 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, and schema 7 adds hash-only monitoring service tokens. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
+Fresh installations create schema 8 and version-2 through version-8 migration records. Valid schema-1 through schema-7 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, and schema 8 adds normalized trigram Share search plus composite audit-pagination indexes. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
 
 The database defaults to `/var/lib/vaultlink/data.sqlite`; its required matching keyring is `/var/lib/vaultlink/secrets.keyring`. Both must be owned by `vaultlink:vaultlink` with mode `0600`. The database contains encrypted secrets, but the matching keyring can decrypt them, so the pair and every complete backup are production credentials.
 
@@ -129,6 +129,20 @@ expected_mount_source = "/dev/mapper/vaultlink"
 `expected_mount_source` must exactly match the source field in the active `/proc/self/mountinfo` row; a `UUID=` entry in `/etc/fstab` is not automatically the same value. Supported audited local filesystems are ext2/3/4, XFS, Btrfs, F2FS, Bcachefs, and ZFS. The root, internal directory, and data directory belong to the `vaultlink` service user and must not be writable through group/other mode bits or the POSIX ACL mask. SQLite may share that local mount only outside the visible tree. With CIFS/SMB, SQLite must be on a separate local filesystem.
 
 `public_base_url` uses canonical `http://` or `https://` authority syntax without a trailing slash. Base paths, credentials, query strings, and fragments are unsupported.
+
+The optional `[admission]` section protects the reserved administrator capacity and slow-client boundaries. Omitted sections use the shown defaults. Operators may only tighten them: reduce parallelism/duration or increase minimum DATA-byte throughput. The global ceilings remain 32 uploads and 128 streams, leaving at least four upload and 32 stream slots outside the public pools.
+
+```toml
+[admission]
+max_public_uploads = 28
+max_uploads_per_share = 2
+upload_min_bytes_per_second = 65536
+upload_max_duration_seconds = 21600
+max_public_streams = 96
+max_streams_per_share = 16
+stream_min_bytes_per_second = 16384
+stream_max_duration_seconds = 21600
+```
 
 ### External SMB server with standard clients
 
@@ -306,7 +320,7 @@ Test first with `letsencrypt_staging = true` and `hsts_enabled = false`. For pro
 
 ## 8. Native package deployment
 
-VaultLink 0.7.0 supports only the exact native packages listed in
+VaultLink 0.6.0 supports only the exact native packages listed in
 [docs/PACKAGING.md](docs/PACKAGING.md): Debian 13 and Ubuntu 24.04/26.04 on
 amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch snapshot on
 x86_64. Install the matching package from the GitHub release after verifying
@@ -315,10 +329,10 @@ both its direct Minisign signature and its digest in the signed global
 
 ```sh
 # Set PACKAGE to exactly one matching release asset, for example
-# vaultlink_0.7.0-1+deb13_amd64.deb,
-# vaultlink_0.7.0-1+ubuntu24.04_arm64.deb,
-# vaultlink-0.7.0-1.fc44.x86_64.rpm, or
-# vaultlink-0.7.0-1-x86_64.pkg.tar.zst.
+# vaultlink_0.6.0-1+deb13_amd64.deb,
+# vaultlink_0.6.0-1+ubuntu24.04_arm64.deb,
+# vaultlink-0.6.0-1.fc44.x86_64.rpm, or
+# vaultlink-0.6.0-1-x86_64.pkg.tar.zst.
 : "${PACKAGE:?set PACKAGE to the exact asset for this host}"
 # Obtain minisign.pub through a separately trusted copy of this repository;
 # its key ID is EC6AEC772F7CDDEC.
@@ -327,7 +341,7 @@ PUBLIC_KEY=/path/to/trusted/minisign.pub
 # Freeze every input in one root-only staging directory *before* verification.
 # PACKAGE must be a basename, not a path containing '/'.
 case "$PACKAGE" in */*|'') exit 64 ;; esac
-STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.7.0.XXXXXXXX)
+STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.6.0.XXXXXXXX)
 test "$(sudo stat -c '%u:%g:%a' "$STAGE")" = 0:0:700
 sudo install -o root -g root -m 0600 \
   "$PACKAGE" "$PACKAGE.minisig" SHA256SUMS SHA256SUMS.minisig \

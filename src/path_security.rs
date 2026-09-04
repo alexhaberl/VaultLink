@@ -4,7 +4,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const INTERNAL_STORAGE_DIRECTORY_NAME: &str = ".vaultlink-internal";
+pub use crate::storage_contract::INTERNAL_STORAGE_DIRECTORY_NAME;
 pub const SHARE_ALIAS_MIN_LENGTH: usize = 12;
 pub const SHARE_ALIAS_MAX_LENGTH: usize = 32;
 

@@ -1,10 +1,18 @@
-use std::fmt::{self, Display, Formatter};
+use std::{
+    borrow::Borrow,
+    fmt::{self, Display, Formatter},
+};
 
 use askama::{filters::HtmlSafe, Template};
 use qrcode::{render::svg, QrCode};
 
 use super::{common::human, rendering::PageId, AppError, Result};
-use crate::{http_auth::runtime_settings, i18n, AppState};
+use crate::{
+    http_auth::runtime_settings,
+    i18n,
+    internal_reporting::{report_internal, InternalOperation},
+    AppState,
+};
 
 #[derive(Clone)]
 pub(super) struct PublicShell {
@@ -131,12 +139,13 @@ struct AdminPageTemplate<'a> {
 }
 
 pub(super) fn admin_shell(
-    state: &AppState,
+    state: &(impl Borrow<AppState> + ?Sized),
     page: PageId,
     show_create_link: bool,
     csrf_token: &str,
     show_locale_switcher: bool,
 ) -> AdminShell {
+    let state = state.borrow();
     let locale = i18n::current_locale();
     let active = page.nav();
     let navigation = [
@@ -186,8 +195,8 @@ pub(super) fn admin_shell(
     })
     .collect();
     let disk = state
-        .disk_stats_cache
-        .peek_and_refresh(state.secure_root.display_root());
+        .disk_stats_cache()
+        .peek_and_refresh(state.secure_root().display_root());
     AdminShell {
         asset_version: super::rendering::ASSET_VERSION,
         locale_code: locale.code(),
@@ -206,7 +215,7 @@ pub(super) fn admin_shell(
             .map(|value| human(value.total))
             .unwrap_or_else(|| "n/a".into()),
         public_base_url: runtime_settings(state).public_base_url,
-        server_mode: format!("{:?}", state.config.server.mode),
+        server_mode: format!("{:?}", state.config().server.mode),
         admin_label: i18n::text(locale, i18n::VAULTLINK_ADMIN),
         show_create_link,
         create_link_icon: TrustedMarkup::static_icon(crate::ui::Icon::Link),
@@ -225,7 +234,8 @@ pub(super) fn admin_shell(
 }
 
 pub(super) fn render<T: Template>(template: &T) -> Result<String> {
-    let html = template.render().map_err(|_| {
+    let html = template.render().map_err(|error| {
+        let _reported = report_internal(InternalOperation::WebTemplateRenderFailure, error);
         AppError(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "Template could not be rendered",
@@ -247,7 +257,7 @@ pub(super) fn public_page<T: Template>(title: i18n::MessageKey, body: &T) -> Res
 }
 
 pub(super) fn admin_page<T: Template>(
-    state: &AppState,
+    state: &(impl Borrow<AppState> + ?Sized),
     page: PageId,
     body: &T,
     show_create_link: bool,

@@ -14,14 +14,15 @@ use crate::{
     db::AuditAction,
     http_auth::{
         admin_login_attempt_admitted, audit_observation, clear_session_cookie, csrf_header,
-        enabled_audit_client_ip, make_session_cookie, password_login_admitted, required_database,
-        session, MissingSession,
+        enabled_audit_client_ip, make_session_cookie, password_login_admitted,
+        required_audited_service_database, service_database, session, MissingSession,
     },
+    internal_reporting::{report_internal, InternalOperation},
     sensitive::SecretString,
     services::auth::{
         AuthService, PasswordLoginCommand, PasswordLoginOutcome, TotpLoginCommand, TotpLoginOutcome,
     },
-    AppState,
+    AuthRouteState,
 };
 
 use super::{ApiError, ApiResult, SimpleResponse};
@@ -42,7 +43,7 @@ struct LoginResponse {
 }
 
 pub(super) async fn login(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     Json(form): Json<LoginRequest>,
@@ -57,7 +58,7 @@ pub(super) async fn login(
     let attempted_username = form.username.clone();
     let token = auth::random_token(32);
     let csrf = auth::random_token(24);
-    let expires = Utc::now() + Duration::hours(state.config.security.session_hours);
+    let expires = Utc::now() + Duration::hours(state.config().security.session_hours);
     let outcome = password_login_admitted(
         &state,
         PasswordLoginCommand {
@@ -94,7 +95,12 @@ pub(super) async fn login(
     .into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_str(&make_session_cookie(&state, &token)).map_err(ApiError::internal)?,
+        HeaderValue::from_str(&make_session_cookie(&state, &token)).map_err(|error| {
+            ApiError::from(report_internal(
+                InternalOperation::ApiSessionLoginCookieHeader,
+                error,
+            ))
+        })?,
     );
     Ok(response)
 }
@@ -105,7 +111,7 @@ pub(super) struct MfaRequest {
 }
 
 pub(super) async fn mfa(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     headers: HeaderMap,
     Json(form): Json<MfaRequest>,
 ) -> ApiResult<Response> {
@@ -120,7 +126,7 @@ pub(super) async fn mfa(
     }
     csrf_header(&session_data, &headers)?;
     let key = format!("mfa:{}", session_data.username.to_lowercase());
-    if !state.limiter.check_and_record_attempt(&key) {
+    if !state.login_limiter().check_and_record_attempt(&key) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -138,9 +144,11 @@ pub(super) async fn mfa(
         rotated_csrf_token: new_csrf.clone(),
         audit_client_ip: enabled_audit_client_ip(&state),
     };
-    let outcome = required_database(state.db.clone(), move |db| {
-        AuthService::new(db).login_with_totp(command)
-    })
+    let outcome = service_database(
+        state.db().clone(),
+        move |db| AuthService::new(db).login_with_totp(command),
+        InternalOperation::HttpAuthDatabaseFailure,
+    )
     .await?;
     match outcome {
         TotpLoginOutcome::Created => {}
@@ -175,7 +183,7 @@ pub(super) async fn mfa(
             ));
         }
     }
-    state.limiter.success(&key);
+    state.login_limiter().success(&key);
     let mut response = Json(MeResponse {
         authenticated: true,
         admin_id: session_data.admin_id,
@@ -186,14 +194,18 @@ pub(super) async fn mfa(
     .into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_str(&make_session_cookie(&state, &new_token))
-            .map_err(ApiError::internal)?,
+        HeaderValue::from_str(&make_session_cookie(&state, &new_token)).map_err(|error| {
+            ApiError::from(report_internal(
+                InternalOperation::ApiSessionMfaCookieHeader,
+                error,
+            ))
+        })?,
     );
     Ok(response)
 }
 
 pub(super) async fn logout(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let (token, session_data) =
@@ -201,14 +213,21 @@ pub(super) async fn logout(
     csrf_header(&session_data, &headers)?;
     let audit_actor = session_data.username;
     let audit_client_ip = enabled_audit_client_ip(&state);
-    required_database(state.db.clone(), move |db| {
-        AuthService::new(db).logout(&token, audit_actor, audit_client_ip)
-    })
+    required_audited_service_database(
+        state.db().clone(),
+        move |db| AuthService::new(db).logout(&token, audit_actor, audit_client_ip),
+        InternalOperation::HttpAuthDatabaseFailure,
+    )
     .await?;
     let mut response = Json(SimpleResponse { ok: true }).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_str(&clear_session_cookie(&state)).map_err(ApiError::internal)?,
+        HeaderValue::from_str(&clear_session_cookie(&state)).map_err(|error| {
+            ApiError::from(report_internal(
+                InternalOperation::ApiSessionLogoutCookieHeader,
+                error,
+            ))
+        })?,
     );
     Ok(response)
 }
@@ -223,7 +242,7 @@ pub(super) struct MeResponse {
 }
 
 pub(super) async fn me(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<MeResponse>> {
     let (_, session_data) = session(&state, &headers, false, MissingSession::Unauthorized).await?;

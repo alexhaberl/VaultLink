@@ -346,7 +346,7 @@ fn validate_extensions(values: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::config::{
-        Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage, Tls,
+        Admission, Config, Logging, ReverseProxy, Security, Server, ServerMode, Storage, Tls,
     };
 
     fn config() -> Config {
@@ -384,6 +384,7 @@ mod tests {
             reverse_proxy: ReverseProxy::default(),
             tls: Tls::default(),
             security: Security::default(),
+            admission: Admission::default(),
             logging: Logging::default(),
         }
     }

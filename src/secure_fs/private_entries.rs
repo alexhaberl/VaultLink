@@ -4,13 +4,12 @@ use std::{
     sync::{Mutex, MutexGuard, OnceLock},
 };
 
-use super::is_deletion_tombstone_name;
+use super::{
+    is_deletion_tombstone_name, PRIVATE_STORAGE_RANDOM_BYTES, PRIVATE_STORAGE_TOKEN_LENGTH,
+    UPLOAD_FRAGMENT_PREFIX, UPLOAD_FRAGMENT_SUFFIX,
+};
 
 pub(super) type ActiveUploadFragmentKey = String;
-
-const UPLOAD_FRAGMENT_PREFIX: &str = ".vaultlink-";
-const UPLOAD_FRAGMENT_SUFFIX: &str = ".part";
-const UPLOAD_FRAGMENT_TOKEN_LENGTH: usize = 24;
 
 static ACTIVE_UPLOAD_FRAGMENTS: OnceLock<Mutex<HashSet<ActiveUploadFragmentKey>>> = OnceLock::new();
 
@@ -47,7 +46,7 @@ pub(super) fn unregister_upload_fragment(key: &str) {
 pub fn upload_fragment_name() -> String {
     format!(
         "{UPLOAD_FRAGMENT_PREFIX}{}{UPLOAD_FRAGMENT_SUFFIX}",
-        crate::auth::random_token(18)
+        crate::auth::random_token(PRIVATE_STORAGE_RANDOM_BYTES)
     )
 }
 
@@ -62,7 +61,7 @@ pub fn is_upload_fragment_name(name: &OsStr) -> bool {
     else {
         return false;
     };
-    token.len() == UPLOAD_FRAGMENT_TOKEN_LENGTH
+    token.len() == PRIVATE_STORAGE_TOKEN_LENGTH
         && token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))

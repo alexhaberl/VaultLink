@@ -51,6 +51,18 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = "${{ matrix.expected_uname }}"
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.expected_rust_host }}"
+      - name: Lint GitHub Actions with pinned Actionlint
+        run: sh tools/run-actionlint.sh
+      - name: Validate embedded web assets
+        run: sh tools/check-web-assets.sh
+      - name: Architecture and performance-evidence policies
+        run: |
+          python3 tools/test-architecture.py
+          python3 tools/check-architecture.py --root .
+          python3 tools/test-release-state.py
+          python3 tools/test-performance-evidence.py
+          python3 tools/test-refactoring-contracts.py
+          python3 tools/check-refactoring-contracts.py --root .
       - name: Supply-chain policy
         run: sh tools/check-supply-chain-policy.sh
       - name: Parse release Dockerfiles with the pinned frontend
