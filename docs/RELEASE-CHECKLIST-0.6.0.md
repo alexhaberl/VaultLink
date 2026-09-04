@@ -1,8 +1,19 @@
 # v0.6.0 native-package release checklist
 
-Status: unreleased release candidate planned for 2026-09-01. The frozen
-candidate is the exact clean `main` commit for which every pre-soak gate below
-is green.
+Status: supported package release, published on 2026-09-01. The authoritative
+lifecycle and immutable evidence record is
+[`release/release-state.json`](../release/release-state.json).
+
+The public release was re-verified read-only on 2026-09-04: GitHub validates
+the signed annotated `v0.6.0` tag object
+`422e4839f98f16c120acf1af51719ccea21e910c`, targeting exact commit
+`0d9d3f1e72c2b0aa57f3433c10457f4b7b9abdf8`; the published release is
+immutable and contains exactly 21 project assets. The commit-bound package,
+native amd64/arm64, reproducibility, distro-VM, candidate, fuzz amd64/arm64,
+72-hour-soak, dry-run, and evidence-preflight statuses are all successful.
+Detailed boxes left open below preserve the contemporaneous
+recording state and are not retroactively asserted without their original
+fine-grained evidence.
 
 Goal: a signed, package-only GitHub release for the exact nine targets in
 `release/package-targets.json`. Every checkbox is fail-closed release evidence;

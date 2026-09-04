@@ -2,10 +2,13 @@
 
 ## 0.7.0 — Unreleased
 
+- Added an authoritative release-state manifest and fail-closed 0.7.0 qualification ledger; corrected public documentation to identify 0.6.0 as supported and 0.5.0 as withdrawn, and recorded the verified signed tag, exact commit, immutable 21-asset release, and required gate evidence for 0.6.0.
+- Added checksum-pinned Actionlint 1.7.12 on native amd64/arm64 CI, moved the Arch rolling guest commands into a ShellCheck-checked helper, and constrained the compensated RSA advisory exception to its exact dependency path and RS256 negative tests.
 - Advanced the stable toolchain, canonical Docker smoke image, and native package-builder recipe to Rust 1.98.0; the builder-image locks are deliberately left `UNPROVISIONED` until the protected refresh emits reviewed replacements.
 - Added instance-wide, hash-only `monitoring:read` service tokens with one-time credential display, optional expiry, bounded inventory, throttled last-use tracking, atomic security audits, administrator UI/API management, and a local revoke-all recovery command.
 - Added bearer-authenticated, read-only monitoring endpoints for an instance summary and strictly redacted Share metadata while keeping every existing Share, file, administration, session, public, and HTML route outside the service-token trust boundary.
 - Added schema 7 with transactional migration and validation, monitoring authentication/rate-limit/redaction coverage, and restore guidance requiring token revocation and reissue after an older manual database restore.
+- Added schema 8 with a transactional, fault-injected 7→8 migration, normalized FTS5-trigram Share search maintained atomically with Share mutations, composite audit indexes, and keyset-based HTML audit pagination while preserving legacy `?page=` and API-v2 responses.
 
 ## 0.6.0 — 2026-09-01
 

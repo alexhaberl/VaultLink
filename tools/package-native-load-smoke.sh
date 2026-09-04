@@ -92,7 +92,13 @@ totp_secret=
 totp_code=
 csrf=
 download_token=
+admission_download_token=
+range_download_token=
 upload_token=
+upload_token_2=
+upload_token_3=
+upload_token_4=
+upload_token_5=
 verify_token=
 
 write_redacted_tail() {
@@ -107,7 +113,13 @@ write_redacted_tail() {
     NATIVE_REDACT_TOTP_CODE=$totp_code \
     NATIVE_REDACT_CSRF=$csrf \
     NATIVE_REDACT_DOWNLOAD_TOKEN=$download_token \
+    NATIVE_REDACT_ADMISSION_DOWNLOAD_TOKEN=$admission_download_token \
+    NATIVE_REDACT_RANGE_DOWNLOAD_TOKEN=$range_download_token \
     NATIVE_REDACT_UPLOAD_TOKEN=$upload_token \
+    NATIVE_REDACT_UPLOAD_TOKEN_2=$upload_token_2 \
+    NATIVE_REDACT_UPLOAD_TOKEN_3=$upload_token_3 \
+    NATIVE_REDACT_UPLOAD_TOKEN_4=$upload_token_4 \
+    NATIVE_REDACT_UPLOAD_TOKEN_5=$upload_token_5 \
     NATIVE_REDACT_VERIFY_TOKEN=$verify_token \
     python3 - "$source_log" "$destination_log" "$maximum_lines" <<'PY'
 from collections import deque
@@ -125,7 +137,13 @@ secret_names = (
     "NATIVE_REDACT_TOTP_CODE",
     "NATIVE_REDACT_CSRF",
     "NATIVE_REDACT_DOWNLOAD_TOKEN",
+    "NATIVE_REDACT_ADMISSION_DOWNLOAD_TOKEN",
+    "NATIVE_REDACT_RANGE_DOWNLOAD_TOKEN",
     "NATIVE_REDACT_UPLOAD_TOKEN",
+    "NATIVE_REDACT_UPLOAD_TOKEN_2",
+    "NATIVE_REDACT_UPLOAD_TOKEN_3",
+    "NATIVE_REDACT_UPLOAD_TOKEN_4",
+    "NATIVE_REDACT_UPLOAD_TOKEN_5",
     "NATIVE_REDACT_VERIFY_TOKEN",
 )
 known_secrets = sorted(
@@ -624,9 +642,18 @@ create_share() {
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 }
 download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
+admission_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
+range_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
 upload_token=$(create_share vaultlink-load/uploads upload_only)
+upload_token_2=$(create_share vaultlink-load/uploads upload_only)
+upload_token_3=$(create_share vaultlink-load/uploads upload_only)
+upload_token_4=$(create_share vaultlink-load/uploads upload_only)
+upload_token_5=$(create_share vaultlink-load/uploads upload_only)
 verify_token=$(create_share vaultlink-load/uploads download_upload)
-for secret_value in "$download_token" "$upload_token" "$verify_token"; do
+for secret_value in \
+    "$download_token" "$admission_download_token" "$range_download_token" \
+    "$upload_token" "$upload_token_2" "$upload_token_3" "$upload_token_4" \
+    "$upload_token_5" "$verify_token"; do
     [ -n "$secret_value" ] || fail "load share creation returned an empty token"
 done
 
@@ -637,7 +664,13 @@ load_status=0
 VAULTLINK_BASE_URL=http://127.0.0.1:18081 \
 VAULTLINK_HEALTH_URL=http://127.0.0.1:18081/api/v2/health/ready \
 DOWNLOAD_TOKEN=$download_token \
+ADMISSION_DOWNLOAD_TOKEN=$admission_download_token \
+RANGE_DOWNLOAD_TOKEN=$range_download_token \
 UPLOAD_TOKEN=$upload_token \
+UPLOAD_TOKEN_2=$upload_token_2 \
+UPLOAD_TOKEN_3=$upload_token_3 \
+UPLOAD_TOKEN_4=$upload_token_4 \
+UPLOAD_TOKEN_5=$upload_token_5 \
 UPLOAD_VERIFY_TOKEN=$verify_token \
 SOAK_NAMESPACE="package-native-$target_id" \
 LOAD_RUN_ID=native-package \
@@ -700,7 +733,11 @@ assert_field "$result" metadata_p95_enforced true
 assert_field "$result" metadata_clients 100
 assert_field "$result" metadata_requests 2000
 assert_field "$result" range_streams 40
+assert_field "$result" range_share_count 3
+assert_field "$result" range_streams_per_share_max 14
 assert_field "$result" uploads 10
+assert_field "$result" upload_share_count 5
+assert_field "$result" uploads_per_share 2
 assert_field "$result" upload_integrity server_readback
 assert_field "$profile" metadata_status 0
 assert_field "$profile" download_status 0
@@ -783,7 +820,7 @@ assert_field "$result" fixture_bytes 53687091200
 expected_content_range='bytes 0-67108863/53687091200'
 awk -F, -v expected_hash="$range_sha256" \
     -v expected_content_range="$expected_content_range" '
-    NF != 6 || $1 !~ /^[0-9]+$/ || $1 < 0 || $1 >= 40 \
+    NF != 9 || $1 !~ /^[0-9]+$/ || $1 < 0 || $1 >= 40 \
         || $2 != "198.18.2." ($1 + 1) || $3 != 206 || $4 != 67108864 \
         || $5 != expected_hash || $6 != expected_content_range || seen[$1]++ { exit 1 }
     END {

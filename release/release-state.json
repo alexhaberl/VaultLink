@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "development_version": "0.7.0",
+  "supported_version": "0.6.0",
+  "expected_package_assets": 9,
+  "releases": [
+    {
+      "version": "0.7.0",
+      "status": "unreleased",
+      "checklist": "docs/RELEASE-CHECKLIST-0.7.0.md",
+      "qualification": "release/qualification-0.7.0.json"
+    },
+    {
+      "version": "0.6.0",
+      "status": "supported",
+      "release_date": "2026-09-01",
+      "tag": "v0.6.0",
+      "tag_object_sha": "422e4839f98f16c120acf1af51719ccea21e910c",
+      "commit_sha": "0d9d3f1e72c2b0aa57f3433c10457f4b7b9abdf8",
+      "checklist": "docs/RELEASE-CHECKLIST-0.6.0.md",
+      "release_url": "https://github.com/alexhaberl/VaultLink/releases/tag/v0.6.0",
+      "published_at": "2026-09-01T04:26:27Z",
+      "tag_verification": {
+        "verified": true,
+        "reason": "valid",
+        "verified_at": "2026-09-01T04:23:18Z"
+      },
+      "immutable": true,
+      "asset_count": 21,
+      "required_commit_gates": [
+        {
+          "context": "vaultlink/native-amd64",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33140591623"
+        },
+        {
+          "context": "vaultlink/native-arm64",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33140591623"
+        },
+        {
+          "context": "vaultlink/packages",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33140591625"
+        },
+        {
+          "context": "vaultlink/package-reproducibility",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33141191520"
+        },
+        {
+          "context": "vaultlink/distro-vms",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33141190073"
+        },
+        {
+          "context": "vaultlink/release-candidate-preflight",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33185248979"
+        },
+        {
+          "context": "vaultlink/fuzz-600s-amd64",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33303428111"
+        },
+        {
+          "context": "vaultlink/fuzz-600s-arm64",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33303428111"
+        },
+        {
+          "context": "vaultlink/72h-soak",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33417592859"
+        },
+        {
+          "context": "vaultlink/release-dry-run",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33429251196"
+        },
+        {
+          "context": "vaultlink/release-evidence-preflight",
+          "state": "success",
+          "run_url": "https://github.com/alexhaberl/VaultLink/actions/runs/33429251196"
+        }
+      ]
+    },
+    {
+      "version": "0.5.0",
+      "status": "withdrawn",
+      "release_date": "2026-08-24",
+      "withdrawn_at": "2026-08-25",
+      "tag": "v0.5.0",
+      "tag_object_sha": "f00d6b1ea89f43097fe9d267ef2fadac062c4213",
+      "commit_sha": "60bfb9c60c5df408890b4a645218e2b99ff0906f",
+      "assets_withdrawn": true,
+      "checklist": "docs/RELEASE-CHECKLIST.md"
+    }
+  ]
+}

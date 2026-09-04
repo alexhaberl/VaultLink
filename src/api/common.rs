@@ -1,5 +1,6 @@
 use axum::http::StatusCode;
 use chrono::Utc;
+use std::borrow::Borrow;
 
 use crate::{
     db::Share,
@@ -12,15 +13,23 @@ use crate::{
 
 use super::{ApiError, ApiResult};
 
-pub(super) async fn find_share_by_id(state: &AppState, id: i64) -> ApiResult<Share> {
-    database(state.db.clone(), move |db| db.share_by_id(id))
+pub(super) async fn find_share_by_id(
+    state: &(impl Borrow<AppState> + ?Sized),
+    id: i64,
+) -> ApiResult<Share> {
+    let state = state.borrow();
+    database(state.db().clone(), move |db| db.share_by_id(id))
         .await?
         .ok_or_else(|| ApiError::not_found("Share not found"))
 }
 
-pub(super) async fn get_share(state: &AppState, token: &str) -> ApiResult<Share> {
+pub(super) async fn get_share(
+    state: &(impl Borrow<AppState> + ?Sized),
+    token: &str,
+) -> ApiResult<Share> {
+    let state = state.borrow();
     let token = token.to_string();
-    let share = database(state.db.clone(), move |db| db.share_by_token(&token))
+    let share = database(state.db().clone(), move |db| db.share_by_token(&token))
         .await?
         .ok_or_else(|| ApiError::not_found("Share not found"))?;
     usable(&share)?;

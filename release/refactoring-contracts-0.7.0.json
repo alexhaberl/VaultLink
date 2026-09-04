@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "release_version": "0.7.0",
+  "required_paths": {
+    "files": [
+      "src/db/transfers/reservations.rs",
+      "src/db/transfers/leases.rs",
+      "src/db/transfers/statistics.rs",
+      "src/services/auth/mod.rs",
+      "src/services/admin/mod.rs",
+      "src/services/share/mod.rs",
+      "src/services/share/authority.rs",
+      "src/services/file/mod.rs",
+      "src/i18n/request.rs",
+      "src/i18n/catalog.rs",
+      "src/i18n/messages.rs",
+      "src/i18n/render.rs",
+      "src/public_upload_transport/multipart.rs",
+      "src/public_upload_transport/finalizer.rs",
+      "src/public_upload_transport/reservation.rs",
+      "src/public_upload_transport/test_support.rs"
+    ],
+    "directories": [
+      "src/db/transfers",
+      "src/services/auth",
+      "src/services/admin",
+      "src/services/share",
+      "src/services/file",
+      "src/i18n",
+      "src/public_upload_transport"
+    ]
+  },
+  "locked_files": [
+    {
+      "path": "src/db/schema.rs",
+      "sha256": "8d043772acae13e31ccf11692a4172209ff5eccc3931f5fba9a7e13a530bf3e9",
+      "contract": "schema version and fingerprints"
+    },
+    {
+      "path": "src/db/schema/bootstrap.rs",
+      "sha256": "4962d6a9e36e2941ac8df039c980af4bc10513cb547d3a0418f60227a5a82eec",
+      "contract": "bootstrap SQL"
+    },
+    {
+      "path": "src/db/schema/migrations.rs",
+      "sha256": "45ec78f7133278d0367298b5c104e966922156d7a46e038c1aa4c057840d6b2d",
+      "contract": "migration SQL"
+    },
+    {
+      "path": "src/db/schema/validation.rs",
+      "sha256": "468433ab76d37075ec833419bd54001d8119099f1d57b24f04f81d06465a60db",
+      "contract": "schema validation SQL"
+    },
+    {
+      "path": "src/db/database.rs",
+      "sha256": "88842dc202845a590e69b723275a26ee1a85d896292b05fc4a2c90cc19887b4f",
+      "contract": "encrypted-secret AAD and database ownership"
+    },
+    {
+      "path": "src/db/shares/query.rs",
+      "sha256": "cc1b68b8a58414af28b48ab42e2e7ccc98061672f7ac954453f1bbb6fb94c871",
+      "contract": "share-token AAD"
+    },
+    {
+      "path": "src/db/tests/schema_fixtures.rs",
+      "sha256": "1c93a2d7b1f8a6bb2cacd651f6df387094e0baf121f46ad23edba68da6e87074",
+      "contract": "historical schema fixtures"
+    },
+    {
+      "path": "src/db/tests/secrets.rs",
+      "sha256": "61c4bad5884cc410c31a1743532f42da0400e6000cbefcead290aa97ffccf9c3",
+      "contract": "encrypted-secret and AAD behavior fixtures"
+    },
+    {
+      "path": "src/http_contract.rs",
+      "sha256": "52f9d3f47eb1429acf0b451ad2ff5c79562282ce04fef0cd60dd28bf991ffa6a",
+      "contract": "HTTP limits and stable headers"
+    },
+    {
+      "path": "src/route-manifest.snapshot",
+      "sha256": "f7740ec0438ef5863ef0f7383a73bae91553dd540caa14fced257567e8904017",
+      "contract": "route, auth, MFA, CSRF, audit, body and mutation inventory"
+    },
+    {
+      "path": "src/i18n.rs",
+      "sha256": "1076ccf3c59107d71900ad064d21ac67c06958804ee8c12de1177c1ebb0983f5",
+      "contract": "i18n split order"
+    },
+    {
+      "path": "src/db/transfers.rs",
+      "sha256": "277831f98176655ac6ea24d18d415fc339356a07f2c348e860cb8181c7ca4ee4",
+      "contract": "transfer split order and common SQL helpers"
+    }
+  ],
+  "logical_sources": [
+    {
+      "name": "i18n request-catalog-messages-render",
+      "parts": [
+        "src/i18n/request.rs",
+        "src/i18n/catalog.rs",
+        "src/i18n/messages.rs",
+        "src/i18n/render.rs"
+      ],
+      "sha256": "3d41c0c387950e36335f818dc045b5cc15a08c8fde2d664698c272c7e66e8f2a"
+    },
+    {
+      "name": "service domain source bundle",
+      "parts": [
+        "src/services/auth/mod.rs",
+        "src/services/admin/mod.rs",
+        "src/services/share/authority.rs",
+        "src/services/share/mod.rs",
+        "src/services/file/mod.rs"
+      ],
+      "sha256": "de3230d8c99b0d8735c3f7c88b56535d6f1f985ee86110812c2ccacbf8c05fd5"
+    },
+    {
+      "name": "config model-defaults-validation-tls",
+      "parts": [
+        "src/config/model.rs",
+        "src/config/defaults.rs",
+        "src/config/validation.rs",
+        "src/config/tls.rs"
+      ],
+      "sha256": "c32dac368eb19baa0b77359bf540c0424985b720168a1103c8dc4b2b6e8ec997"
+    },
+    {
+      "name": "setup state-routes-handlers-commit-discovery-views",
+      "parts": [
+        "src/setup/state.rs",
+        "src/setup/routes.rs",
+        "src/setup/handlers.rs",
+        "src/setup/commit.rs",
+        "src/setup/discovery.rs",
+        "src/setup/views.rs"
+      ],
+      "sha256": "24f129cf08d59b3cb3902eb9eff0caab8c61eb3694542469ca52776fd4c05075"
+    },
+    {
+      "name": "database auth common-admins-mfa-webauthn-sessions",
+      "parts": [
+        "src/db/auth/common.rs",
+        "src/db/auth/admins.rs",
+        "src/db/auth/mfa.rs",
+        "src/db/auth/webauthn.rs",
+        "src/db/auth/sessions.rs"
+      ],
+      "sha256": "ae1a6555daeaa7f57032fc59b30a50f40cac2856e2c593c36a62544fc4607454"
+    },
+    {
+      "name": "database schema bootstrap-migrations-validation",
+      "parts": [
+        "src/db/schema/bootstrap.rs",
+        "src/db/schema/migrations.rs",
+        "src/db/schema/validation.rs"
+      ],
+      "sha256": "e59a5c65d0aa1efec0ea019c90d71522d37181b95fab9458ce2f872e142a1cf8"
+    },
+    {
+      "name": "database transfer method sequence",
+      "parts": [
+        {
+          "path": "src/db/transfers/reservations.rs",
+          "strip_prefix": "impl Database {\n",
+          "strip_suffix": "}\n"
+        },
+        {
+          "path": "src/db/transfers/leases.rs",
+          "strip_prefix": "impl Database {\n",
+          "strip_suffix": "}\n"
+        },
+        {
+          "path": "src/db/transfers/statistics.rs",
+          "strip_prefix": "impl Database {\n",
+          "strip_suffix": "}\n"
+        }
+      ],
+      "sha256": "6d43f7b35e905fe52565bdbcf8b70cc6387dcd44a7e7184de534afbc3e261ef1"
+    },
+    {
+      "name": "secure filesystem model-root-directory-staging-recovery",
+      "parts": [
+        "src/secure_fs/model.rs",
+        "src/secure_fs/root.rs",
+        "src/secure_fs/directory.rs",
+        "src/secure_fs/staging/rename.rs",
+        "src/secure_fs/staging/delete.rs",
+        "src/secure_fs/recovery/fragments.rs",
+        "src/secure_fs/recovery/validation.rs",
+        "src/secure_fs/recovery/rename.rs",
+        "src/secure_fs/recovery/delete.rs",
+        "src/secure_fs/recovery/cleanup.rs"
+      ],
+      "sha256": "a33a00c18c58093e2a65b0516074a12f1af511cf90f23676b3bbd4eb9e4d6b2e"
+    },
+    {
+      "name": "web file views-mutations-browser-download-preview-upload",
+      "parts": [
+        "src/web/files/views.rs",
+        "src/web/files/mutations.rs",
+        "src/web/files/browser.rs",
+        "src/web/files/download.rs",
+        "src/web/files/preview.rs",
+        "src/web/files/admin_upload.rs",
+        "src/web/files/admin_upload_flow.rs"
+      ],
+      "sha256": "a14f3cc23565c22666b5b975ee2b5965468ab327aa676196c42e6b2cee00052a"
+    },
+    {
+      "name": "shared public upload transport and adapters",
+      "parts": [
+        "src/public_upload_transport/multipart.rs",
+        "src/public_upload_transport/reservation.rs",
+        "src/public_upload_transport/finalizer.rs",
+        "src/public_upload_transport/test_support.rs",
+        "src/web/public_upload/mod.rs",
+        "src/web/public_upload/presenter.rs"
+      ],
+      "sha256": "03f5f96d137807280ee0b1ca5893c165693366a5b631e4b46b97f00d7668b5ff"
+    }
+  ]
+}

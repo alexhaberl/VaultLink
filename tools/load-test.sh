@@ -6,13 +6,49 @@ export LC_ALL LANG
 
 : "${VAULTLINK_BASE_URL:?set VAULTLINK_BASE_URL}"
 : "${DOWNLOAD_TOKEN:?set DOWNLOAD_TOKEN}"
+: "${ADMISSION_DOWNLOAD_TOKEN:?set ADMISSION_DOWNLOAD_TOKEN for a second share of the download fixture}"
+: "${RANGE_DOWNLOAD_TOKEN:?set RANGE_DOWNLOAD_TOKEN for a third share of the download fixture}"
 : "${UPLOAD_TOKEN:?set UPLOAD_TOKEN}"
+: "${UPLOAD_TOKEN_2:?set UPLOAD_TOKEN_2 for a second upload share}"
+: "${UPLOAD_TOKEN_3:?set UPLOAD_TOKEN_3 for a third upload share}"
+: "${UPLOAD_TOKEN_4:?set UPLOAD_TOKEN_4 for a fourth upload share}"
+: "${UPLOAD_TOKEN_5:?set UPLOAD_TOKEN_5 for a fifth upload share}"
 : "${UPLOAD_VERIFY_TOKEN:?set UPLOAD_VERIFY_TOKEN for the same upload directory}"
 : "${SOAK_NAMESPACE:?set SOAK_NAMESPACE from vaultlink-soak-control}"
 : "${VAULTLINK_CONFIG:?set VAULTLINK_CONFIG}"
 command -v curl >/dev/null
 
+validate_distinct_token_set() {
+    token_set_name=$1
+    shift
+    for token_value in "$@"; do
+        case "$token_value" in
+            ''|*[!A-Za-z0-9._~-]*)
+                echo "$token_set_name contains an invalid share token" >&2
+                exit 64
+                ;;
+        esac
+    done
+    while [ "$#" -gt 1 ]; do
+        token_value=$1
+        shift
+        for other_token_value in "$@"; do
+            [ "$token_value" != "$other_token_value" ] || {
+                echo "$token_set_name must contain distinct share tokens" >&2
+                exit 64
+            }
+        done
+    done
+}
+
+validate_distinct_token_set "download token set" \
+    "$DOWNLOAD_TOKEN" "$ADMISSION_DOWNLOAD_TOKEN" "$RANGE_DOWNLOAD_TOKEN"
+validate_distinct_token_set "upload token set" \
+    "$UPLOAD_TOKEN" "$UPLOAD_TOKEN_2" "$UPLOAD_TOKEN_3" \
+    "$UPLOAD_TOKEN_4" "$UPLOAD_TOKEN_5"
+
 p95_limit=2.000
+range_ttfb_p95_limit=2.000
 p95_policy=${LOAD_P95_POLICY:-strict}
 case "$p95_policy" in
     strict) p95_enforced=true ;;
@@ -313,11 +349,19 @@ verify_forwarded_admission_identity() {
     }
     holder=0
     while [ "$holder" -lt 16 ]; do
+        # Spread one client's 16 streams across two shares. A single share
+        # would also exhaust max_streams_per_share=16 and make the distinct
+        # client probe return a correct but ambiguous 503.
+        if [ $((holder % 2)) -eq 0 ]; then
+            holder_token=$DOWNLOAD_TOKEN
+        else
+            holder_token=$ADMISSION_DOWNLOAD_TOKEN
+        fi
         curl --interface 127.0.0.1 --header "X-Forwarded-For: $identity" \
             --silent --show-error --max-time "$admission_holder_max_time" \
             --limit-rate 1024 --range "0-$admission_range_end" \
             --dump-header "$work/admission-$holder.headers" --output /dev/null \
-            "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download" &
+            "$VAULTLINK_BASE_URL/v/$holder_token/download" &
         admission_holders="$admission_holders $!"
         holder=$((holder + 1))
     done
@@ -509,17 +553,37 @@ download_profile() {
     while [ "$download" -lt 40 ]; do
         (
             identity="198.18.2.$((download + 1))"
+            case $((download % 3)) in
+                0) download_token=$DOWNLOAD_TOKEN ;;
+                1) download_token=$ADMISSION_DOWNLOAD_TOKEN ;;
+                2) download_token=$RANGE_DOWNLOAD_TOKEN ;;
+            esac
             wait_for_profile_go
             headers="$work/range-$download.headers"
             body="$work/range-$download.bin"
-            status=$(soak_curl "$identity" --silent --show-error \
+            metrics=$(soak_curl "$identity" --silent --show-error \
                 --connect-timeout "$connect_timeout" \
                 --max-time "$transfer_max_time" \
                 --range "0-$range_end" \
                 --dump-header "$headers" \
                 --output "$body" \
-                --write-out '%{http_code}' \
-                "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download")
+                --write-out '%{http_code},%{time_starttransfer},%{speed_download},%{time_total}' \
+                "$VAULTLINK_BASE_URL/v/$download_token/download")
+            status=${metrics%%,*}
+            remaining_metrics=${metrics#*,}
+            time_starttransfer=${remaining_metrics%%,*}
+            remaining_metrics=${remaining_metrics#*,}
+            speed_download=${remaining_metrics%%,*}
+            time_total=${remaining_metrics#*,}
+            [ "$metrics" != "$remaining_metrics" ]
+            case "$time_total" in *,*) exit 1 ;; esac
+            awk -v ttfb="$time_starttransfer" -v speed="$speed_download" \
+                -v duration="$time_total" 'BEGIN {
+                    numeric = "^[0-9]+([.][0-9]+)?$"
+                    numeric_values = ttfb ~ numeric && speed ~ numeric && duration ~ numeric
+                    positive_values = ttfb + 0 >= 0 && speed + 0 > 0 && duration + 0 > 0
+                    exit !(numeric_values && positive_values)
+                }'
             size=$(stat -c '%s' "$body")
             hash=$(sha256sum "$body" | awk '{print $1}')
             content_range=$(awk '
@@ -530,8 +594,11 @@ download_profile() {
                     exit
                 }
             ' "$headers")
-            printf '%s,%s,%s,%s,%s,%s\n' \
-                "$download" "$identity" "$status" "$size" "$hash" "$content_range"
+            # Keep the established first six columns byte-compatible for older
+            # evidence readers; append performance measurements only.
+            printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                "$download" "$identity" "$status" "$size" "$hash" "$content_range" \
+                "$time_starttransfer" "$speed_download" "$time_total"
             [ "$status" = 206 ]
             [ "$size" -eq "$range_bytes" ]
             [ "$hash" = "$expected_range_hash" ]
@@ -549,6 +616,23 @@ download_profile() {
     cat "$work"/range-*.result >"$work/ranges.csv"
     [ "$download_failed" -eq 0 ] || return 1
     [ "$(wc -l <"$work/ranges.csv")" -eq 40 ] || return 1
+    range_ttfb_p95=$(awk -F, '{ print $7 }' "$work/ranges.csv" \
+        | sort -n | awk 'NR == 38 { print; exit }')
+    range_throughput_median=$(awk -F, '{ print $8 }' "$work/ranges.csv" \
+        | sort -n | awk 'NR == 20 { lower = $1 } NR == 21 { print (lower + $1) / 2; exit }')
+    range_duration_p95=$(awk -F, '{ print $9 }' "$work/ranges.csv" \
+        | sort -n | awk 'NR == 38 { print; exit }')
+    [ -n "$range_ttfb_p95" ] && [ -n "$range_throughput_median" ] \
+        && [ -n "$range_duration_p95" ] || return 1
+    printf '%s\n' "$range_ttfb_p95" >"$work/range-ttfb.p95"
+    printf '%s\n' "$range_throughput_median" >"$work/range-throughput.median"
+    printf '%s\n' "$range_duration_p95" >"$work/range-duration.p95"
+    range_ttfb_within_limit=false
+    if awk -v p95="$range_ttfb_p95" -v limit="$range_ttfb_p95_limit" \
+        'BEGIN { exit !(p95 < limit) }'; then
+        range_ttfb_within_limit=true
+    fi
+    printf '%s\n' "$range_ttfb_within_limit" >"$work/range-ttfb.p95-within-limit"
 }
 
 upload_profile() {
@@ -557,6 +641,13 @@ upload_profile() {
     while [ "$upload" -lt 10 ]; do
         (
             identity="198.18.3.$((upload + 1))"
+            case $((upload % 5)) in
+                0) upload_token=$UPLOAD_TOKEN ;;
+                1) upload_token=$UPLOAD_TOKEN_2 ;;
+                2) upload_token=$UPLOAD_TOKEN_3 ;;
+                3) upload_token=$UPLOAD_TOKEN_4 ;;
+                4) upload_token=$UPLOAD_TOKEN_5 ;;
+            esac
             wait_for_profile_go
             headers="$work/upload-$upload.headers"
             filename="load-$SOAK_NAMESPACE-$run_id-$upload.bin"
@@ -567,7 +658,7 @@ upload_profile() {
                 --dump-header "$headers" \
                 --output /dev/null \
                 --write-out '%{http_code}' \
-                "$VAULTLINK_BASE_URL/v/$UPLOAD_TOKEN/upload")
+                "$VAULTLINK_BASE_URL/v/$upload_token/upload")
             outcome=$(awk '
                 tolower($1) == "x-vaultlink-upload-outcome:" {
                     sub(/^[^:]*:[[:space:]]*/, "")
@@ -689,6 +780,10 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     [ ! -f "$work/rss-samples.csv" ] || rss_rows=$(wc -l <"$work/rss-samples.csv")
     observed_p95=unavailable
     observed_p95_within_limit=unavailable
+    observed_range_ttfb_p95=unavailable
+    observed_range_ttfb_within_limit=unavailable
+    observed_range_throughput_median=unavailable
+    observed_range_duration_p95=unavailable
     if [ -s "$work/metadata.csv" ]; then
         observed_p95=$(awk -F, '{ print $3 }' "$work/metadata.csv" \
             | sort -n | awk 'NR == 1900 { print; exit }')
@@ -696,6 +791,18 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     fi
     if [ -s "$work/metadata.p95-within-limit" ]; then
         observed_p95_within_limit=$(cat "$work/metadata.p95-within-limit")
+    fi
+    if [ -s "$work/range-ttfb.p95" ]; then
+        observed_range_ttfb_p95=$(cat "$work/range-ttfb.p95")
+    fi
+    if [ -s "$work/range-ttfb.p95-within-limit" ]; then
+        observed_range_ttfb_within_limit=$(cat "$work/range-ttfb.p95-within-limit")
+    fi
+    if [ -s "$work/range-throughput.median" ]; then
+        observed_range_throughput_median=$(cat "$work/range-throughput.median")
+    fi
+    if [ -s "$work/range-duration.p95" ]; then
+        observed_range_duration_p95=$(cat "$work/range-duration.p95")
     fi
     profile_status_tmp="$LOAD_TEST_EVIDENCE_DIR/.profile-status.env.$$"
     printf '%s\n' \
@@ -713,6 +820,12 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         "metadata_p95_limit_seconds=$p95_limit" \
         "metadata_p95_within_limit=$observed_p95_within_limit" \
         "metadata_p95_enforced=$p95_enforced" \
+        "range_ttfb_observed_p95_seconds=$observed_range_ttfb_p95" \
+        "range_ttfb_p95_limit_seconds=$range_ttfb_p95_limit" \
+        "range_ttfb_p95_within_limit=$observed_range_ttfb_within_limit" \
+        "range_ttfb_p95_enforced=$p95_enforced" \
+        "range_throughput_median_bytes_per_second=$observed_range_throughput_median" \
+        "range_duration_observed_p95_seconds=$observed_range_duration_p95" \
         >"$profile_status_tmp"
     chmod 0640 "$profile_status_tmp"
     mv "$profile_status_tmp" "$LOAD_TEST_EVIDENCE_DIR/profile-status.env"
@@ -720,6 +833,10 @@ fi
 [ "$profile_failed" -eq 0 ] || { echo "parallel load profile failed" >&2; exit 1; }
 p95=$(cat "$work/metadata.p95")
 p95_within_limit=$(cat "$work/metadata.p95-within-limit")
+range_ttfb_p95=$(cat "$work/range-ttfb.p95")
+range_ttfb_within_limit=$(cat "$work/range-ttfb.p95-within-limit")
+range_throughput_median=$(cat "$work/range-throughput.median")
+range_duration_p95=$(cat "$work/range-duration.p95")
 max_rss_kib=$(awk -F, 'NR > 1 { if ($3 > maximum) maximum = $3 } END {
     if (NR <= 1) exit 1
     print maximum
@@ -757,13 +874,23 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         "metadata_p95_limit_seconds=$p95_limit" \
         "metadata_p95_within_limit=$p95_within_limit" \
         "metadata_p95_enforced=$p95_enforced" \
+        "range_ttfb_p95_seconds=$range_ttfb_p95" \
+        "range_ttfb_p95_limit_seconds=$range_ttfb_p95_limit" \
+        "range_ttfb_p95_within_limit=$range_ttfb_within_limit" \
+        "range_ttfb_p95_enforced=$p95_enforced" \
+        "range_throughput_median_bytes_per_second=$range_throughput_median" \
+        "range_duration_p95_seconds=$range_duration_p95" \
         'metadata_clients=100' \
         'metadata_requests=2000' \
         'range_streams=40' \
+        'range_share_count=3' \
+        'range_streams_per_share_max=14' \
         "range_bytes=$range_bytes" \
         "fixture_bytes=$fixture_bytes" \
         "range_sha256=$expected_range_hash" \
         'uploads=10' \
+        'upload_share_count=5' \
+        'uploads_per_share=2' \
         "upload_sha256=$upload_hash" \
         'upload_integrity=server_readback' \
         "max_rss_kib=$max_rss_kib" \
@@ -775,6 +902,10 @@ if [ "$p95_enforced" = true ] && [ "$p95_within_limit" != true ]; then
     echo "metadata p95 gate failed: $p95 seconds is not below $p95_limit seconds" >&2
     exit 1
 fi
+if [ "$p95_enforced" = true ] && [ "$range_ttfb_within_limit" != true ]; then
+    echo "range TTFB p95 gate failed: $range_ttfb_p95 seconds is not below $range_ttfb_p95_limit seconds" >&2
+    exit 1
+fi
 
-echo "Parallel load profile passed; metadata p95: $p95 seconds (limit $p95_limit, within limit: $p95_within_limit, enforced: $p95_enforced); max RSS: $max_rss_kib KiB."
+echo "Parallel load profile passed; metadata p95: $p95 seconds; range TTFB p95: $range_ttfb_p95 seconds; range throughput median: $range_throughput_median bytes/s; range duration p95: $range_duration_p95 seconds; max RSS: $max_rss_kib KiB."
 load_stage=complete

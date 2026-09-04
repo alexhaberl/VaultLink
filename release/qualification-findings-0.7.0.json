@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "release_version": "0.7.0",
+  "findings": [
+    {
+      "id": "QUAL-001",
+      "title": "Pinned performance baseline and compatibility fixtures"
+    },
+    {
+      "id": "REL-001",
+      "title": "Authoritative release state and historical v0.6.0 evidence"
+    },
+    {
+      "id": "SEC-001",
+      "title": "Typed route manifest and MFA mutation context"
+    },
+    {
+      "id": "CI-001",
+      "title": "Pinned Actionlint, Arch helper, and constrained RSA exception"
+    },
+    {
+      "id": "SEC-002",
+      "title": "Hierarchical admission and slow-client defence"
+    },
+    {
+      "id": "SEC-003",
+      "title": "Descriptor-safe TLS loading and reload"
+    },
+    {
+      "id": "SEC-004",
+      "title": "Log injection defence and single internal-error reporting"
+    },
+    {
+      "id": "PERF-001",
+      "title": "Bounded database executor and hot paths"
+    },
+    {
+      "id": "PERF-002",
+      "title": "Storage authority coordinator"
+    },
+    {
+      "id": "PERF-003",
+      "title": "64 KiB streaming and bounded direct ZIP generation"
+    },
+    {
+      "id": "PERF-004",
+      "title": "Directory snapshot and disk-stat caches"
+    },
+    {
+      "id": "PERF-005",
+      "title": "Schema 8 share search and keyset audit pagination"
+    },
+    {
+      "id": "REL-002",
+      "title": "Bounded runtime and shutdown"
+    },
+    {
+      "id": "QUAL-002",
+      "title": "Extracted web assets and domain test suites"
+    },
+    {
+      "id": "QUAL-003",
+      "title": "Mechanical module splits with byte-stable contracts"
+    },
+    {
+      "id": "QUAL-004",
+      "title": "Private AppState and service boundaries"
+    },
+    {
+      "id": "SEC-005",
+      "title": "Required-audit type contract"
+    },
+    {
+      "id": "SEC-006",
+      "title": "Non-clonable upload state machines"
+    },
+    {
+      "id": "QUAL-005",
+      "title": "Transport-neutral public transfer service"
+    },
+    {
+      "id": "CI-002",
+      "title": "Architecture and module-size gates"
+    },
+    {
+      "id": "QUAL-006",
+      "title": "Nine-target, CIFS, fuzz, load, and 72-hour final qualification"
+    }
+  ]
+}

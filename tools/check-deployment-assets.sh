@@ -26,6 +26,22 @@ check_sample_limits() {
         || fail "$config has a non-decimal max_preview_size default"
     [ "$(toml_integer "$config" max_media_preview_size)" = 100000000 ] \
         || fail "$config has a non-decimal max_media_preview_size default"
+    [ "$(toml_integer "$config" max_public_uploads)" = 28 ] \
+        || fail "$config has an unsafe public-upload admission default"
+    [ "$(toml_integer "$config" max_uploads_per_share)" = 2 ] \
+        || fail "$config has an unsafe per-share upload admission default"
+    [ "$(toml_integer "$config" upload_min_bytes_per_second)" = 65536 ] \
+        || fail "$config has an unsafe upload progress default"
+    [ "$(toml_integer "$config" upload_max_duration_seconds)" = 21600 ] \
+        || fail "$config has an unsafe upload duration default"
+    [ "$(toml_integer "$config" max_public_streams)" = 96 ] \
+        || fail "$config has an unsafe public-stream admission default"
+    [ "$(toml_integer "$config" max_streams_per_share)" = 16 ] \
+        || fail "$config has an unsafe per-share stream admission default"
+    [ "$(toml_integer "$config" stream_min_bytes_per_second)" = 16384 ] \
+        || fail "$config has an unsafe stream progress default"
+    [ "$(toml_integer "$config" stream_max_duration_seconds)" = 21600 ] \
+        || fail "$config has an unsafe stream duration default"
 }
 
 check_sample_limits config/development.toml 100000000
@@ -73,8 +89,8 @@ if ! grep -F -q "if sudo test ! -e /etc/vaultlink/update.conf && \\" README.md \
 fi
 if ! grep -F -q "Open \`http://127.0.0.1:8090/#token=...\` locally." README.md \
     || grep -F -q '?token=' README.md \
-    || ! grep -F -q 'http://127.0.0.1:{port}/#token={token}' src/setup.rs \
-    || ! grep -F -q "new URLSearchParams(location.hash.slice(1))" src/setup.rs; then
+    || ! grep -F -q 'http://127.0.0.1:{port}/#token={token}' src/setup/routes.rs \
+    || ! grep -F -q "new URLSearchParams(location.hash.slice(1))" assets/web/setup.js; then
     fail "README and setup implementation must pass the one-time setup token in the URL fragment, never the query string"
 fi
 grep -F -x -q 'repository=alexhaberl/VaultLink' deploy/vaultlink-update.sh \
@@ -94,6 +110,16 @@ grep -F -x -q 'StartLimitIntervalSec=1h' deploy/vaultlink.service \
     || fail "VaultLink service must bound repeated parity-guard start failures"
 grep -F -x -q 'StartLimitBurst=3' deploy/vaultlink.service \
     || fail "VaultLink service must cap parity-guard restart attempts"
+grep -F -x -q 'TimeoutStopSec=45s' deploy/vaultlink.service \
+    || fail "VaultLink service must leave a ten-second margin above the 35-second application shutdown budget"
+grep -F -x -q 'const MAX_BLOCKING_THREADS: usize = 64;' src/server/acceptor.rs \
+    || fail "the Tokio runtime must cap blocking workers at 64"
+grep -F -q '.max_blocking_threads(MAX_BLOCKING_THREADS)' src/server/runtime.rs \
+    || fail "the Tokio runtime builder must apply its blocking-worker cap"
+grep -F -x -q 'const SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(25);' src/server/acceptor.rs \
+    || fail "the HTTP connection drain must retain its 25-second deadline"
+grep -F -x -q 'const CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);' src/server/acceptor.rs \
+    || fail "the cleanup worker join must have a ten-second deadline"
 grep -F -x -q 'TimeoutStartSec=90min' deploy/vaultlink-update.service \
     || fail "the update service must allow a bounded full package transaction"
 grep -F -x -q 'TimeoutStopSec=30min' deploy/vaultlink-update.service \

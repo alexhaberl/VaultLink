@@ -1,16 +1,28 @@
 # v0.7.0 native-package release checklist
 
-This checklist is intentionally separate from the withdrawn 0.5.0 historical
-record and the in-progress 0.6.0 release checklist. It applies to the
-unreleased 0.7.0 monitoring feature line, which must not be merged or published
-before the signed `v0.6.0` package release is public. Every item remains
+Status: unreleased. This checklist is intentionally separate from the
+withdrawn 0.5.0 historical record and the supported 0.6.0 release checklist.
+[`release/release-state.json`](../release/release-state.json) is authoritative
+for lifecycle state, and
+[`release/qualification-0.7.0.json`](../release/qualification-0.7.0.json) is
+authoritative for review-finding closure. Candidate, soak, and tag preflight
+must fail while any qualification entry is open. Every item remains
 fail-closed until checked against the exact release commit.
+
+## Release-state and finding contract
+
+- [x] The signed, immutable 21-asset `v0.6.0` package release is the supported
+  rollback input; withdrawn 0.5.0 remains unsupported.
+- [ ] Every `SEC`, `REL`, `PERF`, `QUAL`, and `CI` qualification entry is
+  `closed` or explicitly `accepted` with evidence; none is `open`.
+- [ ] README, SECURITY, changelog, package, soak, and tag checks agree with the
+  release-state manifest and the exact nine-target package manifest.
 
 ## Feature and schema contract
 
-- [ ] A fresh database is schema 7 and records migrations 2 through 7.
-- [ ] Every supported schema 1 through 6 migrates transactionally to schema 7;
-  the injected 6→7 failure leaves a complete, valid schema-6 database.
+- [ ] A fresh database is schema 8 and records migrations 2 through 8.
+- [ ] Every supported schema 1 through 7 migrates transactionally to schema 8;
+  the injected 7→8 failure leaves a complete, valid schema-7 database.
 - [ ] Schema validation rejects missing/extra service-token objects, malformed
   hashes, unsupported scope bits, corrupt history/fingerprint state, future
   schemas, and non-empty unversioned databases.
@@ -75,16 +87,16 @@ fail-closed until checked against the exact release commit.
 - [ ] Route inventory and API smoke include all new routes, token creation,
   monitoring reads, redaction, negative route access, restart persistence,
   revocation, and log leak checks.
-- [ ] Every offline native-package gate performs a real populated schema-6→7
-  migration and checks empty service-token state plus history 7; its separate
+- [ ] Every offline native-package gate performs real populated migrations
+  through schema 8 and checks service-token/search state plus history 8; its separate
   upgrade-safety suite verifies backup and rollback behavior. Every full-system
   distro VM gate additionally verifies the populated schema-6 backup, rolls it
-  back, and returns cleanly to schema 7.
+  back, and returns cleanly to schema 8.
 - [ ] Upgrade, backup, automatic recovery, explicit rollback, runtime guard,
   package lifecycle, and load/soak gates remain green for all nine targets.
 - [ ] `Cargo.toml`, `Cargo.lock`, health/monitoring version output, README,
   SECURITY, threat model, packaging, upgrade/restore documentation, SBOMs,
-  changelog, and release metadata all identify 0.7.0/schema 7.
+  changelog, and release metadata all identify 0.7.0/schema 8.
 - [ ] No static realistic service token is committed; test credentials are
   assembled from runtime randomness or non-secret components and the unchanged
   full-history secret scan passes.

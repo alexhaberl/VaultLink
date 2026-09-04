@@ -10,23 +10,25 @@ use chrono::{Duration, Utc};
 use serde::Deserialize;
 
 use super::{
-    common::{decode_security_keys, internal, webauthn_start_response, CsrfForm},
+    common::{decode_security_keys, webauthn_start_response, CsrfForm},
     templates::public_page,
     AppError, Result,
 };
 use crate::{
     auth,
-    db::{AuditAction, AuditContext},
+    db::{AuditAction, AuditContext, RequiredAuditCompletion},
     http_auth::{
         admin_login_attempt_admitted, audit_observation, clear_session_cookie, csrf, database,
         enabled_audit_client_ip, make_session_cookie, password_login_admitted,
-        redirect_with_cookie, required_database, session, MissingSession,
+        redirect_with_cookie, required_audit_decision, required_audited_service_database,
+        service_database, session, MissingSession,
     },
     i18n,
+    internal_reporting::{report_internal, report_invariant, InternalOperation},
     services::auth::{
         AuthService, PasswordLoginCommand, PasswordLoginOutcome, TotpLoginCommand, TotpLoginOutcome,
     },
-    AppState,
+    AuthRouteState,
 };
 
 #[derive(Template)]
@@ -52,7 +54,7 @@ pub(super) struct LoginForm {
 }
 
 pub(super) async fn login(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     Form(form): Form<LoginForm>,
@@ -66,7 +68,7 @@ pub(super) async fn login(
     let attempted_username = form.username.clone();
     let token = auth::random_token(32);
     let csrf = auth::random_token(24);
-    let expires = Utc::now() + Duration::hours(state.config.security.session_hours);
+    let expires = Utc::now() + Duration::hours(state.config().security.session_hours);
     let outcome = password_login_admitted(
         &state,
         PasswordLoginCommand {
@@ -100,14 +102,14 @@ pub(super) async fn login(
 }
 
 pub(super) async fn mfa_page(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     headers: HeaderMap,
 ) -> Result<Html<String>> {
     let (_, current_session) =
         session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     let admin_id = current_session.admin_id;
     let username = current_session.username.clone();
-    let (security_key_count, totp_enabled) = database(state.db.clone(), move |db| {
+    let (security_key_count, totp_enabled) = database(state.db().clone(), move |db| {
         let security_key_count = db.admin_webauthn_credentials(admin_id)?.len();
         let admin = db
             .admin(&username)?
@@ -132,14 +134,14 @@ pub(super) struct MfaForm {
 }
 
 pub(super) async fn mfa(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     headers: HeaderMap,
     Form(form): Form<MfaForm>,
 ) -> Result<Response> {
     let (token, s) = session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     csrf(&s, &form.csrf)?;
     let key = format!("mfa:{}", s.username.to_lowercase());
-    if !state.limiter.check_and_record_attempt(&key) {
+    if !state.login_limiter().check_and_record_attempt(&key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many MFA attempts",
@@ -156,9 +158,11 @@ pub(super) async fn mfa(
         rotated_csrf_token: new_csrf,
         audit_client_ip: enabled_audit_client_ip(&state),
     };
-    let outcome = required_database(state.db.clone(), move |db| {
-        AuthService::new(db).login_with_totp(command)
-    })
+    let outcome = service_database(
+        state.db().clone(),
+        move |db| AuthService::new(db).login_with_totp(command),
+        InternalOperation::HttpAuthDatabaseFailure,
+    )
     .await?;
     match outcome {
         TotpLoginOutcome::Created => {}
@@ -171,7 +175,7 @@ pub(super) async fn mfa(
             return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid MFA code"));
         }
     }
-    state.limiter.success(&key);
+    state.login_limiter().success(&key);
     Ok(redirect_with_cookie(
         "/admin",
         &make_session_cookie(&state, &new_token),
@@ -179,7 +183,7 @@ pub(super) async fn mfa(
 }
 
 pub(super) async fn start_security_key_authentication(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     headers: HeaderMap,
     Json(body): Json<CsrfForm>,
 ) -> Result<Response> {
@@ -193,14 +197,14 @@ pub(super) async fn start_security_key_authentication(
     }
     csrf(&session, &body.csrf)?;
     let start_key = format!("mfa-webauthn-start:{}", session.username.to_lowercase());
-    if !state.limiter.check_and_record_attempt(&start_key) {
+    if !state.login_limiter().check_and_record_attempt(&start_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many security-key requests",
         ));
     }
     let admin_id = session.admin_id;
-    let rows = database(state.db.clone(), move |db| {
+    let rows = database(state.db().clone(), move |db| {
         db.admin_webauthn_credentials(admin_id)
     })
     .await?;
@@ -222,7 +226,7 @@ pub(super) struct SecurityKeyAuthenticationFinish {
 }
 
 pub(super) async fn finish_security_key_authentication(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     headers: HeaderMap,
     Json(body): Json<SecurityKeyAuthenticationFinish>,
 ) -> Result<Response> {
@@ -236,14 +240,14 @@ pub(super) async fn finish_security_key_authentication(
     }
     csrf(&session, &body.csrf)?;
     let attempt_key = format!("mfa:{}", session.username.to_lowercase());
-    if !state.limiter.check_and_record_attempt(&attempt_key) {
+    if !state.login_limiter().check_and_record_attempt(&attempt_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many MFA attempts",
         ));
     }
     let admin_id = session.admin_id;
-    let rows = database(state.db.clone(), move |db| {
+    let rows = database(state.db().clone(), move |db| {
         db.admin_webauthn_credentials(admin_id)
     })
     .await?;
@@ -252,18 +256,27 @@ pub(super) async fn finish_security_key_authentication(
     let index = webauthn
         .finish_authentication(&token, admin_id, &body.credential, &mut keys)
         .map_err(|_| AppError(StatusCode::UNAUTHORIZED, "Invalid security key"))?;
-    let row = rows.get(index).ok_or_else(|| internal(()))?;
+    let row = rows.get(index).ok_or_else(|| {
+        AppError::from(report_invariant(
+            InternalOperation::WebAuthCredentialRowInvariant,
+        ))
+    })?;
     let credential_id = row.id;
     let expected_credential_blob = row.credential_blob.clone();
-    let credential_blob = keys[index].to_blob().map_err(internal)?;
+    let credential_blob = keys[index].to_blob().map_err(|error| {
+        AppError::from(report_internal(
+            InternalOperation::WebAuthCredentialEncode,
+            error,
+        ))
+    })?;
     let new_token = auth::random_token(32);
     let new_csrf = auth::random_token(24);
     let rotated_token = new_token.clone();
     let rotated_csrf = new_csrf.clone();
     let audit_context =
         AuditContext::new(session.username.clone(), enabled_audit_client_ip(&state));
-    let completed = required_database(state.db.clone(), move |db| {
-        db.complete_webauthn_mfa_and_audit(
+    let completed = required_audit_decision(state.db().clone(), move |db| {
+        db.complete_webauthn_mfa_and_audit_audited(
             &token,
             &rotated_token,
             &rotated_csrf,
@@ -275,23 +288,31 @@ pub(super) async fn finish_security_key_authentication(
         )
     })
     .await?;
-    if !completed {
-        return Err(AppError(
-            StatusCode::CONFLICT,
-            "Security key changed concurrently",
-        ));
+    match completed {
+        RequiredAuditCompletion::Committed(()) => {}
+        RequiredAuditCompletion::Rejected(()) => {
+            return Err(AppError(
+                StatusCode::CONFLICT,
+                "Security key changed concurrently",
+            ));
+        }
     }
-    state.limiter.success(&attempt_key);
+    state.login_limiter().success(&attempt_key);
     let mut response = Json(serde_json::json!({"redirect":"/admin"})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_str(&make_session_cookie(&state, &new_token)).map_err(internal)?,
+        HeaderValue::from_str(&make_session_cookie(&state, &new_token)).map_err(|error| {
+            AppError::from(report_internal(
+                InternalOperation::WebAuthSessionCookieHeader,
+                error,
+            ))
+        })?,
     );
     Ok(response)
 }
 
 pub(super) async fn logout(
-    State(state): State<AppState>,
+    State(state): State<AuthRouteState>,
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> Result<Response> {
@@ -299,9 +320,11 @@ pub(super) async fn logout(
     csrf(&s, &form.csrf)?;
     let actor = s.username;
     let client_ip = enabled_audit_client_ip(&state);
-    required_database(state.db.clone(), move |db| {
-        AuthService::new(db).logout(&token, actor, client_ip)
-    })
+    required_audited_service_database(
+        state.db().clone(),
+        move |db| AuthService::new(db).logout(&token, actor, client_ip),
+        InternalOperation::HttpAuthDatabaseFailure,
+    )
     .await?;
     Ok(redirect_with_cookie(
         "/login",

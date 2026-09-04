@@ -12,16 +12,16 @@ use crate::{
         Permission,
     },
     http_auth::{authorize_monitoring, current_client_limit_key, database},
-    AppState,
+    MonitoringRouteState,
 };
 
 use super::{ApiError, ApiResult};
 
 const MONITORING_RETRY_AFTER_SECONDS: u64 = 60;
 
-fn admit_monitoring_request(state: &AppState) -> ApiResult<()> {
+fn admit_monitoring_request(state: &MonitoringRouteState) -> ApiResult<()> {
     let key = current_client_limit_key().to_string();
-    if state.monitoring_limiter.check_and_record_attempt(&key) {
+    if state.monitoring_limiter().check_and_record_attempt(&key) {
         Ok(())
     } else {
         Err(ApiError::rate_limited(
@@ -98,21 +98,36 @@ impl MonitoringSummaryResponse {
 }
 
 pub(super) async fn monitoring_summary(
-    State(state): State<AppState>,
+    State(state): State<MonitoringRouteState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<MonitoringSummaryResponse>> {
     admit_monitoring_request(&state)?;
     authorize_monitoring(&state, &headers).await?;
-    let generated_at = Utc::now();
-    let database_future = database(state.db.clone(), move |database| {
-        database.monitoring_summary(generated_at)
-    });
-    let storage_future = state.disk_stats_cache.get(state.secure_root.display_root());
-    let (summary, storage) = tokio::join!(database_future, storage_future);
+    let cache = state.monitoring_summary_cache().clone();
+    let database_handle = state.db().clone();
+    let disk_stats = state.disk_stats_cache().clone();
+    let storage_root = state.secure_root().display_root().to_path_buf();
+    let snapshot = cache
+        .get_or_try_insert(|| async move {
+            let generated_at = Utc::now();
+            let database_future = database(database_handle, move |database| {
+                database.monitoring_summary(generated_at)
+            });
+            let storage_future = disk_stats.get(&storage_root);
+            let (summary, storage) = tokio::join!(database_future, storage_future);
+            Ok::<_, crate::http_auth::HttpAuthError>(
+                crate::monitoring_cache::MonitoringSummarySnapshot {
+                    generated_at,
+                    summary: summary?,
+                    storage: storage.ok(),
+                },
+            )
+        })
+        .await?;
     Ok(Json(MonitoringSummaryResponse::new(
-        summary?,
-        generated_at,
-        storage.ok(),
+        snapshot.summary,
+        snapshot.generated_at,
+        snapshot.storage,
     )))
 }
 
@@ -199,7 +214,7 @@ pub(super) struct MonitoringSharePageResponse {
 }
 
 pub(super) async fn monitoring_share_page(
-    State(state): State<AppState>,
+    State(state): State<MonitoringRouteState>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> ApiResult<Json<MonitoringSharePageResponse>> {
@@ -227,7 +242,7 @@ pub(super) async fn monitoring_share_page(
         limit,
         now: generated_at,
     };
-    let page = database(state.db.clone(), move |database| {
+    let page = database(state.db().clone(), move |database| {
         database.list_monitoring_share_page(&options)
     })
     .await?;

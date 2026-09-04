@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use super::common::webauthn_start_response;
 use super::{
-    common::{decode_security_keys, format_utc_minute, internal, otpauth_url, qr_svg},
+    common::{decode_security_keys, format_utc_minute, otpauth_url, qr_svg},
     rendering::PageId,
     templates::{admin_page as render_admin_page, TrustedMarkup},
     AppError, Result,
@@ -24,12 +24,14 @@ use crate::{
     },
     http_auth::{
         audit_observation, clear_session_cookie, csrf, current_audit_client_ip, database,
-        enabled_audit_client_ip, hash_password_admitted, mfa_session, redirect_with_cookie,
-        required_database, runtime_settings, session, verify_password_admitted, MissingSession,
+        database_runtime_permit, enabled_audit_client_ip, hash_password_admitted, mfa_session,
+        redirect_with_cookie, required_mfa_audit_database, runtime_settings, session,
+        verify_password_admitted, MissingSession,
     },
+    internal_reporting::{report_internal, InternalOperation},
     sensitive::SecretString,
     webauthn::WebAuthnServiceError,
-    AppState,
+    AccountRouteState,
 };
 
 enum SecurityKeyRegistrationFinishError {
@@ -104,14 +106,14 @@ pub(super) struct SecurityKeyRegistrationStart {
 }
 
 pub(super) async fn start_security_key_registration(
-    State(state): State<AppState>,
+    State(state): State<AccountRouteState>,
     headers: HeaderMap,
     Json(body): Json<SecurityKeyRegistrationStart>,
 ) -> Result<Response> {
     let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&authenticated, &body.csrf)?;
     let limiter_key = format!("security-key-register:{}", authenticated.admin_id);
-    if !state.limiter.check_and_record_attempt(&limiter_key) {
+    if !state.login_limiter().check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many password attempts",
@@ -125,7 +127,7 @@ pub(super) async fn start_security_key_registration(
         ));
     }
     let username = authenticated.username.clone();
-    let admin = database(state.db.clone(), move |db| db.admin(&username))
+    let admin = database(state.db().clone(), move |db| db.admin(&username))
         .await?
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let password_hash = admin.password_hash;
@@ -156,17 +158,17 @@ pub(super) async fn start_security_key_registration(
     }
     // Successful password reauthentication remains rate-limited.
     let admin_id = authenticated.admin_id;
-    let rows = database(state.db.clone(), move |db| {
+    let rows = database(state.db().clone(), move |db| {
         db.admin_webauthn_credentials(admin_id)
     })
     .await?;
     let existing = decode_security_keys(&rows)?;
-    let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
+    let security_settings_guard = state.acquire_security_settings_mutation().await;
     let webauthn = crate::http_auth::webauthn_service(&state)?;
     let username = authenticated.username.clone();
-    let proof = authenticated.proof().clone();
+    let (_, proof) = authenticated.into_parts();
     let ceremony_key = proof.webauthn_registration_key();
-    let registration = required_database(state.db.clone(), move |db| {
+    let registration = database(state.db().clone(), move |db| {
         // Keep the RP/origin snapshot and pending-ceremony mutation ordered
         // with settings replacement even if the HTTP future is cancelled.
         let _security_settings_guard = security_settings_guard;
@@ -195,7 +197,7 @@ pub(super) struct SecurityKeyRegistrationFinish {
 }
 
 pub(super) async fn finish_security_key_registration(
-    State(state): State<AppState>,
+    State(state): State<AccountRouteState>,
     headers: HeaderMap,
     Json(body): Json<SecurityKeyRegistrationFinish>,
 ) -> Result<Json<serde_json::Value>> {
@@ -208,52 +210,78 @@ pub(super) async fn finish_security_key_registration(
             "Invalid security-key label",
         ));
     }
-    let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
+    let security_settings_guard = state.acquire_security_settings_mutation().await;
     let webauthn = crate::http_auth::webauthn_service(&state)?;
     let admin_id = authenticated.admin_id;
-    let proof = authenticated.proof().clone();
-    let ceremony_key = proof.webauthn_registration_key();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
-    let audit_context = AuditContext::new(authenticated.username.clone(), audit_client_ip);
-    let database = state.db.clone();
+    let database = state.db().clone();
+    let database_queue_started = std::time::Instant::now();
+    let database_permit =
+        database_runtime_permit(&database, "webauthn_registration", database_queue_started).await?;
+    let database_queue_duration_ms =
+        u64::try_from(database_queue_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let credential = body.credential;
     let registration = tokio::task::spawn_blocking(move || {
+        let _database_permit = database_permit;
+        let database_operation_started = std::time::Instant::now();
         // The complete settings -> pending registration -> SQLite writer
         // boundary remains alive even if the HTTP future is cancelled.
         let _security_settings_guard = security_settings_guard;
-        webauthn.with_registration_mutations(|registrations| {
-            database.required_transaction_for_mfa_session(&proof, &audit_context, |transaction| {
-                // The live-session predicate has succeeded while BEGIN
-                // IMMEDIATE is held. Only now may this single-use challenge
-                // be consumed and its credential made durable.
-                let key = registrations.finish(&ceremony_key, admin_id, &credential)?;
-                let credential_id =
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.credential_id());
-                let credential_blob = key.to_blob()?;
-                Database::insert_admin_webauthn_credential_in_transaction(
-                    transaction,
+        let (authenticated, proof) = authenticated.into_parts();
+        let ceremony_key = proof.webauthn_registration_key();
+        let audit_context = AuditContext::new(authenticated.username, audit_client_ip);
+        let result = webauthn.with_registration_mutations(|registrations| {
+            database.run_required_session_audit(|database| {
+                database.required_transaction_for_mfa_session_audited(
                     &proof,
-                    &label,
-                    &credential_id,
-                    &credential_blob,
-                )?;
-                Ok((
-                    (),
-                    vec![RequiredAuditEvent::new(
-                        AuditAction::WebauthnCredentialAdded,
-                        None,
-                        None,
-                    )],
-                ))
+                    &audit_context,
+                    |transaction| {
+                        // The live-session predicate has succeeded while BEGIN
+                        // IMMEDIATE is held. Only now may this single-use challenge
+                        // be consumed and its credential made durable.
+                        let key = registrations.finish(&ceremony_key, admin_id, &credential)?;
+                        let credential_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(key.credential_id());
+                        let credential_blob = key.to_blob()?;
+                        Database::insert_admin_webauthn_credential_in_transaction(
+                            transaction,
+                            &proof,
+                            &label,
+                            &credential_id,
+                            &credential_blob,
+                        )?;
+                        Ok((
+                            (),
+                            vec![RequiredAuditEvent::new(
+                                AuditAction::WebauthnCredentialAdded,
+                                None,
+                                None,
+                            )],
+                        ))
+                    },
+                )
             })
-        })
+        });
+        tracing::debug!(
+            operation = "database.webauthn_registration",
+            queue_duration_ms = database_queue_duration_ms,
+            operation_duration_ms =
+                u64::try_from(database_operation_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "database operation completed"
+        );
+        result
     })
     .await
-    .map_err(internal)?
+    .map_err(|error| {
+        AppError::from(report_internal(
+            InternalOperation::WebAccountCredentialRegistrationTaskJoin,
+            error,
+        ))
+    })?
     .map_err(security_key_registration_finish_error)?;
     super::session_bound(registration)?;
     Ok(Json(serde_json::json!({"redirect":"/admin/account"})))
@@ -267,7 +295,7 @@ pub(super) struct DeleteSecurityKeyForm {
 }
 
 pub(super) async fn delete_security_key(
-    State(state): State<AppState>,
+    State(state): State<AccountRouteState>,
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
     Form(form): Form<DeleteSecurityKeyForm>,
@@ -275,14 +303,14 @@ pub(super) async fn delete_security_key(
     let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&authenticated, &form.csrf)?;
     let limiter_key = format!("security-key-delete:{}", authenticated.admin_id);
-    if !state.limiter.check_and_record_attempt(&limiter_key) {
+    if !state.login_limiter().check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many password attempts",
         ));
     }
     let username = authenticated.username.clone();
-    let admin = database(state.db.clone(), move |db| db.admin(&username))
+    let admin = database(state.db().clone(), move |db| db.admin(&username))
         .await?
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let expected_password_hash = admin.password_hash;
@@ -333,31 +361,35 @@ pub(super) async fn delete_security_key(
         return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
     }
     // Successful password reauthentication remains rate-limited.
-    let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
-    let proof = authenticated.proof().clone();
+    let security_settings_guard = state.acquire_security_settings_mutation().await;
+    let response_session = (*authenticated).clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
-    let outcome = required_database(state.db.clone(), move |db| {
-        // Credential deletion changes the WebAuthn credential count and must
-        // serialize with public-base-URL/runtime replacement.
-        let _security_settings_guard = security_settings_guard;
-        if totp_enabled {
-            db.delete_admin_webauthn_credential_with_totp_for_mfa_session(
-                &proof,
-                id,
-                &expected_password_hash,
-                expected_totp_generation,
-                totp_step.expect("enabled TOTP was validated before the database task"),
-                audit_client_ip.as_deref(),
-            )
-        } else {
-            db.delete_admin_webauthn_credential_without_totp_for_mfa_session(
-                &proof,
-                id,
-                &expected_password_hash,
-                audit_client_ip.as_deref(),
-            )
-        }
-    })
+    let outcome = required_mfa_audit_database(
+        state.db().clone(),
+        authenticated,
+        move |db, _session, proof| {
+            // Credential deletion changes the WebAuthn credential count and must
+            // serialize with public-base-URL/runtime replacement.
+            let _security_settings_guard = security_settings_guard;
+            if totp_enabled {
+                db.delete_admin_webauthn_credential_with_totp_for_mfa_session(
+                    &proof,
+                    id,
+                    &expected_password_hash,
+                    expected_totp_generation,
+                    totp_step.expect("enabled TOTP was validated before the database task"),
+                    audit_client_ip.as_deref(),
+                )
+            } else {
+                db.delete_admin_webauthn_credential_without_totp_for_mfa_session(
+                    &proof,
+                    id,
+                    &expected_password_hash,
+                    audit_client_ip.as_deref(),
+                )
+            }
+        },
+    )
     .await?;
     let outcome = super::session_bound(outcome)?;
     match outcome {
@@ -369,7 +401,7 @@ pub(super) async fn delete_security_key(
         | AdminWebauthnCredentialDeletionOutcome::TotpRejected => {
             audit_observation(
                 &state,
-                authenticated.username.clone(),
+                response_session.username.clone(),
                 AuditAction::SecurityKeyReauthFailed,
                 Some(id.to_string()),
                 None,
@@ -384,13 +416,13 @@ pub(super) async fn delete_security_key(
 }
 
 pub(super) async fn account_page(
-    State(state): State<AppState>,
+    State(state): State<AccountRouteState>,
     headers: HeaderMap,
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
     let admin_id = session.admin_id;
     let username = session.username.clone();
-    let (security_keys, totp_enabled) = database(state.db.clone(), move |db| {
+    let (security_keys, totp_enabled) = database(state.db().clone(), move |db| {
         let keys = db.admin_webauthn_credentials(admin_id)?;
         let admin = db
             .admin(&username)?
@@ -437,21 +469,21 @@ pub(super) struct AccountTotpSettingForm {
 }
 
 pub(super) async fn set_account_totp(
-    State(state): State<AppState>,
+    State(state): State<AccountRouteState>,
     headers: HeaderMap,
     Form(form): Form<AccountTotpSettingForm>,
 ) -> Result<Redirect> {
     let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&authenticated, &form.csrf)?;
     let limiter_key = format!("account-totp-setting:{}", authenticated.admin_id);
-    if !state.limiter.check_and_record_attempt(&limiter_key) {
+    if !state.login_limiter().check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many password attempts",
         ));
     }
     let username = authenticated.username.clone();
-    let admin = database(state.db.clone(), move |db| db.admin(&username))
+    let admin = database(state.db().clone(), move |db| db.admin(&username))
         .await?
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let expected_password_hash = admin.password_hash;
@@ -494,19 +526,23 @@ pub(super) async fn set_account_totp(
     }
     let enabled = form.enabled;
     let audit_client_ip = enabled_audit_client_ip(&state);
-    let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
-    let proof = authenticated.proof().clone();
-    let outcome = required_database(state.db.clone(), move |db| {
-        let _security_settings_guard = security_settings_guard;
-        db.set_admin_totp_enabled_with_reauthentication_for_mfa_session(
-            &proof,
-            &expected_password_hash,
-            expected_totp_generation,
-            enabled,
-            totp_step,
-            audit_client_ip.as_deref(),
-        )
-    })
+    let security_settings_guard = state.acquire_security_settings_mutation().await;
+    let response_session = (*authenticated).clone();
+    let outcome = required_mfa_audit_database(
+        state.db().clone(),
+        authenticated,
+        move |db, _session, proof| {
+            let _security_settings_guard = security_settings_guard;
+            db.set_admin_totp_enabled_with_reauthentication_for_mfa_session(
+                &proof,
+                &expected_password_hash,
+                expected_totp_generation,
+                enabled,
+                totp_step,
+                audit_client_ip.as_deref(),
+            )
+        },
+    )
     .await?;
     let outcome = super::session_bound(outcome)?;
     match outcome {
@@ -521,7 +557,7 @@ pub(super) async fn set_account_totp(
         | AdminTotpSettingOutcome::TotpRejected => {
             audit_observation(
                 &state,
-                authenticated.username.clone(),
+                response_session.username.clone(),
                 AuditAction::AccountTotpSettingReauthFailed,
                 None,
                 None,
@@ -541,14 +577,14 @@ pub(super) struct AccountPasswordForm {
 }
 
 pub(super) async fn change_account_password(
-    State(state): State<AppState>,
+    State(state): State<AccountRouteState>,
     headers: HeaderMap,
     Form(form): Form<AccountPasswordForm>,
 ) -> Result<Response> {
     let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&authenticated, &form.csrf)?;
     let limiter_key = format!("account-password:{}", authenticated.admin_id);
-    if !state.limiter.check_and_record_attempt(&limiter_key) {
+    if !state.login_limiter().check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many password attempts",
@@ -556,7 +592,7 @@ pub(super) async fn change_account_password(
     }
 
     let username = authenticated.username.clone();
-    let admin = database(state.db.clone(), move |db| db.admin(&username))
+    let admin = database(state.db().clone(), move |db| db.admin(&username))
         .await?
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let expected_hash = admin.password_hash.clone();
@@ -591,11 +627,19 @@ pub(super) async fn change_account_password(
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
-    let audit_context = AuditContext::new(authenticated.username.clone(), audit_client_ip);
-    let proof = authenticated.proof().clone();
-    let outcome = required_database(state.db.clone(), move |db| {
-        db.change_admin_password_cas_for_session(&proof, &expected_hash, &new_hash, &audit_context)
-    })
+    let outcome = required_mfa_audit_database(
+        state.db().clone(),
+        authenticated,
+        move |db, session, proof| {
+            let audit_context = AuditContext::new(session.username, audit_client_ip);
+            db.change_admin_password_cas_for_session(
+                &proof,
+                &expected_hash,
+                &new_hash,
+                &audit_context,
+            )
+        },
+    )
     .await?;
     let outcome = super::session_bound(outcome)?;
     match outcome {
@@ -620,14 +664,14 @@ pub(super) struct AccountMfaStartForm {
 }
 
 pub(super) async fn start_account_mfa(
-    State(state): State<AppState>,
+    State(state): State<AccountRouteState>,
     headers: HeaderMap,
     Form(form): Form<AccountMfaStartForm>,
 ) -> Result<Html<String>> {
     let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&authenticated, &form.csrf)?;
     let limiter_key = format!("account-mfa-start:{}", authenticated.admin_id);
-    if !state.limiter.check_and_record_attempt(&limiter_key) {
+    if !state.login_limiter().check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many MFA attempts",
@@ -635,7 +679,7 @@ pub(super) async fn start_account_mfa(
     }
 
     let username = authenticated.username.clone();
-    let admin = database(state.db.clone(), move |db| db.admin(&username))
+    let admin = database(state.db().clone(), move |db| db.admin(&username))
         .await?
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let verification_hash = admin.password_hash;
@@ -662,20 +706,22 @@ pub(super) async fn start_account_mfa(
     let new_secret = auth::new_totp_secret_value();
     let response_secret = new_secret.duplicate_for_one_time_response();
     let token_for_db = enrollment_token.clone();
-    let audit_context = AuditContext::new(
-        authenticated.username.clone(),
-        enabled_audit_client_ip(&state),
-    );
-    let proof = authenticated.proof().clone();
-    let outcome = required_database(state.db.clone(), move |db| {
-        db.start_admin_mfa_enrollment_and_audit_for_session(
-            &proof,
-            &token_for_db,
-            new_secret.expose_secret(),
-            totp_step,
-            &audit_context,
-        )
-    })
+    let response_session = (*authenticated).clone();
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let outcome = required_mfa_audit_database(
+        state.db().clone(),
+        authenticated,
+        move |db, session, proof| {
+            let audit_context = AuditContext::new(session.username, audit_client_ip);
+            db.start_admin_mfa_enrollment_and_audit_for_session(
+                &proof,
+                &token_for_db,
+                new_secret.expose_secret(),
+                totp_step,
+                &audit_context,
+            )
+        },
+    )
     .await?;
     let outcome = super::session_bound(outcome)?;
     let expires_at = match outcome {
@@ -691,14 +737,14 @@ pub(super) async fn start_account_mfa(
     let expires_at = DateTime::parse_from_rfc3339(&expires_at)
         .map(|value| format_utc_minute(value.with_timezone(&Utc)))
         .unwrap_or(expires_at);
-    let otpauth = otpauth_url(&authenticated.username, response_secret.expose_secret());
+    let otpauth = otpauth_url(&response_session.username, response_secret.expose_secret());
     let qr = qr_svg(otpauth.expose_secret())?;
     let body = MfaEnrollmentTemplate {
         qr: &qr,
         secret: response_secret.expose_secret(),
         otpauth: otpauth.expose_secret(),
         expires_at: &expires_at,
-        csrf: &authenticated.csrf_token,
+        csrf: &response_session.csrf_token,
         enrollment_token: &enrollment_token,
     };
     Ok(Html(render_admin_page(
@@ -706,7 +752,7 @@ pub(super) async fn start_account_mfa(
         PageId::Account,
         &body,
         false,
-        &authenticated.csrf_token,
+        &response_session.csrf_token,
         false,
     )?))
 }
@@ -719,7 +765,7 @@ pub(super) struct AccountMfaConfirmForm {
 }
 
 pub(super) async fn confirm_account_mfa(
-    State(state): State<AppState>,
+    State(state): State<AccountRouteState>,
     headers: HeaderMap,
     Form(form): Form<AccountMfaConfirmForm>,
 ) -> Result<Response> {
@@ -729,7 +775,7 @@ pub(super) async fn confirm_account_mfa(
         return Err(AppError(StatusCode::BAD_REQUEST, "Account change failed."));
     }
     let limiter_key = format!("account-mfa-confirm:{}", authenticated.admin_id);
-    if !state.limiter.check_and_record_attempt(&limiter_key) {
+    if !state.login_limiter().check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many MFA attempts",
@@ -737,7 +783,7 @@ pub(super) async fn confirm_account_mfa(
     }
     let admin_id = authenticated.admin_id;
     let lookup_token = form.enrollment_token.clone();
-    let enrollment = database(state.db.clone(), move |db| {
+    let enrollment = database(state.db().clone(), move |db| {
         db.admin_mfa_enrollment(admin_id, &lookup_token)
     })
     .await?
@@ -754,16 +800,19 @@ pub(super) async fn confirm_account_mfa(
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
-    let audit_context = AuditContext::new(authenticated.username.clone(), audit_client_ip);
-    let proof = authenticated.proof().clone();
-    let outcome = required_database(state.db.clone(), move |db| {
-        db.activate_admin_mfa_enrollment_for_session(
-            &proof,
-            &activation_token,
-            totp_step,
-            &audit_context,
-        )
-    })
+    let outcome = required_mfa_audit_database(
+        state.db().clone(),
+        authenticated,
+        move |db, session, proof| {
+            let audit_context = AuditContext::new(session.username, audit_client_ip);
+            db.activate_admin_mfa_enrollment_for_session(
+                &proof,
+                &activation_token,
+                totp_step,
+                &audit_context,
+            )
+        },
+    )
     .await?;
     let outcome = super::session_bound(outcome)?;
     match outcome {

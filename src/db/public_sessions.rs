@@ -1,6 +1,6 @@
 use super::{
-    insert_required_audits, token_hash, trace_required_audits, AuditAction, AuditContext, Database,
-    PreviewSessionCreateOutcome, RequiredAuditEvent, MAX_ACTIVE_PREVIEW_SESSIONS_GLOBAL,
+    insert_required_audits, token_hash, trace_required_audits, AuditAction, AuditContext, Audited,
+    Database, PreviewSessionCreateOutcome, RequiredAuditEvent, MAX_ACTIVE_PREVIEW_SESSIONS_GLOBAL,
     MAX_ACTIVE_PREVIEW_SESSIONS_PER_OWNER_SHARE, MAX_ACTIVE_PREVIEW_SESSIONS_PER_RESOURCE,
     MAX_ACTIVE_PREVIEW_SESSIONS_PER_SHARE,
 };
@@ -53,6 +53,29 @@ impl Database {
             expires,
             Some(context),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_unlock_session_for_verified_password_and_audit_audited(
+        &self,
+        token: &str,
+        share_id: i64,
+        expected_password_hash: &str,
+        expected_upload_policy_epoch: i64,
+        csrf_token: &str,
+        expires: DateTime<Utc>,
+        context: &AuditContext,
+    ) -> rusqlite::Result<Audited<bool>> {
+        self.create_unlock_session_for_verified_password_internal(
+            token,
+            share_id,
+            expected_password_hash,
+            expected_upload_policy_epoch,
+            csrf_token,
+            expires,
+            Some(context),
+        )
+        .map(Audited::new)
     }
 
     #[allow(clippy::too_many_arguments)]

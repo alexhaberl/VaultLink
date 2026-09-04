@@ -1,8 +1,8 @@
 #[cfg(test)]
 use super::{insert_required_audits, trace_required_audits};
 use super::{
-    AuditAction, AuditContext, CommitPublication, Database, MfaSessionProof, RequiredAuditEvent,
-    SessionBound,
+    AuditAction, AuditContext, Audited, CommitPublication, Database, MfaSessionProof,
+    RequiredAuditEvent, SessionBound,
 };
 use chrono::Utc;
 use rusqlite::params;
@@ -45,12 +45,12 @@ impl Database {
         context: &AuditContext,
         audit_detail: String,
         publish_snapshot: impl FnOnce() -> T,
-    ) -> rusqlite::Result<SessionBound<T>>
+    ) -> rusqlite::Result<SessionBound<Audited<T>>>
     where
         T: CommitPublication,
     {
         let admin = proof.admin_id();
-        self.required_transaction_for_mfa_session_with_commit(
+        self.required_transaction_for_mfa_session_with_commit_audited(
             proof,
             context,
             |transaction| {

@@ -1,6 +1,22 @@
 # Release signing and immutable package inputs
 
-VaultLink 0.7.0 publishes only the nine native packages declared in
+Lifecycle state and already-published evidence come exclusively from
+[`release-state.json`](release-state.json); review-finding closure for the
+unreleased 0.7.0 line comes from
+[`qualification-0.7.0.json`](qualification-0.7.0.json). Its required ID/title
+inventory is independently fixed in
+[`qualification-findings-0.7.0.json`](qualification-findings-0.7.0.json); local
+evidence entries must resolve to existing, non-symlink repository paths.
+
+Pure module moves are frozen separately in
+[`refactoring-contracts-0.7.0.json`](refactoring-contracts-0.7.0.json). The
+checker normalizes only checkout line endings, hashes migration/schema/AAD and
+route-contract sources, and hashes each ordered logical source assembled from
+its split files. Missing, reordered, symlinked, or edited parts fail CI. Update
+that manifest only together with an explicit contract or architecture review;
+it is not a generated exception list.
+
+The VaultLink 0.7.0 release workflow will publish only the nine native packages declared in
 `package-targets.json`. The release workflow must not publish project tar
 archives or standalone binaries. GitHub's automatic source archives are
 unsupported source material.

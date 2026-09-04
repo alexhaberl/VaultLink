@@ -33,13 +33,20 @@ done
 
 cd "$(dirname "$0")/.."
 
+python3 tools/check-release-state.py >/dev/null
+development_version=$(python3 tools/check-release-state.py --print-development-version)
+
 package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')
 [ -n "$package_version" ] || {
     echo "Cargo.toml package version is missing" >&2
     exit 1
 }
-release_version=0.7.0
+release_version=$development_version
 if [ "$release_candidate" -eq 1 ] || [ -n "$release_tag" ]; then
+    python3 tools/check-release-state.py --require-ready >/dev/null
+    python3 tools/check-performance-evidence.py compare \
+        --baseline release/performance/baseline.json \
+        --candidate release/performance/candidate.json >/dev/null
     [ "$package_version" = "$release_version" ] || {
         echo "release preflight is fixed to $release_version, not $package_version" >&2
         exit 1
@@ -114,7 +121,7 @@ if [ "$release_candidate" -eq 1 ] || [ -n "$release_tag" ]; then
     }
 fi
 
-grep -Fq 'env!("CARGO_PKG_VERSION")' src/main.rs
+grep -Fq 'env!("CARGO_PKG_VERSION")' src/server/runtime.rs
 grep -Fq 'env!("CARGO_PKG_VERSION")' src/api.rs
 
 # The bootstrap PR is intentionally allowed to carry UNPROVISIONED image and

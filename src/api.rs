@@ -1,15 +1,21 @@
+#[cfg(test)]
+use axum::routing::get;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(panic = "unwind")]
+use tower_http::catch_panic::CatchPanicLayer;
 
-use crate::{sensitive::SecretString, AppState};
+use crate::{
+    internal_reporting::ReportedInternalError, sensitive::SecretString, state::ReadinessState,
+    AppState,
+};
 
 mod admins;
 mod auth;
@@ -17,6 +23,8 @@ mod common;
 mod files;
 mod monitoring;
 mod public;
+mod public_transfer;
+mod public_upload;
 mod service_tokens;
 mod settings_audit;
 mod shares;
@@ -29,6 +37,8 @@ use auth::{login, logout, me, mfa};
 use files::{create_directory, delete_file_entry, files, rename_file_entry};
 use monitoring::{monitoring_share_page, monitoring_summary};
 use public::{public_share, unlock_share};
+use public_transfer::{download, download_zip, public_preview, public_preview_raw};
+use public_upload::upload;
 use service_tokens::{create_service_token, list_service_tokens, revoke_service_token};
 use settings_audit::{delete_audit_client_ips, get_settings, list_audit, update_settings};
 use shares::{
@@ -49,7 +59,7 @@ use settings_audit::settings_body;
 #[cfg(test)]
 use std::net::SocketAddr;
 
-const MAX_SEARCH_QUERY_BYTES: usize = 256;
+use crate::http_contract::MAX_SEARCH_QUERY_BYTES;
 
 #[derive(Debug)]
 struct ApiError {
@@ -70,6 +80,13 @@ fn session_bound<T>(outcome: crate::db::SessionBound<T>) -> ApiResult<T> {
 
 fn storage_recovery_api_error(error: crate::file_ops::FileOperationError) -> ApiError {
     match error {
+        crate::file_ops::FileOperationError::DatabaseCapacity => {
+            ApiError::from(crate::http_auth::HttpAuthError::with_kind(
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::http_auth::DATABASE_BUSY_MESSAGE,
+                crate::http_auth::HttpAuthErrorKind::CapacityUnavailable,
+            ))
+        }
         crate::file_ops::FileOperationError::Database(database_error)
             if crate::db::is_audit_unavailable(&database_error)
                 || crate::db::is_sqlite_busy_or_locked(&database_error) =>
@@ -109,17 +126,20 @@ impl ApiError {
             "Session is no longer authorized",
         )
     }
-    fn internal<T>(_: T) -> Self {
+    fn rate_limited(message: &'static str, retry_after_seconds: u64) -> Self {
+        let mut error = Self::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", message);
+        error.retry_after_seconds = Some(retry_after_seconds);
+        error
+    }
+}
+
+impl From<ReportedInternalError> for ApiError {
+    fn from(_: ReportedInternalError) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "Internal error",
         )
-    }
-    fn rate_limited(message: &'static str, retry_after_seconds: u64) -> Self {
-        let mut error = Self::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", message);
-        error.retry_after_seconds = Some(retry_after_seconds);
-        error
     }
 }
 
@@ -176,6 +196,60 @@ impl From<crate::http_auth::HttpAuthError> for ApiError {
     }
 }
 
+impl From<crate::services::public_transfer::PublicTransferError> for ApiError {
+    fn from(error: crate::services::public_transfer::PublicTransferError) -> Self {
+        use crate::services::public_transfer::PublicTransferError as Error;
+        let (status, code) = match error {
+            Error::NotFound | Error::FileUnavailable | Error::ShareTargetUnavailable => {
+                (StatusCode::NOT_FOUND, "not_found")
+            }
+            Error::Inactive
+            | Error::Expired
+            | Error::Changed
+            | Error::TransferLimitReached
+            | Error::TransferShareUnavailable => (StatusCode::GONE, "gone"),
+            Error::StorageUnavailable | Error::Capacity => {
+                (StatusCode::SERVICE_UNAVAILABLE, "internal_error")
+            }
+            Error::AuditUnavailable => {
+                return Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "audit_unavailable",
+                    "Service Unavailable",
+                )
+            }
+            Error::InvalidFilePath
+            | Error::MissingFilePath
+            | Error::InvalidZipPath
+            | Error::NotFile => (StatusCode::BAD_REQUEST, "bad_request"),
+            Error::PreviewLimitReached => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+            Error::RangeNotSatisfiable(_) => {
+                (StatusCode::RANGE_NOT_SATISFIABLE, "range_not_satisfiable")
+            }
+            Error::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            Error::ConcurrentDownloads => {
+                let mut response = Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "internal_error",
+                    "Service Unavailable",
+                );
+                response.retry_after_seconds = Some(1);
+                return response;
+            }
+            Error::Internal(reported) => return Self::from(reported),
+        };
+        let mut response = Self::new(
+            status,
+            code,
+            status.canonical_reason().unwrap_or("Request failed"),
+        );
+        if matches!(error, Error::Capacity) {
+            response.retry_after_seconds = Some(1);
+        }
+        response
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         #[derive(Serialize)]
@@ -208,79 +282,157 @@ impl IntoResponse for ApiError {
     }
 }
 
+crate::declare_routes! {
+    pub static API_ROUTE_SPECS = ApiV2;
+    fn add_api_routes(router: Router<AppState>) -> Router<AppState>;
+    "/health" {
+        GET => health, [Public, None, None, None, None, ReadOnly];
+    }
+    "/health/live" {
+        GET => health, [Public, None, None, None, None, ReadOnly];
+    }
+    "/health/ready" {
+        GET => readiness, [Public, None, None, None, None, ReadOnly];
+    }
+    "/session/login" {
+        POST => login, [Public, None, None, Required, Json, Authentication];
+    }
+    "/session/mfa" {
+        POST => mfa, [Session, None, Header, Required, Json, Authentication];
+    }
+    "/session/logout" {
+        POST => logout, [Session, None, Header, Required, None, Authentication];
+    }
+    "/session/me" {
+        GET => me, [Session, None, None, None, None, ReadOnly];
+    }
+    "/monitoring/summary" {
+        GET => monitoring_summary, [MonitoringCredential, None, None, None, None, ReadOnly];
+        HEAD => monitoring_method_not_allowed, [Public, None, None, None, None, ReadOnly];
+    }
+    "/monitoring/shares" {
+        GET => monitoring_share_page, [MonitoringCredential, None, None, None, None, ReadOnly];
+        HEAD => monitoring_method_not_allowed, [Public, None, None, None, None, ReadOnly];
+    }
+    "/files" {
+        GET => files, [AdminSession, VerifiedSession, None, None, None, ReadOnly];
+        PATCH => rename_file_entry, [AdminSession, MutationContext, Header, Required, Json, Storage];
+        DELETE => delete_file_entry, [AdminSession, MutationContext, Header, Required, Json, Storage];
+    }
+    "/files/directories" {
+        POST => create_directory, [AdminSession, MutationContext, Header, Required, Json, Storage];
+    }
+    "/shares" {
+        GET => list_shares, [AdminSession, VerifiedSession, None, None, None, ReadOnly];
+        POST => create_share, [AdminSession, MutationContext, Header, Required, Json, Privileged];
+    }
+    "/shares/{id}" {
+        PATCH => update_share, [AdminSession, MutationContext, Header, Required, Json, Privileged];
+        DELETE => delete_share, [AdminSession, MutationContext, Header, Required, None, Privileged];
+    }
+    "/shares/{id}/activate" {
+        POST => activate_share, [AdminSession, MutationContext, Header, Required, None, Privileged];
+    }
+    "/shares/{id}/deactivate" {
+        POST => deactivate_share, [AdminSession, MutationContext, Header, Required, None, Privileged];
+    }
+    "/shares/{id}/password" {
+        PUT => set_share_password, [AdminSession, MutationContext, Header, Required, Json, Privileged];
+        DELETE => remove_share_password, [AdminSession, MutationContext, Header, Required, None, Privileged];
+    }
+    "/admins" {
+        GET => list_admins, [AdminSession, VerifiedSession, None, None, None, ReadOnly];
+        POST => create_admin, [AdminSession, MutationContext, Header, Required, Json, Privileged];
+    }
+    "/admins/{id}/activate" {
+        POST => activate_admin, [AdminSession, MutationContext, Header, Required, None, Privileged];
+    }
+    "/admins/{id}/deactivate" {
+        POST => deactivate_admin, [AdminSession, MutationContext, Header, Required, None, Privileged];
+    }
+    "/admins/{id}/password" {
+        PUT => reset_admin_password, [AdminSession, MutationContext, Header, Required, Json, Privileged];
+    }
+    "/admins/{id}/totp/reset" {
+        POST => reset_admin_totp, [AdminSession, MutationContext, Header, Required, None, Privileged];
+    }
+    "/settings" {
+        GET => get_settings, [AdminSession, VerifiedSession, None, None, None, ReadOnly];
+        PUT => update_settings, [AdminSession, MutationContext, Header, Required, Json, Privileged];
+    }
+    "/audit" {
+        GET => list_audit, [AdminSession, VerifiedSession, None, None, None, ReadOnly];
+    }
+    "/audit/client-ips" {
+        DELETE => delete_audit_client_ips, [AdminSession, MutationContext, Header, Required, Json, Privileged];
+    }
+    "/service-tokens" {
+        GET => list_service_tokens, [AdminSession, VerifiedSession, None, None, None, ReadOnly];
+        POST => create_service_token, [AdminSession, MutationContext, Header, Required, Json, Privileged];
+    }
+    "/service-tokens/{id}" {
+        DELETE => revoke_service_token, [AdminSession, MutationContext, Header, Required, None, Privileged];
+    }
+    "/public/shares/{token}" {
+        GET => public_share, [ShareCapability, None, None, Observation, None, ReadOnly];
+    }
+    "/public/shares/{token}/unlock" {
+        POST => unlock_share, [ShareCapability, None, None, Observation, Json, ShareUnlock];
+    }
+    "/public/shares/{token}/download" {
+        GET => download, [ShareCapability, None, None, Required, None, ReadOnly];
+        HEAD => download, [ShareCapability, None, None, Required, None, ReadOnly];
+    }
+    "/public/shares/{token}/preview" {
+        GET => public_preview, [ShareCapability, None, None, Observation, None, ReadOnly];
+    }
+    "/public/shares/{token}/preview/raw" {
+        GET => public_preview_raw, [ShareCapability, None, None, Observation, None, ReadOnly];
+        HEAD => public_preview_raw, [ShareCapability, None, None, Observation, None, ReadOnly];
+    }
+    "/public/shares/{token}/download.zip" {
+        GET => download_zip, [ShareCapability, None, None, Required, None, ReadOnly];
+    }
+    "/public/shares/{token}/upload" {
+        POST => upload, [ShareCapability, None, None, Required, Multipart, Upload];
+    }
+    layers [
+        DefaultBodyLimit::max(crate::http_contract::HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize),
+        middleware::from_fn(guard_api_multipart_upload),
+    ];
+}
+
 pub fn router(state: AppState) -> Router<AppState> {
-    Router::new()
-        .route("/health", get(health))
-        .route("/health/live", get(health))
-        .route("/health/ready", get(readiness))
-        .route("/session/login", post(login))
-        .route("/session/mfa", post(mfa))
-        .route("/session/logout", post(logout))
-        .route("/session/me", get(me))
-        .route(
-            "/monitoring/summary",
-            get(monitoring_summary).head(monitoring_method_not_allowed),
-        )
-        .route(
-            "/monitoring/shares",
-            get(monitoring_share_page).head(monitoring_method_not_allowed),
-        )
-        .route(
-            "/files",
-            get(files)
-                .patch(rename_file_entry)
-                .delete(delete_file_entry),
-        )
-        .route("/files/directories", post(create_directory))
-        .route("/shares", get(list_shares).post(create_share))
-        .route("/shares/{id}", patch(update_share).delete(delete_share))
-        .route("/shares/{id}/activate", post(activate_share))
-        .route("/shares/{id}/deactivate", post(deactivate_share))
-        .route(
-            "/shares/{id}/password",
-            put(set_share_password).delete(remove_share_password),
-        )
-        .route("/admins", get(list_admins).post(create_admin))
-        .route("/admins/{id}/activate", post(activate_admin))
-        .route("/admins/{id}/deactivate", post(deactivate_admin))
-        .route("/admins/{id}/password", put(reset_admin_password))
-        .route("/admins/{id}/totp/reset", post(reset_admin_totp))
-        .route("/settings", get(get_settings).put(update_settings))
-        .route("/audit", get(list_audit))
-        .route("/audit/client-ips", delete(delete_audit_client_ips))
-        .route(
-            "/service-tokens",
-            get(list_service_tokens).post(create_service_token),
-        )
-        .route("/service-tokens/{id}", delete(revoke_service_token))
-        .route("/public/shares/{token}", get(public_share))
-        .route("/public/shares/{token}/unlock", post(unlock_share))
-        .route(
-            "/public/shares/{token}/download",
-            get(crate::web::download).head(crate::web::download),
-        )
-        .route(
-            "/public/shares/{token}/preview",
-            get(crate::web::public_preview),
-        )
-        .route(
-            "/public/shares/{token}/preview/raw",
-            get(crate::web::public_preview_raw).head(crate::web::public_preview_raw),
-        )
-        .route(
-            "/public/shares/{token}/download.zip",
-            get(crate::web::download_zip),
-        )
-        .route(
-            "/public/shares/{token}/upload",
-            post(crate::web::upload_api)
-                .layer(DefaultBodyLimit::max(
-                    crate::web::HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize,
-                ))
-                .layer(middleware::from_fn(crate::web::guard_multipart_upload)),
-        )
-        .layer(middleware::from_fn(normalize_api_errors))
-        .with_state(state)
+    crate::install_safe_panic_reporting();
+    let router = add_api_routes(Router::new()).layer(middleware::from_fn(normalize_api_errors));
+    #[cfg(panic = "unwind")]
+    let router = router.layer(CatchPanicLayer::custom(api_panic_response));
+    router.with_state(state)
+}
+
+#[cfg(panic = "unwind")]
+fn api_panic_response(_panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal_error",
+        "Internal error",
+    )
+    .into_response()
+}
+
+async fn guard_api_multipart_upload(request: Request, next: Next) -> Response {
+    match crate::multipart_guard::guard_multipart_request(request) {
+        Ok(request) => next.run(request).await,
+        Err(error) => {
+            let status = error.status_code();
+            ApiError::new(
+                status,
+                status_code_name(status),
+                status.canonical_reason().unwrap_or("Request failed"),
+            )
+            .into_response()
+        }
+    }
 }
 
 async fn monitoring_method_not_allowed() -> StatusCode {
@@ -304,7 +456,7 @@ async fn normalize_api_errors(request: Request, next: Next) -> Response {
     }
     let audit_unavailable = response
         .headers()
-        .get(crate::web::ERROR_CODE_HEADER)
+        .get(crate::http_contract::ERROR_CODE_HEADER)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == "audit_unavailable");
     let (mut parts, _) = response.into_parts();
@@ -318,7 +470,9 @@ async fn normalize_api_errors(request: Request, next: Next) -> Response {
     let body = format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#);
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.remove(header::CONTENT_ENCODING);
-    parts.headers.remove(crate::web::ERROR_CODE_HEADER);
+    parts
+        .headers
+        .remove(crate::http_contract::ERROR_CODE_HEADER);
     parts.headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json; charset=utf-8"),
@@ -334,6 +488,7 @@ fn status_code_name(status: StatusCode) -> &'static str {
         StatusCode::NOT_FOUND => "not_found",
         StatusCode::CONFLICT => "conflict",
         StatusCode::GONE => "gone",
+        StatusCode::REQUEST_TIMEOUT => "request_timeout",
         StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
         StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
         StatusCode::TOO_MANY_REQUESTS => "rate_limited",
@@ -357,11 +512,8 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
-    let ready = state
-        .readiness
-        .check(state.db.clone(), state.secure_root.clone())
-        .await;
+async fn readiness(State(state): State<ReadinessState>) -> impl IntoResponse {
+    let ready = state.check().await;
     (
         if ready {
             StatusCode::OK

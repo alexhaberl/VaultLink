@@ -9,10 +9,10 @@ use crate::{
     db::{AuditClientIpDeletionOutcome, AuditContext, AuditEvent},
     http_auth::{
         commit_runtime_settings, csrf_header, database, enabled_audit_client_ip, mfa_session,
-        required_database, runtime_settings, session, MissingSession,
+        required_mfa_audit_database, runtime_settings, session, MissingSession,
     },
     runtime::RuntimeSettings,
-    AppState,
+    SettingsRouteState,
 };
 
 use super::{session_bound, ApiError, ApiResult};
@@ -60,7 +60,7 @@ pub(super) fn settings_body(settings: RuntimeSettings) -> SettingsBody {
 }
 
 pub(super) async fn get_settings(
-    State(state): State<AppState>,
+    State(state): State<SettingsRouteState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<SettingsBody>> {
     session(&state, &headers, true, MissingSession::Unauthorized).await?;
@@ -68,7 +68,7 @@ pub(super) async fn get_settings(
 }
 
 pub(super) async fn update_settings(
-    State(state): State<AppState>,
+    State(state): State<SettingsRouteState>,
     headers: HeaderMap,
     Json(body): Json<SettingsBody>,
 ) -> ApiResult<Json<SettingsBody>> {
@@ -125,16 +125,17 @@ pub(super) async fn update_settings(
     next.validate()
         .map_err(|_| ApiError::bad_request("Invalid setting"))?;
     let changed_keys = current.changed_keys(&next).join(",");
-    session_bound(
+    let actor = authenticated.username.clone();
+    session_bound(crate::db::release_session_audited(
         commit_runtime_settings(
             &state,
-            authenticated.proof().clone(),
+            authenticated,
             next.clone(),
-            authenticated.username.clone(),
+            actor,
             format!("changed_keys={changed_keys}"),
         )
         .await?,
-    )?;
+    ))?;
     Ok(Json(settings_body(next)))
 }
 
@@ -181,7 +182,7 @@ impl AuditEventResponse {
 }
 
 pub(super) async fn list_audit(
-    State(state): State<AppState>,
+    State(state): State<SettingsRouteState>,
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Json<AuditResponse>> {
@@ -189,7 +190,7 @@ pub(super) async fn list_audit(
     let page = query.page.unwrap_or(0).min(1_000_000);
     let action = query.action.filter(|value| !value.trim().is_empty());
     let client_ip_enabled = runtime_settings(&state).audit_client_ip_enabled;
-    let (client_ip_enabled, events) = database(state.db.clone(), move |db| {
+    let (client_ip_enabled, events) = database(state.db().clone(), move |db| {
         let events = db.list_audit(action.as_deref(), 101, page * 100)?;
         Ok((client_ip_enabled, events))
     })
@@ -219,7 +220,7 @@ pub(super) struct DeleteAuditClientIpsRequest {
 }
 
 pub(super) async fn delete_audit_client_ips(
-    State(state): State<AppState>,
+    State(state): State<SettingsRouteState>,
     headers: HeaderMap,
     Json(request): Json<DeleteAuditClientIpsRequest>,
 ) -> ApiResult<Json<DeletedAuditClientIpsResponse>> {
@@ -233,18 +234,20 @@ pub(super) async fn delete_audit_client_ips(
         ));
     }
     let fallback_logging_enabled = runtime_settings(&state).audit_client_ip_enabled;
-    let audit_actor = authenticated.username.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
-    let audit_context = AuditContext::new(audit_actor, audit_client_ip);
-    let proof = authenticated.proof().clone();
     let outcome = session_bound(
-        required_database(state.db.clone(), move |db| {
-            db.delete_audit_client_ips_for_mfa_session(
-                &proof,
-                fallback_logging_enabled,
-                &audit_context,
-            )
-        })
+        required_mfa_audit_database(
+            state.db().clone(),
+            authenticated,
+            move |db, session, proof| {
+                let audit_context = AuditContext::new(session.username, audit_client_ip);
+                db.delete_audit_client_ips_for_mfa_session(
+                    &proof,
+                    fallback_logging_enabled,
+                    &audit_context,
+                )
+            },
+        )
         .await?,
     )?;
     let AuditClientIpDeletionOutcome::Deleted(deleted) = outcome else {

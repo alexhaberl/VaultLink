@@ -19,6 +19,7 @@ fuzzing = []
 argon2 = "0.6"
 askama = "=0.16.0"
 axum = { version = "0.8", features = ["multipart"] }
+bytes = "1"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

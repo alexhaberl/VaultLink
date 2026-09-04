@@ -1,6 +1,9 @@
 use std::{fs::File, io, sync::Arc};
 
-use crate::path_security;
+use crate::{
+    log_safety::{EscapedLogPath, EscapedLogValue},
+    path_security,
+};
 
 use super::identity::entry_identity_state;
 use super::private_entries::{
@@ -293,7 +296,11 @@ impl PendingUpload {
     ) -> io::Result<PublishOutcome> {
         let destination_state = self.publication_identity_state(destination, name);
         if matches!(&destination_state, Ok(EntryIdentityState::Expected)) {
-            tracing::warn!(%rename_error, destination = %name, "upload rename returned an error after publication; continuing with verified identity");
+            tracing::warn!(
+                rename_error = %EscapedLogValue::new(&rename_error),
+                destination = %EscapedLogPath::new(name),
+                "upload rename returned an error after publication; continuing with verified identity"
+            );
             return Ok(self.finish_publication());
         }
 
@@ -306,7 +313,11 @@ impl PendingUpload {
         }
 
         let error = ambiguous_publication_error(&rename_error, &destination_state, &staging_state);
-        tracing::error!(%error, destination = %name, "upload publication is visible or ambiguous after rename response loss");
+        tracing::error!(
+            error = %EscapedLogValue::new(&error),
+            destination = %EscapedLogPath::new(name),
+            "upload publication is visible or ambiguous after rename response loss"
+        );
         Ok(self.finish_uncertain_publication(error))
     }
 

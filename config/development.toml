@@ -37,6 +37,16 @@ share_unlock_minutes = 60
 share_password_attempts = 5
 audit_client_ip_enabled = false
 
+[admission]
+max_public_uploads = 28
+max_uploads_per_share = 2
+upload_min_bytes_per_second = 65536
+upload_max_duration_seconds = 21600
+max_public_streams = 96
+max_streams_per_share = 16
+stream_min_bytes_per_second = 16384
+stream_max_duration_seconds = 21600
+
 [reverse_proxy]
 enabled = false
 allow_non_loopback = false

@@ -6,6 +6,7 @@
 | Baseline commit | Unreleased 0.7.0 monitoring implementation; the exact final commit is recorded before release qualification |
 | Applies to | VaultLink 0.7.0 native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
 | Companion documents | [Security policy](SECURITY.md), [0.7.0 release checklist](docs/RELEASE-CHECKLIST-0.7.0.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
+| Release state | [`release/release-state.json`](release/release-state.json): 0.7.0 unreleased, 0.6.0 supported, 0.5.0 withdrawn |
 
 ## Purpose
 
@@ -153,7 +154,7 @@ A change that weakens one requires an explicit threat-model review.
 | INV-05 | A required-audit database mutation cannot commit without its audit row | `src/db/required_audit.rs`, transaction rollback tests |
 | INV-06 | A filesystem operation already made visible is never falsely reported as safely retryable after later audit uncertainty | `202 audit_durability_uncertain`, persistent file-operation journal, recovery tests |
 | INV-07 | Stored application secrets require the matching protected keyring and are validated before service operation | `src/db/keyring.rs`, startup decryption probes, rotation and restart tests |
-| INV-08 | Unknown and known administrator usernames consume the same admitted Argon2 resource class | shared Argon2 semaphore and dummy hashing path in `src/http_auth.rs` and `src/services/auth.rs` |
+| INV-08 | Unknown and known administrator usernames consume the same admitted Argon2 resource class | shared Argon2 semaphore and dummy hashing path in `src/http_auth.rs` and `src/services/auth/mod.rs` |
 | INV-09 | An untrusted network peer cannot assert another client identity through forwarding headers | exact trusted-proxy allowlist and right-to-left chain validation |
 | INV-10 | RSA WebAuthn credentials remain unreachable while `RUSTSEC-2023-0071` is excepted | no RS256 advertising, centralized runtime rejection, persistence/authentication regression tests |
 | INV-11 | Every release builder and guest is the exact reviewed digest declared for that target or the workflow fails before protected work | `release/package-targets.json`, image-refresh workflow, manifest validation, and supply-chain policy |
@@ -231,7 +232,9 @@ test evidence against which each case is reviewed.
 
 ## Accepted residual risks
 
-The following are explicit design decisions, not undisclosed guarantees:
+The following are explicit design decisions, not undisclosed guarantees.
+Reconfirmed for 0.7.0 on 2026-09-04; each remains subject to its stated
+condition and review trigger:
 
 | ID | Accepted risk | Required condition |
 | --- | --- | --- |
@@ -244,9 +247,14 @@ The following are explicit design decisions, not undisclosed guarantees:
 | RA-07 | One process owns each storage/data pair and can be an availability bottleneck | Active-active operation is unsupported; backup, monitoring, and recovery are operational controls |
 | RA-08 | `RUSTSEC-2023-0071` remains in the lockfile | All compensating conditions and mandatory re-review triggers in `SECURITY.md` continue to hold |
 | RA-09 | Host root, storage administrators, GitHub administrators, and the GitHub control plane retain powerful trusted roles | Access is restricted, reviewed, and separated where the supported deployment requires it |
-| RA-10 | Release provisioning and final package/VM evidence are incomplete before the first supported package tag | The workflow remains fail closed and no release is described as supported before every target and checklist gate succeeds |
 | RA-11 | The supported source repository and release are public | Public users may read, fork, and propose changes but receive no implicit write, tag, environment-approval, signing-secret, or release authority; branch, tag, and environment protections remain mandatory |
 | RA-12 | VaultLink does not operate APT, DNF, or Pacman repositories and depends on GitHub retaining old package assets | Repository-level immutable releases protect future published assets; whole package releases are never deleted, and updates fail closed when the authenticated old package cannot be obtained |
+
+### Closed historical risks
+
+| ID | Closed risk | Closure evidence |
+| --- | --- | --- |
+| RA-10 | Release provisioning and final package/VM evidence were incomplete before the first supported package tag | Closed by the signed `v0.6.0` tag on exact commit `0d9d3f1e72c2b0aa57f3433c10457f4b7b9abdf8`, successful package/reproducibility/distro-VM/72-hour-soak/evidence-preflight gates, and the immutable 21-asset release recorded in `release/release-state.json` |
 
 ## Verification and evidence
 
@@ -275,8 +283,9 @@ checklist items or change an accepted residual risk.
 | --- | --- | --- | --- |
 | 2026-08-02 | `c11c5d2b7e61e4b30b20d4921315fcf31a86390e` | Initial 0.5.0 application, storage, deployment, CI, and release model | Trust boundaries, invariants, abuse cases, and accepted risks documented; open release gates remain fail closed |
 | 2026-08-09 | `5efa3fdf6045753d7754cc98ef9192dfc1373cfa` | Public-repository release and migration from persistent self-hosted CI to ephemeral GitHub-hosted runners | Public visibility is explicitly not release authorization; publication requires public visibility, an authorized exact-main tag, the protected signing environment, pinned inputs, and complete evidence |
-| 2026-08-25 | Unreleased 0.6.0 package implementation | Nine-target native-package distribution, package-bound authenticated updater, per-distro builders and full-system guests, 21-asset release, and withdrawal of 0.5.0 | Archive installation is removed from support; target identity, package database, old/new signed packages, runtime state, and commit-bound package/VM evidence become release and recovery boundaries |
+| 2026-09-01 | `0d9d3f1e72c2b0aa57f3433c10457f4b7b9abdf8` (`v0.6.0`) | Nine-target native-package distribution, package-bound authenticated updater, per-distro builders and full-system guests, immutable 21-asset release, and withdrawal of 0.5.0 | First supported package release; signed tag and all required commit gates verified, closing historical RA-10 |
 | 2026-08-30 | Unreleased 0.7.0 monitoring implementation | Instance-wide `monitoring:read` tokens, redacted monitoring routes, schema 7, administrator lifecycle, local revoke-all recovery, and Home Assistant trust boundary | Bearer authentication is confined to two read-only projections; token plaintext and privileged Share fields remain excluded, and older manual restores require global token revocation/reissue before traffic |
+| 2026-09-04 | Unreleased 0.7.0 review-findings implementation | Release-state truth, qualification ledger, workflow linting, security/performance findings, schema 8, and architecture gates | RA-01 through RA-09 and RA-11 through RA-12 reconfirmed for 0.7.0; release remains fail closed until the qualification ledger has no open entry |
 
 ## Review triggers
 

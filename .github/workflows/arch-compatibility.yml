@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Resolve the latest supported public package release
+      - name: Resolve the supported public package release
         id: release
         shell: bash
         env:
@@ -28,38 +28,16 @@ jobs:
           REPOSITORY_VISIBILITY: ${{ github.repository_visibility }}
         run: |
           set -euo pipefail
+          python3 tools/check-release-state.py
           if [[ "$REPOSITORY_VISIBILITY" != public ]]; then
             printf 'available=false\n' >>"$GITHUB_OUTPUT"
             printf 'Repository is not public; no supported public package release is available.\n' \
               >>"$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
-          if [[ -z "$tag" ]]; then
-            printf 'available=false\n' >>"$GITHUB_OUTPUT"
-            printf 'No supported public VaultLink package release exists yet; compatibility check skipped.\n' \
-              >>"$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          if [[ ! "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            printf 'available=false\n' >>"$GITHUB_OUTPUT"
-            printf 'Latest release is not a supported stable native-package release; check skipped.\n' \
-              >>"$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          version=${tag#v}
-          if ! python3 - "$version" <<'PY'
-          import sys
-          version = tuple(int(part) for part in sys.argv[1].split("."))
-          if version < (0, 6, 0):
-              raise SystemExit("latest release predates supported native packages")
-          PY
-          then
-            printf 'available=false\n' >>"$GITHUB_OUTPUT"
-            printf 'No supported native-package release exists yet; check skipped.\n' \
-              >>"$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          version=$(python3 tools/check-release-state.py --print-supported-version)
+          tag="v$version"
+          python3 tools/verify-supported-release.py --repository "$GITHUB_REPOSITORY"
           asset=$(python3 tools/package-targets.py asset \
             archlinux-amd64 "$version" --allow-unprovisioned)
           printf 'available=true\ntag=%s\nversion=%s\nasset=%s\n' \
@@ -91,35 +69,10 @@ jobs:
           set -euo pipefail
           docker pull archlinux:base
           digest=$(docker image inspect archlinux:base \
-            --format '{{index .RepoDigests 0}}')
+            --format "{{index .RepoDigests 0}}")
           [[ "$digest" =~ @sha256:[0-9a-f]{64}$ ]]
-          printf '## Arch rolling image\n\n`%s`\n' "$digest" >>"$GITHUB_STEP_SUMMARY"
+          printf "## Arch rolling image\n\n\`%s\`\n" "$digest" >>"$GITHUB_STEP_SUMMARY"
           docker run --rm --user root \
             --env ASSET --env VERSION \
-            --volume "$PWD:/work:ro" --workdir /work "$digest" sh -c '
-              set -eu
-              pacman -Syu --noconfirm --needed \
-                ca-certificates coreutils curl libarchive minisign sqlite systemd \
-                tar util-linux zstd
-              minisign -V -q -p release/minisign.pub \
-                -m arch-release/SHA256SUMS \
-                -x arch-release/SHA256SUMS.minisig
-              checksum=$(grep -F "  $ASSET" arch-release/SHA256SUMS)
-              test "$(printf "%s\n" "$checksum" | grep -c .)" -eq 1
-              (cd arch-release && printf "%s\n" "$checksum" | sha256sum -c -)
-              minisign -V -q -p release/minisign.pub \
-                -m "arch-release/$ASSET" \
-                -x "arch-release/$ASSET.minisig"
-              install -o root -g root -m 0600 \
-                "arch-release/$ASSET" "/var/tmp/$ASSET"
-              bsdtar -xOf "/var/tmp/$ASSET" \
-                usr/lib/vaultlink/package/deploy/vaultlink-package-install.sh \
-                >/var/tmp/vaultlink-package-install.sh
-              chown root:root /var/tmp/vaultlink-package-install.sh
-              chmod 0700 /var/tmp/vaultlink-package-install.sh
-              /var/tmp/vaultlink-package-install.sh "/var/tmp/$ASSET"
-              test "$(/opt/vaultlink/vaultlink --version)" = "$VERSION"
-              test "$(cat /usr/share/vaultlink/install-method.env | wc -l)" -eq 5
-              ! systemctl --quiet is-enabled vaultlink.service
-              ! systemctl --quiet is-enabled vaultlink-update.timer
-            '
+            --volume "$PWD:/work:ro" --workdir /work "$digest" \
+            sh tools/arch-rolling-compatibility.sh

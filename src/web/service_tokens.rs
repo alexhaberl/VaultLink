@@ -15,12 +15,12 @@ use crate::{
         SERVICE_TOKEN_SCOPE_MONITORING_READ,
     },
     http_auth::{
-        csrf, database, enabled_audit_client_ip, mfa_session, required_database, session,
-        verify_password_admitted, MissingSession,
+        csrf, database, enabled_audit_client_ip, mfa_session, required_mfa_audit_database, session,
+        verify_password_admitted, MissingSession, SERVICE_TOKEN_PREFIX, SERVICE_TOKEN_RANDOM_BYTES,
     },
     i18n,
     sensitive::SecretString,
-    AppState,
+    ServiceTokenRouteState,
 };
 
 use super::{
@@ -86,12 +86,15 @@ pub(super) struct CreateServiceTokenForm {
 }
 
 pub(super) async fn service_tokens_page(
-    State(state): State<AppState>,
+    State(state): State<ServiceTokenRouteState>,
     Query(query): Query<ServiceTokenNoticeQuery>,
     headers: HeaderMap,
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    let tokens = database(state.db.clone(), |database| database.list_service_tokens()).await?;
+    let tokens = database(state.db().clone(), |database| {
+        database.list_service_tokens()
+    })
+    .await?;
     let locale = i18n::current_locale();
     let now = Utc::now();
     let rows = tokens
@@ -161,7 +164,7 @@ pub(super) async fn service_tokens_page(
 }
 
 pub(super) async fn create_service_token(
-    State(state): State<AppState>,
+    State(state): State<ServiceTokenRouteState>,
     headers: HeaderMap,
     Form(form): Form<CreateServiceTokenForm>,
 ) -> Result<Response> {
@@ -207,16 +210,18 @@ pub(super) async fn create_service_token(
     }
 
     let limiter_key = format!("service-token-create:{}", authenticated.admin_id);
-    if !state.limiter.check_and_record_attempt(&limiter_key) {
+    if !state.login_limiter().check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many password attempts",
         ));
     }
     let username = authenticated.username.clone();
-    let admin = database(state.db.clone(), move |database| database.admin(&username))
-        .await?
-        .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
+    let admin = database(state.db().clone(), move |database| {
+        database.admin(&username)
+    })
+    .await?
+    .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
     let expected_password_hash = admin.password_hash;
     let current_password = form.current_password;
     if current_password.expose_secret().len() > auth::MAX_PASSWORD_BYTES {
@@ -233,24 +238,29 @@ pub(super) async fn create_service_token(
     }
     // Successful password reauthentication remains rate-limited.
 
-    let plaintext_token = SecretString::from(format!("vlk_st_v1_{}", auth::random_token(32)));
+    let plaintext_token = SecretString::from(format!(
+        "{SERVICE_TOKEN_PREFIX}{}",
+        auth::random_token(SERVICE_TOKEN_RANDOM_BYTES)
+    ));
     let response_token = plaintext_token.duplicate_for_one_time_response();
     let response_name = name.clone();
-    let proof = authenticated.proof().clone();
-    let audit_context = AuditContext::new(
-        authenticated.username.clone(),
-        enabled_audit_client_ip(&state),
-    );
-    let outcome = required_database(state.db.clone(), move |database| {
-        database.create_service_token_for_mfa_session(
-            &proof,
-            &expected_password_hash,
-            &name,
-            plaintext_token.expose_secret(),
-            expires_at,
-            &audit_context,
-        )
-    })
+    let response_session = (*authenticated).clone();
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let outcome = required_mfa_audit_database(
+        state.db().clone(),
+        authenticated,
+        move |database, session, proof| {
+            let audit_context = AuditContext::new(session.username, audit_client_ip);
+            database.create_service_token_for_mfa_session(
+                &proof,
+                &expected_password_hash,
+                &name,
+                plaintext_token.expose_secret(),
+                expires_at,
+                &audit_context,
+            )
+        },
+    )
     .await?;
     let outcome = session_bound(outcome)?;
 
@@ -266,7 +276,7 @@ pub(super) async fn create_service_token(
                 PageId::ServiceTokenCreated,
                 &body,
                 false,
-                &authenticated.csrf_token,
+                &response_session.csrf_token,
                 false,
             )?;
             Ok(no_store_html(html))
@@ -286,21 +296,22 @@ pub(super) async fn create_service_token(
 }
 
 pub(super) async fn revoke_service_token(
-    State(state): State<AppState>,
+    State(state): State<ServiceTokenRouteState>,
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
     Form(form): Form<CsrfForm>,
 ) -> Result<Redirect> {
     let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&authenticated, &form.csrf)?;
-    let proof = authenticated.proof().clone();
-    let audit_context = AuditContext::new(
-        authenticated.username.clone(),
-        enabled_audit_client_ip(&state),
-    );
-    let revoked = required_database(state.db.clone(), move |database| {
-        database.revoke_service_token_for_mfa_session(&proof, id, &audit_context)
-    })
+    let audit_client_ip = enabled_audit_client_ip(&state);
+    let revoked = required_mfa_audit_database(
+        state.db().clone(),
+        authenticated,
+        move |database, session, proof| {
+            let audit_context = AuditContext::new(session.username, audit_client_ip);
+            database.revoke_service_token_for_mfa_session(&proof, id, &audit_context)
+        },
+    )
     .await?;
     let revoked = session_bound(revoked)?;
     if !revoked {

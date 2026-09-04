@@ -96,7 +96,13 @@ VAULTLINK_HEALTH_URL=http://127.0.0.1:8080/api/v2/health/ready
 VAULTLINK_DATABASE=/var/lib/vaultlink/data.sqlite
 VAULTLINK_CONFIG=/etc/vaultlink/config.toml
 DOWNLOAD_TOKEN=REPLACE_WITH_STAGING_DOWNLOAD_TOKEN
+ADMISSION_DOWNLOAD_TOKEN=REPLACE_WITH_SECOND_STAGING_DOWNLOAD_TOKEN
+RANGE_DOWNLOAD_TOKEN=REPLACE_WITH_THIRD_STAGING_DOWNLOAD_TOKEN
 UPLOAD_TOKEN=REPLACE_WITH_STAGING_UPLOAD_TOKEN
+UPLOAD_TOKEN_2=REPLACE_WITH_SECOND_STAGING_UPLOAD_TOKEN
+UPLOAD_TOKEN_3=REPLACE_WITH_THIRD_STAGING_UPLOAD_TOKEN
+UPLOAD_TOKEN_4=REPLACE_WITH_FOURTH_STAGING_UPLOAD_TOKEN
+UPLOAD_TOKEN_5=REPLACE_WITH_FIFTH_STAGING_UPLOAD_TOKEN
 UPLOAD_VERIFY_TOKEN=REPLACE_WITH_STAGING_READBACK_TOKEN
 ```
 
@@ -113,14 +119,26 @@ pressure groups overlap. This is separate from the diagnostic p95 recorded by
 full-system QEMU gates; QEMU still runs the identical workload and enforces all
 of its functional, security, integrity, and RSS assertions.
 
-`UPLOAD_VERIFY_TOKEN` must be a staging-only download share rooted at exactly
-the same directory as `UPLOAD_TOKEN`, without a password or download limit.
-Every uploaded namespaced file is downloaded through that share and hashed;
-the profile fails unless the server-side bytes equal the local payload hash.
-Provision the upload share with at least 16 GiB of remaining quota and capacity
-for at least 200 additional files. The twelve required profiles retain 120
-namespaced 64 MiB random-payload files (7.5 GiB before filesystem overhead);
-the larger limits provide retry and operational reserve.
+`DOWNLOAD_TOKEN`, `ADMISSION_DOWNLOAD_TOKEN`, and `RANGE_DOWNLOAD_TOKEN` must
+be three distinct, independent download shares for the same large fixture.
+The admission probe spreads one forwarded client's streams evenly across the
+first two shares, so it exercises the per-client limit without also exhausting
+the per-share limit. The 40 parallel benchmark ranges are distributed across
+all three shares as 14/13/13 streams; no share can reach the hard 16-stream
+ceiling merely because the benchmark is running.
+
+`UPLOAD_TOKEN` and `UPLOAD_TOKEN_2` through `UPLOAD_TOKEN_5` must be five
+distinct, independent upload shares rooted at the same staging-only upload
+directory. The ten parallel uploads are distributed evenly, two per share, so
+the benchmark does not trip the hard two-upload per-share ceiling.
+`UPLOAD_VERIFY_TOKEN` must be a download share rooted at exactly that same
+directory, without a password or download limit. Every uploaded namespaced
+file is downloaded through that share and hashed; the profile fails unless the
+server-side bytes equal the local payload hash. Provision each upload share
+with sufficient quota and the underlying directory with at least 16 GiB of
+remaining capacity for at least 200 additional files. The twelve required
+profiles retain 120 namespaced 64 MiB random-payload files (7.5 GiB before
+filesystem overhead); the larger limits provide retry and operational reserve.
 
 Re-provision every changed orchestration file before starting the final run.
 The control compares all installed orchestration hashes with the approved

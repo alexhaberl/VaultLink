@@ -14,11 +14,12 @@ use crate::{
     db::{AuditAction, AuditContext, Permission},
     http_auth::{
         audit_observation, current_client_limit_key, enabled_audit_client_ip, make_unlock_cookie,
-        required_database, runtime_settings, share_is_unlocked, verify_password_admitted,
+        required_audited_database, runtime_settings, share_is_unlocked, verify_password_admitted,
         UnlockCookieScope,
     },
+    internal_reporting::{report_internal, InternalOperation},
     sensitive::SecretString,
-    AppState,
+    PublicRouteState,
 };
 
 use super::{common::get_share, ApiError, ApiResult};
@@ -55,7 +56,7 @@ pub(super) struct PublicShareResponse {
 }
 
 pub(super) async fn public_share(
-    State(state): State<AppState>,
+    State(state): State<PublicRouteState>,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
 ) -> ApiResult<Json<PublicShareResponse>> {
@@ -114,7 +115,7 @@ struct UnlockResponse {
 }
 
 pub(super) async fn unlock_share(
-    State(state): State<AppState>,
+    State(state): State<PublicRouteState>,
     ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     AxPath(token): AxPath<String>,
@@ -134,7 +135,7 @@ pub(super) async fn unlock_share(
     let global_key = format!("share-unlock-ip:{ip}");
     let share_key = format!("share-unlock:{}:{ip}", share.id);
     if !state
-        .share_limiter
+        .share_limiter()
         .check_and_record_attempts(&[&global_key, &share_key])
     {
         return Err(ApiError::new(
@@ -184,8 +185,8 @@ pub(super) async fn unlock_share(
     let csrf_for_db = unlock_csrf.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new("public", audit_client_ip);
-    let created = required_database(state.db.clone(), move |db| {
-        db.create_unlock_session_for_verified_password_and_audit(
+    let created = required_audited_database(state.db().clone(), move |db| {
+        db.create_unlock_session_for_verified_password_and_audit_audited(
             &token_for_db,
             share_id,
             &expected_password_hash,
@@ -224,7 +225,12 @@ pub(super) async fn unlock_share(
             &unlock_token,
             UnlockCookieScope::Api,
         ))
-        .map_err(ApiError::internal)?,
+        .map_err(|error| {
+            ApiError::from(report_internal(
+                InternalOperation::ApiPublicUnlockCookieHeader,
+                error,
+            ))
+        })?,
     );
     Ok(response)
 }
