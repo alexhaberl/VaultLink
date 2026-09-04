@@ -71,6 +71,12 @@ if ! grep -F -q "if sudo test ! -e /etc/vaultlink/update.conf && \\" README.md \
     || ! grep -F -q 'sudoedit /etc/vaultlink/update.conf' README.md; then
     fail "README must bootstrap updater configuration from the packaged example without overwriting files or symlinks"
 fi
+if ! grep -F -q "Open \`http://127.0.0.1:8090/#token=...\` locally." README.md \
+    || grep -F -q '?token=' README.md \
+    || ! grep -F -q 'http://127.0.0.1:{port}/#token={token}' src/setup.rs \
+    || ! grep -F -q "new URLSearchParams(location.hash.slice(1))" src/setup.rs; then
+    fail "README and setup implementation must pass the one-time setup token in the URL fragment, never the query string"
+fi
 grep -F -x -q 'repository=alexhaberl/VaultLink' deploy/vaultlink-update.sh \
     || fail "the updater repository must be fixed"
 grep -F -x -q 'public_key=/usr/share/vaultlink/minisign.pub' deploy/vaultlink-update.sh \

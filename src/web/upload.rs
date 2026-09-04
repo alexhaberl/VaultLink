@@ -561,21 +561,63 @@ struct PublicUploadAdmission {
     _peer: ClientActivityPermit,
 }
 
+struct PublicUploadDirectoryOutcome {
+    destination: Option<SecureDirectory>,
+    created: Vec<String>,
+    durability_uncertain: bool,
+    complete: bool,
+}
+
 async fn ensure_public_upload_directory(
     base_scope: SecureDirectory,
     relative: &str,
-) -> Result<(SecureDirectory, Vec<String>)> {
+) -> Result<PublicUploadDirectoryOutcome> {
     let relative = crate::path_security::validate_relative(relative)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid folder path"))?
         .to_string_lossy()
         .replace('\\', "/");
     if relative.is_empty() {
-        return Ok((base_scope, Vec::new()));
+        return Ok(PublicUploadDirectoryOutcome {
+            destination: Some(base_scope),
+            created: Vec::new(),
+            durability_uncertain: false,
+            complete: true,
+        });
     }
     tokio::task::spawn_blocking(move || {
-        let created = base_scope.ensure_directory_tree(&relative)?;
-        let destination = base_scope.bind_directory(&relative)?;
-        Ok::<_, std::io::Error>((destination, created))
+        let outcome = base_scope.ensure_directory_tree_with_outcome(&relative)?;
+        let created = outcome.created;
+        if let Some(error) = outcome.terminal_error {
+            if created.is_empty() {
+                return Err(error);
+            }
+            tracing::error!(%error, created = created.len(), "public upload directory tree was only partially created after quota commit");
+            return Ok(PublicUploadDirectoryOutcome {
+                destination: None,
+                created,
+                durability_uncertain: true,
+                complete: false,
+            });
+        }
+        let durability_uncertain = outcome.sync_error.is_some();
+        match base_scope.bind_directory(&relative) {
+            Ok(destination) => Ok(PublicUploadDirectoryOutcome {
+                destination: Some(destination),
+                created,
+                durability_uncertain,
+                complete: true,
+            }),
+            Err(error) if created.is_empty() => Err(error),
+            Err(error) => {
+                tracing::error!(%error, created = created.len(), "public upload directory target became unavailable after partial creation");
+                Ok(PublicUploadDirectoryOutcome {
+                    destination: None,
+                    created,
+                    durability_uncertain: true,
+                    complete: false,
+                })
+            }
+        }
     })
     .await
     .map_err(internal)?
@@ -782,23 +824,94 @@ impl PublicUploadFinalizer {
             }
         };
         let destination_was_missing = current_destination.is_none();
-        let (current_destination, created) = match current_destination {
-            Some(destination) => (destination, Vec::new()),
+        let directory_outcome = match current_destination {
+            Some(destination) => PublicUploadDirectoryOutcome {
+                destination: Some(destination),
+                created: Vec::new(),
+                durability_uncertain: false,
+                complete: true,
+            },
             None => {
                 ensure_public_upload_directory(current_base, &committed_upload.target.folder_path)
                     .await?
             }
         };
-        if !created.is_empty() {
+        let directory_audit_uncertain = if directory_outcome.created.is_empty() {
+            false
+        } else if directory_outcome.complete {
             audit_observation(
                 &state,
                 "public".into(),
                 AuditAction::UploadDirectoriesCreated,
                 Some(committed_upload.target.share_id.to_string()),
-                Some(format!("path={upload_subdir};created={}", created.len())),
+                Some(format!(
+                    "path={upload_subdir};created={}",
+                    directory_outcome.created.len()
+                )),
+            )
+            .await;
+            false
+        } else {
+            persist_required_file_audit(
+                &state,
+                audit_context.clone(),
+                AuditAction::UploadDirectoriesCreated,
+                committed_upload.target.share_id.to_string(),
+                format!(
+                    "path={upload_subdir};created={};complete=false;quota_committed=true",
+                    directory_outcome.created.len()
+                ),
+            )
+            .await
+        };
+        if directory_outcome.durability_uncertain {
+            audit_observation(
+                &state,
+                "public".into(),
+                AuditAction::UploadDurabilityUncertain,
+                Some(committed_upload.target.share_id.to_string()),
+                Some(format!(
+                    "path={upload_subdir};directory_publication=uncertain"
+                )),
             )
             .await;
         }
+        if !directory_outcome.complete {
+            let name = committed_upload.target.file_name.clone();
+            let public_route = public_share_route(&uri, &token);
+            let redirect_target = if upload_subdir.is_empty() {
+                format!("{public_route}?upload=directory_uncertain")
+            } else {
+                format!(
+                    "{public_route}?path={}&upload=directory_uncertain",
+                    encoded(&upload_subdir)
+                )
+            };
+            let mut response = Redirect::to(&redirect_target).into_response();
+            response.headers_mut().insert(
+                "x-vaultlink-upload-file",
+                HeaderValue::from_str(&encoded(&name)).map_err(internal)?,
+            );
+            response.headers_mut().insert(
+                "x-vaultlink-upload-outcome",
+                HeaderValue::from_static("directory_uncertain"),
+            );
+            response.headers_mut().insert(
+                "x-vaultlink-durability",
+                HeaderValue::from_static("uncertain"),
+            );
+            if directory_audit_uncertain {
+                response.headers_mut().insert(
+                    "x-vaultlink-audit-durability",
+                    HeaderValue::from_static("uncertain"),
+                );
+            }
+            return Ok(response);
+        }
+        let current_destination = directory_outcome
+            .destination
+            .expect("complete directory creation has a destination capability");
+        let directory_durability_uncertain = directory_outcome.durability_uncertain;
         if destination_was_missing {
             match committed_upload
                 .target
@@ -848,10 +961,10 @@ impl PublicUploadFinalizer {
         };
         let (target, total, replaced, publish_outcome) = published_upload.into_parts();
         let name = target.file_name;
-        let durability_uncertain = !publish_outcome.is_durable();
+        let durability_uncertain = directory_durability_uncertain || !publish_outcome.is_durable();
         let audit_detail = format!("file={name};bytes={total}");
-        if let Some(error) = publish_outcome.sync_error() {
-            tracing::warn!(share_id = target.share_id, file = %name, %error, "upload published but directory fsync failed");
+        if let Some(error) = publish_outcome.uncertainty_error() {
+            tracing::warn!(share_id = target.share_id, file = %name, %error, "upload publication or directory durability is uncertain");
             audit_observation(
                 &state,
                 "public".into(),

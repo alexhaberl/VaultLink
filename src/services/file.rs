@@ -1,5 +1,5 @@
 use crate::{
-    db::AuditContext,
+    db::{AuditContext, MfaSessionProof, SessionBound},
     file_ops::{
         self, CreateDirectoryResult, DeleteInspection, DeleteResult, FileOperationError,
         RenameResult,
@@ -24,20 +24,22 @@ impl FileService {
 
     pub(crate) async fn create_directory(
         &self,
+        proof: MfaSessionProof,
         parent: &str,
         name: &str,
         audit_context: AuditContext,
-    ) -> Result<CreateDirectoryResult, FileOperationError> {
-        file_ops::create_directory(&self.state, parent, name, audit_context).await
+    ) -> Result<SessionBound<CreateDirectoryResult>, FileOperationError> {
+        file_ops::create_directory(&self.state, proof, parent, name, audit_context).await
     }
 
     pub(crate) async fn rename(
         &self,
+        proof: MfaSessionProof,
         path: &str,
         new_name: &str,
         audit_context: AuditContext,
-    ) -> Result<RenameResult, FileOperationError> {
-        file_ops::rename(&self.state, path, new_name, audit_context).await
+    ) -> Result<SessionBound<RenameResult>, FileOperationError> {
+        file_ops::rename(&self.state, proof, path, new_name, audit_context).await
     }
 
     pub(crate) async fn inspect_delete(
@@ -49,10 +51,11 @@ impl FileService {
 
     pub(crate) async fn delete(
         &self,
+        proof: MfaSessionProof,
         path: &str,
         confirmation: Option<&str>,
         audit_context: AuditContext,
-    ) -> Result<DeleteResult, FileOperationError> {
-        file_ops::delete(&self.state, path, confirmation, audit_context).await
+    ) -> Result<SessionBound<DeleteResult>, FileOperationError> {
+        file_ops::delete(&self.state, proof, path, confirmation, audit_context).await
     }
 }

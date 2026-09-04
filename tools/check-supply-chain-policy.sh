@@ -10,6 +10,265 @@ report() {
     fail=1
 }
 
+check_audit_refresh_build() {
+    audit_build_workflow=$1
+    audit_build_recipe=$2
+    audit_expected_arg_count=$3
+    shift 3
+
+    [ -f "$audit_build_workflow" ] || return
+    audit_build_count=$(awk '
+        $0 !~ /^[[:space:]]*#/ {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            if (line == "docker buildx build " sprintf("%c", 92)) count++
+        }
+        END { print count + 0 }
+    ' "$audit_build_workflow")
+    audit_build_invocation_count=$(awk '
+        $0 !~ /^[[:space:]]*#/ {
+            line = $0
+            while (match(line, /docker[[:space:]]+buildx[[:space:]]+build([[:space:]]|$)/)) {
+                count++
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+        END { print count + 0 }
+    ' "$audit_build_workflow")
+    audit_file_arg_count=$(awk '
+        $0 !~ /^[[:space:]]*#/ {
+            line = $0
+            count += gsub(/--file/, "", line)
+        }
+        END { print count + 0 }
+    ' "$audit_build_workflow")
+    audit_expected_file_count=$(awk -v recipe="$audit_build_recipe" '
+        $0 !~ /^[[:space:]]*#/ {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            expected = "--file " recipe " " sprintf("%c", 92)
+            if (line == expected) count++
+        }
+        END { print count + 0 }
+    ' "$audit_build_workflow")
+    audit_short_file_count=$(awk '
+        $0 !~ /^[[:space:]]*#/ {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            if (line == "docker buildx build " sprintf("%c", 92)) in_build = 1
+            if (in_build && line ~ /(^|[[:space:]])-f/) count++
+            if (in_build && substr(line, length(line), 1) != sprintf("%c", 92)) in_build = 0
+        }
+        END { print count + 0 }
+    ' "$audit_build_workflow")
+    audit_build_arg_count=$(awk '
+        $0 !~ /^[[:space:]]*#/ {
+            line = $0
+            count += gsub(/--build-arg/, "", line)
+        }
+        END { print count + 0 }
+    ' "$audit_build_workflow")
+    audit_alternate_frontend_count=$(awk '
+        $0 !~ /^[[:space:]]*#/ \
+            && ($0 ~ /^[[:space:]]*buildctl([[:space:]]|$)/ \
+                || $0 ~ /^[[:space:]]*docker[[:space:]]+buildx[[:space:]]+bake([[:space:]]|$)/ \
+                || $0 ~ /^[[:space:]]*docker[[:space:]]+build([[:space:]]|$)/ \
+                || $0 ~ /^[[:space:]]*docker[[:space:]]+builder[[:space:]]+build([[:space:]]|$)/ \
+                || $0 ~ /^[[:space:]]*docker[[:space:]]+image[[:space:]]+build([[:space:]]|$)/) {
+                count++
+            }
+        END { print count + 0 }
+    ' "$audit_build_workflow")
+
+    if [ "$audit_build_count" -ne 1 ] \
+        || [ "$audit_build_invocation_count" -ne 1 ] \
+        || [ "$audit_file_arg_count" -ne 1 ] \
+        || [ "$audit_expected_file_count" -ne 1 ] \
+        || [ "$audit_short_file_count" -ne 0 ] \
+        || [ "$audit_build_arg_count" -ne "$audit_expected_arg_count" ] \
+        || [ "$audit_alternate_frontend_count" -ne 0 ]; then
+        report "$audit_build_workflow must have one buildx build bound to $audit_build_recipe and its exact build-argument allowlist"
+        return
+    fi
+    for audit_expected_arg in "$@"; do
+        if [ "$(awk -v argument="$audit_expected_arg" '
+            $0 !~ /^[[:space:]]*#/ {
+                line = $0
+                sub(/^[[:space:]]*/, "", line)
+                sub(/[[:space:]]*$/, "", line)
+                expected = "--build-arg \"" argument "=$" argument "\" " sprintf("%c", 92)
+                if (line == expected) count++
+            }
+            END { print count + 0 }
+        ' "$audit_build_workflow")" -ne 1 ]; then
+            report "$audit_build_workflow must pass exactly the reviewed $audit_expected_arg build argument"
+        fi
+    done
+}
+
+check_audit_remediation_policy() {
+    audit_root=$1
+    audit_ci="$audit_root/.github/workflows/ci.yml"
+    audit_frontend='docker.io/docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e'
+    audit_frontend_line="# syntax=$audit_frontend"
+    audit_package_builder="$audit_root/deploy/docker/Dockerfile.package-builder"
+    audit_qemu_builder="$audit_root/deploy/docker/Dockerfile.qemu-runner"
+    audit_vm_builder="$audit_root/deploy/docker/Dockerfile.distro-vm-image"
+
+    for audit_dockerfile in \
+        "$audit_package_builder" "$audit_qemu_builder" "$audit_vm_builder"; do
+        if [ ! -f "$audit_dockerfile" ] || [ -L "$audit_dockerfile" ]; then
+            report "release Dockerfile is missing or unsafe: $audit_dockerfile"
+            continue
+        fi
+        if [ "$(sed -n '1p' "$audit_dockerfile")" != "$audit_frontend_line" ]; then
+            report "$audit_dockerfile must use the reviewed immutable Dockerfile frontend as its exact first line"
+        fi
+        if [ "$(grep -E -i -c '^[[:space:]]*#[[:space:]]*syntax[[:space:]]*=' \
+                "$audit_dockerfile" || true)" -ne 1 ]; then
+            report "$audit_dockerfile must contain exactly one Dockerfile syntax directive"
+        fi
+    done
+    for audit_dockerfile in "$audit_root"/deploy/docker/Dockerfile*; do
+        if [ -L "$audit_dockerfile" ]; then
+            report "release Dockerfile symlinks are not allowed: $audit_dockerfile"
+            continue
+        fi
+        [ -f "$audit_dockerfile" ] || continue
+        if grep -E -i -q '^[[:space:]]*#[[:space:]]*syntax[[:space:]]*=' \
+                "$audit_dockerfile"; then
+            case "$audit_dockerfile" in
+                "$audit_package_builder"|"$audit_qemu_builder"|"$audit_vm_builder") ;;
+                *) report "unreviewed Dockerfile frontend directive in $audit_dockerfile" ;;
+            esac
+        fi
+    done
+
+    for audit_workflow in \
+        "$audit_root/.github/workflows/package-builders-refresh.yml" \
+        "$audit_root/.github/workflows/qemu-runner-refresh.yml" \
+        "$audit_root/.github/workflows/distro-vm-images-refresh.yml"; do
+        if [ ! -f "$audit_workflow" ]; then
+            report "$audit_workflow must exist"
+        fi
+    done
+    for audit_workflow in "$audit_root"/.github/workflows/*; do
+        [ -f "$audit_workflow" ] || continue
+        if grep -E -i -q 'BUILDKIT[[:space:]_-]*SYNTAX' "$audit_workflow"; then
+            report "$audit_workflow must not override the Dockerfile frontend"
+        fi
+    done
+
+    check_audit_refresh_build \
+        "$audit_root/.github/workflows/package-builders-refresh.yml" \
+        deploy/docker/Dockerfile.package-builder 5 \
+        BASE_IMAGE TARGET_ID DISTRIBUTION DISTRIBUTION_VERSION ARCH_SNAPSHOT_DATE
+    check_audit_refresh_build \
+        "$audit_root/.github/workflows/qemu-runner-refresh.yml" \
+        deploy/docker/Dockerfile.qemu-runner 1 BASE_IMAGE
+    check_audit_refresh_build \
+        "$audit_root/.github/workflows/distro-vm-images-refresh.yml" \
+        deploy/docker/Dockerfile.distro-vm-image 2 TARGET_ID UPSTREAM_SHA256
+
+    if ! awk '
+        $0 == "permissions:" { in_permissions = 1; blocks++; next }
+        in_permissions && /^[^[:space:]]/ { in_permissions = 0 }
+        in_permissions && $0 == "  contents: read" { contents_read++ }
+        in_permissions && $0 !~ /^[[:space:]]*$/ && $0 != "  contents: read" {
+            unexpected = 1
+        }
+        END { exit !(blocks == 1 && contents_read == 1 && unexpected == 0) }
+    ' "$audit_ci"; then
+        report "CI workflow permissions must default to contents: read only"
+    fi
+    if grep -E -q 'permissions:[[:space:]]*write-all' "$audit_ci" \
+        || [ "$(grep -E -c '^[[:space:]]*statuses[[:space:]]*:' "$audit_ci" || true)" -ne 1 ] \
+        || ! awk '
+            $0 == "  publish_native_gates:" { in_gate = 1; gates++; next }
+            in_gate && /^  [A-Za-z0-9_-]+:$/ { in_gate = 0 }
+            in_gate && $0 == "    if: ${{ always() && github.event_name == '\''push'\'' }}" {
+                push_only++
+            }
+            in_gate && $0 == "    permissions:" { in_permissions = 1; blocks++; next }
+            in_gate && in_permissions && /^    [^[:space:]]/ { in_permissions = 0 }
+            in_gate && in_permissions && $0 == "      statuses: write" { statuses_write++ }
+            in_gate && in_permissions && $0 !~ /^[[:space:]]*$/ \
+                && $0 != "      statuses: write" { unexpected = 1 }
+            END {
+                exit !(gates == 1 && push_only == 1 && blocks == 1 \
+                    && statuses_write == 1 && unexpected == 0)
+            }
+        ' "$audit_ci"; then
+        report "only the push-only native gate publisher may receive statuses: write"
+    fi
+
+    audit_native_job=$(awk '
+        $0 == "  native:" { selected = 1 }
+        selected && /^  [A-Za-z0-9_-]+:$/ && $0 != "  native:" { exit }
+        selected { print }
+    ' "$audit_ci")
+    audit_native_step_count=$(printf '%s\n' "$audit_native_job" | awk '
+        $0 !~ /^[[:space:]]*#/ \
+            && $0 ~ /^[[:space:]]*-[[:space:]]+name:[[:space:]]+Parse release Dockerfiles with the pinned frontend[[:space:]]*$/ {
+                count++
+            }
+        END { print count + 0 }
+    ')
+    audit_native_parse_count=$(printf '%s\n' "$audit_native_job" | awk '
+        $0 !~ /^[[:space:]]*#/ \
+            && $0 ~ /^[[:space:]]*docker buildx build --call=targets --file deploy\/docker\/Dockerfile\.[A-Za-z0-9_-]+ \.[[:space:]]*$/ {
+                count++
+            }
+        END { print count + 0 }
+    ')
+    if [ "$audit_native_step_count" -ne 1 ] \
+        || [ "$audit_native_parse_count" -ne 3 ]; then
+        report "both native CI architectures must parse the release Dockerfiles with the pinned frontend"
+    fi
+    for audit_recipe in \
+        Dockerfile.package-builder Dockerfile.qemu-runner Dockerfile.distro-vm-image; do
+        if [ "$(printf '%s\n' "$audit_native_job" | awk -v recipe="deploy/docker/$audit_recipe" '
+            $0 !~ /^[[:space:]]*#/ {
+                line = $0
+                sub(/^[[:space:]]*/, "", line)
+                sub(/[[:space:]]*$/, "", line)
+                if (line == "docker buildx build --call=targets --file " recipe " .") count++
+            }
+            END { print count + 0 }
+        ')" -ne 1 ]; then
+            report "native CI frontend parse is missing deploy/docker/$audit_recipe"
+        fi
+    done
+
+    if ! grep -F -q 'Open `http://127.0.0.1:8090/#token=...` locally.' \
+            "$audit_root/README.md" \
+        || grep -F -q '?token=' "$audit_root/README.md" \
+        || ! grep -F -q 'http://127.0.0.1:{port}/#token={token}' \
+            "$audit_root/src/setup.rs" \
+        || ! grep -F -q 'new URLSearchParams(location.hash.slice(1))' \
+            "$audit_root/src/setup.rs"; then
+        report "setup documentation and implementation must use the URL fragment token"
+    fi
+}
+
+if [ "${1:-}" = --audit-remediation-fixture ]; then
+    if [ "$#" -ne 2 ] || [ ! -d "$2" ]; then
+        echo "usage: $0 --audit-remediation-fixture ROOT" >&2
+        exit 2
+    fi
+    check_audit_remediation_policy "$2"
+    [ "$fail" -eq 0 ] || exit 1
+    exit 0
+fi
+
+check_audit_remediation_policy .
+if ! sh tools/test-audit-remediation-policy.sh; then
+    report "audit-remediation policy negative tests failed"
+fi
+
 if ! sh tools/check-deployment-assets.sh; then
     report "deployment samples and legacy-component policy failed"
 fi
@@ -69,7 +328,7 @@ fi
 
 gitleaks_ignore=.gitleaksignore
 gitleaks_script=tools/check-secrets.sh
-gitleaks_ci=.github/workflows/ci.yml
+ci_workflow=.github/workflows/ci.yml
 gitleaks_fingerprints='a35aeccbffe926997ca69bd2b91ac340ec3af511:src/auth.rs:generic-api-key:375
 ccbafdc3a8810e29ea2981f2ad65ac9673043aa9:src/auth.rs:generic-api-key:375'
 if [ ! -f "$gitleaks_ignore" ]; then
@@ -92,13 +351,12 @@ if ! grep -F -x -q 'expected_gitleaks_version=8.30.0' "$gitleaks_script" \
     || ! grep -F -q -- '--log-opts="--all --full-history"' "$gitleaks_script"; then
     report "secret scan must use pinned Gitleaks with redacted full-history, decoding, and archive coverage"
 fi
-if ! grep -F -q 'fetch-depth: 0' "$gitleaks_ci" \
-    || ! grep -F -q 'GITLEAKS_VERSION: 8.30.0' "$gitleaks_ci" \
-    || ! grep -F -q 'GITLEAKS_SHA256: b4cbbb6ddf7d1b2a603088cd03a4e3f7ce48ee7fd449b51f7de6ee2906f5fa2f' "$gitleaks_ci" \
-    || ! grep -F -q "GITLEAKS_BIN=\"\$work/gitleaks\" make secret-check" "$gitleaks_ci"; then
+if ! grep -F -q 'fetch-depth: 0' "$ci_workflow" \
+    || ! grep -F -q 'GITLEAKS_VERSION: 8.30.0' "$ci_workflow" \
+    || ! grep -F -q 'GITLEAKS_SHA256: b4cbbb6ddf7d1b2a603088cd03a4e3f7ce48ee7fd449b51f7de6ee2906f5fa2f' "$ci_workflow" \
+    || ! grep -F -q "GITLEAKS_BIN=\"\$work/gitleaks\" make secret-check" "$ci_workflow"; then
     report "native CI must run the checksum-pinned Gitleaks full-history gate"
 fi
-
 literal_dollar='$'
 smoke_dockerfile=deploy/docker/Dockerfile.setup-smoke
 snapshot_sources=deploy/docker/debian-snapshot.sources
@@ -245,8 +503,9 @@ for refresh_workflow in \
     if ! grep -F -x -q "  BUILDKIT_IMAGE: $buildkit_image" "$refresh_workflow" \
         || ! grep -F -q 'docker buildx create --driver docker-container' "$refresh_workflow" \
         || ! grep -F -q -- '--driver-opt "image=$BUILDKIT_IMAGE" --name "$builder" --use' "$refresh_workflow" \
-        || ! grep -F -q 'docker buildx inspect --bootstrap' "$refresh_workflow"; then
-        report "$refresh_workflow must use the reviewed immutable BuildKit image with the docker-container driver"
+        || ! grep -F -q 'docker buildx inspect --bootstrap' "$refresh_workflow" \
+        || grep -F -q 'BUILDKIT_SYNTAX' "$refresh_workflow"; then
+        report "$refresh_workflow must use the reviewed immutable BuildKit image and must not override the Dockerfile frontend"
     fi
 done
 

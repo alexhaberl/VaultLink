@@ -1,9 +1,9 @@
 use super::{
     insert_required_audits, token_hash, trace_required_audits, valid_service_token_name,
-    AuditAction, AuditContext, Database, MonitoringShare, MonitoringShareListOptions,
-    MonitoringSharePage, MonitoringShareStatus, MonitoringSummary, Permission, RequiredAuditEvent,
-    ServiceToken, ServiceTokenAuthorizationOutcome, ServiceTokenCreationOutcome,
-    TransferMonthlyCounts, MAX_SERVICE_TOKENS,
+    AuditAction, AuditContext, Database, MfaSessionProof, MonitoringShare,
+    MonitoringShareListOptions, MonitoringSharePage, MonitoringShareStatus, MonitoringSummary,
+    Permission, RequiredAuditEvent, ServiceToken, ServiceTokenAuthorizationOutcome,
+    ServiceTokenCreationOutcome, SessionBound, TransferMonthlyCounts, MAX_SERVICE_TOKENS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
@@ -66,105 +66,92 @@ fn parse_monitoring_status(value: &str) -> rusqlite::Result<MonitoringShareStatu
 
 impl Database {
     #[allow(clippy::too_many_arguments)]
-    pub fn create_service_token_for_verified_admin_and_audit(
+    pub(crate) fn create_service_token_for_mfa_session(
         &self,
-        session_token: &str,
-        admin_id: i64,
+        proof: &MfaSessionProof,
         expected_password_hash: &str,
         name: &str,
         plaintext_token: &str,
         expires_at: Option<DateTime<Utc>>,
         context: &AuditContext,
-    ) -> rusqlite::Result<ServiceTokenCreationOutcome> {
+    ) -> rusqlite::Result<SessionBound<ServiceTokenCreationOutcome>> {
         if !valid_service_token_name(name) || !valid_service_token(plaintext_token) {
             return Err(rusqlite::Error::InvalidQuery);
         }
 
-        let now = Utc::now();
-        if expires_at.is_some_and(|expires_at| expires_at <= now) {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        let now_string = now.to_rfc3339();
-        let idle_cutoff = (now - Duration::minutes(self.session_idle_minutes())).to_rfc3339();
-        let mut connection = self.try_conn()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let username = transaction
-            .query_row(
-                "SELECT admins.username
-                 FROM sessions
-                 JOIN admins ON admins.id=sessions.admin_id
-                 WHERE sessions.token_hash=?1
-                   AND sessions.admin_id=?2
-                   AND sessions.mfa_verified=1
-                   AND sessions.expires_at>?3
-                   AND sessions.last_activity_at>?4
-                   AND admins.active=1
-                   AND admins.password_hash=?5",
+        self.required_transaction_for_mfa_session(proof, context, |transaction| {
+            let now = Utc::now();
+            if expires_at.is_some_and(|expires_at| expires_at <= now) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let now_string = now.to_rfc3339();
+            let admin_id = proof.admin_id();
+            let current_admin = transaction
+                .query_row(
+                    "SELECT username,password_hash FROM admins WHERE id=?1",
+                    [admin_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((username, current_password_hash)) = current_admin else {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            };
+            if current_password_hash != expected_password_hash {
+                return Ok((
+                    ServiceTokenCreationOutcome::ReauthenticationRejected,
+                    vec![],
+                ));
+            }
+
+            let name_exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM service_tokens WHERE name=?1 COLLATE NOCASE)",
+                [name],
+                |row| row.get(0),
+            )?;
+            if name_exists {
+                return Ok((ServiceTokenCreationOutcome::NameConflict, vec![]));
+            }
+            let token_count: usize =
+                transaction
+                    .query_row("SELECT COUNT(*) FROM service_tokens", [], |row| row.get(0))?;
+            if token_count >= MAX_SERVICE_TOKENS {
+                return Ok((ServiceTokenCreationOutcome::CapacityReached, vec![]));
+            }
+
+            let expires_at_string = expires_at.map(|value| value.to_rfc3339());
+            transaction.execute(
+                "INSERT INTO service_tokens(
+                     name,token_hash,scope_mask,created_by,created_at,expires_at,last_used_at
+                 ) VALUES(?1,?2,1,?3,?4,?5,NULL)",
                 params![
-                    token_hash(session_token),
+                    name,
+                    token_hash(plaintext_token),
                     admin_id,
                     now_string,
-                    idle_cutoff,
-                    expected_password_hash,
+                    expires_at_string,
                 ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let Some(username) = username else {
-            transaction.rollback()?;
-            return Ok(ServiceTokenCreationOutcome::ReauthenticationRejected);
-        };
-
-        let name_exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM service_tokens WHERE name=?1 COLLATE NOCASE)",
-            [name],
-            |row| row.get(0),
-        )?;
-        if name_exists {
-            transaction.rollback()?;
-            return Ok(ServiceTokenCreationOutcome::NameConflict);
-        }
-        let token_count: usize =
-            transaction.query_row("SELECT COUNT(*) FROM service_tokens", [], |row| row.get(0))?;
-        if token_count >= MAX_SERVICE_TOKENS {
-            transaction.rollback()?;
-            return Ok(ServiceTokenCreationOutcome::CapacityReached);
-        }
-
-        let expires_at_string = expires_at.map(|value| value.to_rfc3339());
-        transaction.execute(
-            "INSERT INTO service_tokens(
-                 name,token_hash,scope_mask,created_by,created_at,expires_at,last_used_at
-             ) VALUES(?1,?2,1,?3,?4,?5,NULL)",
-            params![
-                name,
-                token_hash(plaintext_token),
-                admin_id,
-                now_string,
-                expires_at_string,
-            ],
-        )?;
-        let id = transaction.last_insert_rowid();
-        let service_token = ServiceToken {
-            id,
-            name: name.to_owned(),
-            scope_mask: super::SERVICE_TOKEN_SCOPE_MONITORING_READ,
-            created_by: admin_id,
-            created_by_username: username.clone(),
-            created_at: now_string,
-            expires_at: expires_at_string,
-            last_used_at: None,
-        };
-        let audit_context = AuditContext::new(username, context.client_ip.clone());
-        let audit_events = [RequiredAuditEvent::new(
-            AuditAction::ServiceTokenCreated,
-            Some(id.to_string()),
-            Some("scope=monitoring:read".to_string()),
-        )];
-        insert_required_audits(&transaction, &audit_context, &audit_events)?;
-        transaction.commit()?;
-        trace_required_audits(&audit_context, &audit_events);
-        Ok(ServiceTokenCreationOutcome::Created(service_token))
+            )?;
+            let id = transaction.last_insert_rowid();
+            let service_token = ServiceToken {
+                id,
+                name: name.to_owned(),
+                scope_mask: super::SERVICE_TOKEN_SCOPE_MONITORING_READ,
+                created_by: admin_id,
+                created_by_username: username,
+                created_at: now_string,
+                expires_at: expires_at_string,
+                last_used_at: None,
+            };
+            let audit_events = vec![RequiredAuditEvent::new(
+                AuditAction::ServiceTokenCreated,
+                Some(id.to_string()),
+                Some("scope=monitoring:read".to_string()),
+            )];
+            Ok((
+                ServiceTokenCreationOutcome::Created(service_token),
+                audit_events,
+            ))
+        })
     }
 
     pub fn list_service_tokens(&self) -> rusqlite::Result<Vec<ServiceToken>> {
@@ -278,36 +265,35 @@ impl Database {
         Ok(ServiceTokenAuthorizationOutcome::Authorized { token_id: id })
     }
 
-    pub fn revoke_service_token_and_audit(
+    pub(crate) fn revoke_service_token_for_mfa_session(
         &self,
+        proof: &MfaSessionProof,
         id: i64,
         context: &AuditContext,
-    ) -> rusqlite::Result<bool> {
-        let mut connection = self.try_conn()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists = transaction
-            .query_row("SELECT 1 FROM service_tokens WHERE id=?1", [id], |row| {
-                row.get::<_, i64>(0)
-            })
-            .optional()?
-            .is_some();
-        if !exists {
-            transaction.rollback()?;
-            return Ok(false);
-        }
-        let deleted = transaction.execute("DELETE FROM service_tokens WHERE id=?1", [id])?;
-        if deleted != 1 {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        let audit_events = [RequiredAuditEvent::new(
-            AuditAction::ServiceTokenRevoked,
-            Some(id.to_string()),
-            None,
-        )];
-        insert_required_audits(&transaction, context, &audit_events)?;
-        transaction.commit()?;
-        trace_required_audits(context, &audit_events);
-        Ok(true)
+    ) -> rusqlite::Result<SessionBound<bool>> {
+        self.required_transaction_for_mfa_session(proof, context, |transaction| {
+            let exists = transaction
+                .query_row("SELECT 1 FROM service_tokens WHERE id=?1", [id], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?
+                .is_some();
+            if !exists {
+                return Ok((false, vec![]));
+            }
+            let deleted = transaction.execute("DELETE FROM service_tokens WHERE id=?1", [id])?;
+            if deleted != 1 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok((
+                true,
+                vec![RequiredAuditEvent::new(
+                    AuditAction::ServiceTokenRevoked,
+                    Some(id.to_string()),
+                    None,
+                )],
+            ))
+        })
     }
 
     pub fn revoke_all_service_tokens_and_audit(
@@ -510,20 +496,32 @@ mod tests {
         database
     }
 
+    fn admin_proof() -> MfaSessionProof {
+        MfaSessionProof::for_test("admin-session", 1)
+    }
+
+    fn authorized<T>(outcome: SessionBound<T>) -> T {
+        match outcome {
+            SessionBound::Authorized(value) => value,
+            SessionBound::SessionUnavailable => panic!("test MFA session was unavailable"),
+        }
+    }
+
     fn create_token(database: &Database, name: &str, seed: u8) -> (String, ServiceToken) {
         let plaintext = test_service_token(seed);
         let context = AuditContext::new("admin", None);
-        let outcome = database
-            .create_service_token_for_verified_admin_and_audit(
-                "admin-session",
-                1,
-                "password-hash",
-                name,
-                &plaintext,
-                Some(Utc::now() + Duration::days(1)),
-                &context,
-            )
-            .unwrap();
+        let outcome = authorized(
+            database
+                .create_service_token_for_mfa_session(
+                    &admin_proof(),
+                    "password-hash",
+                    name,
+                    &plaintext,
+                    Some(Utc::now() + Duration::days(1)),
+                    &context,
+                )
+                .unwrap(),
+        );
         let ServiceTokenCreationOutcome::Created(token) = outcome else {
             panic!("service token was not created")
         };
@@ -603,17 +601,18 @@ mod tests {
     fn service_token_create_rechecks_live_mfa_session_password_and_capacity() {
         let database = authenticated_database();
         let context = AuditContext::new("admin", None);
-        let rejected = database
-            .create_service_token_for_verified_admin_and_audit(
-                "admin-session",
-                1,
-                "stale-hash",
-                "Rejected",
-                &test_service_token(1),
-                None,
-                &context,
-            )
-            .unwrap();
+        let rejected = authorized(
+            database
+                .create_service_token_for_mfa_session(
+                    &admin_proof(),
+                    "stale-hash",
+                    "Rejected",
+                    &test_service_token(1),
+                    None,
+                    &context,
+                )
+                .unwrap(),
+        );
         assert_eq!(
             rejected,
             ServiceTokenCreationOutcome::ReauthenticationRejected
@@ -622,17 +621,18 @@ mod tests {
         for index in 0..MAX_SERVICE_TOKENS {
             create_token(&database, &format!("token-{index}"), index as u8);
         }
-        let capacity = database
-            .create_service_token_for_verified_admin_and_audit(
-                "admin-session",
-                1,
-                "password-hash",
-                "one-too-many",
-                &test_service_token(255),
-                None,
-                &context,
-            )
-            .unwrap();
+        let capacity = authorized(
+            database
+                .create_service_token_for_mfa_session(
+                    &admin_proof(),
+                    "password-hash",
+                    "one-too-many",
+                    &test_service_token(255),
+                    None,
+                    &context,
+                )
+                .unwrap(),
+        );
         assert_eq!(capacity, ServiceTokenCreationOutcome::CapacityReached);
         let direct_insert = database.conn().execute(
             "INSERT INTO service_tokens(
@@ -647,6 +647,46 @@ mod tests {
     }
 
     #[test]
+    fn service_token_mutations_distinguish_session_revocation_from_domain_outcomes() {
+        let database = authenticated_database();
+        let (_, existing) = create_token(&database, "Existing", 2);
+        let created_audits = database.count_audit(Some("service_token_created")).unwrap();
+        let proof = admin_proof();
+        database.delete_session("admin-session").unwrap();
+
+        let create = database
+            .create_service_token_for_mfa_session(
+                &proof,
+                "password-hash",
+                "Blocked",
+                &test_service_token(3),
+                None,
+                &AuditContext::new("admin", None),
+            )
+            .unwrap();
+        assert_eq!(create, SessionBound::SessionUnavailable);
+        assert_eq!(database.list_service_tokens().unwrap().len(), 1);
+        assert_eq!(
+            database.count_audit(Some("service_token_created")).unwrap(),
+            created_audits
+        );
+
+        let revoke = database
+            .revoke_service_token_for_mfa_session(
+                &proof,
+                existing.id,
+                &AuditContext::new("admin", None),
+            )
+            .unwrap();
+        assert_eq!(revoke, SessionBound::SessionUnavailable);
+        assert_eq!(database.list_service_tokens().unwrap().len(), 1);
+        assert_eq!(
+            database.count_audit(Some("service_token_revoked")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn service_token_expiration_must_be_strictly_in_the_future() {
         let database = authenticated_database();
         let context = AuditContext::new("admin", None);
@@ -654,9 +694,8 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let result = database.create_service_token_for_verified_admin_and_audit(
-                "admin-session",
-                1,
+            let result = database.create_service_token_for_mfa_session(
+                &admin_proof(),
                 "password-hash",
                 &format!("invalid-expiry-{index}"),
                 &test_service_token(index as u8 + 40),
@@ -673,17 +712,18 @@ mod tests {
 
         let future = Utc::now() + Duration::days(1);
         let future_string = future.to_rfc3339();
-        let outcome = database
-            .create_service_token_for_verified_admin_and_audit(
-                "admin-session",
-                1,
-                "password-hash",
-                "future-expiry",
-                &test_service_token(42),
-                Some(future),
-                &context,
-            )
-            .unwrap();
+        let outcome = authorized(
+            database
+                .create_service_token_for_mfa_session(
+                    &admin_proof(),
+                    "password-hash",
+                    "future-expiry",
+                    &test_service_token(42),
+                    Some(future),
+                    &context,
+                )
+                .unwrap(),
+        );
         let ServiceTokenCreationOutcome::Created(created) = outcome else {
             panic!("future service-token expiration was rejected")
         };
@@ -702,17 +742,18 @@ mod tests {
 
         let database = authenticated_database();
         create_token(&database, "Home Assistant", 20);
-        let outcome = database
-            .create_service_token_for_verified_admin_and_audit(
-                "admin-session",
-                1,
-                "password-hash",
-                "home assistant",
-                &test_service_token(21),
-                None,
-                &AuditContext::new("admin", None),
-            )
-            .unwrap();
+        let outcome = authorized(
+            database
+                .create_service_token_for_mfa_session(
+                    &admin_proof(),
+                    "password-hash",
+                    "home assistant",
+                    &test_service_token(21),
+                    None,
+                    &AuditContext::new("admin", None),
+                )
+                .unwrap(),
+        );
         assert_eq!(outcome, ServiceTokenCreationOutcome::NameConflict);
         assert_eq!(database.list_service_tokens().unwrap().len(), 1);
     }
@@ -768,9 +809,8 @@ mod tests {
             .unwrap();
         let context = AuditContext::new("admin", None);
         let create_error = database
-            .create_service_token_for_verified_admin_and_audit(
-                "admin-session",
-                1,
+            .create_service_token_for_mfa_session(
+                &admin_proof(),
                 "password-hash",
                 "Rolled Back",
                 &test_service_token(40),
@@ -809,12 +849,16 @@ mod tests {
         let database = authenticated_database();
         let (_, first) = create_token(&database, "First", 50);
         let context = AuditContext::new("admin", None);
-        assert!(database
-            .revoke_service_token_and_audit(first.id, &context)
-            .unwrap());
-        assert!(!database
-            .revoke_service_token_and_audit(first.id, &context)
-            .unwrap());
+        assert!(authorized(
+            database
+                .revoke_service_token_for_mfa_session(&admin_proof(), first.id, &context)
+                .unwrap()
+        ));
+        assert!(!authorized(
+            database
+                .revoke_service_token_for_mfa_session(&admin_proof(), first.id, &context)
+                .unwrap()
+        ));
         let (_, second) = create_token(&database, "Second", 51);
         assert!(second.id > first.id);
         assert_eq!(
@@ -854,7 +898,7 @@ mod tests {
             .unwrap();
         let context = AuditContext::new("admin", None);
         let error = database
-            .revoke_service_token_and_audit(token.id, &context)
+            .revoke_service_token_for_mfa_session(&admin_proof(), token.id, &context)
             .unwrap_err();
         assert!(super::super::is_audit_unavailable(&error));
         assert_eq!(database.list_service_tokens().unwrap().len(), 1);
@@ -1110,12 +1154,15 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap();
 
-        assert!(database
-            .revoke_service_token_and_audit(
-                token.id,
-                &AuditContext::new("admin", Some("192.0.2.1".into())),
-            )
-            .unwrap());
+        assert!(authorized(
+            database
+                .revoke_service_token_for_mfa_session(
+                    &admin_proof(),
+                    token.id,
+                    &AuditContext::new("admin", Some("192.0.2.1".into())),
+                )
+                .unwrap()
+        ));
         release_sender.send(()).unwrap();
         let (authorization, summary) = request.join().unwrap().unwrap();
         assert_eq!(
@@ -1156,9 +1203,15 @@ mod tests {
         // must therefore never mirror administrator-supplied token names.
         let (second_plaintext, second) = create_token(&database, &first_plaintext, 81);
         let second_hash = token_hash(&second_plaintext);
-        assert!(database
-            .revoke_service_token_and_audit(second.id, &AuditContext::new("admin", None))
-            .unwrap());
+        assert!(authorized(
+            database
+                .revoke_service_token_for_mfa_session(
+                    &admin_proof(),
+                    second.id,
+                    &AuditContext::new("admin", None),
+                )
+                .unwrap()
+        ));
         assert_eq!(
             database
                 .revoke_all_service_tokens_and_audit(&AuditContext::new("local_recovery", None))

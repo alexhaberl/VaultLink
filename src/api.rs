@@ -61,16 +61,20 @@ struct ApiError {
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+fn session_bound<T>(outcome: crate::db::SessionBound<T>) -> ApiResult<T> {
+    match outcome {
+        crate::db::SessionBound::Authorized(value) => Ok(value),
+        crate::db::SessionBound::SessionUnavailable => Err(ApiError::session_revoked()),
+    }
+}
+
 fn storage_recovery_api_error(error: crate::file_ops::FileOperationError) -> ApiError {
     match error {
         crate::file_ops::FileOperationError::Database(database_error)
-            if crate::db::is_audit_unavailable(&database_error) =>
+            if crate::db::is_audit_unavailable(&database_error)
+                || crate::db::is_sqlite_busy_or_locked(&database_error) =>
         {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "audit_unavailable",
-                "Security audit temporarily unavailable",
-            )
+            ApiError::from(crate::http_auth::database_error(database_error))
         }
         _ => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -98,6 +102,13 @@ impl ApiError {
     fn conflict(message: &'static str) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", message)
     }
+    fn session_revoked() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "session_revoked",
+            "Session is no longer authorized",
+        )
+    }
     fn internal<T>(_: T) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -121,6 +132,7 @@ impl From<crate::http_auth::HttpAuthError> for ApiError {
                 "ambiguous_authentication"
             }
             crate::http_auth::HttpAuthErrorKind::InsufficientScope => "insufficient_scope",
+            crate::http_auth::HttpAuthErrorKind::SessionRevoked => "session_revoked",
             crate::http_auth::HttpAuthErrorKind::Request => match value.status {
                 StatusCode::UNAUTHORIZED => "unauthorized",
                 StatusCode::FORBIDDEN => "forbidden",
@@ -140,6 +152,9 @@ impl From<crate::http_auth::HttpAuthError> for ApiError {
             }
             crate::http_auth::HttpAuthErrorKind::InsufficientScope => {
                 "Service token scope is insufficient"
+            }
+            crate::http_auth::HttpAuthErrorKind::SessionRevoked => {
+                "Session is no longer authorized"
             }
             crate::http_auth::HttpAuthErrorKind::Request => match value.status {
                 StatusCode::BAD_REQUEST => "Invalid request",

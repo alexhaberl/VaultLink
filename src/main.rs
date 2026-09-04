@@ -1278,45 +1278,24 @@ mod tests {
                 .unwrap(),
             InitialAdminOutcome::Created
         );
+        drop(database);
+
+        // This helper exercises the offline, explicitly non-session-bound
+        // recovery command. Seed its fixture directly so production code does
+        // not expose a raw-session-token service-token mutator as an escape
+        // hatch around `MfaSessionProof`.
+        let connection = rusqlite::Connection::open(path).unwrap();
         assert_eq!(
-            database
-                .create_session_for_verified_password_and_audit(
-                    "recovery-test-pre-mfa-session",
-                    1,
-                    "password-hash",
-                    "recovery-test-pre-mfa-csrf",
-                    chrono::Utc::now() + chrono::Duration::hours(1),
-                    &audit_context,
+            connection
+                .execute(
+                    "INSERT INTO service_tokens(
+                         name,token_hash,scope_mask,created_by,created_at
+                     ) VALUES(?1,?2,1,1,?3)",
+                    rusqlite::params![name, "0".repeat(64), chrono::Utc::now().to_rfc3339()],
                 )
                 .unwrap(),
-            vaultlink::db::PasswordSessionCreationOutcome::Created
+            1
         );
-        assert!(database
-            .verify_mfa_with_totp_step_and_audit(
-                "recovery-test-pre-mfa-session",
-                "recovery-test-session",
-                "recovery-test-csrf",
-                1,
-                1,
-                &audit_context,
-            )
-            .unwrap());
-        let plaintext = format!("vlk_st_v1_{}", auth::random_token(32));
-        let outcome = database
-            .create_service_token_for_verified_admin_and_audit(
-                "recovery-test-session",
-                1,
-                "password-hash",
-                name,
-                &plaintext,
-                None,
-                &audit_context,
-            )
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            vaultlink::db::ServiceTokenCreationOutcome::Created(_)
-        ));
     }
 
     fn assert_revoke_all_audit(path: &std::path::Path) {
@@ -1520,14 +1499,17 @@ mod tests {
         let valid = tempfile::tempdir().unwrap();
         let valid_database = valid.path().join("data.sqlite");
         let database = Database::open(&valid_database).unwrap();
-        database
-            .create_admin_and_audit(
-                "admin",
-                "password-hash",
-                "JBSWY3DPEHPK3PXP",
-                &AuditContext::new("backup-verification-test", None),
-            )
-            .unwrap();
+        assert_eq!(
+            database
+                .create_initial_admin_and_audit(
+                    "admin",
+                    "password-hash",
+                    "JBSWY3DPEHPK3PXP",
+                    &AuditContext::new("backup-verification-test", None),
+                )
+                .unwrap(),
+            InitialAdminOutcome::Created
+        );
         drop(database);
         std::fs::remove_file(valid.path().join("secrets.keyring.lock")).unwrap();
 

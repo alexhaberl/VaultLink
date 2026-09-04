@@ -11,14 +11,14 @@ use crate::{
     auth,
     db::{valid_service_token_name, AuditContext, ServiceToken, ServiceTokenCreationOutcome},
     http_auth::{
-        csrf_header, database, enabled_audit_client_ip, required_database, session,
+        csrf_header, database, enabled_audit_client_ip, mfa_session, required_database, session,
         verify_password_admitted, MissingSession, SERVICE_TOKEN_PREFIX,
     },
     sensitive::SecretString,
     AppState,
 };
 
-use super::{ApiError, ApiResult};
+use super::{session_bound, ApiError, ApiResult};
 
 const SERVICE_TOKEN_SCOPE: &str = "monitoring:read";
 
@@ -94,9 +94,8 @@ pub(super) async fn create_service_token(
     headers: HeaderMap,
     Json(request): Json<CreateServiceTokenRequest>,
 ) -> ApiResult<Response> {
-    let (session_token, session_data) =
-        session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
 
     let CreateServiceTokenRequest {
         name,
@@ -109,12 +108,12 @@ pub(super) async fn create_service_token(
         return Err(ApiError::bad_request("Invalid service token settings"));
     }
 
-    let limiter_key = format!("service-token-create:{}", session_data.admin_id);
+    let limiter_key = format!("service-token-create:{}", authenticated.admin_id);
     if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(ApiError::rate_limited("Too many password attempts", 60));
     }
 
-    let username = session_data.username.clone();
+    let username = authenticated.username.clone();
     let admin = database(state.db.clone(), move |database| database.admin(&username))
         .await?
         .ok_or_else(|| {
@@ -142,15 +141,14 @@ pub(super) async fn create_service_token(
 
     let generated = SecretString::from(format!("{SERVICE_TOKEN_PREFIX}{}", auth::random_token(32)));
     let response_token = generated.duplicate_for_one_time_response();
-    let admin_id = session_data.admin_id;
+    let proof = authenticated.proof().clone();
     let audit_context = AuditContext::new(
-        session_data.username.clone(),
+        authenticated.username.clone(),
         enabled_audit_client_ip(&state),
     );
     let outcome = required_database(state.db.clone(), move |database| {
-        database.create_service_token_for_verified_admin_and_audit(
-            &session_token,
-            admin_id,
+        database.create_service_token_for_mfa_session(
+            &proof,
             &expected_password_hash,
             &name,
             generated.expose_secret(),
@@ -159,7 +157,7 @@ pub(super) async fn create_service_token(
         )
     })
     .await?;
-    let created = match outcome {
+    let created = match session_bound(outcome)? {
         ServiceTokenCreationOutcome::Created(token) => token,
         ServiceTokenCreationOutcome::ReauthenticationRejected => {
             return Err(ApiError::new(
@@ -192,16 +190,21 @@ pub(super) async fn revoke_service_token(
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<StatusCode> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
     if id <= 0 {
         return Err(ApiError::not_found("Service token not found"));
     }
-    let audit_context = AuditContext::new(session_data.username, enabled_audit_client_ip(&state));
+    let proof = authenticated.proof().clone();
+    let audit_context = AuditContext::new(
+        authenticated.username.clone(),
+        enabled_audit_client_ip(&state),
+    );
     let revoked = required_database(state.db.clone(), move |database| {
-        database.revoke_service_token_and_audit(id, &audit_context)
+        database.revoke_service_token_for_mfa_session(&proof, id, &audit_context)
     })
     .await?;
+    let revoked = session_bound(revoked)?;
     if !revoked {
         return Err(ApiError::not_found("Service token not found"));
     }

@@ -1,16 +1,17 @@
-#[cfg(test)]
-use super::AdminMfaEnrollmentStartOutcome;
 use super::{
     insert_required_audits, token_hash, trace_required_audits, Admin, AdminDeactivationOutcome,
     AdminMfaEnrollmentActivationOutcome, AdminPasswordChangeOutcome, AdminRecoveryOutcome,
     AdminSummary, AdminTotpSettingOutcome, AdminWebauthnCredential,
-    AdminWebauthnCredentialDeletionOutcome, AdminWebauthnCredentialRegistrationOutcome,
-    AuditAction, AuditContext, AuditedAdminMfaEnrollmentStartOutcome, Database,
-    InitialAdminOutcome, PasswordSessionCreationOutcome, PendingAdminMfaEnrollment,
-    RequiredAuditEvent, Session, ADMIN_MFA_ENROLLMENT_TTL_SECONDS,
+    AdminWebauthnCredentialDeletionOutcome, AuditAction, AuditContext,
+    AuditedAdminMfaEnrollmentStartOutcome, AuthenticatedMfaSession, CommitPublication, Database,
+    InitialAdminOutcome, MfaSessionAuthentication, MfaSessionProof, PasswordSessionCreationOutcome,
+    PendingAdminMfaEnrollment, RequiredAuditEvent, Session, SessionBound,
+    ADMIN_MFA_ENROLLMENT_TTL_SECONDS,
 };
+#[cfg(test)]
+use super::{AdminMfaEnrollmentStartOutcome, AdminWebauthnCredentialRegistrationOutcome};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, DropBehavior, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::sensitive::SecretString;
 
@@ -37,15 +38,7 @@ fn consume_admin_totp_step(
     admin_id: i64,
     step: u64,
 ) -> rusqlite::Result<bool> {
-    if step > i64::MAX as u64 {
-        return Ok(false);
-    }
-    let active = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM admins WHERE id=?1 AND active=1)",
-        [admin_id],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !active {
+    if !admin_totp_step_is_fresh(transaction, admin_id, step)? {
         return Ok(false);
     }
     Ok(transaction.execute(
@@ -54,6 +47,28 @@ fn consume_admin_totp_step(
          WHERE excluded.last_step>admin_totp_replay.last_step",
         params![admin_id, step as i64],
     )? == 1)
+}
+
+fn admin_totp_step_is_fresh(
+    transaction: &Transaction<'_>,
+    admin_id: i64,
+    step: u64,
+) -> rusqlite::Result<bool> {
+    if step > i64::MAX as u64 {
+        return Ok(false);
+    }
+    transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM admins
+             WHERE id=?1 AND active=1
+               AND NOT EXISTS(
+                   SELECT 1 FROM admin_totp_replay
+                   WHERE admin_id=?1 AND last_step>=?2
+               )
+         )",
+        params![admin_id, step as i64],
+        |row| row.get::<_, bool>(0),
+    )
 }
 
 fn cleanup_admin_mfa_enrollments(
@@ -73,6 +88,47 @@ fn revoke_admin_auth_state(transaction: &Transaction<'_>, admin_id: i64) -> rusq
         [admin_id],
     )?;
     Ok(())
+}
+
+fn live_mfa_session(
+    transaction: &Transaction<'_>,
+    proof: &MfaSessionProof,
+    times: &SessionTimes,
+) -> rusqlite::Result<bool> {
+    transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM sessions
+             JOIN admins ON admins.id=sessions.admin_id
+             WHERE sessions.token_hash=?1
+               AND sessions.admin_id=?2
+               AND sessions.mfa_verified=1
+               AND sessions.expires_at>?3
+               AND sessions.last_activity_at>?4
+               AND admins.active=1
+         )",
+        params![
+            proof.token_hash.as_str(),
+            proof.admin_id,
+            times.now.as_str(),
+            times.idle_cutoff.as_str(),
+        ],
+        |row| row.get::<_, bool>(0),
+    )
+}
+
+fn active_admin_usernames_on_connection(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<Vec<String>> {
+    let mut statement =
+        connection.prepare("SELECT username FROM admins WHERE active=1 ORDER BY id ASC")?;
+    let usernames = statement
+        .query_map([], |row| {
+            row.get::<_, String>(0)
+                .map(|username| username.to_ascii_lowercase())
+        })?
+        .collect();
+    usernames
 }
 
 impl Database {
@@ -221,6 +277,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn create_admin_and_audit(
         &self,
         username: &str,
@@ -252,6 +309,46 @@ impl Database {
                 )],
             ))
         })
+    }
+
+    pub(crate) fn create_admin_and_audit_for_session<T>(
+        &self,
+        proof: &MfaSessionProof,
+        username: &str,
+        password_hash: &str,
+        totp_secret: &str,
+        context: &AuditContext,
+        publish_active_admins: impl FnOnce(Vec<String>) -> T,
+    ) -> rusqlite::Result<SessionBound<(AdminSummary, T)>>
+    where
+        T: CommitPublication,
+    {
+        let (totp_key_id, totp_ciphertext) = self.encrypt_admin_totp(username, totp_secret)?;
+        self.required_transaction_for_mfa_session_with_commit(proof, context, |transaction| {
+            let created_at = Utc::now().to_rfc3339();
+            transaction.execute(
+                "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active)
+                 VALUES(?1,?2,?3,?4,?5,1)",
+                params![username, password_hash, totp_key_id, totp_ciphertext, &created_at],
+            )?;
+            let id = transaction.last_insert_rowid();
+            let admin = AdminSummary {
+                id,
+                username: username.to_string(),
+                created_at,
+                active: true,
+            };
+            let publication =
+                publish_active_admins(active_admin_usernames_on_connection(transaction)?);
+            Ok((
+                (admin, publication),
+                vec![RequiredAuditEvent::new(
+                    AuditAction::AdminCreated,
+                    Some(id.to_string()),
+                    None,
+                )],
+            ))
+        }, |(_, publication)| publication.accept_commit())
     }
     pub fn admin(&self, username: &str) -> rusqlite::Result<Option<Admin>> {
         self.try_conn()?
@@ -287,15 +384,7 @@ impl Database {
     }
     pub fn active_admin_usernames(&self) -> rusqlite::Result<Vec<String>> {
         let connection = self.try_conn()?;
-        let mut statement =
-            connection.prepare("SELECT username FROM admins WHERE active=1 ORDER BY id ASC")?;
-        let usernames = statement
-            .query_map([], |row| {
-                row.get::<_, String>(0)
-                    .map(|username| username.to_ascii_lowercase())
-            })?
-            .collect();
-        usernames
+        active_admin_usernames_on_connection(&connection)
     }
     pub fn list_admins(&self) -> rusqlite::Result<Vec<AdminSummary>> {
         let c = self.try_conn()?;
@@ -321,6 +410,7 @@ impl Database {
             == 1)
     }
 
+    #[cfg(test)]
     pub fn activate_admin_and_audit(
         &self,
         id: i64,
@@ -338,11 +428,46 @@ impl Database {
         })
     }
 
+    pub(crate) fn activate_admin_and_audit_for_session<T>(
+        &self,
+        proof: &MfaSessionProof,
+        id: i64,
+        context: &AuditContext,
+        publish_active_admins: impl FnOnce(Vec<String>) -> T,
+    ) -> rusqlite::Result<SessionBound<(bool, T)>>
+    where
+        T: CommitPublication,
+    {
+        self.required_transaction_for_mfa_session_with_commit(
+            proof,
+            context,
+            |transaction| {
+                let changed =
+                    transaction.execute("UPDATE admins SET active=1 WHERE id=?1", [id])? == 1;
+                let publication =
+                    publish_active_admins(active_admin_usernames_on_connection(transaction)?);
+                let events = changed
+                    .then(|| {
+                        RequiredAuditEvent::new(
+                            AuditAction::AdminActivated,
+                            Some(id.to_string()),
+                            None,
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                Ok(((changed, publication), events))
+            },
+            |(_, publication)| publication.accept_commit(),
+        )
+    }
+
     #[cfg(test)]
     pub fn deactivate_admin(&self, id: i64) -> rusqlite::Result<AdminDeactivationOutcome> {
         self.deactivate_admin_internal(id, None)
     }
 
+    #[cfg(test)]
     pub fn deactivate_admin_and_audit(
         &self,
         id: i64,
@@ -351,6 +476,69 @@ impl Database {
         self.deactivate_admin_internal(id, Some(context))
     }
 
+    pub(crate) fn deactivate_admin_and_audit_for_session<T>(
+        &self,
+        proof: &MfaSessionProof,
+        id: i64,
+        context: &AuditContext,
+        publish_active_admins: impl FnOnce(Vec<String>) -> T,
+    ) -> rusqlite::Result<SessionBound<(AdminDeactivationOutcome, T)>>
+    where
+        T: CommitPublication,
+    {
+        self.required_transaction_for_mfa_session_with_commit(
+            proof,
+            context,
+            |transaction| {
+                let active = transaction
+                    .query_row("SELECT active FROM admins WHERE id=?1", [id], |row| {
+                        row.get::<_, i64>(0).map(|active| active != 0)
+                    })
+                    .optional()?;
+                let outcome = match active {
+                    None => AdminDeactivationOutcome::NotFound,
+                    Some(false) => {
+                        revoke_admin_auth_state(transaction, id)?;
+                        AdminDeactivationOutcome::AlreadyInactive
+                    }
+                    Some(true) => {
+                        let changed = transaction.execute(
+                            "UPDATE admins SET active=0
+                         WHERE id=?1 AND active=1
+                           AND EXISTS(SELECT 1 FROM admins WHERE active=1 AND id<>?1)",
+                            [id],
+                        )? == 1;
+                        if changed {
+                            revoke_admin_auth_state(transaction, id)?;
+                            AdminDeactivationOutcome::Deactivated
+                        } else {
+                            AdminDeactivationOutcome::LastActive
+                        }
+                    }
+                };
+                let events = matches!(
+                    outcome,
+                    AdminDeactivationOutcome::Deactivated
+                        | AdminDeactivationOutcome::AlreadyInactive
+                )
+                .then(|| {
+                    RequiredAuditEvent::new(
+                        AuditAction::AdminDeactivated,
+                        Some(id.to_string()),
+                        None,
+                    )
+                })
+                .into_iter()
+                .collect();
+                let publication =
+                    publish_active_admins(active_admin_usernames_on_connection(transaction)?);
+                Ok(((outcome, publication), events))
+            },
+            |(_, publication)| publication.accept_commit(),
+        )
+    }
+
+    #[cfg(test)]
     fn deactivate_admin_internal(
         &self,
         id: i64,
@@ -499,6 +687,7 @@ impl Database {
     }
 
     /// Changes an administrator password only if the hash verified by the caller is still current.
+    #[cfg(test)]
     pub fn change_admin_password_cas(
         &self,
         id: i64,
@@ -552,6 +741,50 @@ impl Database {
         transaction.commit()?;
         trace_required_audits(&audit_context, &audit_events);
         Ok(AdminPasswordChangeOutcome::Changed)
+    }
+
+    pub(crate) fn change_admin_password_cas_for_session(
+        &self,
+        proof: &MfaSessionProof,
+        expected_password_hash: &str,
+        new_password_hash: &str,
+        context: &AuditContext,
+    ) -> rusqlite::Result<SessionBound<AdminPasswordChangeOutcome>> {
+        let id = proof.admin_id();
+        self.required_transaction_for_mfa_session(proof, context, |transaction| {
+            let admin = transaction
+                .query_row(
+                    "SELECT password_hash,active FROM admins WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+                )
+                .optional()?;
+            let Some((current_password_hash, active)) = admin else {
+                return Ok((AdminPasswordChangeOutcome::NotFound, Vec::new()));
+            };
+            if !active {
+                return Ok((AdminPasswordChangeOutcome::Inactive, Vec::new()));
+            }
+            if current_password_hash != expected_password_hash {
+                return Ok((AdminPasswordChangeOutcome::StalePassword, Vec::new()));
+            }
+            let changed = transaction.execute(
+                "UPDATE admins SET password_hash=?3 WHERE id=?1 AND password_hash=?2",
+                params![id, expected_password_hash, new_password_hash],
+            )?;
+            if changed != 1 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            revoke_admin_auth_state(transaction, id)?;
+            Ok((
+                AdminPasswordChangeOutcome::Changed,
+                vec![RequiredAuditEvent::new(
+                    AuditAction::AccountPasswordChanged,
+                    Some(id.to_string()),
+                    None,
+                )],
+            ))
+        })
     }
 
     /// Starts or replaces one short-lived enrollment. Only a hash of `token` is persisted.
@@ -613,6 +846,7 @@ impl Database {
     /// Atomically consumes the current TOTP counter, starts a pending enrollment,
     /// and persists the required audit event. An audit failure rolls all three
     /// mutations back, including the replay counter update.
+    #[cfg(test)]
     pub fn start_admin_mfa_enrollment_and_audit(
         &self,
         admin_id: i64,
@@ -649,6 +883,60 @@ impl Database {
                 }
                 Some(true) => {}
             }
+            if !consume_admin_totp_step(transaction, admin_id, verified_totp_step)? {
+                return Ok((
+                    AuditedAdminMfaEnrollmentStartOutcome::TotpRejected,
+                    Vec::new(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO admin_mfa_enrollments(
+                     admin_id,token_hash,totp_key_id,totp_ciphertext,created_at,expires_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(admin_id) DO UPDATE SET
+                     token_hash=excluded.token_hash,
+                     totp_key_id=excluded.totp_key_id,
+                     totp_ciphertext=excluded.totp_ciphertext,
+                     created_at=excluded.created_at,
+                     expires_at=excluded.expires_at",
+                params![
+                    admin_id,
+                    enrollment_token_hash,
+                    totp_key_id,
+                    totp_ciphertext,
+                    now_string,
+                    expires_at
+                ],
+            )?;
+            Ok((
+                AuditedAdminMfaEnrollmentStartOutcome::Started { expires_at },
+                vec![RequiredAuditEvent::new(
+                    AuditAction::AccountMfaEnrollmentStarted,
+                    Some(admin_id.to_string()),
+                    None,
+                )],
+            ))
+        })
+    }
+
+    pub(crate) fn start_admin_mfa_enrollment_and_audit_for_session(
+        &self,
+        proof: &MfaSessionProof,
+        token: &str,
+        totp_secret: &str,
+        verified_totp_step: u64,
+        context: &AuditContext,
+    ) -> rusqlite::Result<SessionBound<AuditedAdminMfaEnrollmentStartOutcome>> {
+        let enrollment_token_hash = token_hash(token);
+        let (totp_key_id, totp_ciphertext) =
+            self.encrypt_enrollment_totp(&enrollment_token_hash, totp_secret)?;
+        let admin_id = proof.admin_id();
+        self.required_transaction_for_mfa_session(proof, context, |transaction| {
+            let now = Utc::now();
+            let now_string = now.to_rfc3339();
+            let expires_at =
+                (now + Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS)).to_rfc3339();
+            cleanup_admin_mfa_enrollments(transaction, &now_string)?;
             if !consume_admin_totp_step(transaction, admin_id, verified_totp_step)? {
                 return Ok((
                     AuditedAdminMfaEnrollmentStartOutcome::TotpRejected,
@@ -728,6 +1016,7 @@ impl Database {
 
     /// Activates and consumes an enrollment after the caller verified a code against its secret.
     /// The secret is never included in the audit event.
+    #[cfg(test)]
     pub fn activate_admin_mfa_enrollment(
         &self,
         admin_id: i64,
@@ -800,6 +1089,82 @@ impl Database {
         Ok(AdminMfaEnrollmentActivationOutcome::Activated)
     }
 
+    pub(crate) fn activate_admin_mfa_enrollment_for_session(
+        &self,
+        proof: &MfaSessionProof,
+        token: &str,
+        verified_totp_step: u64,
+        context: &AuditContext,
+    ) -> rusqlite::Result<SessionBound<AdminMfaEnrollmentActivationOutcome>> {
+        if verified_totp_step > i64::MAX as u64 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "verified_totp_step".into(),
+            ));
+        }
+        let enrollment_token_hash = token_hash(token);
+        let admin_id = proof.admin_id();
+        self.required_transaction_for_mfa_session(proof, context, |transaction| {
+            // Capture time only after BEGIN IMMEDIATE has acquired the writer
+            // slot. A request that waited behind another mutation must not
+            // activate an enrollment which expired while it was queued.
+            let now = Utc::now().to_rfc3339();
+            cleanup_admin_mfa_enrollments(transaction, &now)?;
+            let enrollment = transaction
+                .query_row(
+                    "SELECT admins.username,admin_mfa_enrollments.totp_key_id,
+                            admin_mfa_enrollments.totp_ciphertext
+                     FROM admin_mfa_enrollments
+                     JOIN admins ON admins.id=admin_mfa_enrollments.admin_id
+                     WHERE admin_mfa_enrollments.admin_id=?1
+                       AND admin_mfa_enrollments.token_hash=?2
+                       AND admin_mfa_enrollments.expires_at>?3
+                       AND admins.active=1",
+                    params![admin_id, enrollment_token_hash, now],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((username, enrollment_key_id, enrollment_ciphertext)) = enrollment else {
+                return Ok((
+                    AdminMfaEnrollmentActivationOutcome::NotFoundOrExpired,
+                    Vec::new(),
+                ));
+            };
+            let totp_secret = self.decrypt_enrollment_totp(
+                &enrollment_token_hash,
+                enrollment_key_id,
+                &enrollment_ciphertext,
+            )?;
+            let (totp_key_id, totp_ciphertext) =
+                self.encrypt_admin_totp(&username, totp_secret.expose_secret())?;
+            transaction.execute(
+                "UPDATE admins SET totp_key_id=?2,totp_ciphertext=?3,
+                     totp_generation=totp_generation+1,totp_enabled=1 WHERE id=?1",
+                params![admin_id, totp_key_id, totp_ciphertext],
+            )?;
+            transaction.execute(
+                "INSERT INTO admin_totp_replay(admin_id,last_step) VALUES(?1,?2)
+                 ON CONFLICT(admin_id) DO UPDATE SET last_step=excluded.last_step",
+                params![admin_id, verified_totp_step as i64],
+            )?;
+            revoke_admin_auth_state(transaction, admin_id)?;
+            Ok((
+                AdminMfaEnrollmentActivationOutcome::Activated,
+                vec![RequiredAuditEvent::new(
+                    AuditAction::AccountMfaChanged,
+                    Some(admin_id.to_string()),
+                    None,
+                )],
+            ))
+        })
+    }
+
+    #[cfg(test)]
     pub fn cleanup_expired_admin_mfa_enrollments(&self) -> rusqlite::Result<usize> {
         self.try_conn()?.execute(
             "DELETE FROM admin_mfa_enrollments WHERE expires_at<=?1",
@@ -822,6 +1187,7 @@ impl Database {
         Ok(changed)
     }
 
+    #[cfg(test)]
     pub fn reset_admin_password_and_audit(
         &self,
         id: i64,
@@ -829,6 +1195,35 @@ impl Database {
         context: &AuditContext,
     ) -> rusqlite::Result<bool> {
         self.required_transaction(context, |transaction| {
+            let changed = transaction.execute(
+                "UPDATE admins SET password_hash=?2 WHERE id=?1",
+                params![id, password_hash],
+            )? == 1;
+            if changed {
+                revoke_admin_auth_state(transaction, id)?;
+            }
+            let events = changed
+                .then(|| {
+                    RequiredAuditEvent::new(
+                        AuditAction::AdminPasswordReset,
+                        Some(id.to_string()),
+                        None,
+                    )
+                })
+                .into_iter()
+                .collect();
+            Ok((changed, events))
+        })
+    }
+
+    pub(crate) fn reset_admin_password_and_audit_for_session(
+        &self,
+        proof: &MfaSessionProof,
+        id: i64,
+        password_hash: &str,
+        context: &AuditContext,
+    ) -> rusqlite::Result<SessionBound<bool>> {
+        self.required_transaction_for_mfa_session(proof, context, |transaction| {
             let changed = transaction.execute(
                 "UPDATE admins SET password_hash=?2 WHERE id=?1",
                 params![id, password_hash],
@@ -876,6 +1271,7 @@ impl Database {
         Ok(username)
     }
 
+    #[cfg(test)]
     pub fn reset_admin_totp_and_audit(
         &self,
         id: i64,
@@ -893,6 +1289,48 @@ impl Database {
             .map(|username| self.encrypt_admin_totp(username, totp_secret))
             .transpose()?;
         self.required_transaction(context, |transaction| {
+            if let Some((totp_key_id, totp_ciphertext)) = encrypted.as_ref() {
+                transaction.execute(
+                    "UPDATE admins SET totp_key_id=?2,totp_ciphertext=?3,
+                         totp_generation=totp_generation+1,totp_enabled=1 WHERE id=?1",
+                    params![id, totp_key_id, totp_ciphertext],
+                )?;
+                transaction.execute(
+                    "DELETE FROM admin_webauthn_credentials WHERE admin_id=?1",
+                    [id],
+                )?;
+                transaction.execute("DELETE FROM admin_totp_replay WHERE admin_id=?1", [id])?;
+                revoke_admin_auth_state(transaction, id)?;
+            }
+            let events = username
+                .is_some()
+                .then(|| {
+                    RequiredAuditEvent::new(AuditAction::AdminTotpReset, Some(id.to_string()), None)
+                })
+                .into_iter()
+                .collect();
+            Ok((username, events))
+        })
+    }
+
+    pub(crate) fn reset_admin_totp_and_audit_for_session(
+        &self,
+        proof: &MfaSessionProof,
+        id: i64,
+        totp_secret: &str,
+        context: &AuditContext,
+    ) -> rusqlite::Result<SessionBound<Option<String>>> {
+        let username = self
+            .try_conn()?
+            .query_row("SELECT username FROM admins WHERE id=?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        let encrypted = username
+            .as_deref()
+            .map(|username| self.encrypt_admin_totp(username, totp_secret))
+            .transpose()?;
+        self.required_transaction_for_mfa_session(proof, context, |transaction| {
             if let Some((totp_key_id, totp_ciphertext)) = encrypted.as_ref() {
                 transaction.execute(
                     "UPDATE admins SET totp_key_id=?2,totp_ciphertext=?3,
@@ -969,6 +1407,7 @@ impl Database {
     /// The session predicate, credential insert and audit event share one
     /// transaction so an MFA reset either removes the new key afterwards or
     /// makes a stale completion fail before it can restore a credential.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn add_admin_webauthn_credential_for_session(
         &self,
@@ -979,56 +1418,89 @@ impl Database {
         credential_blob: &(impl AsRef<[u8]> + ?Sized),
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminWebauthnCredentialRegistrationOutcome> {
-        let times = self.session_times(Utc::now());
-        let session_token_hash = token_hash(session_token);
-        let mut connection = self.try_conn()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let username = transaction
-            .query_row(
-                "SELECT admins.username
-                 FROM sessions
-                 JOIN admins ON admins.id=sessions.admin_id
-                 WHERE sessions.token_hash=?1
-                   AND sessions.admin_id=?2
-                   AND sessions.mfa_verified=1
-                   AND sessions.expires_at>?3
-                   AND sessions.last_activity_at>?4
-                   AND admins.active=1",
-                params![session_token_hash, admin_id, times.now, times.idle_cutoff,],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let Some(username) = username else {
-            transaction.commit()?;
-            return Ok(AdminWebauthnCredentialRegistrationOutcome::SessionUnavailable);
-        };
+        let proof = MfaSessionProof::from_token(session_token, admin_id);
+        Ok(
+            match self.add_admin_webauthn_credential_for_mfa_session(
+                &proof,
+                label,
+                credential_id,
+                credential_blob,
+                client_ip,
+            )? {
+                SessionBound::Authorized(outcome) => outcome,
+                SessionBound::SessionUnavailable => {
+                    AdminWebauthnCredentialRegistrationOutcome::SessionUnavailable
+                }
+            },
+        )
+    }
+
+    /// Inserts a verified WebAuthn credential through an already-open live
+    /// session transaction. Callers must use the transaction supplied by
+    /// `required_transaction_for_mfa_session`; this helper never checks out a
+    /// second connection.
+    pub(crate) fn insert_admin_webauthn_credential_in_transaction(
+        transaction: &Transaction<'_>,
+        proof: &MfaSessionProof,
+        label: &str,
+        credential_id: &str,
+        credential_blob: &(impl AsRef<[u8]> + ?Sized),
+    ) -> rusqlite::Result<i64> {
+        let created_at = Utc::now().to_rfc3339();
         transaction.execute(
             "INSERT INTO admin_webauthn_credentials(
                  admin_id,label,credential_id,credential_blob,created_at
              ) VALUES(?1,?2,?3,?4,?5)",
             params![
-                admin_id,
+                proof.admin_id(),
                 label,
                 credential_id,
                 credential_blob.as_ref(),
-                times.now
+                created_at
             ],
         )?;
-        let credential_row_id = transaction.last_insert_rowid();
-        let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::new(
-            AuditAction::WebauthnCredentialAdded,
-            None,
-            None,
-        )];
-        insert_required_audits(&transaction, &audit_context, &audit_events)?;
-        transaction.commit()?;
-        trace_required_audits(&audit_context, &audit_events);
-        Ok(AdminWebauthnCredentialRegistrationOutcome::Registered(
-            credential_row_id,
-        ))
+        Ok(transaction.last_insert_rowid())
     }
 
+    #[cfg(test)]
+    pub(crate) fn add_admin_webauthn_credential_for_mfa_session(
+        &self,
+        proof: &MfaSessionProof,
+        label: &str,
+        credential_id: &str,
+        credential_blob: &(impl AsRef<[u8]> + ?Sized),
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<SessionBound<AdminWebauthnCredentialRegistrationOutcome>> {
+        let username = self
+            .try_conn()?
+            .query_row(
+                "SELECT username FROM admins WHERE id=?1",
+                [proof.admin_id()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let audit_context = AuditContext::new(username, client_ip.map(str::to_string));
+        self.required_transaction_for_mfa_session(proof, &audit_context, |transaction| {
+            let credential_row_id = Self::insert_admin_webauthn_credential_in_transaction(
+                transaction,
+                proof,
+                label,
+                credential_id,
+                credential_blob,
+            )?;
+            Ok((
+                AdminWebauthnCredentialRegistrationOutcome::Registered(credential_row_id),
+                vec![RequiredAuditEvent::new(
+                    AuditAction::WebauthnCredentialAdded,
+                    None,
+                    None,
+                )],
+            ))
+        })
+    }
+
+    #[cfg(test)]
     pub fn update_admin_webauthn_credential(
         &self,
         id: i64,
@@ -1194,6 +1666,7 @@ impl Database {
     /// and records the success audit as one serialized transaction. This closes
     /// both cancellation gaps and credential/session reset races.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn delete_admin_webauthn_credential_with_totp(
         &self,
         session_token: &str,
@@ -1204,65 +1677,115 @@ impl Database {
         totp_step: u64,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminWebauthnCredentialDeletionOutcome> {
-        let times = self.session_times(Utc::now());
-        let mut connection = self.try_conn()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let username = transaction
+        let proof = MfaSessionProof::from_token(session_token, admin_id);
+        Ok(
+            match self.delete_admin_webauthn_credential_with_totp_for_mfa_session(
+                &proof,
+                id,
+                expected_password_hash,
+                expected_totp_generation,
+                totp_step,
+                client_ip,
+            )? {
+                SessionBound::Authorized(outcome) => outcome,
+                SessionBound::SessionUnavailable => {
+                    AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected
+                }
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn delete_admin_webauthn_credential_with_totp_for_mfa_session(
+        &self,
+        proof: &MfaSessionProof,
+        id: i64,
+        expected_password_hash: &str,
+        expected_totp_generation: u64,
+        totp_step: u64,
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<SessionBound<AdminWebauthnCredentialDeletionOutcome>> {
+        let username = self
+            .try_conn()?
             .query_row(
-                "SELECT admins.username
-                 FROM sessions
-                 JOIN admins ON admins.id=sessions.admin_id
-                 WHERE sessions.token_hash=?1
-                   AND sessions.admin_id=?2
-                   AND sessions.mfa_verified=1
-                   AND sessions.expires_at>?3
-                   AND sessions.last_activity_at>?4
-                   AND admins.active=1
-                   AND admins.password_hash=?5
-                   AND admins.totp_generation=?6",
+                "SELECT username FROM admins WHERE id=?1",
+                [proof.admin_id()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let audit_context = AuditContext::new(username, client_ip.map(str::to_string));
+        self.required_transaction_for_mfa_session(proof, &audit_context, |transaction| {
+            let reauthentication_matches = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM admins
+                     WHERE id=?1 AND active=1 AND password_hash=?2 AND totp_generation=?3
+                 )",
                 params![
-                    token_hash(session_token),
-                    admin_id,
-                    times.now,
-                    times.idle_cutoff,
+                    proof.admin_id(),
                     expected_password_hash,
                     expected_totp_generation,
                 ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let Some(username) = username else {
-            transaction.rollback()?;
-            return Ok(AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected);
-        };
-        if !consume_admin_totp_step(&transaction, admin_id, totp_step)? {
-            transaction.commit()?;
-            return Ok(AdminWebauthnCredentialDeletionOutcome::TotpRejected);
-        }
-        let deleted = transaction.execute(
-            "DELETE FROM admin_webauthn_credentials
-             WHERE id=?1 AND admin_id=?2
-               AND (SELECT COUNT(*) FROM admin_webauthn_credentials WHERE admin_id=?2) <> 2",
-            params![id, admin_id],
-        )? == 1;
-        if !deleted {
-            transaction.rollback()?;
-            return Ok(AdminWebauthnCredentialDeletionOutcome::NotDeleted);
-        }
-        revoke_admin_auth_state(&transaction, admin_id)?;
-        let object_id = id.to_string();
-        let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::new(
-            AuditAction::WebauthnCredentialDeleted,
-            Some(object_id),
-            None,
-        )];
-        insert_required_audits(&transaction, &audit_context, &audit_events)?;
-        transaction.commit()?;
-        trace_required_audits(&audit_context, &audit_events);
-        Ok(AdminWebauthnCredentialDeletionOutcome::Deleted)
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !reauthentication_matches {
+                return Ok((
+                    AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected,
+                    Vec::new(),
+                ));
+            }
+            // Preserve the security error ordering of the original atomic
+            // implementation: a replayed TOTP must not be masked by the
+            // credential-count policy. This check does not consume a fresh
+            // step, so a policy-rejected deletion can still be retried after
+            // another key has been registered.
+            if !admin_totp_step_is_fresh(transaction, proof.admin_id(), totp_step)? {
+                return Ok((
+                    AdminWebauthnCredentialDeletionOutcome::TotpRejected,
+                    Vec::new(),
+                ));
+            }
+            let deletable = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM admin_webauthn_credentials
+                     WHERE id=?1 AND admin_id=?2
+                       AND (SELECT COUNT(*) FROM admin_webauthn_credentials WHERE admin_id=?2) <> 2
+                 )",
+                params![id, proof.admin_id()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !deletable {
+                return Ok((
+                    AdminWebauthnCredentialDeletionOutcome::NotDeleted,
+                    Vec::new(),
+                ));
+            }
+            if !consume_admin_totp_step(transaction, proof.admin_id(), totp_step)? {
+                return Ok((
+                    AdminWebauthnCredentialDeletionOutcome::TotpRejected,
+                    Vec::new(),
+                ));
+            }
+            if transaction.execute(
+                "DELETE FROM admin_webauthn_credentials WHERE id=?1 AND admin_id=?2",
+                params![id, proof.admin_id()],
+            )? != 1
+            {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            revoke_admin_auth_state(transaction, proof.admin_id())?;
+            Ok((
+                AdminWebauthnCredentialDeletionOutcome::Deleted,
+                vec![RequiredAuditEvent::new(
+                    AuditAction::WebauthnCredentialDeleted,
+                    Some(id.to_string()),
+                    None,
+                )],
+            ))
+        })
     }
 
+    #[cfg(test)]
     pub fn delete_admin_webauthn_credential_without_totp(
         &self,
         session_token: &str,
@@ -1271,61 +1794,90 @@ impl Database {
         expected_password_hash: &str,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminWebauthnCredentialDeletionOutcome> {
-        let times = self.session_times(Utc::now());
-        let mut connection = self.try_conn()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let username = transaction
+        let proof = MfaSessionProof::from_token(session_token, admin_id);
+        Ok(
+            match self.delete_admin_webauthn_credential_without_totp_for_mfa_session(
+                &proof,
+                id,
+                expected_password_hash,
+                client_ip,
+            )? {
+                SessionBound::Authorized(outcome) => outcome,
+                SessionBound::SessionUnavailable => {
+                    AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected
+                }
+            },
+        )
+    }
+
+    pub(crate) fn delete_admin_webauthn_credential_without_totp_for_mfa_session(
+        &self,
+        proof: &MfaSessionProof,
+        id: i64,
+        expected_password_hash: &str,
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<SessionBound<AdminWebauthnCredentialDeletionOutcome>> {
+        let username = self
+            .try_conn()?
             .query_row(
-                "SELECT admins.username
-                 FROM sessions
-                 JOIN admins ON admins.id=sessions.admin_id
-                 WHERE sessions.token_hash=?1
-                   AND sessions.admin_id=?2
-                   AND sessions.mfa_verified=1
-                   AND sessions.expires_at>?3
-                   AND sessions.last_activity_at>?4
-                   AND admins.active=1
-                   AND admins.password_hash=?5
-                   AND admins.totp_enabled=0",
-                params![
-                    token_hash(session_token),
-                    admin_id,
-                    times.now,
-                    times.idle_cutoff,
-                    expected_password_hash,
-                ],
+                "SELECT username FROM admins WHERE id=?1",
+                [proof.admin_id()],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?;
-        let Some(username) = username else {
-            transaction.rollback()?;
-            return Ok(AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected);
-        };
-        let deleted = transaction.execute(
-            "DELETE FROM admin_webauthn_credentials
-             WHERE id=?1 AND admin_id=?2
-               AND (SELECT COUNT(*) FROM admin_webauthn_credentials WHERE admin_id=?2) > 2",
-            params![id, admin_id],
-        )? == 1;
-        if !deleted {
-            transaction.rollback()?;
-            return Ok(AdminWebauthnCredentialDeletionOutcome::NotDeleted);
-        }
-        revoke_admin_auth_state(&transaction, admin_id)?;
-        let object_id = id.to_string();
-        let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::new(
-            AuditAction::WebauthnCredentialDeleted,
-            Some(object_id),
-            Some("totp_disabled".into()),
-        )];
-        insert_required_audits(&transaction, &audit_context, &audit_events)?;
-        transaction.commit()?;
-        trace_required_audits(&audit_context, &audit_events);
-        Ok(AdminWebauthnCredentialDeletionOutcome::Deleted)
+            .optional()?
+            .unwrap_or_default();
+        let audit_context = AuditContext::new(username, client_ip.map(str::to_string));
+        self.required_transaction_for_mfa_session(proof, &audit_context, |transaction| {
+            let reauthentication_matches = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM admins
+                     WHERE id=?1 AND active=1 AND password_hash=?2 AND totp_enabled=0
+                 )",
+                params![proof.admin_id(), expected_password_hash],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !reauthentication_matches {
+                return Ok((
+                    AdminWebauthnCredentialDeletionOutcome::ReauthenticationRejected,
+                    Vec::new(),
+                ));
+            }
+            let deletable = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM admin_webauthn_credentials
+                     WHERE id=?1 AND admin_id=?2
+                       AND (SELECT COUNT(*) FROM admin_webauthn_credentials WHERE admin_id=?2) > 2
+                 )",
+                params![id, proof.admin_id()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !deletable {
+                return Ok((
+                    AdminWebauthnCredentialDeletionOutcome::NotDeleted,
+                    Vec::new(),
+                ));
+            }
+            if transaction.execute(
+                "DELETE FROM admin_webauthn_credentials WHERE id=?1 AND admin_id=?2",
+                params![id, proof.admin_id()],
+            )? != 1
+            {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            revoke_admin_auth_state(transaction, proof.admin_id())?;
+            Ok((
+                AdminWebauthnCredentialDeletionOutcome::Deleted,
+                vec![RequiredAuditEvent::new(
+                    AuditAction::WebauthnCredentialDeleted,
+                    Some(id.to_string()),
+                    Some("totp_disabled".into()),
+                )],
+            ))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn set_admin_totp_enabled_with_reauthentication(
         &self,
         session_token: &str,
@@ -1336,82 +1888,105 @@ impl Database {
         totp_step: Option<u64>,
         client_ip: Option<&str>,
     ) -> rusqlite::Result<AdminTotpSettingOutcome> {
-        let times = self.session_times(Utc::now());
-        let mut connection = self.try_conn()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = transaction
+        let proof = MfaSessionProof::from_token(session_token, admin_id);
+        Ok(
+            match self.set_admin_totp_enabled_with_reauthentication_for_mfa_session(
+                &proof,
+                expected_password_hash,
+                expected_totp_generation,
+                enabled,
+                totp_step,
+                client_ip,
+            )? {
+                SessionBound::Authorized(outcome) => outcome,
+                SessionBound::SessionUnavailable => {
+                    AdminTotpSettingOutcome::ReauthenticationRejected
+                }
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn set_admin_totp_enabled_with_reauthentication_for_mfa_session(
+        &self,
+        proof: &MfaSessionProof,
+        expected_password_hash: &str,
+        expected_totp_generation: u64,
+        enabled: bool,
+        totp_step: Option<u64>,
+        client_ip: Option<&str>,
+    ) -> rusqlite::Result<SessionBound<AdminTotpSettingOutcome>> {
+        let username = self
+            .try_conn()?
             .query_row(
-                "SELECT admins.username,admins.totp_enabled
-                 FROM sessions
-                 JOIN admins ON admins.id=sessions.admin_id
-                 WHERE sessions.token_hash=?1
-                   AND sessions.admin_id=?2
-                   AND sessions.mfa_verified=1
-                   AND sessions.expires_at>?3
-                   AND sessions.last_activity_at>?4
-                   AND admins.active=1
-                   AND admins.password_hash=?5
-                   AND admins.totp_generation=?6",
-                params![
-                    token_hash(session_token),
-                    admin_id,
-                    times.now,
-                    times.idle_cutoff,
-                    expected_password_hash,
-                    expected_totp_generation,
-                ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+                "SELECT username FROM admins WHERE id=?1",
+                [proof.admin_id()],
+                |row| row.get::<_, String>(0),
             )
-            .optional()?;
-        let Some((username, currently_enabled)) = current else {
-            transaction.rollback()?;
-            return Ok(AdminTotpSettingOutcome::ReauthenticationRejected);
-        };
-        if currently_enabled == enabled {
-            transaction.rollback()?;
-            return Ok(AdminTotpSettingOutcome::Unchanged);
-        }
-        if !enabled {
-            let key_count: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM admin_webauthn_credentials WHERE admin_id=?1",
-                [admin_id],
-                |row| row.get(0),
-            )?;
-            if key_count < 2 {
-                transaction.rollback()?;
-                return Ok(AdminTotpSettingOutcome::InsufficientSecurityKeys);
-            }
-            let Some(step) = totp_step else {
-                transaction.rollback()?;
-                return Ok(AdminTotpSettingOutcome::TotpRejected);
+            .optional()?
+            .unwrap_or_default();
+        let audit_context = AuditContext::new(username, client_ip.map(str::to_string));
+        self.required_transaction_for_mfa_session(proof, &audit_context, |transaction| {
+            let current = transaction
+                .query_row(
+                    "SELECT totp_enabled FROM admins
+                     WHERE id=?1 AND active=1 AND password_hash=?2 AND totp_generation=?3",
+                    params![
+                        proof.admin_id(),
+                        expected_password_hash,
+                        expected_totp_generation,
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            let Some(currently_enabled) = current else {
+                return Ok((
+                    AdminTotpSettingOutcome::ReauthenticationRejected,
+                    Vec::new(),
+                ));
             };
-            if !consume_admin_totp_step(&transaction, admin_id, step)? {
-                transaction.commit()?;
-                return Ok(AdminTotpSettingOutcome::TotpRejected);
+            if currently_enabled == enabled {
+                return Ok((AdminTotpSettingOutcome::Unchanged, Vec::new()));
             }
-        }
-        let changed = transaction.execute(
-            "UPDATE admins SET totp_enabled=?2 WHERE id=?1 AND totp_enabled<>?2",
-            params![admin_id, enabled],
-        )?;
-        if changed != 1 {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        let action = if enabled {
-            AuditAction::AdminTotpEnabled
-        } else {
-            AuditAction::AdminTotpDisabled
-        };
-        let audit_context = AuditContext::new(&username, client_ip.map(str::to_string));
-        let audit_events = [RequiredAuditEvent::new(
-            action,
-            Some(admin_id.to_string()),
-            None,
-        )];
-        insert_required_audits(&transaction, &audit_context, &audit_events)?;
-        transaction.commit()?;
-        trace_required_audits(&audit_context, &audit_events);
-        Ok(AdminTotpSettingOutcome::Updated)
+            if !enabled {
+                let key_count: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM admin_webauthn_credentials WHERE admin_id=?1",
+                    [proof.admin_id()],
+                    |row| row.get(0),
+                )?;
+                if key_count < 2 {
+                    return Ok((
+                        AdminTotpSettingOutcome::InsufficientSecurityKeys,
+                        Vec::new(),
+                    ));
+                }
+                let Some(step) = totp_step else {
+                    return Ok((AdminTotpSettingOutcome::TotpRejected, Vec::new()));
+                };
+                if !consume_admin_totp_step(transaction, proof.admin_id(), step)? {
+                    return Ok((AdminTotpSettingOutcome::TotpRejected, Vec::new()));
+                }
+            }
+            if transaction.execute(
+                "UPDATE admins SET totp_enabled=?2 WHERE id=?1 AND totp_enabled<>?2",
+                params![proof.admin_id(), enabled],
+            )? != 1
+            {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            Ok((
+                AdminTotpSettingOutcome::Updated,
+                vec![RequiredAuditEvent::new(
+                    if enabled {
+                        AuditAction::AdminTotpEnabled
+                    } else {
+                        AuditAction::AdminTotpDisabled
+                    },
+                    Some(proof.admin_id().to_string()),
+                    None,
+                )],
+            ))
+        })
     }
     #[cfg(test)]
     pub fn create_session(
@@ -1549,6 +2124,23 @@ impl Database {
         self.session_at(token, Utc::now())
     }
 
+    /// Loads and touches the session and, only after the database has verified
+    /// MFA, binds it to the opaque proof used at the later commit boundary.
+    pub(crate) fn authenticated_mfa_session(
+        &self,
+        token: &str,
+    ) -> rusqlite::Result<Option<MfaSessionAuthentication>> {
+        let Some(session) = self.session(token)? else {
+            return Ok(None);
+        };
+        if !session.mfa_verified {
+            return Ok(Some(MfaSessionAuthentication::MfaRequired));
+        }
+        Ok(Some(MfaSessionAuthentication::Authenticated(
+            AuthenticatedMfaSession::new(token, session),
+        )))
+    }
+
     fn session_at(&self, token: &str, now: DateTime<Utc>) -> rusqlite::Result<Option<Session>> {
         let times = self.session_times(now);
         let session_token_hash = token_hash(token);
@@ -1614,41 +2206,105 @@ impl Database {
         Ok(())
     }
 
-    /// Runs `operation` only while the exact MFA session is still authorized.
+    /// Executes one audited database mutation only if the exact MFA session is
+    /// still live after this connection has acquired SQLite's writer slot.
     ///
-    /// The database connection mutex remains held until `operation` returns. Callers
-    /// can therefore linearize a non-database security-sensitive commit with logout,
-    /// credential reset and administrator deactivation, all of which use the same
-    /// connection mutex.
-    pub fn with_live_mfa_session<T>(
+    /// The session predicate, mutation and required audit events share one
+    /// `BEGIN IMMEDIATE` transaction. Session revocation therefore either wins
+    /// before the predicate (and the closure is never called), or waits until
+    /// the complete authorized mutation has committed.
+    ///
+    /// Callers must acquire application-level mutation locks before entering
+    /// this method. The closure must use the supplied transaction instead of
+    /// checking out another database connection, which keeps lock ordering
+    /// deterministic and avoids pool/SQLite lock inversion.
+    pub(crate) fn required_transaction_for_mfa_session<T, E, F>(
         &self,
-        token: &str,
-        admin_id: i64,
-        operation: impl FnOnce() -> T,
-    ) -> rusqlite::Result<Option<T>> {
+        proof: &MfaSessionProof,
+        context: &AuditContext,
+        operation: F,
+    ) -> Result<SessionBound<T>, E>
+    where
+        E: From<rusqlite::Error>,
+        F: FnOnce(&Transaction<'_>) -> Result<(T, Vec<RequiredAuditEvent>), E>,
+    {
+        self.required_transaction_for_mfa_session_with_commit(proof, context, operation, |_| {})
+    }
+
+    /// Variant for a transaction-coupled in-memory publication. `committed`
+    /// must only disarm the publication's rollback guard; the visible snapshot
+    /// itself is installed by `operation` while the writer transaction is
+    /// still open. It is invoked immediately after a successful COMMIT and
+    /// before tracing or any other post-commit work can unwind.
+    pub(crate) fn required_transaction_for_mfa_session_with_commit<T, E, F, C>(
+        &self,
+        proof: &MfaSessionProof,
+        context: &AuditContext,
+        operation: F,
+        committed: C,
+    ) -> Result<SessionBound<T>, E>
+    where
+        E: From<rusqlite::Error>,
+        F: FnOnce(&Transaction<'_>) -> Result<(T, Vec<RequiredAuditEvent>), E>,
+        C: FnOnce(&mut T),
+    {
+        let mut connection = self.try_conn()?;
+        let mut transaction =
+            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let times = self.session_times(Utc::now());
-        let connection = self.try_conn()?;
-        let live = connection.query_row(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM sessions
-                 JOIN admins ON admins.id=sessions.admin_id
-                 WHERE sessions.token_hash=?1
-                   AND sessions.admin_id=?2
-                   AND sessions.mfa_verified=1
-                   AND sessions.expires_at>?3
-                   AND sessions.last_activity_at>?4
-                   AND admins.active=1
-             )",
-            params![token_hash(token), admin_id, times.now, times.idle_cutoff,],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !live {
-            return Ok(None);
+        if !live_mfa_session(&transaction, proof, &times)? {
+            transaction.rollback()?;
+            return Ok(SessionBound::SessionUnavailable);
         }
-        let outcome = operation();
-        drop(connection);
-        Ok(Some(outcome))
+        let (outcome, events) = operation(&transaction)?;
+        insert_required_audits(&transaction, context, &events)?;
+        // Commit without consuming `transaction`.  If COMMIT fails, drop the
+        // operation outcome first: snapshot-publication outcomes use `Drop`
+        // to restore their previous in-memory value while SQLite's writer
+        // fence is still held.  Only then may the transaction roll back and a
+        // waiting revocation proceed.
+        if let Err(error) = transaction.execute_batch("COMMIT") {
+            drop(outcome);
+            drop(events);
+            let _ = transaction.rollback();
+            return Err(error.into());
+        }
+        let mut outcome = outcome;
+        committed(&mut outcome);
+        transaction.set_drop_behavior(DropBehavior::Ignore);
+        drop(transaction);
+        trace_required_audits(context, &events);
+        Ok(SessionBound::Authorized(outcome))
+    }
+
+    /// Holds SQLite's writer slot from the exact-session check through one
+    /// non-database commit, such as publishing a staged upload.
+    ///
+    /// This transaction is intentionally rollback-only: it exists as a
+    /// cross-connection and cross-process authorization fence and makes no
+    /// database changes of its own. As above, callers acquire any application
+    /// mutation lock before entering the fence and the closure must not perform
+    /// nested database work.
+    pub(crate) fn with_live_mfa_fence<T, E>(
+        &self,
+        proof: &MfaSessionProof,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<SessionBound<T>, E>
+    where
+        E: From<rusqlite::Error>,
+    {
+        let mut connection = self.try_conn()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let times = self.session_times(Utc::now());
+        if !live_mfa_session(&transaction, proof, &times)? {
+            transaction.rollback()?;
+            return Ok(SessionBound::SessionUnavailable);
+        }
+        let outcome = operation()?;
+        // Dropping the read-only IMMEDIATE transaction releases the writer
+        // fence without creating a misleading durable database mutation.
+        drop(transaction);
+        Ok(SessionBound::Authorized(outcome))
     }
 
     /// Consumes a TOTP counter and verifies exactly the bound, unexpired session.

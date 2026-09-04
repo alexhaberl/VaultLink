@@ -185,6 +185,18 @@ impl SecureDirectory {
             _storage_instance_lock: self._storage_instance_lock.clone(),
             #[cfg(test)]
             next_create_directory_sync_error: self.next_create_directory_sync_error.clone(),
+            #[cfg(test)]
+            next_create_directory_mkdir_error: self.next_create_directory_mkdir_error.clone(),
+            #[cfg(test)]
+            next_create_directory_probe_error: self.next_create_directory_probe_error.clone(),
+            #[cfg(test)]
+            next_upload_publication_rename_error: self.next_upload_publication_rename_error.clone(),
+            #[cfg(test)]
+            next_upload_publication_identity_probe_errors: self
+                .next_upload_publication_identity_probe_errors
+                .clone(),
+            #[cfg(test)]
+            after_directory_tree_create_hook: self.after_directory_tree_create_hook.clone(),
         })
     }
 

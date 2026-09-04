@@ -4,14 +4,17 @@ use std::{
     collections::HashMap,
     future::Future,
     net::{IpAddr, Ipv4Addr},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLockWriteGuard},
 };
 
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::{
     auth,
-    db::{AuditAction, AuditContext, Database, Session, Share},
+    db::{
+        AuditAction, AuditContext, AuthenticatedMfaSession, Database, MfaSessionProof, Session,
+        SessionBound, Share,
+    },
     runtime::RuntimeSettings,
     AppState,
 };
@@ -21,6 +24,7 @@ pub const SECURE_SESSION_COOKIE: &str = "__Host-vaultlink_session";
 pub(crate) const AUDIT_UNAVAILABLE_MESSAGE: &str = "Security audit log temporarily unavailable";
 pub(crate) const ARGON2_BUSY_MESSAGE: &str = "Password processing temporarily unavailable";
 pub(crate) const SERVICE_TOKEN_PREFIX: &str = "vlk_st_v1_";
+pub(crate) const DATABASE_BUSY_MESSAGE: &str = "Database temporarily unavailable";
 const TRANSFER_COOKIE_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 
 tokio::task_local! {
@@ -139,6 +143,7 @@ pub struct HttpAuthError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpAuthErrorKind {
     Request,
+    SessionRevoked,
     AuditUnavailable,
     CapacityUnavailable,
     AmbiguousAuthentication,
@@ -256,7 +261,7 @@ pub(crate) async fn password_login_admitted(
     })
     .await
     .map_err(internal)?
-    .map_err(required_database_error)
+    .map_err(database_error)
 }
 
 pub async fn database<T, F>(database: Database, operation: F) -> Result<T>
@@ -267,7 +272,7 @@ where
     tokio::task::spawn_blocking(move || operation(database))
         .await
         .map_err(internal)?
-        .map_err(internal)
+        .map_err(database_error)
 }
 
 pub async fn required_database<T, F>(database: Database, operation: F) -> Result<T>
@@ -278,10 +283,10 @@ where
     tokio::task::spawn_blocking(move || operation(database))
         .await
         .map_err(internal)?
-        .map_err(required_database_error)
+        .map_err(database_error)
 }
 
-fn required_database_error(error: rusqlite::Error) -> HttpAuthError {
+pub(crate) fn database_error(error: rusqlite::Error) -> HttpAuthError {
     if crate::db::is_audit_unavailable(&error) {
         tracing::error!(
             error = %error,
@@ -291,6 +296,13 @@ fn required_database_error(error: rusqlite::Error) -> HttpAuthError {
             StatusCode::SERVICE_UNAVAILABLE,
             AUDIT_UNAVAILABLE_MESSAGE,
             HttpAuthErrorKind::AuditUnavailable,
+        )
+    } else if crate::db::is_sqlite_busy_or_locked(&error) {
+        tracing::warn!(error = %error, "database operation timed out waiting for SQLite capacity");
+        HttpAuthError::with_kind(
+            StatusCode::SERVICE_UNAVAILABLE,
+            DATABASE_BUSY_MESSAGE,
+            HttpAuthErrorKind::CapacityUnavailable,
         )
     } else {
         internal(error)
@@ -394,13 +406,68 @@ pub fn webauthn_service(state: &AppState) -> Result<crate::webauthn::WebAuthnSer
     }
 }
 
-pub async fn commit_runtime_settings(
+/// Keeps the previous in-memory settings snapshots available until SQLite's
+/// required-audit transaction has committed. If audit insertion or COMMIT
+/// fails, `Drop` restores both snapshots before the transaction releases its
+/// writer fence, so a waiting revocation can never observe a later publication.
+struct RuntimeSettingsPublication<'a> {
+    runtime: RwLockWriteGuard<'a, RuntimeSettings>,
+    previous_runtime: Option<RuntimeSettings>,
+    webauthn: Option<RwLockWriteGuard<'a, crate::webauthn::WebAuthnService>>,
+    previous_webauthn: Option<crate::webauthn::WebAuthnService>,
+}
+
+impl<'a> RuntimeSettingsPublication<'a> {
+    fn publish(
+        mut runtime: RwLockWriteGuard<'a, RuntimeSettings>,
+        next: RuntimeSettings,
+        mut webauthn: Option<RwLockWriteGuard<'a, crate::webauthn::WebAuthnService>>,
+        replacement_webauthn: Option<crate::webauthn::WebAuthnService>,
+    ) -> Self {
+        let previous_runtime = Some(std::mem::replace(&mut *runtime, next));
+        let previous_webauthn = match (webauthn.as_mut(), replacement_webauthn) {
+            (Some(current), Some(replacement)) => {
+                Some(std::mem::replace(&mut **current, replacement))
+            }
+            (None, None) => None,
+            _ => unreachable!("WebAuthn snapshot lock and replacement must agree"),
+        };
+        Self {
+            runtime,
+            previous_runtime,
+            webauthn,
+            previous_webauthn,
+        }
+    }
+}
+
+impl crate::db::CommitPublication for RuntimeSettingsPublication<'_> {
+    fn accept_commit(&mut self) {
+        self.previous_runtime = None;
+        self.previous_webauthn = None;
+    }
+}
+
+impl Drop for RuntimeSettingsPublication<'_> {
+    fn drop(&mut self) {
+        if let (Some(current), Some(previous)) =
+            (self.webauthn.as_mut(), self.previous_webauthn.take())
+        {
+            **current = previous;
+        }
+        if let Some(previous) = self.previous_runtime.take() {
+            *self.runtime = previous;
+        }
+    }
+}
+
+pub(crate) async fn commit_runtime_settings(
     state: &AppState,
+    proof: MfaSessionProof,
     next: RuntimeSettings,
-    admin_id: i64,
     audit_actor: String,
     audit_detail: String,
-) -> Result<()> {
+) -> Result<SessionBound<()>> {
     let security_settings_guard = state.security_settings_mutation.clone().lock_owned().await;
     next.validate_for_config(&state.config)
         .map_err(|_| HttpAuthError::status(StatusCode::BAD_REQUEST, "Invalid setting"))?;
@@ -430,6 +497,9 @@ pub async fn commit_runtime_settings(
     }
     let runtime = state.runtime.clone();
     let webauthn = state.webauthn.clone();
+    let replace_webauthn = replacement_webauthn.is_some();
+    #[cfg(test)]
+    let settings_publication_barrier = state.settings_publication_barrier.clone();
     // Match the previous post-commit audit semantics: an update that enables
     // client-IP auditing may record this request, while a disabling update may
     // not. The database still re-checks the persisted setting at insert time.
@@ -444,36 +514,64 @@ pub async fn commit_runtime_settings(
         // operation keeps this owned guard until the runtime/WebAuthn snapshot
         // and SQLite commit have advanced together.
         let _security_settings_guard = security_settings_guard;
-        // Settings commits always acquire locks in Runtime -> Database order. Readers
-        // therefore see the old snapshot until SQLite has committed the replacement.
-        let mut current = match runtime.write() {
+        // Settings commits always acquire locks in Runtime -> WebAuthn -> Database
+        // order. The publication guard rolls both snapshots back on any required-
+        // audit or COMMIT failure before SQLite admits a waiting revocation.
+        let current = match runtime.write() {
             Ok(current) => current,
             Err(poisoned) => {
                 tracing::error!("replacing poisoned runtime settings snapshot");
                 poisoned.into_inner()
             }
         };
-        let pairs = next.pairs();
-        database.replace_runtime_settings_and_audit(
-            &pairs,
-            admin_id,
-            &audit_context,
-            audit_detail,
-        )?;
-        *current = next;
-        runtime.clear_poison();
-        if let Some(replacement) = replacement_webauthn {
-            let mut service = match webauthn.write() {
+        let current_webauthn = if replacement_webauthn.is_some() {
+            Some(match webauthn.write() {
                 Ok(service) => service,
                 Err(poisoned) => {
                     tracing::error!("replacing poisoned WebAuthn service snapshot");
                     poisoned.into_inner()
                 }
-            };
-            *service = replacement;
-            webauthn.clear_poison();
+            })
+        } else {
+            None
+        };
+        let pairs = next.pairs();
+        let outcome = database.replace_runtime_settings_for_mfa_session(
+            &proof,
+            &pairs,
+            &audit_context,
+            audit_detail,
+            || {
+                #[cfg(test)]
+                {
+                    let mut barrier = match settings_publication_barrier.lock() {
+                        Ok(barrier) => barrier,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if let Some((entered, release)) = barrier.take() {
+                        let _ = entered.send(());
+                        let _ = release.recv();
+                    }
+                }
+                RuntimeSettingsPublication::publish(
+                    current,
+                    next,
+                    current_webauthn,
+                    replacement_webauthn,
+                )
+            },
+        )?;
+        match outcome {
+            SessionBound::Authorized(publication) => {
+                runtime.clear_poison();
+                if replace_webauthn {
+                    webauthn.clear_poison();
+                }
+                drop(publication);
+                Ok(SessionBound::Authorized(()))
+            }
+            SessionBound::SessionUnavailable => Ok(SessionBound::SessionUnavailable),
         }
-        Ok(())
     })
     .await
 }
@@ -654,11 +752,12 @@ pub async fn session(
     let session_token = token.to_string();
     let session = database(state.db.clone(), move |db| db.session(&session_token))
         .await?
-        .ok_or_else(|| match missing {
-            MissingSession::RedirectToLogin => HttpAuthError::redirect("/login"),
-            MissingSession::Unauthorized => {
-                HttpAuthError::status(StatusCode::UNAUTHORIZED, "Sign-in required")
-            }
+        .ok_or_else(|| {
+            HttpAuthError::with_kind(
+                StatusCode::UNAUTHORIZED,
+                "Session is no longer authorized",
+                HttpAuthErrorKind::SessionRevoked,
+            )
         })?;
     if require_mfa && !session.mfa_verified {
         return Err(HttpAuthError::status(
@@ -667,6 +766,40 @@ pub async fn session(
         ));
     }
     Ok((token.to_string(), session))
+}
+
+/// Performs the request-bound MFA check and retains only an opaque hash proof
+/// of the exact session for the later commit-time revalidation.
+pub(crate) async fn mfa_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    missing: MissingSession,
+) -> Result<AuthenticatedMfaSession> {
+    let token = session_cookie(state, headers).ok_or_else(|| match missing {
+        MissingSession::RedirectToLogin => HttpAuthError::redirect("/login"),
+        MissingSession::Unauthorized => {
+            HttpAuthError::status(StatusCode::UNAUTHORIZED, "Sign-in required")
+        }
+    })?;
+    let session_token = token.to_string();
+    let authenticated = database(state.db.clone(), move |database| {
+        database.authenticated_mfa_session(&session_token)
+    })
+    .await?
+    .ok_or_else(|| {
+        HttpAuthError::with_kind(
+            StatusCode::UNAUTHORIZED,
+            "Session is no longer authorized",
+            HttpAuthErrorKind::SessionRevoked,
+        )
+    })?;
+    match authenticated {
+        crate::db::MfaSessionAuthentication::Authenticated(authenticated) => Ok(authenticated),
+        crate::db::MfaSessionAuthentication::MfaRequired => Err(HttpAuthError::status(
+            StatusCode::FORBIDDEN,
+            "MFA verification required",
+        )),
+    }
 }
 
 pub fn csrf(session: &Session, value: &str) -> Result<()> {
@@ -931,6 +1064,45 @@ mod tests {
             exact_authorization(&joined),
             ExactHeader::Ambiguous
         ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_database_busy_and_locked_errors_are_retryable_capacity_failures() {
+        fn sqlite_capacity_error(code: i32) -> rusqlite::Error {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+        }
+
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_BUSY_TIMEOUT,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE,
+        ] {
+            assert!(crate::db::is_sqlite_busy_or_locked(&sqlite_capacity_error(
+                code
+            )));
+            let mapped = database(Database::open(":memory:").unwrap(), move |_| {
+                Err::<(), _>(sqlite_capacity_error(code))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(mapped.kind, HttpAuthErrorKind::CapacityUnavailable);
+            assert_eq!(mapped.message, DATABASE_BUSY_MESSAGE);
+
+            let response = crate::web::AppError::from(mapped).into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+
+            let required_mapped =
+                required_database(Database::open(":memory:").unwrap(), move |_| {
+                    Err::<(), _>(sqlite_capacity_error(code))
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(required_mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(required_mapped.kind, HttpAuthErrorKind::CapacityUnavailable);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

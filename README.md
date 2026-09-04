@@ -506,7 +506,7 @@ Open the printed IPv4 tunnel in a second local terminal:
 ssh -4 -N -L 127.0.0.1:8090:127.0.0.1:8090 admin@server.example.com
 ```
 
-Open `http://127.0.0.1:8090/?token=...` locally. After safely storing the TOTP secret, stop setup with Ctrl+C instead of starting the server directly, then install the generated configuration and start the service:
+Open `http://127.0.0.1:8090/#token=...` locally. The fragment keeps the one-time token out of the HTTP request and browser history after bootstrap. After safely storing the TOTP secret, stop setup with Ctrl+C instead of starting the server directly, then install the generated configuration and start the service:
 
 ```sh
 sudo install -o root -g vaultlink -m 0640 \

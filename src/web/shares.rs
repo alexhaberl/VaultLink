@@ -28,8 +28,8 @@ use crate::{
     },
     file_ops,
     http_auth::{
-        csrf, current_audit_client_ip, database, hash_password_admitted, runtime_settings, session,
-        MissingSession,
+        csrf, current_audit_client_ip, database, hash_password_admitted, mfa_session,
+        runtime_settings, session, MissingSession,
     },
     i18n::{self},
     path_security,
@@ -444,8 +444,8 @@ pub(super) async fn create_share(
     headers: HeaderMap,
     Form(f): Form<CreateShare>,
 ) -> Result<Redirect> {
-    let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    csrf(&s, &f.csrf)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    csrf(&authenticated, &f.csrf)?;
     let settings = runtime_settings(&state);
     let service = ShareService::new(
         state.db.clone(),
@@ -557,7 +557,7 @@ pub(super) async fn create_share(
             max_upload_files,
             password,
             overwrite_allowed,
-            created_by: s.admin_id,
+            created_by: authenticated.admin_id,
         })
         .map_err(share_service_app_error)?;
     let (prepared, password) = validated.into_password_hash_input();
@@ -592,31 +592,43 @@ pub(super) async fn create_share(
             "Target changed during processing",
         ));
     }
-    let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
-    let username = s.username;
+    let authority_mutation =
+        ShareAuthorityMutation::from_guard(&state, storage_guard, authenticated.proof().clone());
+    let username = authenticated.username.clone();
     let audit_client_ip = settings
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    authority_mutation
-        .commit(move |_| {
+    let created = authority_mutation
+        .commit(move |_, proof| {
             // Keep target revalidation and the non-cancellable SQLite create
             // serialized even when the client disconnects mid-request.
-            service
-                .create(prepared, password_hash.as_deref(), &audit_context)
-                .map(drop)
-                .map_err(share_service_database_error)
-        })
-        .await
-        .map_err(|error| {
-            if error.status == StatusCode::SERVICE_UNAVAILABLE {
-                AppError::from(error)
-            } else {
-                AppError(StatusCode::CONFLICT, "Token or alias already exists")
+            match service.create_for_mfa_session(
+                &proof,
+                prepared,
+                password_hash.as_deref(),
+                &audit_context,
+            ) {
+                Ok(created) => Ok(created.map(Some)),
+                Err(error) => {
+                    let error = share_service_database_error(error);
+                    if crate::db::is_sqlite_unique_constraint(&error) {
+                        Ok(crate::db::SessionBound::Authorized(None))
+                    } else {
+                        Err(error)
+                    }
+                }
             }
-        })?;
+        })
+        .await?;
+    if crate::web::session_bound(created)?.is_none() {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "Token or alias already exists",
+        ));
+    }
     Ok(Redirect::to("/admin/shares"))
 }
 
@@ -686,25 +698,34 @@ pub(super) async fn toggle_share(
     AxPath(id): AxPath<i64>,
     Form(f): Form<CsrfForm>,
 ) -> Result<Redirect> {
-    let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    csrf(&s, &f.csrf)?;
-    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    csrf(&authenticated, &f.csrf)?;
+    let authority_mutation =
+        ShareAuthorityMutation::acquire(&state, authenticated.proof().clone()).await;
     let sh = database(state.db.clone(), move |db| db.share_by_id(id))
         .await?
         .ok_or(AppError(StatusCode::NOT_FOUND, "Link not found"))?;
     let active = !sh.active;
-    let username = s.username;
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let changed = authority_mutation
-        .commit(move |db| {
-            db.set_share_active_and_audit(id, active, &audit_context, AuditAction::ShareToggled)
-        })
-        .await?;
+    let changed = crate::web::session_bound(
+        authority_mutation
+            .commit(move |db, proof| {
+                db.set_share_active_for_mfa_session(
+                    &proof,
+                    id,
+                    active,
+                    &audit_context,
+                    AuditAction::ShareToggled,
+                )
+            })
+            .await?,
+    )?;
     if !changed {
         return Err(AppError(StatusCode::NOT_FOUND, "Link not found"));
     }
@@ -726,8 +747,8 @@ pub(super) async fn set_share_upload_conflict(
     AxPath(id): AxPath<i64>,
     Form(form): Form<UploadConflictForm>,
 ) -> Result<Redirect> {
-    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    csrf(&session, &form.csrf)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    csrf(&authenticated, &form.csrf)?;
     let strategy = if let Some(strategy) = form.strategy.as_deref() {
         UploadConflictStrategy::parse(strategy).ok_or(AppError(
             StatusCode::BAD_REQUEST,
@@ -744,7 +765,8 @@ pub(super) async fn set_share_upload_conflict(
             "Overwriting is disabled with external storage writers",
         ));
     }
-    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let authority_mutation =
+        ShareAuthorityMutation::acquire(&state, authenticated.proof().clone()).await;
     let share = database(state.db.clone(), move |db| db.share_by_id(id))
         .await?
         .ok_or(AppError(StatusCode::NOT_FOUND, "Link not found"))?;
@@ -797,7 +819,7 @@ pub(super) async fn set_share_upload_conflict(
         ));
     }
     let stored_strategy = strategy.clone();
-    let username = session.username;
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
@@ -812,18 +834,21 @@ pub(super) async fn set_share_upload_conflict(
             strategy.as_str()
         )),
     )];
-    let outcome = authority_mutation
-        .commit(move |db| {
-            db.update_share_controls_and_audit(
-                id,
-                None,
-                Some(&stored_strategy),
-                Some((total_limit, file_limit)),
-                &audit_context,
-                &audit_events,
-            )
-        })
-        .await?;
+    let (outcome, _response_snapshot) = crate::web::session_bound(
+        authority_mutation
+            .commit(move |db, proof| {
+                db.update_share_controls_for_mfa_session(
+                    &proof,
+                    id,
+                    None,
+                    Some(&stored_strategy),
+                    Some((total_limit, file_limit)),
+                    &audit_context,
+                    &audit_events,
+                )
+            })
+            .await?,
+    )?;
     match outcome {
         ShareControlsUpdateOutcome::Updated => {}
         ShareControlsUpdateOutcome::NotFound => {
@@ -853,8 +878,8 @@ pub(super) async fn set_share_password(
     AxPath(id): AxPath<i64>,
     Form(form): Form<SharePasswordForm>,
 ) -> Result<Redirect> {
-    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    csrf(&session, &form.csrf)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    csrf(&authenticated, &form.csrf)?;
     if database(state.db.clone(), move |db| db.share_by_id(id))
         .await?
         .is_none()
@@ -888,19 +913,28 @@ pub(super) async fn set_share_password(
     } else {
         AuditAction::SharePasswordSet
     };
-    let username = session.username;
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
-    let changed = authority_mutation
-        .commit(move |db| {
-            db.set_share_password_and_audit(id, password_hash.as_deref(), &audit_context, action)
-        })
-        .await?;
+    let authority_mutation =
+        ShareAuthorityMutation::acquire(&state, authenticated.proof().clone()).await;
+    let changed = crate::web::session_bound(
+        authority_mutation
+            .commit(move |db, proof| {
+                db.set_share_password_for_mfa_session(
+                    &proof,
+                    id,
+                    password_hash.as_deref(),
+                    &audit_context,
+                    action,
+                )
+            })
+            .await?,
+    )?;
     if !changed {
         return Err(AppError(StatusCode::NOT_FOUND, "Link not found"));
     }
@@ -913,19 +947,22 @@ pub(super) async fn delete_share(
     AxPath(id): AxPath<i64>,
     Form(f): Form<CsrfForm>,
 ) -> Result<Redirect> {
-    let (_, s) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    csrf(&s, &f.csrf)?;
-    let username = s.username;
+    let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    csrf(&authenticated, &f.csrf)?;
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
-    let deleted = authority_mutation
-        .commit(move |db| db.delete_share_and_audit(id, &audit_context))
-        .await?;
+    let authority_mutation =
+        ShareAuthorityMutation::acquire(&state, authenticated.proof().clone()).await;
+    let deleted = crate::web::session_bound(
+        authority_mutation
+            .commit(move |db, proof| db.delete_share_for_mfa_session(&proof, id, &audit_context))
+            .await?,
+    )?;
     if !deleted {
         return Err(AppError(StatusCode::NOT_FOUND, "Link not found"));
     }

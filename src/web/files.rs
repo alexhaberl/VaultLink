@@ -32,7 +32,7 @@ use super::{
     },
     upload::{upload_queue_error_response, UploadQueueSuccess},
     AppError, Result, MAX_RENDERED_TEXT_PREVIEW_BYTES, MAX_SEARCH_QUERY_BYTES,
-    MAX_UPLOAD_OPTION_FIELD_BYTES, MAX_UPLOAD_PATH_FIELD_BYTES,
+    MAX_UPLOAD_OPTION_FIELD_BYTES, MAX_UPLOAD_PATH_FIELD_BYTES, SESSION_REVOKED_MESSAGE,
 };
 
 #[derive(Template)]
@@ -239,12 +239,12 @@ fn admin_file_row_view(
     }
 }
 use crate::{
-    db::{AuditAction, AuditContext},
+    db::{AuditAction, AuditContext, MfaSessionProof, RequiredAuditEvent, SessionBound},
     file_ops,
     http_auth::{
-        audit_observation, clear_session_cookie, csrf, current_audit_client_ip,
-        current_client_limit_key, database, enabled_audit_client_ip, runtime_settings, session,
-        try_acquire_client_activity, with_audit_client_ip, MissingSession,
+        audit_observation, csrf, current_audit_client_ip, current_client_limit_key, database,
+        enabled_audit_client_ip, mfa_session, runtime_settings, session,
+        try_acquire_client_activity, with_audit_client_ip, ClientActivityPermit, MissingSession,
     },
     i18n::{self, Locale},
     path_security,
@@ -285,21 +285,23 @@ pub(super) async fn create_directory_ui(
     headers: HeaderMap,
     Form(form): Form<CreateDirectoryForm>,
 ) -> Result<Redirect> {
-    let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let admin = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&admin, &form.csrf)?;
     let file_service = FileService::new(state.clone());
     let operation_parent = form.parent.clone();
     let operation_name = form.name;
+    let proof = admin.proof().clone();
     let audit_client_ip = current_audit_client_ip();
-    let audit_context = AuditContext::new(admin.username, enabled_audit_client_ip(&state));
+    let audit_context = AuditContext::new(admin.username.clone(), enabled_audit_client_ip(&state));
     let result = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
         file_service
-            .create_directory(&operation_parent, &operation_name, audit_context)
+            .create_directory(proof, &operation_parent, &operation_name, audit_context)
             .await
     }))
     .await
     .map_err(internal)?
     .map_err(file_operation_app_error)?;
+    let result = super::session_bound(result)?;
     Ok(Redirect::to(&browser_redirect(
         &form.parent,
         if result.audit_durability.is_uncertain() {
@@ -315,22 +317,24 @@ pub(super) async fn rename_file_ui(
     headers: HeaderMap,
     Form(form): Form<RenameFileForm>,
 ) -> Result<Redirect> {
-    let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let admin = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&admin, &form.csrf)?;
     let parent = parent_path(&form.path).unwrap_or_default();
     let file_service = FileService::new(state.clone());
     let operation_path = form.path;
     let operation_name = form.name;
+    let proof = admin.proof().clone();
     let audit_client_ip = current_audit_client_ip();
-    let audit_context = AuditContext::new(admin.username, enabled_audit_client_ip(&state));
+    let audit_context = AuditContext::new(admin.username.clone(), enabled_audit_client_ip(&state));
     let result = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
         file_service
-            .rename(&operation_path, &operation_name, audit_context)
+            .rename(proof, &operation_path, &operation_name, audit_context)
             .await
     }))
     .await
     .map_err(internal)?
     .map_err(file_operation_app_error)?;
+    let result = super::session_bound(result)?;
     Ok(Redirect::to(&browser_redirect(
         &parent,
         if result.audit_durability.is_uncertain() {
@@ -346,7 +350,7 @@ pub(super) async fn delete_file_confirmation(
     headers: HeaderMap,
     Query(query): Query<DeleteFileQuery>,
 ) -> Result<Html<String>> {
-    let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let admin = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     let inspection = FileService::new(state.clone())
         .inspect_delete(&query.path)
         .await
@@ -385,22 +389,29 @@ pub(super) async fn delete_file_ui(
     headers: HeaderMap,
     Form(form): Form<DeleteFileForm>,
 ) -> Result<Redirect> {
-    let (_, admin) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let admin = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&admin, &form.csrf)?;
     let parent = parent_path(&form.path).unwrap_or_default();
     let file_service = FileService::new(state.clone());
     let operation_path = form.path;
     let confirm_name = form.confirm_name;
+    let proof = admin.proof().clone();
     let audit_client_ip = current_audit_client_ip();
-    let audit_context = AuditContext::new(admin.username, enabled_audit_client_ip(&state));
+    let audit_context = AuditContext::new(admin.username.clone(), enabled_audit_client_ip(&state));
     let result = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
         file_service
-            .delete(&operation_path, confirm_name.as_deref(), audit_context)
+            .delete(
+                proof,
+                &operation_path,
+                confirm_name.as_deref(),
+                audit_context,
+            )
             .await
     }))
     .await
     .map_err(internal)?
     .map_err(file_operation_app_error)?;
+    let result = super::session_bound(result)?;
     let notice = if result.audit_durability.is_uncertain() {
         "audit_durability_uncertain"
     } else if result.cleanup_pending {
@@ -531,16 +542,24 @@ pub(super) async fn stage_admin_upload(
 
 async fn ensure_admin_upload_directory(
     state: &AppState,
+    proof: MfaSessionProof,
     base: &str,
     relative: &str,
     actor: &str,
-) -> Result<String> {
+    upload_permit: tokio::sync::OwnedSemaphorePermit,
+    upload_peer_permit: ClientActivityPermit,
+) -> Result<(
+    String,
+    bool,
+    tokio::sync::OwnedSemaphorePermit,
+    ClientActivityPermit,
+)> {
     let relative = path_security::validate_relative(relative)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid folder path"))?
         .to_string_lossy()
         .replace('\\', "/");
     if relative.is_empty() {
-        return Ok(base.to_string());
+        return Ok((base.to_string(), false, upload_permit, upload_peer_permit));
     }
     let target = join_display(base, &relative);
     let guard = state.storage_mutation.clone().lock_owned().await;
@@ -550,34 +569,131 @@ async fn ensure_admin_upload_directory(
     let secure_root = state.secure_root.clone();
     let base = base.to_string();
     let tree = relative.clone();
-    let created = tokio::task::spawn_blocking(move || {
+    let database = state.db.clone();
+    let audit_context = AuditContext::new(actor, enabled_audit_client_ip(state));
+    let target_for_audit = target.clone();
+    #[cfg(test)]
+    let upload_directory_creation_barrier = state.upload_directory_creation_barrier.clone();
+    let (created, upload_permit, upload_peer_permit) = tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        secure_root
-            .bind_directory(&base)?
-            .ensure_directory_tree(&tree)
+        let mut created_snapshot = None;
+        let outcome = match database.required_transaction_for_mfa_session(
+            &proof,
+            &audit_context,
+            |_transaction| {
+                #[cfg(test)]
+                {
+                    let mut barrier = match upload_directory_creation_barrier.lock() {
+                        Ok(barrier) => barrier,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if let Some((entered, release)) = barrier.take() {
+                        let _ = entered.send(());
+                        let _ = release.recv();
+                    }
+                }
+                let tree_outcome = secure_root
+                    .bind_directory(&base)
+                    .and_then(|directory| directory.ensure_directory_tree_with_outcome(&tree))
+                    .map_err(file_ops::FileOperationError::Io)?;
+                let created = tree_outcome.created;
+                let complete = tree_outcome.terminal_error.is_none();
+                created_snapshot = Some((created.clone(), complete));
+                let durability_uncertain = tree_outcome.sync_error.is_some() || !complete;
+                if let Some(error) = tree_outcome.sync_error {
+                    tracing::error!(
+                        %error,
+                        action = "upload_directories_created",
+                        path = target_for_audit,
+                        "upload directory is visible but parent-directory durability is uncertain"
+                    );
+                }
+                if let Some(error) = tree_outcome.terminal_error {
+                    tracing::error!(
+                        %error,
+                        action = "upload_directories_created",
+                        path = target_for_audit,
+                        "upload directory tree was only partially created"
+                    );
+                }
+                let events = if created.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![RequiredAuditEvent::new(
+                        AuditAction::UploadDirectoriesCreated,
+                        Some(target_for_audit.clone()),
+                        Some(format!("created={};complete={complete}", created.len())),
+                    )]
+                };
+                Ok::<_, file_ops::FileOperationError>((
+                    (created, durability_uncertain, complete),
+                    events,
+                ))
+            },
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(file_ops::FileOperationError::Database(error))
+                if created_snapshot
+                    .as_ref()
+                    .is_some_and(|(created, _)| !created.is_empty()) =>
+            {
+                let (created, complete) =
+                    created_snapshot.expect("created upload directories recorded");
+                tracing::error!(
+                    %error,
+                    action = "upload_directories_created",
+                    path = target_for_audit,
+                    "upload directories are visible but required audit durability is uncertain"
+                );
+                Ok(SessionBound::Authorized((created, true, complete)))
+            }
+            Err(error) => Err(error),
+        }?;
+        Ok::<_, file_ops::FileOperationError>((outcome, upload_permit, upload_peer_permit))
     })
     .await
     .map_err(internal)?
-    .map_err(|error| match error.kind() {
-        std::io::ErrorKind::InvalidInput => {
+    .map_err(upload_directory_error)?;
+    let (_created, durability_uncertain, complete) = match created {
+        SessionBound::Authorized(outcome) => outcome,
+        SessionBound::SessionUnavailable => {
+            return Err(AppError(
+                StatusCode::UNAUTHORIZED,
+                ADMIN_UPLOAD_SESSION_REVOKED,
+            ));
+        }
+    };
+    if !complete {
+        return Err(AppError(
+            StatusCode::ACCEPTED,
+            "Upload directory creation is uncertain",
+        ));
+    }
+    Ok((
+        target,
+        durability_uncertain,
+        upload_permit,
+        upload_peer_permit,
+    ))
+}
+
+fn upload_directory_error(error: file_ops::FileOperationError) -> AppError {
+    match error {
+        file_ops::FileOperationError::Io(error)
+            if error.kind() == std::io::ErrorKind::InvalidInput =>
+        {
             AppError(StatusCode::BAD_REQUEST, "Invalid folder path")
         }
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+        file_ops::FileOperationError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
             AppError(StatusCode::CONFLICT, "Upload folder could not be created")
         }
-        _ => internal(error),
-    })?;
-    if !created.is_empty() {
-        audit_observation(
-            state,
-            actor.to_string(),
-            AuditAction::UploadDirectoriesCreated,
-            Some(target.clone()),
-            Some(format!("created={}", created.len())),
-        )
-        .await;
+        other => file_operation_app_error(other),
     }
-    Ok(target)
 }
 
 pub(super) async fn process_admin_upload(
@@ -585,28 +701,26 @@ pub(super) async fn process_admin_upload(
     headers: &HeaderMap,
     mut multipart: Multipart,
 ) -> Result<AdminUploadSuccess> {
-    let (session_token, admin) =
-        session(state, headers, true, MissingSession::RedirectToLogin).await?;
-    let admin_id = admin.admin_id;
-    let _upload_permit = state
-        .upload_admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
+    let admin = mfa_session(state, headers, MissingSession::RedirectToLogin).await?;
+    let mut upload_permit = Some(state.upload_admission.clone().try_acquire_owned().map_err(
+        |_| {
             AppError(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Too many concurrent uploads",
             )
-        })?;
-    let _upload_peer_permit = try_acquire_client_activity(
-        state.upload_peer_admission.clone(),
-        current_client_limit_key(),
-        crate::MAX_IN_FLIGHT_UPLOADS_PER_CLIENT,
-    )
-    .ok_or(AppError(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Too many concurrent uploads from this client",
-    ))?;
+        },
+    )?);
+    let mut upload_peer_permit = Some(
+        try_acquire_client_activity(
+            state.upload_peer_admission.clone(),
+            current_client_limit_key(),
+            crate::MAX_IN_FLIGHT_UPLOADS_PER_CLIENT,
+        )
+        .ok_or(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many concurrent uploads from this client",
+        ))?,
+    );
     let settings = runtime_settings(state);
     if let Some(length) = headers
         .get(header::CONTENT_LENGTH)
@@ -635,6 +749,7 @@ pub(super) async fn process_admin_upload(
     let mut overwrite_existing = false;
     let mut saw_overwrite = false;
     let mut folder_path: Option<String> = None;
+    let mut directory_durability_uncertain = false;
     let mut staged: Option<(PendingUpload, String, u64)> = None;
     let mut fields_seen = 0usize;
     while let Some(field) = multipart
@@ -732,8 +847,27 @@ pub(super) async fn process_admin_upload(
                     ));
                 }
                 let target = if let Some(folder_path) = folder_path.as_deref() {
-                    ensure_admin_upload_directory(state, target, folder_path, &admin.username)
-                        .await?
+                    let (
+                        target,
+                        durability_uncertain,
+                        returned_upload_permit,
+                        returned_upload_peer_permit,
+                    ) = ensure_admin_upload_directory(
+                        state,
+                        admin.proof().clone(),
+                        target,
+                        folder_path,
+                        &admin.username,
+                        upload_permit.take().expect("upload permit is owned"),
+                        upload_peer_permit
+                            .take()
+                            .expect("upload peer permit is owned"),
+                    )
+                    .await?;
+                    upload_permit = Some(returned_upload_permit);
+                    upload_peer_permit = Some(returned_upload_peer_permit);
+                    directory_durability_uncertain |= durability_uncertain;
+                    target
                 } else {
                     target.to_string()
                 };
@@ -776,10 +910,11 @@ pub(super) async fn process_admin_upload(
         pending.fail_next_directory_sync(kind);
     }
     let task_state = state.clone();
-    let upload_permit = _upload_permit;
-    let upload_peer_permit = _upload_peer_permit;
+    let upload_permit = upload_permit.expect("upload permit is owned");
+    let upload_peer_permit = upload_peer_permit.expect("upload peer permit is owned");
     let audit_client_ip = current_audit_client_ip();
-    let audit_context = AuditContext::new(admin.username, enabled_audit_client_ip(state));
+    let proof = admin.proof().clone();
+    let audit_context = AuditContext::new(admin.username.clone(), enabled_audit_client_ip(state));
     let finalizer = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
         let _upload_permit = upload_permit;
         let _upload_peer_permit = upload_peer_permit;
@@ -809,63 +944,96 @@ pub(super) async fn process_admin_upload(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(internal(error)),
         };
-        let publish_result = database(state.db.clone(), move |database| {
-            // Publishing is not cancelled with the HTTP request. Retain the storage
-            // lock through the namespace change, and retain the database connection
-            // lock from the exact-session recheck through publication. Session
-            // revocation and this commit therefore have one deterministic order.
-            let _storage_guard = storage_guard;
-            database.with_live_mfa_session(&session_token, admin_id, || {
-                if overwrite_existing {
-                    pending.publish_replace(&publish_name)
-                } else {
-                    pending.publish(&publish_name)
-                }
-            })
-        })
-        .await?;
-        let Some(publish_result) = publish_result else {
-            return Err(AppError(
-                StatusCode::UNAUTHORIZED,
-                ADMIN_UPLOAD_SESSION_REVOKED,
-            ));
+        let replaced = overwrite_existing && existed;
+        let detail = format!("file={name};bytes={total};path={destination}");
+        let success_action = if replaced {
+            AuditAction::AdminUploadReplaced
+        } else {
+            AuditAction::AdminUpload
         };
-        let publish_outcome = match publish_result {
-            Ok(outcome) => outcome,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(AppError(
+        let publish_log_name = name.clone();
+        let database = state.db.clone();
+        let publish_result = tokio::task::spawn_blocking(move || {
+            // Publishing is not cancelled with the HTTP request. Retain the storage
+            // lock through the namespace change, and retain SQLite's writer slot
+            // from the exact-session recheck through publication and its required
+            // audit. Session revocation and this complete commit therefore have
+            // one deterministic order.
+            let _storage_guard = storage_guard;
+            let mut published_snapshot = None;
+            match database.required_transaction_for_mfa_session(
+                &proof,
+                &audit_context,
+                |_transaction| {
+                    let outcome = if overwrite_existing {
+                        pending.publish_replace(&publish_name)
+                    } else {
+                        pending.publish(&publish_name)
+                    };
+                    let outcome = outcome.map_err(file_ops::FileOperationError::Io)?;
+                    let durability_uncertain = !outcome.is_durable();
+                    published_snapshot = Some(durability_uncertain);
+                    let mut events = vec![RequiredAuditEvent::new(
+                        success_action,
+                        Some(destination.clone()),
+                        Some(detail.clone()),
+                    )];
+                    if let Some(error) = outcome.uncertainty_error() {
+                        tracing::warn!(file = %publish_log_name, %error, "admin upload publication or directory durability is uncertain");
+                        events.push(RequiredAuditEvent::new(
+                            AuditAction::AdminUploadDurabilityUncertain,
+                            Some(destination.clone()),
+                            Some(detail.clone()),
+                        ));
+                    }
+                    Ok::<_, file_ops::FileOperationError>((durability_uncertain, events))
+                },
+            ) {
+                Ok(SessionBound::Authorized(durability_uncertain)) => Ok(
+                    SessionBound::Authorized((durability_uncertain, false)),
+                ),
+                Ok(SessionBound::SessionUnavailable) => Ok(SessionBound::SessionUnavailable),
+                Err(file_ops::FileOperationError::Database(error))
+                    if published_snapshot.is_some() =>
+                {
+                    let durability_uncertain =
+                        published_snapshot.expect("published upload snapshot recorded");
+                    tracing::error!(
+                        %error,
+                        action = success_action.as_str(),
+                        path = destination,
+                        "admin upload is visible but required audit durability is uncertain"
+                    );
+                    Ok(SessionBound::Authorized((durability_uncertain, true)))
+                }
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .map_err(internal)?
+        .map_err(|error| match error {
+            file_ops::FileOperationError::Io(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                AppError(
                     StatusCode::CONFLICT,
                     "File already exists; replacement must be confirmed for this file",
-                ))
+                )
             }
-            Err(error) => return Err(upload_io_error(error)),
+            file_ops::FileOperationError::Io(error) => upload_io_error(error),
+            other => file_operation_app_error(other),
+        })?;
+        let (durability_uncertain, upload_audit_uncertain) = match publish_result {
+            crate::db::SessionBound::Authorized(outcome) => outcome,
+            crate::db::SessionBound::SessionUnavailable => {
+                return Err(AppError(
+                    StatusCode::UNAUTHORIZED,
+                    ADMIN_UPLOAD_SESSION_REVOKED,
+                ));
+            }
         };
-        let replaced = overwrite_existing && existed;
-        let durability_uncertain = !publish_outcome.is_durable();
-        let detail = format!("file={name};bytes={total};path={destination}");
-        if let Some(error) = publish_outcome.sync_error() {
-            tracing::warn!(file = %name, %error, "admin upload published but directory fsync failed");
-            audit_observation(
-                state,
-                audit_context.actor.clone(),
-                AuditAction::AdminUploadDurabilityUncertain,
-                Some(destination.clone()),
-                Some(detail.clone()),
-            )
-            .await;
-        }
-        let audit_durability_uncertain = persist_required_file_audit(
-            state,
-            audit_context,
-            if replaced {
-                AuditAction::AdminUploadReplaced
-            } else {
-                AuditAction::AdminUpload
-            },
-            destination,
-            detail,
-        )
-        .await;
+        let audit_durability_uncertain =
+            directory_durability_uncertain || durability_uncertain || upload_audit_uncertain;
         let outcome = match (replaced, durability_uncertain) {
             (true, true) => "replaced_uncertain",
             (false, true) => "created_uncertain",
@@ -890,12 +1058,7 @@ pub(super) async fn admin_upload(
     let success = match process_admin_upload(&state, &headers, multipart).await {
         Ok(success) => success,
         Err(AppError(StatusCode::UNAUTHORIZED, ADMIN_UPLOAD_SESSION_REVOKED)) => {
-            let mut response = Redirect::to("/login").into_response();
-            response.headers_mut().insert(
-                header::SET_COOKIE,
-                HeaderValue::from_str(&clear_session_cookie(&state)).map_err(internal)?,
-            );
-            return Ok(response);
+            return Err(AppError(StatusCode::UNAUTHORIZED, SESSION_REVOKED_MESSAGE));
         }
         Err(error) => return Err(error),
     };
@@ -949,7 +1112,10 @@ pub(super) async fn admin_upload_queue(
             )
                 .into_response()
         }
-        Err(AppError(StatusCode::UNAUTHORIZED, ADMIN_UPLOAD_SESSION_REVOKED)) => (
+        Err(AppError(
+            StatusCode::UNAUTHORIZED,
+            ADMIN_UPLOAD_SESSION_REVOKED | SESSION_REVOKED_MESSAGE,
+        )) => (
             StatusCode::UNAUTHORIZED,
             Json(AdminUploadSessionRevoked {
                 error: ADMIN_UPLOAD_SESSION_REVOKED,
@@ -977,17 +1143,10 @@ pub(super) fn file_operation_app_error(error: file_ops::FileOperationError) -> A
             StatusCode::CONFLICT,
             "The exact folder name must be confirmed",
         ),
-        FileOperationError::Database(database_error)
-            if crate::db::is_audit_unavailable(&database_error) =>
-        {
-            AppError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE,
-            )
+        FileOperationError::Database(database_error) => {
+            AppError::from(crate::http_auth::database_error(database_error))
         }
-        other @ (FileOperationError::Database(_)
-        | FileOperationError::Io(_)
-        | FileOperationError::Join(_)) => internal(other),
+        other @ (FileOperationError::Io(_) | FileOperationError::Join(_)) => internal(other),
     }
 }
 

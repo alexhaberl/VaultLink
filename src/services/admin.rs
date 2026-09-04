@@ -2,7 +2,10 @@ use thiserror::Error;
 
 use crate::{
     auth,
-    db::{AdminDeactivationOutcome, AdminSummary, AuditContext, Database},
+    db::{
+        AdminDeactivationOutcome, AdminSummary, AuditContext, Database, MfaSessionProof,
+        SessionBound,
+    },
     sensitive::SecretString,
 };
 
@@ -92,78 +95,108 @@ impl AdminService {
         validate_password(password, confirmation)
     }
 
-    pub(crate) fn create(
+    pub(crate) fn create_for_mfa_session<T>(
         &self,
+        proof: &MfaSessionProof,
         prepared: &PreparedAdminCreate,
         password_hash: &str,
         context: &AuditContext,
-    ) -> Result<CreatedAdmin, AdminServiceError> {
+        publish_active_admins: impl FnOnce(Vec<String>) -> T,
+    ) -> Result<SessionBound<(CreatedAdmin, T)>, AdminServiceError>
+    where
+        T: crate::db::CommitPublication,
+    {
         let secret = auth::new_totp_secret_value();
         let response_secret = secret.duplicate_for_one_time_response();
-        let summary = self
-            .database
-            .create_admin_and_audit(
+        self.database
+            .create_admin_and_audit_for_session(
+                proof,
                 &prepared.username,
                 password_hash,
                 secret.expose_secret(),
                 context,
+                publish_active_admins,
             )
-            .map_err(AdminServiceError::Database)?;
-        Ok(CreatedAdmin {
-            summary,
-            totp_secret: response_secret,
-        })
-    }
-
-    pub(crate) fn set_active(
-        &self,
-        id: i64,
-        active: bool,
-        context: &AuditContext,
-    ) -> Result<AdminActivationResult, AdminServiceError> {
-        if active {
-            self.database
-                .activate_admin_and_audit(id, context)
-                .map(|changed| {
-                    if changed {
-                        AdminActivationResult::Changed
-                    } else {
-                        AdminActivationResult::NotFound
-                    }
+            .map(|outcome| {
+                outcome.map(|(summary, publication)| {
+                    (
+                        CreatedAdmin {
+                            summary,
+                            totp_secret: response_secret,
+                        },
+                        publication,
+                    )
                 })
-                .map_err(AdminServiceError::Database)
-        } else {
-            self.database
-                .deactivate_admin_and_audit(id, context)
-                .map(AdminActivationResult::Deactivation)
-                .map_err(AdminServiceError::Database)
-        }
-    }
-
-    pub(crate) fn reset_password(
-        &self,
-        id: i64,
-        password_hash: &str,
-        context: &AuditContext,
-    ) -> Result<bool, AdminServiceError> {
-        self.database
-            .reset_admin_password_and_audit(id, password_hash, context)
+            })
             .map_err(AdminServiceError::Database)
     }
 
-    pub(crate) fn reset_totp(
+    pub(crate) fn set_active_for_mfa_session<T>(
         &self,
+        proof: &MfaSessionProof,
+        id: i64,
+        active: bool,
+        context: &AuditContext,
+        publish_active_admins: impl FnOnce(Vec<String>) -> T,
+    ) -> Result<SessionBound<(AdminActivationResult, T)>, AdminServiceError>
+    where
+        T: crate::db::CommitPublication,
+    {
+        let outcome = if active {
+            self.database
+                .activate_admin_and_audit_for_session(proof, id, context, publish_active_admins)
+                .map(|outcome| {
+                    outcome.map(|(changed, publication)| {
+                        (
+                            if changed {
+                                AdminActivationResult::Changed
+                            } else {
+                                AdminActivationResult::NotFound
+                            },
+                            publication,
+                        )
+                    })
+                })
+        } else {
+            self.database
+                .deactivate_admin_and_audit_for_session(proof, id, context, publish_active_admins)
+                .map(|outcome| {
+                    outcome.map(|(outcome, publication)| {
+                        (AdminActivationResult::Deactivation(outcome), publication)
+                    })
+                })
+        };
+        outcome.map_err(AdminServiceError::Database)
+    }
+
+    pub(crate) fn reset_password_for_mfa_session(
+        &self,
+        proof: &MfaSessionProof,
+        id: i64,
+        password_hash: &str,
+        context: &AuditContext,
+    ) -> Result<SessionBound<bool>, AdminServiceError> {
+        self.database
+            .reset_admin_password_and_audit_for_session(proof, id, password_hash, context)
+            .map_err(AdminServiceError::Database)
+    }
+
+    pub(crate) fn reset_totp_for_mfa_session(
+        &self,
+        proof: &MfaSessionProof,
         id: i64,
         context: &AuditContext,
-    ) -> Result<Option<ResetTotpResult>, AdminServiceError> {
+    ) -> Result<SessionBound<Option<ResetTotpResult>>, AdminServiceError> {
         let secret = auth::new_totp_secret_value();
         let response_secret = secret.duplicate_for_one_time_response();
         self.database
-            .reset_admin_totp_and_audit(id, secret.expose_secret(), context)
-            .map(|username| {
-                username.map(|username| ResetTotpResult {
-                    username,
-                    totp_secret: response_secret,
+            .reset_admin_totp_and_audit_for_session(proof, id, secret.expose_secret(), context)
+            .map(|outcome| {
+                outcome.map(|username| {
+                    username.map(|username| ResetTotpResult {
+                        username,
+                        totp_secret: response_secret,
+                    })
                 })
             })
             .map_err(AdminServiceError::Database)

@@ -183,6 +183,7 @@ catalog! {
     INVALID_LANGUAGE, "error.invalid_language", "Ungültige Sprache", "Invalid language";
     AUDIT_TEMPORARILY_UNAVAILABLE, "error.audit_unavailable", "Sicherheitsprotokoll vorübergehend nicht verfügbar", "Security audit log temporarily unavailable";
     PASSWORD_PROCESSING_UNAVAILABLE, "error.password_processing_unavailable", "Passwortverarbeitung vorübergehend nicht verfügbar", "Password processing temporarily unavailable";
+    DATABASE_TEMPORARILY_UNAVAILABLE, "error.database_unavailable", "Datenbank vorübergehend nicht verfügbar", "Database temporarily unavailable";
 
     SETUP_TITLE, "setup.title", "VaultLink Setup", "VaultLink Setup";
     SETUP_INITIAL_SETUP, "setup.initial_setup", "Ersteinrichtung", "Initial setup";

@@ -4,7 +4,7 @@ use thiserror::Error;
 use crate::{
     config::MAX_UPLOAD_SIZE,
     db::{
-        AuditContext, Database, Permission, UploadConflictStrategy,
+        AuditContext, Database, MfaSessionProof, Permission, SessionBound, UploadConflictStrategy,
         DEFAULT_SHARE_UPLOAD_FILE_COUNT, DEFAULT_SHARE_UPLOAD_TOTAL_SIZE, MAX_SQLITE_UNSIGNED,
     },
     path_security,
@@ -21,35 +21,46 @@ use crate::{
 pub(crate) struct ShareAuthorityMutation {
     database: Database,
     storage_guard: tokio::sync::OwnedMutexGuard<()>,
+    proof: MfaSessionProof,
 }
 
 impl ShareAuthorityMutation {
-    pub(crate) async fn acquire(state: &AppState) -> Self {
-        Self::from_guard(state, state.storage_mutation.clone().lock_owned().await)
+    pub(crate) async fn acquire(state: &AppState, proof: MfaSessionProof) -> Self {
+        Self::from_guard(
+            state,
+            state.storage_mutation.clone().lock_owned().await,
+            proof,
+        )
     }
 
     pub(crate) fn from_guard(
         state: &AppState,
         storage_guard: tokio::sync::OwnedMutexGuard<()>,
+        proof: MfaSessionProof,
     ) -> Self {
         Self {
             database: state.db.clone(),
             storage_guard,
+            proof,
         }
     }
 
-    pub(crate) async fn commit<T, F>(self, operation: F) -> crate::http_auth::Result<T>
+    pub(crate) async fn commit<T, F>(
+        self,
+        operation: F,
+    ) -> crate::http_auth::Result<SessionBound<T>>
     where
         T: Send + 'static,
-        F: FnOnce(Database) -> rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(Database, MfaSessionProof) -> rusqlite::Result<SessionBound<T>> + Send + 'static,
     {
         let Self {
             database,
             storage_guard,
+            proof,
         } = self;
         crate::http_auth::required_database(database, move |database| {
             let _storage_guard = storage_guard;
-            operation(database)
+            operation(database, proof)
         })
         .await
     }
@@ -412,6 +423,7 @@ impl ShareService {
     /// Persists an already validated command together with its required audit
     /// row. The caller supplies the Argon2 result after moving the plaintext
     /// returned by `into_password_hash_input` into an admitted blocking task.
+    #[cfg(test)]
     pub(crate) fn create(
         &self,
         prepared: PreparedCreateShare,
@@ -445,6 +457,55 @@ impl ShareService {
             id,
             token: prepared.token,
         })
+    }
+
+    pub(crate) fn create_for_mfa_session(
+        &self,
+        proof: &MfaSessionProof,
+        prepared: PreparedCreateShare,
+        password_hash: Option<&str>,
+        audit_context: &AuditContext,
+    ) -> Result<SessionBound<(CreatedShare, crate::db::Share)>, ShareServiceError> {
+        if prepared.password_protected != password_hash.is_some() {
+            return Err(ShareServiceError::PasswordHashStateMismatch);
+        }
+        if prepared.created_by != proof.admin_id() {
+            // This is an adapter/service invariant. The database still derives
+            // `created_by` from the proof, but reject a mismatched prepared
+            // command rather than silently attributing it to another actor.
+            return Err(ShareServiceError::Database(rusqlite::Error::InvalidQuery));
+        }
+        let share_token = prepared.token.clone();
+        self.database
+            .create_share_with_upload_limits_for_mfa_session(
+                proof,
+                &prepared.token,
+                prepared.alias.as_deref(),
+                &prepared.path,
+                prepared.is_directory,
+                &prepared.permission,
+                prepared.expires_at,
+                prepared.max_downloads,
+                prepared.max_upload_size,
+                prepared.max_upload_total_size,
+                prepared.max_upload_files,
+                password_hash,
+                &prepared.upload_conflict_strategy,
+                audit_context,
+                Some(prepared.audit_detail),
+            )
+            .map(|outcome| {
+                outcome.map(|(id, share)| {
+                    (
+                        CreatedShare {
+                            id,
+                            token: share_token,
+                        },
+                        share,
+                    )
+                })
+            })
+            .map_err(ShareServiceError::Database)
     }
 }
 
