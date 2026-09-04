@@ -305,7 +305,7 @@ impl PendingUpload {
             return Err(rename_error);
         }
 
-        let error = ambiguous_publication_error(rename_error, destination_state, staging_state);
+        let error = ambiguous_publication_error(&rename_error, &destination_state, &staging_state);
         tracing::error!(%error, destination = %name, "upload publication is visible or ambiguous after rename response loss");
         Ok(self.finish_uncertain_publication(error))
     }
@@ -453,9 +453,9 @@ impl PendingUpload {
 }
 
 fn ambiguous_publication_error(
-    rename_error: io::Error,
-    destination_state: io::Result<EntryIdentityState>,
-    staging_state: io::Result<EntryIdentityState>,
+    rename_error: &io::Error,
+    destination_state: &io::Result<EntryIdentityState>,
+    staging_state: &io::Result<EntryIdentityState>,
 ) -> io::Error {
     fn describe(state: &io::Result<EntryIdentityState>) -> String {
         match state {
@@ -470,8 +470,8 @@ fn ambiguous_publication_error(
         rename_error.kind(),
         format!(
             "upload rename outcome is ambiguous after {rename_error}; destination {}; staging {}",
-            describe(&destination_state),
-            describe(&staging_state)
+            describe(destination_state),
+            describe(staging_state)
         ),
     )
 }

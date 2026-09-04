@@ -361,7 +361,7 @@ impl SecureRoot {
                         return Err(error);
                     }
 
-                    let error = ambiguous_delete_stage_error(error, pending_state, source_state);
+                    let error = ambiguous_delete_stage_error(&error, &pending_state, &source_state);
                     tracing::error!(%error, recovery_entry = %candidate, manifest = %manifest_name, original = %original_path, "delete staging rename outcome is visible or ambiguous; recovery metadata was preserved");
                     return Ok(DeleteStageOutcome::PublishedUncertain {
                         original_path,
@@ -672,7 +672,7 @@ impl SecureRoot {
                 }
                 Err(manifest_error) => {
                     let error = uncertain_delete_rollback_error(
-                        original_error,
+                        &original_error,
                         &rollback,
                         &source_state,
                         &pending_state,
@@ -691,7 +691,7 @@ impl SecureRoot {
         }
 
         let error = uncertain_delete_rollback_error(
-            original_error,
+            &original_error,
             &rollback,
             &source_state,
             &pending_state,
@@ -801,9 +801,9 @@ impl SecureRoot {
 }
 
 fn ambiguous_delete_stage_error(
-    rename_error: io::Error,
-    pending_state: io::Result<EntryIdentityState>,
-    source_state: io::Result<EntryIdentityState>,
+    rename_error: &io::Error,
+    pending_state: &io::Result<EntryIdentityState>,
+    source_state: &io::Result<EntryIdentityState>,
 ) -> io::Error {
     fn describe(state: &io::Result<EntryIdentityState>) -> String {
         match state {
@@ -818,15 +818,15 @@ fn ambiguous_delete_stage_error(
         rename_error.kind(),
         format!(
             "delete staging rename outcome is ambiguous after {rename_error}; pending {}; source {}",
-            describe(&pending_state),
-            describe(&source_state)
+            describe(pending_state),
+            describe(source_state)
         ),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn uncertain_delete_rollback_error(
-    original_error: io::Error,
+    original_error: &io::Error,
     rollback: &io::Result<()>,
     source_state: &io::Result<EntryIdentityState>,
     pending_state: &io::Result<EntryIdentityState>,

@@ -224,9 +224,8 @@ fn mfa_session_transaction_linearizes_both_race_orders_on_persistent_pool() {
     let ran_after_revocation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let marker = ran_after_revocation.clone();
     let (checked_sender, checked_receiver) = std::sync::mpsc::channel();
-    let checking_database = database.clone();
     let checker = std::thread::spawn(move || {
-        let outcome = checking_database
+        let outcome = database
             .required_transaction_for_mfa_session(
                 &proof,
                 &AuditContext::new("admin", None),
