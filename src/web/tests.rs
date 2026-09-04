@@ -1527,6 +1527,54 @@ fn controlled_multipart_request(
     (request, sender)
 }
 
+fn controlled_admin_multipart_request(
+    uri: &str,
+    path: &str,
+    csrf: &str,
+    session_token: &str,
+    name: &str,
+    content: &[u8],
+) -> (
+    Request,
+    tokio::sync::mpsc::Sender<std::result::Result<Bytes, io::Error>>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|chunk| (chunk, receiver))
+    });
+    let mut prefix = Vec::new();
+    for (field, value) in [("path", path), ("csrf", csrf)] {
+        prefix.extend_from_slice(
+            format!(
+                "--{CONTROLLED_UPLOAD_BOUNDARY}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    prefix.extend_from_slice(
+        format!(
+            "--{CONTROLLED_UPLOAD_BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    prefix.extend_from_slice(content);
+    sender.try_send(Ok(Bytes::from(prefix))).unwrap();
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::COOKIE, format!("vaultlink_session={session_token}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={CONTROLLED_UPLOAD_BOUNDARY}"),
+        )
+        .body(Body::from_stream(stream))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+    ));
+    (request, sender)
+}
+
 async fn finish_controlled_multipart(
     sender: tokio::sync::mpsc::Sender<std::result::Result<Bytes, io::Error>>,
 ) {
@@ -2341,6 +2389,28 @@ fn file_recovery_required_audit_failure_maps_to_ui_503_marker() {
         response.headers().get(ERROR_CODE_HEADER).unwrap(),
         "audit_unavailable"
     );
+}
+
+#[test]
+fn file_database_busy_and_locked_errors_map_to_retryable_ui_capacity() {
+    for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+        for recovery in [false, true] {
+            let file_error = crate::file_ops::FileOperationError::Database(
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+            );
+            let mapped = if recovery {
+                storage_recovery_app_error(file_error)
+            } else {
+                super::files::file_operation_app_error(file_error)
+            };
+            assert_eq!(mapped.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(mapped.1, crate::http_auth::DATABASE_BUSY_MESSAGE);
+
+            let response = mapped.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        }
+    }
 }
 
 #[tokio::test]
@@ -4250,6 +4320,334 @@ async fn http_share_permissions_password_unlock_and_range() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_totp_mutation_redirects_when_session_is_revoked_before_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    let password = "current-admin-password";
+    let password_hash = auth::hash_password(password).unwrap();
+    let secret = auth::new_totp_secret();
+    state
+        .db
+        .create_admin("admin", &password_hash, &secret)
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "revoked-account-session",
+            1,
+            "account-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("revoked-account-session").unwrap();
+    for (label, credential_id) in [("Primary", "credential-a"), ("Backup", "credential-b")] {
+        assert!(matches!(
+            state
+                .db
+                .add_admin_webauthn_credential_for_session(
+                    "revoked-account-session",
+                    1,
+                    label,
+                    credential_id,
+                    "{}",
+                    None,
+                )
+                .unwrap(),
+            crate::db::AdminWebauthnCredentialRegistrationOutcome::Registered(_)
+        ));
+    }
+
+    // Observe completion of the initial authentication without relying on a
+    // sleep: session lookup refreshes this deliberately stale timestamp before
+    // the handler waits for the settings mutation lock.
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    probe
+        .execute("UPDATE sessions SET last_activity_at=?1", [&stale_activity])
+        .unwrap();
+    let settings_guard = state.security_settings_mutation.clone().lock_owned().await;
+    let code = auth::totp_code(&secret, Utc::now().timestamp() as u64 / 30).unwrap();
+    let mut disable = request(
+        Method::POST,
+        "/admin/account/totp",
+        &format!("csrf=account-csrf&current_password={password}&current_code={code}&enabled=false"),
+    );
+    disable.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=revoked-account-session"),
+    );
+    let app = router(state.clone());
+    let queued = tokio::spawn(async move { app.oneshot(disable).await.unwrap() });
+
+    let mut initial_check_completed = false;
+    for _ in 0..100 {
+        let current_activity: String = probe
+            .query_row("SELECT last_activity_at FROM sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        if current_activity != stale_activity {
+            initial_check_completed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        initial_check_completed,
+        "request did not complete its initial session check"
+    );
+
+    state.db.delete_session("revoked-account-session").unwrap();
+    drop(settings_guard);
+    let response = queued.await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    assert!(response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
+    assert!(state.db.admin("admin").unwrap().unwrap().totp_enabled);
+    assert_eq!(
+        state.db.count_audit(Some("admin_totp_disabled")).unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_security_key_finish_preserves_pending_challenge_and_audit() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state
+        .db
+        .create_admin(
+            "admin",
+            &auth::hash_password("current-admin-password").unwrap(),
+            &auth::new_totp_secret(),
+        )
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "revoked-registration-session",
+            1,
+            "registration-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("revoked-registration-session").unwrap();
+    let webauthn = state.webauthn.read().unwrap().clone();
+    webauthn
+        .start_registration("revoked-registration-session", 1, "admin", &[])
+        .unwrap();
+    assert!(webauthn.has_pending_registration("revoked-registration-session"));
+
+    // Hold the first lock in the commit order so the request deterministically
+    // completes its initial MFA lookup before revocation wins the DB fence.
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    probe
+        .execute("UPDATE sessions SET last_activity_at=?1", [&stale_activity])
+        .unwrap();
+    let settings_guard = state.security_settings_mutation.clone().lock_owned().await;
+    let mut finish = request(
+        Method::POST,
+        "/admin/account/security-keys/register/finish",
+        r#"{"csrf":"registration-csrf","label":"Primary","credential":{}}"#,
+    );
+    finish.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    finish.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=revoked-registration-session"),
+    );
+    let app = router(state.clone());
+    let queued = tokio::spawn(async move { app.oneshot(finish).await.unwrap() });
+
+    let mut initial_check_completed = false;
+    for _ in 0..100 {
+        let current_activity: String = probe
+            .query_row("SELECT last_activity_at FROM sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        if current_activity != stale_activity {
+            initial_check_completed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        initial_check_completed,
+        "request did not complete its initial session check"
+    );
+
+    state
+        .db
+        .delete_session("revoked-registration-session")
+        .unwrap();
+    drop(settings_guard);
+    let response = queued.await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    assert!(response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
+    assert!(webauthn.has_pending_registration("revoked-registration-session"));
+    assert!(state.db.admin_webauthn_credentials(1).unwrap().is_empty());
+    assert_eq!(
+        state
+            .db
+            .count_audit(Some("webauthn_credential_added"))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_security_key_start_does_not_publish_a_pending_challenge() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    let password = "current-admin-password";
+    state
+        .db
+        .create_admin(
+            "admin",
+            &auth::hash_password(password).unwrap(),
+            &auth::new_totp_secret(),
+        )
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "revoked-registration-start",
+            1,
+            "registration-start-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("revoked-registration-start").unwrap();
+    let webauthn = state.webauthn.read().unwrap().clone();
+
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    probe
+        .execute("UPDATE sessions SET last_activity_at=?1", [&stale_activity])
+        .unwrap();
+    let settings_guard = state.security_settings_mutation.clone().lock_owned().await;
+    let mut start = request(
+        Method::POST,
+        "/admin/account/security-keys/register/start",
+        &format!(
+            r#"{{"csrf":"registration-start-csrf","current_password":"{password}","label":"Primary"}}"#
+        ),
+    );
+    start.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    start.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=revoked-registration-start"),
+    );
+    let app = router(state.clone());
+    let queued = tokio::spawn(async move { app.oneshot(start).await.unwrap() });
+
+    let mut initial_check_completed = false;
+    for _ in 0..100 {
+        let current_activity: String = probe
+            .query_row("SELECT last_activity_at FROM sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        if current_activity != stale_activity {
+            initial_check_completed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        initial_check_completed,
+        "request did not complete its initial session check"
+    );
+
+    state
+        .db
+        .delete_session("revoked-registration-start")
+        .unwrap();
+    drop(settings_guard);
+    let response = queued.await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    assert!(!webauthn.has_pending_registration("revoked-registration-start"));
+}
+
+#[tokio::test]
+async fn invalid_security_key_finish_remains_a_bad_request_without_success_audit() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state
+        .db
+        .create_admin(
+            "admin",
+            &auth::hash_password("current-admin-password").unwrap(),
+            &auth::new_totp_secret(),
+        )
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "invalid-registration-session",
+            1,
+            "registration-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("invalid-registration-session").unwrap();
+    let webauthn = state.webauthn.read().unwrap().clone();
+    webauthn
+        .start_registration("invalid-registration-session", 1, "admin", &[])
+        .unwrap();
+
+    let mut finish = request(
+        Method::POST,
+        "/admin/account/security-keys/register/finish",
+        r#"{"csrf":"registration-csrf","label":"Primary","credential":{}}"#,
+    );
+    finish.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    finish.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=invalid-registration-session"),
+    );
+    let response = router(state.clone()).oneshot(finish).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!webauthn.has_pending_registration("invalid-registration-session"));
+    assert!(state.db.admin_webauthn_credentials(1).unwrap().is_empty());
+    assert_eq!(
+        state
+            .db
+            .count_audit(Some("webauthn_credential_added"))
+            .unwrap(),
+        0
+    );
+}
+
 #[tokio::test]
 async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compact() {
     let root = tempfile::tempdir().unwrap();
@@ -5178,6 +5576,156 @@ async fn upload_only_never_exposes_target_paths_or_existing_content() {
     assert!(api_body.contains(r#""path":"""#));
     assert!(!api_body.contains("private-drop"));
     assert!(!api_body.contains("hidden-secret.txt"));
+}
+
+#[tokio::test]
+async fn public_folder_upload_propagates_first_and_later_mkdir_uncertainty() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_share(
+            "mkdir-response-loss",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let app = router(state.clone());
+
+    state
+        .secure_root
+        .fail_next_create_directory_mkdir_after_success(std::io::ErrorKind::TimedOut);
+    state
+        .secure_root
+        .fail_next_create_directory_probe(std::io::ErrorKind::WouldBlock);
+    let first = app
+        .clone()
+        .oneshot(public_folder_upload_request(
+            "/v/mkdir-response-loss/upload/queue",
+            "",
+            "first/nested",
+            "one.txt",
+            b"one",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(response_text(first)
+        .await
+        .contains(r#""outcome":"created_uncertain""#));
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/first/nested/one.txt")).unwrap(),
+        b"one"
+    );
+
+    let fault_root = state.secure_root.clone();
+    state.secure_root.after_next_directory_tree_create(move || {
+        fault_root
+            .fail_next_create_directory_mkdir_after_success(std::io::ErrorKind::ConnectionReset);
+        fault_root.fail_next_create_directory_probe(std::io::ErrorKind::WouldBlock);
+    });
+    let later = app
+        .oneshot(public_folder_upload_request(
+            "/v/mkdir-response-loss/upload/queue",
+            "",
+            "later/nested",
+            "two.txt",
+            b"two",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(later.status(), StatusCode::OK);
+    assert!(response_text(later)
+        .await
+        .contains(r#""outcome":"created_uncertain""#));
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/later/nested/two.txt")).unwrap(),
+        b"two"
+    );
+    assert_eq!(
+        state
+            .db
+            .count_audit(Some("upload_directories_created"))
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn public_folder_partial_creation_after_quota_commit_is_audited_outcome_not_500() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_share_with_upload_limits(
+            "partial-folder",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            Some(100),
+            Some(100),
+            Some(10),
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let external_root = root.path().to_path_buf();
+    state.secure_root.after_next_directory_tree_create(move || {
+        std::fs::write(external_root.join("uploads/partial/blocker"), b"external").unwrap();
+    });
+    let app = router(state.clone());
+
+    let response = app
+        .oneshot(public_folder_upload_request(
+            "/v/partial-folder/upload/queue",
+            "",
+            "partial/blocker/child",
+            "not-published.txt",
+            b"payload",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response_text(response)
+        .await
+        .contains(r#""outcome":"directory_uncertain""#));
+    assert!(root.path().join("uploads/partial").is_dir());
+    assert!(root.path().join("uploads/partial/blocker").is_file());
+    assert!(!root
+        .path()
+        .join("uploads/partial/blocker/child/not-published.txt")
+        .exists());
+    let share = state.db.share_by_token("partial-folder").unwrap().unwrap();
+    assert_eq!((share.uploaded_bytes, share.uploaded_files), (7, 1));
+    let events = state
+        .db
+        .list_audit(Some("upload_directories_created"), 10, 0)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0]
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("complete=false")));
+    assert_eq!(upload_fragment_count(root.path()), 0);
 }
 
 #[tokio::test]
@@ -6713,6 +7261,63 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
         std::fs::read(root.path().join("uploads/uncertain.txt")).unwrap(),
         b"x"
     );
+    state
+        .secure_root
+        .fail_next_upload_publication_rename_after_success(std::io::ErrorKind::TimedOut);
+    state
+        .secure_root
+        .fail_next_upload_publication_identity_probes(std::io::ErrorKind::WouldBlock, 2);
+    let response_loss = app
+        .clone()
+        .oneshot(multipart_request(
+            "/v/upload/upload",
+            "response-loss.txt",
+            b"visible",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_loss.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response_loss
+            .headers()
+            .get("x-vaultlink-durability")
+            .unwrap(),
+        "uncertain"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/response-loss.txt")).unwrap(),
+        b"visible"
+    );
+
+    state
+        .secure_root
+        .fail_next_upload_publication_rename_after_success(std::io::ErrorKind::ConnectionReset);
+    state
+        .secure_root
+        .fail_next_upload_publication_identity_probes(std::io::ErrorKind::WouldBlock, 2);
+    let replace_response_loss = app
+        .clone()
+        .oneshot(multipart_request_with_options(
+            "/v/replace/upload",
+            "ok.txt",
+            b"updated",
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replace_response_loss.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        replace_response_loss
+            .headers()
+            .get("x-vaultlink-durability")
+            .unwrap(),
+        "uncertain"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/ok.txt")).unwrap(),
+        b"updated"
+    );
     let percent_name = app
         .clone()
         .oneshot(multipart_request(
@@ -6801,13 +7406,16 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
         .unwrap()
         .iter()
         .all(|priority| *priority == 100));
-    assert_eq!(state.db.audit_priorities("upload_replaced").unwrap(), [100]);
+    assert_eq!(
+        state.db.audit_priorities("upload_replaced").unwrap(),
+        [100, 100]
+    );
     assert_eq!(
         state
             .db
             .audit_priorities("upload_durability_uncertain")
             .unwrap(),
-        [100]
+        [100, 100, 100]
     );
     let blocked = app
         .clone()
@@ -8084,4 +8692,1132 @@ async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_adm
         state.db.count_audit(Some("admin_upload_replaced")).unwrap(),
         0
     );
+}
+
+fn assert_revoked_admin_redirect_clears_both_session_cookies(response: &Response) {
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    let cookies = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|cookie| cookie.to_str().unwrap())
+        .collect::<Vec<_>>();
+    for name in ["vaultlink_session", "__Host-vaultlink_session"] {
+        assert!(
+            cookies.iter().any(|cookie| {
+                cookie.starts_with(&format!("{name}=;")) && cookie.contains("Max-Age=0")
+            }),
+            "revocation response did not clear {name}: {cookies:?}"
+        );
+    }
+}
+
+async fn wait_for_initial_session_check(
+    probe: &rusqlite::Connection,
+    csrf_token: &str,
+    stale_activity: &str,
+) {
+    for _ in 0..100 {
+        let current_activity: String = probe
+            .query_row(
+                "SELECT last_activity_at FROM sessions WHERE csrf_token=?1",
+                [csrf_token],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if current_activity != stale_activity {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("request did not complete its initial session check");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_admin_file_rename_and_delete_preserve_storage_shares_and_audit() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("rename-source.txt"), b"rename-original").unwrap();
+    std::fs::write(root.path().join("delete-target.txt"), b"delete-original").unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_share(
+            "rename-share",
+            None,
+            "rename-source.txt",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    state
+        .db
+        .create_share(
+            "delete-share",
+            None,
+            "delete-target.txt",
+            false,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let app = router(state.clone());
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+
+    state
+        .db
+        .create_session(
+            "rename-revoked-session",
+            1,
+            "rename-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("rename-revoked-session").unwrap();
+    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    probe
+        .execute(
+            "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
+            [stale_activity.as_str(), "rename-csrf"],
+        )
+        .unwrap();
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut rename = request(
+        Method::POST,
+        "/admin/files/rename",
+        "csrf=rename-csrf&path=rename-source.txt&name=rename-destination.txt",
+    );
+    rename.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=rename-revoked-session"),
+    );
+    let rename_app = app.clone();
+    let rename = tokio::spawn(async move { rename_app.oneshot(rename).await.unwrap() });
+    wait_for_initial_session_check(&probe, "rename-csrf", &stale_activity).await;
+    state.db.delete_session("rename-revoked-session").unwrap();
+    drop(storage_guard);
+
+    let response = rename.await.unwrap();
+    assert_revoked_admin_redirect_clears_both_session_cookies(&response);
+    assert_eq!(
+        std::fs::read(root.path().join("rename-source.txt")).unwrap(),
+        b"rename-original"
+    );
+    assert!(!root.path().join("rename-destination.txt").exists());
+    let rename_share = state.db.share_by_token("rename-share").unwrap().unwrap();
+    assert_eq!(rename_share.relative_path, "rename-source.txt");
+    assert!(rename_share.active);
+    assert_eq!(state.db.count_audit(Some("path_renamed")).unwrap(), 0);
+
+    state
+        .db
+        .create_session(
+            "delete-revoked-session",
+            1,
+            "delete-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("delete-revoked-session").unwrap();
+    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    probe
+        .execute(
+            "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
+            [stale_activity.as_str(), "delete-csrf"],
+        )
+        .unwrap();
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut delete = request(
+        Method::POST,
+        "/admin/files/delete",
+        "csrf=delete-csrf&path=delete-target.txt",
+    );
+    delete.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=delete-revoked-session"),
+    );
+    let delete_app = app.clone();
+    let delete = tokio::spawn(async move { delete_app.oneshot(delete).await.unwrap() });
+    wait_for_initial_session_check(&probe, "delete-csrf", &stale_activity).await;
+    state.db.delete_session("delete-revoked-session").unwrap();
+    drop(storage_guard);
+
+    let response = delete.await.unwrap();
+    assert_revoked_admin_redirect_clears_both_session_cookies(&response);
+    assert_eq!(
+        std::fs::read(root.path().join("delete-target.txt")).unwrap(),
+        b"delete-original"
+    );
+    let delete_share = state.db.share_by_token("delete-share").unwrap().unwrap();
+    assert_eq!(delete_share.relative_path, "delete-target.txt");
+    assert!(delete_share.active);
+    assert_eq!(state.db.count_audit(Some("path_deleted")).unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_admin_settings_preserve_sqlite_runtime_webauthn_and_audit() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "settings-revoked-session",
+            1,
+            "settings-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("settings-revoked-session").unwrap();
+    let persisted_before = state.db.runtime_settings().unwrap();
+    let runtime_before = state.runtime.read().unwrap().clone();
+    let webauthn_before = state.webauthn.read().unwrap().instance_id();
+
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    probe
+        .execute(
+            "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
+            [stale_activity.as_str(), "settings-csrf"],
+        )
+        .unwrap();
+    let settings_guard = state.security_settings_mutation.clone().lock_owned().await;
+    let mut update = request(
+        Method::POST,
+        "/admin/settings",
+        "csrf=settings-csrf&public_base_url=http%3A%2F%2Flocalhost%3A9999&max_upload_size_gb=16&blocked_extensions=exe%2Cbat&share_password_min_length=12&share_password_max_length=128&share_unlock_minutes=30&max_zip_size_gb=2&max_zip_files=20&max_search_entries=200&max_search_results=20&max_preview_size_mb=64&preview_extensions=txt%2Clog&image_preview_extensions=jpg%2Cpng&pdf_preview_enabled=on&max_media_preview_size_mb=4096",
+    );
+    update.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=settings-revoked-session"),
+    );
+    let app = router(state.clone());
+    let update = tokio::spawn(async move { app.oneshot(update).await.unwrap() });
+    wait_for_initial_session_check(&probe, "settings-csrf", &stale_activity).await;
+    state.db.delete_session("settings-revoked-session").unwrap();
+    drop(settings_guard);
+
+    let response = update.await.unwrap();
+    assert_revoked_admin_redirect_clears_both_session_cookies(&response);
+    assert_eq!(state.db.runtime_settings().unwrap(), persisted_before);
+    assert_eq!(*state.runtime.read().unwrap(), runtime_before);
+    assert_eq!(
+        state.webauthn.read().unwrap().instance_id(),
+        webauthn_before
+    );
+    assert_eq!(state.db.count_audit(Some("settings_updated")).unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authorized_settings_publication_finishes_before_waiting_logout_returns() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "settings-wins-session",
+            1,
+            "settings-wins-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("settings-wins-session").unwrap();
+    let webauthn_before = state.webauthn.read().unwrap().instance_id();
+
+    let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    *state.settings_publication_barrier.lock().unwrap() = Some((entered_sender, release_receiver));
+
+    let mut update = request(
+        Method::POST,
+        "/admin/settings",
+        "csrf=settings-wins-csrf&public_base_url=http%3A%2F%2Flocalhost%3A9999&max_upload_size_gb=16&blocked_extensions=exe%2Cbat&share_password_min_length=12&share_password_max_length=128&share_unlock_minutes=30&max_zip_size_gb=2&max_zip_files=20&max_search_entries=200&max_search_results=20&max_preview_size_mb=64&preview_extensions=txt%2Clog&image_preview_extensions=jpg%2Cpng&pdf_preview_enabled=on&max_media_preview_size_mb=4096",
+    );
+    update.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=settings-wins-session"),
+    );
+    let update_app = router(state.clone());
+    let update = tokio::spawn(async move { update_app.oneshot(update).await.unwrap() });
+    tokio::task::spawn_blocking(move || {
+        entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("settings transaction should reach snapshot publication")
+    })
+    .await
+    .unwrap();
+
+    let mut logout = request(Method::POST, "/logout", "csrf=settings-wins-csrf");
+    logout.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=settings-wins-session"),
+    );
+    let logout_state = state.clone();
+    let logout = tokio::spawn(async move {
+        let response = router(logout_state.clone()).oneshot(logout).await.unwrap();
+        let observed_runtime = runtime_settings(&logout_state);
+        let observed_webauthn = logout_state.webauthn.read().unwrap().instance_id();
+        (response, observed_runtime, observed_webauthn)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !logout.is_finished(),
+        "logout must wait while the authorized settings transaction owns the fence"
+    );
+
+    release_sender.send(()).unwrap();
+    let update_response = update.await.unwrap();
+    assert_eq!(update_response.status(), StatusCode::OK);
+    let (logout_response, observed_runtime, observed_webauthn) = logout.await.unwrap();
+    assert_eq!(logout_response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(observed_runtime.public_base_url, "http://localhost:9999");
+    assert_ne!(observed_webauthn, webauthn_before);
+    assert!(state
+        .db
+        .runtime_settings()
+        .unwrap()
+        .iter()
+        .any(|(key, value)| key == "public_base_url" && value == "http://localhost:9999"));
+    assert_eq!(state.db.count_audit(Some("settings_updated")).unwrap(), 1);
+    assert_eq!(state.db.count_audit(Some("logout")).unwrap(), 1);
+    assert!(state.db.session("settings-wins-session").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn stale_session_cookies_use_revoked_contract_but_missing_cookie_stays_unauthorized() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    let app = router(state.clone());
+
+    state
+        .db
+        .create_session(
+            "already-revoked-session",
+            1,
+            "already-revoked-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("already-revoked-session").unwrap();
+    state.db.delete_session("already-revoked-session").unwrap();
+    let mut html = request(
+        Method::POST,
+        "/admin/files/directories",
+        "csrf=already-revoked-csrf&parent=&name=forbidden-html",
+    );
+    html.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=already-revoked-session"),
+    );
+    let response = app.clone().oneshot(html).await.unwrap();
+    assert_revoked_admin_redirect_clears_both_session_cookies(&response);
+
+    state
+        .db
+        .create_session(
+            "queue-stale-session",
+            1,
+            "queue-stale-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("queue-stale-session").unwrap();
+    state.db.delete_session("queue-stale-session").unwrap();
+    let mut queue = admin_multipart_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "queue-stale-csrf",
+        "forbidden-queue.txt",
+        b"must not be staged",
+        false,
+    );
+    queue.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=queue-stale-session"),
+    );
+    let response = app.clone().oneshot(queue).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_text(response).await,
+        r#"{"error":"session_revoked"}"#
+    );
+
+    state
+        .db
+        .create_session(
+            "absolute-expired-session",
+            1,
+            "absolute-expired-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("absolute-expired-session").unwrap();
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    probe
+        .execute(
+            "UPDATE sessions SET expires_at=?1 WHERE csrf_token=?2",
+            [
+                (Utc::now() - Duration::seconds(1)).to_rfc3339().as_str(),
+                "absolute-expired-csrf",
+            ],
+        )
+        .unwrap();
+    let absolute = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v2/files/directories")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, "vaultlink_session=absolute-expired-session")
+        .header("x-csrf-token", "absolute-expired-csrf")
+        .body(Body::from(r#"{"parent":"","name":"forbidden-absolute"}"#))
+        .unwrap();
+    let response = app.clone().oneshot(absolute).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response_text(response)
+        .await
+        .contains(r#""code":"session_revoked""#));
+
+    state
+        .db
+        .create_session(
+            "idle-expired-session",
+            1,
+            "idle-expired-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("idle-expired-session").unwrap();
+    let idle_expired_at = (Utc::now() - Duration::hours(2)).to_rfc3339();
+    probe
+        .execute(
+            "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
+            [idle_expired_at.as_str(), "idle-expired-csrf"],
+        )
+        .unwrap();
+    let idle = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v2/files/directories")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, "vaultlink_session=idle-expired-session")
+        .header("x-csrf-token", "idle-expired-csrf")
+        .body(Body::from(r#"{"parent":"","name":"forbidden-idle"}"#))
+        .unwrap();
+    let response = app.clone().oneshot(idle).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response_text(response)
+        .await
+        .contains(r#""code":"session_revoked""#));
+
+    let missing = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v2/files/directories")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"parent":"","name":"missing-cookie"}"#))
+        .unwrap();
+    let response = app.oneshot(missing).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(response).await;
+    assert!(body.contains(r#""code":"unauthorized""#));
+    assert!(!body.contains("session_revoked"));
+
+    assert!(!root.path().join("forbidden-html").exists());
+    assert!(!root.path().join("forbidden-absolute").exists());
+    assert!(!root.path().join("forbidden-idle").exists());
+    assert!(!root.path().join("uploads/forbidden-queue.txt").exists());
+    assert_eq!(upload_fragment_count(root.path()), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_api_admin_totp_reset_preserves_credentials_state_and_audit() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state
+        .db
+        .create_admin("actor", "hash", "actor-secret")
+        .unwrap();
+    state
+        .db
+        .create_admin("target", "hash", "target-secret")
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "target-credential-setup-session",
+            2,
+            "target-credential-setup-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state
+        .db
+        .verify_mfa("target-credential-setup-session")
+        .unwrap();
+    state
+        .db
+        .add_admin_webauthn_credential_for_session(
+            "target-credential-setup-session",
+            2,
+            "preserved",
+            "credential-id",
+            b"credential",
+            None,
+        )
+        .unwrap();
+    state
+        .db
+        .create_session(
+            "admin-reset-revoked-session",
+            1,
+            "admin-reset-revoked-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("admin-reset-revoked-session").unwrap();
+
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let before = probe
+        .query_row(
+            "SELECT totp_generation,totp_key_id,totp_ciphertext FROM admins WHERE id=2",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    probe
+        .execute(
+            "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
+            [stale_activity.as_str(), "admin-reset-revoked-csrf"],
+        )
+        .unwrap();
+    let settings_guard = state.security_settings_mutation.clone().lock_owned().await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v2/admins/2/totp/reset")
+        .header(
+            header::COOKIE,
+            "vaultlink_session=admin-reset-revoked-session",
+        )
+        .header("x-csrf-token", "admin-reset-revoked-csrf")
+        .body(Body::empty())
+        .unwrap();
+    let app = router(state.clone());
+    let reset = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+    wait_for_initial_session_check(&probe, "admin-reset-revoked-csrf", &stale_activity).await;
+    state
+        .db
+        .delete_session("admin-reset-revoked-session")
+        .unwrap();
+    drop(settings_guard);
+
+    let response = reset.await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response_text(response)
+        .await
+        .contains(r#""code":"session_revoked""#));
+    let after = probe
+        .query_row(
+            "SELECT totp_generation,totp_key_id,totp_ciphertext FROM admins WHERE id=2",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(state.db.admin_webauthn_credentials(2).unwrap().len(), 1);
+    assert_eq!(state.db.count_audit(Some("admin_totp_reset")).unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_admin_upload_retains_fence_resources_until_revocation_commits() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "cancelled-admin-upload-session",
+            1,
+            "cancelled-admin-upload-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state
+        .db
+        .verify_mfa("cancelled-admin-upload-session")
+        .unwrap();
+
+    // First hold storage so the initial session lookup and upload streaming can
+    // finish before a test writer takes SQLite's writer slot. Session lookup
+    // refreshes idle activity with an UPDATE even for a fresh session.
+    let initial_storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut upload = admin_multipart_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "cancelled-admin-upload-csrf",
+        "cancelled-finalizer.txt",
+        b"must never be published",
+        false,
+    );
+    upload.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=cancelled-admin-upload-session"),
+    );
+    let app = router(state.clone());
+    let upload = tokio::spawn(async move { app.oneshot(upload).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+    let mut writer = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let writer = writer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    drop(initial_storage_guard);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.storage_mutation.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upload finalizer should acquire the storage mutation lock");
+    assert_eq!(state.upload_admission.available_permits(), 0);
+    assert!(state.storage_mutation.try_lock().is_err());
+
+    // Dropping the HTTP future must only detach the finalizer. The finalizer
+    // remains the single owner of its permit, storage lock, staged file and
+    // exact-session proof until the blocked fence resolves.
+    upload.abort();
+    let _ = upload.await;
+    tokio::task::yield_now().await;
+    assert_eq!(state.upload_admission.available_permits(), 0);
+    assert!(state.storage_mutation.try_lock().is_err());
+    assert_eq!(upload_fragment_count(root.path()), 1);
+
+    writer
+        .execute(
+            "DELETE FROM sessions WHERE csrf_token=?1",
+            ["cancelled-admin-upload-csrf"],
+        )
+        .unwrap();
+    writer.commit().unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if state.upload_admission.available_permits() == 1
+                && state.storage_mutation.try_lock().is_ok()
+                && upload_fragment_count(root.path()) == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("detached upload finalizer should release every resource");
+
+    assert!(!root.path().join("uploads/cancelled-finalizer.txt").exists());
+    assert!(state.upload_peer_admission.lock().unwrap().is_empty());
+    assert_eq!(state.db.count_audit(Some("admin_upload")).unwrap(), 0);
+    assert_eq!(
+        state.db.count_audit(Some("admin_upload_replaced")).unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_folder_creation_retains_permits_proof_and_fence_until_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "cancelled-folder-session",
+            1,
+            "cancelled-folder-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("cancelled-folder-session").unwrap();
+
+    let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    *state.upload_directory_creation_barrier.lock().unwrap() =
+        Some((entered_sender, release_receiver));
+    let mut upload = admin_folder_upload_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "cancelled-folder-csrf",
+        "committed/despite-cancellation",
+        "never-staged.txt",
+        b"request body is abandoned after the directory fence",
+    );
+    upload.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=cancelled-folder-session"),
+    );
+    let app = router(state.clone());
+    let upload = tokio::spawn(async move { app.oneshot(upload).await.unwrap() });
+    tokio::task::spawn_blocking(move || {
+        entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("folder creation should enter its live-session transaction")
+    })
+    .await
+    .unwrap();
+
+    upload.abort();
+    let _ = upload.await;
+    tokio::task::yield_now().await;
+    assert_eq!(state.upload_admission.available_permits(), 0);
+    assert!(state.storage_mutation.try_lock().is_err());
+    assert_eq!(state.upload_peer_admission.lock().unwrap().len(), 1);
+
+    let revoke_database = state.db.clone();
+    let revocation = tokio::task::spawn_blocking(move || {
+        revoke_database.delete_session("cancelled-folder-session")
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !revocation.is_finished(),
+        "revocation must wait for the already-authorized folder mutation"
+    );
+    release_sender.send(()).unwrap();
+    revocation.await.unwrap().unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if state.upload_admission.available_permits() == 1
+                && state.storage_mutation.try_lock().is_ok()
+                && state.upload_peer_admission.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("detached folder finalizer should release every retained resource");
+
+    assert!(root
+        .path()
+        .join("uploads/committed/despite-cancellation")
+        .is_dir());
+    assert!(!root
+        .path()
+        .join("uploads/committed/despite-cancellation/never-staged.txt")
+        .exists());
+    assert_eq!(
+        state
+            .db
+            .count_audit(Some("upload_directories_created"))
+            .unwrap(),
+        1
+    );
+    assert!(state
+        .db
+        .session("cancelled-folder-session")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_admin_folder_upload_creates_no_directory_or_success_audit() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let mut state = test_state(root.path(), data.path());
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "revoked-folder-upload-session",
+            1,
+            "revoked-folder-upload-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state
+        .db
+        .verify_mfa("revoked-folder-upload-session")
+        .unwrap();
+
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    probe
+        .execute(
+            "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
+            [stale_activity.as_str(), "revoked-folder-upload-csrf"],
+        )
+        .unwrap();
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut upload = admin_folder_upload_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "revoked-folder-upload-csrf",
+        "revoked/nested/folder",
+        "must-not-exist.txt",
+        b"must never be staged or published",
+    );
+    upload.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=revoked-folder-upload-session"),
+    );
+    let app = router(state.clone());
+    let upload = tokio::spawn(async move { app.oneshot(upload).await.unwrap() });
+    wait_for_initial_session_check(&probe, "revoked-folder-upload-csrf", &stale_activity).await;
+    state
+        .db
+        .delete_session("revoked-folder-upload-session")
+        .unwrap();
+    drop(storage_guard);
+
+    let response = upload.await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_text(response).await,
+        r#"{"error":"session_revoked"}"#
+    );
+    assert!(!root.path().join("uploads/revoked").exists());
+    assert_eq!(upload_fragment_count(root.path()), 0);
+    assert_eq!(state.upload_admission.available_permits(), 1);
+    assert!(state.upload_peer_admission.lock().unwrap().is_empty());
+    assert_eq!(
+        state
+            .db
+            .count_audit(Some("upload_directories_created"))
+            .unwrap(),
+        0
+    );
+    assert_eq!(state.db.count_audit(Some("admin_upload")).unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streamed_admin_upload_keeps_storage_and_sqlite_writer_sections_short() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let mut state = test_state_with_limit(root.path(), data.path(), 2 * 1024 * 1024);
+    state.upload_admission = Arc::new(tokio::sync::Semaphore::new(1));
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "streamed-admin-upload-session",
+            1,
+            "streamed-admin-upload-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state
+        .db
+        .verify_mfa("streamed-admin-upload-session")
+        .unwrap();
+    let content = vec![b's'; 128 * 1024];
+    let (request, sender) = controlled_admin_multipart_request(
+        "/admin/files/upload/queue",
+        "uploads",
+        "streamed-admin-upload-csrf",
+        "streamed-admin-upload-session",
+        "slow-stream.bin",
+        &content,
+    );
+    let app = router(state.clone());
+    let upload = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+    wait_for_upload_fragment(root.path()).await;
+
+    // The request is deliberately stalled inside the file field. Neither the
+    // storage namespace lock nor SQLite's writer slot belongs to streaming.
+    let storage_guard = state
+        .storage_mutation
+        .clone()
+        .try_lock_owned()
+        .expect("multipart streaming must not hold the storage lock");
+    let mut writer = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let writer = writer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("multipart streaming must not hold SQLite's writer slot");
+    assert_eq!(state.upload_admission.available_permits(), 0);
+    assert!(!upload.is_finished());
+    drop(writer);
+    drop(storage_guard);
+
+    finish_controlled_multipart(sender).await;
+    let response = upload.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response_text(response)
+        .await
+        .contains(r#""outcome":"created""#));
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/slow-stream.bin")).unwrap(),
+        content
+    );
+    assert_eq!(state.upload_admission.available_permits(), 1);
+    assert!(state.upload_peer_admission.lock().unwrap().is_empty());
+    assert_eq!(state.db.count_audit(Some("admin_upload")).unwrap(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_logout_is_retryable_and_never_reports_false_revocation_success() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "busy-logout-session",
+            1,
+            "busy-logout-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("busy-logout-session").unwrap();
+
+    let proof = crate::db::MfaSessionProof::for_test("busy-logout-session", 1);
+    let database = state.db.clone();
+    let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let holder = tokio::task::spawn_blocking(move || {
+        database.required_transaction_for_mfa_session(
+            &proof,
+            &crate::db::AuditContext::new("admin", None),
+            |_transaction| -> rusqlite::Result<_> {
+                entered_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                Ok(((), Vec::new()))
+            },
+        )
+    });
+    entered_receiver.await.unwrap();
+
+    let mut logout = request(Method::POST, "/logout", "csrf=busy-logout-csrf");
+    logout.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=busy-logout-session"),
+    );
+    let busy_started = std::time::Instant::now();
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        router(state.clone()).oneshot(logout),
+    )
+    .await
+    .expect("logout should expose SQLite's five-second busy timeout")
+    .unwrap();
+    let busy_elapsed = busy_started.elapsed();
+    let first_status = first.status();
+    let retry_after = first
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    // Database::session intentionally performs an idle-touch UPDATE. Use a
+    // separate read-only connection while the writer is still fenced.
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let session_remained = probe
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE csrf_token=?1)",
+            ["busy-logout-csrf"],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap();
+    let logout_audits_before_retry = state.db.count_audit(Some("logout")).unwrap();
+
+    // Always release the blocking holder before assertions so a diagnostic
+    // failure cannot strand the test runtime on a blocking task.
+    release_sender.send(()).unwrap();
+    assert!(matches!(
+        holder.await.unwrap().unwrap(),
+        crate::db::SessionBound::Authorized(())
+    ));
+    assert_eq!(first_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_after.as_deref(), Some("1"));
+    assert!(busy_elapsed >= std::time::Duration::from_secs(4));
+    assert!(session_remained);
+    assert_eq!(logout_audits_before_retry, 0);
+
+    let mut retry = request(Method::POST, "/logout", "csrf=busy-logout-csrf");
+    retry.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("vaultlink_session=busy-logout-session"),
+    );
+    let retry = router(state.clone()).oneshot(retry).await.unwrap();
+    assert_eq!(retry.status(), StatusCode::SEE_OTHER);
+    assert_eq!(retry.headers().get(header::LOCATION).unwrap(), "/login");
+    assert!(state.db.session("busy-logout-session").unwrap().is_none());
+    assert_eq!(state.db.count_audit(Some("logout")).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn html_admin_create_maps_only_the_unique_constraint_to_conflict() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "admin-create-session",
+            1,
+            "admin-create-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("admin-create-session").unwrap();
+    let app = router(state.clone());
+    let cookie = HeaderValue::from_static("vaultlink_session=admin-create-session");
+
+    let mut duplicate = request(
+        Method::POST,
+        "/admin/admins",
+        "csrf=admin-create-csrf&username=admin&password=another-secure-password&password_confirm=another-secure-password",
+    );
+    duplicate
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let duplicate = app.clone().oneshot(duplicate).await.unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    assert_ne!(
+        duplicate.headers().get(ERROR_CODE_HEADER),
+        Some(&HeaderValue::from_static("audit_unavailable"))
+    );
+
+    rusqlite::Connection::open(data.path().join("data.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_html_admin_create_audit
+             BEFORE INSERT ON audit
+             WHEN NEW.action='admin_created'
+             BEGIN SELECT RAISE(FAIL, 'injected admin create audit failure'); END;",
+        )
+        .unwrap();
+    let mut audit_failure = request(
+        Method::POST,
+        "/admin/admins",
+        "csrf=admin-create-csrf&username=audit-ops&password=another-secure-password&password_confirm=another-secure-password",
+    );
+    audit_failure.headers_mut().insert(header::COOKIE, cookie);
+    let audit_failure = app.oneshot(audit_failure).await.unwrap();
+    assert_eq!(audit_failure.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        audit_failure.headers().get(ERROR_CODE_HEADER).unwrap(),
+        "audit_unavailable"
+    );
+    assert!(state.db.admin("audit-ops").unwrap().is_none());
+    assert_eq!(state.db.count_audit(Some("admin_created")).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn html_share_create_maps_only_the_unique_constraint_to_conflict() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "share-create-session",
+            1,
+            "share-create-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("share-create-session").unwrap();
+    state
+        .db
+        .create_share(
+            "existing-share-token",
+            Some("duplicate-alias-123"),
+            "docs",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = HeaderValue::from_static("vaultlink_session=share-create-session");
+
+    let mut duplicate = request(
+        Method::POST,
+        "/admin/shares",
+        "csrf=share-create-csrf&path=docs&permission=download_only&alias=duplicate-alias-123",
+    );
+    duplicate
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    let duplicate = app.clone().oneshot(duplicate).await.unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    assert_ne!(
+        duplicate.headers().get(ERROR_CODE_HEADER),
+        Some(&HeaderValue::from_static("audit_unavailable"))
+    );
+
+    rusqlite::Connection::open(data.path().join("data.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_html_share_create_audit
+             BEFORE INSERT ON audit
+             WHEN NEW.action='share_created'
+             BEGIN SELECT RAISE(FAIL, 'injected share create audit failure'); END;",
+        )
+        .unwrap();
+    let mut audit_failure = request(
+        Method::POST,
+        "/admin/shares",
+        "csrf=share-create-csrf&path=docs&permission=download_only&alias=audit-failure-alias",
+    );
+    audit_failure.headers_mut().insert(header::COOKIE, cookie);
+    let audit_failure = app.oneshot(audit_failure).await.unwrap();
+    assert_eq!(audit_failure.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        audit_failure.headers().get(ERROR_CODE_HEADER).unwrap(),
+        "audit_unavailable"
+    );
+    assert!(state
+        .db
+        .share_by_alias("audit-failure-alias")
+        .unwrap()
+        .is_none());
+    assert_eq!(state.db.list_shares().unwrap().len(), 1);
+    assert_eq!(state.db.count_audit(Some("share_created")).unwrap(), 0);
 }

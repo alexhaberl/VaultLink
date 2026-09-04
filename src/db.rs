@@ -365,6 +365,25 @@ pub enum DatabaseError {
     Sqlite(#[source] rusqlite::Error),
 }
 
+pub(crate) fn is_sqlite_busy_or_locked(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite, _)
+            if matches!(
+                sqlite.extended_code & 0xff,
+                rusqlite::ffi::SQLITE_BUSY | rusqlite::ffi::SQLITE_LOCKED
+            )
+    )
+}
+
+pub(crate) fn is_sqlite_unique_constraint(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite, _)
+            if sqlite.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    )
+}
+
 impl From<rusqlite::Error> for DatabaseError {
     fn from(error: rusqlite::Error) -> Self {
         if schema::is_schema_error(&error) {
@@ -373,11 +392,11 @@ impl From<rusqlite::Error> for DatabaseError {
         if keyring::is_crypto_error(&error) {
             return Self::Cryptography(error);
         }
+        if is_sqlite_busy_or_locked(&error) {
+            return Self::Busy(error);
+        }
         if let rusqlite::Error::SqliteFailure(sqlite, _) = &error {
             let primary = sqlite.extended_code & 0xff;
-            if primary == rusqlite::ffi::SQLITE_BUSY || primary == rusqlite::ffi::SQLITE_LOCKED {
-                return Self::Busy(error);
-            }
             if primary == rusqlite::ffi::SQLITE_CORRUPT || primary == rusqlite::ffi::SQLITE_NOTADB {
                 return Self::Corruption(error);
             }
@@ -428,6 +447,105 @@ pub struct Session {
     pub username: String,
     pub csrf_token: String,
     pub mfa_verified: bool,
+}
+
+/// Opaque identity of the exact MFA session that authorized a later mutation.
+///
+/// Only the already one-way token hash is retained, so long-running requests do
+/// not keep a reusable bearer token alive while they hash passwords, stream an
+/// upload, or wait for a mutation lock.  The database still treats the value as
+/// untrusted and revalidates every predicate immediately before the mutation.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MfaSessionProof {
+    token_hash: String,
+    admin_id: i64,
+}
+
+impl MfaSessionProof {
+    fn from_token(token: &str, admin_id: i64) -> Self {
+        Self {
+            token_hash: token_hash(token),
+            admin_id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(token: &str, admin_id: i64) -> Self {
+        Self::from_token(token, admin_id)
+    }
+
+    pub(crate) fn admin_id(&self) -> i64 {
+        self.admin_id
+    }
+
+    pub(crate) fn webauthn_registration_key(&self) -> crate::webauthn::RegistrationCeremonyKey {
+        crate::webauthn::RegistrationCeremonyKey::from_session_token_hash(&self.token_hash)
+    }
+}
+
+impl std::fmt::Debug for MfaSessionProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MfaSessionProof")
+            .field("token_hash", &"[REDACTED]")
+            .field("admin_id", &self.admin_id)
+            .finish()
+    }
+}
+
+/// Initial session data paired with the opaque proof needed at commit time.
+pub(crate) struct AuthenticatedMfaSession {
+    session: Session,
+    proof: MfaSessionProof,
+}
+
+impl AuthenticatedMfaSession {
+    fn new(token: &str, session: Session) -> Self {
+        let proof = MfaSessionProof::from_token(token, session.admin_id);
+        Self { session, proof }
+    }
+
+    pub(crate) fn proof(&self) -> &MfaSessionProof {
+        &self.proof
+    }
+}
+
+/// Result of the database-owned request authentication step. Only the DB
+/// module can construct the authenticated variant and its opaque proof.
+pub(crate) enum MfaSessionAuthentication {
+    Authenticated(AuthenticatedMfaSession),
+    MfaRequired,
+}
+
+impl std::ops::Deref for AuthenticatedMfaSession {
+    type Target = Session;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+/// Outcome of a mutation whose exact MFA session is checked at commit time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionBound<T> {
+    Authorized(T),
+    SessionUnavailable,
+}
+
+/// Rollback guard for an in-memory snapshot installed before a session-bound
+/// SQLite transaction commits. Implementations must make this operation
+/// infallible and must not perform any additional externally visible mutation.
+pub(crate) trait CommitPublication {
+    fn accept_commit(&mut self);
+}
+
+impl<T> SessionBound<T> {
+    pub(crate) fn map<U>(self, operation: impl FnOnce(T) -> U) -> SessionBound<U> {
+        match self {
+            Self::Authorized(value) => SessionBound::Authorized(operation(value)),
+            Self::SessionUnavailable => SessionBound::SessionUnavailable,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

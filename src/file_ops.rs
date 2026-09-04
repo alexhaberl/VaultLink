@@ -3,9 +3,12 @@ use std::io;
 use thiserror::Error;
 
 use crate::{
-    db::AuditContext,
+    db::{AuditAction, AuditContext, MfaSessionProof, RequiredAuditEvent, SessionBound},
     path_security,
-    secure_fs::{EntryKind, EntryStatus, FileOperationRecovery, SecureRoot},
+    secure_fs::{
+        DeleteCommitStageOutcome, DeleteStageOutcome, EntryKind, EntryStatus,
+        FileOperationRecovery, RenameStageOutcome, SecureRoot,
+    },
     AppState,
 };
 
@@ -79,12 +82,13 @@ pub struct DeleteResult {
     pub audit_durability: AuditDurability,
 }
 
-pub async fn create_directory(
+pub(crate) async fn create_directory(
     state: &AppState,
+    proof: MfaSessionProof,
     parent: &str,
     name: &str,
     audit_context: AuditContext,
-) -> Result<CreateDirectoryResult, FileOperationError> {
+) -> Result<SessionBound<CreateDirectoryResult>, FileOperationError> {
     let parent = normalize(parent, true)?;
     let name = validate_name(name)?;
     let guard = state.storage_mutation.clone().lock_owned().await;
@@ -93,65 +97,136 @@ pub async fn create_directory(
     let database = state.db.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _storage_guard = guard;
-        let path = secure_root
-            .create_directory(&parent, &name)
-            .map_err(map_io)?;
-        let audit_durability = match database.audit_action_with_client_ip(
-            crate::db::AuditAction::DirectoryCreated,
-            &audit_context.actor,
-            Some(&path),
-            None,
-            audit_context.client_ip.as_deref(),
+        let mut created_path = None;
+        match database.required_transaction_for_mfa_session(
+            &proof,
+            &audit_context,
+            |_transaction| {
+                let (path, publication) = secure_root
+                    .create_directory(&parent, &name)
+                    .map_err(map_io)?;
+                created_path = Some(path.clone());
+                let audit_durability = match publication.uncertainty_error() {
+                    Some(error) => {
+                        tracing::error!(
+                            %error,
+                            action = "directory_created",
+                            path,
+                            "directory publication or parent-directory durability is uncertain"
+                        );
+                        AuditDurability::Uncertain
+                    }
+                    None => AuditDurability::Durable,
+                };
+                Ok::<_, FileOperationError>((
+                    CreateDirectoryResult {
+                        path: path.clone(),
+                        audit_durability,
+                    },
+                    vec![RequiredAuditEvent::new(
+                        AuditAction::DirectoryCreated,
+                        Some(path),
+                        None,
+                    )],
+                ))
+            },
         ) {
-            Ok(()) => AuditDurability::Durable,
-            Err(error) => {
+            Ok(outcome) => Ok(outcome),
+            Err(FileOperationError::Database(error)) if created_path.is_some() => {
+                let path = created_path.expect("created path recorded");
                 tracing::error!(
                     %error,
                     action = "directory_created",
                     path,
                     "filesystem mutation completed but required audit durability is uncertain"
                 );
-                AuditDurability::Uncertain
+                Ok(SessionBound::Authorized(CreateDirectoryResult {
+                    path,
+                    audit_durability: AuditDurability::Uncertain,
+                }))
             }
-        };
-        Ok::<_, FileOperationError>(CreateDirectoryResult {
-            path,
-            audit_durability,
-        })
+            Err(error) => Err(error),
+        }
     })
     .await??;
     Ok(result)
 }
 
-pub async fn rename(
+pub(crate) async fn rename(
     state: &AppState,
+    proof: MfaSessionProof,
     path: &str,
     new_name: &str,
     audit_context: AuditContext,
-) -> Result<RenameResult, FileOperationError> {
+) -> Result<SessionBound<RenameResult>, FileOperationError> {
     let plan = plan_rename(path, new_name)?;
     let path = plan.path;
     let new_name = plan.new_name;
     let guard = state.storage_mutation.clone().lock_owned().await;
     let guard = recover_pending_file_operations_with_guard(state, guard).await?;
     let secure_root = state.secure_root.clone();
+    let cleanup = state.storage_cleanup.clone();
     let database = state.db.clone();
     tokio::task::spawn_blocking(move || {
         let _storage_guard = guard;
-        let mut staged = secure_root.stage_rename(&path, &new_name).map_err(map_io)?;
-        let old_path = staged.original_path().to_string();
-        let new_path = staged.new_path().to_string();
-        let kind = staged.kind();
-        staged.begin_database_commit();
-        let updated_shares = match database.rename_share_paths_and_audit(
-            &old_path,
-            &new_path,
-            kind == EntryKind::Directory,
+        let mut staged_snapshot = None;
+        let outcome = database.required_transaction_for_mfa_session(
+            &proof,
             &audit_context,
-            false,
-        ) {
-            Ok(updated_shares) => updated_shares,
-            Err(error) => {
+            |transaction| {
+                let mut staged = match secure_root
+                    .stage_rename_with_outcome(&path, &new_name)
+                    .map_err(map_io)?
+                {
+                    RenameStageOutcome::Ready(staged) => staged,
+                    RenameStageOutcome::PublishedUncertain {
+                        new_path,
+                        kind,
+                        error,
+                    } => {
+                        tracing::error!(
+                            %error,
+                            action = "path_renamed",
+                            path = new_path,
+                            "rename publication is visible or ambiguous; durable recovery intent was preserved"
+                        );
+                        return Ok::<_, FileOperationError>(((
+                            None,
+                            new_path,
+                            kind,
+                            0,
+                        ), Vec::new()));
+                    }
+                };
+                let old_path = staged.original_path().to_string();
+                let new_path = staged.new_path().to_string();
+                let kind = staged.kind();
+                staged_snapshot = Some((new_path.clone(), kind));
+                staged.begin_database_commit();
+                let (updated_shares, events) = database
+                    .rename_share_paths_in_transaction(
+                        transaction,
+                        &old_path,
+                        &new_path,
+                        kind == EntryKind::Directory,
+                        false,
+                    )
+                    .map_err(FileOperationError::Database)?;
+                Ok::<_, FileOperationError>(((
+                    Some(staged),
+                    new_path,
+                    kind,
+                    updated_shares,
+                ), events))
+            },
+        );
+        let (staged, new_path, kind, updated_shares) = match outcome {
+            Ok(SessionBound::Authorized(outcome)) => outcome,
+            Ok(SessionBound::SessionUnavailable) => {
+                return Ok(SessionBound::SessionUnavailable);
+            }
+            Err(FileOperationError::Database(error)) if staged_snapshot.is_some() => {
+                let (new_path, kind) = staged_snapshot.expect("staged rename snapshot recorded");
                 tracing::error!(
                     %error,
                     action = "path_renamed",
@@ -159,13 +234,36 @@ pub async fn rename(
                     audit_unavailable = crate::db::is_audit_unavailable(&error),
                     "filesystem mutation completed but database/audit durability is uncertain"
                 );
-                return Ok(RenameResult {
+                recover_uncertain_file_operation_before_unlock(
+                    &secure_root,
+                    &database,
+                    &cleanup,
+                    "rename",
+                    &new_path,
+                );
+                return Ok(SessionBound::Authorized(RenameResult {
                     path: new_path,
                     kind,
                     updated_shares: 0,
                     audit_durability: AuditDurability::Uncertain,
-                });
+                }));
             }
+            Err(error) => return Err(error),
+        };
+        let Some(staged) = staged else {
+            recover_uncertain_file_operation_before_unlock(
+                &secure_root,
+                &database,
+                &cleanup,
+                "rename",
+                &new_path,
+            );
+            return Ok(SessionBound::Authorized(RenameResult {
+                path: new_path,
+                kind,
+                updated_shares: 0,
+                audit_durability: AuditDurability::Uncertain,
+            }));
         };
         if let Err(error) = staged.commit() {
             tracing::error!(
@@ -174,19 +272,26 @@ pub async fn rename(
                 path = new_path,
                 "filesystem and database mutation completed but journal finalization is uncertain"
             );
-            return Ok(RenameResult {
+            recover_uncertain_file_operation_before_unlock(
+                &secure_root,
+                &database,
+                &cleanup,
+                "rename",
+                &new_path,
+            );
+            return Ok(SessionBound::Authorized(RenameResult {
                 path: new_path,
                 kind,
                 updated_shares,
                 audit_durability: AuditDurability::Uncertain,
-            });
+            }));
         }
-        Ok(RenameResult {
+        Ok(SessionBound::Authorized(RenameResult {
             path: new_path,
             kind,
             updated_shares,
             audit_durability: AuditDurability::Durable,
-        })
+        }))
     })
     .await?
 }
@@ -215,12 +320,13 @@ pub async fn inspect_delete(
     })
 }
 
-pub async fn delete(
+pub(crate) async fn delete(
     state: &AppState,
+    proof: MfaSessionProof,
     path: &str,
     confirm_name: Option<&str>,
     audit_context: AuditContext,
-) -> Result<DeleteResult, FileOperationError> {
+) -> Result<SessionBound<DeleteResult>, FileOperationError> {
     let path = normalize(path, false)?;
     let confirmation = confirm_name.map(str::to_string);
     let guard = state.storage_mutation.clone().lock_owned().await;
@@ -230,55 +336,156 @@ pub async fn delete(
     let database = state.db.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _storage_guard = guard;
-        let inspected = secure_root.entry_status(&path).map_err(map_io)?;
-        validate_delete_confirmation(
-            &path,
-            inspected.kind == EntryKind::Directory && inspected.directory_non_empty,
-            confirmation.as_deref(),
-        )?;
-        let staged = secure_root.stage_delete(&path).map_err(map_io)?;
-        let status = staged.status().clone();
-        // A trusted external writer may change the path between inspection and
-        // the atomic rename. Revalidate the staged object before touching SQLite.
-        validate_delete_confirmation(
-            &path,
-            status.kind == EntryKind::Directory && status.directory_non_empty,
-            confirmation.as_deref(),
-        )?;
-        let original_path = staged.original_path().to_string();
-        let allow_recursive = confirmation.as_deref() == original_path.rsplit('/').next();
-        let committed = staged
-            .commit(allow_recursive)
-            .map_err(|error| map_delete_commit_io(error, &original_path))?;
-        // The durable filesystem intent now makes this SQLite update
-        // recoverable. If SQLite fails (including an uncertain commit), Drop
-        // deliberately leaves the intent for startup reconciliation.
-        let cleanup_pending = committed.outcome().cleanup_pending;
-        let deactivated_shares = match database.deactivate_shares_for_path_and_audit(
-            &original_path,
-            status.kind == EntryKind::Directory,
+        let mut committed_snapshot = None;
+        let outcome = database.required_transaction_for_mfa_session(
+            &proof,
             &audit_context,
-            false,
-            cleanup_pending,
-        ) {
-            Ok(deactivated_shares) => deactivated_shares,
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    action = "path_deleted",
-                    path = original_path,
-                    audit_unavailable = crate::db::is_audit_unavailable(&error),
-                    "filesystem mutation completed but database/audit durability is uncertain"
-                );
-                drop(committed);
-                return Ok(DeleteResult {
-                    path: original_path,
-                    kind: status.kind,
-                    deactivated_shares: 0,
+            |transaction| {
+                let inspected = secure_root.entry_status(&path).map_err(map_io)?;
+                validate_delete_confirmation(
+                    &path,
+                    inspected.kind == EntryKind::Directory && inspected.directory_non_empty,
+                    confirmation.as_deref(),
+                )?;
+                let staged = match secure_root
+                    .stage_delete(&path)
+                    .map_err(map_io)?
+                {
+                    DeleteStageOutcome::Ready(staged) => *staged,
+                    DeleteStageOutcome::PublishedUncertain {
+                        original_path,
+                        kind,
+                        error,
+                    } => {
+                        tracing::error!(
+                            %error,
+                            action = "path_deleted",
+                            path = original_path,
+                            "delete staging is visible or ambiguous; recovery metadata was preserved"
+                        );
+                        let status = EntryStatus {
+                            kind,
+                            directory_non_empty: inspected.directory_non_empty
+                                && kind == EntryKind::Directory,
+                        };
+                        return Ok::<_, FileOperationError>(((
+                            None,
+                            original_path,
+                            status,
+                            false,
+                            0,
+                        ), Vec::new()));
+                    }
+                };
+                let status = staged.status().clone();
+                // A trusted external writer may change the path between inspection and
+                // the atomic rename. Revalidate the staged object before touching SQLite.
+                validate_delete_confirmation(
+                    &path,
+                    status.kind == EntryKind::Directory && status.directory_non_empty,
+                    confirmation.as_deref(),
+                )?;
+                let original_path = staged.original_path().to_string();
+                let allow_recursive = confirmation.as_deref() == original_path.rsplit('/').next();
+                let committed = match staged
+                    .commit_with_outcome(allow_recursive)
+                    .map_err(|error| map_delete_commit_io(error, &original_path))?
+                {
+                    DeleteCommitStageOutcome::Ready(committed) => Some(committed),
+                    DeleteCommitStageOutcome::PublishedUncertain {
+                        cleanup_pending,
+                        error,
+                    } => {
+                        tracing::error!(
+                            %error,
+                            action = "path_deleted",
+                            path = original_path,
+                            "delete publication is visible or ambiguous; durable recovery metadata was preserved"
+                        );
+                        return Ok::<_, FileOperationError>(((
+                            None,
+                            original_path,
+                            status,
+                            cleanup_pending,
+                            0,
+                        ), Vec::new()));
+                    }
+                };
+                // The durable filesystem intent now makes the SQLite update
+                // recoverable. If SQLite fails (including an uncertain commit), Drop
+                // deliberately leaves the intent for startup reconciliation.
+                let cleanup_pending = committed
+                    .as_ref()
+                    .expect("ready delete commit recorded")
+                    .outcome()
+                    .cleanup_pending;
+                committed_snapshot = Some((original_path.clone(), status.kind, cleanup_pending));
+                let (deactivated_shares, events) = database
+                    .deactivate_shares_for_path_in_transaction(
+                        transaction,
+                        &original_path,
+                        status.kind == EntryKind::Directory,
+                        false,
+                        cleanup_pending,
+                    )
+                    .map_err(FileOperationError::Database)?;
+                Ok::<_, FileOperationError>(((
+                    committed,
+                    original_path,
+                    status,
                     cleanup_pending,
-                    audit_durability: AuditDurability::Uncertain,
-                });
-            }
+                    deactivated_shares,
+                ), events))
+            },
+        );
+        let (committed, original_path, status, cleanup_pending, deactivated_shares) =
+            match outcome {
+                Ok(SessionBound::Authorized(outcome)) => outcome,
+                Ok(SessionBound::SessionUnavailable) => {
+                    return Ok(SessionBound::SessionUnavailable);
+                }
+                Err(FileOperationError::Database(error)) if committed_snapshot.is_some() => {
+                    let (original_path, kind, cleanup_pending) =
+                        committed_snapshot.expect("committed delete snapshot recorded");
+                    tracing::error!(
+                        %error,
+                        action = "path_deleted",
+                        path = original_path,
+                        audit_unavailable = crate::db::is_audit_unavailable(&error),
+                        "filesystem mutation completed but database/audit durability is uncertain"
+                    );
+                    recover_uncertain_file_operation_before_unlock(
+                        &secure_root,
+                        &database,
+                        &cleanup,
+                        "delete",
+                        &original_path,
+                    );
+                    return Ok(SessionBound::Authorized(DeleteResult {
+                        path: original_path,
+                        kind,
+                        deactivated_shares: 0,
+                        cleanup_pending,
+                        audit_durability: AuditDurability::Uncertain,
+                    }));
+                }
+                Err(error) => return Err(error),
+            };
+        let Some(committed) = committed else {
+            recover_uncertain_file_operation_before_unlock(
+                &secure_root,
+                &database,
+                &cleanup,
+                "delete",
+                &original_path,
+            );
+            return Ok(SessionBound::Authorized(DeleteResult {
+                path: original_path,
+                kind: status.kind,
+                deactivated_shares: 0,
+                cleanup_pending,
+                audit_durability: AuditDurability::Uncertain,
+            }));
         };
         let committed = match committed.complete() {
             Ok(committed) => committed,
@@ -289,13 +496,20 @@ pub async fn delete(
                     path = original_path,
                     "filesystem and database mutation completed but journal finalization is uncertain"
                 );
-                return Ok(DeleteResult {
+                recover_uncertain_file_operation_before_unlock(
+                    &secure_root,
+                    &database,
+                    &cleanup,
+                    "delete",
+                    &original_path,
+                );
+                return Ok(SessionBound::Authorized(DeleteResult {
                     path: original_path,
                     kind: status.kind,
                     deactivated_shares,
                     cleanup_pending,
                     audit_durability: AuditDurability::Uncertain,
-                });
+                }));
             }
         };
         if committed.tombstone_path.is_some() {
@@ -305,13 +519,13 @@ pub async fn delete(
             // tombstones themselves are the work list.
             cleanup.request_cleanup();
         }
-        Ok::<_, FileOperationError>(DeleteResult {
+        Ok::<_, FileOperationError>(SessionBound::Authorized(DeleteResult {
             path: original_path,
             kind: status.kind,
             deactivated_shares,
             cleanup_pending: committed.cleanup_pending,
             audit_durability: AuditDurability::Durable,
-        })
+        }))
     })
     .await??;
     Ok(result)
@@ -357,7 +571,15 @@ fn recover_pending_file_operations_blocking(
     database: &crate::db::Database,
 ) -> Result<Vec<String>, FileOperationError> {
     let mut cleanup_paths = Vec::new();
-    for pending in secure_root.pending_file_operations().map_err(map_io)? {
+    let pending_operations = secure_root.pending_file_operations().map_err(map_io)?;
+    // A delete can lose the rename response before its durable operation
+    // journal is promoted. Its pending manifest is already sufficient to
+    // restore the visible name, and must be reconciled while the caller still
+    // owns the storage lock.
+    secure_root
+        .recover_pending_deletions(&pending_operations)
+        .map_err(map_io)?;
+    for pending in pending_operations {
         match secure_root
             .recover_file_operation(&pending)
             .map_err(map_io)?
@@ -407,6 +629,36 @@ fn recover_pending_file_operations_blocking(
         }
     }
     Ok(cleanup_paths)
+}
+
+/// Makes one reconciliation attempt while the caller still owns the storage
+/// mutation lock. The writer transaction that produced the uncertain outcome
+/// must already be closed: recovery deliberately opens its own SQLite
+/// transaction. A failed attempt is logged but does not replace the operation's
+/// `Authorized/uncertain` result; the durable journal remains for startup or the
+/// next mutation to retry.
+fn recover_uncertain_file_operation_before_unlock(
+    secure_root: &SecureRoot,
+    database: &crate::db::Database,
+    cleanup: &crate::storage_cleanup::StorageCleanupCoordinator,
+    operation: &'static str,
+    path: &str,
+) {
+    match recover_pending_file_operations_blocking(secure_root, database) {
+        Ok(cleanup_paths) => {
+            if !cleanup_paths.is_empty() {
+                cleanup.request_cleanup();
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                operation,
+                path,
+                "immediate filesystem-operation recovery failed; durable journal was preserved"
+            );
+        }
+    }
 }
 
 pub fn plan_rename(path: &str, new_name: &str) -> Result<RenamePlan, FileOperationError> {
@@ -538,6 +790,35 @@ mod tests {
         .unwrap()
     }
 
+    fn mfa_proof(state: &AppState) -> MfaSessionProof {
+        let admin_id = match state.db.admin("admin").unwrap() {
+            Some(admin) => admin.id,
+            None => {
+                state.db.create_admin("admin", "hash", "secret").unwrap();
+                state.db.admin("admin").unwrap().unwrap().id
+            }
+        };
+        const TOKEN: &str = "file-ops-test-session";
+        state
+            .db
+            .create_session(
+                TOKEN,
+                admin_id,
+                "csrf",
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        assert!(state.db.verify_mfa(TOKEN).unwrap());
+        MfaSessionProof::for_test(TOKEN, admin_id)
+    }
+
+    fn authorized<T>(outcome: SessionBound<T>) -> T {
+        match outcome {
+            SessionBound::Authorized(value) => value,
+            SessionBound::SessionUnavailable => panic!("test MFA session unexpectedly unavailable"),
+        }
+    }
+
     fn tombstone_paths(root: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(
             root.join(crate::path_security::INTERNAL_STORAGE_DIRECTORY_NAME)
@@ -581,9 +862,17 @@ mod tests {
         let state = test_state(root.path(), data.path());
         let fault = install_audit_failure(data.path());
 
-        let result = create_directory(&state, "", "created", AuditContext::new("admin", None))
+        let result = authorized(
+            create_directory(
+                &state,
+                mfa_proof(&state),
+                "",
+                "created",
+                AuditContext::new("admin", None),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         assert_eq!(result.audit_durability, AuditDurability::Uncertain);
         assert!(root.path().join("created").is_dir());
         assert_eq!(state.db.count_audit(None).unwrap(), 0);
@@ -592,6 +881,356 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_required_audit;")
             .unwrap();
         assert_eq!(state.db.count_audit(None).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn directory_parent_sync_failure_is_reported_as_uncertain_and_audited_once() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        state
+            .secure_root
+            .fail_next_create_directory_sync(io::ErrorKind::Other);
+
+        let result = authorized(
+            create_directory(
+                &state,
+                mfa_proof(&state),
+                "",
+                "created",
+                AuditContext::new("admin", None),
+            )
+            .await
+            .expect("a visible mkdir must not be reported as a retryable failure"),
+        );
+
+        assert_eq!(result.audit_durability, AuditDurability::Uncertain);
+        assert!(root.path().join("created").is_dir());
+        let events = state
+            .db
+            .list_audit(Some("directory_created"), 10, 0)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "admin");
+    }
+
+    #[tokio::test]
+    async fn mkdir_response_loss_with_probe_failure_is_uncertain_and_audited_once() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let state = test_state(root.path(), data.path());
+        state
+            .secure_root
+            .fail_next_create_directory_mkdir_after_success(io::ErrorKind::TimedOut);
+        state
+            .secure_root
+            .fail_next_create_directory_probe(io::ErrorKind::WouldBlock);
+
+        let result = authorized(
+            create_directory(
+                &state,
+                mfa_proof(&state),
+                "",
+                "ambiguous",
+                AuditContext::new("admin", None),
+            )
+            .await
+            .expect("a potentially visible mkdir must not be a retryable error"),
+        );
+
+        assert_eq!(result.path, "ambiguous");
+        assert_eq!(result.audit_durability, AuditDurability::Uncertain);
+        assert!(root.path().join("ambiguous").is_dir());
+        let events = state
+            .db
+            .list_audit(Some("directory_created"), 10, 0)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "admin");
+    }
+
+    #[tokio::test]
+    async fn rename_parent_sync_failure_recovers_before_releasing_storage_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("old.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "rename-sync-token",
+                None,
+                "old.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        state
+            .secure_root
+            .fail_next_rename_parent_sync(io::ErrorKind::Other);
+
+        let result = authorized(
+            rename(
+                &state,
+                mfa_proof(&state),
+                "old.txt",
+                "new.txt",
+                AuditContext::new("admin", None),
+            )
+            .await
+            .expect("a moved entry with uncertain sync must return an uncertain outcome"),
+        );
+        assert_eq!(result.audit_durability, AuditDurability::Uncertain);
+        assert!(root.path().join("new.txt").is_file());
+        assert_eq!(
+            state
+                .db
+                .share_by_token("rename-sync-token")
+                .unwrap()
+                .unwrap()
+                .relative_path,
+            "new.txt"
+        );
+        assert!(state
+            .secure_root
+            .pending_file_operations()
+            .unwrap()
+            .is_empty());
+        let events = state.db.list_audit(Some("path_renamed"), 10, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "system");
+
+        recover_pending_file_operations(&state).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .list_audit(Some("path_renamed"), 10, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_commit_sync_failure_recovers_before_releasing_storage_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("remove.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "delete-sync-token",
+                None,
+                "remove.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        state
+            .secure_root
+            .fail_next_delete_commit_sync(io::ErrorKind::Other);
+
+        let result = authorized(
+            delete(
+                &state,
+                mfa_proof(&state),
+                "remove.txt",
+                None,
+                AuditContext::new("admin", None),
+            )
+            .await
+            .expect("an unlinked entry with uncertain sync must return an uncertain outcome"),
+        );
+        assert_eq!(result.audit_durability, AuditDurability::Uncertain);
+        assert!(!root.path().join("remove.txt").exists());
+        assert!(
+            !state
+                .db
+                .share_by_token("delete-sync-token")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert!(state
+            .secure_root
+            .pending_file_operations()
+            .unwrap()
+            .is_empty());
+        let events = state.db.list_audit(Some("path_deleted"), 10, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, "system");
+
+        recover_pending_file_operations(&state).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .list_audit(Some("path_deleted"), 10, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_staging_response_loss_recovers_before_unlock_and_is_uncertain() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("ambiguous.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+        state.db.create_admin("admin", "hash", "secret").unwrap();
+        state
+            .db
+            .create_share(
+                "delete-stage-response-loss-token",
+                None,
+                "ambiguous.txt",
+                false,
+                &Permission::DownloadOnly,
+                None,
+                None,
+                None,
+                1,
+                None,
+                &UploadConflictStrategy::Reject,
+            )
+            .unwrap();
+        state
+            .secure_root
+            .fail_next_delete_staging_rename_after_success(io::ErrorKind::TimedOut);
+        state
+            .secure_root
+            .fail_next_delete_staging_identity_probes(io::ErrorKind::WouldBlock, 2);
+
+        let result = authorized(
+            delete(
+                &state,
+                mfa_proof(&state),
+                "ambiguous.txt",
+                None,
+                AuditContext::new("admin", None),
+            )
+            .await
+            .expect("an inconclusive staging rename must return an uncertain outcome"),
+        );
+
+        assert_eq!(result.path, "ambiguous.txt");
+        assert_eq!(result.kind, EntryKind::File);
+        assert_eq!(result.audit_durability, AuditDurability::Uncertain);
+        assert!(!result.cleanup_pending);
+        assert_eq!(
+            std::fs::read(root.path().join("ambiguous.txt")).unwrap(),
+            b"content"
+        );
+        assert!(
+            state
+                .db
+                .share_by_token("delete-stage-response-loss-token")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert!(state
+            .secure_root
+            .pending_file_operations()
+            .unwrap()
+            .is_empty());
+        assert!(tombstone_paths(root.path()).is_empty());
+        assert!(state
+            .db
+            .list_audit(Some("path_deleted"), 10, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_stage_failure_with_failed_restore_is_uncertain_and_recovered_before_unlock() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("restore-retry.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+        state
+            .secure_root
+            .fail_next_delete_post_stage(io::ErrorKind::Other);
+        state
+            .secure_root
+            .fail_next_delete_rollback_rename_before_mutation(io::ErrorKind::TimedOut);
+
+        let result = authorized(
+            delete(
+                &state,
+                mfa_proof(&state),
+                "restore-retry.txt",
+                None,
+                AuditContext::new("admin", None),
+            )
+            .await
+            .expect("a failed post-stage restore must not escape as a retryable error"),
+        );
+
+        assert_eq!(result.audit_durability, AuditDurability::Uncertain);
+        assert_eq!(
+            std::fs::read(root.path().join("restore-retry.txt")).unwrap(),
+            b"content"
+        );
+        assert!(tombstone_paths(root.path()).is_empty());
+        assert!(state
+            .db
+            .list_audit(Some("path_deleted"), 10, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn restored_delete_with_parent_sync_failure_is_uncertain_and_finalized_before_unlock() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("restore-sync.txt"), b"content").unwrap();
+        let state = test_state(root.path(), data.path());
+        state
+            .secure_root
+            .fail_next_delete_post_stage(io::ErrorKind::Other);
+        state
+            .secure_root
+            .fail_next_delete_rollback_parent_sync(io::ErrorKind::WouldBlock);
+
+        let result = authorized(
+            delete(
+                &state,
+                mfa_proof(&state),
+                "restore-sync.txt",
+                None,
+                AuditContext::new("admin", None),
+            )
+            .await
+            .expect("a restored name with uncertain sync must return an uncertain outcome"),
+        );
+
+        assert_eq!(result.audit_durability, AuditDurability::Uncertain);
+        assert_eq!(
+            std::fs::read(root.path().join("restore-sync.txt")).unwrap(),
+            b"content"
+        );
+        assert!(tombstone_paths(root.path()).is_empty());
+        assert!(state
+            .db
+            .list_audit(Some("path_deleted"), 10, 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -621,12 +1260,14 @@ mod tests {
 
         let result = rename(
             &state,
+            mfa_proof(&state),
             "old.txt",
             "new.txt",
             AuditContext::new("admin", None),
         )
         .await
         .unwrap();
+        let result = authorized(result);
         assert_eq!(result.audit_durability, AuditDurability::Uncertain);
         assert!(root.path().join("new.txt").is_file());
         assert_eq!(
@@ -688,9 +1329,17 @@ mod tests {
             .unwrap();
         let fault = install_audit_failure(data.path());
 
-        let result = delete(&state, "remove.txt", None, AuditContext::new("admin", None))
+        let result = authorized(
+            delete(
+                &state,
+                mfa_proof(&state),
+                "remove.txt",
+                None,
+                AuditContext::new("admin", None),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         assert_eq!(result.audit_durability, AuditDurability::Uncertain);
         assert!(!root.path().join("remove.txt").exists());
         assert!(
@@ -752,12 +1401,14 @@ mod tests {
 
         let result = rename(
             &state,
+            mfa_proof(&state),
             "old.txt",
             "new.txt",
             AuditContext::new("admin", None),
         )
         .await
         .expect("a visible rename must be reported as uncertain, not failed");
+        let result = authorized(result);
         assert_eq!(result.audit_durability, AuditDurability::Uncertain);
         assert!(root.path().join("new.txt").is_file());
         assert_eq!(
@@ -814,9 +1465,17 @@ mod tests {
             .unwrap();
         let fault = install_share_update_failure(data.path());
 
-        let result = delete(&state, "remove.txt", None, AuditContext::new("admin", None))
+        let result = authorized(
+            delete(
+                &state,
+                mfa_proof(&state),
+                "remove.txt",
+                None,
+                AuditContext::new("admin", None),
+            )
             .await
-            .expect("a visible deletion must be reported as uncertain, not failed");
+            .expect("a visible deletion must be reported as uncertain, not failed"),
+        );
         assert_eq!(result.audit_durability, AuditDurability::Uncertain);
         assert!(!root.path().join("remove.txt").exists());
         assert!(
@@ -890,9 +1549,17 @@ mod tests {
             .start_worker(state.secure_root.clone())
             .unwrap();
 
-        let result = delete(&state, "tree", Some("tree"), AuditContext::system())
+        let result = authorized(
+            delete(
+                &state,
+                mfa_proof(&state),
+                "tree",
+                Some("tree"),
+                AuditContext::system(),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         assert!(result.cleanup_pending);
         assert_eq!(result.deactivated_shares, 1);
         assert!(!root.path().join("tree").exists());
@@ -1125,9 +1792,17 @@ mod tests {
         std::fs::write(root.path().join("single.txt"), b"content").unwrap();
         let state = test_state(root.path(), data.path());
 
-        let result = delete(&state, "single.txt", None, AuditContext::system())
+        let result = authorized(
+            delete(
+                &state,
+                mfa_proof(&state),
+                "single.txt",
+                None,
+                AuditContext::system(),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         assert!(!result.cleanup_pending);
         assert!(tombstone_paths(root.path()).is_empty());
         assert!(!root.path().join("single.txt").exists());
@@ -1165,9 +1840,17 @@ mod tests {
             )
             .unwrap();
 
-        let outcome = rename(&state, "old.txt", "new.txt", AuditContext::system())
+        let outcome = authorized(
+            rename(
+                &state,
+                mfa_proof(&state),
+                "old.txt",
+                "new.txt",
+                AuditContext::system(),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         assert_eq!(outcome.audit_durability, AuditDurability::Uncertain);
         assert!(!root.path().join("old.txt").exists());
         assert_eq!(
@@ -1241,9 +1924,17 @@ mod tests {
             )
             .unwrap();
 
-        let outcome = delete(&state, "remove.txt", None, AuditContext::system())
+        let outcome = authorized(
+            delete(
+                &state,
+                mfa_proof(&state),
+                "remove.txt",
+                None,
+                AuditContext::system(),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         assert_eq!(outcome.audit_durability, AuditDurability::Uncertain);
         assert!(!root.path().join("remove.txt").exists());
         assert!(

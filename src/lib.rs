@@ -53,6 +53,9 @@ use thiserror::Error;
 
 const STORAGE_INSTANCE_LOCK_NAME: &str = ".vaultlink-instance.lock";
 
+#[cfg(test)]
+pub(crate) type BlockingTestBarrier = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
 pub const MAX_IN_FLIGHT_RESPONSES: usize = 256;
 pub const MAX_IN_FLIGHT_STREAMS: usize = 128;
 pub const TEXT_PREVIEW_RENDER_BUDGET_PERMITS: usize = 64;
@@ -79,7 +82,11 @@ pub struct AppState {
     pub monitoring_limiter: auth::LoginLimiter,
     pub runtime: Arc<RwLock<RuntimeSettings>>,
     pub webauthn: Arc<RwLock<webauthn::WebAuthnService>>,
+    // Global mutation order is security-settings -> runtime/WebAuthn -> DB.
+    // Never await this or another Tokio lock from inside a SQLite transaction.
     pub security_settings_mutation: Arc<tokio::sync::Mutex<()>>,
+    // Storage-authority operations acquire storage -> DB. The owned guard is
+    // moved into non-cancellable blocking finalizers before BEGIN IMMEDIATE.
     pub storage_mutation: Arc<tokio::sync::Mutex<()>>,
     pub storage_cleanup: storage_cleanup::StorageCleanupCoordinator,
     pub upload_admission: Arc<tokio::sync::Semaphore>,
@@ -102,6 +109,11 @@ pub struct AppState {
     _storage_instance_lock: Arc<StorageInstanceLock>,
     #[cfg(test)]
     pub upload_directory_sync_failure: Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>,
+    #[cfg(test)]
+    pub(crate) settings_publication_barrier: Arc<std::sync::Mutex<Option<BlockingTestBarrier>>>,
+    #[cfg(test)]
+    pub(crate) upload_directory_creation_barrier:
+        Arc<std::sync::Mutex<Option<BlockingTestBarrier>>>,
 }
 
 #[derive(Debug)]
@@ -232,6 +244,10 @@ impl AppState {
             _storage_instance_lock: storage_instance_lock,
             #[cfg(test)]
             upload_directory_sync_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            settings_publication_barrier: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            upload_directory_creation_barrier: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 }

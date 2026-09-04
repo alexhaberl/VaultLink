@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::{AuditClientIpDeletionOutcome, AuditContext, AuditEvent},
     http_auth::{
-        commit_runtime_settings, csrf_header, database, enabled_audit_client_ip, required_database,
-        runtime_settings, session, MissingSession,
+        commit_runtime_settings, csrf_header, database, enabled_audit_client_ip, mfa_session,
+        required_database, runtime_settings, session, MissingSession,
     },
     runtime::RuntimeSettings,
     AppState,
 };
 
-use super::{ApiError, ApiResult};
+use super::{session_bound, ApiError, ApiResult};
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct SettingsBody {
@@ -72,8 +72,8 @@ pub(super) async fn update_settings(
     headers: HeaderMap,
     Json(body): Json<SettingsBody>,
 ) -> ApiResult<Json<SettingsBody>> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
     let current = runtime_settings(&state);
     let mut next = current.clone();
     let max_upload_size = body.max_upload_size.to_string();
@@ -124,16 +124,17 @@ pub(super) async fn update_settings(
     .map_err(|_| ApiError::bad_request("Invalid runtime setting"))?;
     next.validate()
         .map_err(|_| ApiError::bad_request("Invalid setting"))?;
-    let admin_id = session_data.admin_id;
     let changed_keys = current.changed_keys(&next).join(",");
-    commit_runtime_settings(
-        &state,
-        next.clone(),
-        admin_id,
-        session_data.username,
-        format!("changed_keys={changed_keys}"),
-    )
-    .await?;
+    session_bound(
+        commit_runtime_settings(
+            &state,
+            authenticated.proof().clone(),
+            next.clone(),
+            authenticated.username.clone(),
+            format!("changed_keys={changed_keys}"),
+        )
+        .await?,
+    )?;
     Ok(Json(settings_body(next)))
 }
 
@@ -222,8 +223,8 @@ pub(super) async fn delete_audit_client_ips(
     headers: HeaderMap,
     Json(request): Json<DeleteAuditClientIpsRequest>,
 ) -> ApiResult<Json<DeletedAuditClientIpsResponse>> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
     if request.confirmation != "IP-DATEN LÖSCHEN" {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -232,13 +233,20 @@ pub(super) async fn delete_audit_client_ips(
         ));
     }
     let fallback_logging_enabled = runtime_settings(&state).audit_client_ip_enabled;
-    let audit_actor = session_data.username;
+    let audit_actor = authenticated.username.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
-    let outcome = required_database(state.db.clone(), move |db| {
-        db.delete_audit_client_ips_if_disabled_and_audit(fallback_logging_enabled, &audit_context)
-    })
-    .await?;
+    let proof = authenticated.proof().clone();
+    let outcome = session_bound(
+        required_database(state.db.clone(), move |db| {
+            db.delete_audit_client_ips_for_mfa_session(
+                &proof,
+                fallback_logging_enabled,
+                &audit_context,
+            )
+        })
+        .await?,
+    )?;
     let AuditClientIpDeletionOutcome::Deleted(deleted) = outcome else {
         return Err(ApiError::new(
             StatusCode::CONFLICT,

@@ -1,7 +1,9 @@
+#[cfg(test)]
+use super::{insert_required_audits, trace_required_audits};
 use super::{
-    insert_required_audits, trace_required_audits, AuditAction, AuditClientIpDeletionOutcome,
-    AuditContext, AuditEvent, AuditPriority, AuditRetentionOutcome, AuditSortColumn,
-    AuditSortDirection, Database, RequiredAuditEvent, MAX_AUDIT_ROWS,
+    AuditAction, AuditClientIpDeletionOutcome, AuditContext, AuditEvent, AuditPriority,
+    AuditRetentionOutcome, AuditSortColumn, AuditSortDirection, Database, MfaSessionProof,
+    RequiredAuditEvent, SessionBound, MAX_AUDIT_ROWS,
 };
 use chrono::Utc;
 #[cfg(test)]
@@ -247,6 +249,7 @@ impl Database {
         self.delete_audit_client_ips_if_disabled_internal(fallback_logging_enabled, None)
     }
 
+    #[cfg(test)]
     pub fn delete_audit_client_ips_if_disabled_and_audit(
         &self,
         fallback_logging_enabled: bool,
@@ -255,6 +258,32 @@ impl Database {
         self.delete_audit_client_ips_if_disabled_internal(fallback_logging_enabled, Some(context))
     }
 
+    pub(crate) fn delete_audit_client_ips_for_mfa_session(
+        &self,
+        proof: &MfaSessionProof,
+        fallback_logging_enabled: bool,
+        context: &AuditContext,
+    ) -> rusqlite::Result<SessionBound<AuditClientIpDeletionOutcome>> {
+        self.required_transaction_for_mfa_session(proof, context, |transaction| {
+            if persisted_audit_client_ip_enabled(transaction, fallback_logging_enabled)? {
+                return Ok((AuditClientIpDeletionOutcome::LoggingEnabled, Vec::new()));
+            }
+            let deleted = transaction.execute(
+                "UPDATE audit SET client_ip=NULL WHERE client_ip IS NOT NULL",
+                [],
+            )?;
+            Ok((
+                AuditClientIpDeletionOutcome::Deleted(deleted),
+                vec![RequiredAuditEvent::new(
+                    AuditAction::AuditClientIpsDeleted,
+                    None,
+                    Some(format!("deleted={deleted}")),
+                )],
+            ))
+        })
+    }
+
+    #[cfg(test)]
     fn delete_audit_client_ips_if_disabled_internal(
         &self,
         fallback_logging_enabled: bool,

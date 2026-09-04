@@ -2,17 +2,22 @@ use std::{fs::File, io, sync::Arc};
 
 use crate::path_security;
 
-use super::identity::entry_matches_identity;
+use super::identity::entry_identity_state;
 use super::private_entries::{
     active_upload_fragment_guard, unregister_upload_fragment, upload_fragment_name,
     ActiveUploadFragmentKey,
 };
-use super::{linux, validated, EntryKind, SecureDirectory, SecureRoot};
+use super::{linux, validated, EntryIdentityState, EntryKind, SecureDirectory, SecureRoot};
 
 #[derive(Debug)]
 pub enum PublishOutcome {
     Durable,
     PublishedSyncUncertain(io::Error),
+    /// The publication syscall may have changed the visible namespace, but an
+    /// I/O failure prevented a conclusive identity probe. Callers must treat
+    /// this as a completed, audit-worthy mutation whose durability is
+    /// uncertain, never as a retryable pre-publication failure.
+    PublishedUncertain(io::Error),
 }
 
 impl PublishOutcome {
@@ -20,11 +25,15 @@ impl PublishOutcome {
         matches!(self, Self::Durable)
     }
 
-    pub fn sync_error(&self) -> Option<&io::Error> {
+    pub fn uncertainty_error(&self) -> Option<&io::Error> {
         match self {
             Self::Durable => None,
-            Self::PublishedSyncUncertain(error) => Some(error),
+            Self::PublishedSyncUncertain(error) | Self::PublishedUncertain(error) => Some(error),
         }
+    }
+
+    pub fn sync_error(&self) -> Option<&io::Error> {
+        self.uncertainty_error()
     }
 }
 
@@ -50,6 +59,7 @@ impl SecureDirectory {
             self.allow_replace,
             self._storage_instance_lock.clone(),
         )?;
+        self.transfer_publication_faults(&mut pending);
         pending.bind_destination_file(destination)?;
         Ok(pending)
     }
@@ -58,11 +68,37 @@ impl SecureDirectory {
     /// destination. The caller can therefore finish quota admission before a
     /// user-visible directory is mutated.
     pub fn begin_staged_upload(&self) -> io::Result<PendingUpload> {
-        PendingUpload::new(
+        let mut pending = PendingUpload::new(
             self.staging.as_ref().try_clone()?,
             self.allow_replace,
             self._storage_instance_lock.clone(),
-        )
+        )?;
+        self.transfer_publication_faults(&mut pending);
+        Ok(pending)
+    }
+
+    fn transfer_publication_faults(&self, pending: &mut PendingUpload) {
+        #[cfg(test)]
+        {
+            if let Some(kind) = self
+                .next_upload_publication_rename_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                pending.fail_next_publication_rename_after_success(kind);
+            }
+            if let Some((kind, count)) = self
+                .next_upload_publication_identity_probe_errors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                pending.fail_next_publication_identity_probes(kind, count);
+            }
+        }
+        #[cfg(not(test))]
+        let _ = pending;
     }
 }
 
@@ -87,6 +123,10 @@ pub struct PendingUpload {
     _storage_instance_lock: Option<Arc<crate::StorageInstanceLock>>,
     #[cfg(test)]
     next_directory_sync_error: Option<io::ErrorKind>,
+    #[cfg(test)]
+    next_publication_rename_error: Option<io::ErrorKind>,
+    #[cfg(test)]
+    next_publication_identity_probe_errors: Option<(io::ErrorKind, usize)>,
 }
 
 impl PendingUpload {
@@ -131,6 +171,10 @@ impl PendingUpload {
                         _storage_instance_lock: storage_instance_lock,
                         #[cfg(test)]
                         next_directory_sync_error: None,
+                        #[cfg(test)]
+                        next_publication_rename_error: None,
+                        #[cfg(test)]
+                        next_publication_identity_probe_errors: None,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -206,15 +250,17 @@ impl PendingUpload {
     pub fn publish(&mut self, name: &str) -> io::Result<PublishOutcome> {
         let name = upload_destination_name(name)?;
         self.validate_staging_identity()?;
-        let destination = self.destination()?;
-        let rename =
-            linux::rename_noreplace_between(&self.staging, &self.temporary_name, destination, name);
+        let destination = self.destination()?.try_clone()?;
+        let rename = linux::rename_noreplace_between(
+            &self.staging,
+            &self.temporary_name,
+            &destination,
+            name,
+        );
+        #[cfg(test)]
+        let rename = self.inject_publication_rename_response_loss(rename);
         if let Err(error) = rename {
-            if entry_matches_identity(destination, name, self.expected_identity, EntryKind::File) {
-                tracing::warn!(%error, destination = %name, "upload rename returned an error after publication; continuing with verified identity");
-            } else {
-                return Err(error);
-            }
+            return self.reconcile_publication_error(&destination, name, error);
         }
         Ok(self.finish_publication())
     }
@@ -228,17 +274,65 @@ impl PendingUpload {
         }
         let name = upload_destination_name(name)?;
         self.validate_staging_identity()?;
-        let destination = self.destination()?;
+        let destination = self.destination()?.try_clone()?;
         let rename =
-            linux::rename_replace_between(&self.staging, &self.temporary_name, destination, name);
+            linux::rename_replace_between(&self.staging, &self.temporary_name, &destination, name);
+        #[cfg(test)]
+        let rename = self.inject_publication_rename_response_loss(rename);
         if let Err(error) = rename {
-            if entry_matches_identity(destination, name, self.expected_identity, EntryKind::File) {
-                tracing::warn!(%error, destination = %name, "replacement rename returned an error after publication; continuing with verified identity");
-            } else {
-                return Err(error);
-            }
+            return self.reconcile_publication_error(&destination, name, error);
         }
         Ok(self.finish_publication())
+    }
+
+    fn reconcile_publication_error(
+        &mut self,
+        destination: &File,
+        name: &str,
+        rename_error: io::Error,
+    ) -> io::Result<PublishOutcome> {
+        let destination_state = self.publication_identity_state(destination, name);
+        if matches!(&destination_state, Ok(EntryIdentityState::Expected)) {
+            tracing::warn!(%rename_error, destination = %name, "upload rename returned an error after publication; continuing with verified identity");
+            return Ok(self.finish_publication());
+        }
+
+        let staging_state = self.staging_identity_state_after_publication_error();
+        if matches!(&staging_state, Ok(EntryIdentityState::Expected)) {
+            // The exact fragment is still at the source, so this invocation did
+            // not publish it. A destination probe failure alone is not enough
+            // to turn a proven pre-publication failure into a success.
+            return Err(rename_error);
+        }
+
+        let error = ambiguous_publication_error(&rename_error, &destination_state, &staging_state);
+        tracing::error!(%error, destination = %name, "upload publication is visible or ambiguous after rename response loss");
+        Ok(self.finish_uncertain_publication(error))
+    }
+
+    fn publication_identity_state(
+        &mut self,
+        directory: &File,
+        name: &str,
+    ) -> io::Result<EntryIdentityState> {
+        #[cfg(test)]
+        if let Some(error) = self.take_publication_identity_probe_error() {
+            return Err(error);
+        }
+        entry_identity_state(directory, name, self.expected_identity, EntryKind::File)
+    }
+
+    fn staging_identity_state_after_publication_error(&mut self) -> io::Result<EntryIdentityState> {
+        #[cfg(test)]
+        if let Some(error) = self.take_publication_identity_probe_error() {
+            return Err(error);
+        }
+        entry_identity_state(
+            &self.staging,
+            &self.temporary_name,
+            self.expected_identity,
+            EntryKind::File,
+        )
     }
 
     fn validate_staging_identity(&self) -> io::Result<()> {
@@ -279,6 +373,25 @@ impl PendingUpload {
         }
     }
 
+    fn finish_uncertain_publication(&mut self, publication_error: io::Error) -> PublishOutcome {
+        // The rename may have consumed the fragment. Do not let Drop unlink or
+        // otherwise reinterpret an ambiguous namespace transition as a normal
+        // failed upload.
+        self.published = true;
+        if let Some(active_key) = self.active_key.take() {
+            unregister_upload_fragment(&active_key);
+        }
+        match self.sync_directory() {
+            Ok(()) => PublishOutcome::PublishedUncertain(publication_error),
+            Err(sync_error) => PublishOutcome::PublishedUncertain(io::Error::new(
+                publication_error.kind(),
+                format!(
+                    "{publication_error}; publication directory sync also failed: {sync_error}"
+                ),
+            )),
+        }
+    }
+
     fn sync_directory(&mut self) -> io::Result<()> {
         #[cfg(test)]
         if let Some(kind) = self.next_directory_sync_error.take() {
@@ -292,6 +405,75 @@ impl PendingUpload {
     pub(crate) fn fail_next_directory_sync(&mut self, kind: io::ErrorKind) {
         self.next_directory_sync_error = Some(kind);
     }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_publication_rename_after_success(&mut self, kind: io::ErrorKind) {
+        self.next_publication_rename_error = Some(kind);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_publication_identity_probes(
+        &mut self,
+        kind: io::ErrorKind,
+        count: usize,
+    ) {
+        assert!(count > 0, "identity probe failure count must be positive");
+        self.next_publication_identity_probe_errors = Some((kind, count));
+    }
+
+    #[cfg(test)]
+    fn inject_publication_rename_response_loss(
+        &mut self,
+        result: io::Result<()>,
+    ) -> io::Result<()> {
+        match (result, self.next_publication_rename_error.take()) {
+            (Ok(()), Some(kind)) => Err(io::Error::new(
+                kind,
+                "injected upload rename response loss after successful publication",
+            )),
+            (result, _) => result,
+        }
+    }
+
+    #[cfg(test)]
+    fn take_publication_identity_probe_error(&mut self) -> Option<io::Error> {
+        let (kind, exhausted) = {
+            let (kind, remaining) = self.next_publication_identity_probe_errors.as_mut()?;
+            *remaining -= 1;
+            (*kind, *remaining == 0)
+        };
+        if exhausted {
+            self.next_publication_identity_probe_errors = None;
+        }
+        Some(io::Error::new(
+            kind,
+            "injected upload publication identity probe failure",
+        ))
+    }
+}
+
+fn ambiguous_publication_error(
+    rename_error: &io::Error,
+    destination_state: &io::Result<EntryIdentityState>,
+    staging_state: &io::Result<EntryIdentityState>,
+) -> io::Error {
+    fn describe(state: &io::Result<EntryIdentityState>) -> String {
+        match state {
+            Ok(EntryIdentityState::Expected) => "expected identity".to_string(),
+            Ok(EntryIdentityState::Missing) => "missing".to_string(),
+            Ok(EntryIdentityState::Replaced) => "different identity".to_string(),
+            Err(error) => format!("probe failed: {error}"),
+        }
+    }
+
+    io::Error::new(
+        rename_error.kind(),
+        format!(
+            "upload rename outcome is ambiguous after {rename_error}; destination {}; staging {}",
+            describe(destination_state),
+            describe(staging_state)
+        ),
+    )
 }
 
 impl Drop for PendingUpload {

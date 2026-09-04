@@ -87,6 +87,7 @@ const UPLOAD_QUOTA_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration
 const TEXT_PREVIEW_RENDER_UNIT_BYTES: u64 = 1_000_000;
 const MAX_RENDERED_TEXT_PREVIEW_BYTES: usize = crate::config::MAX_TEXT_PREVIEW_SIZE as usize;
 const TEXT_PREVIEW_STREAM_MARKER: &str = "<!--VAULTLINK_ESCAPED_TEXT_PREVIEW_STREAM-->";
+pub(crate) const SESSION_REVOKED_MESSAGE: &str = "Session was revoked before commit";
 #[derive(Debug)]
 pub struct AppError(StatusCode, &'static str);
 
@@ -98,6 +99,22 @@ struct ErrorTemplate<'a> {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if self.0 == StatusCode::UNAUTHORIZED && self.1 == SESSION_REVOKED_MESSAGE {
+            let mut response = Redirect::to("/login").into_response();
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_static(
+                    "vaultlink_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+                ),
+            );
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_static(
+                    "__Host-vaultlink_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure",
+                ),
+            );
+            return response;
+        }
         if self.0.is_redirection() {
             return Redirect::to(self.1).into_response();
         }
@@ -106,6 +123,8 @@ impl IntoResponse for AppError {
             std::borrow::Cow::Borrowed(i18n::text(locale, i18n::AUDIT_TEMPORARILY_UNAVAILABLE))
         } else if self.1 == crate::http_auth::ARGON2_BUSY_MESSAGE {
             std::borrow::Cow::Borrowed(i18n::text(locale, i18n::PASSWORD_PROCESSING_UNAVAILABLE))
+        } else if self.1 == crate::http_auth::DATABASE_BUSY_MESSAGE {
+            std::borrow::Cow::Borrowed(i18n::text(locale, i18n::DATABASE_TEMPORARILY_UNAVAILABLE))
         } else {
             i18n::localized_text(locale, self.1)
         };
@@ -123,7 +142,10 @@ impl IntoResponse for AppError {
             );
         }
         if self.0 == StatusCode::SERVICE_UNAVAILABLE
-            && self.1 == crate::http_auth::ARGON2_BUSY_MESSAGE
+            && matches!(
+                self.1,
+                crate::http_auth::ARGON2_BUSY_MESSAGE | crate::http_auth::DATABASE_BUSY_MESSAGE
+            )
         {
             response
                 .headers_mut()
@@ -134,15 +156,22 @@ impl IntoResponse for AppError {
 }
 type Result<T> = std::result::Result<T, AppError>;
 
+pub(crate) fn session_bound<T>(outcome: crate::db::SessionBound<T>) -> Result<T> {
+    match outcome {
+        crate::db::SessionBound::Authorized(value) => Ok(value),
+        crate::db::SessionBound::SessionUnavailable => {
+            Err(AppError(StatusCode::UNAUTHORIZED, SESSION_REVOKED_MESSAGE))
+        }
+    }
+}
+
 fn storage_recovery_app_error(error: crate::file_ops::FileOperationError) -> AppError {
     match error {
         crate::file_ops::FileOperationError::Database(database_error)
-            if crate::db::is_audit_unavailable(&database_error) =>
+            if crate::db::is_audit_unavailable(&database_error)
+                || crate::db::is_sqlite_busy_or_locked(&database_error) =>
         {
-            AppError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE,
-            )
+            AppError::from(crate::http_auth::database_error(database_error))
         }
         _ => AppError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -153,7 +182,9 @@ fn storage_recovery_app_error(error: crate::file_ops::FileOperationError) -> App
 
 impl From<crate::http_auth::HttpAuthError> for AppError {
     fn from(value: crate::http_auth::HttpAuthError) -> Self {
-        if let Some(location) = value.redirect {
+        if value.kind == crate::http_auth::HttpAuthErrorKind::SessionRevoked {
+            AppError(StatusCode::UNAUTHORIZED, SESSION_REVOKED_MESSAGE)
+        } else if let Some(location) = value.redirect {
             AppError(StatusCode::SEE_OTHER, location)
         } else {
             AppError(value.status, value.message)

@@ -181,6 +181,7 @@ struct LimiterState {
     operations: u64,
 }
 
+#[derive(Clone)]
 struct AttemptHistory {
     attempts: Vec<Instant>,
 }
@@ -204,6 +205,8 @@ pub struct AdminLoginLimiter {
     origin_max: usize,
     account_max: usize,
     window: Duration,
+    #[cfg(test)]
+    publication_barrier: Arc<Mutex<Option<crate::BlockingTestBarrier>>>,
 }
 
 struct AdminLoginLimiterState {
@@ -213,6 +216,48 @@ struct AdminLoginLimiterState {
     unknown_accounts: Vec<Option<AttemptHistory>>,
     unknown_ips: Vec<Option<AttemptHistory>>,
     hash_builder: RandomState,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AdminLoginLimiterSnapshot {
+    pub(crate) active_admins: Vec<String>,
+    pub(crate) known_accounts: Vec<(String, Vec<Instant>)>,
+    pub(crate) known_origins: Vec<((String, IpAddr), Vec<Instant>)>,
+    pub(crate) unknown_accounts: Vec<Option<Vec<Instant>>>,
+    pub(crate) unknown_ips: Vec<Option<Vec<Instant>>>,
+}
+
+/// Transaction-coupled publication of the active-admin cache. Until
+/// `accept` is called this guard owns the limiter mutex and restores the
+/// previous cache (including per-admin attempt histories) when dropped.
+pub(crate) struct AdminLoginLimiterPublication<'a> {
+    state: std::sync::MutexGuard<'a, AdminLoginLimiterState>,
+    previous_active_admins: Option<HashSet<String>>,
+    previous_known_accounts: Option<HashMap<String, AttemptHistory>>,
+    previous_known_origins: Option<HashMap<(String, IpAddr), AttemptHistory>>,
+}
+
+impl crate::db::CommitPublication for AdminLoginLimiterPublication<'_> {
+    fn accept_commit(&mut self) {
+        self.previous_active_admins = None;
+        self.previous_known_accounts = None;
+        self.previous_known_origins = None;
+    }
+}
+
+impl Drop for AdminLoginLimiterPublication<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous_active_admins.take() {
+            self.state.active_admins = previous;
+        }
+        if let Some(previous) = self.previous_known_accounts.take() {
+            self.state.known_accounts = previous;
+        }
+        if let Some(previous) = self.previous_known_origins.take() {
+            self.state.known_origins = previous;
+        }
+    }
 }
 
 impl AdminLoginLimiter {
@@ -241,16 +286,62 @@ impl AdminLoginLimiter {
             origin_max,
             account_max,
             window,
+            #[cfg(test)]
+            publication_barrier: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn replace_active_admins(&self, usernames: impl IntoIterator<Item = String>) {
         let mut state = self.state();
+        Self::replace_active_admins_in_state(&mut state, usernames);
+    }
+
+    pub(crate) fn publish_active_admins(
+        &self,
+        usernames: impl IntoIterator<Item = String>,
+    ) -> AdminLoginLimiterPublication<'_> {
+        let mut state = self.state();
+        let previous_active_admins = Some(state.active_admins.clone());
+        let previous_known_accounts = Some(state.known_accounts.clone());
+        let previous_known_origins = Some(state.known_origins.clone());
+        Self::replace_active_admins_in_state(&mut state, usernames);
+        #[cfg(test)]
+        {
+            let mut barrier = match self.publication_barrier.lock() {
+                Ok(barrier) => barrier,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some((entered, release)) = barrier.take() {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+        }
+        AdminLoginLimiterPublication {
+            state,
+            previous_active_admins,
+            previous_known_accounts,
+            previous_known_origins,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_publication_barrier(&self, barrier: crate::BlockingTestBarrier) {
+        let mut installed = match self.publication_barrier.lock() {
+            Ok(installed) => installed,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *installed = Some(barrier);
+    }
+
+    fn replace_active_admins_in_state(
+        state: &mut AdminLoginLimiterState,
+        usernames: impl IntoIterator<Item = String>,
+    ) {
         state.active_admins = usernames
             .into_iter()
             .map(|username| username.to_ascii_lowercase())
             .collect();
-        let active_admins = state.active_admins.clone();
+        let active_admins = &state.active_admins;
         state
             .known_accounts
             .retain(|username, _| active_admins.contains(username));
@@ -372,6 +463,40 @@ impl AdminLoginLimiter {
         self.state()
             .active_admins
             .contains(&username.to_ascii_lowercase())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_test(&self) -> AdminLoginLimiterSnapshot {
+        let state = self.state();
+        let mut active_admins = state.active_admins.iter().cloned().collect::<Vec<_>>();
+        active_admins.sort_unstable();
+        let mut known_accounts = state
+            .known_accounts
+            .iter()
+            .map(|(username, history)| (username.clone(), history.attempts.clone()))
+            .collect::<Vec<_>>();
+        known_accounts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut known_origins = state
+            .known_origins
+            .iter()
+            .map(|(key, history)| (key.clone(), history.attempts.clone()))
+            .collect::<Vec<_>>();
+        known_origins.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        AdminLoginLimiterSnapshot {
+            active_admins,
+            known_accounts,
+            known_origins,
+            unknown_accounts: state
+                .unknown_accounts
+                .iter()
+                .map(|history| history.as_ref().map(|history| history.attempts.clone()))
+                .collect(),
+            unknown_ips: state
+                .unknown_ips
+                .iter()
+                .map(|history| history.as_ref().map(|history| history.attempts.clone()))
+                .collect(),
+        }
     }
 
     #[cfg(test)]

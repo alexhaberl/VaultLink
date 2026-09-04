@@ -11,8 +11,8 @@ Release line: `0.7.0` is unreleased development and must not be merged or publis
 
 ## Build and release security
 
-- GitHub Actions are pinned to full commit SHAs and build containers to SHA-256 manifest digests. Human-readable versions remain beside the pins and Dependabot proposes reviewed updates.
-- Rust toolchains and CI-installed Cargo tools use exact versions. `tools/check-supply-chain-policy.sh` rejects mutable workflow references, remote `curl | sh`, and missing Docker build-context exclusions.
+- GitHub Actions are pinned to full commit SHAs, while build containers and external Dockerfile frontends are pinned to SHA-256 multiarch manifest digests. Human-readable versions remain beside the pins and dependency updates are reviewed.
+- Rust toolchains and CI-installed Cargo tools use exact versions. `tools/check-supply-chain-policy.sh` rejects mutable workflow and Dockerfile-frontend references, frontend overrides, remote `curl | sh`, and missing Docker build-context exclusions.
 - Push and pull-request CI audits the shared workspace `Cargo.lock`, compiles every fuzz target, and runs setup, API, package, signed-update, upgrade, and rollback Docker smokes without external runtime networking.
 - Native CI runs checksum-pinned Gitleaks 8.30.0 over the complete fetched Git history with redacted output, recursive decoding, and archive inspection. `.gitleaksignore` contains only two commit-bound findings for the public RFC 6238 Appendix B TOTP test vector.
 - Local `.env`, root `config.toml`, and SQLite files are excluded from the Docker context; the smoke image copies only build inputs and deploy tests explicitly.

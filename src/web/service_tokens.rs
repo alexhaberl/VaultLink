@@ -15,7 +15,7 @@ use crate::{
         SERVICE_TOKEN_SCOPE_MONITORING_READ,
     },
     http_auth::{
-        csrf, database, enabled_audit_client_ip, required_database, session,
+        csrf, database, enabled_audit_client_ip, mfa_session, required_database, session,
         verify_password_admitted, MissingSession,
     },
     i18n,
@@ -26,6 +26,7 @@ use crate::{
 use super::{
     common::{format_audit_time, parse_expiry, CsrfForm},
     rendering::PageId,
+    session_bound,
     templates::admin_page as render_admin_page,
     AppError, Result,
 };
@@ -164,9 +165,8 @@ pub(super) async fn create_service_token(
     headers: HeaderMap,
     Form(form): Form<CreateServiceTokenForm>,
 ) -> Result<Response> {
-    let (session_token, session) =
-        session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    csrf(&session, &form.csrf)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    csrf(&authenticated, &form.csrf)?;
 
     let name = form.name;
     if !valid_service_token_name(&name) {
@@ -206,14 +206,14 @@ pub(super) async fn create_service_token(
         ));
     }
 
-    let limiter_key = format!("service-token-create:{}", session.admin_id);
+    let limiter_key = format!("service-token-create:{}", authenticated.admin_id);
     if !state.limiter.check_and_record_attempt(&limiter_key) {
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many password attempts",
         ));
     }
-    let username = session.username.clone();
+    let username = authenticated.username.clone();
     let admin = database(state.db.clone(), move |database| database.admin(&username))
         .await?
         .ok_or(AppError(StatusCode::UNAUTHORIZED, "Sign-in required"))?;
@@ -236,12 +236,14 @@ pub(super) async fn create_service_token(
     let plaintext_token = SecretString::from(format!("vlk_st_v1_{}", auth::random_token(32)));
     let response_token = plaintext_token.duplicate_for_one_time_response();
     let response_name = name.clone();
-    let admin_id = session.admin_id;
-    let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
+    let proof = authenticated.proof().clone();
+    let audit_context = AuditContext::new(
+        authenticated.username.clone(),
+        enabled_audit_client_ip(&state),
+    );
     let outcome = required_database(state.db.clone(), move |database| {
-        database.create_service_token_for_verified_admin_and_audit(
-            &session_token,
-            admin_id,
+        database.create_service_token_for_mfa_session(
+            &proof,
             &expected_password_hash,
             &name,
             plaintext_token.expose_secret(),
@@ -250,6 +252,7 @@ pub(super) async fn create_service_token(
         )
     })
     .await?;
+    let outcome = session_bound(outcome)?;
 
     match outcome {
         ServiceTokenCreationOutcome::Created(_) => {
@@ -263,7 +266,7 @@ pub(super) async fn create_service_token(
                 PageId::ServiceTokenCreated,
                 &body,
                 false,
-                &session.csrf_token,
+                &authenticated.csrf_token,
                 false,
             )?;
             Ok(no_store_html(html))
@@ -288,13 +291,18 @@ pub(super) async fn revoke_service_token(
     AxPath(id): AxPath<i64>,
     Form(form): Form<CsrfForm>,
 ) -> Result<Redirect> {
-    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    csrf(&session, &form.csrf)?;
-    let audit_context = AuditContext::new(session.username, enabled_audit_client_ip(&state));
+    let authenticated = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    csrf(&authenticated, &form.csrf)?;
+    let proof = authenticated.proof().clone();
+    let audit_context = AuditContext::new(
+        authenticated.username.clone(),
+        enabled_audit_client_ip(&state),
+    );
     let revoked = required_database(state.db.clone(), move |database| {
-        database.revoke_service_token_and_audit(id, &audit_context)
+        database.revoke_service_token_for_mfa_session(&proof, id, &audit_context)
     })
     .await?;
+    let revoked = session_bound(revoked)?;
     if !revoked {
         return Err(AppError(StatusCode::NOT_FOUND, "Service token not found"));
     }

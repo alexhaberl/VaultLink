@@ -136,6 +136,17 @@ fn current_totp(secret: &str) -> String {
     auth::totp_code(secret, step).unwrap()
 }
 
+#[test]
+fn session_bound_outcomes_have_an_explicit_api_contract() {
+    assert_eq!(
+        session_bound(crate::db::SessionBound::Authorized(7)).unwrap(),
+        7
+    );
+    let error = session_bound::<()>(crate::db::SessionBound::SessionUnavailable).unwrap_err();
+    assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(error.code, "session_revoked");
+}
+
 #[tokio::test]
 async fn health_reports_the_exact_package_version() {
     let root = tempfile::tempdir().unwrap();
@@ -792,6 +803,98 @@ async fn api_hashes_share_password_before_waiting_for_storage_mutation() {
     assert!(state.db.list_shares().unwrap().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_share_mutation_rechecks_the_exact_session_after_waiting_for_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db.create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db
+        .create_session(
+            "queued-api-session",
+            1,
+            "csrf-token",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db.verify_mfa("queued-api-session").unwrap();
+    let share_id = state
+        .db
+        .create_share(
+            "queued-api-share",
+            None,
+            "docs",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+
+    // Make the initial session lookup observable: it refreshes activity before
+    // the handler queues on the storage lock. This avoids a timing-only test.
+    let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    probe
+        .execute("UPDATE sessions SET last_activity_at=?1", [&stale_activity])
+        .unwrap();
+
+    let storage_guard = state.storage_mutation.clone().lock_owned().await;
+    let mut request = json_request(
+        Method::POST,
+        &format!("/api/v2/shares/{share_id}/deactivate"),
+        "{}",
+    );
+    authorize_mutation(
+        &mut request,
+        "vaultlink_session=queued-api-session",
+        "csrf-token",
+    );
+    let app = crate::web::router(state.clone());
+    let queued = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+
+    let mut initial_check_completed = false;
+    for _ in 0..100 {
+        let current_activity: String = probe
+            .query_row("SELECT last_activity_at FROM sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        if current_activity != stale_activity {
+            initial_check_completed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        initial_check_completed,
+        "request did not complete its initial session check"
+    );
+
+    state.db.delete_session("queued-api-session").unwrap();
+    drop(storage_guard);
+    let response = queued.await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response_text(response)
+        .await
+        .contains(r#""code":"session_revoked""#));
+    assert!(
+        state
+            .db
+            .share_by_token("queued-api-share")
+            .unwrap()
+            .unwrap()
+            .active
+    );
+    assert_eq!(state.db.count_audit(Some("share_deactivated")).unwrap(), 0);
+}
+
 #[tokio::test]
 async fn external_writers_reject_api_overwrite_configuration() {
     let root = tempfile::tempdir().unwrap();
@@ -1010,6 +1113,211 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
         app.oneshot(missing).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_limiter_publication_finishes_before_waiting_logout_returns() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    let secret = auth::new_totp_secret();
+    let hash = auth::hash_password("correct horse battery staple").unwrap();
+    state.db.create_admin("admin", &hash, &secret).unwrap();
+    let (session_cookie, csrf) = api_login(&state, &secret).await;
+
+    let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    state
+        .admin_login_limiter
+        .install_publication_barrier((entered_sender, release_receiver));
+
+    let mut create = json_request(
+        Method::POST,
+        "/api/v2/admins",
+        r#"{"username":"fenced-ops","password":"another correct horse password"}"#,
+    );
+    authorize_mutation(&mut create, &session_cookie, &csrf);
+    let create_app = crate::web::router(state.clone());
+    let create = tokio::spawn(async move { create_app.oneshot(create).await.unwrap() });
+    tokio::task::spawn_blocking(move || {
+        entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("admin creation should reach limiter publication")
+    })
+    .await
+    .unwrap();
+
+    let mut logout = json_request(Method::POST, "/api/v2/session/logout", "{}");
+    authorize_mutation(&mut logout, &session_cookie, &csrf);
+    let logout_state = state.clone();
+    let logout = tokio::spawn(async move {
+        let response = crate::web::router(logout_state.clone())
+            .oneshot(logout)
+            .await
+            .unwrap();
+        let limiter_contains_created_admin = logout_state
+            .admin_login_limiter
+            .has_active_admin("fenced-ops");
+        (response, limiter_contains_created_admin)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !logout.is_finished(),
+        "logout must wait while the admin transaction publishes its limiter snapshot"
+    );
+
+    release_sender.send(()).unwrap();
+    let create_response = create.await.unwrap();
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let (logout_response, limiter_contains_created_admin) = logout.await.unwrap();
+    assert_eq!(logout_response.status(), StatusCode::OK);
+    assert!(limiter_contains_created_admin);
+    assert!(state.db.admin("fenced-ops").unwrap().is_some());
+    assert_eq!(state.db.count_audit(Some("admin_created")).unwrap(), 1);
+    assert_eq!(state.db.count_audit(Some("logout")).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn admin_limiter_publication_rolls_back_when_required_audit_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    let secret = auth::new_totp_secret();
+    let hash = auth::hash_password("correct horse battery staple").unwrap();
+    state.db.create_admin("admin", &hash, &secret).unwrap();
+    state
+        .db
+        .create_admin("ops", "ops-password-hash", &auth::new_totp_secret())
+        .unwrap();
+    state
+        .admin_login_limiter
+        .replace_active_admins(state.db.active_admin_usernames().unwrap());
+    let (session_cookie, csrf) = api_login(&state, &secret).await;
+    let ops_id = state
+        .db
+        .list_admins()
+        .unwrap()
+        .into_iter()
+        .find(|admin| admin.username == "ops")
+        .unwrap()
+        .id;
+    state
+        .db
+        .create_session(
+            "ops-session",
+            ops_id,
+            "ops-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(state.db.verify_mfa("ops-session").unwrap());
+    assert!(state
+        .admin_login_limiter
+        .check_and_record_attempt("ops", "192.0.2.44".parse().unwrap()));
+    let admins_before = state
+        .db
+        .list_admins()
+        .unwrap()
+        .into_iter()
+        .map(|admin| (admin.id, admin.username, admin.created_at, admin.active))
+        .collect::<Vec<_>>();
+    let limiter_before = state.admin_login_limiter.snapshot_for_test();
+    let audit_before = state.db.count_audit(None).unwrap();
+    rusqlite::Connection::open(data.path().join("data.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_admin_deactivation_audit
+             BEFORE INSERT ON audit
+             WHEN NEW.action='admin_deactivated'
+             BEGIN SELECT RAISE(FAIL, 'injected admin deactivation audit failure'); END;",
+        )
+        .unwrap();
+
+    let mut deactivate = json_request(
+        Method::POST,
+        &format!("/api/v2/admins/{ops_id}/deactivate"),
+        "{}",
+    );
+    authorize_mutation(&mut deactivate, &session_cookie, &csrf);
+    let response = crate::web::router(state.clone())
+        .oneshot(deactivate)
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response_text(response)
+        .await
+        .contains(r#""code":"audit_unavailable""#));
+    let admins_after = state
+        .db
+        .list_admins()
+        .unwrap()
+        .into_iter()
+        .map(|admin| (admin.id, admin.username, admin.created_at, admin.active))
+        .collect::<Vec<_>>();
+    assert_eq!(admins_after, admins_before);
+    assert!(state.db.session("ops-session").unwrap().is_some());
+    let limiter_after = state.admin_login_limiter.snapshot_for_test();
+    assert_eq!(limiter_after.active_admins, limiter_before.active_admins);
+    assert_eq!(limiter_after.known_accounts, limiter_before.known_accounts);
+    assert_eq!(limiter_after.known_origins, limiter_before.known_origins);
+    assert_eq!(
+        limiter_after.unknown_accounts,
+        limiter_before.unknown_accounts
+    );
+    assert_eq!(limiter_after.unknown_ips, limiter_before.unknown_ips);
+    assert_eq!(state.db.count_audit(None).unwrap(), audit_before);
+    assert_eq!(state.db.count_audit(Some("admin_deactivated")).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn runtime_settings_publication_rolls_back_when_required_audit_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    let secret = auth::new_totp_secret();
+    let hash = auth::hash_password("correct horse battery staple").unwrap();
+    state.db.create_admin("admin", &hash, &secret).unwrap();
+    let (session_cookie, csrf) = api_login(&state, &secret).await;
+    let persisted_before = state.db.runtime_settings().unwrap();
+    let runtime_before = runtime_settings(&state);
+    let webauthn_before = state.webauthn.read().unwrap().instance_id();
+    let audit_before = state.db.count_audit(None).unwrap();
+    rusqlite::Connection::open(data.path().join("data.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_runtime_settings_audit
+             BEFORE INSERT ON audit
+             WHEN NEW.action='settings_updated'
+             BEGIN SELECT RAISE(FAIL, 'injected settings audit failure'); END;",
+        )
+        .unwrap();
+    let mut update = settings_body(runtime_before.clone());
+    update.public_base_url = "http://localhost:8081/".into();
+    let mut request = json_request(
+        Method::PUT,
+        "/api/v2/settings",
+        &serde_json::to_string(&update).unwrap(),
+    );
+    authorize_mutation(&mut request, &session_cookie, &csrf);
+
+    let response = crate::web::router(state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response_text(response)
+        .await
+        .contains(r#""code":"audit_unavailable""#));
+    assert_eq!(state.db.runtime_settings().unwrap(), persisted_before);
+    assert_eq!(runtime_settings(&state), runtime_before);
+    assert_eq!(
+        state.webauthn.read().unwrap().instance_id(),
+        webauthn_before
+    );
+    assert_eq!(state.db.count_audit(None).unwrap(), audit_before);
+    assert_eq!(state.db.count_audit(Some("settings_updated")).unwrap(), 0);
 }
 
 #[tokio::test]
@@ -1980,6 +2288,33 @@ fn file_recovery_required_audit_failure_maps_to_stable_503_code() {
     assert_eq!(mapped.message, "Security audit temporarily unavailable");
 }
 
+#[test]
+fn file_database_busy_and_locked_errors_map_to_retryable_api_capacity() {
+    for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+        for recovery in [false, true] {
+            let file_error = crate::file_ops::FileOperationError::Database(
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+            );
+            let mapped = if recovery {
+                storage_recovery_api_error(file_error)
+            } else {
+                files::file_operation_error(file_error)
+            };
+            assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(mapped.code, "request_failed");
+            assert_eq!(
+                mapped.message,
+                "Request processing capacity is temporarily unavailable"
+            );
+            assert_eq!(mapped.retry_after_seconds, Some(1));
+
+            let response = mapped.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        }
+    }
+}
+
 #[tokio::test]
 async fn api_share_creation_preserves_audit_unavailable_from_real_pending_recovery() {
     let root = tempfile::tempdir().unwrap();
@@ -2015,13 +2350,21 @@ async fn api_share_creation_preserves_audit_unavailable_from_real_pending_recove
         )
         .unwrap();
 
-    let rename = crate::file_ops::rename(
-        &state,
-        "old.txt",
-        "new.txt",
-        crate::db::AuditContext::new("admin", None),
+    let session_token = session_cookie
+        .strip_prefix("vaultlink_session=")
+        .expect("test session cookie");
+    let proof = crate::db::MfaSessionProof::for_test(session_token, 1);
+    let rename = session_bound(
+        crate::file_ops::rename(
+            &state,
+            proof,
+            "old.txt",
+            "new.txt",
+            crate::db::AuditContext::new("admin", None),
+        )
+        .await
+        .unwrap(),
     )
-    .await
     .unwrap();
     assert!(rename.audit_durability.is_uncertain());
     assert_eq!(
@@ -3156,4 +3499,42 @@ async fn monitoring_rate_limit_is_per_effective_client_ip() {
         app.oneshot(request("127.0.0.2")).await.unwrap().status(),
         StatusCode::OK
     );
+}
+
+#[test]
+fn api_share_create_and_update_build_responses_without_post_commit_reads() {
+    let source = include_str!("shares.rs");
+
+    let create_start = source
+        .find("pub(super) async fn create_share(")
+        .expect("API share create handler");
+    let create_end = source[create_start..]
+        .find("pub(super) struct UpdateShareRequest")
+        .map(|offset| create_start + offset)
+        .expect("API share update request follows create handler");
+    let create = &source[create_start..create_end];
+    let create_snapshot = create
+        .find("let (_created, share) = session_bound(")
+        .expect("create must receive its response snapshot from the MFA transaction");
+    let create_response = &create[create_snapshot..];
+    assert!(create_response.contains("share_response(&settings, share)"));
+    assert!(!create_response.contains("share_by_token("));
+    assert!(!create_response.contains("database("));
+
+    let update_start = source
+        .find("pub(super) async fn update_share(")
+        .expect("API share update handler");
+    let update_end = source[update_start..]
+        .find("pub(super) async fn activate_share(")
+        .map(|offset| update_start + offset)
+        .expect("API share activation handler follows update handler");
+    let update = &source[update_start..update_end];
+    let update_snapshot = update
+        .find("let (outcome, share) = session_bound(")
+        .expect("update must receive its response snapshot from the MFA transaction");
+    let update_response = &update[update_snapshot..];
+    assert!(update_response.contains("let share = share.ok_or_else"));
+    assert!(update_response.contains("share_response(&settings, share)"));
+    assert!(!update_response.contains("find_share_by_id("));
+    assert!(!update_response.contains("database("));
 }

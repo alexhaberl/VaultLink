@@ -10,6 +10,7 @@ mod staging;
 mod upload;
 
 use capability::{directory_scan_from_file, linux};
+use identity::entry_exists;
 #[cfg(test)]
 use journal::{replace_delete_operation_phase, replace_file_operation, write_file_operation};
 use private_entries::ActiveUploadFragmentKey;
@@ -174,6 +175,12 @@ pub struct DeleteCommitOutcome {
     pub tombstone_path: Option<String>,
 }
 
+pub(crate) struct DirectoryTreeOutcome {
+    pub(crate) created: Vec<String>,
+    pub(crate) sync_error: Option<io::Error>,
+    pub(crate) terminal_error: Option<io::Error>,
+}
+
 #[derive(Clone)]
 pub struct SecureRoot {
     display_root: PathBuf,
@@ -185,9 +192,23 @@ pub struct SecureRoot {
     #[cfg(test)]
     next_delete_staging_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
     #[cfg(test)]
+    next_delete_staging_identity_probe_errors: Arc<Mutex<Option<(io::ErrorKind, usize)>>>,
+    #[cfg(test)]
+    next_delete_post_stage_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_delete_rollback_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_delete_rollback_rename_response_loss: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_delete_rollback_parent_sync_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
     next_delete_promotion_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
     #[cfg(test)]
     next_delete_identity_probe_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_rename_parent_sync_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_delete_commit_sync_error: Arc<Mutex<Option<io::ErrorKind>>>,
     #[cfg(test)]
     before_rename_hook: Arc<Mutex<Option<TestOnceHook>>>,
     #[cfg(test)]
@@ -196,6 +217,14 @@ pub struct SecureRoot {
     next_cleanup_batch_error: Arc<Mutex<Option<io::ErrorKind>>>,
     #[cfg(test)]
     next_create_directory_sync_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_create_directory_mkdir_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_create_directory_probe_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_upload_publication_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_upload_publication_identity_probe_errors: Arc<Mutex<Option<(io::ErrorKind, usize)>>>,
     #[cfg(test)]
     before_cleanup_batch_hook: Arc<Mutex<Option<TestOnceHook>>>,
 }
@@ -210,6 +239,16 @@ pub struct SecureDirectory {
     _storage_instance_lock: Option<Arc<crate::StorageInstanceLock>>,
     #[cfg(test)]
     next_create_directory_sync_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_create_directory_mkdir_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_create_directory_probe_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_upload_publication_rename_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
+    next_upload_publication_identity_probe_errors: Arc<Mutex<Option<(io::ErrorKind, usize)>>>,
+    #[cfg(test)]
+    after_directory_tree_create_hook: Arc<Mutex<Option<TestOnceHook>>>,
 }
 
 /// An already-opened regular file bound to the scope that authorized it.
@@ -324,6 +363,8 @@ pub struct StagedDelete {
     #[cfg(test)]
     next_identity_probe_error: Arc<Mutex<Option<io::ErrorKind>>>,
     #[cfg(test)]
+    next_commit_sync_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    #[cfg(test)]
     after_promotion_hook: Option<TestOnceHook>,
 }
 
@@ -333,6 +374,32 @@ pub struct PendingDeleteCommit {
     outcome: DeleteCommitOutcome,
     active_key: Option<ActiveUploadFragmentKey>,
     _storage_instance_lock: Option<Arc<crate::StorageInstanceLock>>,
+}
+
+pub(crate) enum RenameStageOutcome {
+    Ready(StagedRename),
+    PublishedUncertain {
+        new_path: String,
+        kind: EntryKind,
+        error: io::Error,
+    },
+}
+
+pub(crate) enum DeleteCommitStageOutcome {
+    Ready(PendingDeleteCommit),
+    PublishedUncertain {
+        cleanup_pending: bool,
+        error: io::Error,
+    },
+}
+
+pub(crate) enum DeleteStageOutcome {
+    Ready(Box<StagedDelete>),
+    PublishedUncertain {
+        original_path: String,
+        kind: EntryKind,
+        error: io::Error,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -758,6 +825,16 @@ impl SecureRoot {
         probe_storage_mutations(uploads.as_ref(), tombstones.as_ref())?;
         #[cfg(test)]
         let next_create_directory_sync_error = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let next_create_directory_mkdir_error = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let next_create_directory_probe_error = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let next_upload_publication_rename_error = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let next_upload_publication_identity_probe_errors = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let after_directory_tree_create_hook = Arc::new(Mutex::new(None));
         let secure_root = Self {
             display_root,
             root: SecureDirectory {
@@ -768,15 +845,40 @@ impl SecureRoot {
                 _storage_instance_lock: storage_instance_lock.clone(),
                 #[cfg(test)]
                 next_create_directory_sync_error: next_create_directory_sync_error.clone(),
+                #[cfg(test)]
+                next_create_directory_mkdir_error: next_create_directory_mkdir_error.clone(),
+                #[cfg(test)]
+                next_create_directory_probe_error: next_create_directory_probe_error.clone(),
+                #[cfg(test)]
+                next_upload_publication_rename_error: next_upload_publication_rename_error.clone(),
+                #[cfg(test)]
+                next_upload_publication_identity_probe_errors:
+                    next_upload_publication_identity_probe_errors.clone(),
+                #[cfg(test)]
+                after_directory_tree_create_hook,
             },
             tombstones,
             _storage_instance_lock: storage_instance_lock,
             #[cfg(test)]
             next_delete_staging_rename_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            next_delete_staging_identity_probe_errors: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_delete_post_stage_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_delete_rollback_rename_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_delete_rollback_rename_response_loss: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_delete_rollback_parent_sync_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             next_delete_promotion_rename_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_delete_identity_probe_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_rename_parent_sync_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_delete_commit_sync_error: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             before_rename_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -786,6 +888,14 @@ impl SecureRoot {
             #[cfg(test)]
             next_create_directory_sync_error,
             #[cfg(test)]
+            next_create_directory_mkdir_error,
+            #[cfg(test)]
+            next_create_directory_probe_error,
+            #[cfg(test)]
+            next_upload_publication_rename_error,
+            #[cfg(test)]
+            next_upload_publication_identity_probe_errors,
+            #[cfg(test)]
             before_cleanup_batch_hook: Arc::new(Mutex::new(None)),
         };
         secure_root.remove_incomplete_file_operation_writes()?;
@@ -794,20 +904,73 @@ impl SecureRoot {
         Ok(secure_root)
     }
 
-    pub fn create_directory(&self, parent: &str, name: &str) -> io::Result<String> {
+    pub fn create_directory(
+        &self,
+        parent: &str,
+        name: &str,
+    ) -> io::Result<(String, PublishOutcome)> {
         let parent = normalized(parent)?;
         let name = path_security::safe_admin_filename(name)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
-        self.root.bind_directory(&parent)?.create_directory(name)?;
-        Ok(join_relative(&parent, name))
+        let outcome = self
+            .root
+            .bind_directory(&parent)?
+            .create_directory_with_outcome(name)?;
+        Ok((join_relative(&parent, name), outcome))
     }
 
     #[cfg(test)]
-    fn fail_next_create_directory_sync(&self, kind: io::ErrorKind) {
+    pub(crate) fn fail_next_create_directory_sync(&self, kind: io::ErrorKind) {
         *self
             .next_create_directory_sync_error
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(kind);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_create_directory_mkdir_after_success(&self, kind: io::ErrorKind) {
+        *self
+            .next_create_directory_mkdir_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(kind);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_create_directory_probe(&self, kind: io::ErrorKind) {
+        *self
+            .next_create_directory_probe_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(kind);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_upload_publication_rename_after_success(&self, kind: io::ErrorKind) {
+        *self
+            .next_upload_publication_rename_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(kind);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_upload_publication_identity_probes(
+        &self,
+        kind: io::ErrorKind,
+        count: usize,
+    ) {
+        assert!(count > 0, "identity probe failure count must be positive");
+        *self
+            .next_upload_publication_identity_probe_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((kind, count));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn after_next_directory_tree_create(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .root
+            .after_directory_tree_create_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
     }
 }
 
@@ -825,39 +988,177 @@ impl SecureDirectory {
     /// scope. Existing directories are accepted, while files and symlinks fail
     /// closed when the capability is narrowed to the next component.
     pub fn ensure_directory_tree(&self, relative: &str) -> io::Result<Vec<String>> {
+        let outcome = self.ensure_directory_tree_with_outcome(relative)?;
+        if let Some(error) = outcome.terminal_error {
+            return Err(error);
+        }
+        match outcome.sync_error {
+            Some(error) => Err(error),
+            None => Ok(outcome.created),
+        }
+    }
+
+    pub(crate) fn ensure_directory_tree_with_outcome(
+        &self,
+        relative: &str,
+    ) -> io::Result<DirectoryTreeOutcome> {
         let relative = path_security::validate_relative(relative)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory path"))?
             .to_string_lossy()
             .replace('\\', "/");
-        let mut current = self.clone();
-        let mut current_path = String::new();
-        let mut created = Vec::new();
-        for component in relative
+        let components: Vec<&str> = relative
             .split('/')
             .filter(|component| !component.is_empty())
-        {
+            .collect();
+        // Validate the complete user-supplied tree before the first mkdir. A
+        // policy error in a later component must not turn an otherwise
+        // mutation-free bad request into an unaudited partial creation.
+        for component in &components {
             path_security::safe_admin_filename(component).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name")
             })?;
-            match current.create_directory(component) {
-                Ok(()) => {
+        }
+        let mut current = self.clone();
+        let mut current_path = String::new();
+        let mut created = Vec::new();
+        let mut sync_error = None;
+        for component in components {
+            match current.create_directory_with_outcome(component) {
+                Ok(outcome) => {
                     current_path = join_relative(&current_path, component);
                     created.push(current_path.clone());
+                    if sync_error.is_none() {
+                        match outcome {
+                            PublishOutcome::Durable => {}
+                            PublishOutcome::PublishedSyncUncertain(error)
+                            | PublishOutcome::PublishedUncertain(error) => {
+                                sync_error = Some(error);
+                            }
+                        }
+                    }
+                    #[cfg(test)]
+                    self.run_after_directory_tree_create_hook();
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     current_path = join_relative(&current_path, component);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if created.is_empty() {
+                        return Err(error);
+                    }
+                    return Ok(DirectoryTreeOutcome {
+                        created,
+                        sync_error,
+                        terminal_error: Some(error),
+                    });
+                }
             }
-            current = current.bind_directory(component)?;
+            current = match current.bind_directory(component) {
+                Ok(directory) => directory,
+                Err(error) if created.is_empty() => return Err(error),
+                Err(error) => {
+                    return Ok(DirectoryTreeOutcome {
+                        created,
+                        sync_error,
+                        terminal_error: Some(error),
+                    });
+                }
+            };
         }
-        Ok(created)
+        Ok(DirectoryTreeOutcome {
+            created,
+            sync_error,
+            terminal_error: None,
+        })
     }
 
-    fn create_directory(&self, name: &str) -> io::Result<()> {
+    #[cfg(test)]
+    fn run_after_directory_tree_create_hook(&self) {
+        let hook = self
+            .after_directory_tree_create_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn create_directory_with_outcome(&self, name: &str) -> io::Result<PublishOutcome> {
         path_security::safe_admin_filename(name)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
-        linux::mkdir(self.directory.as_ref(), name)?;
+        // A post-error probe is only meaningful after proving the name did not
+        // exist before this invocation. This avoids interpreting an ordinary
+        // EEXIST as a successful mkdir with a lost response.
+        if entry_exists(self.directory.as_ref(), name)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "directory already exists",
+            ));
+        }
+        let mkdir = linux::mkdir(self.directory.as_ref(), name);
+        #[cfg(test)]
+        let mkdir = match (mkdir, self.take_create_directory_mkdir_error()) {
+            (Ok(()), Some(kind)) => Err(io::Error::new(
+                kind,
+                "injected mkdir response loss after successful creation",
+            )),
+            (mkdir, _) => mkdir,
+        };
+        let publication_error = match mkdir {
+            Ok(()) => None,
+            Err(error) => {
+                let probe = self.probe_created_directory(name);
+                match probe {
+                    Ok(false) => return Err(error),
+                    Ok(true) => Some(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "mkdir returned an error after the directory became visible: {error}"
+                        ),
+                    )),
+                    Err(probe_error) => Some(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "mkdir outcome is ambiguous after {error}; visibility probe failed: {probe_error}"
+                        ),
+                    )),
+                }
+            }
+        };
+        let sync = self.sync_created_directory_parent();
+        if let Some(publication_error) = publication_error {
+            return Ok(PublishOutcome::PublishedUncertain(match sync {
+                Ok(()) => publication_error,
+                Err(sync_error) => io::Error::new(
+                    publication_error.kind(),
+                    format!("{publication_error}; parent-directory sync also failed: {sync_error}"),
+                ),
+            }));
+        }
+        Ok(match sync {
+            Ok(()) => PublishOutcome::Durable,
+            Err(error) => PublishOutcome::PublishedSyncUncertain(error),
+        })
+    }
+
+    fn probe_created_directory(&self, name: &str) -> io::Result<bool> {
+        #[cfg(test)]
+        if let Some(kind) = self
+            .next_create_directory_probe_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return Err(io::Error::new(
+                kind,
+                "injected created-directory visibility probe failure",
+            ));
+        }
+        entry_exists(self.directory.as_ref(), name)
+    }
+
+    fn sync_created_directory_parent(&self) -> io::Result<()> {
         #[cfg(test)]
         if let Some(kind) = self
             .next_create_directory_sync_error
@@ -871,6 +1172,14 @@ impl SecureDirectory {
             ));
         }
         self.directory.sync_all()
+    }
+
+    #[cfg(test)]
+    fn take_create_directory_mkdir_error(&self) -> Option<io::ErrorKind> {
+        self.next_create_directory_mkdir_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     fn rename_noreplace(&self, old: &str, new: &str) -> io::Result<()> {
@@ -985,7 +1294,9 @@ mod tests {
     fn admin_mutations_create_rename_rollback_and_delete_tree() {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
-        assert_eq!(root.create_directory("", "docs").unwrap(), "docs");
+        let (created, outcome) = root.create_directory("", "docs").unwrap();
+        assert_eq!(created, "docs");
+        assert!(outcome.is_durable());
         std::fs::write(directory.path().join("docs/file.txt"), b"content").unwrap();
 
         {
@@ -1005,7 +1316,7 @@ mod tests {
             .create_directory("", &deletion_tombstone_name())
             .is_err());
 
-        let staged = root.stage_delete("docs").unwrap();
+        let staged = root.stage_delete_ready("docs").unwrap();
         assert_eq!(
             staged.status(),
             &EntryStatus {
@@ -1052,14 +1363,109 @@ mod tests {
     }
 
     #[test]
+    fn directory_tree_outcome_preserves_visible_partial_creation_on_terminal_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let external_path = directory.path().to_path_buf();
+        root.after_next_directory_tree_create(move || {
+            std::fs::write(external_path.join("album/blocker"), b"external file").unwrap();
+        });
+
+        let outcome = root
+            .bind_directory("")
+            .unwrap()
+            .ensure_directory_tree_with_outcome("album/blocker/child")
+            .unwrap();
+
+        assert_eq!(outcome.created, ["album"]);
+        assert!(outcome.sync_error.is_none());
+        assert!(matches!(
+            outcome.terminal_error.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::NotADirectory)
+        ));
+        assert!(directory.path().join("album").is_dir());
+        assert!(directory.path().join("album/blocker").is_file());
+        assert!(!directory.path().join("album/blocker/child").exists());
+    }
+
+    #[test]
+    fn directory_tree_preserves_first_component_publication_uncertainty() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        root.fail_next_create_directory_mkdir_after_success(io::ErrorKind::TimedOut);
+        root.fail_next_create_directory_probe(io::ErrorKind::WouldBlock);
+
+        let outcome = root
+            .bind_directory("")
+            .unwrap()
+            .ensure_directory_tree_with_outcome("first/second")
+            .unwrap();
+
+        assert_eq!(outcome.created, ["first", "first/second"]);
+        assert_eq!(
+            outcome.sync_error.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::TimedOut)
+        );
+        assert!(outcome.terminal_error.is_none());
+        assert!(directory.path().join("first/second").is_dir());
+    }
+
+    #[test]
+    fn directory_tree_preserves_later_component_publication_uncertainty() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let fault_root = root.clone();
+        root.after_next_directory_tree_create(move || {
+            fault_root
+                .fail_next_create_directory_mkdir_after_success(io::ErrorKind::ConnectionReset);
+            fault_root.fail_next_create_directory_probe(io::ErrorKind::WouldBlock);
+        });
+
+        let outcome = root
+            .bind_directory("")
+            .unwrap()
+            .ensure_directory_tree_with_outcome("first/second")
+            .unwrap();
+
+        assert_eq!(outcome.created, ["first", "first/second"]);
+        assert_eq!(
+            outcome.sync_error.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::ConnectionReset)
+        );
+        assert!(outcome.terminal_error.is_none());
+        assert!(directory.path().join("first/second").is_dir());
+    }
+
+    #[test]
     fn create_directory_reports_parent_sync_uncertainty() {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         root.fail_next_create_directory_sync(io::ErrorKind::Other);
 
-        let error = root.create_directory("", "uncertain").unwrap_err();
+        let (created, outcome) = root.create_directory("", "uncertain").unwrap();
+        assert_eq!(created, "uncertain");
+        let PublishOutcome::PublishedSyncUncertain(error) = outcome else {
+            panic!("injected post-mkdir sync failure must preserve publication state");
+        };
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(directory.path().join("uncertain").is_dir());
+    }
+
+    #[test]
+    fn create_directory_response_loss_with_probe_failure_is_published_uncertain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        root.fail_next_create_directory_mkdir_after_success(io::ErrorKind::TimedOut);
+        root.fail_next_create_directory_probe(io::ErrorKind::WouldBlock);
+
+        let (created, outcome) = root.create_directory("", "ambiguous").unwrap();
+
+        assert_eq!(created, "ambiguous");
+        let PublishOutcome::PublishedUncertain(error) = outcome else {
+            panic!("mkdir response loss with an inconclusive probe must be typed uncertain");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(directory.path().join("ambiguous").is_dir());
     }
 
     #[test]
@@ -1071,7 +1477,7 @@ mod tests {
         std::fs::create_dir(directory.path().join("empty")).unwrap();
         let external_writer = File::open(directory.path().join("empty")).unwrap();
 
-        let mut staged = root.stage_delete("empty").unwrap();
+        let mut staged = root.stage_delete_ready("empty").unwrap();
         assert!(!staged.status().directory_non_empty);
         let cleanup_root = root.clone();
         staged.run_after_promotion(move || {
@@ -1121,7 +1527,7 @@ mod tests {
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::create_dir(directory.path().join("empty")).unwrap();
         let external_writer = File::open(directory.path().join("empty")).unwrap();
-        let mut staged = root.stage_delete("empty").unwrap();
+        let mut staged = root.stage_delete_ready("empty").unwrap();
         staged.run_after_promotion(move || {
             std::fs::write(
                 format!("/proc/self/fd/{}/late.txt", external_writer.as_raw_fd()),
@@ -1273,7 +1679,7 @@ mod tests {
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::write(directory.path().join("restore.txt"), b"content").unwrap();
 
-        let mut staged = root.stage_delete("restore.txt").unwrap();
+        let mut staged = root.stage_delete_ready("restore.txt").unwrap();
         let operation = DurableFileOperation::Delete {
             original_path: staged.original_path.clone(),
             kind: staged.status.kind.into(),
@@ -1308,7 +1714,7 @@ mod tests {
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::create_dir(directory.path().join("restore-dir")).unwrap();
 
-        let mut staged = root.stage_delete("restore-dir").unwrap();
+        let mut staged = root.stage_delete_ready("restore-dir").unwrap();
         let (committed_name, operation_name) = staged.promote_for_cleanup(false).unwrap();
         assert_eq!(committed_name, staged.tombstone_name);
         replace_delete_operation_phase(
@@ -1475,7 +1881,11 @@ mod tests {
         std::fs::create_dir(directory.path().join("tree")).unwrap();
         std::fs::write(directory.path().join("tree/child.txt"), b"content").unwrap();
 
-        let committed = root.stage_delete("tree").unwrap().commit(true).unwrap();
+        let committed = root
+            .stage_delete_ready("tree")
+            .unwrap()
+            .commit(true)
+            .unwrap();
         let tombstone = committed.outcome().tombstone_path.as_ref().unwrap().clone();
         drop(committed);
         drop(root);
@@ -1899,7 +2309,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::write(directory.path().join("keep.txt"), b"keep").unwrap();
-        let staged = root.stage_delete("keep.txt").unwrap();
+        let staged = root.stage_delete_ready("keep.txt").unwrap();
         let mut cleanup = root.start_upload_fragment_cleanup().unwrap();
         let mut removed = 0;
         loop {
@@ -1924,7 +2334,7 @@ mod tests {
         std::fs::write(directory.path().join("response-loss.txt"), b"original").unwrap();
         root.fail_next_delete_staging_rename_after_success(io::ErrorKind::AlreadyExists);
 
-        let staged = root.stage_delete("response-loss.txt").unwrap();
+        let staged = root.stage_delete_ready("response-loss.txt").unwrap();
         assert!(!directory.path().join("response-loss.txt").exists());
         let recovery_path = directory
             .path()
@@ -1955,12 +2365,77 @@ mod tests {
     }
 
     #[test]
+    fn delete_staging_response_loss_with_probe_failures_preserves_recovery_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("ambiguous.txt"), b"original").unwrap();
+        root.fail_next_delete_staging_rename_after_success(io::ErrorKind::TimedOut);
+        root.fail_next_delete_staging_identity_probes(io::ErrorKind::WouldBlock, 2);
+
+        let outcome = root.stage_delete("ambiguous.txt").unwrap();
+        let DeleteStageOutcome::PublishedUncertain {
+            original_path,
+            kind,
+            error,
+        } = outcome
+        else {
+            panic!("inconclusive delete staging must not be returned as a normal error");
+        };
+        assert_eq!(original_path, "ambiguous.txt");
+        assert_eq!(kind, EntryKind::File);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!directory.path().join("ambiguous.txt").exists());
+
+        let tombstones = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(TOMBSTONE_STAGING_DIRECTORY_NAME);
+        assert_eq!(std::fs::read_dir(&tombstones).unwrap().count(), 2);
+        root.recover_pending_deletions(&[]).unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join("ambiguous.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read_dir(tombstones).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn delete_restore_response_loss_returns_original_error_after_verified_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("restored.txt"), b"original").unwrap();
+        root.fail_next_delete_post_stage(io::ErrorKind::InvalidData);
+        root.fail_next_delete_rollback_rename_after_success(io::ErrorKind::TimedOut);
+
+        let Err(error) = root.stage_delete("restored.txt") else {
+            panic!("a verified durable rollback must return the original pre-publication error");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read(directory.path().join("restored.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read_dir(
+                directory
+                    .path()
+                    .join(INTERNAL_DIRECTORY_NAME)
+                    .join(TOMBSTONE_STAGING_DIRECTORY_NAME)
+            )
+            .unwrap()
+            .count(),
+            0
+        );
+    }
+
+    #[test]
     fn deletion_promotion_reconciles_response_loss_before_exists_handling() {
         for error_kind in [io::ErrorKind::AlreadyExists, io::ErrorKind::Other] {
             let directory = tempfile::tempdir().unwrap();
             let root = SecureRoot::open(directory.path()).unwrap();
             std::fs::write(directory.path().join("commit.txt"), b"content").unwrap();
-            let staged = root.stage_delete("commit.txt").unwrap();
+            let staged = root.stage_delete_ready("commit.txt").unwrap();
             root.fail_next_delete_promotion_rename_after_success(error_kind);
 
             let outcome = staged.commit(false).unwrap().complete().unwrap();
@@ -1991,7 +2466,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::write(directory.path().join("report.txt"), b"original").unwrap();
-        let staged = root.stage_delete("report.txt").unwrap();
+        let staged = root.stage_delete_ready("report.txt").unwrap();
         let recovery_name = staged.tombstone_name.clone();
 
         // Simulate a co-writer reusing the visible name before rollback.
@@ -2032,7 +2507,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::write(directory.path().join("restore.txt"), b"original").unwrap();
-        let staged = root.stage_delete("restore.txt").unwrap();
+        let staged = root.stage_delete_ready("restore.txt").unwrap();
         let active_key = staged.active_key.clone().unwrap();
 
         // Simulate process loss: Drop cannot run and the in-memory registry is
@@ -2062,10 +2537,10 @@ mod tests {
         for index in 0..32 {
             let path = format!("restore-{index}.txt");
             std::fs::write(directory.path().join(&path), path.as_bytes()).unwrap();
-            staged_deletes.push((path.clone(), root.stage_delete(&path).unwrap()));
+            staged_deletes.push((path.clone(), root.stage_delete_ready(&path).unwrap()));
         }
         std::fs::write(directory.path().join("forward.txt"), b"forward").unwrap();
-        let forward = root.stage_delete("forward.txt").unwrap();
+        let forward = root.stage_delete_ready("forward.txt").unwrap();
         let forward_operation = DurableFileOperation::Delete {
             original_path: forward.original_path.clone(),
             kind: forward.status.kind.into(),
@@ -2116,7 +2591,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::write(directory.path().join("shared.txt"), b"original").unwrap();
-        let staged = root.stage_delete("shared.txt").unwrap();
+        let staged = root.stage_delete_ready("shared.txt").unwrap();
         let pending_name = staged.tombstone_name.clone();
         let active_key = staged.active_key.clone().unwrap();
         std::fs::write(directory.path().join("shared.txt"), b"replacement").unwrap();
@@ -2146,7 +2621,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::write(directory.path().join("forward.txt"), b"content").unwrap();
-        let staged = root.stage_delete("forward.txt").unwrap();
+        let staged = root.stage_delete_ready("forward.txt").unwrap();
         let active_key = staged.active_key.clone().unwrap();
         let committed_name = deletion_tombstone_name();
         let operation = DurableFileOperation::Delete {
@@ -2193,17 +2668,11 @@ mod tests {
             .map(|_| format!("{}.pending", file_operation_name()))
             .collect::<Vec<_>>();
         let unknown_name = format!("{}.pending.backup", file_operation_name());
-        let orphan_manifests = (0..32)
-            .map(|_| deletion_manifest_name(&deletion_pending_name()))
-            .collect::<Vec<_>>();
         let unknown_manifest = format!("not-a-delete{DELETION_MANIFEST_SUFFIX}");
         for temporary_name in &temporary_names {
             std::fs::write(tombstones.join(temporary_name), b"partial").unwrap();
         }
         std::fs::write(tombstones.join(&unknown_name), b"preserve").unwrap();
-        for orphan_manifest in &orphan_manifests {
-            std::fs::write(tombstones.join(orphan_manifest), b"orphan").unwrap();
-        }
         std::fs::write(tombstones.join(&unknown_manifest), b"preserve manifest").unwrap();
         drop(root);
 
@@ -2211,9 +2680,6 @@ mod tests {
         assert!(temporary_names
             .iter()
             .all(|temporary_name| !tombstones.join(temporary_name).exists()));
-        assert!(orphan_manifests
-            .iter()
-            .all(|orphan_manifest| !tombstones.join(orphan_manifest).exists()));
         assert_eq!(
             std::fs::read(tombstones.join(unknown_name)).unwrap(),
             b"preserve"
@@ -2226,11 +2692,33 @@ mod tests {
     }
 
     #[test]
+    fn startup_fails_closed_and_preserves_an_invalid_orphan_delete_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let tombstones = directory
+            .path()
+            .join(INTERNAL_DIRECTORY_NAME)
+            .join(TOMBSTONE_STAGING_DIRECTORY_NAME);
+        let manifest_name = deletion_manifest_name(&deletion_pending_name());
+        std::fs::write(tombstones.join(&manifest_name), b"not valid json").unwrap();
+        drop(root);
+
+        let error = SecureRoot::open(directory.path())
+            .err()
+            .expect("startup must fail closed on an invalid recovery manifest");
+        assert!(error.to_string().contains("has no valid recovery manifest"));
+        assert_eq!(
+            std::fs::read(tombstones.join(manifest_name)).unwrap(),
+            b"not valid json"
+        );
+    }
+
+    #[test]
     fn committed_delete_removes_pending_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let root = SecureRoot::open(directory.path()).unwrap();
         std::fs::write(directory.path().join("delete.txt"), b"content").unwrap();
-        let staged = root.stage_delete("delete.txt").unwrap();
+        let staged = root.stage_delete_ready("delete.txt").unwrap();
         assert!(staged
             .commit(false)
             .unwrap()
@@ -2596,6 +3084,57 @@ mod tests {
         assert_eq!(
             std::fs::read(directory.path().join("existing.txt")).unwrap(),
             b"new"
+        );
+    }
+
+    #[test]
+    fn upload_response_loss_with_probe_failures_is_published_uncertain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        let mut upload = root.begin_upload("").unwrap();
+        let mut file = upload.take_file().unwrap();
+        file.write_all(b"published").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        upload.fail_next_publication_rename_after_success(io::ErrorKind::TimedOut);
+        upload.fail_next_publication_identity_probes(io::ErrorKind::WouldBlock, 2);
+
+        let outcome = upload.publish("ambiguous.txt").unwrap();
+
+        let PublishOutcome::PublishedUncertain(error) = outcome else {
+            panic!("an inconclusive publication must not be returned as a normal error");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(upload);
+        assert_eq!(
+            std::fs::read(directory.path().join("ambiguous.txt")).unwrap(),
+            b"published"
+        );
+    }
+
+    #[test]
+    fn upload_replace_response_loss_with_probe_failures_is_published_uncertain() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = SecureRoot::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join("existing.txt"), b"old").unwrap();
+        let mut upload = root.begin_upload("").unwrap();
+        let mut file = upload.take_file().unwrap();
+        file.write_all(b"replacement").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        upload.fail_next_publication_rename_after_success(io::ErrorKind::ConnectionReset);
+        upload.fail_next_publication_identity_probes(io::ErrorKind::WouldBlock, 2);
+
+        let outcome = upload.publish_replace("existing.txt").unwrap();
+
+        let PublishOutcome::PublishedUncertain(error) = outcome else {
+            panic!("an inconclusive replacement must not be returned as a normal error");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        drop(upload);
+        assert_eq!(
+            std::fs::read(directory.path().join("existing.txt")).unwrap(),
+            b"replacement"
         );
     }
 

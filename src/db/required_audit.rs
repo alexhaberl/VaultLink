@@ -89,13 +89,19 @@ pub(super) fn insert_required_audits(
 pub(super) fn trace_required_audits(context: &AuditContext, events: &[RequiredAuditEvent]) {
     for event in events {
         // Client IP retention is SQLite-only. Never mirror it into tracing/journald.
-        tracing::info!(
-            target: "vaultlink::audit",
-            actor = context.actor,
-            action = event.action.as_str(),
-            object_id = event.object_id.as_deref().unwrap_or(""),
-            detail = event.detail.as_deref().unwrap_or(""),
-            "audit event"
-        );
+        // A third-party tracing subscriber is allowed to fail, but it must not
+        // unwind across an already-committed security transaction and make the
+        // caller observe a false rollback. SQLite remains the required audit
+        // sink; tracing is explicitly best-effort fallback telemetry.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracing::info!(
+                target: "vaultlink::audit",
+                actor = context.actor,
+                action = event.action.as_str(),
+                object_id = event.object_id.as_deref().unwrap_or(""),
+                detail = event.detail.as_deref().unwrap_or(""),
+                "audit event"
+            );
+        }));
     }
 }

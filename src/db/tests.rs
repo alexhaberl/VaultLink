@@ -1,23 +1,139 @@
 use super::*;
 
+static SQLITE_BUSY_WAIT_SIGNAL: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+fn signal_sqlite_busy_wait(_attempt: i32) -> bool {
+    if let Some(sender) = SQLITE_BUSY_WAIT_SIGNAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        let _ = sender.send(());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    true
+}
+
 #[test]
-fn live_mfa_session_operation_linearizes_with_session_revocation() {
+fn mfa_session_proof_debug_never_exposes_token_material() {
+    let raw_token = "highly-sensitive-session-token";
+    let digest = token_hash(raw_token);
+    let proof = MfaSessionProof::from_token(raw_token, 42);
+    let debug = format!("{proof:?}");
+
+    assert!(debug.contains("[REDACTED]"));
+    assert!(debug.contains("admin_id: 42"));
+    assert!(!debug.contains(raw_token));
+    assert!(!debug.contains(&digest));
+}
+
+#[derive(Clone, Copy)]
+struct PanickingAuditWriter;
+
+impl std::io::Write for PanickingAuditWriter {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        panic!("injected tracing subscriber failure")
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for PanickingAuditWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        *self
+    }
+}
+
+struct TestCommitPublication {
+    value: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    previous: usize,
+    accepted: bool,
+}
+
+impl CommitPublication for TestCommitPublication {
+    fn accept_commit(&mut self) {
+        self.accepted = true;
+    }
+}
+
+impl Drop for TestCommitPublication {
+    fn drop(&mut self) {
+        if !self.accepted {
+            self.value
+                .store(self.previous, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[test]
+fn committed_publication_survives_a_panicking_fallback_tracing_subscriber() {
     let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let proof = verified_mfa_proof(&database, "post-commit-tracing", 1);
+    let value = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let published = value.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(PanickingAuditWriter)
+        .finish();
+
+    let outcome = tracing::subscriber::with_default(subscriber, || {
+        database.required_transaction_for_mfa_session_with_commit(
+            &proof,
+            &AuditContext::new("admin", None),
+            |_transaction| {
+                let previous = published.swap(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, rusqlite::Error>((
+                    TestCommitPublication {
+                        value: published.clone(),
+                        previous,
+                        accepted: false,
+                    },
+                    vec![RequiredAuditEvent::new(
+                        AuditAction::SettingsUpdated,
+                        None,
+                        None,
+                    )],
+                ))
+            },
+            CommitPublication::accept_commit,
+        )
+    });
+
+    assert!(matches!(&outcome, Ok(SessionBound::Authorized(_))));
+    drop(outcome);
+    assert_eq!(value.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(database.count_audit(Some("settings_updated")).unwrap(), 1);
+}
+
+#[test]
+fn mfa_session_transaction_linearizes_both_race_orders_on_persistent_pool() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("data.sqlite")).unwrap();
+    assert_eq!(database.0.pool.max_size(), 4);
     database.create_admin("admin", "hash", "secret").unwrap();
     database
         .create_session("live-session", 1, "csrf", Utc::now() + Duration::hours(1))
         .unwrap();
     assert!(database.verify_mfa("live-session").unwrap());
+    let proof = MfaSessionProof::from_token("live-session", 1);
+    let audit_context = AuditContext::new("admin", None);
 
     let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     let publishing_database = database.clone();
     let publisher = std::thread::spawn(move || {
         publishing_database
-            .with_live_mfa_session("live-session", 1, || {
+            .required_transaction_for_mfa_session(&proof, &audit_context, |_transaction| {
                 entered_sender.send(()).unwrap();
                 release_receiver.recv().unwrap();
-                "published"
+                Ok::<_, rusqlite::Error>(("published", Vec::new()))
             })
             .unwrap()
     });
@@ -25,39 +141,241 @@ fn live_mfa_session_operation_linearizes_with_session_revocation() {
         .recv_timeout(std::time::Duration::from_secs(1))
         .unwrap();
 
-    let (revocation_started_sender, revocation_started_receiver) = std::sync::mpsc::channel();
+    let (revocation_waiting_sender, revocation_waiting_receiver) = std::sync::mpsc::channel();
+    *SQLITE_BUSY_WAIT_SIGNAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(revocation_waiting_sender);
     let (revoked_sender, revoked_receiver) = std::sync::mpsc::channel();
     let revoking_database = database.clone();
     let revoker = std::thread::spawn(move || {
-        revocation_started_sender.send(()).unwrap();
-        revoking_database.delete_session("live-session").unwrap();
+        let mut connection = revoking_database.try_conn().unwrap();
+        connection
+            .busy_handler(Some(signal_sqlite_busy_wait))
+            .unwrap();
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "DELETE FROM sessions WHERE token_hash=?1",
+                [token_hash("live-session")],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         revoked_sender.send(()).unwrap();
     });
-    revocation_started_receiver
+    // This signal comes from SQLite's busy handler on the revoker's exact
+    // connection. It proves BEGIN IMMEDIATE has collided with the mutation's
+    // writer transaction; no scheduler timing assumption is involved.
+    revocation_waiting_receiver
         .recv_timeout(std::time::Duration::from_secs(1))
         .unwrap();
-    assert!(revoked_receiver
-        .recv_timeout(std::time::Duration::from_millis(25))
-        .is_err());
+    assert!(matches!(
+        revoked_receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
 
     release_sender.send(()).unwrap();
-    assert_eq!(publisher.join().unwrap(), Some("published"));
+    assert_eq!(
+        publisher.join().unwrap(),
+        SessionBound::Authorized("published")
+    );
     revoked_receiver
         .recv_timeout(std::time::Duration::from_secs(1))
         .unwrap();
     revoker.join().unwrap();
 
+    database
+        .create_session(
+            "revocation-first",
+            1,
+            "csrf-2",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    assert!(database.verify_mfa("revocation-first").unwrap());
+    let proof = MfaSessionProof::from_token("revocation-first", 1);
+    let (revocation_holds_writer_sender, revocation_holds_writer_receiver) =
+        std::sync::mpsc::channel();
+    let (commit_revocation_sender, commit_revocation_receiver) = std::sync::mpsc::channel();
+    let revoking_database = database.clone();
+    let revoker = std::thread::spawn(move || {
+        let mut connection = revoking_database.try_conn().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "DELETE FROM sessions WHERE token_hash=?1",
+                [token_hash("revocation-first")],
+            )
+            .unwrap();
+        revocation_holds_writer_sender.send(()).unwrap();
+        commit_revocation_receiver.recv().unwrap();
+        transaction.commit().unwrap();
+    });
+    revocation_holds_writer_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+
     let ran_after_revocation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let marker = ran_after_revocation.clone();
+    let (checked_sender, checked_receiver) = std::sync::mpsc::channel();
+    let checker = std::thread::spawn(move || {
+        let outcome = database
+            .required_transaction_for_mfa_session(
+                &proof,
+                &AuditContext::new("admin", None),
+                |_transaction| {
+                    marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, rusqlite::Error>(((), Vec::new()))
+                },
+            )
+            .unwrap();
+        checked_sender.send(()).unwrap();
+        outcome
+    });
+    assert!(checked_receiver
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_err());
+    commit_revocation_sender.send(()).unwrap();
+    revoker.join().unwrap();
+    checked_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(checker.join().unwrap(), SessionBound::SessionUnavailable);
+    assert!(!ran_after_revocation.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+fn verified_mfa_proof(database: &Database, token: &str, admin_id: i64) -> MfaSessionProof {
+    database
+        .create_session(token, admin_id, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    assert!(database.verify_mfa(token).unwrap());
+    MfaSessionProof::from_token(token, admin_id)
+}
+
+fn assert_mfa_proof_authorized(database: &Database, proof: &MfaSessionProof) {
+    let mut entered = false;
+    let outcome = database
+        .required_transaction_for_mfa_session(
+            proof,
+            &AuditContext::new("admin", None),
+            |_transaction| {
+                entered = true;
+                Ok::<_, rusqlite::Error>(((), Vec::new()))
+            },
+        )
+        .unwrap();
+    assert_eq!(outcome, SessionBound::Authorized(()));
+    assert!(entered);
+}
+
+fn assert_mfa_proof_unavailable(database: &Database, proof: &MfaSessionProof) {
+    let mut entered = false;
+    let outcome = database
+        .required_transaction_for_mfa_session(
+            proof,
+            &AuditContext::new("admin", None),
+            |_transaction| {
+                entered = true;
+                Ok::<_, rusqlite::Error>(((), Vec::new()))
+            },
+        )
+        .unwrap();
+    assert_eq!(outcome, SessionBound::SessionUnavailable);
+    assert!(
+        !entered,
+        "an unavailable session entered the mutation closure"
+    );
+}
+
+#[test]
+fn mfa_session_fence_rejects_every_auth_state_revocation_path() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    database
+        .create_admin("other-admin", "other-hash", "other-secret")
+        .unwrap();
+
+    // Exact-session logout must not invalidate another live session belonging
+    // to the same administrator, and the revoked proof must not fall back to
+    // administrator identity alone.
+    let logged_out = verified_mfa_proof(&database, "logged-out", 1);
+    let sibling = verified_mfa_proof(&database, "sibling", 1);
+    database.delete_session("logged-out").unwrap();
+    assert_mfa_proof_unavailable(&database, &logged_out);
+    assert_mfa_proof_authorized(&database, &sibling);
+
+    assert_eq!(
+        database.deactivate_admin(1).unwrap(),
+        AdminDeactivationOutcome::Deactivated
+    );
+    assert_mfa_proof_unavailable(&database, &sibling);
+    assert!(database.activate_admin(1).unwrap());
+
+    let password_reset = verified_mfa_proof(&database, "password-reset", 1);
+    assert!(database
+        .reset_admin_password(1, "replacement-hash")
+        .unwrap());
+    assert_mfa_proof_unavailable(&database, &password_reset);
+
+    let totp_reset = verified_mfa_proof(&database, "totp-reset", 1);
+    assert_eq!(
+        database.reset_admin_totp(1, "replacement-secret").unwrap(),
+        Some("admin".to_string())
+    );
+    assert_mfa_proof_unavailable(&database, &totp_reset);
+
+    // Security-key deletion is itself a credential reset and revokes every
+    // session for the administrator, not only the session authorizing it.
+    let credential_authority = verified_mfa_proof(&database, "credential-authority", 1);
+    let credential_sibling = verified_mfa_proof(&database, "credential-sibling", 1);
+    let credential_id = database
+        .add_admin_webauthn_credential(1, "First", "credential-a", "{}")
+        .unwrap();
+    database
+        .add_admin_webauthn_credential(1, "Second", "credential-b", "{}")
+        .unwrap();
+    database
+        .add_admin_webauthn_credential(1, "Third", "credential-c", "{}")
+        .unwrap();
+    let generation = database.admin("admin").unwrap().unwrap().totp_generation;
     assert_eq!(
         database
-            .with_live_mfa_session("live-session", 1, || {
-                marker.store(true, std::sync::atomic::Ordering::SeqCst);
-            })
+            .delete_admin_webauthn_credential_with_totp_for_mfa_session(
+                &credential_authority,
+                credential_id,
+                "replacement-hash",
+                generation,
+                42,
+                None,
+            )
             .unwrap(),
-        None
+        SessionBound::Authorized(AdminWebauthnCredentialDeletionOutcome::Deleted)
     );
-    assert!(!ran_after_revocation.load(std::sync::atomic::Ordering::SeqCst));
+    assert_mfa_proof_unavailable(&database, &credential_authority);
+    assert_mfa_proof_unavailable(&database, &credential_sibling);
+
+    let absolute_expiry = verified_mfa_proof(&database, "absolute-expiry", 1);
+    database.expire_session_for_test("absolute-expiry").unwrap();
+    assert_mfa_proof_unavailable(&database, &absolute_expiry);
+
+    let idle_expiry = verified_mfa_proof(&database, "idle-expiry", 1);
+    database
+        .conn()
+        .execute(
+            "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
+            params![
+                token_hash("idle-expiry"),
+                (Utc::now() - Duration::minutes(31)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+    assert_mfa_proof_unavailable(&database, &idle_expiry);
 }
 
 #[test]
@@ -3075,17 +3393,17 @@ fn persistent_secrets_survive_restart_and_key_rotation_without_plaintext_columns
         .unwrap();
     assert!(database.verify_mfa("rotation-session").unwrap());
     let service_token = format!("vlk_st_v1_{}", crate::auth::random_token(32));
-    let ServiceTokenCreationOutcome::Created(service_token_metadata) = database
-        .create_service_token_for_verified_admin_and_audit(
-            "rotation-session",
-            1,
-            "password-hash",
-            "Rotation invariant",
-            &service_token,
-            None,
-            &AuditContext::new("admin", None),
-        )
-        .unwrap()
+    let SessionBound::Authorized(ServiceTokenCreationOutcome::Created(service_token_metadata)) =
+        database
+            .create_service_token_for_mfa_session(
+                &MfaSessionProof::for_test("rotation-session", 1),
+                "password-hash",
+                "Rotation invariant",
+                &service_token,
+                None,
+                &AuditContext::new("admin", None),
+            )
+            .unwrap()
     else {
         panic!("service token was not created")
     };

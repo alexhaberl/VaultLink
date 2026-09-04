@@ -56,6 +56,22 @@ fn session_key(session_token: &str) -> String {
     data_encoding::HEXLOWER.encode(digest.as_ref())
 }
 
+/// Opaque lookup key for a session-bound registration ceremony. It deliberately
+/// implements neither `Display` nor serialization so the underlying session
+/// hash cannot accidentally enter responses or structured logs.
+pub(crate) struct RegistrationCeremonyKey(String);
+
+impl RegistrationCeremonyKey {
+    pub(crate) fn from_session_token_hash(token_hash: &str) -> Self {
+        Self(token_hash.to_owned())
+    }
+
+    #[cfg(test)]
+    fn from_session_token(session_token: &str) -> Self {
+        Self(session_key(session_token))
+    }
+}
+
 fn user_handle(admin_id: i64) -> Result<UserHandle64, WebAuthnServiceError> {
     let digest = Sha512::digest(format!("vaultlink-webauthn-user:{admin_id}").as_bytes());
     let mut bytes = [0u8; USER_HANDLE_MAX_LEN];
@@ -258,6 +274,80 @@ struct PendingRegistration {
     state: RegistrationServerState<USER_HANDLE_MAX_LEN>,
 }
 
+/// Ceremony material prepared before the runtime and SQLite commit locks are
+/// acquired. It does not become a usable pending challenge until
+/// `RegistrationMutations::commit_start` inserts it.
+pub(crate) struct PreparedRegistration {
+    key: RegistrationCeremonyKey,
+    challenge: serde_json::Value,
+    admin_id: i64,
+    state: RegistrationServerState<USER_HANDLE_MAX_LEN>,
+}
+
+/// Exclusive access to pending registrations while a durable commit is fenced
+/// by the database. Acquiring this value neither creates nor consumes a
+/// challenge: callers invoke `start`/`finish` only after their live-session
+/// check has succeeded.
+pub(crate) struct RegistrationMutations<'a> {
+    registrations: &'a mut HashMap<String, PendingRegistration>,
+    rp_id: &'a RpId,
+    origin: &'a String,
+}
+
+impl RegistrationMutations<'_> {
+    pub(crate) fn commit_start(
+        &mut self,
+        prepared: PreparedRegistration,
+    ) -> Result<serde_json::Value, WebAuthnServiceError> {
+        let PreparedRegistration {
+            key,
+            challenge,
+            admin_id,
+            state,
+        } = prepared;
+        self.registrations
+            .retain(|_, value| value.created.elapsed() < CEREMONY_TTL);
+        ensure_pending_capacity(self.registrations, &key.0)?;
+        self.registrations.insert(
+            key.0,
+            PendingRegistration {
+                admin_id,
+                created: Instant::now(),
+                state,
+            },
+        );
+        Ok(challenge)
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        key: &RegistrationCeremonyKey,
+        admin_id: i64,
+        credential: &serde_json::Value,
+    ) -> Result<StoredCredential, WebAuthnServiceError> {
+        let pending = self.registrations.remove(&key.0).ok_or_else(|| {
+            WebAuthnServiceError::Ceremony("registration challenge missing or already used".into())
+        })?;
+        if pending.admin_id != admin_id || pending.created.elapsed() >= CEREMONY_TTL {
+            return Err(WebAuthnServiceError::Ceremony(
+                "registration challenge expired or belongs to another account".into(),
+            ));
+        }
+        let json = serde_json::to_vec(credential).map_err(WebAuthnServiceError::ceremony)?;
+        let registration =
+            Registration::from_json_custom(&json).map_err(WebAuthnServiceError::ceremony)?;
+        let options = RegistrationVerificationOptions::<String, String> {
+            allowed_origins: std::slice::from_ref(self.origin),
+            ..Default::default()
+        };
+        let registered = pending
+            .state
+            .verify(self.rp_id, &registration, &options)
+            .map_err(WebAuthnServiceError::ceremony)?;
+        StoredCredential::from_registered(registered)
+    }
+}
+
 struct PendingAuthentication {
     admin_id: i64,
     created: Instant,
@@ -300,13 +390,32 @@ impl WebAuthnService {
         Arc::as_ptr(&self.inner) as usize
     }
 
-    pub fn start_registration(
+    #[cfg(test)]
+    pub(crate) fn start_registration(
         &self,
         session_token: &str,
         admin_id: i64,
         username: &str,
         existing: &[StoredCredential],
     ) -> Result<serde_json::Value, WebAuthnServiceError> {
+        let prepared = self.prepare_registration(
+            RegistrationCeremonyKey::from_session_token(session_token),
+            admin_id,
+            username,
+            existing,
+        )?;
+        self.with_registration_mutations(|registrations| registrations.commit_start(prepared))
+    }
+
+    /// Performs the comparatively expensive ceremony setup without holding
+    /// either the pending-registration mutex or SQLite's writer slot.
+    pub(crate) fn prepare_registration(
+        &self,
+        key: RegistrationCeremonyKey,
+        admin_id: i64,
+        username: &str,
+        existing: &[StoredCredential],
+    ) -> Result<PreparedRegistration, WebAuthnServiceError> {
         let user_id = user_handle(admin_id)?;
         let user = PublicKeyCredentialUserEntity {
             name: username
@@ -336,52 +445,33 @@ impl WebAuthnService {
         let (state, client) = options
             .start_ceremony()
             .map_err(WebAuthnServiceError::ceremony)?;
-        let challenge = serde_json::json!({ "publicKey": client });
-        let mut pending = ceremony_map(&self.inner.registrations, "WebAuthn registrations");
-        pending.retain(|_, value| value.created.elapsed() < CEREMONY_TTL);
-        let key = session_key(session_token);
-        ensure_pending_capacity(&pending, &key)?;
-        pending.insert(
+        Ok(PreparedRegistration {
             key,
-            PendingRegistration {
-                admin_id,
-                created: Instant::now(),
-                state,
-            },
-        );
-        Ok(challenge)
+            challenge: serde_json::json!({ "publicKey": client }),
+            admin_id,
+            state,
+        })
     }
 
-    pub fn finish_registration(
+    /// Holds the registration runtime lock across a caller-provided commit
+    /// boundary. The callback may create or consume a challenge only after its
+    /// database live-session predicate has succeeded.
+    pub(crate) fn with_registration_mutations<T>(
         &self,
-        session_token: &str,
-        admin_id: i64,
-        credential: &serde_json::Value,
-    ) -> Result<StoredCredential, WebAuthnServiceError> {
-        let pending = ceremony_map(&self.inner.registrations, "WebAuthn registrations")
-            .remove(&session_key(session_token))
-            .ok_or_else(|| {
-                WebAuthnServiceError::Ceremony(
-                    "registration challenge missing or already used".into(),
-                )
-            })?;
-        if pending.admin_id != admin_id || pending.created.elapsed() >= CEREMONY_TTL {
-            return Err(WebAuthnServiceError::Ceremony(
-                "registration challenge expired or belongs to another account".into(),
-            ));
-        }
-        let json = serde_json::to_vec(credential).map_err(WebAuthnServiceError::ceremony)?;
-        let registration =
-            Registration::from_json_custom(&json).map_err(WebAuthnServiceError::ceremony)?;
-        let options = RegistrationVerificationOptions::<String, String> {
-            allowed_origins: std::slice::from_ref(&self.inner.origin),
-            ..Default::default()
-        };
-        let registered = pending
-            .state
-            .verify(&self.inner.rp_id, &registration, &options)
-            .map_err(WebAuthnServiceError::ceremony)?;
-        StoredCredential::from_registered(registered)
+        operation: impl FnOnce(&mut RegistrationMutations<'_>) -> T,
+    ) -> T {
+        let mut registrations = ceremony_map(&self.inner.registrations, "WebAuthn registrations");
+        operation(&mut RegistrationMutations {
+            registrations: &mut registrations,
+            rp_id: &self.inner.rp_id,
+            origin: &self.inner.origin,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_registration(&self, session_token: &str) -> bool {
+        let key = RegistrationCeremonyKey::from_session_token(session_token);
+        ceremony_map(&self.inner.registrations, "WebAuthn registrations").contains_key(&key.0)
     }
 
     pub fn start_authentication(

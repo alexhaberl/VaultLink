@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  statuses: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -54,6 +53,13 @@ jobs:
           test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.expected_rust_host }}"
       - name: Supply-chain policy
         run: sh tools/check-supply-chain-policy.sh
+      - name: Parse release Dockerfiles with the pinned frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --call=targets --file deploy/docker/Dockerfile.package-builder .
+          docker buildx build --call=targets --file deploy/docker/Dockerfile.qemu-runner .
+          docker buildx build --call=targets --file deploy/docker/Dockerfile.distro-vm-image .
       - name: Full-history secret scan
         if: matrix.architecture == 'arm64'
         shell: bash
@@ -190,6 +196,8 @@ jobs:
     if: ${{ always() && github.event_name == 'push' }}
     needs: [native, coverage, fuzz_compile, docker_smoke]
     runs-on: ubuntu-24.04-arm
+    permissions:
+      statuses: write
     steps:
       - name: Publish aggregate amd64 and arm64 results
         env:

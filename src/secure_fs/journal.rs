@@ -209,31 +209,3 @@ pub(super) fn remove_pending_manifest(staging: &File, manifest_name: &str) -> io
         Err(error) => Err(error),
     }
 }
-
-pub(super) fn rollback_pending_delete(
-    staging: &File,
-    pending_name: &str,
-    manifest_name: &str,
-    parent: &File,
-    original_name: &str,
-    original_path: &str,
-) -> io::Result<()> {
-    match linux::rename_noreplace_between(staging, pending_name, parent, original_name) {
-        Ok(()) => {
-            // Cross-directory rename durability requires the restored visible
-            // destination to be synced before the private source directory.
-            parent.sync_all()?;
-            staging.sync_all()?;
-            remove_pending_manifest(staging, manifest_name)
-        }
-        Err(error) => {
-            tracing::error!(
-                %error,
-                recovery_entry = %pending_name,
-                original = %original_path,
-                "could not roll back pending deletion; private recovery entry was preserved"
-            );
-            Err(error)
-        }
-    }
-}

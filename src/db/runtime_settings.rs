@@ -1,9 +1,13 @@
+#[cfg(test)]
+use super::{insert_required_audits, trace_required_audits};
 use super::{
-    insert_required_audits, trace_required_audits, AuditAction, AuditContext, Database,
-    RequiredAuditEvent,
+    AuditAction, AuditContext, CommitPublication, Database, MfaSessionProof, RequiredAuditEvent,
+    SessionBound,
 };
 use chrono::Utc;
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::params;
+#[cfg(test)]
+use rusqlite::TransactionBehavior;
 
 impl Database {
     pub fn runtime_settings(&self) -> rusqlite::Result<Vec<(String, String)>> {
@@ -23,6 +27,7 @@ impl Database {
         self.replace_runtime_settings_internal(settings, admin, None)
     }
 
+    #[cfg(test)]
     pub fn replace_runtime_settings_and_audit(
         &self,
         settings: &[(&str, String)],
@@ -33,6 +38,52 @@ impl Database {
         self.replace_runtime_settings_internal(settings, admin, Some((context, audit_detail)))
     }
 
+    pub(crate) fn replace_runtime_settings_for_mfa_session<T>(
+        &self,
+        proof: &MfaSessionProof,
+        settings: &[(&str, String)],
+        context: &AuditContext,
+        audit_detail: String,
+        publish_snapshot: impl FnOnce() -> T,
+    ) -> rusqlite::Result<SessionBound<T>>
+    where
+        T: CommitPublication,
+    {
+        let admin = proof.admin_id();
+        self.required_transaction_for_mfa_session_with_commit(
+            proof,
+            context,
+            |transaction| {
+                transaction.execute("DELETE FROM runtime_settings", [])?;
+                let updated_at = Utc::now().to_rfc3339();
+                {
+                    let mut statement = transaction.prepare(
+                        "INSERT INTO runtime_settings(key,value,updated_by,updated_at)
+                         VALUES(?1,?2,?3,?4)",
+                    )?;
+                    for (key, value) in settings {
+                        statement.execute(params![*key, value.as_str(), admin, updated_at])?;
+                    }
+                }
+                // Publish only after every fallible settings statement has
+                // succeeded. Required-audit insertion still follows in the
+                // canonical helper; if it or COMMIT fails, a guard returned here
+                // can restore the old snapshot before the writer fence is released.
+                let publication = publish_snapshot();
+                Ok((
+                    publication,
+                    vec![RequiredAuditEvent::new(
+                        AuditAction::SettingsUpdated,
+                        None,
+                        Some(audit_detail),
+                    )],
+                ))
+            },
+            |publication| publication.accept_commit(),
+        )
+    }
+
+    #[cfg(test)]
     fn replace_runtime_settings_internal(
         &self,
         settings: &[(&str, String)],

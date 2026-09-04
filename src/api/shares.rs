@@ -15,8 +15,8 @@ use crate::{
     },
     file_ops,
     http_auth::{
-        csrf_header, current_audit_client_ip, database, hash_password_admitted, runtime_settings,
-        session, MissingSession,
+        csrf_header, current_audit_client_ip, database, hash_password_admitted, mfa_session,
+        runtime_settings, session, MissingSession,
     },
     runtime::RuntimeSettings,
     sensitive::SecretString,
@@ -28,8 +28,8 @@ use crate::{
 };
 
 use super::{
-    common::find_share_by_id, storage_recovery_api_error, ApiError, ApiResult, PasswordRequest,
-    SimpleResponse,
+    common::find_share_by_id, session_bound, storage_recovery_api_error, ApiError, ApiResult,
+    PasswordRequest, SimpleResponse,
 };
 
 #[derive(Serialize)]
@@ -172,8 +172,8 @@ pub(super) async fn create_share(
     headers: HeaderMap,
     Json(request): Json<CreateShareRequest>,
 ) -> ApiResult<Json<ShareResponse>> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
     let settings = runtime_settings(&state);
     let service = ShareService::new(
         state.db.clone(),
@@ -207,7 +207,7 @@ pub(super) async fn create_share(
     let revalidation_path = rel.clone();
     let validated = service
         .prepare_create(CreateShareCommand {
-            token: token.clone(),
+            token,
             path: rel,
             target,
             permission: request.permission,
@@ -219,7 +219,7 @@ pub(super) async fn create_share(
             max_upload_files: request.max_upload_files,
             password,
             overwrite_allowed: request.overwrite_allowed.unwrap_or(false),
-            created_by: session_data.admin_id,
+            created_by: authenticated.admin_id,
         })
         .map_err(share_validation_error)?;
     let (prepared, password) = validated.into_password_hash_input();
@@ -248,28 +248,32 @@ pub(super) async fn create_share(
     if current_target != target {
         return Err(ApiError::conflict("Target changed during processing"));
     }
-    let authority_mutation = ShareAuthorityMutation::from_guard(&state, storage_guard);
-    let username = session_data.username;
+    let authority_mutation =
+        ShareAuthorityMutation::from_guard(&state, storage_guard, authenticated.proof().clone());
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    authority_mutation
-        .commit(move |_| {
-            // The database task is not cancelled with the request. The authority
-            // mutation retains the storage lock so rename/delete cannot interleave
-            // after the target metadata check and create a share for a stale path.
-            service
-                .create(prepared, password_hash.as_deref(), &audit_context)
-                .map(drop)
-                .map_err(share_database_error)
-        })
-        .await?;
-    let share = database(state.db.clone(), move |db| db.share_by_token(&token))
-        .await?
-        .ok_or_else(|| ApiError::internal(()))?;
+    let (_created, share) = session_bound(
+        authority_mutation
+            .commit(move |_, proof| {
+                // The database task is not cancelled with the request. The authority
+                // mutation retains the storage lock so rename/delete cannot interleave
+                // after the target metadata check and create a share for a stale path.
+                service
+                    .create_for_mfa_session(
+                        &proof,
+                        prepared,
+                        password_hash.as_deref(),
+                        &audit_context,
+                    )
+                    .map_err(share_database_error)
+            })
+            .await?,
+    )?;
     Ok(Json(share_response(&settings, share)))
 }
 
@@ -287,8 +291,8 @@ pub(super) async fn update_share(
     AxPath(id): AxPath<i64>,
     Json(request): Json<UpdateShareRequest>,
 ) -> ApiResult<Json<ShareResponse>> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
     let no_changes = request.active.is_none()
         && request.upload_conflict_strategy.is_none()
         && request.max_upload_total_size.is_none()
@@ -300,7 +304,8 @@ pub(super) async fn update_share(
             current_share,
         )));
     }
-    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
+    let authority_mutation =
+        ShareAuthorityMutation::acquire(&state, authenticated.proof().clone()).await;
     let current_share = find_share_by_id(&state, id).await?;
     if request
         .upload_conflict_strategy
@@ -351,7 +356,7 @@ pub(super) async fn update_share(
     let active = request.active;
     let strategy = request.upload_conflict_strategy.clone();
     let strategy_for_db = strategy.clone();
-    let username = session_data.username;
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
@@ -385,18 +390,21 @@ pub(super) async fn update_share(
             Some(format!("bytes={total};files={files}")),
         ));
     }
-    let outcome = authority_mutation
-        .commit(move |db| {
-            db.update_share_controls_and_audit(
-                id,
-                active,
-                strategy_for_db.as_ref(),
-                upload_limits,
-                &audit_context,
-                &audit_events,
-            )
-        })
-        .await?;
+    let (outcome, share) = session_bound(
+        authority_mutation
+            .commit(move |db, proof| {
+                db.update_share_controls_for_mfa_session(
+                    &proof,
+                    id,
+                    active,
+                    strategy_for_db.as_ref(),
+                    upload_limits,
+                    &audit_context,
+                    &audit_events,
+                )
+            })
+            .await?,
+    )?;
     match outcome {
         ShareControlsUpdateOutcome::Updated => {}
         ShareControlsUpdateOutcome::NotFound => {
@@ -411,7 +419,7 @@ pub(super) async fn update_share(
         }
     }
     let settings = runtime_settings(&state);
-    let share = find_share_by_id(&state, id).await?;
+    let share = share.ok_or_else(|| ApiError::internal(()))?;
     Ok(Json(share_response(&settings, share)))
 }
 
@@ -437,30 +445,34 @@ async fn set_share_active_api(
     id: i64,
     active: bool,
 ) -> ApiResult<Json<SimpleResponse>> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
-    let username = session_data.username;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
-    let changed = authority_mutation
-        .commit(move |db| {
-            db.set_share_active_and_audit(
-                id,
-                active,
-                &audit_context,
-                if active {
-                    AuditAction::ShareActivated
-                } else {
-                    AuditAction::ShareDeactivated
-                },
-            )
-        })
-        .await?;
+    let authority_mutation =
+        ShareAuthorityMutation::acquire(&state, authenticated.proof().clone()).await;
+    let changed = session_bound(
+        authority_mutation
+            .commit(move |db, proof| {
+                db.set_share_active_for_mfa_session(
+                    &proof,
+                    id,
+                    active,
+                    &audit_context,
+                    if active {
+                        AuditAction::ShareActivated
+                    } else {
+                        AuditAction::ShareDeactivated
+                    },
+                )
+            })
+            .await?,
+    )?;
     if !changed {
         return Err(ApiError::not_found("Share not found"));
     }
@@ -472,19 +484,22 @@ pub(super) async fn delete_share(
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<SimpleResponse>> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
-    let username = session_data.username;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
-    let deleted = authority_mutation
-        .commit(move |db| db.delete_share_and_audit(id, &audit_context))
-        .await?;
+    let authority_mutation =
+        ShareAuthorityMutation::acquire(&state, authenticated.proof().clone()).await;
+    let deleted = session_bound(
+        authority_mutation
+            .commit(move |db, proof| db.delete_share_for_mfa_session(&proof, id, &audit_context))
+            .await?,
+    )?;
     if !deleted {
         return Err(ApiError::not_found("Share not found"));
     }
@@ -497,8 +512,8 @@ pub(super) async fn set_share_password(
     AxPath(id): AxPath<i64>,
     Json(request): Json<PasswordRequest>,
 ) -> ApiResult<Json<SimpleResponse>> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
     let service = ShareService::new(
         state.db.clone(),
         runtime_settings(&state),
@@ -509,24 +524,28 @@ pub(super) async fn set_share_password(
         .map_err(share_validation_error)?
         .ok_or_else(|| ApiError::bad_request("Invalid share password"))?;
     let hash = hash_password_admitted(&state, password).await?;
-    let username = session_data.username;
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
-    let changed = authority_mutation
-        .commit(move |db| {
-            db.set_share_password_and_audit(
-                id,
-                Some(&hash),
-                &audit_context,
-                AuditAction::SharePasswordSet,
-            )
-        })
-        .await?;
+    let authority_mutation =
+        ShareAuthorityMutation::acquire(&state, authenticated.proof().clone()).await;
+    let changed = session_bound(
+        authority_mutation
+            .commit(move |db, proof| {
+                db.set_share_password_for_mfa_session(
+                    &proof,
+                    id,
+                    Some(&hash),
+                    &audit_context,
+                    AuditAction::SharePasswordSet,
+                )
+            })
+            .await?,
+    )?;
     if !changed {
         return Err(ApiError::not_found("Share not found"));
     }
@@ -585,26 +604,30 @@ pub(super) async fn remove_share_password(
     headers: HeaderMap,
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<SimpleResponse>> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
-    let username = session_data.username;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
+    let username = authenticated.username.clone();
     let audit_client_ip = runtime_settings(&state)
         .audit_client_ip_enabled
         .then(current_audit_client_ip)
         .flatten()
         .map(|ip| ip.to_string());
     let audit_context = AuditContext::new(username, audit_client_ip);
-    let authority_mutation = ShareAuthorityMutation::acquire(&state).await;
-    let changed = authority_mutation
-        .commit(move |db| {
-            db.set_share_password_and_audit(
-                id,
-                None,
-                &audit_context,
-                AuditAction::SharePasswordRemoved,
-            )
-        })
-        .await?;
+    let authority_mutation =
+        ShareAuthorityMutation::acquire(&state, authenticated.proof().clone()).await;
+    let changed = session_bound(
+        authority_mutation
+            .commit(move |db, proof| {
+                db.set_share_password_for_mfa_session(
+                    &proof,
+                    id,
+                    None,
+                    &audit_context,
+                    AuditAction::SharePasswordRemoved,
+                )
+            })
+            .await?,
+    )?;
     if !changed {
         return Err(ApiError::not_found("Share not found"));
     }

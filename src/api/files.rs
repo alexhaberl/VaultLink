@@ -12,7 +12,7 @@ use crate::{
     file_ops,
     http_auth::{
         csrf_header, current_audit_client_ip, current_client_limit_key, enabled_audit_client_ip,
-        runtime_settings, session, try_acquire_client_activity, with_audit_client_ip,
+        mfa_session, runtime_settings, session, try_acquire_client_activity, with_audit_client_ip,
         MissingSession,
     },
     services::file::FileService,
@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     common::{preview_allowed, validate_rel},
-    ApiError, ApiResult, MAX_SEARCH_QUERY_BYTES,
+    session_bound, ApiError, ApiResult, MAX_SEARCH_QUERY_BYTES,
 };
 
 #[derive(Default, Deserialize)]
@@ -237,19 +237,24 @@ pub(super) async fn create_directory(
     headers: HeaderMap,
     Json(request): Json<CreateDirectoryRequest>,
 ) -> ApiResult<Response> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
     let service = FileService::new(state.clone());
     let audit_client_ip = current_audit_client_ip();
-    let audit_context = AuditContext::new(session_data.username, enabled_audit_client_ip(&state));
-    let result = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+    let audit_context = AuditContext::new(
+        authenticated.username.clone(),
+        enabled_audit_client_ip(&state),
+    );
+    let proof = authenticated.proof().clone();
+    let outcome = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
         service
-            .create_directory(&request.parent, &request.name, audit_context)
+            .create_directory(proof, &request.parent, &request.name, audit_context)
             .await
     }))
     .await
     .map_err(ApiError::internal)?
     .map_err(file_operation_error)?;
+    let result = session_bound(outcome)?;
     let audit_uncertain = result.audit_durability.is_uncertain();
     Ok((
         if audit_uncertain {
@@ -272,19 +277,24 @@ pub(super) async fn rename_file_entry(
     headers: HeaderMap,
     Json(request): Json<RenameFileRequest>,
 ) -> ApiResult<Response> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
     let service = FileService::new(state.clone());
     let audit_client_ip = current_audit_client_ip();
-    let audit_context = AuditContext::new(session_data.username, enabled_audit_client_ip(&state));
-    let result = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+    let audit_context = AuditContext::new(
+        authenticated.username.clone(),
+        enabled_audit_client_ip(&state),
+    );
+    let proof = authenticated.proof().clone();
+    let outcome = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
         service
-            .rename(&request.path, &request.name, audit_context)
+            .rename(proof, &request.path, &request.name, audit_context)
             .await
     }))
     .await
     .map_err(ApiError::internal)?
     .map_err(file_operation_error)?;
+    let result = session_bound(outcome)?;
     let audit_uncertain = result.audit_durability.is_uncertain();
     Ok((
         if audit_uncertain {
@@ -308,14 +318,19 @@ pub(super) async fn delete_file_entry(
     headers: HeaderMap,
     Json(request): Json<DeleteFileRequest>,
 ) -> ApiResult<Response> {
-    let (_, session_data) = session(&state, &headers, true, MissingSession::Unauthorized).await?;
-    csrf_header(&session_data, &headers)?;
+    let authenticated = mfa_session(&state, &headers, MissingSession::Unauthorized).await?;
+    csrf_header(&authenticated, &headers)?;
     let service = FileService::new(state.clone());
     let audit_client_ip = current_audit_client_ip();
-    let audit_context = AuditContext::new(session_data.username, enabled_audit_client_ip(&state));
-    let result = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
+    let audit_context = AuditContext::new(
+        authenticated.username.clone(),
+        enabled_audit_client_ip(&state),
+    );
+    let proof = authenticated.proof().clone();
+    let outcome = tokio::spawn(with_audit_client_ip(audit_client_ip, async move {
         service
             .delete(
+                proof,
                 &request.path,
                 request.confirm_name.as_deref(),
                 audit_context,
@@ -325,6 +340,7 @@ pub(super) async fn delete_file_entry(
     .await
     .map_err(ApiError::internal)?
     .map_err(file_operation_error)?;
+    let result = session_bound(outcome)?;
     let audit_uncertain = result.audit_durability.is_uncertain();
     let status = if result.cleanup_pending || audit_uncertain {
         StatusCode::ACCEPTED
@@ -365,17 +381,11 @@ pub(super) fn file_operation_error(error: file_ops::FileOperationError) -> ApiEr
             "confirmation_required",
             "The exact directory name must be confirmed",
         ),
-        FileOperationError::Database(database_error)
-            if crate::db::is_audit_unavailable(&database_error) =>
-        {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "audit_unavailable",
-                "Security audit temporarily unavailable",
-            )
+        FileOperationError::Database(database_error) => {
+            ApiError::from(crate::http_auth::database_error(database_error))
         }
-        other @ (FileOperationError::Database(_)
-        | FileOperationError::Io(_)
-        | FileOperationError::Join(_)) => ApiError::internal(other),
+        other @ (FileOperationError::Io(_) | FileOperationError::Join(_)) => {
+            ApiError::internal(other)
+        }
     }
 }

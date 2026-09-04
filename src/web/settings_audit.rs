@@ -93,8 +93,8 @@ use crate::{
         AuditClientIpDeletionOutcome, AuditContext, AuditSortColumn, AuditSortDirection, Session,
     },
     http_auth::{
-        commit_runtime_settings, csrf, database, enabled_audit_client_ip, required_database,
-        runtime_settings, session, MissingSession,
+        commit_runtime_settings, csrf, database, enabled_audit_client_ip, mfa_session,
+        required_database, runtime_settings, session, MissingSession,
     },
     i18n::{self},
     runtime::RuntimeSettings,
@@ -190,7 +190,7 @@ pub(super) async fn update_settings(
     headers: HeaderMap,
     Form(form): Form<SettingsForm>,
 ) -> Result<Html<String>> {
-    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let session = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
     let mut next = runtime_settings(&state);
     let max_upload_size =
@@ -262,18 +262,20 @@ pub(super) async fn update_settings(
             "Production public_base_url must use HTTPS",
         ));
     }
-    let admin_id = session.admin_id;
+    let proof = session.proof().clone();
     let previous = runtime_settings(&state);
     let actor = session.username.clone();
     let changed = previous.changed_keys(&next);
-    commit_runtime_settings(
-        &state,
-        next.clone(),
-        admin_id,
-        actor,
-        format!("changed_keys={}", changed.join(",")),
-    )
-    .await?;
+    super::session_bound(
+        commit_runtime_settings(
+            &state,
+            proof,
+            next.clone(),
+            actor,
+            format!("changed_keys={}", changed.join(",")),
+        )
+        .await?,
+    )?;
     let ip_count = database(state.db.clone(), |db| db.count_audit_client_ips()).await?;
     let body = settings_form_template(
         &session,
@@ -330,7 +332,7 @@ pub(super) async fn delete_audit_ips_ui(
     headers: HeaderMap,
     Form(form): Form<DeleteAuditIpsForm>,
 ) -> Result<Redirect> {
-    let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    let session = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&session, &form.csrf)?;
     if form.confirmation != "IP-DATEN LÖSCHEN" {
         return Err(AppError(
@@ -339,13 +341,15 @@ pub(super) async fn delete_audit_ips_ui(
         ));
     }
     let fallback_logging_enabled = runtime_settings(&state).audit_client_ip_enabled;
-    let audit_actor = session.username;
+    let proof = session.proof().clone();
+    let audit_actor = session.username.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
     let outcome = required_database(state.db.clone(), move |db| {
-        db.delete_audit_client_ips_if_disabled_and_audit(fallback_logging_enabled, &audit_context)
+        db.delete_audit_client_ips_for_mfa_session(&proof, fallback_logging_enabled, &audit_context)
     })
     .await?;
+    let outcome = super::session_bound(outcome)?;
     let AuditClientIpDeletionOutcome::Deleted(_) = outcome else {
         return Err(AppError(
             StatusCode::CONFLICT,

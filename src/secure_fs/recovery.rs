@@ -321,13 +321,10 @@ impl SecureRoot {
         let names = snapshot_directory_names(self.tombstones.as_ref())?;
         let mut removed = false;
         for name in names {
-            let should_remove = if is_file_operation_temporary_name(&name) {
-                true
-            } else if let Some(pending_name) = deletion_pending_from_manifest_name(&name) {
-                !entry_exists(self.tombstones.as_ref(), pending_name)?
-            } else {
-                false
-            };
+            // Orphaned delete manifests are recovery intents, not incomplete
+            // writes. recover_pending_deletions syncs the restored visible
+            // parent before removing them.
+            let should_remove = is_file_operation_temporary_name(&name);
             if !should_remove {
                 continue;
             }
@@ -343,7 +340,7 @@ impl SecureRoot {
         Ok(())
     }
 
-    pub(super) fn recover_pending_deletions(
+    pub(crate) fn recover_pending_deletions(
         &self,
         pending_operations: &[PendingFileOperation],
     ) -> io::Result<()> {
@@ -355,6 +352,43 @@ impl SecureRoot {
             })
             .collect();
         let names = snapshot_directory_names(self.tombstones.as_ref())?;
+        for manifest_name in &names {
+            let Some(pending_name) = deletion_pending_from_manifest_name(manifest_name) else {
+                continue;
+            };
+            if journaled_pending.contains(pending_name)
+                || entry_exists(self.tombstones.as_ref(), pending_name)?
+            {
+                continue;
+            }
+            let Some(manifest_name) = manifest_name.to_str() else {
+                continue;
+            };
+            let original_path = read_pending_manifest(self.tombstones.as_ref(), manifest_name)
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "restored deletion {pending_name} has no valid recovery manifest: {error}"
+                        ),
+                    )
+                })?;
+            let (parent_path, original_name) = split_parent_name(&original_path)?;
+            let parent = self.root.bind_directory(&parent_path)?;
+            if !entry_exists(parent.directory.as_ref(), &original_name)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "delete recovery lost both pending entry {pending_name} and original path {original_path}"
+                    ),
+                ));
+            }
+            parent.directory.sync_all()?;
+            self.tombstones.sync_all()?;
+            remove_pending_manifest(self.tombstones.as_ref(), manifest_name)?;
+            unregister_upload_fragment(pending_name);
+            tracing::warn!(recovery_entry = %pending_name, original = %original_path, "finalized an uncertain restored deletion during recovery");
+        }
         for pending_name in names {
             if !is_deletion_pending_name(&pending_name) {
                 continue;
@@ -385,8 +419,10 @@ impl SecureRoot {
             )?;
             parent.directory.sync_all()?;
             self.tombstones.sync_all()?;
-            remove_pending_manifest(self.tombstones.as_ref(), &manifest_name)?;
-            tracing::warn!(recovery_entry = %pending_name, original = %original_path, "restored uncommitted deletion after restart");
+            let manifest_result = remove_pending_manifest(self.tombstones.as_ref(), &manifest_name);
+            unregister_upload_fragment(pending_name);
+            manifest_result?;
+            tracing::warn!(recovery_entry = %pending_name, original = %original_path, "restored uncommitted deletion during recovery");
         }
         Ok(())
     }
