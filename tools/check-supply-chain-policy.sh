@@ -1163,6 +1163,9 @@ if ! grep -F -q 'SOAK_ORCHESTRATION_SHA256' deploy/vaultlink-soak-control.sh \
     || ! grep -F -q 'approved_orchestration_sha256=' tools/check-soak-evidence.sh \
     || ! grep -F -q 'load profiles do not cover all 12 six-hour soak buckets' tools/check-soak-evidence.sh \
     || ! grep -F -q 'upload_integrity=server_readback' tools/load-test.sh \
+    || ! grep -F -q 'holder_token=$ADMISSION_DOWNLOAD_TOKEN' tools/load-test.sh \
+    || ! grep -F -q '"$VAULTLINK_BASE_URL/v/$holder_token/download" &' tools/load-test.sh \
+    || ! grep -F -q 'ADMISSION_DOWNLOAD_TOKEN' docs/SOAK-RUNNER.md \
     || ! grep -F -q 'UPLOAD_VERIFY_TOKEN' docs/SOAK-RUNNER.md; then
     report "soak evidence must bind orchestration, distributed load windows, and server-side upload readback"
 fi
@@ -1535,6 +1538,8 @@ if ! grep -F -q 'evidence_value "$p95_evidence" metadata_p95_policy)" = diagnost
     || ! grep -F -q 'range_rows=40' "$vm_harness" \
     || ! grep -F -q 'upload_rows=10' "$vm_harness" \
     || ! grep -F -q 'upload_integrity=server_readback' "$vm_harness" \
+    || ! grep -F -q 'admission_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)' "$vm_runtime_smoke" \
+    || ! grep -F -q 'ADMISSION_DOWNLOAD_TOKEN=$admission_download_token' "$vm_runtime_smoke" \
     || ! grep -F -q 'integrity=ok' "$vm_runtime_smoke" \
     || ! grep -F -q 'sudo sqlite3 /var/lib/vaultlink/data.sqlite "PRAGMA integrity_check;"' "$vm_harness" \
     || ! grep -F -q '$2 !~ /^2[0-9][0-9]$/' "$load_test" \
@@ -2025,7 +2030,9 @@ if ! grep -F -q '[ "$evidence" = "/work/offline-smoke/$target_id/native-load" ]'
     || ! grep -F -q 'LOAD_PROFILE_READY_TIMEOUT_SECONDS=10' "$package_native_load_smoke" \
     || ! grep -F -q 'LOAD_ADMISSION_READY_TIMEOUT_SECONDS=10' "$package_native_load_smoke" \
     || ! grep -F -q 'LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS=30' "$package_native_load_smoke" \
-    || ! grep -F -q 'LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS=5' "$package_native_load_smoke"; then
+    || ! grep -F -q 'LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS=5' "$package_native_load_smoke" \
+    || ! grep -F -q 'admission_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)' "$package_native_load_smoke" \
+    || ! grep -F -q 'ADMISSION_DOWNLOAD_TOKEN=$admission_download_token' "$package_native_load_smoke"; then
     report "native performance must use the exact installed package payload, package database, unprivileged PID, and normal strict timeouts"
 fi
 if [ ! -f "$native_storage_qualification" ] \

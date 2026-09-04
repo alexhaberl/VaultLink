@@ -195,9 +195,13 @@ impl Database {
 }
 
 fn configure_connection(connection: &mut Connection) -> rusqlite::Result<()> {
+    // r2d2 opens pool members concurrently. Install the busy handler before
+    // each connection negotiates WAL mode so simultaneous first opens wait
+    // for the schema/journal writer instead of failing immediately with
+    // SQLITE_BUSY on slower architectures.
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.set_prepared_statement_cache_capacity(128);
     Ok(())
 }

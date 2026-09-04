@@ -96,6 +96,7 @@ VAULTLINK_HEALTH_URL=http://127.0.0.1:8080/api/v2/health/ready
 VAULTLINK_DATABASE=/var/lib/vaultlink/data.sqlite
 VAULTLINK_CONFIG=/etc/vaultlink/config.toml
 DOWNLOAD_TOKEN=REPLACE_WITH_STAGING_DOWNLOAD_TOKEN
+ADMISSION_DOWNLOAD_TOKEN=REPLACE_WITH_SECOND_STAGING_DOWNLOAD_TOKEN
 UPLOAD_TOKEN=REPLACE_WITH_STAGING_UPLOAD_TOKEN
 UPLOAD_VERIFY_TOKEN=REPLACE_WITH_STAGING_READBACK_TOKEN
 ```
@@ -112,6 +113,11 @@ every profile requires metadata p95 to remain below 2 seconds while all three
 pressure groups overlap. This is separate from the diagnostic p95 recorded by
 full-system QEMU gates; QEMU still runs the identical workload and enforces all
 of its functional, security, integrity, and RSS assertions.
+
+`ADMISSION_DOWNLOAD_TOKEN` must be a second, independent download share for the
+same large fixture as `DOWNLOAD_TOKEN`. The admission probe spreads one
+forwarded client's streams evenly across both shares, so it exercises the
+per-client limit without also exhausting the per-share limit.
 
 `UPLOAD_VERIFY_TOKEN` must be a staging-only download share rooted at exactly
 the same directory as `UPLOAD_TOKEN`, without a password or download limit.

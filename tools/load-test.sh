@@ -6,11 +6,17 @@ export LC_ALL LANG
 
 : "${VAULTLINK_BASE_URL:?set VAULTLINK_BASE_URL}"
 : "${DOWNLOAD_TOKEN:?set DOWNLOAD_TOKEN}"
+: "${ADMISSION_DOWNLOAD_TOKEN:?set ADMISSION_DOWNLOAD_TOKEN for a second share of the download fixture}"
 : "${UPLOAD_TOKEN:?set UPLOAD_TOKEN}"
 : "${UPLOAD_VERIFY_TOKEN:?set UPLOAD_VERIFY_TOKEN for the same upload directory}"
 : "${SOAK_NAMESPACE:?set SOAK_NAMESPACE from vaultlink-soak-control}"
 : "${VAULTLINK_CONFIG:?set VAULTLINK_CONFIG}"
 command -v curl >/dev/null
+
+[ "$ADMISSION_DOWNLOAD_TOKEN" != "$DOWNLOAD_TOKEN" ] || {
+    echo "ADMISSION_DOWNLOAD_TOKEN must identify a separate download share" >&2
+    exit 64
+}
 
 p95_limit=2.000
 range_ttfb_p95_limit=2.000
@@ -314,11 +320,19 @@ verify_forwarded_admission_identity() {
     }
     holder=0
     while [ "$holder" -lt 16 ]; do
+        # Spread one client's 16 streams across two shares. A single share
+        # would also exhaust max_streams_per_share=16 and make the distinct
+        # client probe return a correct but ambiguous 503.
+        if [ $((holder % 2)) -eq 0 ]; then
+            holder_token=$DOWNLOAD_TOKEN
+        else
+            holder_token=$ADMISSION_DOWNLOAD_TOKEN
+        fi
         curl --interface 127.0.0.1 --header "X-Forwarded-For: $identity" \
             --silent --show-error --max-time "$admission_holder_max_time" \
             --limit-rate 1024 --range "0-$admission_range_end" \
             --dump-header "$work/admission-$holder.headers" --output /dev/null \
-            "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download" &
+            "$VAULTLINK_BASE_URL/v/$holder_token/download" &
         admission_holders="$admission_holders $!"
         holder=$((holder + 1))
     done

@@ -1010,6 +1010,29 @@ fn share_activity_limits_are_scoped_and_release_on_drop() {
     drop(other);
 }
 
+#[test]
+fn client_limit_can_be_probed_without_exhausting_a_share_limit() {
+    let clients = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let shares = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let first_client = "198.18.255.1".parse().unwrap();
+    let other_client = "198.18.255.2".parse().unwrap();
+    let mut held = Vec::new();
+
+    for share_id in [7, 8] {
+        let client = try_acquire_client_activity(clients.clone(), first_client, 2).unwrap();
+        let share = try_acquire_share_activity(shares.clone(), share_id, 2).unwrap();
+        held.push((client, share));
+    }
+
+    assert!(try_acquire_client_activity(clients.clone(), first_client, 2).is_none());
+    let other_client_permit =
+        try_acquire_client_activity(clients, other_client, 2).expect("other client has own bucket");
+    let non_saturated_share = try_acquire_share_activity(shares, 7, 2)
+        .expect("alternating holders leave capacity in each share bucket");
+
+    drop((other_client_permit, non_saturated_share, held));
+}
+
 #[tokio::test]
 async fn non_upload_routes_reject_large_buffered_bodies() {
     let root = tempfile::tempdir().unwrap();

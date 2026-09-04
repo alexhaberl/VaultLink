@@ -92,6 +92,7 @@ totp_secret=
 totp_code=
 csrf=
 download_token=
+admission_download_token=
 upload_token=
 verify_token=
 
@@ -107,6 +108,7 @@ write_redacted_tail() {
     NATIVE_REDACT_TOTP_CODE=$totp_code \
     NATIVE_REDACT_CSRF=$csrf \
     NATIVE_REDACT_DOWNLOAD_TOKEN=$download_token \
+    NATIVE_REDACT_ADMISSION_DOWNLOAD_TOKEN=$admission_download_token \
     NATIVE_REDACT_UPLOAD_TOKEN=$upload_token \
     NATIVE_REDACT_VERIFY_TOKEN=$verify_token \
     python3 - "$source_log" "$destination_log" "$maximum_lines" <<'PY'
@@ -125,6 +127,7 @@ secret_names = (
     "NATIVE_REDACT_TOTP_CODE",
     "NATIVE_REDACT_CSRF",
     "NATIVE_REDACT_DOWNLOAD_TOKEN",
+    "NATIVE_REDACT_ADMISSION_DOWNLOAD_TOKEN",
     "NATIVE_REDACT_UPLOAD_TOKEN",
     "NATIVE_REDACT_VERIFY_TOKEN",
 )
@@ -624,9 +627,11 @@ create_share() {
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 }
 download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
+admission_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
 upload_token=$(create_share vaultlink-load/uploads upload_only)
 verify_token=$(create_share vaultlink-load/uploads download_upload)
-for secret_value in "$download_token" "$upload_token" "$verify_token"; do
+for secret_value in \
+    "$download_token" "$admission_download_token" "$upload_token" "$verify_token"; do
     [ -n "$secret_value" ] || fail "load share creation returned an empty token"
 done
 
@@ -637,6 +642,7 @@ load_status=0
 VAULTLINK_BASE_URL=http://127.0.0.1:18081 \
 VAULTLINK_HEALTH_URL=http://127.0.0.1:18081/api/v2/health/ready \
 DOWNLOAD_TOKEN=$download_token \
+ADMISSION_DOWNLOAD_TOKEN=$admission_download_token \
 UPLOAD_TOKEN=$upload_token \
 UPLOAD_VERIFY_TOKEN=$verify_token \
 SOAK_NAMESPACE="package-native-$target_id" \

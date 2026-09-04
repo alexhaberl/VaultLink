@@ -282,6 +282,7 @@ create_share() {
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 }
 download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
+admission_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
 upload_token=$(create_share vaultlink-load/uploads upload_only)
 verify_token=$(create_share vaultlink-load/uploads download_upload)
 
@@ -313,6 +314,7 @@ fi
 VAULTLINK_BASE_URL=http://127.0.0.1:18081 \
 VAULTLINK_HEALTH_URL=http://127.0.0.1:18081/api/v2/health/ready \
 DOWNLOAD_TOKEN=$download_token \
+ADMISSION_DOWNLOAD_TOKEN=$admission_download_token \
 UPLOAD_TOKEN=$upload_token \
 UPLOAD_VERIFY_TOKEN=$verify_token \
 SOAK_NAMESPACE="package-$target_id" \
