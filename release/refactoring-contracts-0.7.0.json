@@ -53,7 +53,7 @@
     },
     {
       "path": "src/db/database.rs",
-      "sha256": "2aad8a7dd28b87e23857026af0df619fbb60ac3b5023d16af5ec3f615cbe9939",
+      "sha256": "88842dc202845a590e69b723275a26ee1a85d896292b05fc4a2c90cc19887b4f",
       "contract": "encrypted-secret AAD and database ownership"
     },
     {
