@@ -546,8 +546,9 @@ download_profile() {
             awk -v ttfb="$time_starttransfer" -v speed="$speed_download" \
                 -v duration="$time_total" 'BEGIN {
                     numeric = "^[0-9]+([.][0-9]+)?$"
-                    exit !(ttfb ~ numeric && speed ~ numeric && duration ~ numeric
-                        && ttfb + 0 >= 0 && speed + 0 > 0 && duration + 0 > 0)
+                    numeric_values = ttfb ~ numeric && speed ~ numeric && duration ~ numeric
+                    positive_values = ttfb + 0 >= 0 && speed + 0 > 0 && duration + 0 > 0
+                    exit !(numeric_values && positive_values)
                 }'
             size=$(stat -c '%s' "$body")
             hash=$(sha256sum "$body" | awk '{print $1}')
