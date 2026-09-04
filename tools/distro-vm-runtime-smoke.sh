@@ -37,6 +37,63 @@ rm -rf "$evidence"
 install -d -m 0755 "$evidence"
 runtime_stage=initialization
 runtime_config_work=
+download_token=
+admission_download_token=
+range_download_token=
+upload_token=
+upload_token_2=
+upload_token_3=
+upload_token_4=
+upload_token_5=
+verify_token=
+
+redact_runtime_load_log() {
+    runtime_load_log=$1
+    if [ ! -f "$runtime_load_log" ] || [ -L "$runtime_load_log" ]; then
+        return 0
+    fi
+    VM_REDACT_DOWNLOAD_TOKEN=$download_token \
+    VM_REDACT_ADMISSION_DOWNLOAD_TOKEN=$admission_download_token \
+    VM_REDACT_RANGE_DOWNLOAD_TOKEN=$range_download_token \
+    VM_REDACT_UPLOAD_TOKEN=$upload_token \
+    VM_REDACT_UPLOAD_TOKEN_2=$upload_token_2 \
+    VM_REDACT_UPLOAD_TOKEN_3=$upload_token_3 \
+    VM_REDACT_UPLOAD_TOKEN_4=$upload_token_4 \
+    VM_REDACT_UPLOAD_TOKEN_5=$upload_token_5 \
+    VM_REDACT_VERIFY_TOKEN=$verify_token \
+    python3 - "$runtime_load_log" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8", errors="replace") as handle:
+    text = handle.read()
+secret_names = (
+    "VM_REDACT_DOWNLOAD_TOKEN",
+    "VM_REDACT_ADMISSION_DOWNLOAD_TOKEN",
+    "VM_REDACT_RANGE_DOWNLOAD_TOKEN",
+    "VM_REDACT_UPLOAD_TOKEN",
+    "VM_REDACT_UPLOAD_TOKEN_2",
+    "VM_REDACT_UPLOAD_TOKEN_3",
+    "VM_REDACT_UPLOAD_TOKEN_4",
+    "VM_REDACT_UPLOAD_TOKEN_5",
+    "VM_REDACT_VERIFY_TOKEN",
+)
+known_secrets = sorted(
+    {os.environ.get(name, "") for name in secret_names} - {""},
+    key=len,
+    reverse=True,
+)
+for secret in known_secrets:
+    text = text.replace(secret, "[REDACTED]")
+temporary = f"{path}.redacted.{os.getpid()}"
+with open(temporary, "x", encoding="utf-8", newline="\n") as handle:
+    handle.write(text)
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+PY
+}
+
 finalize_runtime_evidence() {
     runtime_status=$?
     trap - EXIT
@@ -45,6 +102,10 @@ finalize_runtime_evidence() {
     fi
     if [ -d "$evidence" ] && [ ! -L "$evidence" ]; then
         rm -f "$evidence/cookies.txt" || true
+        if ! redact_runtime_load_log "$evidence/load.log"; then
+            rm -f "$evidence/load.log" || true
+            [ "$runtime_status" -ne 0 ] || runtime_status=1
+        fi
         if [ "$runtime_status" -ne 0 ]; then
             systemctl show vaultlink.service --no-pager \
                 >"$evidence/runtime-failure-systemd.env" 2>&1 || true
@@ -283,7 +344,12 @@ create_share() {
 }
 download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
 admission_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
+range_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)
 upload_token=$(create_share vaultlink-load/uploads upload_only)
+upload_token_2=$(create_share vaultlink-load/uploads upload_only)
+upload_token_3=$(create_share vaultlink-load/uploads upload_only)
+upload_token_4=$(create_share vaultlink-load/uploads upload_only)
+upload_token_5=$(create_share vaultlink-load/uploads upload_only)
 verify_token=$(create_share vaultlink-load/uploads download_upload)
 
 load_tmp="$runtime_mount_base/.distro-vm-load-work"
@@ -315,7 +381,12 @@ VAULTLINK_BASE_URL=http://127.0.0.1:18081 \
 VAULTLINK_HEALTH_URL=http://127.0.0.1:18081/api/v2/health/ready \
 DOWNLOAD_TOKEN=$download_token \
 ADMISSION_DOWNLOAD_TOKEN=$admission_download_token \
+RANGE_DOWNLOAD_TOKEN=$range_download_token \
 UPLOAD_TOKEN=$upload_token \
+UPLOAD_TOKEN_2=$upload_token_2 \
+UPLOAD_TOKEN_3=$upload_token_3 \
+UPLOAD_TOKEN_4=$upload_token_4 \
+UPLOAD_TOKEN_5=$upload_token_5 \
 UPLOAD_VERIFY_TOKEN=$verify_token \
 SOAK_NAMESPACE="package-$target_id" \
 LOAD_RUN_ID=full-system \
@@ -356,6 +427,10 @@ for p95_evidence in \
     [ "$(evidence_value "$p95_evidence" metadata_p95_within_limit)" \
         = "$expected_p95_within_limit" ]
 done
+[ "$(evidence_value "$evidence/load/result.env" range_share_count)" = 3 ]
+[ "$(evidence_value "$evidence/load/result.env" range_streams_per_share_max)" = 14 ]
+[ "$(evidence_value "$evidence/load/result.env" upload_share_count)" = 5 ]
+[ "$(evidence_value "$evidence/load/result.env" uploads_per_share)" = 2 ]
 
 runtime_stage=upgrade-migration-rollback
 database=/var/lib/vaultlink/data.sqlite

@@ -1165,8 +1165,23 @@ if ! grep -F -q 'SOAK_ORCHESTRATION_SHA256' deploy/vaultlink-soak-control.sh \
     || ! grep -F -q 'upload_integrity=server_readback' tools/load-test.sh \
     || ! grep -F -q 'holder_token=$ADMISSION_DOWNLOAD_TOKEN' tools/load-test.sh \
     || ! grep -F -q '"$VAULTLINK_BASE_URL/v/$holder_token/download" &' tools/load-test.sh \
+    || ! grep -F -q 'validate_distinct_token_set "download token set"' tools/load-test.sh \
+    || ! grep -F -q 'validate_distinct_token_set "upload token set"' tools/load-test.sh \
+    || ! grep -F -q 'case $((download % 3)) in' tools/load-test.sh \
+    || ! grep -F -q '2) download_token=$RANGE_DOWNLOAD_TOKEN' tools/load-test.sh \
+    || ! grep -F -q 'case $((upload % 5)) in' tools/load-test.sh \
+    || ! grep -F -q '4) upload_token=$UPLOAD_TOKEN_5' tools/load-test.sh \
+    || ! grep -F -q 'range_share_count=3' tools/load-test.sh \
+    || ! grep -F -q 'range_streams_per_share_max=14' tools/load-test.sh \
+    || ! grep -F -q 'upload_share_count=5' tools/load-test.sh \
+    || ! grep -F -q 'uploads_per_share=2' tools/load-test.sh \
+    || ! grep -F -q 'soak load result does not prove bounded per-share sharding' tools/check-soak-evidence.sh \
     || ! grep -F -q 'ADMISSION_DOWNLOAD_TOKEN' docs/SOAK-RUNNER.md \
-    || ! grep -F -q 'UPLOAD_VERIFY_TOKEN' docs/SOAK-RUNNER.md; then
+    || ! grep -F -q 'RANGE_DOWNLOAD_TOKEN' docs/SOAK-RUNNER.md \
+    || ! grep -F -q 'UPLOAD_TOKEN_5' docs/SOAK-RUNNER.md \
+    || ! grep -F -q 'UPLOAD_VERIFY_TOKEN' docs/SOAK-RUNNER.md \
+    || ! grep -F -q '14/13/13 streams' docs/SOAK-RUNNER.md \
+    || ! grep -F -q 'two per share' docs/SOAK-RUNNER.md; then
     report "soak evidence must bind orchestration, distributed load windows, and server-side upload readback"
 fi
 if ! grep -F -q 'SOAK_START_EPOCH=' deploy/vaultlink-soak-control.sh \
@@ -1539,7 +1554,15 @@ if ! grep -F -q 'evidence_value "$p95_evidence" metadata_p95_policy)" = diagnost
     || ! grep -F -q 'upload_rows=10' "$vm_harness" \
     || ! grep -F -q 'upload_integrity=server_readback' "$vm_harness" \
     || ! grep -F -q 'admission_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)' "$vm_runtime_smoke" \
+    || ! grep -F -q 'range_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)' "$vm_runtime_smoke" \
     || ! grep -F -q 'ADMISSION_DOWNLOAD_TOKEN=$admission_download_token' "$vm_runtime_smoke" \
+    || ! grep -F -q 'RANGE_DOWNLOAD_TOKEN=$range_download_token' "$vm_runtime_smoke" \
+    || ! grep -F -q 'UPLOAD_TOKEN_5=$upload_token_5' "$vm_runtime_smoke" \
+    || ! grep -F -q 'range_share_count)" = 3' "$vm_runtime_smoke" \
+    || ! grep -F -q 'upload_share_count)" = 5' "$vm_runtime_smoke" \
+    || ! grep -F -q 'redact_runtime_load_log "$evidence/load.log"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'VM_REDACT_RANGE_DOWNLOAD_TOKEN' "$vm_runtime_smoke" \
+    || ! grep -F -q 'VM_REDACT_UPLOAD_TOKEN_5' "$vm_runtime_smoke" \
     || ! grep -F -q 'integrity=ok' "$vm_runtime_smoke" \
     || ! grep -F -q 'sudo sqlite3 /var/lib/vaultlink/data.sqlite "PRAGMA integrity_check;"' "$vm_harness" \
     || ! grep -F -q '$2 !~ /^2[0-9][0-9]$/' "$load_test" \
@@ -2032,7 +2055,10 @@ if ! grep -F -q '[ "$evidence" = "/work/offline-smoke/$target_id/native-load" ]'
     || ! grep -F -q 'LOAD_ADMISSION_HOLDER_MAX_TIME_SECONDS=30' "$package_native_load_smoke" \
     || ! grep -F -q 'LOAD_ADMISSION_PROBE_MAX_TIME_SECONDS=5' "$package_native_load_smoke" \
     || ! grep -F -q 'admission_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)' "$package_native_load_smoke" \
-    || ! grep -F -q 'ADMISSION_DOWNLOAD_TOKEN=$admission_download_token' "$package_native_load_smoke"; then
+    || ! grep -F -q 'range_download_token=$(create_share vaultlink-load/sparse-50GiB.bin download_only)' "$package_native_load_smoke" \
+    || ! grep -F -q 'ADMISSION_DOWNLOAD_TOKEN=$admission_download_token' "$package_native_load_smoke" \
+    || ! grep -F -q 'RANGE_DOWNLOAD_TOKEN=$range_download_token' "$package_native_load_smoke" \
+    || ! grep -F -q 'UPLOAD_TOKEN_5=$upload_token_5' "$package_native_load_smoke"; then
     report "native performance must use the exact installed package payload, package database, unprivileged PID, and normal strict timeouts"
 fi
 if [ ! -f "$native_storage_qualification" ] \
@@ -2197,6 +2223,10 @@ if ! grep -F -q 'if [ "$native_status" -ne 0 ]; then' "$package_native_load_smok
     || ! grep -F -q 'known_secrets = sorted(' "$package_native_load_smoke" \
     || ! grep -F -q 'text = text.replace(secret, "[REDACTED]")' \
         "$package_native_load_smoke" \
+    || ! grep -F -q 'NATIVE_REDACT_RANGE_DOWNLOAD_TOKEN' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'NATIVE_REDACT_UPLOAD_TOKEN_5' \
+        "$package_native_load_smoke" \
     || ! grep -F -q 'authorization\s*:\s*bearer' "$package_native_load_smoke" \
     || ! grep -F -q '(?:set-)?cookie' "$package_native_load_smoke" \
     || ! grep -F -q 'x-csrf-token' "$package_native_load_smoke" \
@@ -2221,7 +2251,11 @@ for native_result_line in \
     'assert_field "$result" metadata_clients 100' \
     'assert_field "$result" metadata_requests 2000' \
     'assert_field "$result" range_streams 40' \
+    'assert_field "$result" range_share_count 3' \
+    'assert_field "$result" range_streams_per_share_max 14' \
     'assert_field "$result" uploads 10' \
+    'assert_field "$result" upload_share_count 5' \
+    'assert_field "$result" uploads_per_share 2' \
     'assert_field "$result" upload_integrity server_readback' \
     'assert_field "$load_command" stage complete' \
     'assert_field "$load_command" exit_status 0' \
@@ -2263,6 +2297,7 @@ if ! grep -F -q 'value < 2.000' "$package_native_load_smoke" \
     || ! grep -F -q '[ "$recomputed_max_rss" = "$max_rss_kib" ]' "$package_native_load_smoke" \
     || ! grep -F -q '$2 != "198.18.2." ($1 + 1) || $3 != 206 || $4 != 67108864' \
         "$package_native_load_smoke" \
+    || ! grep -F -q 'NF != 9' "$package_native_load_smoke" \
     || ! grep -F -q '$5 != expected_hash' "$package_native_load_smoke" \
     || ! grep -F -q '$6 != expected_content_range || seen[$1]++' "$package_native_load_smoke" \
     || ! grep -F -q 'if (NR != 40) exit 1' "$package_native_load_smoke" \

@@ -7,16 +7,45 @@ export LC_ALL LANG
 : "${VAULTLINK_BASE_URL:?set VAULTLINK_BASE_URL}"
 : "${DOWNLOAD_TOKEN:?set DOWNLOAD_TOKEN}"
 : "${ADMISSION_DOWNLOAD_TOKEN:?set ADMISSION_DOWNLOAD_TOKEN for a second share of the download fixture}"
+: "${RANGE_DOWNLOAD_TOKEN:?set RANGE_DOWNLOAD_TOKEN for a third share of the download fixture}"
 : "${UPLOAD_TOKEN:?set UPLOAD_TOKEN}"
+: "${UPLOAD_TOKEN_2:?set UPLOAD_TOKEN_2 for a second upload share}"
+: "${UPLOAD_TOKEN_3:?set UPLOAD_TOKEN_3 for a third upload share}"
+: "${UPLOAD_TOKEN_4:?set UPLOAD_TOKEN_4 for a fourth upload share}"
+: "${UPLOAD_TOKEN_5:?set UPLOAD_TOKEN_5 for a fifth upload share}"
 : "${UPLOAD_VERIFY_TOKEN:?set UPLOAD_VERIFY_TOKEN for the same upload directory}"
 : "${SOAK_NAMESPACE:?set SOAK_NAMESPACE from vaultlink-soak-control}"
 : "${VAULTLINK_CONFIG:?set VAULTLINK_CONFIG}"
 command -v curl >/dev/null
 
-[ "$ADMISSION_DOWNLOAD_TOKEN" != "$DOWNLOAD_TOKEN" ] || {
-    echo "ADMISSION_DOWNLOAD_TOKEN must identify a separate download share" >&2
-    exit 64
+validate_distinct_token_set() {
+    token_set_name=$1
+    shift
+    for token_value in "$@"; do
+        case "$token_value" in
+            ''|*[!A-Za-z0-9._~-]*)
+                echo "$token_set_name contains an invalid share token" >&2
+                exit 64
+                ;;
+        esac
+    done
+    while [ "$#" -gt 1 ]; do
+        token_value=$1
+        shift
+        for other_token_value in "$@"; do
+            [ "$token_value" != "$other_token_value" ] || {
+                echo "$token_set_name must contain distinct share tokens" >&2
+                exit 64
+            }
+        done
+    done
 }
+
+validate_distinct_token_set "download token set" \
+    "$DOWNLOAD_TOKEN" "$ADMISSION_DOWNLOAD_TOKEN" "$RANGE_DOWNLOAD_TOKEN"
+validate_distinct_token_set "upload token set" \
+    "$UPLOAD_TOKEN" "$UPLOAD_TOKEN_2" "$UPLOAD_TOKEN_3" \
+    "$UPLOAD_TOKEN_4" "$UPLOAD_TOKEN_5"
 
 p95_limit=2.000
 range_ttfb_p95_limit=2.000
@@ -524,6 +553,11 @@ download_profile() {
     while [ "$download" -lt 40 ]; do
         (
             identity="198.18.2.$((download + 1))"
+            case $((download % 3)) in
+                0) download_token=$DOWNLOAD_TOKEN ;;
+                1) download_token=$ADMISSION_DOWNLOAD_TOKEN ;;
+                2) download_token=$RANGE_DOWNLOAD_TOKEN ;;
+            esac
             wait_for_profile_go
             headers="$work/range-$download.headers"
             body="$work/range-$download.bin"
@@ -534,7 +568,7 @@ download_profile() {
                 --dump-header "$headers" \
                 --output "$body" \
                 --write-out '%{http_code},%{time_starttransfer},%{speed_download},%{time_total}' \
-                "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN/download")
+                "$VAULTLINK_BASE_URL/v/$download_token/download")
             status=${metrics%%,*}
             remaining_metrics=${metrics#*,}
             time_starttransfer=${remaining_metrics%%,*}
@@ -607,6 +641,13 @@ upload_profile() {
     while [ "$upload" -lt 10 ]; do
         (
             identity="198.18.3.$((upload + 1))"
+            case $((upload % 5)) in
+                0) upload_token=$UPLOAD_TOKEN ;;
+                1) upload_token=$UPLOAD_TOKEN_2 ;;
+                2) upload_token=$UPLOAD_TOKEN_3 ;;
+                3) upload_token=$UPLOAD_TOKEN_4 ;;
+                4) upload_token=$UPLOAD_TOKEN_5 ;;
+            esac
             wait_for_profile_go
             headers="$work/upload-$upload.headers"
             filename="load-$SOAK_NAMESPACE-$run_id-$upload.bin"
@@ -617,7 +658,7 @@ upload_profile() {
                 --dump-header "$headers" \
                 --output /dev/null \
                 --write-out '%{http_code}' \
-                "$VAULTLINK_BASE_URL/v/$UPLOAD_TOKEN/upload")
+                "$VAULTLINK_BASE_URL/v/$upload_token/upload")
             outcome=$(awk '
                 tolower($1) == "x-vaultlink-upload-outcome:" {
                     sub(/^[^:]*:[[:space:]]*/, "")
@@ -842,10 +883,14 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         'metadata_clients=100' \
         'metadata_requests=2000' \
         'range_streams=40' \
+        'range_share_count=3' \
+        'range_streams_per_share_max=14' \
         "range_bytes=$range_bytes" \
         "fixture_bytes=$fixture_bytes" \
         "range_sha256=$expected_range_hash" \
         'uploads=10' \
+        'upload_share_count=5' \
+        'uploads_per_share=2' \
         "upload_sha256=$upload_hash" \
         'upload_integrity=server_readback' \
         "max_rss_kib=$max_rss_kib" \

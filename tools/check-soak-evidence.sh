@@ -259,6 +259,13 @@ for load_result in "$evidence"/load-*/result.env; do
         echo "soak load result does not retain the full 100/40/10 workload" >&2
         exit 1
     fi
+    if [ "$(load_value range_share_count)" != 3 ] \
+        || [ "$(load_value range_streams_per_share_max)" != 14 ] \
+        || [ "$(load_value upload_share_count)" != 5 ] \
+        || [ "$(load_value uploads_per_share)" != 2 ]; then
+        echo "soak load result does not prove bounded per-share sharding" >&2
+        exit 1
+    fi
     for profile_line in \
         'metadata_status=0' \
         'download_status=0' \

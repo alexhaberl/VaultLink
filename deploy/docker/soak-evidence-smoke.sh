@@ -198,10 +198,14 @@ while [ "$run" -le 12 ]; do
         'metadata_clients=100' \
         'metadata_requests=2000' \
         'range_streams=40' \
+        'range_share_count=3' \
+        'range_streams_per_share_max=14' \
         'range_bytes=64' \
         'fixture_bytes=128' \
         'range_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
         'uploads=10' \
+        'upload_share_count=5' \
+        'uploads_per_share=2' \
         'upload_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
         'upload_integrity=server_readback' \
         'max_rss_kib=101000' \
