@@ -122,6 +122,115 @@ async fn queued_transfer_writers_leave_runtime_capacity_for_reads() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn mixed_transfer_load_preserves_reads_while_sqlite_writer_is_active() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("data.sqlite")).unwrap();
+    let (holder_entered_sender, holder_entered_receiver) = tokio::sync::oneshot::channel();
+    let (release_holder_sender, release_holder_receiver) = std::sync::mpsc::channel();
+    let holder_database = database.clone();
+    let holder = tokio::spawn(async move {
+        execute_transfer_database_operation(holder_database, "transfer_write", move |database| {
+            let _write_guard = database.transfer_write_guard()?;
+            let connection = database.conn();
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let _ = holder_entered_sender.send(());
+            let released =
+                release_holder_receiver.recv_timeout(EXECUTOR_ADMISSION_FAILSAFE_TIMEOUT);
+            connection.execute_batch("ROLLBACK")?;
+            assert!(released.is_ok(), "the test must release the SQLite writer");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+    });
+    tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, holder_entered_receiver)
+        .await
+        .expect("the writer must acquire a real SQLite transaction")
+        .expect("the writer must announce its transaction");
+
+    // Exercise the queue pressure from the old 100/40/10 package failures:
+    // forty download finalizers and ten upload finalizers behind one writer.
+    // Each start signal proves that admission was polled before reads begin.
+    let mut queued_writers = Vec::new();
+    for index in 0..50 {
+        let writer_database = database.clone();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            await_after_first_pending(
+                execute_transfer_database_operation(
+                    writer_database,
+                    "transfer_write",
+                    move |database| {
+                        let token = format!("mixed-load-{index}");
+                        if index < 40 {
+                            database
+                                .cancel_transfer_lease(&token)
+                                .map(|outcome| outcome == TransferLeaseCancelOutcome::Cancelled)
+                        } else {
+                            database.cancel_upload_reservation(&token)
+                        }
+                    },
+                ),
+                started_sender,
+            )
+            .await
+        });
+        tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, started_receiver)
+            .await
+            .expect("the transfer finalizer must reach admission")
+            .expect("the transfer finalizer must announce its wait");
+        queued_writers.push(writer);
+    }
+    let available_while_writers_queued = database.runtime_available_permits();
+    let idle_connections_while_writers_queued = database.0.pool.state().idle_connections;
+    let mut readers = tokio::task::JoinSet::new();
+    for _ in 0..100 {
+        let reader_database = database.clone();
+        readers.spawn(async move {
+            execute_database_operation(reader_database, "read", |database| database.admin_count())
+                .await
+        });
+    }
+    let reads = tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, async {
+        let mut results = Vec::new();
+        while let Some(result) = readers.join_next().await {
+            results.push(result);
+        }
+        results
+    })
+    .await;
+
+    // Release and join the writer before asserting results, including when a
+    // regressed executor made the reads fail with an admission timeout.
+    let _ = release_holder_sender.send(());
+    tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, holder)
+        .await
+        .expect("the SQLite writer must finish after release")
+        .expect("the SQLite writer task must not panic")
+        .expect("the SQLite transaction must close successfully");
+    let mut writer_results = Vec::new();
+    for writer in queued_writers {
+        writer_results.push(
+            tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, writer)
+                .await
+                .expect("the transfer finalizer must finish after release")
+                .expect("the transfer finalizer task must not panic"),
+        );
+    }
+    assert_eq!(available_while_writers_queued, 3);
+    assert_eq!(idle_connections_while_writers_queued, 3);
+    let reads = reads.expect("all metadata reads must complete with the SQLite writer held");
+    assert_eq!(reads.len(), 100);
+    for read in reads {
+        assert_eq!(read.unwrap().unwrap(), 0);
+    }
+    for result in writer_results {
+        assert!(!result.expect("the finalizer must retain its admission budget"));
+    }
+    assert_eq!(database.runtime_available_permits(), 4);
+    assert_eq!(database.0.pool.state().idle_connections, 4);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn cancelled_transfer_writer_waiter_releases_its_queue_position() {
     let directory = tempfile::tempdir().unwrap();
     let database = Database::open(directory.path().join("data.sqlite")).unwrap();
