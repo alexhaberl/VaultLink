@@ -32,11 +32,28 @@ corpus tooling, restores the current Git seeds, replays them, and fuzzes every
 target for 30 seconds on native AMD64. It does not publish a reusable corpus or
 the release fuzz status.
 
+The smoke job disables LTO and uses 16 codegen units to reduce compilation time,
+while retaining optimization, ASan, and libFuzzer instrumentation. Its Cargo
+dependency/build cache is separate from corpus storage and keyed by the runner,
+tool versions, build profile, manifests, and source inputs. Cargo still validates
+restored build outputs before running the targets. The 600-second campaigns keep
+the production release profile with ThinLTO and one codegen unit.
+
 `fuzz.yml` runs weekly and on demand. Native AMD64 and ARM64 jobs each replay the
 restored corpus, fuzz every target for 600 seconds, and minimize the result. Build
 parallelism is separate from runtime parallelism: the workflows use two Cargo
 build jobs and two or four fuzz workers according to runner capacity. The native
 600-second statuses remain bound to the exact tested commit.
+
+Allow substantial time for a cold instrumented build: the original ThinLTO smoke
+build took 39 minutes 40 seconds on GitHub AMD64, followed by 2 minutes 18 seconds
+for all thirteen replays, 30-second campaigns, and minimizations. The build has a
+separate 60-minute limit on both native architectures; this is a ceiling, not an
+expected duration. Build output is streamed into the CI log, with a heartbeat
+after 30 seconds without new compiler output. Cache hits and the lighter smoke
+profile reduce build work, but their elapsed time depends on changed inputs and
+runner capacity. With four fuzz workers, thirteen 600-second campaigns need about
+40 minutes of mutation time after compilation, plus replay and minimization.
 
 Replay and minimization each have their own wall-clock budget. A crash, assertion,
 build error, or timeout fails the campaign; a successful mutation phase cannot
@@ -163,7 +180,8 @@ restore path.
 | `FUZZ_NIGHTLY_TOOLCHAIN` | `nightly-2026-07-01` | Rustup toolchain |
 | `FUZZ_MAX_TOTAL_TIME` | `600` | Mutation seconds per target, excluding replay and cmin |
 | `FUZZ_JOBS` | `1` (`make` uses `4`) | Parallel targets; independent of `CARGO_BUILD_JOBS` |
-| `FUZZ_BUILD_TIMEOUT` | `1800` | Initial build wall-clock seconds; campaign/smoke CI uses `2400` |
+| `FUZZ_CODEGEN_UNITS` | `1` | Codegen units passed to every cargo-fuzz build/run/cmin command; PR smoke uses `16` |
+| `FUZZ_BUILD_TIMEOUT` | `3600` | Initial build wall-clock seconds; same limit in campaign/smoke CI |
 | `FUZZ_REPLAY_TIMEOUT` | `120` | Replay wall-clock seconds; also campaign startup allowance |
 | `FUZZ_CMIN_TIMEOUT` | `120` | Corpus minimization wall-clock seconds |
 | `FUZZ_CORPUS_DIR` | `.tmp/fuzz-corpus` | Writable accumulated inputs |

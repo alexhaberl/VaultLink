@@ -308,7 +308,7 @@ class CorpusTests(unittest.TestCase):
             CORPUS.select_artifacts(artifacts, 1)
 
     def test_failed_stage_preserves_exit_code_inputs_and_stops_later_stages(self):
-        config = {"toolchain": "test", "fuzz_seconds": 1, "replay_timeout": 5, "cmin_timeout": 5}
+        config = {"toolchain": "test", "codegen_units": 1, "fuzz_seconds": 1, "replay_timeout": 5, "cmin_timeout": 5}
         for failure in ("replay", "fuzz", "cmin", None):
             with self.subTest(failure=failure):
                 corpus = self.base / f"runtime-{failure}"
@@ -320,7 +320,7 @@ class CorpusTests(unittest.TestCase):
                     log.write_text("#32 DONE cov: 7 ft: 12\nstat::number_of_executed_units: 32\nstat::average_exec_per_sec: 16\nstat::peak_rss_mb: 40\n")
                     if stage == "cmin":
                         # Simulate cmin modifying its input even when it fails.
-                        for entry in Path(command[5]).iterdir():
+                        for entry in Path(command[command.index("--") - 1]).iterdir():
                             entry.unlink()
                     return 77 if stage == failure else 0
                 with patch.object(RUNNER, "run_command", side_effect=execute):
@@ -333,10 +333,135 @@ class CorpusTests(unittest.TestCase):
                 if failure != "replay":
                     self.assertEqual(result["statistics"]["executions"], 32)
 
+    def test_build_replay_fuzz_and_cmin_use_identical_codegen_units(self):
+        corpus = self.base / "runtime-codegen"
+        CORPUS.restore(corpus, [], {}, self.root)
+        calls = []
+
+        def execute(command, log, timeout, **kwargs):
+            calls.append((log.stem, command))
+            log.write_text("#1 DONE cov: 1 ft: 1\n")
+            return 0
+
+        actual_run_target = RUNNER.run_target
+        with patch.dict(os.environ, {"FUZZ_CODEGEN_UNITS": "16",
+                                     "FUZZ_CORPUS_DIR": str(corpus),
+                                     "FUZZ_LOG_DIR": str(self.base / "logs-codegen")}, clear=True), \
+                patch.object(sys, "argv", ["run-fuzz-targets.py"]), \
+                patch.object(RUNNER, "ROOT", self.root), \
+                patch.object(RUNNER.CORPUS, "targets", return_value={"alpha": 1}), \
+                patch.object(RUNNER, "run_command", side_effect=execute), \
+                patch.object(RUNNER, "run_target", side_effect=lambda *args: actual_run_target(*args, root=self.root)):
+            self.assertEqual(RUNNER.main(), 0)
+        self.assertEqual([stage for stage, _ in calls], ["build", "replay", "fuzz", "cmin"])
+        for (stage, command), subcommand in zip(calls, ("build", "run", "run", "cmin")):
+            with self.subTest(stage=stage):
+                self.assertEqual(command[:6], ["cargo", "+nightly-2026-07-01", "fuzz", subcommand,
+                                              "--codegen-units", "16"])
+                self.assertEqual(command.count("--codegen-units"), 1)
+
+    def test_codegen_units_default_to_one_and_reject_invalid_values(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(RUNNER.configuration()["codegen_units"], 1)
+        for value in ("0", "-1", "1.5", ""):
+            with self.subTest(value=value), patch.dict(os.environ, {"FUZZ_CODEGEN_UNITS": value}, clear=True):
+                with self.assertRaisesRegex(ValueError, "FUZZ_CODEGEN_UNITS must be a positive integer"):
+                    RUNNER.configuration()
+
     def test_subprocess_failure_and_timeout_are_not_swallowed(self):
         self.assertEqual(RUNNER.run_command([sys.executable, "-c", "raise SystemExit(77)"], self.base / "exit.log", 5), 77)
         self.assertEqual(RUNNER.run_command([sys.executable, "-c", "import time; time.sleep(30)"], self.base / "timeout.log", 1), 124)
         self.assertIn("exceeded", (self.base / "timeout.log").read_text())
+
+    def test_live_output_reaches_stdout_before_command_can_finish(self):
+        acknowledgement = self.base / "output-was-visible"
+
+        class AcknowledgingOutput(io.StringIO):
+            def write(self, value):
+                count = super().write(value)
+                # The JSON command header also contains the program text; only
+                # acknowledge a complete line emitted by the child itself.
+                if "first compiler line" in self.getvalue().splitlines():
+                    acknowledgement.touch()
+                return count
+
+        program = """import pathlib, sys, time
+print('first compiler line', flush=True)
+acknowledgement = pathlib.Path(sys.argv[1])
+deadline = time.monotonic() + 5
+while not acknowledgement.exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit(99)
+    time.sleep(0.01)
+print('last compiler line', flush=True)
+"""
+        captured = AcknowledgingOutput()
+        log = self.base / "live-build.log"
+        with redirect_stdout(captured):
+            code = RUNNER.run_command([sys.executable, "-c", program, str(acknowledgement)],
+                                      log, 10, live_output=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(acknowledgement.exists())
+        self.assertEqual(captured.getvalue().splitlines(), log.read_text(encoding="utf-8").splitlines())
+        self.assertEqual(captured.getvalue().splitlines().count("first compiler line"), 1)
+        self.assertEqual(captured.getvalue().splitlines().count("last compiler line"), 1)
+
+    def test_live_log_decodes_utf8_split_between_polls_without_altering_file(self):
+        log = self.base / "split-utf8.log"
+        log.write_bytes(b"\xe2")
+        captured = io.StringIO()
+        decoder = RUNNER.codecs.getincrementaldecoder("utf-8")(errors="replace")
+        with log.open("rb") as reader, redirect_stdout(captured):
+            self.assertTrue(RUNNER.forward_log(reader, decoder))
+            self.assertEqual(captured.getvalue(), "")
+            with log.open("ab") as output:
+                output.write(b"\x82\xac\n")
+            self.assertTrue(RUNNER.forward_log(reader, decoder, final=True))
+        self.assertEqual(captured.getvalue(), "€\n")
+        self.assertEqual(log.read_bytes(), b"\xe2\x82\xac\n")
+
+    def test_live_command_failure_and_timeout_keep_output_and_exit_codes(self):
+        for name, program, expected in (
+            ("failure", "print('compiler failed', flush=True); raise SystemExit(77)", 77),
+            ("timeout", "import time; print('compiler waiting', flush=True); time.sleep(30)", 124),
+        ):
+            with self.subTest(name=name):
+                captured = io.StringIO()
+                log = self.base / f"live-{name}.log"
+                with redirect_stdout(captured):
+                    code = RUNNER.run_command([sys.executable, "-c", program], log, 1, live_output=True)
+                self.assertEqual(code, expected)
+                self.assertEqual(captured.getvalue().splitlines(), log.read_text(encoding="utf-8").splitlines())
+                self.assertIn(f"Exit code: {expected}", captured.getvalue())
+                if name == "timeout":
+                    self.assertIn("Stage exceeded its 1s wall-clock budget", captured.getvalue())
+
+    def test_quiet_live_build_reports_heartbeat_every_thirty_seconds(self):
+        clock = [0.0]
+
+        class QuietProcess:
+            args = ["quiet-compiler"]
+
+            def poll(self):
+                return 0 if clock[0] >= 65 else None
+
+            def wait(self, timeout=None):
+                clock[0] = min(65, clock[0] + timeout)
+                if clock[0] < 65:
+                    raise RUNNER.subprocess.TimeoutExpired(self.args, timeout)
+                return 0
+
+        captured = io.StringIO()
+        with patch.object(RUNNER.subprocess, "Popen", return_value=QuietProcess()), \
+                patch.object(RUNNER.time, "monotonic", side_effect=lambda: clock[0]), \
+                redirect_stdout(captured):
+            code = RUNNER.run_command(["quiet-compiler"], self.base / "quiet-build.log", 100, live_output=True)
+        self.assertEqual(code, 0)
+        heartbeats = [line for line in captured.getvalue().splitlines() if line.startswith("Fuzz build still running")]
+        self.assertEqual(heartbeats, [
+            "Fuzz build still running (30s elapsed; timeout 100s)",
+            "Fuzz build still running (60s elapsed; timeout 100s)",
+        ])
 
     def test_coverage_scope_excludes_harnesses_and_test_support(self):
         for name in ("src/parser.rs", "src/service/mod.rs", "src/fuzzing.rs", "src/fuzzing/helpers.rs",

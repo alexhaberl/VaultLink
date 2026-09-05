@@ -16,13 +16,17 @@ jobs:
   smoke:
     name: Fuzz replay and smoke (amd64)
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
       CARGO_BUILD_JOBS: 2
+      # Smoke favors compile time; the 600-second campaign retains release LTO.
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+      FUZZ_CODEGEN_UNITS: 16
       FUZZ_JOBS: ${{ github.repository_visibility == 'public' && '4' || '2' }}
       FUZZ_MAX_TOTAL_TIME: 30
-      FUZZ_BUILD_TIMEOUT: 2400
+      FUZZ_BUILD_TIMEOUT: 3600
       FUZZ_REPLAY_TIMEOUT: 120
       FUZZ_CMIN_TIMEOUT: 120
     steps:
@@ -35,6 +39,22 @@ jobs:
           components: rust-src
       - name: Verify native architecture
         run: test "$(uname -m)" = x86_64
+      - name: Cache smoke build dependencies and artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # Cache service failures must still allow the build and fuzz gates to run.
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Workspace builds live in target; corpus and credentials are excluded.
+          key: fuzz-smoke-v1-${{ runner.os }}-${{ runner.arch }}-nightly-2026-07-01-cargo-fuzz-0.13.2-release-lto-off-cgu16-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'fuzz/Cargo.toml', '.cargo/config*') }}-${{ hashFiles('src/**', 'fuzz/fuzz_targets/**', 'templates/**', 'assets/**', '.github/workflows/fuzz-smoke.yml', 'tools/run-fuzz-targets.py', 'Makefile') }}
+          restore-keys: |
+            fuzz-smoke-v1-${{ runner.os }}-${{ runner.arch }}-nightly-2026-07-01-cargo-fuzz-0.13.2-release-lto-off-cgu16-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'fuzz/Cargo.toml', '.cargo/config*') }}-
       - name: Configure isolated corpus and evidence directories
         shell: bash
         run: |
