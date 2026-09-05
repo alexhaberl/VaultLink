@@ -34,10 +34,13 @@ jobs:
       # Instrumented ASan/coverage linkers can use several GiB each. Keep the
       # build fan-out independent from the four runtime fuzz workers below.
       CARGO_BUILD_JOBS: 2
+      # Keep optimized fuzz throughput without repeating ThinLTO for every target.
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      FUZZ_CODEGEN_UNITS: 1
       # Private standard runners provide two cores and 8 GiB; public standard
       # runners provide four cores and 16 GiB. Keep one fuzzer per core.
       FUZZ_JOBS: ${{ github.repository_visibility == 'public' && '4' || '2' }}
-      FUZZ_MAX_TOTAL_TIME: 600
+      FUZZ_MAX_TOTAL_TIME: 900
       FUZZ_BUILD_TIMEOUT: 3600
       FUZZ_REPLAY_TIMEOUT: 120
       FUZZ_CMIN_TIMEOUT: 120
@@ -62,7 +65,7 @@ jobs:
         run: python3 tools/fuzz-corpus.py restore --destination "$FUZZ_CORPUS_DIR" --repository "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
-      - name: Replay, fuzz every target for 10 minutes, and minimize
+      - name: Replay, fuzz every target for 15 minutes, and minimize
         run: make fuzz-parallel
       - name: Prepare validated corpus snapshot
         run: >-
@@ -89,7 +92,9 @@ jobs:
             ${{ runner.temp }}/vaultlink-fuzz-corpus/
           if-no-files-found: ignore
           retention-days: 30
-      - name: Publish exact-commit 600-second fuzz gate
+      # Retain the existing status contexts consumed by release and soak. The
+      # 900-second campaign exceeds their historical 600-second minimum.
+      - name: Publish exact-commit native fuzz gate
         if: always()
         env:
           GATE_RESULT: ${{ job.status }}
@@ -97,8 +102,8 @@ jobs:
         shell: bash
         run: |
           case "$GATE_RESULT" in
-            success) state=success; description='All targets passed the native 600-second fuzz gate' ;;
-            *) state=failure; description='The native 600-second fuzz gate failed' ;;
+            success) state=success; description='All targets passed the native 900-second fuzz campaign' ;;
+            *) state=failure; description='The native 900-second fuzz campaign failed' ;;
           esac
           curl --fail-with-body --silent --show-error \
             --retry 5 \

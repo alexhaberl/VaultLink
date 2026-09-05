@@ -72,7 +72,7 @@ def check(root: Path = ROOT) -> None:
         require(text, "if: always()", "successful and failed campaign evidence must be retained")
     for architecture in ("amd64", "arm64"):
         require(campaign, f"architecture: {architecture}", "release fuzzing must run on both architectures")
-    require(campaign, "FUZZ_MAX_TOTAL_TIME: 600", "release campaigns require 600 seconds per target")
+    require(campaign, "FUZZ_MAX_TOTAL_TIME: 900", "release campaigns require 900 seconds per target")
     require(campaign, "retention-days: 90", "rolling corpora need 90-day retention")
     require(campaign, 'restore --destination "$FUZZ_CORPUS_DIR" --repository "$GITHUB_REPOSITORY"',
             "release campaigns must restore verified main corpora")
@@ -96,7 +96,7 @@ def check(root: Path = ROOT) -> None:
         text = (root / ".github/workflows" / path).read_text()
         for architecture in ("amd64", "arm64"):
             require(text, f"validate_gate vaultlink/fuzz-600s-{architecture} .github/workflows/fuzz.yml",
-                    "release and soak must retain both exact-commit 600-second gates")
+                    "release and soak must retain both existing exact-commit fuzz gates")
 
 
 if __name__ == "__main__":

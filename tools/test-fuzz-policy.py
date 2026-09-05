@@ -126,9 +126,9 @@ class FuzzPolicyTests(unittest.TestCase):
         self.reject_edit(".github/workflows/fuzz-smoke.yml", "--seed-only", "--repository example/repo")
 
     def test_release_budget_cannot_be_replaced_by_pr_smoke_budget(self):
-        for replacement in ("FUZZ_MAX_TOTAL_TIME: 30", "# FUZZ_MAX_TOTAL_TIME: 600"):
+        for replacement in ("FUZZ_MAX_TOTAL_TIME: 30", "FUZZ_MAX_TOTAL_TIME: 600", "# FUZZ_MAX_TOTAL_TIME: 900"):
             with self.subTest(replacement=replacement):
-                self.reject_edit(".github/workflows/fuzz.yml", "FUZZ_MAX_TOTAL_TIME: 600", replacement)
+                self.reject_edit(".github/workflows/fuzz.yml", "FUZZ_MAX_TOTAL_TIME: 900", replacement)
         self.reject_edit(".github/workflows/fuzz-smoke.yml", "FUZZ_MAX_TOTAL_TIME: 30", "FUZZ_MAX_TOTAL_TIME: 1")
 
     def test_both_native_architecture_release_gates_are_required(self):
