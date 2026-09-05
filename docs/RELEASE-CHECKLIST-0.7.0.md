@@ -20,8 +20,8 @@ fail-closed until checked against the exact release commit.
 
 ## Feature and schema contract
 
-- [ ] A fresh database is schema 8 and records migrations 2 through 8.
-- [ ] Every supported schema 1 through 7 migrates transactionally to schema 8;
+- [ ] A fresh database is schema 9 and records migrations 2 through 9.
+- [ ] Every supported schema 1 through 8 migrates transactionally to schema 9;
   the injected 7→8 failure leaves a complete, valid schema-7 database.
 - [ ] Schema validation rejects missing/extra service-token objects, malformed
   hashes, unsupported scope bits, corrupt history/fingerprint state, future
@@ -91,10 +91,10 @@ fail-closed until checked against the exact release commit.
   monitoring reads, redaction, negative route access, restart persistence,
   revocation, and log leak checks.
 - [ ] Every offline native-package gate performs real populated migrations
-  through schema 8 and checks service-token/search state plus history 8; its separate
+  through schema 9 and checks service-token/search state plus history 8 and 9; its separate
   upgrade-safety suite verifies backup and rollback behavior. Every full-system
-  distro VM gate additionally verifies the populated schema-6 backup, rolls it
-  back, and returns cleanly to schema 8.
+  distro VM gate additionally verifies the populated schema-7 backup, rolls it
+  back, and returns cleanly to schema 9.
 - [ ] Upgrade, backup, automatic recovery, explicit rollback, runtime guard,
   package lifecycle, and 50/20/5 CI smoke gates remain green for all nine targets.
 - [ ] The existing Debian 13 amd64 soak VM (8 vCPUs, 16 GiB RAM) supplies at
@@ -107,10 +107,25 @@ fail-closed until checked against the exact release commit.
   QEMU functional coverage.
 - [ ] `Cargo.toml`, `Cargo.lock`, health/monitoring version output, README,
   SECURITY, threat model, packaging, upgrade/restore documentation, SBOMs,
-  changelog, and release metadata all identify 0.7.0/schema 8.
+  changelog, and release metadata all identify 0.7.0/schema 9.
 - [ ] No static realistic service token is committed; test credentials are
   assembled from runtime randomness or non-secret components and the unchanged
   full-history secret scan passes.
 - [ ] Home Assistant code and HACS metadata remain exclusively in the separate
   `alexhaberl/vaultlink-home-assistant` repository and are not part of this
   release artifact.
+
+## Candidate qualification phases
+
+- [ ] Review and commit `release/performance/baseline.lock.json` from the protected
+  baseline producer before freezing the candidate, as described in
+  `release/performance/README.md`. Never hand-author measurement values.
+- [ ] Finish the nine-target/native/fuzz/reproducibility/VM gates and the candidate
+  preflight. Only QUAL-001 (performance) and QUAL-006 (soak) may remain deferred.
+- [ ] Run the protected performance producer for the same commit and exact Debian
+  package binary; verify all five schema-v2 runs and the reviewed baseline lock.
+- [ ] Soak start verifies the immutable performance artifact before activation.
+  Evidence/tag phases additionally verify the full 72-hour soak on that binary.
+- [ ] Archive effective qualification as an Actions artifact. Do not commit
+  candidate measurements or change qualification flags after the soak; that
+  would create a different candidate requiring a new qualification cycle.

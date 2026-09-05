@@ -37,6 +37,7 @@ pub(super) async fn admin_download(
         ))
     })?
     .map_err(|error| match error.kind() {
+        std::io::ErrorKind::WouldBlock => AppError::storage_busy(),
         std::io::ErrorKind::InvalidInput => AppError(StatusCode::BAD_REQUEST, "Not a file"),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
             AppError(StatusCode::NOT_FOUND, "File unavailable")

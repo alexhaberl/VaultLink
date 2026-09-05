@@ -52,7 +52,11 @@ pub(super) async fn raw_preview_response<D: DirectoryAccess, G: Send + 'static>(
             error,
         ))
     })?
-    .map_err(|_| AppError(StatusCode::NOT_FOUND, "File unavailable"))?;
+    .map_err(|error| {
+        AppError::storage_io(error, |_| {
+            AppError(StatusCode::NOT_FOUND, "File unavailable")
+        })
+    })?;
     raw_preview_opened_response(file, method, headers, relative_file, kind, max_size).await
 }
 

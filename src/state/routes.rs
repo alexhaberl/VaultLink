@@ -5,7 +5,7 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, TryAcquireError};
 
 use super::ClientActivityPermit;
 use crate::{
-    auth::{AdminLoginLimiter, LoginLimiter},
+    auth::LoginLimiter,
     config::Config,
     db::Database,
     directory_cache::DirectorySnapshotCache,
@@ -87,7 +87,6 @@ pub(crate) trait DatabaseCapability {}
 pub(crate) trait SecureRootCapability {}
 pub(crate) trait DiskStatsCapability {}
 pub(crate) trait LoginLimiterCapability {}
-pub(crate) trait AdminLoginLimiterCapability {}
 pub(crate) trait SecuritySettingsCapability {}
 pub(crate) trait AdmissionCapability {}
 pub(crate) trait DirectoryCacheCapability {}
@@ -150,7 +149,6 @@ grant!(
     MonitoringRoutes,
 );
 grant!(LoginLimiterCapability => AccountRoutes, AuthRoutes, ServiceTokenRoutes);
-grant!(AdminLoginLimiterCapability => AdminRoutes);
 grant!(SecuritySettingsCapability => AccountRoutes, AdminRoutes, SettingsRoutes);
 grant!(AdmissionCapability => AdmissionRoutes, FileRoutes, PublicRoutes, PublicTransferRoutes);
 grant!(DirectoryCacheCapability => FileRoutes, PublicRoutes);
@@ -183,12 +181,6 @@ impl<Domain: DiskStatsCapability> RouteState<Domain> {
 impl<Domain: LoginLimiterCapability> RouteState<Domain> {
     pub(crate) fn login_limiter(&self) -> &LoginLimiter {
         self.inner.login_limiter()
-    }
-}
-
-impl<Domain: AdminLoginLimiterCapability> RouteState<Domain> {
-    pub(crate) fn admin_login_limiter(&self) -> &AdminLoginLimiter {
-        self.inner.admin_login_limiter()
     }
 }
 

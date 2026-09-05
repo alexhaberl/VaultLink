@@ -6,6 +6,13 @@ upgrade, or migration path from the withdrawn 0.5.0 archive installation. A
 markerless or mismatched installation fails closed before package files or
 runtime state are changed.
 
+The current development binary creates schema 9 and migrates supported schemas
+1 through 8 forward. The 8-to-9 step adds the partial pending-transfer index in
+an atomic `IMMEDIATE` transaction; a failed step leaves a valid schema-8 database.
+An older schema-8 binary cannot open a schema-9 database. Rollback therefore
+restores the matching pre-upgrade binary, configuration, database and keyring
+backup; do not downgrade `PRAGMA user_version` in an operational database.
+
 ## Installation and package identity
 
 The native package owns the release candidate at

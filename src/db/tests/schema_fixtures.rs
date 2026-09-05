@@ -14,7 +14,7 @@ fn rejects_unknown_newer_schema() {
 }
 
 #[test]
-fn fresh_database_is_exactly_schema_eight_without_plaintext_secret_columns() {
+fn fresh_database_is_exactly_schema_nine_without_plaintext_secret_columns() {
     let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
     assert_eq!(
@@ -25,12 +25,12 @@ fn fresh_database_is_exactly_schema_eight_without_plaintext_secret_columns() {
     );
     let migration_records: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3,4,5,6,7,8) AND length(applied_at)>0",
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (2,3,4,5,6,7,8,9) AND length(applied_at)>0",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migration_records, 7);
+    assert_eq!(migration_records, 8);
     let service_token_columns: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('service_tokens')",
@@ -137,7 +137,9 @@ fn fresh_database_is_exactly_schema_eight_without_plaintext_secret_columns() {
 fn downgrade_schema_eight_to_seven(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TRIGGER trg_share_search_insert;
+            "DROP INDEX idx_transfer_grants_pending_id;
+             DELETE FROM vaultlink_schema_migrations WHERE target_version=9;
+             DROP TRIGGER trg_share_search_insert;
              DROP TRIGGER trg_share_search_delete;
              DROP TRIGGER trg_share_search_update;
              DROP TABLE share_search_fts;

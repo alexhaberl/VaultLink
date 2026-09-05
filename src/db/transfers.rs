@@ -67,20 +67,33 @@ fn required_transfer_audit_action(action: &str) -> rusqlite::Result<AuditAction>
     }
 }
 
-fn cleanup_transfer_state(transaction: &Transaction<'_>, now: &str) -> rusqlite::Result<()> {
-    transaction.execute(
-        "DELETE FROM public_transfer_leases WHERE expires_at<=?1",
-        [now],
-    )?;
-    transaction.execute(
-        "DELETE FROM public_transfer_grants
-         WHERE expires_at<=?1
-            OR (counted=0 AND NOT EXISTS(
+const CLEANUP_EXPIRED_LEASES: &str = "DELETE FROM public_transfer_leases WHERE expires_at<=?1";
+const CLEANUP_EXPIRED_GRANTS: &str = "DELETE FROM public_transfer_grants
+         WHERE expires_at<=?1";
+const CLEANUP_ORPHAN_GRANTS: &str = "DELETE FROM public_transfer_grants
+         WHERE counted=0 AND NOT EXISTS(
                 SELECT 1 FROM public_transfer_leases leases
                 WHERE leases.grant_id=public_transfer_grants.id AND leases.expires_at>?1
-            ))",
-        [now],
-    )?;
+            )";
+const CLEANUP_EXPIRED_LEASES_HEARTBEAT: &str = "DELETE FROM public_transfer_leases
+         WHERE expires_at<=?1 AND token_hash<>?2";
+const CLEANUP_EXPIRED_GRANTS_HEARTBEAT: &str = "DELETE FROM public_transfer_grants
+         WHERE id NOT IN(
+                 SELECT grant_id FROM public_transfer_leases WHERE token_hash=?2
+               )
+           AND expires_at<=?1";
+const CLEANUP_ORPHAN_GRANTS_HEARTBEAT: &str = "DELETE FROM public_transfer_grants
+         WHERE counted=0
+           AND id NOT IN(SELECT grant_id FROM public_transfer_leases WHERE token_hash=?2)
+           AND NOT EXISTS(
+               SELECT 1 FROM public_transfer_leases leases
+               WHERE leases.grant_id=public_transfer_grants.id AND leases.expires_at>?1
+           )";
+
+fn cleanup_transfer_state(transaction: &Transaction<'_>, now: &str) -> rusqlite::Result<()> {
+    transaction.execute(CLEANUP_EXPIRED_LEASES, [now])?;
+    transaction.execute(CLEANUP_EXPIRED_GRANTS, [now])?;
+    transaction.execute(CLEANUP_ORPHAN_GRANTS, [now])?;
     Ok(())
 }
 
@@ -90,20 +103,15 @@ fn cleanup_transfer_state_before_heartbeat(
     current_lease_hash: &str,
 ) -> rusqlite::Result<()> {
     transaction.execute(
-        "DELETE FROM public_transfer_leases
-         WHERE expires_at<=?1 AND token_hash<>?2",
+        CLEANUP_EXPIRED_LEASES_HEARTBEAT,
         params![now, current_lease_hash],
     )?;
     transaction.execute(
-        "DELETE FROM public_transfer_grants
-         WHERE id NOT IN(
-                 SELECT grant_id FROM public_transfer_leases WHERE token_hash=?2
-               )
-           AND (expires_at<=?1
-                OR (counted=0 AND NOT EXISTS(
-                    SELECT 1 FROM public_transfer_leases leases
-                    WHERE leases.grant_id=public_transfer_grants.id AND leases.expires_at>?1
-                )))",
+        CLEANUP_EXPIRED_GRANTS_HEARTBEAT,
+        params![now, current_lease_hash],
+    )?;
+    transaction.execute(
+        CLEANUP_ORPHAN_GRANTS_HEARTBEAT,
         params![now, current_lease_hash],
     )?;
     Ok(())
@@ -188,3 +196,7 @@ fn transfer_access_state(
 include!("transfers/reservations.rs");
 include!("transfers/leases.rs");
 include!("transfers/statistics.rs");
+
+#[cfg(test)]
+#[path = "transfers/cleanup_tests.rs"]
+mod cleanup_tests;

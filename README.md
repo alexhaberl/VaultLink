@@ -77,7 +77,15 @@ SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and
 
 `shares.max_upload_size` is the optional per-file limit; `NULL` uses the global runtime limit. Upload shares also have cumulative `max_upload_total_size` and `max_upload_files` limits, with baseline defaults of 100,000,000,000 bytes and 1,000 fail-closed accounted files. Byte and file usage is recorded atomically before visible publication; if publication later fails, quota use deliberately remains so a visible file can never be unaccounted.
 
-Fresh installations create schema 8 and version-2 through version-8 migration records. Valid schema-1 through schema-7 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, and schema 8 adds normalized trigram Share search plus composite audit-pagination indexes. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
+Fresh installations create schema 9 and version-2 through version-9 migration records. Valid schema-1 through schema-8 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, schema 8 adds normalized trigram Share search plus composite audit-pagination indexes, and schema 9 adds an index for pending transfer cleanup. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
+
+Concurrent filesystem renames can temporarily prevent a confined lookup.
+VaultLink retries that lookup at most eight times without weakening path
+confinement. Exhausted contention returns HTTP `503` and `Retry-After: 1`;
+JSON file/transfer endpoints use error code `storage_busy`. Clients may retry
+reads after that delay. An already-started transfer retains its existing
+partial-response and retry semantics.
+
 
 The database defaults to `/var/lib/vaultlink/data.sqlite`; its required matching keyring is `/var/lib/vaultlink/secrets.keyring`. Both must be owned by `vaultlink:vaultlink` with mode `0600`. The database contains encrypted secrets, but the matching keyring can decrypt them, so the pair and every complete backup are production credentials.
 

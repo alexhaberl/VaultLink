@@ -2,13 +2,16 @@
 set -eu
 
 usage() {
-    echo "usage: $0 [--binary PATH] [--release-candidate | --release-tag TAG]" >&2
+    echo "usage: $0 [--binary PATH] [--release-candidate | --release-soak | --release-evidence | --release-tag TAG] [--performance-receipt FILE --packages-run-id ID]" >&2
     exit 64
 }
 
 binary=
 release_candidate=0
 release_tag=
+phase=development
+performance_receipt=
+packages_run_id=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --binary)
@@ -17,13 +20,33 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --release-tag)
+            [ "$phase" = development ] || usage
             [ "$#" -ge 2 ] || usage
             release_tag=$2
+            phase=tag
             shift 2
             ;;
         --release-candidate)
+            [ "$phase" = development ] || usage
             release_candidate=1
+            phase=candidate
             shift
+            ;;
+        --release-soak|--release-evidence)
+            [ "$phase" = development ] || usage
+            release_candidate=1
+            phase=${1#--release-}
+            shift
+            ;;
+        --performance-receipt)
+            [ "$#" -ge 2 ] || usage
+            performance_receipt=$2
+            shift 2
+            ;;
+        --packages-run-id)
+            [ "$#" -ge 2 ] || usage
+            packages_run_id=$2
+            shift 2
             ;;
         *) usage ;;
     esac
@@ -43,10 +66,20 @@ package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p
 }
 release_version=$development_version
 if [ "$release_candidate" -eq 1 ] || [ -n "$release_tag" ]; then
-    python3 tools/check-release-state.py --require-ready >/dev/null
-    python3 tools/check-performance-evidence.py compare \
-        --baseline release/performance/baseline.json \
-        --candidate release/performance/candidate.json >/dev/null
+    candidate_commit=$(git rev-parse HEAD)
+    if [ "$phase" = candidate ]; then
+        python3 tools/check-release-state.py --phase candidate --expected-commit "$candidate_commit" >/dev/null
+    else
+        if [ -z "$binary" ] || [ -z "$performance_receipt" ] || [ -z "$packages_run_id" ]; then
+            echo "final version phases require the extracted binary, packages run, and performance receipt" >&2
+            exit 1
+        fi
+        binary_sha256=$(sha256sum "$binary" | awk '{print $1}')
+        python3 tools/check-release-state.py --phase "$phase" \
+            --expected-commit "$candidate_commit" --expected-binary-sha256 "$binary_sha256" \
+            --expected-packages-run-id "$packages_run_id" --performance-receipt "$performance_receipt" \
+            --output "${RUNNER_TEMP:-/tmp}/effective-qualification.json" >/dev/null
+    fi
     [ "$package_version" = "$release_version" ] || {
         echo "release preflight is fixed to $release_version, not $package_version" >&2
         exit 1

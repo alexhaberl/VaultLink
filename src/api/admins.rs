@@ -85,7 +85,6 @@ pub(super) async fn create_admin(
     let audit_actor = authenticated.username.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
-    let login_limiter = state.admin_login_limiter().clone();
     let created = session_bound(
         required_session_service_database(
             state.db().clone(),
@@ -95,16 +94,10 @@ pub(super) async fn create_admin(
                     &prepared,
                     &password_hash,
                     &audit_context,
-                    |active_admins| login_limiter.publish_active_admins(active_admins),
                 )?;
                 match outcome {
                     crate::db::SessionBound::Authorized(audited) => {
-                        Ok(crate::db::SessionBound::Authorized(audited.map(
-                            |(created, publication)| {
-                                drop(publication);
-                                created
-                            },
-                        )))
+                        Ok(crate::db::SessionBound::Authorized(audited))
                     }
                     crate::db::SessionBound::SessionUnavailable => {
                         Ok(crate::db::SessionBound::SessionUnavailable)
@@ -161,7 +154,6 @@ async fn set_admin_active_api(
     let audit_client_ip = enabled_audit_client_ip(&state);
     let audit_context = AuditContext::new(audit_actor, audit_client_ip);
     let service = AdminService::new(state.db().clone());
-    let login_limiter = state.admin_login_limiter().clone();
     let outcome = session_bound(
         required_session_service_database(
             state.db().clone(),
@@ -171,16 +163,10 @@ async fn set_admin_active_api(
                     id,
                     active,
                     &audit_context,
-                    |active_admins| login_limiter.publish_active_admins(active_admins),
                 )?;
                 match outcome {
                     crate::db::SessionBound::Authorized(audited) => {
-                        Ok(crate::db::SessionBound::Authorized(audited.map(
-                            |(outcome, publication)| {
-                                drop(publication);
-                                outcome
-                            },
-                        )))
+                        Ok(crate::db::SessionBound::Authorized(audited))
                     }
                     crate::db::SessionBound::SessionUnavailable => {
                         Ok(crate::db::SessionBound::SessionUnavailable)

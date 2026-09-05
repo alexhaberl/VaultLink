@@ -71,6 +71,7 @@ struct AuditRowView {
 #[derive(Template)]
 #[template(path = "web/settings/audit.html")]
 struct AuditPageTemplate {
+    pagination_reset: bool,
     sort_value: &'static str,
     direction_value: &'static str,
     filter_value: String,
@@ -539,7 +540,10 @@ pub(super) struct AuditQuery {
 
 #[derive(Deserialize, Serialize)]
 struct AuditCursorToken {
-    value: String,
+    #[serde(default = "legacy_audit_cursor_version")]
+    version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
     id: i64,
     position: String,
     action: String,
@@ -547,15 +551,20 @@ struct AuditCursorToken {
     direction: String,
 }
 
+fn legacy_audit_cursor_version() -> u8 {
+    1
+}
+
 fn encode_audit_cursor(
-    cursor: AuditCursor,
+    cursor: &AuditCursor,
     position: AuditKeysetPosition,
     action: &str,
     sort: AuditSortColumn,
     direction: AuditSortDirection,
 ) -> Option<String> {
     let token = AuditCursorToken {
-        value: cursor.value,
+        version: 2,
+        value: None,
         id: cursor.id,
         position: match position {
             AuditKeysetPosition::After => "after",
@@ -584,7 +593,11 @@ fn decode_audit_cursor(
         .decode(encoded.as_bytes())
         .ok()?;
     let token = serde_json::from_slice::<AuditCursorToken>(&json).ok()?;
-    if token.action != action
+    if !matches!(token.version, 1 | 2)
+        || token.id <= 0
+        || (token.version == 1 && token.value.is_none())
+        || (token.version == 2 && token.value.is_some())
+        || token.action != action
         || token.sort != audit_sort_column_value(sort)
         || token.direction != audit_sort_direction_value(direction)
     {
@@ -611,6 +624,10 @@ struct AuditPagination {
     next_cursor: Option<String>,
 }
 
+#[cfg(test)]
+#[path = "settings_audit_cursor_tests.rs"]
+mod audit_cursor_tests;
+
 fn audit_pagination(
     events: &[AuditEvent],
     page_number: usize,
@@ -626,7 +643,13 @@ fn audit_pagination(
             .first()
             .map(|event| event.cursor(sort))
             .and_then(|cursor| {
-                encode_audit_cursor(cursor, AuditKeysetPosition::Before, action, sort, direction)
+                encode_audit_cursor(
+                    &cursor,
+                    AuditKeysetPosition::Before,
+                    action,
+                    sort,
+                    direction,
+                )
             })
     });
     let next_cursor = next_page.and_then(|_| {
@@ -634,7 +657,7 @@ fn audit_pagination(
             .last()
             .map(|event| event.cursor(sort))
             .and_then(|cursor| {
-                encode_audit_cursor(cursor, AuditKeysetPosition::After, action, sort, direction)
+                encode_audit_cursor(&cursor, AuditKeysetPosition::After, action, sort, direction)
             })
     });
     AuditPagination {
@@ -669,10 +692,20 @@ pub(super) async fn audit_page(
         )
     });
     let action_for_db = action.clone();
-    let (events, total, page_number) = database(state.db().clone(), move |db| {
+    let (events, total, page_number, pagination_reset) = database(state.db().clone(), move |db| {
         let total = db.count_audit(action_for_db.as_deref())?;
         let total_pages = total.div_ceil(100).max(1);
-        let page_number = requested_page.min(total_pages - 1);
+        let mut page_number = requested_page.min(total_pages - 1);
+        let pagination_reset = match cursor.as_ref() {
+            Some((cursor, _)) if cursor.value.is_none() => !db.audit_cursor_exists(cursor.id)?,
+            _ => false,
+        };
+        let cursor = if pagination_reset {
+            page_number = 0;
+            None
+        } else {
+            cursor
+        };
         let (cursor, position) = if let Some((cursor, position)) = cursor {
             (Some(cursor), position)
         } else if page_number > 0 {
@@ -696,7 +729,7 @@ pub(super) async fn audit_page(
             cursor.as_ref(),
             position,
         )?;
-        Ok((events, total, page_number))
+        Ok((events, total, page_number, pagination_reset))
     })
     .await?;
     let total_pages = total.div_ceil(100).max(1);
@@ -737,6 +770,7 @@ pub(super) async fn audit_page(
         percent_encoding::utf8_percent_encode(&filter_value, percent_encoding::NON_ALPHANUMERIC)
             .to_string();
     let body = AuditPageTemplate {
+        pagination_reset,
         sort_value,
         direction_value,
         filter_value,

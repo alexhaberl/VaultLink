@@ -82,6 +82,20 @@ pub(crate) const SESSION_REVOKED_MESSAGE: &str = "Session was revoked before com
 #[derive(Debug)]
 pub struct AppError(StatusCode, &'static str);
 
+impl AppError {
+    fn storage_busy() -> Self {
+        Self(StatusCode::SERVICE_UNAVAILABLE, "Storage temporarily busy")
+    }
+
+    fn storage_io(error: std::io::Error, fallback: impl FnOnce(std::io::Error) -> Self) -> Self {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Self::storage_busy()
+        } else {
+            fallback(error)
+        }
+    }
+}
+
 impl From<crate::internal_reporting::ReportedInternalError> for AppError {
     fn from(_: crate::internal_reporting::ReportedInternalError) -> Self {
         Self(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
@@ -97,6 +111,7 @@ impl From<crate::services::public_transfer::PublicTransferError> for AppError {
                 Self(StatusCode::GONE, "This link is no longer active")
             }
             Error::Changed => Self(StatusCode::GONE, "Share changed in the meantime"),
+            Error::StorageBusy => Self::storage_busy(),
             Error::StorageUnavailable => Self(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Storage state is being recovered",
@@ -163,7 +178,9 @@ impl IntoResponse for AppError {
             return Redirect::to(self.1).into_response();
         }
         let locale = i18n::current_locale();
-        let message = if self.1 == crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE {
+        let message = if self.1 == "Storage temporarily busy" {
+            std::borrow::Cow::Borrowed(i18n::text(locale, i18n::STORAGE_TEMPORARILY_BUSY))
+        } else if self.1 == crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE {
             std::borrow::Cow::Borrowed(i18n::text(locale, i18n::AUDIT_TEMPORARILY_UNAVAILABLE))
         } else if self.1 == crate::http_auth::ARGON2_BUSY_MESSAGE {
             std::borrow::Cow::Borrowed(i18n::text(locale, i18n::PASSWORD_PROCESSING_UNAVAILABLE))
@@ -188,7 +205,9 @@ impl IntoResponse for AppError {
         if self.0 == StatusCode::SERVICE_UNAVAILABLE
             && (matches!(
                 self.1,
-                crate::http_auth::ARGON2_BUSY_MESSAGE | crate::http_auth::DATABASE_BUSY_MESSAGE
+                crate::http_auth::ARGON2_BUSY_MESSAGE
+                    | crate::http_auth::DATABASE_BUSY_MESSAGE
+                    | "Storage temporarily busy"
             ) || self.1.starts_with("Too many concurrent "))
         {
             response

@@ -227,3 +227,11 @@ neither the bridge nor the long-running service ever receives one.
 After the tag is published, archive the evidence outside the host and remove
 the `active` state under an administrator-controlled maintenance procedure.
 Never remove or replace active evidence while the systemd unit is running.
+
+
+The v0.7.0 qualification sequence is candidate preflight, protected performance
+verification, soak start, and final evidence/tag verification. Soak start now
+requires `vaultlink/performance` for the exact extracted package binary. The
+final phases re-download immutable performance and soak artifacts and archive
+an effective qualification record without modifying the candidate commit.
+See `release/performance/README.md` for provisioning and baseline registration.

@@ -284,15 +284,12 @@ if ! python3 tools/check-release-state.py >/dev/null; then
     report "release-state and qualification policy failed"
 fi
 if ! grep -F -x -q 'release_version=$development_version' tools/check-version-consistency.sh \
-    || ! grep -F -q 'tools/check-release-state.py --require-ready' \
-        tools/check-version-consistency.sh \
-    || ! grep -F -q 'tools/check-performance-evidence.py compare' \
-        tools/check-version-consistency.sh \
-    || ! grep -F -q -- '--baseline release/performance/baseline.json' \
-        tools/check-version-consistency.sh \
-    || ! grep -F -q -- '--candidate release/performance/candidate.json' \
-        tools/check-version-consistency.sh; then
-    report "candidate and tag version policy must use release-state and require complete qualification"
+    || ! grep -F -q 'tools/check-release-state.py --phase' tools/check-version-consistency.sh \
+    || ! grep -F -q -- '--expected-binary-sha256' tools/check-version-consistency.sh \
+    || ! grep -F -q 'tools/release-evidence.py performance' .github/workflows/release.yml \
+    || ! grep -F -q 'tools/release-evidence.py performance' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'verify_receipt' tools/check-release-state.py; then
+    report "release phases must verify immutable evidence against the actual source and package binary"
 fi
 if ! grep -F -q 'tools/check-version-consistency.sh --binary target/release/vaultlink' \
         .github/workflows/packages.yml \
@@ -402,6 +399,7 @@ if [ ! -f clippy.toml ] \
     || ! grep -F -q 'python3 tools/check-architecture.py --root .' .github/workflows/ci.yml \
     || ! grep -F -q 'python3 tools/test-release-state.py' .github/workflows/ci.yml \
     || ! grep -F -q 'python3 tools/test-performance-evidence.py' .github/workflows/ci.yml \
+    || ! grep -F -q 'python3 tools/test-release-evidence.py' .github/workflows/ci.yml \
     || ! grep -F -q 'python3 tools/test-refactoring-contracts.py' .github/workflows/ci.yml \
     || ! grep -F -q 'python3 tools/check-refactoring-contracts.py --root .' .github/workflows/ci.yml \
     || ! grep -F -q '$(MAKE) architecture-check performance-evidence-check refactoring-contracts-check' Makefile; then
@@ -2395,12 +2393,12 @@ if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.7.1' "$package_workflow" \
     || ! grep -F -q 'sh tools/real-package-update-smoke.sh' Makefile; then
     report "all native package targets must run the same-commit real package-manager update/recovery gate and upload evidence"
 fi
-fresh_schema_security_test='db::tests::fresh_database_is_exactly_schema_eight_without_plaintext_secret_columns'
+fresh_schema_security_test='db::tests::fresh_database_is_exactly_schema_nine_without_plaintext_secret_columns'
 if ! grep -F -q "fresh_schema_test='$fresh_schema_security_test'" Makefile \
     || ! grep -F -q 'cargo test -- --list >"$$listed_tests"' Makefile \
     || ! grep -F -q 'test "$$match_count" -eq 1' Makefile \
     || ! grep -F -q 'cargo test "$$fresh_schema_test" -- --exact' Makefile; then
-    report "security-test must fail closed unless the exact fresh schema-8 secret-column test exists and runs"
+    report "security-test must fail closed unless the exact fresh schema-9 secret-column test exists and runs"
 fi
 if ! grep -F -q '[ -f /.dockerenv ]' "$real_package_smoke" \
     || ! grep -F -q 'minisign -G -W' "$real_package_smoke" \

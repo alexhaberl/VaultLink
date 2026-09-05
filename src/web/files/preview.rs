@@ -42,7 +42,7 @@ pub(super) async fn admin_preview(
             error,
         ))
     })?
-    .map_err(|_| AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Preview not allowed"))?;
+    .map_err(admin_preview_read_error)?;
     let content = match content {
         PreviewContent::Text(text)
             if escaped_html_len(&text)
@@ -181,4 +181,10 @@ pub(super) async fn admin_preview_raw(
         storage_guard,
     )
     .await
+}
+
+fn admin_preview_read_error(error: std::io::Error) -> AppError {
+    AppError::storage_io(error, |_| {
+        AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Preview not allowed")
+    })
 }

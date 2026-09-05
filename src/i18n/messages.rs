@@ -1,4 +1,6 @@
 catalog! {
+    STORAGE_TEMPORARILY_BUSY, "storage.busy", "Speicher vorübergehend ausgelastet", "Storage temporarily busy";
+    AUDIT_PAGINATION_RESET, "audit.pagination_reset", "Der Ausgangseintrag ist nicht mehr vorhanden. Die erste Seite wird angezeigt.", "The starting audit entry has expired. Showing the first page.";
     BRAND_TAGLINE, "brand.tagline", "Secure file sharing", "Secure file sharing";
     SKIP_TO_CONTENT, "shell.skip_to_content", "Zum Inhalt springen", "Skip to content";
     MAIN_NAVIGATION, "shell.main_navigation", "Hauptnavigation", "Main navigation";

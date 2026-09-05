@@ -342,7 +342,8 @@ pub enum AuditKeysetPosition {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditCursor {
-    pub value: String,
+    /// Legacy cursor value; new cursors resolve the sort value by row ID in SQL.
+    pub value: Option<String>,
     pub id: i64,
 }
 
@@ -771,16 +772,11 @@ pub struct AuditEvent {
 }
 
 impl AuditEvent {
-    pub fn cursor(&self, column: AuditSortColumn) -> AuditCursor {
-        let value = match column {
-            AuditSortColumn::Time => self.occurred_at.clone(),
-            AuditSortColumn::Actor => self.actor.clone(),
-            AuditSortColumn::Action => self.action.clone(),
-            AuditSortColumn::Object => self.object_id.clone().unwrap_or_default(),
-            AuditSortColumn::Detail => self.detail.clone().unwrap_or_default(),
-            AuditSortColumn::ClientIp => self.client_ip.clone().unwrap_or_default(),
-        };
-        AuditCursor { value, id: self.id }
+    pub fn cursor(&self, _column: AuditSortColumn) -> AuditCursor {
+        AuditCursor {
+            value: None,
+            id: self.id,
+        }
     }
 }
 

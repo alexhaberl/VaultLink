@@ -27,7 +27,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
     assert!(body.contains(r#""username":"ops""#));
     assert!(body.contains("otpauth://totp/VaultLink:ops"));
     let ops_id = json_i64_value(&body, "id");
-    assert!(state.admin_login_limiter().has_active_admin("OPS"));
+    assert!(state.db().admin("OPS").unwrap().is_some());
 
     let mut deactivate = json_request(
         Method::POST,
@@ -64,7 +64,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
         app.clone().oneshot(deactivate).await.unwrap().status(),
         StatusCode::OK
     );
-    assert!(!state.admin_login_limiter().has_active_admin("ops"));
+    assert!(state.db().admin("ops").unwrap().is_none());
 
     let mut activate = json_request(
         Method::POST,
@@ -76,7 +76,7 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
         app.clone().oneshot(activate).await.unwrap().status(),
         StatusCode::OK
     );
-    assert!(state.admin_login_limiter().has_active_admin("ops"));
+    assert!(state.db().admin("ops").unwrap().is_some());
 
     let mut reset_password = json_request(
         Method::PUT,
@@ -116,70 +116,8 @@ async fn api_admin_and_settings_flows_are_csrf_protected() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admin_limiter_publication_finishes_before_waiting_logout_returns() {
-    let root = tempfile::tempdir().unwrap();
-    let data = tempfile::tempdir().unwrap();
-    let state = test_state(root.path(), data.path());
-    let secret = auth::new_totp_secret();
-    let hash = auth::hash_password("correct horse battery staple").unwrap();
-    state.db().create_admin("admin", &hash, &secret).unwrap();
-    let (session_cookie, csrf) = api_login(&state, &secret).await;
-
-    let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
-    let (release_sender, release_receiver) = std::sync::mpsc::channel();
-    state
-        .admin_login_limiter()
-        .install_publication_barrier((entered_sender, release_receiver));
-
-    let mut create = json_request(
-        Method::POST,
-        "/api/v2/admins",
-        r#"{"username":"fenced-ops","password":"another correct horse password"}"#,
-    );
-    authorize_mutation(&mut create, &session_cookie, &csrf);
-    let create_app = crate::web::router(state.clone());
-    let create = tokio::spawn(async move { create_app.oneshot(create).await.unwrap() });
-    tokio::task::spawn_blocking(move || {
-        entered_receiver
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("admin creation should reach limiter publication")
-    })
-    .await
-    .unwrap();
-
-    let mut logout = json_request(Method::POST, "/api/v2/session/logout", "{}");
-    authorize_mutation(&mut logout, &session_cookie, &csrf);
-    let logout_state = state.clone();
-    let logout = tokio::spawn(async move {
-        let response = crate::web::router(logout_state.clone())
-            .oneshot(logout)
-            .await
-            .unwrap();
-        let limiter_contains_created_admin = logout_state
-            .admin_login_limiter()
-            .has_active_admin("fenced-ops");
-        (response, limiter_contains_created_admin)
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(
-        !logout.is_finished(),
-        "logout must wait while the admin transaction publishes its limiter snapshot"
-    );
-
-    release_sender.send(()).unwrap();
-    let create_response = create.await.unwrap();
-    assert_eq!(create_response.status(), StatusCode::OK);
-    let (logout_response, limiter_contains_created_admin) = logout.await.unwrap();
-    assert_eq!(logout_response.status(), StatusCode::OK);
-    assert!(limiter_contains_created_admin);
-    assert!(state.db().admin("fenced-ops").unwrap().is_some());
-    assert_eq!(state.db().count_audit(Some("admin_created")).unwrap(), 1);
-    assert_eq!(state.db().count_audit(Some("logout")).unwrap(), 1);
-}
-
 #[tokio::test]
-async fn admin_limiter_publication_rolls_back_when_required_audit_fails() {
+async fn admin_mutation_and_sessions_roll_back_without_resetting_login_history() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let state = test_state(root.path(), data.path());
@@ -190,9 +128,6 @@ async fn admin_limiter_publication_rolls_back_when_required_audit_fails() {
         .db()
         .create_admin("ops", "ops-password-hash", &auth::new_totp_secret())
         .unwrap();
-    state
-        .admin_login_limiter()
-        .replace_active_admins(state.db().active_admin_usernames().unwrap());
     let (session_cookie, csrf) = api_login(&state, &secret).await;
     let ops_id = state
         .db()
@@ -259,16 +194,12 @@ async fn admin_limiter_publication_rolls_back_when_required_audit_fails() {
     assert_eq!(admins_after, admins_before);
     assert!(state.db().session("ops-session").unwrap().is_some());
     let limiter_after = state.admin_login_limiter().snapshot_for_test();
-    assert_eq!(limiter_after.active_admins, limiter_before.active_admins);
-    assert_eq!(limiter_after.known_accounts, limiter_before.known_accounts);
-    assert_eq!(limiter_after.known_origins, limiter_before.known_origins);
-    assert_eq!(
-        limiter_after.unknown_accounts,
-        limiter_before.unknown_accounts
-    );
-    assert_eq!(limiter_after.unknown_ips, limiter_before.unknown_ips);
+    assert_eq!(limiter_after, limiter_before);
     assert_eq!(state.db().count_audit(None).unwrap(), audit_before);
-    assert_eq!(state.db().count_audit(Some("admin_deactivated")).unwrap(), 0);
+    assert_eq!(
+        state.db().count_audit(Some("admin_deactivated")).unwrap(),
+        0
+    );
 }
 
 #[tokio::test]

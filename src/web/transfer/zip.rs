@@ -327,6 +327,9 @@ fn direct_body(
 fn zip_error(error: &ZipBuildError) -> AppError {
     match error {
         ZipBuildError::Limit(_) => AppError(StatusCode::PAYLOAD_TOO_LARGE, "ZIP limit reached"),
+        ZipBuildError::Source(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            AppError::storage_busy()
+        }
         ZipBuildError::Source(_) => AppError(StatusCode::NOT_FOUND, "ZIP source unavailable"),
         ZipBuildError::Output(_) => {
             let _reported = report_internal(InternalOperation::WebZipOutputFailure, error);

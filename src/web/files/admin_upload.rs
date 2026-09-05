@@ -234,6 +234,12 @@ fn create_admin_directory_tree(
     creation: &AdminDirectoryCreation,
     created_snapshot: &mut Option<(Vec<String>, bool)>,
 ) -> AdminDirectoryResult<AdminDirectoryAudit> {
+    RequiredAuditEvent::new(
+        AuditAction::UploadDirectoriesCreated,
+        Some(creation.target.clone()),
+        None,
+    )
+    .validate()?;
     wait_for_admin_directory_test_barrier(&creation.state);
     let tree_outcome = creation
         .state

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RUN_COUNT = 5
 BASELINE_COMMIT = "a390dd9a2210a2e227655a562c541b2b4ebd493c"
 REQUIRED_RUNNER_FIELDS = {"id", "image", "cpu_model", "cpu_set", "memory_bytes", "storage"}
@@ -69,7 +69,41 @@ class EvidenceError(ValueError):
     pass
 
 
+IDENTITY_FIELDS = ("commit", "binary_sha256", "package_target", "packages_run_id",
+                   "candidate_preflight_run_id", "producer_sha256")
+
+
+def _sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        raise EvidenceError(f"{label}: expected lowercase SHA-256")
+    return value
+
+
+def identity(value: dict[str, Any], kind: str = "candidate") -> dict[str, Any]:
+    result = {key: value.get(key) for key in IDENTITY_FIELDS}
+    _commit(result["commit"], "identity")
+    for key in ("binary_sha256", "producer_sha256"):
+        _sha256(result[key], key)
+    if result["package_target"] != "debian13-amd64":
+        raise EvidenceError("performance qualification requires debian13-amd64")
+    for key in ("packages_run_id", "candidate_preflight_run_id"):
+        number = result[key]
+        if kind == "baseline" and key == "candidate_preflight_run_id" and number is None:
+            continue
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            raise EvidenceError(f"{key}: expected a positive workflow run ID")
+    return result
+
+
+def _regular_path(path: Path) -> None:
+    if any(part.is_symlink() for part in (path, *path.parents)):
+        raise EvidenceError(f"{path}: symbolic links are not allowed")
+
+
 def _read_json(path: Path) -> tuple[dict[str, Any], bytes]:
+    _regular_path(path)
+    if not path.is_file() or path.stat().st_size > 1_048_576:
+        raise EvidenceError(f"{path}: expected a regular JSON file of at most 1 MiB")
     raw = path.read_bytes()
     try:
         value = json.loads(raw)
@@ -141,11 +175,16 @@ def aggregate(kind: str, paths: list[Path]) -> dict[str, Any]:
     commit = _commit(parsed[0][0].get("commit"), str(parsed[0][2]))
     if kind == "baseline" and commit != BASELINE_COMMIT:
         raise EvidenceError(f"baseline commit must be {BASELINE_COMMIT}")
+    binding = identity(parsed[0][0], kind)
     runner = _runner(parsed[0][0].get("runner"), str(parsed[0][2]))
     indexes: set[int] = set()
     observations = {name: [] for name in REQUIRED_METRICS}
     sources = []
     for value, raw, path in parsed:
+        if any(value.get(key) != binding["binary_sha256"] for key in ("binary_sha256_before", "binary_sha256_after")):
+            raise EvidenceError("measured binary changed before or after a run")
+        if identity(value, kind) != binding:
+            raise EvidenceError("all five runs must use the same binary, source, producer and workflow identity")
         if _commit(value.get("commit"), str(path)) != commit:
             raise EvidenceError("all five runs must use the same commit")
         if _runner(value.get("runner"), str(path)) != runner:
@@ -173,7 +212,7 @@ def aggregate(kind: str, paths: list[Path]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": kind,
-        "commit": commit,
+        **binding,
         "runner": runner,
         "run_count": RUN_COUNT,
         "sources": sorted(sources, key=lambda source: source["path"]),
@@ -239,9 +278,12 @@ def _aggregate_file(path: Path, expected_kind: str) -> dict[str, Any]:
     return value
 
 
-def compare(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
+def compare(baseline_path: Path, candidate_path: Path, expected: dict[str, Any]) -> dict[str, Any]:
     baseline = _aggregate_file(baseline_path, "baseline")
     candidate = _aggregate_file(candidate_path, "candidate")
+    expected = identity(expected)
+    if identity(candidate) != expected:
+        raise EvidenceError("candidate identity does not match trusted expected release inputs")
     failures: list[str] = []
     if baseline["commit"] != BASELINE_COMMIT:
         failures.append(f"baseline commit is not {BASELINE_COMMIT}")
@@ -284,6 +326,7 @@ def compare(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "baseline_commit": baseline["commit"],
         "candidate_commit": candidate["commit"],
+        "candidate_identity": identity(candidate),
         "runner": candidate["runner"],
         "passed": not failures,
         "failures": failures,
@@ -291,6 +334,7 @@ def compare(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
+    _regular_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -305,6 +349,43 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
+def write_bundle(kind: str, paths: list[Path], output: Path) -> dict[str, Any]:
+    # Validate everything before publishing anything. The aggregate is the commit marker.
+    result = aggregate(kind, paths)
+    payloads = []
+    for path in paths:
+        value, raw = _read_json(path)
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest not in {source["sha256"] for source in result["sources"]}:
+            raise EvidenceError("source changed while preparing bundle")
+        name = f"{kind}-run-{value['run_index']:02d}-{digest}.json"
+        payloads.append((output.parent / name, raw))
+    _regular_path(output)
+    for destination, raw in payloads:
+        _regular_path(destination)
+        if destination.exists() and destination.read_bytes() != raw:
+            raise EvidenceError(f"{destination}: conflicting bundle member")
+        if destination == output:
+            raise EvidenceError("aggregate collides with a source file")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    for destination, raw in payloads:
+        if destination.exists():
+            continue
+        descriptor, temporary = tempfile.mkstemp(prefix=".run-", dir=output.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Exclusive publication cannot overwrite a concurrently created member.
+            os.link(temporary, destination)
+        finally:
+            os.unlink(temporary)
+    result = aggregate(kind, [path for path, _ in payloads])
+    _write_json(output, result)
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -316,13 +397,15 @@ def main() -> int:
     compare_parser.add_argument("--baseline", type=Path, required=True)
     compare_parser.add_argument("--candidate", type=Path, required=True)
     compare_parser.add_argument("--output", type=Path)
+    for field in IDENTITY_FIELDS:
+        compare_parser.add_argument("--expected-" + field.replace("_", "-"), required=True,
+                                    type=int if field.endswith("_run_id") else str)
     args = parser.parse_args()
     try:
         if args.command == "aggregate":
-            result = aggregate(args.kind, args.runs)
-            _write_json(args.output, result)
+            result = write_bundle(args.kind, args.runs, args.output)
         else:
-            result = compare(args.baseline, args.candidate)
+            result = compare(args.baseline, args.candidate, {field: getattr(args, "expected_" + field) for field in IDENTITY_FIELDS})
             if args.output:
                 _write_json(args.output, result)
             else:

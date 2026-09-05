@@ -38,7 +38,7 @@ security-test:
 	cargo test secure_fs
 	cargo test range
 	@set -eu; \
-		fresh_schema_test='db::tests::fresh_database_is_exactly_schema_eight_without_plaintext_secret_columns'; \
+		fresh_schema_test='db::tests::fresh_database_is_exactly_schema_nine_without_plaintext_secret_columns'; \
 		listed_tests=$$(mktemp); \
 		trap 'rm -f "$$listed_tests"' EXIT HUP INT TERM; \
 		cargo test -- --list >"$$listed_tests"; \
@@ -65,6 +65,7 @@ architecture-check:
 
 performance-evidence-check:
 	$(PYTHON) tools/test-performance-evidence.py
+	$(PYTHON) tools/test-release-evidence.py
 
 refactoring-contracts-check:
 	$(PYTHON) tools/test-refactoring-contracts.py

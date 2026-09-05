@@ -1,5 +1,5 @@
 macro_rules! monitoring_share_query {
-    ($predicate:literal) => {
+    ($predicate:literal, $cursor:literal) => {
         concat!(
             "SELECT shares.id,\n",
             "       CASE\n",
@@ -23,34 +23,69 @@ macro_rules! monitoring_share_query {
             "LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id\n",
             "WHERE ",
             $predicate,
-            "\n  AND (?2 IS NULL OR shares.id<?2)\n",
+            "\n  AND ",
+            $cursor,
+            "\n",
             "ORDER BY shares.id DESC\n",
             "LIMIT ?3"
         )
     };
 }
 
-const MONITORING_SHARES_ALL: &str = monitoring_share_query!("1=1");
-const MONITORING_SHARES_INACTIVE: &str = monitoring_share_query!("shares.active=0");
+#[cfg(test)]
+#[path = "monitoring_tests.rs"]
+mod monitoring_tests;
+
+const MONITORING_SHARES_ALL: &str = monitoring_share_query!("1=1", "1=1");
+const MONITORING_SHARES_INACTIVE: &str = monitoring_share_query!("shares.active=0", "1=1");
 const MONITORING_SHARES_EXPIRED: &str = monitoring_share_query!(
-    "shares.active=1 AND shares.expires_at IS NOT NULL AND shares.expires_at<=?1"
+    "shares.active=1 AND shares.expires_at IS NOT NULL AND shares.expires_at<=?1",
+    "1=1"
 );
 const MONITORING_SHARES_DOWNLOAD_LIMIT: &str = monitoring_share_query!(
     "shares.active=1 AND (shares.expires_at IS NULL OR shares.expires_at>?1)\n\
-     AND shares.max_downloads IS NOT NULL AND shares.download_count>=shares.max_downloads"
+     AND shares.max_downloads IS NOT NULL AND shares.download_count>=shares.max_downloads",
+    "1=1"
 );
 const MONITORING_SHARES_AVAILABLE: &str = monitoring_share_query!(
     "shares.active=1 AND (shares.expires_at IS NULL OR shares.expires_at>?1)\n\
-     AND (shares.max_downloads IS NULL OR shares.download_count<shares.max_downloads)"
+     AND (shares.max_downloads IS NULL OR shares.download_count<shares.max_downloads)",
+    "1=1"
+);
+const MONITORING_SHARES_ALL_AFTER: &str = monitoring_share_query!("1=1", "shares.id<?2");
+const MONITORING_SHARES_INACTIVE_AFTER: &str =
+    monitoring_share_query!("shares.active=0", "shares.id<?2");
+const MONITORING_SHARES_EXPIRED_AFTER: &str = monitoring_share_query!(
+    "shares.active=1 AND shares.expires_at IS NOT NULL AND shares.expires_at<=?1",
+    "shares.id<?2"
+);
+const MONITORING_SHARES_DOWNLOAD_LIMIT_AFTER: &str = monitoring_share_query!(
+    "shares.active=1 AND (shares.expires_at IS NULL OR shares.expires_at>?1)\n\
+     AND shares.max_downloads IS NOT NULL AND shares.download_count>=shares.max_downloads",
+    "shares.id<?2"
+);
+const MONITORING_SHARES_AVAILABLE_AFTER: &str = monitoring_share_query!(
+    "shares.active=1 AND (shares.expires_at IS NULL OR shares.expires_at>?1)\n\
+     AND (shares.max_downloads IS NULL OR shares.download_count<shares.max_downloads)",
+    "shares.id<?2"
 );
 
-fn monitoring_share_query_for(status: MonitoringShareListStatus) -> &'static str {
-    match status {
-        MonitoringShareListStatus::All => MONITORING_SHARES_ALL,
-        MonitoringShareListStatus::Available => MONITORING_SHARES_AVAILABLE,
-        MonitoringShareListStatus::Inactive => MONITORING_SHARES_INACTIVE,
-        MonitoringShareListStatus::Expired => MONITORING_SHARES_EXPIRED,
-        MonitoringShareListStatus::DownloadLimitReached => MONITORING_SHARES_DOWNLOAD_LIMIT,
+fn monitoring_share_query_for(status: MonitoringShareListStatus, after: bool) -> &'static str {
+    match (status, after) {
+        (MonitoringShareListStatus::All, false) => MONITORING_SHARES_ALL,
+        (MonitoringShareListStatus::All, true) => MONITORING_SHARES_ALL_AFTER,
+        (MonitoringShareListStatus::Available, false) => MONITORING_SHARES_AVAILABLE,
+        (MonitoringShareListStatus::Available, true) => MONITORING_SHARES_AVAILABLE_AFTER,
+        (MonitoringShareListStatus::Inactive, false) => MONITORING_SHARES_INACTIVE,
+        (MonitoringShareListStatus::Inactive, true) => MONITORING_SHARES_INACTIVE_AFTER,
+        (MonitoringShareListStatus::Expired, false) => MONITORING_SHARES_EXPIRED,
+        (MonitoringShareListStatus::Expired, true) => MONITORING_SHARES_EXPIRED_AFTER,
+        (MonitoringShareListStatus::DownloadLimitReached, false) => {
+            MONITORING_SHARES_DOWNLOAD_LIMIT
+        }
+        (MonitoringShareListStatus::DownloadLimitReached, true) => {
+            MONITORING_SHARES_DOWNLOAD_LIMIT_AFTER
+        }
     }
 }
 
@@ -133,8 +168,10 @@ impl Database {
     ) -> rusqlite::Result<MonitoringSharePage> {
         let limit = options.limit.clamp(1, 200);
         let connection = self.try_conn()?;
-        let mut statement =
-            connection.prepare_cached(monitoring_share_query_for(options.status))?;
+        let mut statement = connection.prepare_cached(monitoring_share_query_for(
+            options.status,
+            options.cursor.is_some(),
+        ))?;
         let mut shares = statement
             .query_map(
                 params![

@@ -112,20 +112,16 @@ impl Database {
         })
     }
 
-    pub(crate) fn create_admin_and_audit_for_session<T>(
+    pub(crate) fn create_admin_and_audit_for_session(
         &self,
         proof: &MfaSessionProof,
         username: &str,
         password_hash: &str,
         totp_secret: &str,
         context: &AuditContext,
-        publish_active_admins: impl FnOnce(Vec<String>) -> T,
-    ) -> rusqlite::Result<SessionBound<Audited<(AdminSummary, T)>>>
-    where
-        T: CommitPublication,
-    {
+    ) -> rusqlite::Result<SessionBound<Audited<AdminSummary>>> {
         let (totp_key_id, totp_ciphertext) = self.encrypt_admin_totp(username, totp_secret)?;
-        self.required_transaction_for_mfa_session_with_commit_audited(proof, context, |transaction| {
+        self.required_transaction_for_mfa_session_audited(proof, context, |transaction| {
             let created_at = Utc::now().to_rfc3339();
             transaction.execute(
                 "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active)
@@ -139,17 +135,15 @@ impl Database {
                 created_at,
                 active: true,
             };
-            let publication =
-                publish_active_admins(active_admin_usernames_on_connection(transaction)?);
             Ok((
-                (admin, publication),
+                admin,
                 vec![RequiredAuditEvent::new(
                     AuditAction::AdminCreated,
                     Some(id.to_string()),
                     None,
                 )],
             ))
-        }, |(_, publication)| publication.accept_commit())
+        })
     }
     pub fn admin(&self, username: &str) -> rusqlite::Result<Option<Admin>> {
         self.try_conn()?
@@ -229,38 +223,22 @@ impl Database {
         })
     }
 
-    pub(crate) fn activate_admin_and_audit_for_session<T>(
+    pub(crate) fn activate_admin_and_audit_for_session(
         &self,
         proof: &MfaSessionProof,
         id: i64,
         context: &AuditContext,
-        publish_active_admins: impl FnOnce(Vec<String>) -> T,
-    ) -> rusqlite::Result<SessionBound<Audited<(bool, T)>>>
-    where
-        T: CommitPublication,
-    {
-        self.required_transaction_for_mfa_session_with_commit_audited(
-            proof,
-            context,
-            |transaction| {
-                let changed =
-                    transaction.execute("UPDATE admins SET active=1 WHERE id=?1", [id])? == 1;
-                let publication =
-                    publish_active_admins(active_admin_usernames_on_connection(transaction)?);
-                let events = changed
-                    .then(|| {
-                        RequiredAuditEvent::new(
-                            AuditAction::AdminActivated,
-                            Some(id.to_string()),
-                            None,
-                        )
-                    })
-                    .into_iter()
-                    .collect();
-                Ok(((changed, publication), events))
-            },
-            |(_, publication)| publication.accept_commit(),
-        )
+    ) -> rusqlite::Result<SessionBound<Audited<bool>>> {
+        self.required_transaction_for_mfa_session_audited(proof, context, |transaction| {
+            let changed = transaction.execute("UPDATE admins SET active=1 WHERE id=?1", [id])? == 1;
+            let events = changed
+                .then(|| {
+                    RequiredAuditEvent::new(AuditAction::AdminActivated, Some(id.to_string()), None)
+                })
+                .into_iter()
+                .collect();
+            Ok((changed, events))
+        })
     }
 
     #[cfg(test)]
@@ -277,66 +255,50 @@ impl Database {
         self.deactivate_admin_internal(id, Some(context))
     }
 
-    pub(crate) fn deactivate_admin_and_audit_for_session<T>(
+    pub(crate) fn deactivate_admin_and_audit_for_session(
         &self,
         proof: &MfaSessionProof,
         id: i64,
         context: &AuditContext,
-        publish_active_admins: impl FnOnce(Vec<String>) -> T,
-    ) -> rusqlite::Result<SessionBound<Audited<(AdminDeactivationOutcome, T)>>>
-    where
-        T: CommitPublication,
-    {
-        self.required_transaction_for_mfa_session_with_commit_audited(
-            proof,
-            context,
-            |transaction| {
-                let active = transaction
-                    .query_row("SELECT active FROM admins WHERE id=?1", [id], |row| {
-                        row.get::<_, i64>(0).map(|active| active != 0)
-                    })
-                    .optional()?;
-                let outcome = match active {
-                    None => AdminDeactivationOutcome::NotFound,
-                    Some(false) => {
-                        revoke_admin_auth_state(transaction, id)?;
-                        AdminDeactivationOutcome::AlreadyInactive
-                    }
-                    Some(true) => {
-                        let changed = transaction.execute(
-                            "UPDATE admins SET active=0
+    ) -> rusqlite::Result<SessionBound<Audited<AdminDeactivationOutcome>>> {
+        self.required_transaction_for_mfa_session_audited(proof, context, |transaction| {
+            let active = transaction
+                .query_row("SELECT active FROM admins WHERE id=?1", [id], |row| {
+                    row.get::<_, i64>(0).map(|active| active != 0)
+                })
+                .optional()?;
+            let outcome = match active {
+                None => AdminDeactivationOutcome::NotFound,
+                Some(false) => {
+                    revoke_admin_auth_state(transaction, id)?;
+                    AdminDeactivationOutcome::AlreadyInactive
+                }
+                Some(true) => {
+                    let changed = transaction.execute(
+                        "UPDATE admins SET active=0
                          WHERE id=?1 AND active=1
                            AND EXISTS(SELECT 1 FROM admins WHERE active=1 AND id<>?1)",
-                            [id],
-                        )? == 1;
-                        if changed {
-                            revoke_admin_auth_state(transaction, id)?;
-                            AdminDeactivationOutcome::Deactivated
-                        } else {
-                            AdminDeactivationOutcome::LastActive
-                        }
+                        [id],
+                    )? == 1;
+                    if changed {
+                        revoke_admin_auth_state(transaction, id)?;
+                        AdminDeactivationOutcome::Deactivated
+                    } else {
+                        AdminDeactivationOutcome::LastActive
                     }
-                };
-                let events = matches!(
-                    outcome,
-                    AdminDeactivationOutcome::Deactivated
-                        | AdminDeactivationOutcome::AlreadyInactive
-                )
-                .then(|| {
-                    RequiredAuditEvent::new(
-                        AuditAction::AdminDeactivated,
-                        Some(id.to_string()),
-                        None,
-                    )
-                })
-                .into_iter()
-                .collect();
-                let publication =
-                    publish_active_admins(active_admin_usernames_on_connection(transaction)?);
-                Ok(((outcome, publication), events))
-            },
-            |(_, publication)| publication.accept_commit(),
-        )
+                }
+            };
+            let events = matches!(
+                outcome,
+                AdminDeactivationOutcome::Deactivated | AdminDeactivationOutcome::AlreadyInactive
+            )
+            .then(|| {
+                RequiredAuditEvent::new(AuditAction::AdminDeactivated, Some(id.to_string()), None)
+            })
+            .into_iter()
+            .collect();
+            Ok((outcome, events))
+        })
     }
 
     #[cfg(test)]

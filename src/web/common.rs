@@ -34,6 +34,33 @@ use crate::{
     webauthn::WebAuthnServiceError,
 };
 
+/// Shared ownership keeps admission charged until all blocking filesystem work ends.
+pub(super) struct ScanAdmission {
+    _peer: crate::http_auth::ClientActivityPermit,
+    _scan: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl ScanAdmission {
+    pub(super) fn new(
+        peer: crate::http_auth::ClientActivityPermit,
+        scan: tokio::sync::OwnedSemaphorePermit,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            _peer: peer,
+            _scan: scan,
+        })
+    }
+    pub(super) fn spawn_blocking<T: Send + 'static>(
+        self: std::sync::Arc<Self>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        tokio::task::spawn_blocking(move || {
+            let _admission = self;
+            work()
+        })
+    }
+}
+
 pub(super) fn webauthn_start_response<T: Serialize>(
     result: std::result::Result<T, WebAuthnServiceError>,
 ) -> Result<Response> {
@@ -287,6 +314,7 @@ pub(super) fn public_preview_error(error: &io::Error) -> AppError {
         return AppError(StatusCode::NOT_FOUND, "File unavailable");
     }
     match error.kind() {
+        io::ErrorKind::WouldBlock => AppError::storage_busy(),
         io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
             AppError(StatusCode::NOT_FOUND, "File unavailable")
         }
@@ -813,3 +841,5 @@ pub(super) fn search_tree<D: DirectoryAccess>(
 }
 
 include!("common/directory_cursor_tests.rs");
+
+include!("common/scan_admission_tests.rs");

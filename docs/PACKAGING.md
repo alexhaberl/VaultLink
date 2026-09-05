@@ -381,3 +381,11 @@ from the exact final DEB and hash-bound to the candidate commit. Every soak
 load profile continues to enforce p95 strictly below two seconds. Arch is
 built and boot-tested against the release-date snapshot; a weekly read-only
 job checks the current rolling image without changing published support claims.
+
+
+The v0.7.0 qualification sequence is candidate preflight, protected performance
+verification, soak start, and final evidence/tag verification. Soak start now
+requires `vaultlink/performance` for the exact extracted package binary. The
+final phases re-download immutable performance and soak artifacts and archive
+an effective qualification record without modifying the candidate commit.
+See `release/performance/README.md` for provisioning and baseline registration.

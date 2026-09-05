@@ -2,6 +2,7 @@
 .gitattributes text eol=lf
 
 *.rs text eol=lf
+*.py text eol=lf
 *.toml text eol=lf
 Cargo.lock text eol=lf
 *.lock text eol=lf
@@ -22,3 +23,5 @@ Caddyfile text eol=lf
 .dockerignore text eol=lf
 .gitleaksignore text eol=lf
 fuzz/corpus/** -text
+
+*.snapshot text eol=lf

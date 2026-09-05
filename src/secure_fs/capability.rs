@@ -347,15 +347,33 @@ pub(super) mod linux {
         if forbid_symlinks {
             resolve |= ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV;
         }
-        rustix_openat2(
-            directory,
-            path.as_ref(),
-            flags | OFlags::CLOEXEC,
-            mode,
-            resolve,
-        )
+        retry_resolution(|| {
+            rustix_openat2(
+                directory,
+                path.as_ref(),
+                flags | OFlags::CLOEXEC,
+                mode,
+                resolve,
+            )
+        })
         .map(File::from)
         .map_err(std_error)
+    }
+
+    // RESOLVE_BENEATH may reject a safe lookup during concurrent renames.
+    // Retry only that syscall; never relax confinement or repeat a mutation.
+    fn retry_resolution<T>(
+        mut open: impl FnMut() -> Result<T, rustix::io::Errno>,
+    ) -> Result<T, rustix::io::Errno> {
+        for attempt in 0..8 {
+            match open() {
+                Err(rustix::io::Errno::AGAIN) if attempt < 7 => {
+                    std::thread::sleep(std::time::Duration::from_millis(1))
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final attempt always returns")
     }
 
     pub fn rename_noreplace(directory: &File, old: &str, new: &str) -> io::Result<()> {
@@ -397,5 +415,43 @@ pub(super) mod linux {
 
     pub fn mkdir(directory: &File, name: impl AsRef<Path>) -> io::Result<()> {
         mkdirat(directory, name.as_ref(), Mode::from_raw_mode(0o700)).map_err(std_error)
+    }
+    #[cfg(test)]
+    mod retry_tests {
+        use super::*;
+        #[test]
+        fn retries_only_again_and_stops_at_eight_attempts() {
+            for failures in 0..=8 {
+                let mut attempts = 0;
+                let result = retry_resolution(|| {
+                    attempts += 1;
+                    if attempts <= failures {
+                        Err(rustix::io::Errno::AGAIN)
+                    } else {
+                        Ok(42)
+                    }
+                });
+                assert_eq!(attempts, (failures + 1).min(8));
+                assert_eq!(
+                    result,
+                    if failures < 8 {
+                        Ok(42)
+                    } else {
+                        Err(rustix::io::Errno::AGAIN)
+                    }
+                );
+            }
+            let mut attempts = 0;
+            let result: Result<(), _> = retry_resolution(|| {
+                attempts += 1;
+                Err(if attempts == 1 {
+                    rustix::io::Errno::AGAIN
+                } else {
+                    rustix::io::Errno::XDEV
+                })
+            });
+            assert_eq!(result, Err(rustix::io::Errno::XDEV));
+            assert_eq!(attempts, 2);
+        }
     }
 }
