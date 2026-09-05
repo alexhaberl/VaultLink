@@ -64,8 +64,49 @@ where
     .await
     .map_err(|_| admission(class, queue_started.elapsed()))?
     .map_err(|_| admission(class, queue_started.elapsed()))?;
-    let queue_duration = queue_started.elapsed();
 
+    execute_admitted_database_operation(database, class, queue_started.elapsed(), permit, operation)
+        .await
+}
+
+/// Runs a synchronous transfer write after serializing writers ahead of the
+/// general database queue. A single timeout covers both admission stages.
+pub(crate) async fn execute_transfer_database_operation<T, E, F>(
+    database: Database,
+    class: &'static str,
+    operation: F,
+) -> Result<T, DatabaseExecutionError<E>>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce(Database) -> Result<T, E> + Send + 'static,
+{
+    let queue_started = std::time::Instant::now();
+    let permit = tokio::time::timeout(
+        DATABASE_EXECUTOR_QUEUE_TIMEOUT,
+        database.acquire_transfer_runtime_permit(),
+    )
+    .await
+    .map_err(|_| admission(class, queue_started.elapsed()))?
+    .map_err(|_| admission(class, queue_started.elapsed()))?;
+
+    execute_admitted_database_operation(database, class, queue_started.elapsed(), permit, operation)
+        .await
+}
+
+async fn execute_admitted_database_operation<T, E, F, P>(
+    database: Database,
+    class: &'static str,
+    queue_duration: Duration,
+    permit: P,
+    operation: F,
+) -> Result<T, DatabaseExecutionError<E>>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce(Database) -> Result<T, E> + Send + 'static,
+    P: Send + 'static,
+{
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let operation_started = std::time::Instant::now();

@@ -25,6 +25,11 @@ struct DatabaseInner {
     // from queueing inside r2d2 when SQLite or all pooled connections are
     // saturated. Tokio's semaphore queue is FIFO/fair.
     runtime_admission: Arc<tokio::sync::Semaphore>,
+    // Runtime transfer writers must serialize before they can consume a
+    // general database permit. Otherwise several blocking workers can occupy
+    // every general permit while all but one wait on the synchronous SQLite
+    // writer guard below, starving unrelated reads despite idle connections.
+    transfer_runtime_admission: Arc<tokio::sync::Semaphore>,
     // The server starts one retention worker per instance. This guard also
     // serializes explicit cleanup calls made through clones of this handle.
     audit_retention_admission: Mutex<()>,
@@ -33,12 +38,39 @@ struct DatabaseInner {
     // starving unrelated metadata reads and readiness checks. Admission must
     // therefore happen before a transfer writer checks out a connection.
     transfer_write_admission: Mutex<()>,
+    // Drop-based lease and upload cleanup must survive immediate runtime
+    // shutdown without creating one waiting blocking worker per dropped owner.
+    // One shared FIFO is drained by at most one blocking worker per database.
+    transfer_cleanup_queue: Mutex<TransferCleanupQueue>,
     keyring: keyring::Keyring,
     session_idle_minutes: AtomicI64,
     // Keep the descriptor behind /proc/self/fd alive for the whole connection
     // so the validated directory capability cannot be rebound through file-
     // descriptor reuse while SQLite uses the supplied path.
     _directory_capability: Option<File>,
+}
+
+/// Runtime admission owned by one transfer writer until its blocking database
+/// operation, including any same-worker compensation, has fully completed.
+pub(crate) struct TransferDatabasePermit {
+    _transfer: tokio::sync::OwnedSemaphorePermit,
+    _runtime: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Default)]
+struct TransferCleanupQueue {
+    worker_active: bool,
+    jobs: std::collections::VecDeque<TransferCleanupJob>,
+}
+
+struct TransferCleanupJob {
+    deadline: std::time::Instant,
+    kind: TransferCleanupKind,
+}
+
+enum TransferCleanupKind {
+    UploadReservation(String),
+    TransferLease(String),
 }
 
 pub type DatabaseResult<T> = std::result::Result<T, DatabaseError>;

@@ -11,7 +11,8 @@ mod shares;
 mod transfers;
 
 pub(crate) use executor::{
-    execute_database_operation, DatabaseExecutionError, DatabaseExecutorAdmission,
+    execute_database_operation, execute_transfer_database_operation, DatabaseExecutionError,
+    DatabaseExecutorAdmission,
 };
 use required_audit::{insert_required_audits, trace_required_audits};
 pub use required_audit::{is_audit_unavailable, AuditContext, Audited, RequiredAuditEvent};

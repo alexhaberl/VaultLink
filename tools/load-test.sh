@@ -535,14 +535,23 @@ metadata_profile() {
                                     if (values != 1 || invalid) exit 1
                                     print value
                                 }
-                            ' "$headers")
+                            ' "$headers") || {
+                                echo "metadata client $client request $((request + 1)): 503 with invalid Retry-After shape" >&2
+                                exit 1
+                            }
                             [ "$retry_after" = "$metadata_capacity_retry_after_seconds" ] \
-                                || exit 1
+                                || {
+                                    echo "metadata client $client request $((request + 1)): 503 with unexpected Retry-After value" >&2
+                                    exit 1
+                                }
                             awk -v value="$duration" \
                                 -v limit="$metadata_capacity_response_limit" 'BEGIN {
                                     exit !(value ~ /^[0-9]+([.][0-9]+)?$/ \
                                         && value + 0 > 0 && value + 0 <= limit)
-                                }' || exit 1
+                                }' || {
+                                    echo "metadata client $client request $((request + 1)): 503 duration ${duration}s exceeds ${metadata_capacity_response_limit}s response limit" >&2
+                                    exit 1
+                                }
                             capacity_retries=$((capacity_retries + 1))
                             printf '%s,%s,%s,%s,%s,%s\n' \
                                 "$identity" "$((request + 1))" "$capacity_retries" \
@@ -550,10 +559,16 @@ metadata_profile() {
                                 >>"$capacity_evidence"
                             [ "$capacity_retries" \
                                 -le "$metadata_capacity_retry_limit_per_client" ] \
-                                || exit 1
+                                || {
+                                    echo "metadata client $client request $((request + 1)): 503 retry budget exhausted" >&2
+                                    exit 1
+                                }
                             sleep "$retry_after"
                             ;;
-                        *) exit 1 ;;
+                        *)
+                            echo "metadata client $client request $((request + 1)): unexpected HTTP $status after ${duration}s" >&2
+                            exit 1
+                            ;;
                     esac
                 done
                 request=$((request + 1))
@@ -745,8 +760,14 @@ upload_profile() {
             printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
                 "$upload" "$identity" "$status" "$outcome" "$upload_hash" \
                 "$verify_status" "$server_hash" "$filename"
-            [ "$verify_status" = 200 ]
-            [ "$server_hash" = "$upload_hash" ]
+            [ "$verify_status" = 200 ] || {
+                echo "upload client $upload: POST succeeded but readback returned HTTP $verify_status" >&2
+                exit 1
+            }
+            [ "$server_hash" = "$upload_hash" ] || {
+                echo "upload client $upload: successful readback has a checksum mismatch" >&2
+                exit 1
+            }
         ) >"$work/upload-$upload.result" &
         upload_pids="$upload_pids $!"
         upload=$((upload + 1))

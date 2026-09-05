@@ -1,3 +1,64 @@
+const TRANSFER_CLEANUP_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct TransferCleanupThreadWake(std::thread::Thread);
+
+impl std::task::Wake for TransferCleanupThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+struct TransferCleanupWorkerLaunchGuard {
+    database: Database,
+    armed: bool,
+}
+
+impl TransferCleanupWorkerLaunchGuard {
+    fn new(database: Database) -> Self {
+        Self {
+            database,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TransferCleanupWorkerLaunchGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut queue = self.database.transfer_cleanup_queue_guard();
+        queue.jobs.clear();
+        queue.worker_active = false;
+    }
+}
+
+impl TransferCleanupKind {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::UploadReservation(_) => "upload_reservation_cancel",
+            Self::TransferLease(_) => "transfer_cancel",
+        }
+    }
+
+    fn run(self, database: &Database) -> rusqlite::Result<()> {
+        match self {
+            Self::UploadReservation(token) => {
+                database.cancel_upload_reservation(&token).map(|_| ())
+            }
+            Self::TransferLease(token) => database.cancel_transfer_lease(&token).map(|_| ()),
+        }
+    }
+}
+
 impl Database {
     pub fn rotate_secrets(path: impl AsRef<Path>) -> DatabaseResult<()> {
         keyring::rotate_database(path.as_ref()).map_err(Into::into)
@@ -125,8 +186,10 @@ impl Database {
         Ok(Self(Arc::new(DatabaseInner {
             pool,
             runtime_admission: Arc::new(tokio::sync::Semaphore::new(pool_capacity as usize)),
+            transfer_runtime_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_retention_admission: Mutex::new(()),
             transfer_write_admission: Mutex::new(()),
+            transfer_cleanup_queue: Mutex::new(TransferCleanupQueue::default()),
             keyring,
             session_idle_minutes: AtomicI64::new(30),
             _directory_capability: directory_capability,
@@ -157,13 +220,136 @@ impl Database {
         self.0.runtime_admission.clone().acquire_owned().await
     }
 
-    /// Synchronous fast path for RAII finalizers that must enqueue their
-    /// blocking cleanup before a short-lived Tokio runtime can shut down.
-    /// Saturated callers retain the normal fair asynchronous fallback.
-    pub(crate) fn try_acquire_runtime_permit(
+    /// Admits one runtime transfer writer before it enters the fair general
+    /// database queue. Callers apply one timeout around this whole acquisition
+    /// so the transfer and database queues share the existing one-second
+    /// overload budget.
+    pub(crate) async fn acquire_transfer_runtime_permit(
         &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
-        self.0.runtime_admission.clone().try_acquire_owned()
+    ) -> Result<TransferDatabasePermit, tokio::sync::AcquireError> {
+        let transfer = self
+            .0
+            .transfer_runtime_admission
+            .clone()
+            .acquire_owned()
+            .await?;
+        let runtime = self.0.runtime_admission.clone().acquire_owned().await?;
+        Ok(TransferDatabasePermit {
+            _transfer: transfer,
+            _runtime: runtime,
+        })
+    }
+
+    pub(crate) fn enqueue_upload_reservation_cleanup(
+        &self,
+        handle: &tokio::runtime::Handle,
+        token: String,
+    ) {
+        self.enqueue_transfer_cleanup(
+            handle,
+            TransferCleanupKind::UploadReservation(token),
+        );
+    }
+
+    pub(crate) fn enqueue_transfer_lease_cleanup(
+        &self,
+        handle: &tokio::runtime::Handle,
+        token: String,
+    ) {
+        self.enqueue_transfer_cleanup(handle, TransferCleanupKind::TransferLease(token));
+    }
+
+    fn enqueue_transfer_cleanup(
+        &self,
+        handle: &tokio::runtime::Handle,
+        kind: TransferCleanupKind,
+    ) {
+        let deadline = std::time::Instant::now() + TRANSFER_CLEANUP_QUEUE_TIMEOUT;
+        let start_worker = {
+            let mut queue = self.transfer_cleanup_queue_guard();
+            queue.jobs.push_back(TransferCleanupJob { deadline, kind });
+            if queue.worker_active {
+                false
+            } else {
+                queue.worker_active = true;
+                true
+            }
+        };
+        if start_worker {
+            let database = self.clone();
+            let launch_guard = TransferCleanupWorkerLaunchGuard::new(self.clone());
+            // Drop cannot await admission, and the runtime may shut down as
+            // soon as Drop returns. Schedule exactly one bounded drain worker
+            // synchronously; it performs no database work and holds no global
+            // permit until the ordered composite admission below succeeds.
+            // If Tokio discards the queued closure during shutdown, its armed
+            // launch guard restores the idle state and drops the unadmitted
+            // jobs instead of leaving future cleanups behind a phantom worker.
+            drop(handle.spawn_blocking(move || {
+                let mut launch_guard = launch_guard;
+                launch_guard.disarm();
+                database.drain_transfer_cleanup_queue();
+            }));
+        }
+    }
+
+    fn drain_transfer_cleanup_queue(&self) {
+        loop {
+            let job = {
+                let mut queue = self.transfer_cleanup_queue_guard();
+                let Some(job) = queue.jobs.pop_front() else {
+                    queue.worker_active = false;
+                    return;
+                };
+                job
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.run_transfer_cleanup_job(job);
+            }))
+            .is_err()
+            {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tracing::error!(
+                        operation = "database.transfer_cleanup.panic",
+                        "transfer database cleanup worker panicked"
+                    );
+                }));
+            }
+        }
+    }
+
+    fn run_transfer_cleanup_job(&self, job: TransferCleanupJob) {
+        let class = job.kind.class();
+        let Some(permit) = blocking_acquire_transfer_runtime_permit(self, job.deadline) else {
+            tracing::trace!(
+                operation = "database.transfer_cleanup",
+                class,
+                "transfer database cleanup admission expired"
+            );
+            return;
+        };
+        let result = job.kind.run(self);
+        drop(permit);
+        if result.is_err() {
+            tracing::warn!(
+                operation = "database.transfer_cleanup",
+                class,
+                "transfer database cleanup failed"
+            );
+        } else {
+            tracing::trace!(
+                operation = "database.transfer_cleanup",
+                class,
+                "transfer database cleanup finished"
+            );
+        }
+    }
+
+    fn transfer_cleanup_queue_guard(&self) -> MutexGuard<'_, TransferCleanupQueue> {
+        self.0
+            .transfer_cleanup_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Releases a session-bound value only through the database-owned
@@ -186,11 +372,39 @@ impl Database {
     }
 
     #[cfg(test)]
+    pub(crate) fn transfer_cleanup_queue_state_for_test(&self) -> (bool, usize) {
+        let queue = self.transfer_cleanup_queue_guard();
+        (queue.worker_active, queue.jobs.len())
+    }
+
+    #[cfg(test)]
     pub(crate) fn required_audit_failure_for_test<T>(
         &self,
         error: rusqlite::Error,
     ) -> rusqlite::Result<Audited<T>> {
         Err(error)
+    }
+}
+
+/// Polls the semaphore-only composite admission future from the single cleanup
+/// worker. A thread-backed waker makes this independent of Tokio's timer and
+/// I/O drivers, which may already be shutting down, without busy-spinning.
+fn blocking_acquire_transfer_runtime_permit(
+    database: &Database,
+    deadline: std::time::Instant,
+) -> Option<TransferDatabasePermit> {
+    let waker = std::task::Waker::from(Arc::new(TransferCleanupThreadWake(
+        std::thread::current(),
+    )));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut acquisition = std::pin::pin!(database.acquire_transfer_runtime_permit());
+    loop {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+        match std::future::Future::poll(acquisition.as_mut(), &mut context) {
+            std::task::Poll::Ready(Ok(permit)) => return Some(permit),
+            std::task::Poll::Ready(Err(_)) => return None,
+            std::task::Poll::Pending => std::thread::park_timeout(remaining),
+        }
     }
 }
 

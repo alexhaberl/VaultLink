@@ -24,7 +24,7 @@ impl UploadQuotaReservation {
     pub(super) async fn cancel(mut self) -> Result<()> {
         let token = self.token.clone();
         let database_handle = self.database.clone();
-        database(database_handle, move |database| {
+        transfer_database(database_handle, move |database| {
             database.cancel_upload_reservation(&token)
         })
         .await?;
@@ -41,9 +41,9 @@ impl Drop for UploadQuotaReservation {
         self.armed = false;
         let token = std::mem::take(&mut self.token);
         let database = self.database.clone();
-        spawn_drop_database_cleanup(database, "upload_reservation_cancel", move |database| {
-            let _ = database.cancel_upload_reservation(&token);
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            database.enqueue_upload_reservation_cleanup(&handle, token);
+        }
     }
 }
 
@@ -54,8 +54,12 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
     expected_upload_policy_epoch: i64,
 ) -> Result<PendingReservationOwnership<UploadReservationBeginOutcome>> {
     let queue_started = std::time::Instant::now();
-    let permit =
-        database_runtime_permit(&database, "upload_reservation_begin", queue_started).await?;
+    let permit = transfer_database_runtime_permit(
+        &database,
+        "upload_reservation_begin",
+        queue_started,
+    )
+    .await?;
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {

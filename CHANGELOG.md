@@ -9,6 +9,7 @@
 - Added bearer-authenticated, read-only monitoring endpoints for an instance summary and strictly redacted Share metadata while keeping every existing Share, file, administration, session, public, and HTML route outside the service-token trust boundary.
 - Added schema 7 with transactional migration and validation, monitoring authentication/rate-limit/redaction coverage, and restore guidance requiring token revocation and reissue after an older manual database restore.
 - Added schema 8 with a transactional, fault-injected 7→8 migration, normalized FTS5-trigram Share search maintained atomically with Share mutations, composite audit indexes, and keyset-based HTML audit pagination while preserving legacy `?page=` and API-v2 responses.
+- Prevented queued upload and download writers from consuming all database runtime slots before reaching SQLite's single-writer lock; writer admission now precedes general database admission, with a shared one-second queue budget and cancellation-safe permit ownership.
 
 ## 0.6.0 — 2026-09-01
 

@@ -46,7 +46,7 @@ impl Stream for TransferBodyStream {
             self.heartbeat_stop.take();
             self.finalize.take();
             if let Some(token) = self.lease_token.take() {
-                spawn_transfer_cancel(self.database.clone(), token);
+                spawn_transfer_cancel(&self.database, token);
             }
             return Poll::Ready(Some(Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -95,7 +95,7 @@ impl Stream for TransferBodyStream {
                     if self.remaining_bytes.is_some_and(|remaining| remaining > 0) {
                         self.heartbeat_stop.take();
                         if let Some(token) = self.lease_token.take() {
-                            spawn_transfer_cancel(self.database.clone(), token);
+                            spawn_transfer_cancel(&self.database, token);
                         }
                         return Poll::Ready(Some(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
@@ -112,7 +112,7 @@ impl Stream for TransferBodyStream {
                 Poll::Ready(Some(Err(error))) => {
                     self.heartbeat_stop.take();
                     if let Some(token) = self.lease_token.take() {
-                        spawn_transfer_cancel(self.database.clone(), token);
+                        spawn_transfer_cancel(&self.database, token);
                     }
                     return Poll::Ready(Some(Err(error)));
                 }
@@ -122,7 +122,7 @@ impl Stream for TransferBodyStream {
                         if chunk_length > remaining {
                             self.heartbeat_stop.take();
                             if let Some(token) = self.lease_token.take() {
-                                spawn_transfer_cancel(self.database.clone(), token);
+                                spawn_transfer_cancel(&self.database, token);
                             }
                             return Poll::Ready(Some(Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -163,7 +163,7 @@ impl Drop for TransferBodyStream {
     fn drop(&mut self) {
         self.heartbeat_stop.take();
         if let Some(token) = self.lease_token.take() {
-            spawn_transfer_cancel(self.database.clone(), token);
+            spawn_transfer_cancel(&self.database, token);
         }
     }
 }

@@ -46,7 +46,7 @@ impl PublicTransferLease {
         self.heartbeat_stop.take();
         let lease_token = self.lease_token.clone();
         let cancellation_database = self.database.clone();
-        if database(cancellation_database, move |database| {
+        if transfer_database(cancellation_database, move |database| {
             database.cancel_transfer_lease(&lease_token).map(|_| ())
         })
         .await
@@ -76,7 +76,7 @@ impl Drop for PublicTransferLease {
         self.heartbeat_stop.take();
         if self.armed {
             self.armed = false;
-            spawn_transfer_cancel(self.database.clone(), std::mem::take(&mut self.lease_token));
+            spawn_transfer_cancel(&self.database, std::mem::take(&mut self.lease_token));
         }
     }
 }
@@ -90,7 +90,8 @@ pub(super) async fn begin_transfer_lease_cancellation_safe(
     action: &'static str,
 ) -> Result<PendingReservationOwnership<TransferLeaseBeginOutcome>> {
     let queue_started = std::time::Instant::now();
-    let permit = database_runtime_permit(&database, "transfer_lease_begin", queue_started).await?;
+    let permit =
+        transfer_database_runtime_permit(&database, "transfer_lease_begin", queue_started).await?;
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
@@ -148,9 +149,10 @@ pub(super) fn transfer_complete_future(
 ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
     Box::pin(async move {
         let queue_started = std::time::Instant::now();
-        let permit = database_runtime_permit(&database, "transfer_complete", queue_started)
-            .await
-            .map_err(|_| io::Error::other("database completion admission unavailable"))?;
+        let permit =
+            transfer_database_runtime_permit(&database, "transfer_complete", queue_started)
+                .await
+                .map_err(|_| io::Error::other("database completion admission unavailable"))?;
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             database.complete_transfer_lease_and_audit(
@@ -187,44 +189,9 @@ pub(super) fn transfer_complete_future(
     })
 }
 
-pub(super) fn spawn_transfer_cancel(database: Database, lease_token: String) {
-    spawn_drop_database_cleanup(database, "transfer_cancel", move |database| {
-        let _ = database.cancel_transfer_lease(&lease_token);
-    });
-}
-
-/// Enqueues a cancellation fallback without creating an unbounded blocking
-/// worker. When capacity is immediately free, scheduling `spawn_blocking`
-/// synchronously is important: dropping a current-thread runtime immediately
-/// after its RAII owners otherwise discards an async wrapper before it ever
-/// polls. Saturation still uses the fair, one-second async admission path.
-fn spawn_drop_database_cleanup<F>(database: Database, class: &'static str, cleanup: F)
-where
-    F: FnOnce(&Database) + Send + 'static,
-{
+pub(super) fn spawn_transfer_cancel(database: &Database, lease_token: String) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    match database.try_acquire_runtime_permit() {
-        Ok(permit) => {
-            drop(handle.spawn_blocking(move || {
-                let _permit = permit;
-                cleanup(&database);
-            }));
-        }
-        Err(_) => {
-            drop(handle.spawn(async move {
-                let queue_started = std::time::Instant::now();
-                let Ok(permit) = database_runtime_permit(&database, class, queue_started).await
-                else {
-                    return;
-                };
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    cleanup(&database);
-                })
-                .await;
-            }));
-        }
-    }
+    database.enqueue_transfer_lease_cleanup(&handle, lease_token);
 }

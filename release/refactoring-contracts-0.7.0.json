@@ -53,7 +53,7 @@
     },
     {
       "path": "src/db/database.rs",
-      "sha256": "88842dc202845a590e69b723275a26ee1a85d896292b05fc4a2c90cc19887b4f",
+      "sha256": "41083f9c935846a49df8982058753bdb10472822961ce1756a5762430a759373",
       "contract": "encrypted-secret AAD and database ownership"
     },
     {
@@ -216,7 +216,7 @@
         "src/web/public_upload/mod.rs",
         "src/web/public_upload/presenter.rs"
       ],
-      "sha256": "03f5f96d137807280ee0b1ca5893c165693366a5b631e4b46b97f00d7668b5ff"
+      "sha256": "fa7b8aeeba534f7fd2791446dfe78aea0db2e166213adf6c4730a7257521f631"
     }
   ]
 }

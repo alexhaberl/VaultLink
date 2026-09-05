@@ -176,6 +176,20 @@ where
     .await
 }
 
+pub(crate) async fn transfer_database<T, F>(database: Database, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Database) -> rusqlite::Result<T> + Send + 'static,
+{
+    run_transfer_database_operation(
+        database,
+        "transfer_write",
+        InternalOperation::HttpAuthDatabaseReadJoin,
+        operation,
+    )
+    .await
+}
+
 async fn run_database_operation<T, F>(
     database: Database,
     class: &'static str,
@@ -187,6 +201,28 @@ where
     F: FnOnce(Database) -> rusqlite::Result<T> + Send + 'static,
 {
     run_typed_database_operation(database, class, join_operation, operation, database_error).await
+}
+
+async fn run_transfer_database_operation<T, F>(
+    database: Database,
+    class: &'static str,
+    join_operation: InternalOperation,
+    operation: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Database) -> rusqlite::Result<T> + Send + 'static,
+{
+    match crate::db::execute_transfer_database_operation(database, class, operation).await {
+        Ok(value) => Ok(value),
+        Err(crate::db::DatabaseExecutionError::Admission(error)) => Err(
+            database_capacity_unavailable(error.class(), error.queue_duration()),
+        ),
+        Err(crate::db::DatabaseExecutionError::Join(error)) => {
+            Err(HttpAuthError::from(report_internal(join_operation, error)))
+        }
+        Err(crate::db::DatabaseExecutionError::Operation(error)) => Err(database_error(error)),
+    }
 }
 
 pub(crate) async fn run_typed_database_operation<T, E, F, M>(
@@ -243,6 +279,23 @@ where
     F: FnOnce(Database) -> rusqlite::Result<crate::db::Audited<T>> + Send + 'static,
 {
     run_database_operation(
+        database,
+        "required_audit",
+        InternalOperation::HttpAuthDatabaseRequiredAuditJoin,
+        crate::db::required_audit_job(operation),
+    )
+    .await
+}
+
+pub(crate) async fn required_audited_transfer_database<T, F>(
+    database: Database,
+    operation: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Database) -> rusqlite::Result<crate::db::Audited<T>> + Send + 'static,
+{
+    run_transfer_database_operation(
         database,
         "required_audit",
         InternalOperation::HttpAuthDatabaseRequiredAuditJoin,
@@ -446,6 +499,20 @@ pub(crate) async fn database_runtime_permit(
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
         database.acquire_runtime_permit(),
+    )
+    .await
+    .map_err(|_| database_capacity_unavailable(class, queue_started.elapsed()))?
+    .map_err(|_| database_capacity_unavailable(class, queue_started.elapsed()))
+}
+
+pub(crate) async fn transfer_database_runtime_permit(
+    database: &Database,
+    class: &'static str,
+    queue_started: std::time::Instant,
+) -> Result<crate::db::TransferDatabasePermit> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        database.acquire_transfer_runtime_permit(),
     )
     .await
     .map_err(|_| database_capacity_unavailable(class, queue_started.elapsed()))?
