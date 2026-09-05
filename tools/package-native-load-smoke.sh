@@ -732,6 +732,9 @@ assert_field "$result" metadata_p95_within_limit true
 assert_field "$result" metadata_p95_enforced true
 assert_field "$result" metadata_clients 100
 assert_field "$result" metadata_requests 2000
+assert_field "$result" metadata_capacity_retry_limit_per_client 3
+assert_field "$result" metadata_capacity_retry_after_seconds 1
+assert_field "$result" metadata_capacity_response_limit_seconds 1.100
 assert_field "$result" range_streams 40
 assert_field "$result" range_share_count 3
 assert_field "$result" range_streams_per_share_max 14
@@ -794,6 +797,38 @@ recomputed_p95=$(awk -F, '{ print $3 }' "$metadata_file" \
     || fail "native metadata p95 differs from the independently recomputed value"
 [ "$(unique_field_value "$profile" metadata_observed_p95_seconds)" = "$p95" ] \
     || fail "native profile/result p95 evidence differs"
+metadata_capacity_retries=$(unique_field_value "$result" metadata_capacity_retries)
+metadata_attempts=$(unique_field_value "$result" metadata_attempts)
+case "$metadata_capacity_retries:$metadata_attempts" in
+    *[!0-9:]*|:*|*::*|*:)
+        fail "native metadata attempt counts are invalid"
+        ;;
+esac
+[ "$metadata_capacity_retries" -le 300 ] \
+    || fail "native metadata capacity retry budget was exceeded"
+[ "$metadata_attempts" -eq $((2000 + metadata_capacity_retries)) ] \
+    || fail "native metadata attempt count is inconsistent"
+assert_field "$profile" metadata_capacity_retries "$metadata_capacity_retries"
+assert_field "$profile" metadata_attempts "$metadata_attempts"
+metadata_retry_file=$evidence/load/metadata-capacity-retries.csv
+if [ ! -f "$metadata_retry_file" ] || [ -L "$metadata_retry_file" ] \
+    || [ "$(wc -l <"$metadata_retry_file")" -ne "$metadata_capacity_retries" ]; then
+    fail "native metadata capacity retry evidence is missing or inconsistent"
+fi
+awk -F, -v expected="$metadata_capacity_retries" '
+    NF != 6 || $1 !~ /^198\.18\.1\.[0-9]+$/ \
+        || $2 !~ /^([1-9]|1[0-9]|20)$/ \
+        || $3 !~ /^[1-3]$/ || $4 != 503 \
+        || $5 !~ /^[0-9]+([.][0-9]+)?$/ || $5 + 0 <= 0 \
+        || $5 + 0 > 1.100 || $6 != 1 { exit 1 }
+    {
+        split($1, octets, ".")
+        if (octets[4] < 1 || octets[4] > 100) exit 1
+        if ($3 != ++retries[$1]) exit 1
+    }
+    END { if (NR != expected) exit 1 }
+' "$metadata_retry_file" \
+    || fail "native metadata capacity retry evidence is invalid"
 max_rss_kib=$(unique_field_value "$result" max_rss_kib)
 case "$max_rss_kib" in *[!0-9]*|'') fail "native RSS evidence is invalid" ;; esac
 [ "$max_rss_kib" -le 262144 ] || fail "native RSS exceeded 256 MiB"

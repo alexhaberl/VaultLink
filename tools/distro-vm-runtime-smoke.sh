@@ -431,6 +431,41 @@ done
 [ "$(evidence_value "$evidence/load/result.env" range_streams_per_share_max)" = 14 ]
 [ "$(evidence_value "$evidence/load/result.env" upload_share_count)" = 5 ]
 [ "$(evidence_value "$evidence/load/result.env" uploads_per_share)" = 2 ]
+[ "$(evidence_value "$evidence/load/result.env" \
+    metadata_capacity_retry_limit_per_client)" = 3 ]
+[ "$(evidence_value "$evidence/load/result.env" \
+    metadata_capacity_retry_after_seconds)" = 1 ]
+[ "$(evidence_value "$evidence/load/result.env" \
+    metadata_capacity_response_limit_seconds)" = 1.100 ]
+metadata_capacity_retries=$(evidence_value \
+    "$evidence/load/result.env" metadata_capacity_retries)
+metadata_attempts=$(evidence_value "$evidence/load/result.env" metadata_attempts)
+case "$metadata_capacity_retries:$metadata_attempts" in
+    *[!0-9:]*|:*|*::*|*:) exit 1 ;;
+esac
+[ "$metadata_capacity_retries" -le 300 ]
+[ "$metadata_attempts" -eq $((2000 + metadata_capacity_retries)) ]
+[ "$(evidence_value "$evidence/load/profile-status.env" \
+    metadata_capacity_retries)" = "$metadata_capacity_retries" ]
+[ "$(evidence_value "$evidence/load/profile-status.env" metadata_attempts)" \
+    = "$metadata_attempts" ]
+metadata_retry_file=$evidence/load/metadata-capacity-retries.csv
+[ -f "$metadata_retry_file" ]
+[ ! -L "$metadata_retry_file" ]
+[ "$(wc -l <"$metadata_retry_file")" -eq "$metadata_capacity_retries" ]
+awk -F, -v expected="$metadata_capacity_retries" '
+    NF != 6 || $1 !~ /^198\.18\.1\.[0-9]+$/ \
+        || $2 !~ /^([1-9]|1[0-9]|20)$/ \
+        || $3 !~ /^[1-3]$/ || $4 != 503 \
+        || $5 !~ /^[0-9]+([.][0-9]+)?$/ || $5 + 0 <= 0 \
+        || $5 + 0 > 1.100 || $6 != 1 { exit 1 }
+    {
+        split($1, octets, ".")
+        if (octets[4] < 1 || octets[4] > 100) exit 1
+        if ($3 != ++retries[$1]) exit 1
+    }
+    END { if (NR != expected) exit 1 }
+' "$metadata_retry_file"
 
 runtime_stage=upgrade-migration-rollback
 database=/var/lib/vaultlink/data.sqlite

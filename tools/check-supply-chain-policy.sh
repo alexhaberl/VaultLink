@@ -1688,6 +1688,7 @@ if ! grep -F -q 'runtime_status=$?' "$vm_runtime_smoke" \
     || ! grep -F -q 'persist_load_evidence "$load_exit_status"' "$load_test" \
     || ! grep -F -q 'rm -f "$work/upload.bin" "$work"/range-*.bin' "$load_test" \
     || ! grep -F -q 'metadata-load.partial.csv' "$load_test" \
+    || ! grep -F -q 'metadata-capacity-retries.partial.csv' "$load_test" \
     || ! grep -F -q 'range-results.partial.csv' "$load_test" \
     || ! grep -F -q 'upload-results.partial.csv' "$load_test" \
     || ! grep -F -q 'cat "$work"/metadata-*.csv >"$work/metadata.csv"' "$load_test" \
@@ -1719,6 +1720,32 @@ metadata_failure_line=$(grep -n -F '[ "$metadata_failed" -eq 0 ] || return 1' "$
 if [ -z "$metadata_aggregate_line" ] || [ -z "$metadata_failure_line" ] \
     || [ "$metadata_aggregate_line" -ge "$metadata_failure_line" ]; then
     report "metadata load failures must aggregate completed client results before returning"
+fi
+if ! grep -F -q 'metadata_capacity_retry_limit_per_client=3' "$load_test" \
+    || ! grep -F -q 'metadata_capacity_retry_after_seconds=1' "$load_test" \
+    || ! grep -F -q 'metadata_capacity_response_limit=1.100' "$load_test" \
+    || ! grep -F -q -- '--dump-header "$headers"' "$load_test" \
+    || ! grep -F -q '[ "$retry_after" = "$metadata_capacity_retry_after_seconds" ]' \
+        "$load_test" \
+    || ! grep -F -q 'value + 0 <= limit' "$load_test" \
+    || ! grep -F -q 'sleep "$retry_after"' "$load_test" \
+    || ! grep -F -q 'metadata-capacity-retries.csv' "$load_test" \
+    || ! grep -F -q 'metadata_attempts=$metadata_attempts' "$load_test" \
+    || ! grep -F -q 'soak load result does not retain the bounded capacity retry contract' \
+        tools/check-soak-evidence.sh \
+    || ! grep -F -q 'metadata-capacity-retries.csv' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'accepted a capacity response beyond 1.1 seconds' \
+        deploy/docker/soak-evidence-smoke.sh \
+    || ! grep -F -q 'accepted an uncounted unterminated capacity row' \
+        deploy/docker/soak-evidence-smoke.sh \
+    || ! grep -F -q 'rejected a successful profile without capacity retries' \
+        deploy/docker/soak-evidence-smoke.sh \
+    || ! grep -F -q 'metadata_capacity_retry_limit_per_client' "$vm_runtime_smoke" \
+    || ! grep -F -q 'metadata_capacity_retry_limit_per_client=3' "$vm_harness" \
+    || ! grep -F -q 'metadata-capacity-retries.csv' "$vm_harness" \
+    || ! grep -F -q 'retry at most three capacity responses' docs/SOAK-RUNNER.md \
+    || ! grep -F -q '`metadata-capacity-retries.csv`' docs/SOAK-RUNNER.md; then
+    report "metadata load capacity retries must be bounded and prove Retry-After plus the 1.1-second overload SLO"
 fi
 if [ "$(grep -F -x -c 'ssh_deletekeys: true' "$vm_harness" || true)" -ne 1 ] \
     || [ "$(grep -F -x -c 'ssh_keys:' "$vm_harness" || true)" -ne 1 ] \
@@ -2250,6 +2277,9 @@ for native_result_line in \
     'assert_field "$result" metadata_p95_enforced true' \
     'assert_field "$result" metadata_clients 100' \
     'assert_field "$result" metadata_requests 2000' \
+    'assert_field "$result" metadata_capacity_retry_limit_per_client 3' \
+    'assert_field "$result" metadata_capacity_retry_after_seconds 1' \
+    'assert_field "$result" metadata_capacity_response_limit_seconds 1.100' \
     'assert_field "$result" range_streams 40' \
     'assert_field "$result" range_share_count 3' \
     'assert_field "$result" range_streams_per_share_max 14' \
@@ -2292,6 +2322,13 @@ if ! grep -F -q 'value < 2.000' "$package_native_load_smoke" \
     || ! grep -F -q 'seen["198.18.1." client] != 20' "$package_native_load_smoke" \
     || ! grep -F -q 'NR == 1900 { print; exit }' "$package_native_load_smoke" \
     || ! grep -F -q '[ "$recomputed_p95" = "$p95" ]' "$package_native_load_smoke" \
+    || ! grep -F -q '[ "$metadata_capacity_retries" -le 300 ]' \
+        "$package_native_load_smoke" \
+    || ! grep -F -q 'metadata-capacity-retries.csv' "$package_native_load_smoke" \
+    || ! grep -F -q '$5 + 0 > 1.100 || $6 != 1' "$package_native_load_smoke" \
+    || ! grep -F -q 'if ($3 != ++retries[$1]) exit 1' "$package_native_load_smoke" \
+    || ! grep -F -q 'END { if (NR != expected) exit 1 }' \
+        "$package_native_load_smoke" \
     || ! grep -F -q '[ "$max_rss_kib" -le 262144 ]' "$package_native_load_smoke" \
     || ! grep -F -q '$2 != expected_pid || $3 !~ /^[0-9]+$/' "$package_native_load_smoke" \
     || ! grep -F -q '[ "$recomputed_max_rss" = "$max_rss_kib" ]' "$package_native_load_smoke" \
