@@ -47,6 +47,28 @@ validate_distinct_token_set "upload token set" \
     "$UPLOAD_TOKEN" "$UPLOAD_TOKEN_2" "$UPLOAD_TOKEN_3" \
     "$UPLOAD_TOKEN_4" "$UPLOAD_TOKEN_5"
 
+# Only reviewed profiles are accepted; release/soak callers explicitly pin full.
+load_profile=${LOAD_PROFILE:-full}
+case "$load_profile" in
+    full)
+        metadata_clients=100
+        range_streams=40
+        upload_clients=10
+        ;;
+    ci-smoke)
+        metadata_clients=50
+        range_streams=20
+        upload_clients=5
+        ;;
+    *) echo "LOAD_PROFILE must be full or ci-smoke" >&2; exit 64 ;;
+esac
+metadata_requests=$((metadata_clients * 20))
+metadata_p95_rank=$(((metadata_requests * 95 + 99) / 100))
+range_p95_rank=$(((range_streams * 95 + 99) / 100))
+range_median_lower=$((range_streams / 2))
+range_streams_per_share_max=$(((range_streams + 2) / 3))
+uploads_per_share=$((upload_clients / 5))
+
 p95_limit=2.000
 range_ttfb_p95_limit=2.000
 metadata_capacity_retry_limit_per_client=3
@@ -471,6 +493,9 @@ load_snapshot() {
     printf '%s\n' \
         "epoch=$(date +%s)" \
         "supervision_mode=$supervision_mode" \
+        "load_profile=$load_profile" \
+        "host_cpu_count=$(nproc)" \
+        "host_mem_total_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" \
         "pid=$current_pid" \
         "process_starttime_ticks=$process_starttime" \
         "rss_kib=$rss_kib" \
@@ -499,7 +524,7 @@ wait_for_profile_go() {
 metadata_profile() {
     metadata_pids=""
     client=0
-    while [ "$client" -lt 100 ]; do
+    while [ "$client" -lt "$metadata_clients" ]; do
         (
             identity="198.18.1.$((client + 1))"
             capacity_evidence="$work/capacity-retry-client-$client.csv"
@@ -588,20 +613,21 @@ metadata_profile() {
     cat "$work"/metadata-*.csv >"$work/metadata.csv"
     cat "$work"/capacity-retry-client-*.csv >"$work/metadata-capacity-retries.csv"
     [ "$metadata_failed" -eq 0 ] || return 1
-    [ "$(wc -l <"$work/metadata.csv")" -eq 2000 ] || return 1
-    awk -F, '
+    [ "$(wc -l <"$work/metadata.csv")" -eq "$metadata_requests" ] || return 1
+    awk -F, -v expected_clients="$metadata_clients" '
         $1 !~ /^198\.18\.1\.[0-9]+$/ || $2 !~ /^2[0-9][0-9]$/ \
             || $3 !~ /^[0-9]+([.][0-9]+)?$/ || $3 + 0 <= 0 { exit 1 }
         { if (!seen[$1]++) clients++ }
         END {
-            if (clients != 100) exit 1
-            for (client = 1; client <= 100; client++)
+            if (clients != expected_clients) exit 1
+            for (client = 1; client <= expected_clients; client++)
                 if (seen["198.18.1." client] != 20) exit 1
         }
     ' "$work/metadata.csv" || return 1
     awk -F, -v retry_limit="$metadata_capacity_retry_limit_per_client" \
         -v duration_limit="$metadata_capacity_response_limit" \
-        -v retry_after="$metadata_capacity_retry_after_seconds" '
+        -v retry_after="$metadata_capacity_retry_after_seconds" \
+        -v expected_clients="$metadata_clients" '
         NF != 6 || $1 !~ /^198\.18\.1\.[0-9]+$/ \
             || $2 !~ /^([1-9]|1[0-9]|20)$/ \
             || $3 !~ /^[1-9][0-9]*$/ || $3 > retry_limit || $4 != 503 \
@@ -609,12 +635,12 @@ metadata_profile() {
             || $5 + 0 > duration_limit || $6 != retry_after { exit 1 }
         {
             split($1, octets, ".")
-            if (octets[4] < 1 || octets[4] > 100) exit 1
+            if (octets[4] < 1 || octets[4] > expected_clients) exit 1
             if ($3 != ++retries[$1]) exit 1
         }
     ' "$work/metadata-capacity-retries.csv" || return 1
     p95=$(awk -F, '{ print $3 }' "$work/metadata.csv" \
-        | sort -n | awk 'NR == 1900 { print; exit }')
+        | sort -n | awk -v rank="$metadata_p95_rank" 'NR == rank { print; exit }')
     [ -n "$p95" ] || return 1
     awk -v value="$p95" 'BEGIN {
         exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value + 0 > 0)
@@ -631,7 +657,7 @@ metadata_profile() {
 download_profile() {
     download_pids=""
     download=0
-    while [ "$download" -lt 40 ]; do
+    while [ "$download" -lt "$range_streams" ]; do
         (
             identity="198.18.2.$((download + 1))"
             case $((download % 3)) in
@@ -696,13 +722,13 @@ download_profile() {
     done
     cat "$work"/range-*.result >"$work/ranges.csv"
     [ "$download_failed" -eq 0 ] || return 1
-    [ "$(wc -l <"$work/ranges.csv")" -eq 40 ] || return 1
+    [ "$(wc -l <"$work/ranges.csv")" -eq "$range_streams" ] || return 1
     range_ttfb_p95=$(awk -F, '{ print $7 }' "$work/ranges.csv" \
-        | sort -n | awk 'NR == 38 { print; exit }')
+        | sort -n | awk -v rank="$range_p95_rank" 'NR == rank { print; exit }')
     range_throughput_median=$(awk -F, '{ print $8 }' "$work/ranges.csv" \
-        | sort -n | awk 'NR == 20 { lower = $1 } NR == 21 { print (lower + $1) / 2; exit }')
+        | sort -n | awk -v middle="$range_median_lower" 'NR == middle { lower = $1 } NR == middle + 1 { print (lower + $1) / 2; exit }')
     range_duration_p95=$(awk -F, '{ print $9 }' "$work/ranges.csv" \
-        | sort -n | awk 'NR == 38 { print; exit }')
+        | sort -n | awk -v rank="$range_p95_rank" 'NR == rank { print; exit }')
     [ -n "$range_ttfb_p95" ] && [ -n "$range_throughput_median" ] \
         && [ -n "$range_duration_p95" ] || return 1
     printf '%s\n' "$range_ttfb_p95" >"$work/range-ttfb.p95"
@@ -719,7 +745,7 @@ download_profile() {
 upload_profile() {
     upload_pids=""
     upload=0
-    while [ "$upload" -lt 10 ]; do
+    while [ "$upload" -lt "$upload_clients" ]; do
         (
             identity="198.18.3.$((upload + 1))"
             case $((upload % 5)) in
@@ -780,7 +806,7 @@ upload_profile() {
     done
     cat "$work"/upload-*.result >"$work/uploads.csv"
     [ "$upload_failed" -eq 0 ] || return 1
-    [ "$(wc -l <"$work/uploads.csv")" -eq 10 ] || return 1
+    [ "$(wc -l <"$work/uploads.csv")" -eq "$upload_clients" ] || return 1
 }
 
 rss_profile() {
@@ -811,8 +837,7 @@ rss_profile() {
     done
 }
 
-# All three pressure profiles overlap: 100 metadata clients, 40 validated
-# range streams, and ten uploads are active in the same load window.
+# Both profiles overlap metadata, validated ranges, and uploads in one window.
 load_stage=parallel-profiles
 load_marker="$work/load-active"
 : >"$load_marker"
@@ -877,7 +902,7 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     observed_range_duration_p95=unavailable
     if [ -s "$work/metadata.csv" ]; then
         observed_p95=$(awk -F, '{ print $3 }' "$work/metadata.csv" \
-            | sort -n | awk 'NR == 1900 { print; exit }')
+            | sort -n | awk -v rank="$metadata_p95_rank" 'NR == rank { print; exit }')
         [ -n "$observed_p95" ] || observed_p95=unavailable
     fi
     if [ -s "$work/metadata.p95-within-limit" ]; then
@@ -898,6 +923,7 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     profile_status_tmp="$LOAD_TEST_EVIDENCE_DIR/.profile-status.env.$$"
     printf '%s\n' \
         "supervision_mode=$supervision_mode" \
+        "load_profile=$load_profile" \
         "metadata_status=$metadata_status" \
         "download_status=$download_status" \
         "upload_status=$upload_status" \
@@ -960,6 +986,7 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         "run_id=$run_id" \
         "namespace=$SOAK_NAMESPACE" \
         "supervision_mode=$supervision_mode" \
+        "load_profile=$load_profile" \
         'identity_mode=trusted_proxy_xff' \
         'concurrency_barrier=passed' \
         "admission_same_identity_status=$same_status" \
@@ -975,22 +1002,22 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         "range_ttfb_p95_enforced=$p95_enforced" \
         "range_throughput_median_bytes_per_second=$range_throughput_median" \
         "range_duration_p95_seconds=$range_duration_p95" \
-        'metadata_clients=100' \
-        'metadata_requests=2000' \
+        "metadata_clients=$metadata_clients" \
+        "metadata_requests=$metadata_requests" \
         "metadata_attempts=$metadata_attempts" \
         "metadata_capacity_retries=$metadata_capacity_retries" \
         "metadata_capacity_retry_limit_per_client=$metadata_capacity_retry_limit_per_client" \
         "metadata_capacity_retry_after_seconds=$metadata_capacity_retry_after_seconds" \
         "metadata_capacity_response_limit_seconds=$metadata_capacity_response_limit" \
-        'range_streams=40' \
+        "range_streams=$range_streams" \
         'range_share_count=3' \
-        'range_streams_per_share_max=14' \
+        "range_streams_per_share_max=$range_streams_per_share_max" \
         "range_bytes=$range_bytes" \
         "fixture_bytes=$fixture_bytes" \
         "range_sha256=$expected_range_hash" \
-        'uploads=10' \
+        "uploads=$upload_clients" \
         'upload_share_count=5' \
-        'uploads_per_share=2' \
+        "uploads_per_share=$uploads_per_share" \
         "upload_sha256=$upload_hash" \
         'upload_integrity=server_readback' \
         "max_rss_kib=$max_rss_kib" \

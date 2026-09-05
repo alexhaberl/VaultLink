@@ -317,12 +317,12 @@ authenticated rollback inputs.
 ## Test authority
 
 Local Docker covers the complete x86_64 package matrix. Native GitHub arm64
-results are authoritative for arm64. Fast container gates install packages
-without network access and exercise ownership, modes, no-autostart, setup,
+results are authoritative for arm64 package compatibility. Fast container gates
+install packages without network access and exercise ownership, modes, no-autostart, setup,
 systemd analysis, API smoke, upgrade, migration, backup, rollback,
 reinstallation, and state-preserving removal. For each of the nine targets,
-the same gate runs the unchanged overlapping workload of 100 metadata clients,
-40 range streams, and ten upload/readback clients against the exact installed
+the same gate runs the overlapping `ci-smoke` workload of 50 metadata clients,
+20 range streams, and five upload/readback clients against the exact installed
 package payload. It executes inside the target's digest-pinned distribution
 builder on a native matching-architecture GitHub runner. Before its timing is
 accepted, the job qualifies the public hosted runner for four available vCPUs
@@ -341,13 +341,24 @@ runtime fixture is created. Evidence records both qualifications, container
 and process CPU placement, memory and storage separation, exact workload
 counts, latency, RSS, and integrity results. A runner that cannot prove this
 resource and storage layout fails the gate. The qualified native run is
-authoritative for p95 strictly below two seconds and also fails on invalid
-response statuses, corruption, or exceeding the RSS ceiling. The harness's
+authoritative for the smoke profile only: p95 must be strictly below two
+seconds, and the run also fails on invalid response statuses, corruption, or
+exceeding the RSS ceiling. The harness's
 resource contract is reproducible, but it does not assert deterministic timing
 for arbitrary GitHub standard-runner executions. A failed qualification is not
 automatically retried into a passing result. The managed arm64 GitHub runner
 supplies the same qualified evidence for arm64; private ARM hardware is not
-required.
+required for these smoke results.
+
+Full-load performance qualification is supplied by the dedicated Debian 13
+amd64 soak VM with eight vCPUs and 16 GiB RAM. It runs `LOAD_PROFILE=full`
+(100 metadata clients, 40 ranges, ten uploads) at least twelve times during
+72 hours with strict metadata and range TTFB p95 below two seconds. The
+existing `vaultlink/72h-soak` release gate independently verifies every load
+report, exact commit/package/binary binding, and the VM resource evidence.
+A `ci-smoke` report cannot satisfy it. This is an amd64 performance claim;
+there is no full-load performance qualification for arm64 from the smaller
+hosted smoke profile. See [SOAK-RUNNER.md](SOAK-RUNNER.md).
 
 Full-system gates boot digest-pinned target images on a same-architecture
 GitHub runner. Guests receive packages over an isolated host channel and have

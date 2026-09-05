@@ -60,6 +60,10 @@ pub(super) fn webauthn_start_response<T: Serialize>(
 include!("common/webauthn_response_tests.rs");
 include!("common/model.rs");
 
+#[cfg(feature = "fuzzing")]
+#[path = "common/fuzz.rs"]
+pub(crate) mod fuzz;
+
 fn entry_sort_key(entry: &Entry, column: FileSortColumn) -> DirectoryEntrySortKey {
     let primary = match column {
         FileSortColumn::Name => DirectoryEntrySortPrimary::Name,

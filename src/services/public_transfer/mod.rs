@@ -10,6 +10,10 @@ mod preview;
 mod stream;
 mod zip;
 
+#[cfg(feature = "fuzzing")]
+#[path = "../../fuzzing/zip_preview.rs"]
+pub(crate) mod fuzz;
+
 pub(crate) use lease::{PublicTransferClient, PublicTransferLease};
 pub(crate) use prepare::{
     PreparedFileSelection, PreparedPreview, PreparedPreviewTarget, PreparedZipScope,

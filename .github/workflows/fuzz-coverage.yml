@@ -1,0 +1,97 @@
+name: Fuzz coverage
+
+on:
+  workflow_run:
+    workflows: [Fuzz release gate]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful main Fuzz release gate run with retained corpus artifacts
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: fuzz-coverage-${{ github.event.workflow_run.id || inputs.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: Validate corpus producer
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      run_id: ${{ steps.source.outputs.run_id }}
+    steps:
+      - name: Resolve successful main campaign
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          producer=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" \
+            --jq '[.head_sha,.head_branch,.conclusion,.path,.head_repository.full_name,.event] | @tsv')
+          IFS=$'\t' read -r commit branch conclusion workflow repository event <<<"$producer"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          test "$branch" = main
+          test "$conclusion" = success
+          test "${workflow%%@*}" = .github/workflows/fuzz.yml
+          test "$repository" = "$GITHUB_REPOSITORY"
+          case "$event" in schedule|workflow_dispatch) ;; *) exit 64 ;; esac
+          printf 'commit=%s\nrun_id=%s\n' "$commit" "$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+
+  coverage:
+    name: Corpus coverage (amd64)
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-07-01
+          components: llvm-tools-preview
+      - name: Verify native architecture
+        run: test "$(uname -m)" = x86_64
+      - name: Configure isolated corpus and report directories
+        shell: bash
+        run: |
+          printf 'FUZZ_CORPUS_DIR=%s/vaultlink-coverage-corpus\nFUZZ_COVERAGE_DIR=%s/vaultlink-fuzz-coverage\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Install pinned cargo-fuzz
+        run: cargo install --locked cargo-fuzz --version 0.13.2
+      - name: Restore both corpora from the validated producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ needs.source.outputs.run_id }}
+        run: >-
+          python3 tools/fuzz-corpus.py restore
+          --destination "$FUZZ_CORPUS_DIR"
+          --repository "$GITHUB_REPOSITORY"
+          --run-id "$SOURCE_RUN_ID"
+      - name: Measure per-target production coverage
+        run: sh tools/run-fuzz-coverage.sh
+      - name: Upload source coverage and logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-coverage-amd64-${{ needs.source.outputs.commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/vaultlink-fuzz-coverage/
+          if-no-files-found: error
+          retention-days: 30

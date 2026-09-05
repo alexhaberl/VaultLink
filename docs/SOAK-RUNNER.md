@@ -7,6 +7,20 @@ connect through a dedicated, host-key-pinned SSH key. That key is restricted by
 `start` and `collect` requests. Do not place signing keys, GitHub tokens,
 production credentials, or unrelated workloads on the host.
 
+This host also supplies the authoritative **full-load release gate**. The
+existing `vaultlink/72h-soak` check includes both longevity and at least twelve
+100/40/10 full-load profiles, so no second SSH bridge or long-running Actions
+job is needed. Package CI uses the smaller 50/20/5 `ci-smoke` profile.
+
+The VM is provisioned with **8 vCPUs and 16 GiB RAM**. Start refuses fewer than
+eight available CPUs or less than 15 GiB in Linux `MemTotal` (allowing for
+kernel reservations). The monitor rechecks these resources before each load
+run; every pre-/post-load snapshot records them, and the collector and release
+validator independently enforce the same minimum. Service and generator run
+on the staging VM without the hosted package harness's two-core service pin.
+This qualifies the exact Debian 13 amd64 payload, not full-load performance on
+other distributions or ARM hardware.
+
 ## Host provisioning
 
 Install the exact final Debian 13 amd64 DEB and activate its packaged candidate
@@ -114,8 +128,12 @@ forwarded identity still receives an independent admission slot. The benchmark
 then assigns separate RFC 2544 identities to all 100 metadata clients, 40 range
 streams, and ten upload clients; an untrusted public `X-Forwarded-For` shortcut
 is never used. The dedicated Debian 13 amd64 soak is a strict performance gate:
-every profile requires metadata p95 to remain below 2 seconds while all three
-pressure groups overlap. This is separate from the diagnostic p95 recorded by
+every profile requires metadata and range TTFB p95 to remain below 2 seconds while all three
+pressure groups overlap. The monitor explicitly sets `LOAD_PROFILE=full`;
+`LOAD_PROFILE=ci-smoke` in an inherited environment cannot reduce the workload.
+The release verifier rejects missing, unknown, or `ci-smoke` profile markers
+and independently requires the full counts and raw response evidence.
+This is separate from the diagnostic p95 recorded by
 full-system QEMU gates; QEMU still runs the identical workload and enforces all
 of its functional, security, integrity, and RSS assertions.
 
@@ -154,13 +172,12 @@ commit; changing them afterwards invalidates the evidence.
 ## Start, collection, and release binding
 
 1. Run the complete native, Docker, fuzz, package, upgrade, reproducibility,
-   distro-VM, and per-target load gates for one exact commit. For every target,
-   the authoritative p95 `<2 s` result comes from the exact package payload in
-   its digest-pinned distribution builder on a native matching-architecture
-   GitHub runner after the native job proves its documented 4-vCPU, host-memory,
-   CPU-affinity, and separated client/server-storage contract. The full QEMU
-   run records p95 diagnostically while remaining authoritative for the
-   unchanged workload's functional and security results.
+   and distro-VM candidate gates for one exact commit. All nine native package
+   targets must pass the 50/20/5 smoke profile with strict p95 `<2 s`, status,
+   hash, RSS, and integrity checks. QEMU retains the full 100/40/10 workload
+   with diagnostic timing and hard functional/security assertions. The full
+   strict performance qualification is part of the following VM soak, so the
+   candidate gate does not depend on a soak that has not started yet.
 2. Dispatch `Start 72-hour release soak` from `main` with the exact 40-character
    `origin/main` commit and SHA-256 of the already running amd64 binary. The
    supplied hash is only an explicit confirmation: the workflow downloads the
@@ -188,7 +205,8 @@ commit; changing them afterwards invalidates the evidence.
    from a unit more than 15 minutes past its persisted deadline, become partial
    failure evidence instead of remaining pending.
 5. The tag workflow follows that link, downloads the artifact, revalidates at
-   least 72 hours of metrics and load reports, and compares the complete
+   least 72 hours of metrics and twelve full 100/40/10 load reports (including
+   strict latency, raw counts, hashes, and VM resources), and compares the complete
    evidence hash with the payload extracted from its byte-identical Debian 13
    amd64 DEB. A status from another commit, an expired/missing artifact, or any
    package/payload/live hash mismatch blocks release.

@@ -392,6 +392,7 @@ SOAK_NAMESPACE="package-$target_id" \
 LOAD_RUN_ID=full-system \
 VAULTLINK_CONFIG=/etc/vaultlink/config.toml \
 LOAD_TEST_EVIDENCE_DIR="$evidence/load" \
+LOAD_PROFILE=full \
 LOAD_P95_POLICY=diagnostic \
 LOAD_CONNECT_TIMEOUT_SECONDS="$load_connect_timeout_seconds" \
 LOAD_METADATA_MAX_TIME_SECONDS="$load_metadata_max_time_seconds" \

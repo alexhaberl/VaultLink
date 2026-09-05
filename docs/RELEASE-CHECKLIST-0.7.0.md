@@ -84,6 +84,9 @@ fail-closed until checked against the exact release commit.
 - [ ] `cargo fmt --check`, Clippy, locked unit/integration tests, coverage,
   dependency audits, fuzz compilation/campaigns, secret scan, and policy checks
   pass at the exact candidate commit.
+- [ ] Both native fuzz gates run all thirteen targets for 900 seconds, with validated corpus
+  replays, successful minimization, and retained evidence. Review the separate
+  per-target source coverage report; its percentages are not a release gate.
 - [ ] Route inventory and API smoke include all new routes, token creation,
   monitoring reads, redaction, negative route access, restart persistence,
   revocation, and log leak checks.
@@ -93,7 +96,15 @@ fail-closed until checked against the exact release commit.
   distro VM gate additionally verifies the populated schema-6 backup, rolls it
   back, and returns cleanly to schema 8.
 - [ ] Upgrade, backup, automatic recovery, explicit rollback, runtime guard,
-  package lifecycle, and load/soak gates remain green for all nine targets.
+  package lifecycle, and 50/20/5 CI smoke gates remain green for all nine targets.
+- [ ] The existing Debian 13 amd64 soak VM (8 vCPUs, 16 GiB RAM) supplies at
+  least twelve full 100/40/10 profiles during 72 hours. `vaultlink/72h-soak`
+  must pass on the exact candidate commit. Collector and tag preflight reject
+  smaller profiles, insufficient resources, incomplete/duplicate transfers,
+  corruption, or metadata/range TTFB p95 at or above two seconds. This replaces
+  the full-load performance requirement on hosted package runners described
+  in the historical 0.6.0 checklist; ARM retains native package smoke and full
+  QEMU functional coverage.
 - [ ] `Cargo.toml`, `Cargo.lock`, health/monitoring version output, README,
   SECURITY, threat model, packaging, upgrade/restore documentation, SBOMs,
   changelog, and release metadata all identify 0.7.0/schema 8.

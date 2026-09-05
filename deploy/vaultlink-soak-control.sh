@@ -43,6 +43,12 @@ os_id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')
 os_version_id=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')
 [ "$os_id" = debian ] || fail "soak host must run Debian"
 [ "$os_version_id" = 13 ] || fail "soak host must run Debian 13"
+# Qualify the dedicated 8-vCPU / 16-GiB VM before creating any run state.
+# MemTotal excludes kernel reservations, hence the 15-GiB usable threshold.
+host_cpu_count=$(nproc)
+host_mem_total_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+[ "$host_cpu_count" -ge 8 ] || fail "full load qualification requires at least 8 available vCPUs"
+[ "$host_mem_total_kib" -ge 15728640 ] || fail "full load qualification requires a 16-GiB VM (at least 15 GiB MemTotal)"
 [ -r /etc/vaultlink/soak.env ] || fail "/etc/vaultlink/soak.env is not provisioned"
 [ "$(stat -c '%u' /etc/vaultlink/soak.env)" -eq 0 ] \
     || fail "soak.env must be owned by root"

@@ -169,7 +169,7 @@ while [ "$run" -le 12 ]; do
         >"$load/metadata-capacity-retries.csv"
     stream=0
     while [ "$stream" -lt 40 ]; do
-        printf '%s,198.18.2.%s,206,64,%s,bytes 0-63/128\n' \
+        printf '%s,198.18.2.%s,206,67108864,%s,bytes 0-67108863/53687091200,0.100000,100000000,0.670000\n' \
             "$stream" "$((stream + 1))" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             >>"$load/range-results.csv"
         stream=$((stream + 1))
@@ -192,10 +192,14 @@ while [ "$run" -le 12 ]; do
         'admission_same_identity_status=503' \
         'admission_distinct_identity_status=206' \
         'supervision_mode=systemd' \
+        'load_profile=full' \
         'metadata_p95_policy=strict' \
         'metadata_p95_limit_seconds=2.000' \
         'metadata_p95_within_limit=true' \
         'metadata_p95_enforced=true' \
+        'range_ttfb_p95_limit_seconds=2.000' \
+        'range_ttfb_p95_within_limit=true' \
+        'range_ttfb_p95_enforced=true' \
         'metadata_p95_seconds=0.100000' \
         'metadata_clients=100' \
         'metadata_requests=2000' \
@@ -204,11 +208,12 @@ while [ "$run" -le 12 ]; do
         'metadata_capacity_retry_limit_per_client=3' \
         'metadata_capacity_retry_after_seconds=1' \
         'metadata_capacity_response_limit_seconds=1.100' \
+        'range_ttfb_p95_seconds=0.100000' \
         'range_streams=40' \
         'range_share_count=3' \
         'range_streams_per_share_max=14' \
-        'range_bytes=64' \
-        'fixture_bytes=128' \
+        'range_bytes=67108864' \
+        'fixture_bytes=53687091200' \
         'range_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
         'uploads=10' \
         'upload_share_count=5' \
@@ -225,15 +230,20 @@ while [ "$run" -le 12 ]; do
         'metadata_rows=2000' \
         'metadata_attempts=2001' \
         'metadata_capacity_retries=1' \
+        'range_ttfb_observed_p95_seconds=0.100000' \
         'range_rows=40' \
         'upload_rows=10' \
         'rss_rows=2' \
         'metadata_observed_p95_seconds=0.100000' \
         'supervision_mode=systemd' \
+        'load_profile=full' \
         'metadata_p95_policy=strict' \
         'metadata_p95_limit_seconds=2.000' \
         'metadata_p95_within_limit=true' \
         'metadata_p95_enforced=true' \
+        'range_ttfb_p95_limit_seconds=2.000' \
+        'range_ttfb_p95_within_limit=true' \
+        'range_ttfb_p95_enforced=true' \
         >"$load/profile-status.env"
     printf '%s\n' \
         'stage=complete' \
@@ -254,6 +264,9 @@ while [ "$run" -le 12 ]; do
         "health_sha256=$health_hash" \
         'integrity=ok' \
         'supervision_mode=systemd' \
+        'load_profile=full' \
+        'host_cpu_count=8' \
+        'host_mem_total_kib=15728640' \
         >"$load/pre-load.env"
     printf '%s\n' \
         "epoch=$((load_epoch + 1))" \
@@ -264,6 +277,9 @@ while [ "$run" -le 12 ]; do
         "health_sha256=$health_hash" \
         'integrity=ok' \
         'supervision_mode=systemd' \
+        'load_profile=full' \
+        'host_cpu_count=8' \
+        'host_mem_total_kib=15728640' \
         >"$load/post-load.env"
     run=$((run + 1))
 done
@@ -353,6 +369,61 @@ refresh_evidence_manifest "$direct_evidence"
 if sh tools/check-soak-evidence.sh "$commit" "$direct_evidence" >/dev/null 2>&1; then
     fail "evidence verifier accepted direct-PID supervision for the release soak"
 fi
+
+for corrupt_case in small_ranges duplicate_range duplicate_upload slow_range forged_range_p95; do
+    corrupt_evidence="$work/corrupt-$corrupt_case"
+    cp -R "$destination" "$corrupt_evidence"
+    case "$corrupt_case" in
+        small_ranges)
+            sed -i 's/^range_bytes=67108864$/range_bytes=64/' "$corrupt_evidence/load-1/result.env"
+            ;;
+        duplicate_range|duplicate_upload)
+            if [ "$corrupt_case" = duplicate_range ]; then csv='range-results'; else csv='upload-results'; fi
+            first_row=$(head -n 1 "$corrupt_evidence/load-1/$csv.csv")
+            sed -i "2c\\$first_row" "$corrupt_evidence/load-1/$csv.csv"
+            ;;
+        slow_range)
+            sed -i 's/,0.100000,100000000,/,2.000000,100000000,/' "$corrupt_evidence/load-1/range-results.csv"
+            sed -i 's/^range_ttfb_p95_seconds=.*/range_ttfb_p95_seconds=2.000000/' "$corrupt_evidence/load-1/result.env"
+            sed -i 's/^range_ttfb_observed_p95_seconds=.*/range_ttfb_observed_p95_seconds=2.000000/' "$corrupt_evidence/load-1/profile-status.env"
+            ;;
+        forged_range_p95)
+            sed -i 's/^range_ttfb_p95_seconds=.*/range_ttfb_p95_seconds=0.010000/' "$corrupt_evidence/load-1/result.env"
+            ;;
+    esac
+    refresh_evidence_manifest "$corrupt_evidence"
+    if sh tools/check-soak-evidence.sh "$commit" "$corrupt_evidence" >/dev/null 2>&1; then
+        fail "evidence verifier accepted $corrupt_case"
+    fi
+done
+
+# A hosted CI result must never satisfy the full release load gate, even if
+# its hashes and the remaining full-workload fields are internally consistent.
+for rejected_profile in ci-smoke unknown; do
+    profile_evidence="$work/profile-$rejected_profile"
+    cp -R "$destination" "$profile_evidence"
+    sed -i "s/^load_profile=full$/load_profile=$rejected_profile/" \
+        "$profile_evidence/load-1/result.env" \
+        "$profile_evidence/load-1/profile-status.env"
+    refresh_evidence_manifest "$profile_evidence"
+    if sh tools/check-soak-evidence.sh "$commit" "$profile_evidence" >/dev/null 2>&1; then
+        fail "evidence verifier accepted $rejected_profile as full release load"
+    fi
+done
+for phase in pre post; do
+    for invalid_resource in host_cpu_count=7 host_cpu_count=invalid host_cpu_count=8:0 \
+        host_cpu_count=999999999999999999999999999999 host_mem_total_kib=15728639 host_mem_total_kib=; do
+        resource_evidence="$work/resource-$phase-${invalid_resource%%=*}"
+        mkdir -p "$resource_evidence"
+        cp -R "$destination/." "$resource_evidence/"
+        sed -i "s/^${invalid_resource%%=*}=.*/$invalid_resource/" \
+            "$resource_evidence/load-1/$phase-load.env"
+        refresh_evidence_manifest "$resource_evidence"
+        if sh tools/check-soak-evidence.sh "$commit" "$resource_evidence" >/dev/null 2>&1; then
+            fail "evidence verifier accepted invalid $phase resource $invalid_resource"
+        fi
+    done
+done
 
 warm_boundary_evidence="$work/warm-boundary-evidence"
 cp -R "$destination" "$warm_boundary_evidence"

@@ -68,7 +68,10 @@ fuzz_target!(|input: (String, String, String, bool, u8)| {
     };
     drop(upload);
 
-    if requested_replace {
+    // Private staging names pass safe_filename but publication must reject them.
+    // Keep them in the input space and check the rejection rather than treating
+    // the stricter production destination policy as a crash.
+    if requested_replace && path_security::safe_admin_filename(filename).is_ok() {
         assert!(result.is_ok());
         assert_eq!(std::fs::read(&target_path).unwrap(), [payload_byte]);
     } else {
@@ -76,10 +79,13 @@ fuzz_target!(|input: (String, String, String, bool, u8)| {
         assert_eq!(std::fs::read(&target_path).unwrap(), b"original");
     }
 
-    let remaining_parts = std::fs::read_dir(&target_dir)
+    let staging = root_dir
+        .path()
+        .join(path_security::INTERNAL_STORAGE_DIRECTORY_NAME)
+        .join("uploads");
+    let remaining_parts = std::fs::read_dir(staging)
         .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path() != target_path)
+        .map(|entry| entry.expect("read staging entry"))
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
         .count();
     assert_eq!(remaining_parts, 0);

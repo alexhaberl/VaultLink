@@ -280,6 +280,10 @@ jobs:
             "offline-smoke/$TARGET_ID/offline-smoke.env"
           grep -F -x -q 'upgrade_migration_backup_rollback=ok' \
             "offline-smoke/$TARGET_ID/offline-smoke.env"
+          grep -F -x -q 'load_profile=50_metadata_20_ranges_5_uploads' \
+            "offline-smoke/${{ matrix.id }}/offline-smoke.env"
+          grep -F -x -q 'load_authority=ci_smoke' \
+            "offline-smoke/${{ matrix.id }}/offline-smoke.env"
           grep -F -x -q 'native_package_load=ok' \
             "offline-smoke/$TARGET_ID/offline-smoke.env"
           grep -F -x -q 'metadata_p95_limit_seconds=2.000' \

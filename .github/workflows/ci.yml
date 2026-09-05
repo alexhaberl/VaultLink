@@ -63,6 +63,10 @@ jobs:
           python3 tools/test-performance-evidence.py
           python3 tools/test-refactoring-contracts.py
           python3 tools/check-refactoring-contracts.py --root .
+          python3 tools/test-fuzz-corpus.py
+          python3 tools/test-fuzz-policy.py
+          python3 tools/generate-fuzz-seeds.py --check
+          python3 tools/check-fuzz-policy.py
       - name: Supply-chain policy
         run: sh tools/check-supply-chain-policy.sh
       - name: Parse release Dockerfiles with the pinned frontend

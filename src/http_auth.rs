@@ -47,4 +47,7 @@ include!("http_auth/database.rs");
 include!("http_auth/runtime.rs");
 include!("http_auth/cookies.rs");
 
+#[cfg(feature = "fuzzing")]
+pub(crate) mod fuzz;
+
 include!("http_auth/tests.rs");

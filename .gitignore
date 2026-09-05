@@ -1,5 +1,8 @@
 /target/
 /fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+__pycache__/
 /.tmp/
 /dev/data/
 /dev/mount/

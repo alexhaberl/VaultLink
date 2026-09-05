@@ -11,6 +11,14 @@ pub use crate::policy::{
     UploadFormStateError,
 };
 
+pub use crate::http_auth::fuzz::check_auth_headers;
+pub use crate::secure_fs::fuzz::check_recovery_journal;
+pub use crate::services::public_transfer::fuzz::check_zip_preview;
+
+pub fn check_directory_cursor(input: &[u8]) {
+    crate::web::check_directory_cursor(input);
+}
+
 pub fn is_private_admin_filename(name: &str) -> bool {
     crate::path_security::is_private_admin_filename(name)
 }

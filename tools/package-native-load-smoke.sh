@@ -657,7 +657,7 @@ for secret_value in \
     [ -n "$secret_value" ] || fail "load share creation returned an empty token"
 done
 
-native_stage=authoritative_load
+native_stage=ci_smoke_load
 load_tmp=$load_client_mount/tmp
 install -d -o root -g root -m 0700 "$load_tmp"
 load_status=0
@@ -674,6 +674,7 @@ UPLOAD_TOKEN_5=$upload_token_5 \
 UPLOAD_VERIFY_TOKEN=$verify_token \
 SOAK_NAMESPACE="package-native-$target_id" \
 LOAD_RUN_ID=native-package \
+LOAD_PROFILE=ci-smoke \
 LOAD_P95_POLICY=strict \
 LOAD_CONNECT_TIMEOUT_SECONDS=5 \
 LOAD_METADATA_MAX_TIME_SECONDS=30 \
@@ -695,7 +696,7 @@ TMPDIR="$load_tmp" \
 taskset --cpu-list "$load_client_cpu_set" sh tools/load-test.sh \
     >"$load_log" 2>&1 || load_status=$?
 [ "$load_status" -eq 0 ] \
-    || fail "authoritative 100/40/10 native load profile failed (status $load_status)"
+    || fail "50/20/5 native CI smoke profile failed (status $load_status)"
 rmdir "$load_tmp"
 
 native_stage=evidence_verification
@@ -725,30 +726,32 @@ for evidence_file in "$result" "$profile" "$pre_load" "$post_load" "$load_comman
 done
 assert_field "$load_command" stage complete
 assert_field "$load_command" exit_status 0
+assert_field "$result" load_profile ci-smoke
+assert_field "$profile" load_profile ci-smoke
 assert_field "$result" supervision_mode direct_pid
 assert_field "$result" metadata_p95_policy strict
 assert_field "$result" metadata_p95_limit_seconds 2.000
 assert_field "$result" metadata_p95_within_limit true
 assert_field "$result" metadata_p95_enforced true
-assert_field "$result" metadata_clients 100
-assert_field "$result" metadata_requests 2000
+assert_field "$result" metadata_clients 50
+assert_field "$result" metadata_requests 1000
 assert_field "$result" metadata_capacity_retry_limit_per_client 3
 assert_field "$result" metadata_capacity_retry_after_seconds 1
 assert_field "$result" metadata_capacity_response_limit_seconds 1.100
-assert_field "$result" range_streams 40
+assert_field "$result" range_streams 20
 assert_field "$result" range_share_count 3
-assert_field "$result" range_streams_per_share_max 14
-assert_field "$result" uploads 10
+assert_field "$result" range_streams_per_share_max 7
+assert_field "$result" uploads 5
 assert_field "$result" upload_share_count 5
-assert_field "$result" uploads_per_share 2
+assert_field "$result" uploads_per_share 1
 assert_field "$result" upload_integrity server_readback
 assert_field "$profile" metadata_status 0
 assert_field "$profile" download_status 0
 assert_field "$profile" upload_status 0
 assert_field "$profile" rss_status 0
-assert_field "$profile" metadata_rows 2000
-assert_field "$profile" range_rows 40
-assert_field "$profile" upload_rows 10
+assert_field "$profile" metadata_rows 1000
+assert_field "$profile" range_rows 20
+assert_field "$profile" upload_rows 5
 assert_field "$profile" supervision_mode direct_pid
 assert_field "$profile" metadata_p95_policy strict
 assert_field "$profile" metadata_p95_limit_seconds 2.000
@@ -782,17 +785,17 @@ awk -F, '
         || $3 !~ /^[0-9]+([.][0-9]+)?$/ || $3 + 0 <= 0 { exit 1 }
     {
         split($1, octets, ".")
-        if (octets[4] < 1 || octets[4] > 100) exit 1
+        if (octets[4] < 1 || octets[4] > 50) exit 1
         seen[$1]++
     }
     END {
-        if (NR != 2000) exit 1
-        for (client = 1; client <= 100; client++)
+        if (NR != 1000) exit 1
+        for (client = 1; client <= 50; client++)
             if (seen["198.18.1." client] != 20) exit 1
     }
 ' "$metadata_file" || fail "native metadata evidence is incomplete or invalid"
 recomputed_p95=$(awk -F, '{ print $3 }' "$metadata_file" \
-    | sort -n | awk 'NR == 1900 { print; exit }')
+    | sort -n | awk 'NR == 950 { print; exit }')
 [ "$recomputed_p95" = "$p95" ] \
     || fail "native metadata p95 differs from the independently recomputed value"
 [ "$(unique_field_value "$profile" metadata_observed_p95_seconds)" = "$p95" ] \
@@ -804,9 +807,9 @@ case "$metadata_capacity_retries:$metadata_attempts" in
         fail "native metadata attempt counts are invalid"
         ;;
 esac
-[ "$metadata_capacity_retries" -le 300 ] \
+[ "$metadata_capacity_retries" -le 150 ] \
     || fail "native metadata capacity retry budget was exceeded"
-[ "$metadata_attempts" -eq $((2000 + metadata_capacity_retries)) ] \
+[ "$metadata_attempts" -eq $((1000 + metadata_capacity_retries)) ] \
     || fail "native metadata attempt count is inconsistent"
 assert_field "$profile" metadata_capacity_retries "$metadata_capacity_retries"
 assert_field "$profile" metadata_attempts "$metadata_attempts"
@@ -823,7 +826,7 @@ awk -F, -v expected="$metadata_capacity_retries" '
         || $5 + 0 > 1.100 || $6 != 1 { exit 1 }
     {
         split($1, octets, ".")
-        if (octets[4] < 1 || octets[4] > 100) exit 1
+        if (octets[4] < 1 || octets[4] > 50) exit 1
         if ($3 != ++retries[$1]) exit 1
     }
     END { if (NR != expected) exit 1 }
@@ -855,24 +858,24 @@ assert_field "$result" fixture_bytes 53687091200
 expected_content_range='bytes 0-67108863/53687091200'
 awk -F, -v expected_hash="$range_sha256" \
     -v expected_content_range="$expected_content_range" '
-    NF != 9 || $1 !~ /^[0-9]+$/ || $1 < 0 || $1 >= 40 \
+    NF != 9 || $1 !~ /^[0-9]+$/ || $1 < 0 || $1 >= 20 \
         || $2 != "198.18.2." ($1 + 1) || $3 != 206 || $4 != 67108864 \
         || $5 != expected_hash || $6 != expected_content_range || seen[$1]++ { exit 1 }
     END {
-        if (NR != 40) exit 1
-        for (stream = 0; stream < 40; stream++) if (seen[stream] != 1) exit 1
+        if (NR != 20) exit 1
+        for (stream = 0; stream < 20; stream++) if (seen[stream] != 1) exit 1
     }
 ' "$evidence/load/range-results.csv" \
     || fail "native range evidence is incomplete or corrupt"
 awk -F, -v expected_hash="$upload_sha256" -v target="$target_id" '
-    NF != 8 || $1 !~ /^[0-9]+$/ || $1 < 0 || $1 >= 10 \
+    NF != 8 || $1 !~ /^[0-9]+$/ || $1 < 0 || $1 >= 5 \
         || $2 != "198.18.3." ($1 + 1) || $3 != 303 || $4 != "created" \
         || $5 != expected_hash || $6 != 200 || $7 != expected_hash \
         || $8 != "load-package-native-" target "-native-package-" $1 ".bin" \
         || seen[$1]++ { exit 1 }
     END {
-        if (NR != 10) exit 1
-        for (upload = 0; upload < 10; upload++) if (seen[upload] != 1) exit 1
+        if (NR != 5) exit 1
+        for (upload = 0; upload < 5; upload++) if (seen[upload] != 1) exit 1
     }
 ' "$evidence/load/upload-results.csv" \
     || fail "native upload/readback evidence is incomplete or corrupt"
@@ -915,7 +918,8 @@ printf '%s\n' \
     'metadata_p95_within_limit=true' \
     'metadata_p95_enforced=true' \
     'supervision_mode=direct_pid' \
-    'load_profile=100_metadata_40_ranges_10_uploads' \
+    'load_profile=50_metadata_20_ranges_5_uploads' \
+    'load_authority=ci_smoke' \
     'package_database_parity=ok' \
     'payload_integrity=ok' \
     'readiness=ok' \

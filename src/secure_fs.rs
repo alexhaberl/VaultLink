@@ -9,6 +9,9 @@ mod recovery;
 mod staging;
 mod upload;
 
+#[cfg(feature = "fuzzing")]
+pub(crate) mod fuzz;
+
 use capability::{directory_scan_from_file, linux};
 use identity::entry_exists;
 #[cfg(test)]
