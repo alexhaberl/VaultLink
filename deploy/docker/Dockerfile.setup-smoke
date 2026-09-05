@@ -13,6 +13,7 @@ RUN cargo install --locked cargo-cyclonedx --version 0.5.9 \
 
 WORKDIR /work
 COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile clippy.toml .dockerignore .gitleaksignore ./
+COPY .gitattributes ./
 COPY .cargo ./.cargo
 COPY README.md SECURITY.md CHANGELOG.md THREAT_MODEL.md LICENSE ./
 COPY .github ./.github
@@ -21,7 +22,8 @@ COPY templates ./templates
 COPY assets ./assets
 COPY config ./config
 COPY docs ./docs
-COPY fuzz/Cargo.toml ./fuzz/Cargo.toml
+COPY fuzz/Cargo.toml fuzz/corpus-versions.json ./fuzz/
+COPY fuzz/corpus ./fuzz/corpus
 COPY fuzz/fuzz_targets ./fuzz/fuzz_targets
 COPY deploy ./deploy
 COPY packaging ./packaging

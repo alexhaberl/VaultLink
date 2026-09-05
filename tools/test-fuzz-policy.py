@@ -29,7 +29,7 @@ class FuzzPolicyTests(unittest.TestCase):
             "tools/fuzz-corpus.py", "Makefile", ".gitattributes",
             ".github/workflows/fuzz.yml", ".github/workflows/fuzz-smoke.yml",
             ".github/workflows/fuzz-coverage.yml", ".github/workflows/release.yml",
-            ".github/workflows/soak-start.yml",
+            ".github/workflows/soak-start.yml", "deploy/docker/Dockerfile.setup-smoke",
         ):
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -98,6 +98,23 @@ class FuzzPolicyTests(unittest.TestCase):
         for replacement in ("", "fuzz/corpus/** text", "# fuzz/corpus/** -text"):
             with self.subTest(replacement=replacement):
                 self.reject_edit(".gitattributes", "fuzz/corpus/** -text", replacement)
+
+    def test_setup_smoke_image_requires_schema_seeds_and_attributes(self):
+        dockerfile = "deploy/docker/Dockerfile.setup-smoke"
+        for asset in (".gitattributes", "fuzz/corpus-versions.json"):
+            with self.subTest(asset=asset):
+                self.reject_edit(dockerfile, asset + " ", "")
+        self.reject_edit(dockerfile, "COPY fuzz/corpus ./fuzz/corpus", "# COPY fuzz/corpus ./fuzz/corpus")
+        self.reject_edit(dockerfile, "COPY fuzz/corpus ./fuzz/corpus", "COPY fuzz/corpus ./wrong-place")
+
+    def test_setup_smoke_assets_must_be_copied_before_the_policy_check(self):
+        dockerfile = self.root / "deploy/docker/Dockerfile.setup-smoke"
+        original = dockerfile.read_text(encoding="utf-8")
+        copy = "COPY fuzz/corpus ./fuzz/corpus"
+        self.assertIn(copy, original)
+        dockerfile.write_text(original.replace(copy, "") + "\n" + copy + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "before its policy check"):
+            POLICY.check(self.root)
 
     def test_pr_requires_execution_instead_of_compilation(self):
         for replacement in ("run: cargo +nightly-2026-07-01 fuzz build", "run: true", "# run: make fuzz-parallel"):

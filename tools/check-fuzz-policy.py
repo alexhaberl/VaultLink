@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
+import shlex
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,28 @@ def require(text: str, fragment: str, description: str) -> None:
     active = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     if fragment not in active:
         raise ValueError(description)
+
+
+def check_smoke_docker_assets(text: str) -> None:
+    active = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    instructions = active.replace("\\\n", " ").splitlines()
+    copies = []
+    for instruction in instructions:
+        # These files must already exist when the build invokes the policy
+        # check, not merely be copied somewhere later in the Dockerfile.
+        if "check-supply-chain-policy.sh" in instruction:
+            break
+        tokens = shlex.split(instruction)
+        if tokens and tokens[0].upper() == "COPY":
+            copies.append(tokens)
+    for source, destinations in (
+        (".gitattributes", {".", "/work"}),
+        ("fuzz/Cargo.toml", {"fuzz", "fuzz/Cargo.toml", "/work/fuzz", "/work/fuzz/Cargo.toml"}),
+        ("fuzz/corpus-versions.json", {"fuzz", "fuzz/corpus-versions.json", "/work/fuzz", "/work/fuzz/corpus-versions.json"}),
+        ("fuzz/corpus", {"fuzz/corpus", "/work/fuzz/corpus"}),
+    ):
+        if not any(source in copy[1:-1] and str(PurePosixPath(copy[-1])) in destinations for copy in copies):
+            raise ValueError(f"setup smoke Docker image must COPY {source} into /work before its policy check")
 
 
 def check(root: Path = ROOT) -> None:
@@ -34,6 +57,7 @@ def check(root: Path = ROOT) -> None:
             "Make must discover all Cargo targets through the validated inventory")
     require((root / ".gitattributes").read_text(), "fuzz/corpus/** -text",
             "Git must preserve binary corpus bytes on every host")
+    check_smoke_docker_assets((root / "deploy/docker/Dockerfile.setup-smoke").read_text())
     campaign = (root / ".github/workflows/fuzz.yml").read_text()
     smoke = (root / ".github/workflows/fuzz-smoke.yml").read_text()
     coverage = (root / ".github/workflows/fuzz-coverage.yml").read_text()
