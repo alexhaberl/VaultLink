@@ -84,17 +84,13 @@ impl AdminService {
         validate_password(password, confirmation)
     }
 
-    pub(crate) fn create_for_mfa_session<T>(
+    pub(crate) fn create_for_mfa_session(
         &self,
         authorization: MfaMutationContext,
         prepared: &PreparedAdminCreate,
         password_hash: &str,
         context: &AuditContext,
-        publish_active_admins: impl FnOnce(Vec<String>) -> T,
-    ) -> Result<SessionBound<Audited<(CreatedAdmin, T)>>, AdminServiceError>
-    where
-        T: crate::db::CommitPublication,
-    {
+    ) -> Result<SessionBound<Audited<CreatedAdmin>>, AdminServiceError> {
         let (_, proof) = authorization.into_parts();
         let secret = auth::new_totp_secret_value();
         let response_secret = secret.duplicate_for_one_time_response();
@@ -105,62 +101,45 @@ impl AdminService {
                 password_hash,
                 secret.expose_secret(),
                 context,
-                publish_active_admins,
             )
             .map(|outcome| {
                 outcome.map(|audited| {
-                    audited.map(|(summary, publication)| {
-                        (
-                            CreatedAdmin {
-                                summary,
-                                totp_secret: response_secret,
-                            },
-                            publication,
-                        )
+                    audited.map(|summary| CreatedAdmin {
+                        summary,
+                        totp_secret: response_secret,
                     })
                 })
             })
             .map_err(|error| AdminServiceError::from_database_with_conflict(error, ()))
     }
 
-    pub(crate) fn set_active_for_mfa_session<T>(
+    pub(crate) fn set_active_for_mfa_session(
         &self,
         authorization: MfaMutationContext,
         id: i64,
         active: bool,
         context: &AuditContext,
-        publish_active_admins: impl FnOnce(Vec<String>) -> T,
-    ) -> Result<SessionBound<Audited<(AdminActivationResult, T)>>, AdminServiceError>
-    where
-        T: crate::db::CommitPublication,
-    {
+    ) -> Result<SessionBound<Audited<AdminActivationResult>>, AdminServiceError> {
         let (_, proof) = authorization.into_parts();
         let outcome = if active {
             self.database
-                .activate_admin_and_audit_for_session(&proof, id, context, publish_active_admins)
+                .activate_admin_and_audit_for_session(&proof, id, context)
                 .map(|outcome| {
                     outcome.map(|audited| {
-                        audited.map(|(changed, publication)| {
-                            (
-                                if changed {
-                                    AdminActivationResult::Changed
-                                } else {
-                                    AdminActivationResult::NotFound
-                                },
-                                publication,
-                            )
+                        audited.map(|changed| {
+                            if changed {
+                                AdminActivationResult::Changed
+                            } else {
+                                AdminActivationResult::NotFound
+                            }
                         })
                     })
                 })
         } else {
             self.database
-                .deactivate_admin_and_audit_for_session(&proof, id, context, publish_active_admins)
+                .deactivate_admin_and_audit_for_session(&proof, id, context)
                 .map(|outcome| {
-                    outcome.map(|audited| {
-                        audited.map(|(outcome, publication)| {
-                            (AdminActivationResult::Deactivation(outcome), publication)
-                        })
-                    })
+                    outcome.map(|audited| audited.map(AdminActivationResult::Deactivation))
                 })
         };
         outcome.map_err(AdminServiceError::from_database)

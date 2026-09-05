@@ -164,31 +164,22 @@ pub(super) async fn create_admin_ui(
     let csrf_token = session.csrf_token.clone();
     let audit_context =
         AuditContext::new(session.username.clone(), enabled_audit_client_ip(&state));
-    let login_limiter = state.admin_login_limiter().clone();
     let created = required_session_service_decision(
         state.db().clone(),
         move |_| {
-            let created = match service.create_for_mfa_session(
-                session,
-                &prepared,
-                &hash,
-                &audit_context,
-                |active_admins| login_limiter.publish_active_admins(active_admins),
-            ) {
-                Ok(created) => created,
-                Err(ServiceError::Conflict(())) => {
-                    return Ok(SessionBound::Authorized(
-                        RequiredAuditDecision::Rejected(()),
-                    ));
-                }
-                Err(error) => return Err(error),
-            };
+            let created =
+                match service.create_for_mfa_session(session, &prepared, &hash, &audit_context) {
+                    Ok(created) => created,
+                    Err(ServiceError::Conflict(())) => {
+                        return Ok(SessionBound::Authorized(
+                            RequiredAuditDecision::Rejected(()),
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
             match created {
                 SessionBound::Authorized(audited) => Ok(SessionBound::Authorized(
-                    RequiredAuditDecision::Committed(audited.map(|(created, publication)| {
-                        drop(publication);
-                        created
-                    })),
+                    RequiredAuditDecision::Committed(audited),
                 )),
                 SessionBound::SessionUnavailable => Ok(SessionBound::SessionUnavailable),
             }
@@ -329,24 +320,12 @@ pub(super) async fn deactivate_admin(
     let audit_context =
         AuditContext::new(session.username.clone(), enabled_audit_client_ip(&state));
     let service = AdminService::new(state.db().clone());
-    let login_limiter = state.admin_login_limiter().clone();
     let outcome = required_session_service_database(
         state.db().clone(),
         move |_| {
-            let outcome = service.set_active_for_mfa_session(
-                session,
-                id,
-                false,
-                &audit_context,
-                |active_admins| login_limiter.publish_active_admins(active_admins),
-            )?;
+            let outcome = service.set_active_for_mfa_session(session, id, false, &audit_context)?;
             match outcome {
-                SessionBound::Authorized(audited) => Ok(SessionBound::Authorized(audited.map(
-                    |(outcome, publication)| {
-                        drop(publication);
-                        outcome
-                    },
-                ))),
+                SessionBound::Authorized(audited) => Ok(SessionBound::Authorized(audited)),
                 SessionBound::SessionUnavailable => Ok(SessionBound::SessionUnavailable),
             }
         },
@@ -386,24 +365,12 @@ pub(super) async fn activate_admin(
     let audit_context =
         AuditContext::new(session.username.clone(), enabled_audit_client_ip(&state));
     let service = AdminService::new(state.db().clone());
-    let login_limiter = state.admin_login_limiter().clone();
     let outcome = required_session_service_database(
         state.db().clone(),
         move |_| {
-            let outcome = service.set_active_for_mfa_session(
-                session,
-                id,
-                true,
-                &audit_context,
-                |active_admins| login_limiter.publish_active_admins(active_admins),
-            )?;
+            let outcome = service.set_active_for_mfa_session(session, id, true, &audit_context)?;
             match outcome {
-                SessionBound::Authorized(audited) => Ok(SessionBound::Authorized(audited.map(
-                    |(outcome, publication)| {
-                        drop(publication);
-                        outcome
-                    },
-                ))),
+                SessionBound::Authorized(audited) => Ok(SessionBound::Authorized(audited)),
                 SessionBound::SessionUnavailable => Ok(SessionBound::SessionUnavailable),
             }
         },

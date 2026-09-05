@@ -286,7 +286,7 @@ fn migrate_schema_7_to_8(conn: &mut Connection) -> rusqlite::Result<()> {
 
     // The schema version is the final mutation so every error, including an
     // unavailable FTS5/trigram module, rolls back to a complete schema 7.
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", 8)?;
     validate_schema_8(&tx)?;
     validate_database(&tx)?;
     tx.commit()
@@ -331,4 +331,26 @@ fn backfill_share_search_keys(transaction: &rusqlite::Transaction<'_>) -> rusqli
             .expect("non-empty migration batch has a final row");
     }
     Ok(())
+}
+
+fn migrate_schema_8_to_9(conn: &mut Connection) -> rusqlite::Result<()> {
+    validate_schema_8(conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(PENDING_TRANSFER_INDEX_SQL)?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(9,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+        [SCHEMA_9_FINGERPRINT],
+    )?;
+    #[cfg(test)]
+    if FAIL_NEXT_SCHEMA_8_TO_9_MIGRATION.with(|flag| flag.replace(false)) {
+        return Err(schema_error("injected schema 8 to 9 migration failure"));
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    validate_schema_9(&tx)?;
+    validate_database(&tx)?;
+    tx.commit()
 }

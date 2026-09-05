@@ -224,7 +224,7 @@ def validate_evidence(value: Any, finding_id: str, errors: list[str]) -> None:
             f"evidence path is not a file or directory for {finding_id}: {value}", errors)
 
 
-def validate_qualification(development: str, require_ready: bool, errors: list[str]) -> None:
+def validate_qualification(development: str, require_ready: bool, errors: list[str], resolved: frozenset[str] = frozenset()) -> None:
     path = ROOT / f"release/qualification-{development}.json"
     qualification = load_json(path)
     require(isinstance(qualification, dict), "qualification root must be an object", errors)
@@ -273,7 +273,7 @@ def validate_qualification(development: str, require_ready: bool, errors: list[s
             if status in {"closed", "accepted"}:
                 require(isinstance(evidence, list) and bool(evidence),
                         f"{status} finding lacks evidence: {finding_id}", errors)
-            if status == "open":
+            if status == "open" and finding_id not in resolved:
                 open_findings.append(finding_id)
     require(categories == {"CI", "PERF", "QUAL", "REL", "SEC"},
             "qualification must cover CI, PERF, QUAL, REL, and SEC findings", errors)
@@ -298,7 +298,7 @@ def validate_docs(development: str, supported: str, releases: dict[str, dict[str
     require(
         f"Release line: `{development}` is unreleased development. The currently supported release is `{supported}`." in security,
         "SECURITY supported-version statement is not derived from release-state", errors)
-    require(f"## {development} — Unreleased" in changelog,
+    require(f"## {development} — Unreleased" in changelog or re.search(rf"^## {re.escape(development)} — [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$", changelog, re.MULTILINE),
             "CHANGELOG lacks the unreleased development heading", errors)
     supported_date = releases.get(supported, {}).get("release_date")
     require(f"## {supported} — {supported_date}" in changelog,
@@ -332,8 +332,66 @@ def validate_docs(development: str, supported: str, releases: dict[str, dict[str
                 f"checklist for {version} does not reference release-state", errors)
 
 
+def load_release_evidence():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("release_evidence", ROOT / "tools/release-evidence.py")
+    assert spec and spec.loader
+    evidence = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evidence)
+    return evidence
+
+
+def validate_phase(args, errors: list[str]) -> frozenset[str]:
+    args.effective_qualification = None
+    phase = args.phase
+    if args.require_ready and phase == "development":
+        phase = "evidence"
+    if phase == "development":
+        return frozenset()
+    if not re.fullmatch(r"[0-9a-f]{40}", args.expected_commit or ""):
+        errors.append("release phases require the exact expected commit")
+        return frozenset()
+    if phase == "candidate":
+        return frozenset({"QUAL-001", "QUAL-006"})
+    try:
+        import tempfile
+        evidence = load_release_evidence()
+        evidence.PERF._sha256(args.expected_binary_sha256, "expected binary")
+        evidence.positive(args.expected_packages_run_id, "expected packages run")
+        if args.performance_receipt is None:
+            raise evidence.EvidenceError("a verified performance receipt is required")
+        receipt, _ = evidence.PERF._read_json(args.performance_receipt)
+        evidence.verify_receipt(receipt, args.expected_commit, args.expected_binary_sha256,
+                                args.expected_packages_run_id)
+        soak_receipt = None
+        if phase in {"evidence", "tag"}:
+            api = evidence.GitHub(__import__("os").environ.get("GITHUB_REPOSITORY", ""))
+            with tempfile.TemporaryDirectory() as temporary:
+                soak_receipt = evidence.verify_soak(api, args.expected_commit, args.expected_binary_sha256,
+                                     Path(temporary) / "soak")
+        if args.output:
+            args.effective_qualification = {
+                "schema_version": 1, "phase": phase, "commit": args.expected_commit,
+                "binary_sha256": args.expected_binary_sha256,
+                "packages_run_id": args.expected_packages_run_id,
+                "performance_receipt": receipt,
+                "soak_receipt": soak_receipt,
+                "resolved_findings": ["QUAL-001"] + (["QUAL-006"] if phase != "soak" else []),
+            }
+        return frozenset({"QUAL-001", "QUAL-006"})
+    except (OSError, ValueError, KeyError) as error:
+        errors.append(f"release evidence: {error}")
+        return frozenset()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--phase", choices=("development", "candidate", "soak", "evidence", "tag"), default="development")
+    parser.add_argument("--expected-commit")
+    parser.add_argument("--expected-binary-sha256")
+    parser.add_argument("--expected-packages-run-id", type=int)
+    parser.add_argument("--performance-receipt", type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--require-ready", action="store_true",
                         help="fail while any qualification finding is open")
     parser.add_argument("--print-supported-version", action="store_true")
@@ -346,12 +404,27 @@ def main() -> int:
     errors: list[str] = []
     development, supported, releases = validate_state(state, errors)
     validate_targets(state, errors)
-    validate_qualification(development, args.require_ready, errors)
+    resolved = validate_phase(args, errors)
+    validate_qualification(development, args.require_ready or args.phase != "development", errors, resolved)
     validate_docs(development, supported, releases, errors)
     if errors:
         for error in errors:
             print(f"release-state policy: {error}", file=sys.stderr)
         return 1
+    if args.output and args.effective_qualification is not None:
+        import os
+        import tempfile
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=args.output.parent, delete=False) as stream:
+            try:
+                json.dump(args.effective_qualification, stream, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+                stream.close()
+                os.replace(stream.name, args.output)
+            finally:
+                Path(stream.name).unlink(missing_ok=True)
     if args.print_supported_version:
         print(supported)
     elif args.print_development_version:

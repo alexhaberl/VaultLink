@@ -1,3 +1,4 @@
+{% if pagination_reset %}<p class="notice" data-i18n="audit.pagination_reset">The starting audit entry has expired. Showing the first page.</p>{% endif %}
 <div class="vl-audit-layout">
   <section class="vl-panel">
     <div class="vl-panel-head"><div><p class="vl-eyebrow"><vl-i18n key="audit.traceability"/></p><h2><vl-i18n key="audit.events"/></h2></div><form method="get" class="vl-inline-actions"><input type="hidden" name="sort" value="{{ sort_value }}"><input type="hidden" name="direction" value="{{ direction_value }}"><label class="vl-field"><span class="vl-sr-only"><vl-i18n key="audit.action_filter"/></span><input name="action" value="{{ filter_value }}" placeholder="<vl-i18n key="audit.filter_action"/>"></label><button class="vl-button"><vl-i18n key="common.filter"/></button></form></div>

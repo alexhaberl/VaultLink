@@ -5,7 +5,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use rand::{rngs::SysRng, TryRng};
 use sha1::Sha1;
 use std::{
-    collections::{hash_map::RandomState, HashMap, HashSet},
+    collections::{hash_map::RandomState, HashMap},
     hash::BuildHasher,
     net::IpAddr,
     sync::{Arc, Mutex},
@@ -18,8 +18,6 @@ use crate::sensitive::SecretString;
 const MAX_LIMITER_KEYS: usize = 10_000;
 const OVERFLOW_BUCKETS: usize = 256;
 const GLOBAL_CLEANUP_INTERVAL: u64 = 64;
-const UNKNOWN_ADMIN_ACCOUNT_BUCKETS: usize = 256;
-const UNKNOWN_ADMIN_IP_BUCKETS: usize = 256;
 
 pub const ADMIN_PASSWORD_MIN_CHARACTERS: usize = 14;
 pub const ADMIN_PASSWORD_MAX_CHARACTERS: usize = 256;
@@ -94,6 +92,22 @@ pub fn valid_admin_username(username: &str) -> bool {
         && username
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub(crate) fn failed_login_identity(username: &str) -> (String, Option<String>) {
+    if valid_admin_username(username) {
+        (username.to_owned(), None)
+    } else {
+        use sha2::{Digest, Sha256};
+        (
+            "<invalid-username>".into(),
+            Some(format!(
+                "reason=invalid_username;username_bytes={};username_sha256={}",
+                username.len(),
+                data_encoding::HEXLOWER.encode(&Sha256::digest(username.as_bytes()))
+            )),
+        )
+    }
 }
 
 pub fn valid_admin_password(password: &str) -> bool {
@@ -186,337 +200,59 @@ struct AttemptHistory {
     attempts: Vec<Instant>,
 }
 
-impl AttemptHistory {
-    fn new() -> Self {
-        Self {
-            attempts: Vec::new(),
-        }
-    }
-}
-
-/// Process-local password-login admission with isolated state for active admins.
-///
-/// Unknown and invalid usernames are deliberately confined to fixed bucket
-/// arrays so username churn can neither allocate unbounded state nor consume an
-/// active administrator's exact counters.
+/// Password-login budgets depend only on request history, never account existence.
 #[derive(Clone)]
 pub struct AdminLoginLimiter {
-    inner: Arc<Mutex<AdminLoginLimiterState>>,
-    origin_max: usize,
-    account_max: usize,
-    window: Duration,
-    #[cfg(test)]
-    publication_barrier: Arc<Mutex<Option<crate::BlockingTestBarrier>>>,
-}
-
-struct AdminLoginLimiterState {
-    active_admins: HashSet<String>,
-    known_accounts: HashMap<String, AttemptHistory>,
-    known_origins: HashMap<(String, IpAddr), AttemptHistory>,
-    unknown_accounts: Vec<Option<AttemptHistory>>,
-    unknown_ips: Vec<Option<AttemptHistory>>,
-    hash_builder: RandomState,
-}
-
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct AdminLoginLimiterSnapshot {
-    pub(crate) active_admins: Vec<String>,
-    pub(crate) known_accounts: Vec<(String, Vec<Instant>)>,
-    pub(crate) known_origins: Vec<((String, IpAddr), Vec<Instant>)>,
-    pub(crate) unknown_accounts: Vec<Option<Vec<Instant>>>,
-    pub(crate) unknown_ips: Vec<Option<Vec<Instant>>>,
-}
-
-/// Transaction-coupled publication of the active-admin cache. Until
-/// `accept` is called this guard owns the limiter mutex and restores the
-/// previous cache (including per-admin attempt histories) when dropped.
-pub(crate) struct AdminLoginLimiterPublication<'a> {
-    state: std::sync::MutexGuard<'a, AdminLoginLimiterState>,
-    previous_active_admins: Option<HashSet<String>>,
-    previous_known_accounts: Option<HashMap<String, AttemptHistory>>,
-    previous_known_origins: Option<HashMap<(String, IpAddr), AttemptHistory>>,
-}
-
-impl crate::db::CommitPublication for AdminLoginLimiterPublication<'_> {
-    fn accept_commit(&mut self) {
-        self.previous_active_admins = None;
-        self.previous_known_accounts = None;
-        self.previous_known_origins = None;
-    }
-}
-
-impl Drop for AdminLoginLimiterPublication<'_> {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous_active_admins.take() {
-            self.state.active_admins = previous;
-        }
-        if let Some(previous) = self.previous_known_accounts.take() {
-            self.state.known_accounts = previous;
-        }
-        if let Some(previous) = self.previous_known_origins.take() {
-            self.state.known_origins = previous;
-        }
-    }
+    origins: LoginLimiter,
+    accounts: LoginLimiter,
 }
 
 impl AdminLoginLimiter {
-    pub fn new(
-        active_admins: impl IntoIterator<Item = String>,
-        origin_max: usize,
-        account_max: usize,
-        window: Duration,
-    ) -> Self {
+    pub fn new(origin_max: usize, account_max: usize, window: Duration) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(AdminLoginLimiterState {
-                active_admins: active_admins
-                    .into_iter()
-                    .map(|username| username.to_ascii_lowercase())
-                    .collect(),
-                known_accounts: HashMap::new(),
-                known_origins: HashMap::new(),
-                unknown_accounts: std::iter::repeat_with(|| None)
-                    .take(UNKNOWN_ADMIN_ACCOUNT_BUCKETS)
-                    .collect(),
-                unknown_ips: std::iter::repeat_with(|| None)
-                    .take(UNKNOWN_ADMIN_IP_BUCKETS)
-                    .collect(),
-                hash_builder: RandomState::new(),
-            })),
-            origin_max,
-            account_max,
-            window,
-            #[cfg(test)]
-            publication_barrier: Arc::new(Mutex::new(None)),
+            origins: LoginLimiter::new(origin_max, window),
+            accounts: LoginLimiter::new(account_max, window),
         }
     }
 
-    pub fn replace_active_admins(&self, usernames: impl IntoIterator<Item = String>) {
-        let mut state = self.state();
-        Self::replace_active_admins_in_state(&mut state, usernames);
-    }
-
-    pub(crate) fn publish_active_admins(
-        &self,
-        usernames: impl IntoIterator<Item = String>,
-    ) -> AdminLoginLimiterPublication<'_> {
-        let mut state = self.state();
-        let previous_active_admins = Some(state.active_admins.clone());
-        let previous_known_accounts = Some(state.known_accounts.clone());
-        let previous_known_origins = Some(state.known_origins.clone());
-        Self::replace_active_admins_in_state(&mut state, usernames);
-        #[cfg(test)]
-        {
-            let mut barrier = match self.publication_barrier.lock() {
-                Ok(barrier) => barrier,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some((entered, release)) = barrier.take() {
-                let _ = entered.send(());
-                let _ = release.recv();
-            }
-        }
-        AdminLoginLimiterPublication {
-            state,
-            previous_active_admins,
-            previous_known_accounts,
-            previous_known_origins,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_publication_barrier(&self, barrier: crate::BlockingTestBarrier) {
-        let mut installed = match self.publication_barrier.lock() {
-            Ok(installed) => installed,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *installed = Some(barrier);
-    }
-
-    fn replace_active_admins_in_state(
-        state: &mut AdminLoginLimiterState,
-        usernames: impl IntoIterator<Item = String>,
-    ) {
-        state.active_admins = usernames
-            .into_iter()
-            .map(|username| username.to_ascii_lowercase())
-            .collect();
-        let active_admins = &state.active_admins;
-        state
-            .known_accounts
-            .retain(|username, _| active_admins.contains(username));
-        state
-            .known_origins
-            .retain(|(username, _), _| active_admins.contains(username));
-    }
-
-    /// Atomically checks and records both account-wide and origin-specific
-    /// attempts for an administrator password login.
+    /// Always charge the origin first, even when the account budget is exhausted.
+    /// Password success and account activation never erase either history.
     pub fn check_and_record_attempt(&self, username: &str, origin: IpAddr) -> bool {
-        if self.origin_max == 0 || self.account_max == 0 || self.window.is_zero() {
-            return false;
-        }
-
-        let normalized = username.to_ascii_lowercase();
-        let mut state = self.state();
-        let now = Instant::now();
-        let known = valid_admin_username(username) && state.active_admins.contains(&normalized);
-
-        if known {
-            state.known_origins.retain(|(account, _), history| {
-                if account != &normalized {
-                    return true;
-                }
-                LoginLimiter::prune_history(history, now, self.window);
-                !history.attempts.is_empty()
-            });
-            if !Self::can_record(
-                state.known_accounts.get_mut(&normalized),
-                self.account_max,
-                now,
-                self.window,
-            ) {
-                return false;
-            }
-
-            let origin_key = (normalized.clone(), origin);
-            if !Self::can_record(
-                state.known_origins.get_mut(&origin_key),
-                self.origin_max,
-                now,
-                self.window,
-            ) {
-                return false;
-            }
-
-            state
-                .known_accounts
-                .entry(normalized)
-                .or_insert_with(AttemptHistory::new)
-                .attempts
-                .push(now);
-            state
-                .known_origins
-                .entry(origin_key)
-                .or_insert_with(AttemptHistory::new)
-                .attempts
-                .push(now);
-            return true;
-        }
-
-        let account_bucket = (state
-            .hash_builder
-            .hash_one(("unknown-account", normalized.as_str()))
-            as usize)
-            % state.unknown_accounts.len();
-        let account =
-            state.unknown_accounts[account_bucket].get_or_insert_with(AttemptHistory::new);
-        if !Self::record(account, self.account_max, now, self.window) {
-            return false;
-        }
-
-        let ip_bucket = (state.hash_builder.hash_one(("unknown-ip", origin)) as usize)
-            % state.unknown_ips.len();
-        let ip = state.unknown_ips[ip_bucket].get_or_insert_with(AttemptHistory::new);
-        Self::record(ip, self.origin_max, now, self.window)
-    }
-
-    fn state(&self) -> std::sync::MutexGuard<'_, AdminLoginLimiterState> {
-        match self.inner.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                tracing::error!("recovering poisoned admin login limiter state");
-                self.inner.clear_poison();
-                poisoned.into_inner()
-            }
-        }
-    }
-
-    fn record(
-        history: &mut AttemptHistory,
-        maximum: usize,
-        now: Instant,
-        window: Duration,
-    ) -> bool {
-        LoginLimiter::prune_history(history, now, window);
-        if history.attempts.len() >= maximum {
-            return false;
-        }
-        history.attempts.push(now);
-        true
-    }
-
-    fn can_record(
-        history: Option<&mut AttemptHistory>,
-        maximum: usize,
-        now: Instant,
-        window: Duration,
-    ) -> bool {
-        history.is_none_or(|history| {
-            LoginLimiter::prune_history(history, now, window);
-            history.attempts.len() < maximum
-        })
+        self.origins.check_and_record_attempt(&origin.to_string())
+            && (!valid_admin_username(username)
+                || self
+                    .accounts
+                    .check_and_record_attempt(&username.to_ascii_lowercase()))
     }
 
     #[cfg(test)]
-    pub(crate) fn has_active_admin(&self, username: &str) -> bool {
-        self.state()
-            .active_admins
-            .contains(&username.to_ascii_lowercase())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn snapshot_for_test(&self) -> AdminLoginLimiterSnapshot {
-        let state = self.state();
-        let mut active_admins = state.active_admins.iter().cloned().collect::<Vec<_>>();
-        active_admins.sort_unstable();
-        let mut known_accounts = state
-            .known_accounts
-            .iter()
-            .map(|(username, history)| (username.clone(), history.attempts.clone()))
-            .collect::<Vec<_>>();
-        known_accounts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        let mut known_origins = state
-            .known_origins
-            .iter()
-            .map(|(key, history)| (key.clone(), history.attempts.clone()))
-            .collect::<Vec<_>>();
-        known_origins.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        AdminLoginLimiterSnapshot {
-            active_admins,
-            known_accounts,
-            known_origins,
-            unknown_accounts: state
-                .unknown_accounts
-                .iter()
-                .map(|history| history.as_ref().map(|history| history.attempts.clone()))
-                .collect(),
-            unknown_ips: state
-                .unknown_ips
-                .iter()
-                .map(|history| history.as_ref().map(|history| history.attempts.clone()))
-                .collect(),
+    pub(crate) fn snapshot_for_test(&self) -> Vec<(String, Vec<Instant>)> {
+        let mut snapshot = Vec::new();
+        for (prefix, limiter) in [("ip", &self.origins), ("account", &self.accounts)] {
+            let state = limiter.state();
+            snapshot.extend(
+                state
+                    .entries
+                    .iter()
+                    .map(|(key, history)| (format!("{prefix}:{key}"), history.attempts.clone())),
+            );
+            snapshot.extend(
+                state
+                    .overflow
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, history)| {
+                        history.as_ref().map(|history| {
+                            (
+                                format!("{prefix}:overflow:{index}"),
+                                history.attempts.clone(),
+                            )
+                        })
+                    }),
+            );
         }
-    }
-
-    #[cfg(test)]
-    fn state_sizes(&self) -> (usize, usize, usize, usize) {
-        let state = self.state();
-        (
-            state.known_accounts.len(),
-            state.known_origins.len(),
-            state.unknown_accounts.len(),
-            state.unknown_ips.len(),
-        )
-    }
-
-    #[cfg(test)]
-    fn used_unknown_ip_buckets(&self) -> usize {
-        self.state()
-            .unknown_ips
-            .iter()
-            .filter(|history| history.is_some())
-            .count()
+        snapshot.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        snapshot
     }
 }
 

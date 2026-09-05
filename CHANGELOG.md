@@ -2,6 +2,13 @@
 
 ## 0.7.0 — Unreleased
 
+- Keep search/scan admission permits until blocking workers finish, including cancelled HTML requests.
+- Share the administrator login IP budget across all usernames and Web/API; bound failed-login audit identities and historical audit projections.
+- Retry transient safe path-resolution contention within a fixed budget and return `503` with `Retry-After: 1` when exhausted.
+- Migrate schema 8 to schema 9 atomically with a pending-transfer index; use separate indexed cleanup statements and direct keyset predicates for share/monitoring pages.
+- Bind performance evidence to the candidate commit, package binary and trusted workflow runs; separate candidate, performance, soak and final qualification phases and publish portable evidence bundles.
+- Correct the WebAuthn storage description: public verification records are serialized, while private keys remain with authenticators.
+
 - Added an authoritative release-state manifest and fail-closed 0.7.0 qualification ledger; corrected public documentation to identify 0.6.0 as supported and 0.5.0 as withdrawn, and recorded the verified signed tag, exact commit, immutable 21-asset release, and required gate evidence for 0.6.0.
 - Added checksum-pinned Actionlint 1.7.12 on native amd64/arm64 CI, moved the Arch rolling guest commands into a ShellCheck-checked helper, and constrained the compensated RSA advisory exception to its exact dependency path and RS256 negative tests.
 - Advanced the stable toolchain, canonical Docker smoke image, and native package-builder recipe to Rust 1.98.0; the builder-image locks are deliberately left `UNPROVISIONED` until the protected refresh emits reviewed replacements.

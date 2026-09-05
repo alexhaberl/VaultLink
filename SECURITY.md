@@ -46,7 +46,7 @@ Do not open a public issue. Use GitHub's private vulnerability reporting for thi
 - External SMB writers are trusted content publishers. Their direct changes bypass VaultLink authentication, audit, quotas and link policy; SMB-server audit and account lifecycle controls are therefore part of the security boundary.
 - Overwrite publication is disabled by default whenever external writers are enabled. `allow_external_writer_replace=true` is an explicit last-writer-wins exception: atomic VaultLink publication can overwrite a newer concurrent SMB-client change because standard clients do not participate in VaultLink's storage lock. Operators accepting this mode must treat that undetectable lost-update risk as part of their storage policy.
 - SQLite/WAL, configuration, TLS keys and ACME credentials remain on an audited local filesystem and use the documented restrictive permissions. SQLite must be on a filesystem separate from CIFS/SMB storage and may share an audited local ext*/XFS/Btrfs/F2FS/Bcachefs/ZFS mount only when it is outside the visible tree.
-- SQLite stores Share tokens, TOTP seeds and WebAuthn credentials encrypted at rest. The adjacent matching `secrets.keyring` contains the keys needed to decrypt them. A complete database/keyring pair or upgrade/rollback backup is therefore a production credential and must remain restricted to audited root/service access, encrypted storage and protected backup handling.
+- Share tokens and TOTP secrets are encrypted at rest. WebAuthn credential records contain public verification data and authenticator metadata; they are stored as serialized blobs without application-level encryption. Private authenticator keys remain on the authenticator and are never stored by VaultLink.
 - Monitoring service tokens contain 256 bits of random entropy and are stored only as SHA-256 hashes. Their plaintext is shown once, must be kept in the client's secret store, must never be placed in URLs, logs, diagnostics, screenshots, shell history, or support reports, and should be rotated by overlapping replacement and revocation. HTTPS is mandatory whenever a token crosses a non-loopback network. Disabling or changing the creating administrator does not revoke an instance-wide token.
 - Upgrade and rollback backups are inseparable Binary/Config/SQLite/Keyring units. The live configuration is never rewritten for a candidate before downtime; automatic recovery restores and health-checks the matching old unit and reinstalls the previously verified native package.
 - Restoring an older database can restore a previously revoked monitoring credential. For every older manual restore, keep VaultLink stopped and traffic closed, run `revoke-all-service-tokens (--config PATH | --database PATH) --all`, create replacement tokens, update clients, and only then reopen traffic. The normal verified upgrade-rollback path intentionally preserves tokens.
@@ -68,3 +68,14 @@ Do not open a public issue. Use GitHub's private vulnerability reporting for thi
 - Login limits are process-local and reset whenever the VaultLink process restarts. They limit application work but are not a volumetric network defense; reverse-proxy and network-layer rate limits remain required.
 - Monitoring reads are limited to 120 requests per effective client IP per minute and return `Retry-After` when rejected. This process-local boundary resets on restart and complements, rather than replaces, the reverse proxy or network rate limit.
 - `audit_client_ip_enabled = false` is the privacy-preserving default. It reduces retained personal data but limits forensic correlation of requests, and client IPs are intentionally not mirrored to journald even when SQLite capture is enabled.
+
+Administrator login attempts share one origin budget across Web/API and all
+usernames, including unknown or invalid names: by default five attempts per
+300 seconds per effective IPv4 address or IPv6 /64. A separate 25-attempt
+account budget remains. Shared NAT users consume the same origin budget;
+successful login does not reset it. Invalid usernames are audited as
+`<invalid-username>` with byte length and SHA-256, never as an unbounded actor.
+Audit actor/action/object/detail limits are 64/64/4096/16384 UTF-8 bytes;
+invalid required audit fields fail before a predictable file publication.
+Historical oversized fields are projected to bounded markers without rewriting
+the stored history.

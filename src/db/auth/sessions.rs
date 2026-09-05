@@ -324,6 +324,7 @@ impl Database {
             transaction.rollback()?;
             return Ok(SessionBound::SessionUnavailable);
         }
+        context.validate()?;
         let (outcome, events) = operation(&transaction)?;
         insert_required_audits(&transaction, context, &events)?;
         // Commit without consuming `transaction`.  If COMMIT fails, drop the

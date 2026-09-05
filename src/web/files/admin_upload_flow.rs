@@ -620,6 +620,12 @@ fn publish_admin_file(
     detail: &str,
     published_snapshot: &mut Option<bool>,
 ) -> std::result::Result<(bool, Vec<RequiredAuditEvent>), file_ops::FileOperationError> {
+    let event = RequiredAuditEvent::new(
+        action,
+        Some(destination.to_string()),
+        Some(detail.to_string()),
+    );
+    event.validate()?;
     let outcome = if overwrite_existing {
         pending.publish_replace(name)
     } else {
@@ -628,11 +634,7 @@ fn publish_admin_file(
     .map_err(file_ops::FileOperationError::Io)?;
     let durability_uncertain = !outcome.is_durable();
     *published_snapshot = Some(durability_uncertain);
-    let mut events = vec![RequiredAuditEvent::new(
-        action,
-        Some(destination.to_string()),
-        Some(detail.to_string()),
-    )];
+    let mut events = vec![event];
     if let Some(error) = outcome.uncertainty_error() {
         tracing::warn!(
             file = %EscapedLogPath::new(name),

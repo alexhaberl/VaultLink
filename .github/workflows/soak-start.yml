@@ -102,6 +102,7 @@ jobs:
           validate_gate vaultlink/fuzz-600s-amd64 .github/workflows/fuzz.yml
           validate_gate vaultlink/fuzz-600s-arm64 .github/workflows/fuzz.yml
           validate_gate vaultlink/packages .github/workflows/packages.yml
+          packages_run=$VALIDATED_RUN_ID
           validate_gate vaultlink/package-reproducibility .github/workflows/reproducibility.yml
           validate_gate vaultlink/distro-vms .github/workflows/distro-vms.yml \
             "Distro VMs $APPROVED_COMMIT" workflow_dispatch
@@ -109,6 +110,7 @@ jobs:
           validate_gate vaultlink/release-candidate-preflight .github/workflows/release.yml \
             "Release candidate $APPROVED_COMMIT" workflow_dispatch
           candidate_run=$VALIDATED_RUN_ID
+          validate_gate vaultlink/performance .github/workflows/performance-evidence.yml "" workflow_dispatch
           candidate_artifact="$RUNNER_TEMP/release-candidate-packages"
           test ! -e "$candidate_artifact"
           gh run download "$candidate_run" \
@@ -125,6 +127,12 @@ jobs:
           test -s "$candidate_binary"
           candidate_binary_sha256=$(sha256sum "$candidate_binary" | awk '{print $1}')
           test "$candidate_binary_sha256" = "$APPROVED_BINARY_SHA256"
+          performance_receipt="$RUNNER_TEMP/performance-receipt.json"
+          python3 tools/release-evidence.py performance --commit "$APPROVED_COMMIT" \
+            --binary-sha256 "$candidate_binary_sha256" --packages-run-id "$packages_run" \
+            --output "$performance_receipt"
+          sh tools/check-version-consistency.sh --release-soak --binary "$candidate_binary" \
+            --packages-run-id "$packages_run" --performance-receipt "$performance_receipt"
           echo "binary_sha256=$candidate_binary_sha256" >> "$GITHUB_OUTPUT"
       - name: Configure pinned soak-host SSH transport
         id: ssh

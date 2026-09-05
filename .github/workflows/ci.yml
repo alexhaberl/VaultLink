@@ -61,6 +61,7 @@ jobs:
           python3 tools/check-architecture.py --root .
           python3 tools/test-release-state.py
           python3 tools/test-performance-evidence.py
+          python3 tools/test-release-evidence.py
           python3 tools/test-refactoring-contracts.py
           python3 tools/check-refactoring-contracts.py --root .
           python3 tools/test-fuzz-corpus.py

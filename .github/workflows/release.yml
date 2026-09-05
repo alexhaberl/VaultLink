@@ -66,7 +66,7 @@ jobs:
             candidate_commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
             main_commit=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
             test "$candidate_commit" = "$main_commit"
-            sh tools/check-version-consistency.sh --release-tag "$GITHUB_REF_NAME"
+            sh tools/check-version-consistency.sh --release-candidate
           else
             test "$GITHUB_REF" = refs/heads/main
             test "$(git rev-parse HEAD)" = "$candidate_commit"
@@ -138,6 +138,7 @@ jobs:
           if [[ "$release_stage" == evidence || "$release_stage" == tag ]]; then
             validate_gate vaultlink/release-candidate-preflight .github/workflows/release.yml \
               "Release candidate $candidate_commit" workflow_dispatch
+            validate_gate vaultlink/performance .github/workflows/performance-evidence.yml "" workflow_dispatch
             validate_gate vaultlink/72h-soak .github/workflows/soak-collect.yml
             soak_run=$VALIDATED_RUN_ID
             soak_dir=$(mktemp -d)
@@ -230,6 +231,40 @@ jobs:
           dpkg-deb -x "dist/$deb" "$root"
           test "$(sha256sum "$root/usr/lib/vaultlink/package/vaultlink" | awk '{print $1}')" \
             = "$SOAK_BINARY_SHA256"
+      - name: Verify final performance, soak, and qualification against the extracted binary
+        if: needs.prepare.outputs.release_stage == 'evidence' || needs.prepare.outputs.release_stage == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_COMMIT: ${{ needs.prepare.outputs.candidate_commit }}
+          PACKAGES_RUN: ${{ needs.prepare.outputs.packages_run }}
+          RELEASE_STAGE: ${{ needs.prepare.outputs.release_stage }}
+        run: |
+          set -euo pipefail
+          deb=$(python3 tools/package-targets.py asset debian13-amd64 '${{ needs.prepare.outputs.package_version }}')
+          extracted=$(mktemp -d)
+          trap 'rm -rf "$extracted"' EXIT
+          dpkg-deb -x "dist/$deb" "$extracted"
+          binary="$extracted/usr/lib/vaultlink/package/vaultlink"
+          binary_sha256=$(sha256sum "$binary" | awk '{print $1}')
+          receipt="$RUNNER_TEMP/performance-receipt.json"
+          python3 tools/release-evidence.py performance --commit "$CANDIDATE_COMMIT" \
+            --binary-sha256 "$binary_sha256" --packages-run-id "$PACKAGES_RUN" --output "$receipt"
+          if [[ "$RELEASE_STAGE" == tag ]]; then
+            sh tools/check-version-consistency.sh --release-tag "$GITHUB_REF_NAME" --binary "$binary" \
+              --packages-run-id "$PACKAGES_RUN" --performance-receipt "$receipt"
+          else
+            sh tools/check-version-consistency.sh --release-evidence --binary "$binary" \
+              --packages-run-id "$PACKAGES_RUN" --performance-receipt "$receipt"
+          fi
+      - name: Archive effective qualification without changing the candidate commit
+        if: needs.prepare.outputs.release_stage == 'evidence' || needs.prepare.outputs.release_stage == 'tag'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: effective-qualification-${{ needs.prepare.outputs.candidate_commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/effective-qualification.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Upload exact unsigned release set
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

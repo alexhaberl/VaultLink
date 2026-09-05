@@ -12,6 +12,26 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::log_safety::EscapedLogValue;
 
+pub(super) fn validate_audit_fields(
+    actor: &str,
+    action: &str,
+    object: Option<&str>,
+    detail: Option<&str>,
+    client_ip: Option<&str>,
+) -> rusqlite::Result<()> {
+    if actor.len() > 64
+        || action.len() > 64
+        || object.is_some_and(|v| v.len() > 4096)
+        || detail.is_some_and(|v| v.len() > 16384)
+        || client_ip.is_some_and(|v| v.len() > 45 || v.parse::<std::net::IpAddr>().is_err())
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
+}
+
+const AUDIT_SELECT: &str = "SELECT id,occurred_at,CASE WHEN length(CAST(actor AS BLOB))>64 THEN '<oversized:' || length(CAST(actor AS BLOB)) || ' bytes>' ELSE actor END,CASE WHEN length(CAST(action AS BLOB))>64 THEN '<oversized:' || length(CAST(action AS BLOB)) || ' bytes>' ELSE action END,CASE WHEN length(CAST(object_id AS BLOB))>4096 THEN '<oversized:' || length(CAST(object_id AS BLOB)) || ' bytes>' ELSE object_id END,CASE WHEN length(CAST(detail AS BLOB))>16384 THEN '<oversized:' || length(CAST(detail AS BLOB)) || ' bytes>' ELSE detail END,CASE WHEN length(CAST(client_ip AS BLOB))>45 THEN '<oversized:' || length(CAST(client_ip AS BLOB)) || ' bytes>' ELSE client_ip END";
+
 #[cfg(test)]
 pub(super) fn enforce_audit_retention(
     connection: &Connection,
@@ -43,6 +63,7 @@ pub(super) fn insert_audit_event(
     detail: Option<&str>,
     client_ip: Option<&str>,
 ) -> rusqlite::Result<()> {
+    validate_audit_fields(actor, action.as_str(), object_id, detail, client_ip)?;
     // Runtime settings and audit events live in the same database so privacy
     // decisions can be enforced at commit time. A request that captured an IP
     // before logging was disabled must not be able to write it afterwards.
@@ -358,7 +379,7 @@ impl Database {
         let direction = audit_sort_direction_sql(direction);
         if let Some(action) = action {
             let query = format!(
-                "SELECT id,occurred_at,actor,action,object_id,detail,client_ip
+                "{AUDIT_SELECT}
                  FROM audit WHERE action=?1
                  ORDER BY {column} {direction},id {direction}
                  LIMIT ?2 OFFSET ?3"
@@ -373,7 +394,7 @@ impl Database {
             events
         } else {
             let query = format!(
-                "SELECT id,occurred_at,actor,action,object_id,detail,client_ip
+                "{AUDIT_SELECT}
                  FROM audit
                  ORDER BY {column} {direction},id {direction}
                  LIMIT ?1 OFFSET ?2"
@@ -384,6 +405,14 @@ impl Database {
                 .collect();
             events
         }
+    }
+
+    pub(crate) fn audit_cursor_exists(&self, id: i64) -> rusqlite::Result<bool> {
+        self.try_conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM audit WHERE id=?1)",
+            [id],
+            |row| row.get(0),
+        )
     }
 
     pub fn list_audit_keyset(
@@ -413,18 +442,18 @@ impl Database {
         let mut events = match (action, cursor) {
             (Some(action), Some(cursor)) => {
                 let query = format!(
-                    "SELECT id,occurred_at,actor,action,object_id,detail,client_ip
+                    "{AUDIT_SELECT}
                      FROM audit
                      WHERE action=?1
-                       AND ({column} {comparison} ?2
-                            OR ({column} = ?2 AND id {comparison} ?3))
+                       AND ({column} {comparison} COALESCE(?2,(SELECT {column} FROM audit WHERE id=?3))
+                            OR ({column} = COALESCE(?2,(SELECT {column} FROM audit WHERE id=?3)) AND id {comparison} ?3))
                      ORDER BY {column} {query_direction},id {query_direction}
                      LIMIT ?4"
                 );
                 let mut statement = connection.prepare(&query)?;
                 let events = statement
                     .query_map(
-                        params![action, cursor.value.as_str(), cursor.id, limit],
+                        params![action, cursor.value.as_deref(), cursor.id, limit],
                         map_audit_event,
                     )?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -432,7 +461,7 @@ impl Database {
             }
             (Some(action), None) => {
                 let query = format!(
-                    "SELECT id,occurred_at,actor,action,object_id,detail,client_ip
+                    "{AUDIT_SELECT}
                      FROM audit WHERE action=?1
                      ORDER BY {column} {query_direction},id {query_direction}
                      LIMIT ?2"
@@ -445,17 +474,17 @@ impl Database {
             }
             (None, Some(cursor)) => {
                 let query = format!(
-                    "SELECT id,occurred_at,actor,action,object_id,detail,client_ip
+                    "{AUDIT_SELECT}
                      FROM audit
-                     WHERE {column} {comparison} ?1
-                        OR ({column} = ?1 AND id {comparison} ?2)
+                     WHERE {column} {comparison} COALESCE(?1,(SELECT {column} FROM audit WHERE id=?2))
+                        OR ({column} = COALESCE(?1,(SELECT {column} FROM audit WHERE id=?2)) AND id {comparison} ?2)
                      ORDER BY {column} {query_direction},id {query_direction}
                      LIMIT ?3"
                 );
                 let mut statement = connection.prepare(&query)?;
                 let events = statement
                     .query_map(
-                        params![cursor.value.as_str(), cursor.id, limit],
+                        params![cursor.value.as_deref(), cursor.id, limit],
                         map_audit_event,
                     )?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -463,7 +492,7 @@ impl Database {
             }
             (None, None) => {
                 let query = format!(
-                    "SELECT id,occurred_at,actor,action,object_id,detail,client_ip
+                    "{AUDIT_SELECT}
                      FROM audit
                      ORDER BY {column} {query_direction},id {query_direction}
                      LIMIT ?1"
@@ -493,7 +522,7 @@ impl Database {
         let direction = audit_sort_direction_sql(direction);
         if let Some(action) = action {
             let query = format!(
-                "SELECT {column},id FROM audit WHERE action=?1
+                "SELECT NULL,id FROM audit WHERE action=?1
                  ORDER BY {column} {direction},id {direction}
                  LIMIT 1 OFFSET ?2"
             );
@@ -507,7 +536,7 @@ impl Database {
                 .optional()
         } else {
             let query = format!(
-                "SELECT {column},id FROM audit
+                "SELECT NULL,id FROM audit
                  ORDER BY {column} {direction},id {direction}
                  LIMIT 1 OFFSET ?1"
             );

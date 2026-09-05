@@ -211,6 +211,13 @@ impl AuditContext {
         }
     }
 
+    pub(crate) fn validate(&self) -> rusqlite::Result<()> {
+        super::audit::validate_audit_fields(&self.actor, "", None, None, self.client_ip.as_deref())
+            .map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(AuditUnavailableError(error)))
+            })
+    }
+
     pub fn system() -> Self {
         Self::new("system", None)
     }
@@ -234,6 +241,18 @@ impl RequiredAuditEvent {
             object_id,
             detail,
         }
+    }
+    pub(crate) fn validate(&self) -> rusqlite::Result<()> {
+        super::audit::validate_audit_fields(
+            "",
+            self.action.as_str(),
+            self.object_id.as_deref(),
+            self.detail.as_deref(),
+            None,
+        )
+        .map_err(|error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(AuditUnavailableError(error)))
+        })
     }
 }
 

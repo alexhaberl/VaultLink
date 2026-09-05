@@ -108,7 +108,11 @@ async fn bind_downloadable_directory(
         ))
     })?
     .map(Some)
-    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Share target unavailable"))
+    .map_err(|error| {
+        AppError::storage_io(error, |_| {
+            AppError(StatusCode::NOT_FOUND, "Share target unavailable")
+        })
+    })
 }
 
 fn directory_request(query: &BrowseQuery) -> Result<DirectoryRequest> {
@@ -165,18 +169,19 @@ async fn build_directory_view(
     query: &BrowseQuery,
 ) -> Result<PublicDirectoryView> {
     let request = directory_request(query)?;
-    let _peer_permit = state
+    let peer_permit = state
         .try_acquire_expensive_peer(current_client_limit_key())
         .ok_or(AppError(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many concurrent expensive operations from this client",
         ))?;
-    let _scan_permit = state.try_acquire_search().map_err(|_| {
+    let scan_permit = state.try_acquire_search().map_err(|_| {
         AppError(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many concurrent file searches",
         )
     })?;
+    let admission = super::super::common::ScanAdmission::new(peer_permit, scan_permit);
     let rows = if let Some(search) = request.search.clone() {
         DirectoryRows {
             rows: search_rows(
@@ -187,6 +192,7 @@ async fn build_directory_view(
                 settings.clone(),
                 request.sort_column,
                 request.sort_direction,
+                admission,
             )
             .await?,
             truncated: false,
@@ -194,11 +200,21 @@ async fn build_directory_view(
             next_cursor: None,
         }
     } else {
-        browse_rows(state, token, share, settings, share_scope, &request).await?
+        browse_rows(
+            state,
+            token,
+            share,
+            settings,
+            share_scope,
+            &request,
+            admission,
+        )
+        .await?
     };
     Ok(directory_view(token, &request, rows))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn search_rows(
     token: &str,
     share_scope: crate::secure_fs::SecureDirectory,
@@ -207,19 +223,19 @@ async fn search_rows(
     settings: crate::runtime::RuntimeSettings,
     sort_column: FileSortColumn,
     sort_direction: SortDirection,
+    admission: std::sync::Arc<super::super::common::ScanAdmission>,
 ) -> Result<Vec<PublicFileRowView>> {
     let search_settings = settings.clone();
-    let mut hits = tokio::task::spawn_blocking(move || {
-        search_tree(&share_scope, &relative_dir, &search, &search_settings)
-    })
-    .await
-    .map_err(|error| {
-        AppError::from(report_internal(
-            InternalOperation::WebPublicSearchTaskJoin,
-            error,
-        ))
-    })?
-    .map_err(|error| directory_io_error(&error))?;
+    let mut hits = admission
+        .spawn_blocking(move || search_tree(&share_scope, &relative_dir, &search, &search_settings))
+        .await
+        .map_err(|error| {
+            AppError::from(report_internal(
+                InternalOperation::WebPublicSearchTaskJoin,
+                error,
+            ))
+        })?
+        .map_err(|error| directory_io_error(&error))?;
     sort_search_hits(&mut hits, sort_column, sort_direction);
     Ok(hits
         .into_iter()
@@ -264,6 +280,7 @@ async fn browse_rows(
     settings: &crate::runtime::RuntimeSettings,
     share_scope: crate::secure_fs::SecureDirectory,
     request: &DirectoryRequest,
+    admission: std::sync::Arc<super::super::common::ScanAdmission>,
 ) -> Result<DirectoryRows> {
     let scan_limit = settings.max_search_entries;
     let cursor_after = request.after.clone();
@@ -285,26 +302,32 @@ async fn browse_rows(
         scan_limit,
         storage_generation,
     };
+    let snapshot_admission = admission.clone();
     let snapshot = snapshot_cache
         .get_or_try_load(snapshot_key, || async move {
-            tokio::task::spawn_blocking(move || {
-                let _storage_guard = snapshot_guard;
-                build_directory_snapshot(
-                    &snapshot_root,
-                    &snapshot_path,
-                    scan_limit,
-                    snapshot_sort_column,
-                    snapshot_sort_direction,
-                )
-            })
-            .await
-            .map_err(|error| {
-                AppError::from(report_internal(
-                    InternalOperation::WebPublicDirectoryListTaskJoin,
-                    error,
-                ))
-            })?
-            .map_err(|_| AppError(StatusCode::NOT_FOUND, "Share target unavailable"))
+            snapshot_admission
+                .spawn_blocking(move || {
+                    let _storage_guard = snapshot_guard;
+                    build_directory_snapshot(
+                        &snapshot_root,
+                        &snapshot_path,
+                        scan_limit,
+                        snapshot_sort_column,
+                        snapshot_sort_direction,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    AppError::from(report_internal(
+                        InternalOperation::WebPublicDirectoryListTaskJoin,
+                        error,
+                    ))
+                })?
+                .map_err(|error| {
+                    AppError::storage_io(error, |_| {
+                        AppError(StatusCode::NOT_FOUND, "Share target unavailable")
+                    })
+                })
         })
         .await?;
     let listing = match snapshot {
@@ -325,6 +348,7 @@ async fn browse_rows(
                 scan_limit,
                 request.sort_column,
                 request.sort_direction,
+                admission,
             )
             .await?
         }
@@ -353,29 +377,31 @@ async fn browse_without_snapshot(
     scan_limit: usize,
     sort_column: FileSortColumn,
     sort_direction: SortDirection,
+    admission: std::sync::Arc<super::super::common::ScanAdmission>,
 ) -> Result<std::io::Result<super::super::common::DirectoryCursorPage>> {
     let guard = file_ops::acquire_storage_read(state)
         .await
         .map_err(storage_recovery_app_error)?;
-    tokio::task::spawn_blocking(move || {
-        let _storage_guard = guard;
-        list_directory_cursor_page(
-            &share_scope,
-            &relative_dir,
-            after.as_deref(),
-            before.as_deref(),
-            scan_limit,
-            sort_column,
-            sort_direction,
-        )
-    })
-    .await
-    .map_err(|error| {
-        AppError::from(report_internal(
-            InternalOperation::WebPublicDirectoryListTaskJoin,
-            error,
-        ))
-    })
+    admission
+        .spawn_blocking(move || {
+            let _storage_guard = guard;
+            list_directory_cursor_page(
+                &share_scope,
+                &relative_dir,
+                after.as_deref(),
+                before.as_deref(),
+                scan_limit,
+                sort_column,
+                sort_direction,
+            )
+        })
+        .await
+        .map_err(|error| {
+            AppError::from(report_internal(
+                InternalOperation::WebPublicDirectoryListTaskJoin,
+                error,
+            ))
+        })
 }
 
 fn listing_row(
@@ -473,7 +499,11 @@ async fn build_file_view(
             error,
         ))
     })?
-    .map_err(|_| AppError(StatusCode::NOT_FOUND, "Shared file unavailable"))?;
+    .map_err(|error| {
+        AppError::storage_io(error, |_| {
+            AppError(StatusCode::NOT_FOUND, "Shared file unavailable")
+        })
+    })?;
     let modified = metadata.modified().ok().map(public_file_time);
     let (modified_datetime, modified_label) = modified
         .map_or((None, "—".into()), |(datetime, label)| {
@@ -563,7 +593,9 @@ fn upload_notice(status: Option<&str>) -> Option<&'static str> {
 }
 
 fn directory_io_error(error: &std::io::Error) -> AppError {
-    if error.kind() == std::io::ErrorKind::InvalidInput {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        AppError::storage_busy()
+    } else if error.kind() == std::io::ErrorKind::InvalidInput {
         AppError(StatusCode::BAD_REQUEST, "Invalid directory cursor")
     } else {
         AppError(StatusCode::NOT_FOUND, "Share target unavailable")

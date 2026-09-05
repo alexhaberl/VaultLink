@@ -110,6 +110,15 @@ impl ApiError {
             retry_after_seconds: None,
         }
     }
+    fn storage_busy() -> Self {
+        let mut error = Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage_busy",
+            "Storage temporarily busy",
+        );
+        error.retry_after_seconds = Some(1);
+        error
+    }
     fn bad_request(message: &'static str) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
     }
@@ -200,6 +209,7 @@ impl From<crate::services::public_transfer::PublicTransferError> for ApiError {
     fn from(error: crate::services::public_transfer::PublicTransferError) -> Self {
         use crate::services::public_transfer::PublicTransferError as Error;
         let (status, code) = match error {
+            Error::StorageBusy => return Self::storage_busy(),
             Error::NotFound | Error::FileUnavailable | Error::ShareTargetUnavailable => {
                 (StatusCode::NOT_FOUND, "not_found")
             }

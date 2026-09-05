@@ -245,10 +245,7 @@ impl Database {
         handle: &tokio::runtime::Handle,
         token: String,
     ) {
-        self.enqueue_transfer_cleanup(
-            handle,
-            TransferCleanupKind::UploadReservation(token),
-        );
+        self.enqueue_transfer_cleanup(handle, TransferCleanupKind::UploadReservation(token));
     }
 
     pub(crate) fn enqueue_transfer_lease_cleanup(
@@ -259,11 +256,7 @@ impl Database {
         self.enqueue_transfer_cleanup(handle, TransferCleanupKind::TransferLease(token));
     }
 
-    fn enqueue_transfer_cleanup(
-        &self,
-        handle: &tokio::runtime::Handle,
-        kind: TransferCleanupKind,
-    ) {
+    fn enqueue_transfer_cleanup(&self, handle: &tokio::runtime::Handle, kind: TransferCleanupKind) {
         let deadline = std::time::Instant::now() + TRANSFER_CLEANUP_QUEUE_TIMEOUT;
         let start_worker = {
             let mut queue = self.transfer_cleanup_queue_guard();
@@ -393,9 +386,7 @@ fn blocking_acquire_transfer_runtime_permit(
     database: &Database,
     deadline: std::time::Instant,
 ) -> Option<TransferDatabasePermit> {
-    let waker = std::task::Waker::from(Arc::new(TransferCleanupThreadWake(
-        std::thread::current(),
-    )));
+    let waker = std::task::Waker::from(Arc::new(TransferCleanupThreadWake(std::thread::current())));
     let mut context = std::task::Context::from_waker(&waker);
     let mut acquisition = std::pin::pin!(database.acquire_transfer_runtime_permit());
     loop {
@@ -586,6 +577,7 @@ impl Database {
         let mut connection = self.try_conn()?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        context.validate()?;
         let (outcome, events) = operation(&transaction)?;
         insert_required_audits(&transaction, context, &events)?;
         transaction.commit()?;

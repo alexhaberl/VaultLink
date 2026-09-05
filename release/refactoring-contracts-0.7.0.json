@@ -33,37 +33,37 @@
   "locked_files": [
     {
       "path": "src/db/schema.rs",
-      "sha256": "8d043772acae13e31ccf11692a4172209ff5eccc3931f5fba9a7e13a530bf3e9",
+      "sha256": "2822115866f8fdf928d5186dfd3c0a762eac7c467382e9e4dd074df57f25998b",
       "contract": "schema version and fingerprints"
     },
     {
       "path": "src/db/schema/bootstrap.rs",
-      "sha256": "4962d6a9e36e2941ac8df039c980af4bc10513cb547d3a0418f60227a5a82eec",
+      "sha256": "e115a7d7e333c774fa415f44ca48718ee1381a5b78a0ae3b72cc05707b7107fb",
       "contract": "bootstrap SQL"
     },
     {
       "path": "src/db/schema/migrations.rs",
-      "sha256": "45ec78f7133278d0367298b5c104e966922156d7a46e038c1aa4c057840d6b2d",
+      "sha256": "784de2b6a4fd4060046375dd6adc887f877b589f2879f8be9ac0f85d7eaf51e2",
       "contract": "migration SQL"
     },
     {
       "path": "src/db/schema/validation.rs",
-      "sha256": "468433ab76d37075ec833419bd54001d8119099f1d57b24f04f81d06465a60db",
+      "sha256": "507930edfae8de031f75ad9f42348c694af44b32ae5f42afd663ff79e5249c36",
       "contract": "schema validation SQL"
     },
     {
       "path": "src/db/database.rs",
-      "sha256": "41083f9c935846a49df8982058753bdb10472822961ce1756a5762430a759373",
+      "sha256": "deda533ab693ff063d842b94665ed37306f405f8b88ad0f1a6755e4fea564f28",
       "contract": "encrypted-secret AAD and database ownership"
     },
     {
       "path": "src/db/shares/query.rs",
-      "sha256": "cc1b68b8a58414af28b48ab42e2e7ccc98061672f7ac954453f1bbb6fb94c871",
+      "sha256": "40bbced51a594d4abfecc5498cccffb222b1b773ef9f2bad70cf3b29113896c5",
       "contract": "share-token AAD"
     },
     {
       "path": "src/db/tests/schema_fixtures.rs",
-      "sha256": "1c93a2d7b1f8a6bb2cacd651f6df387094e0baf121f46ad23edba68da6e87074",
+      "sha256": "1926a6837c33b05e0f49e8c55a309309e9127117553f6d2088c95c0225fb1d41",
       "contract": "historical schema fixtures"
     },
     {
@@ -88,7 +88,7 @@
     },
     {
       "path": "src/db/transfers.rs",
-      "sha256": "277831f98176655ac6ea24d18d415fc339356a07f2c348e860cb8181c7ca4ee4",
+      "sha256": "24fdbe13ccb004c9573c6f6aec3941a9063d03d5be4ca6e605563962b45ffc18",
       "contract": "transfer split order and common SQL helpers"
     }
   ],
@@ -101,7 +101,7 @@
         "src/i18n/messages.rs",
         "src/i18n/render.rs"
       ],
-      "sha256": "3d41c0c387950e36335f818dc045b5cc15a08c8fde2d664698c272c7e66e8f2a"
+      "sha256": "ebf6b979ad51abbca9bd7c73a6b7195e10cbb1760515bd2eaca59f353857fda2"
     },
     {
       "name": "service domain source bundle",
@@ -112,7 +112,7 @@
         "src/services/share/mod.rs",
         "src/services/file/mod.rs"
       ],
-      "sha256": "de3230d8c99b0d8735c3f7c88b56535d6f1f985ee86110812c2ccacbf8c05fd5"
+      "sha256": "a64691b3149c63fcee8d9e430b703d258a944d8867f7a095af4d430841be432d"
     },
     {
       "name": "config model-defaults-validation-tls",
@@ -145,7 +145,7 @@
         "src/db/auth/webauthn.rs",
         "src/db/auth/sessions.rs"
       ],
-      "sha256": "ae1a6555daeaa7f57032fc59b30a50f40cac2856e2c593c36a62544fc4607454"
+      "sha256": "c29285e7141950571e8540a6a3c5eed0c44afa900c4c75c932ae566a53e3fa9a"
     },
     {
       "name": "database schema bootstrap-migrations-validation",
@@ -154,7 +154,7 @@
         "src/db/schema/migrations.rs",
         "src/db/schema/validation.rs"
       ],
-      "sha256": "e59a5c65d0aa1efec0ea019c90d71522d37181b95fab9458ce2f872e142a1cf8"
+      "sha256": "f223242e89177f016e5c36100a1bcba0809e88f005b7fc540aed2f20b01dada4"
     },
     {
       "name": "database transfer method sequence",
@@ -204,7 +204,7 @@
         "src/web/files/admin_upload.rs",
         "src/web/files/admin_upload_flow.rs"
       ],
-      "sha256": "a14f3cc23565c22666b5b975ee2b5965468ab327aa676196c42e6b2cee00052a"
+      "sha256": "5c06ed8a776cd3bf66e1f304312ed14cd424a4514d282775e13711999d06c1bb"
     },
     {
       "name": "shared public upload transport and adapters",

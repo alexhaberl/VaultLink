@@ -65,7 +65,7 @@ pub(super) async fn login(
             "Too many sign-in attempts",
         ));
     }
-    let attempted_username = form.username.clone();
+    let (attempted_username, attempted_detail) = auth::failed_login_identity(&form.username);
     let token = auth::random_token(32);
     let csrf = auth::random_token(24);
     let expires = Utc::now() + Duration::hours(state.config().security.session_hours);
@@ -87,7 +87,7 @@ pub(super) async fn login(
             attempted_username,
             AuditAction::LoginFailed,
             None,
-            None,
+            attempted_detail,
         )
         .await;
         return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));

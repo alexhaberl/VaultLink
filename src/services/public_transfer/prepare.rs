@@ -25,6 +25,7 @@ pub(crate) enum PublicTransferError {
     Expired,
     Changed,
     StorageUnavailable,
+    StorageBusy,
     Capacity,
     AuditUnavailable,
     InvalidFilePath,
@@ -40,6 +41,16 @@ pub(crate) enum PublicTransferError {
     PreviewLimitReached,
     RangeNotSatisfiable(u64),
     Internal(ReportedInternalError),
+}
+
+impl PublicTransferError {
+    fn storage_io(error: &io::Error, fallback: Self) -> Self {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            Self::StorageBusy
+        } else {
+            fallback
+        }
+    }
 }
 
 pub(crate) struct PreparedDownload {
@@ -75,7 +86,7 @@ pub(crate) enum PreparedPreviewTarget {
 }
 
 enum RawPreviewOpenError {
-    Unavailable,
+    Unavailable(io::Error),
     Metadata(io::Error),
 }
 
@@ -179,7 +190,9 @@ impl PublicTransferService {
                 error,
             ))
         })?
-        .map_err(|_| PublicTransferError::FileUnavailable)?;
+        .map_err(|error| {
+            PublicTransferError::storage_io(&error, PublicTransferError::FileUnavailable)
+        })?;
         if !metadata.is_file() {
             return Err(PublicTransferError::NotFile);
         }
@@ -214,7 +227,9 @@ impl PublicTransferService {
                 error,
             ))
         })?
-        .map_err(|_| PublicTransferError::ShareTargetUnavailable)?;
+        .map_err(|error| {
+            PublicTransferError::storage_io(&error, PublicTransferError::ShareTargetUnavailable)
+        })?;
         Ok(PreparedZipScope {
             share,
             directory,
@@ -256,7 +271,9 @@ impl PublicTransferService {
                 error,
             ))
         })?
-        .map_err(|_| PublicTransferError::ShareTargetUnavailable)?;
+        .map_err(|error| {
+            PublicTransferError::storage_io(&error, PublicTransferError::ShareTargetUnavailable)
+        })?;
         Ok(PreparedPreview {
             share,
             relative_file,
@@ -295,7 +312,7 @@ impl PreparedPreview {
                 PreparedPreviewTarget::Directory(directory) => directory
                     .open_file(&relative_file)
                     .map(SecureFile::into_file)
-                    .map_err(|_| RawPreviewOpenError::Unavailable)?,
+                    .map_err(RawPreviewOpenError::Unavailable)?,
                 PreparedPreviewTarget::File(file) => file.into_file(),
             };
             let metadata = file.metadata().map_err(RawPreviewOpenError::Metadata)?;
@@ -309,7 +326,9 @@ impl PreparedPreview {
             ))
         })?
         .map_err(|error| match error {
-            RawPreviewOpenError::Unavailable => PublicTransferError::FileUnavailable,
+            RawPreviewOpenError::Unavailable(error) => {
+                PublicTransferError::storage_io(&error, PublicTransferError::FileUnavailable)
+            }
             RawPreviewOpenError::Metadata(error) => PublicTransferError::Internal(report_internal(
                 InternalOperation::WebRawPreviewFileMetadata,
                 error,

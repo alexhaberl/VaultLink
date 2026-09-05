@@ -210,7 +210,25 @@ fn validate_schema_7(conn: &Connection) -> rusqlite::Result<()> {
 
 fn validate_schema_8(conn: &Connection) -> rusqlite::Result<()> {
     validate_fingerprint(conn, SCHEMA_8_FINGERPRINT)?;
-    for target_version in 2..=8 {
+    validate_indexed_schema(conn, 8)
+}
+
+fn validate_schema_9(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_9_FINGERPRINT)?;
+    let sql: Option<String> = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_transfer_grants_pending_id'",
+        [], |row| row.get(0),
+    ).optional()?;
+    if sql.as_deref() != Some(PENDING_TRANSFER_INDEX_SQL) {
+        return Err(schema_error(
+            "schema 9 pending transfer index is missing or invalid",
+        ));
+    }
+    validate_indexed_schema(conn, 9)
+}
+
+fn validate_indexed_schema(conn: &Connection, version: i64) -> rusqlite::Result<()> {
+    for target_version in 2..=version {
         let migration_record = conn
             .query_row(
                 "SELECT applied_at FROM vaultlink_schema_migrations WHERE target_version=?1",

@@ -19,14 +19,9 @@ pub(super) struct AppServices {
 }
 
 impl AppServices {
-    pub(super) fn new(
-        config: Config,
-        database: Database,
-        active_admin_usernames: Vec<String>,
-    ) -> Self {
+    pub(super) fn new(config: Config, database: Database) -> Self {
         Self {
             admin_login_limiter: AdminLoginLimiter::new(
-                active_admin_usernames,
                 config.security.login_attempts,
                 config.security.account_login_attempts,
                 Duration::from_secs(config.security.login_window_seconds),

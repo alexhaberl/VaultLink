@@ -259,85 +259,73 @@ mod tests {
     }
 
     #[test]
-    fn unknown_username_churn_cannot_consume_known_admin_counters() {
-        let limiter = AdminLoginLimiter::new(["Admin".to_string()], 2, 2, Duration::from_secs(60));
+    fn password_origin_budget_is_shared_across_names() {
+        let limiter = AdminLoginLimiter::new(5, 25, Duration::from_secs(300));
         let origin = "192.0.2.1".parse().unwrap();
-        assert!(limiter.check_and_record_attempt("ADMIN", origin));
-
-        for index in 0..50_000 {
-            let _ = limiter.check_and_record_attempt(
-                &format!("random-{index}"),
-                "198.51.100.10".parse().unwrap(),
-            );
+        for name in ["admin", "unknown", "disabled", "Other", "invalid name"] {
+            assert!(limiter.check_and_record_attempt(name, origin));
         }
-
-        assert!(limiter.check_and_record_attempt("admin", origin));
-        assert!(!limiter.check_and_record_attempt("admin", origin));
+        for name in ["admin", "fresh-unknown", "disabled"] {
+            assert!(!limiter.check_and_record_attempt(name, origin));
+        }
+        assert!(limiter.check_and_record_attempt("admin", "192.0.2.2".parse().unwrap()));
     }
 
     #[test]
-    fn unknown_admin_limiter_state_stays_fixed_size_under_concurrency() {
-        use std::{sync::Barrier, thread};
+    fn account_denials_still_consume_origin_budget() {
+        let limiter = AdminLoginLimiter::new(2, 1, Duration::from_secs(60));
+        assert!(limiter.check_and_record_attempt("admin", "192.0.2.1".parse().unwrap()));
+        let other = "192.0.2.2".parse().unwrap();
+        assert!(!limiter.check_and_record_attempt("ADMIN", other));
+        assert!(!limiter.check_and_record_attempt("admin", other));
+        assert!(!limiter.check_and_record_attempt("new-account", other));
+    }
 
-        let limiter = AdminLoginLimiter::new([], 5, 10, Duration::from_secs(60));
-        let barrier = Arc::new(Barrier::new(16));
-        let handles = (0..16)
-            .map(|worker| {
+    #[test]
+    fn password_admission_is_atomic_under_concurrency() {
+        let limiter = AdminLoginLimiter::new(5, 25, Duration::from_secs(60));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let tasks = (0..16)
+            .map(|index| {
                 let limiter = limiter.clone();
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
                     barrier.wait();
-                    for attempt in 0..2_000 {
-                        let username = format!("unknown-{worker}-{attempt}");
-                        let origin = format!("198.51.{}.{}", worker + 1, attempt % 250 + 1)
-                            .parse()
-                            .unwrap();
-                        let _ = limiter.check_and_record_attempt(&username, origin);
-                    }
+                    limiter.check_and_record_attempt(
+                        &format!("name-{index}"),
+                        "192.0.2.1".parse().unwrap(),
+                    )
                 })
             })
             .collect::<Vec<_>>();
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
         assert_eq!(
-            limiter.state_sizes(),
-            (
-                0,
-                0,
-                UNKNOWN_ADMIN_ACCOUNT_BUCKETS,
-                UNKNOWN_ADMIN_IP_BUCKETS
-            )
+            tasks
+                .into_iter()
+                .filter_map(|t| t.join().ok())
+                .filter(|v| *v)
+                .count(),
+            5
         );
     }
 
     #[test]
-    fn exhausted_admin_account_budget_does_not_grow_origin_state() {
-        let limiter = AdminLoginLimiter::new(["admin".to_string()], 5, 1, Duration::from_secs(60));
-        assert!(limiter.check_and_record_attempt("admin", "192.0.2.1".parse().unwrap()));
-        let sizes = limiter.state_sizes();
-        assert!(!limiter.check_and_record_attempt("admin", "192.0.2.2".parse().unwrap()));
-        assert_eq!(limiter.state_sizes(), sizes);
-
-        let unknown = AdminLoginLimiter::new([], 5, 1, Duration::from_secs(60));
-        assert!(unknown.check_and_record_attempt("unknown", "198.51.100.1".parse().unwrap()));
-        let used_ip_buckets = unknown.used_unknown_ip_buckets();
-        assert!(!unknown.check_and_record_attempt("unknown", "203.0.113.1".parse().unwrap()));
-        assert_eq!(unknown.used_unknown_ip_buckets(), used_ip_buckets);
-    }
-
-    #[test]
-    fn known_admins_keep_per_origin_and_global_account_limits() {
-        let limiter = AdminLoginLimiter::new(["admin".to_string()], 2, 4, Duration::from_secs(60));
-        let first = "192.0.2.1".parse().unwrap();
-        let second = "192.0.2.2".parse().unwrap();
-        assert!(limiter.check_and_record_attempt("admin", first));
-        assert!(limiter.check_and_record_attempt("admin", first));
-        assert!(!limiter.check_and_record_attempt("admin", first));
-        assert!(limiter.check_and_record_attempt("admin", second));
-        assert!(limiter.check_and_record_attempt("admin", second));
-        assert!(!limiter.check_and_record_attempt("admin", second));
+    fn password_histories_expire_and_remain_bounded() {
+        let limiter = AdminLoginLimiter::new(5, 25, Duration::from_millis(1));
+        let origin = "192.0.2.1".parse().unwrap();
+        for _ in 0..5 {
+            assert!(limiter.check_and_record_attempt("admin", origin));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(limiter.check_and_record_attempt("admin", origin));
+        let bounded = AdminLoginLimiter::new(5, 25, Duration::from_secs(60));
+        for i in 0..12_000_u32 {
+            let ip = std::net::Ipv4Addr::from(i + 1).into();
+            let _ = bounded.check_and_record_attempt(&format!("name-{i}"), ip);
+        }
+        for state in [bounded.origins.state(), bounded.accounts.state()] {
+            assert!(state.entries.len() <= MAX_LIMITER_KEYS);
+            assert_eq!(state.overflow.len(), OVERFLOW_BUCKETS);
+        }
     }
 
     #[test]

@@ -88,7 +88,6 @@ impl AppState {
         validated_storage.verify_path_bindings(&config.storage)?;
         let database = Database::open_in_directory(validated_storage.data_file()?)?;
         database.configure_session_idle_timeout(config.security.session_idle_minutes);
-        let active_admin_usernames = database.active_admin_usernames()?;
         let persisted_runtime = database.runtime_settings()?;
         let runtime = crate::runtime_settings_from_persisted(&config, &persisted_runtime)
             .map_err(|error| format!("invalid persisted runtime settings: {error}"))?;
@@ -96,7 +95,7 @@ impl AppState {
             .map_err(|error| format!("invalid WebAuthn configuration: {error}"))?;
         let admissions = Admissions::new(&config.admission);
         Ok(Self(Arc::new(StateInner {
-            services: AppServices::new(config, database, active_admin_usernames),
+            services: AppServices::new(config, database),
             storage: StorageContext::new(secure_root, storage_instance_lock),
             runtime: RuntimeSnapshots::new(runtime, webauthn),
             admissions,

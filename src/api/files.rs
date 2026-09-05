@@ -153,7 +153,13 @@ pub(super) async fn files(
     })
     .await
     .map_err(|error| ApiError::from(report_internal(InternalOperation::ApiFilesListJoin, error)))?
-    .map_err(|error| ApiError::from(report_internal(InternalOperation::ApiFilesListScan, error)))?;
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            ApiError::storage_busy()
+        } else {
+            ApiError::from(report_internal(InternalOperation::ApiFilesListScan, error))
+        }
+    })?;
     let mut entries = entries
         .into_iter()
         .map(|entry| {

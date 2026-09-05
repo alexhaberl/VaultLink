@@ -1,0 +1,99 @@
+name: Verify performance evidence
+run-name: Performance ${{ inputs.kind }} ${{ inputs.commit_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Archive the historical baseline or qualify the current candidate
+        type: choice
+        options: [candidate, baseline]
+        default: candidate
+        required: true
+      commit_sha:
+        description: Exact measured commit (current main for candidates)
+        type: string
+        required: true
+      binary_sha256:
+        description: SHA-256 of the measured Debian 13 amd64 package binary
+        type: string
+        required: true
+      packages_run_id:
+        description: Successful Packages workflow run for the measured commit
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+  statuses: write
+
+concurrency:
+  group: vaultlink-performance-${{ inputs.commit_sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: release-performance
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate measurement identifiers
+        env:
+          MEASURED_COMMIT: ${{ inputs.commit_sha }}
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+          PACKAGES_RUN: ${{ inputs.packages_run_id }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          [[ "$MEASURED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$PACKAGES_RUN" =~ ^[1-9][0-9]*$ ]]
+          if [[ "$KIND" == candidate ]]; then test "$MEASURED_COMMIT" = "$GITHUB_SHA"; fi
+      - name: Configure restricted performance collector SSH key
+        id: ssh
+        env:
+          SOAK_SSH_HOST: ${{ secrets.PERFORMANCE_SSH_HOST }}
+          SOAK_SSH_PORT: ${{ secrets.PERFORMANCE_SSH_PORT }}
+          SOAK_SSH_USER: ${{ secrets.PERFORMANCE_SSH_USER }}
+          SOAK_SSH_PRIVATE_KEY: ${{ secrets.PERFORMANCE_SSH_PRIVATE_KEY }}
+          SOAK_SSH_HOST_KEYS: ${{ secrets.PERFORMANCE_SSH_HOST_KEYS }}
+        run: sh tools/configure-soak-ssh.sh
+      - name: Collect and verify five immutable measurements
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MEASURED_COMMIT: ${{ inputs.commit_sha }}
+          BINARY_SHA256: ${{ inputs.binary_sha256 }}
+          PACKAGES_RUN: ${{ inputs.packages_run_id }}
+          KIND: ${{ inputs.kind }}
+          SSH_CONFIG: ${{ steps.ssh.outputs.config }}
+        run: |
+          set -euo pipefail
+          ssh -F "$SSH_CONFIG" vaultlink-soak performance-collect "$MEASURED_COMMIT" "$BINARY_SHA256" > "$RUNNER_TEMP/performance-runs.zip"
+          python3 tools/produce-performance-evidence.py --kind "$KIND" --commit "$MEASURED_COMMIT" \
+            --binary-sha256 "$BINARY_SHA256" --packages-run-id "$PACKAGES_RUN" \
+            --runs "$RUNNER_TEMP/performance-runs.zip" --output "$RUNNER_TEMP/performance"
+      - name: Upload verified evidence before publishing success
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vaultlink-performance-${{ inputs.kind == 'baseline' && 'baseline-' || '' }}${{ inputs.commit_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/performance/*
+          if-no-files-found: error
+          retention-days: 90
+      - name: Publish candidate performance status
+        if: ${{ always() && inputs.kind == 'candidate' && inputs.commit_sha == github.sha }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          state=failure
+          if [[ "$OUTCOME" == success ]]; then state=success; fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context='vaultlink/performance' \
+            -f description='Exact-source and exact-binary performance evidence' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

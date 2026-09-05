@@ -180,9 +180,6 @@ async fn argon2_overload_is_identical_for_known_and_unknown_logins() {
         .db()
         .create_admin("admin", &hash, &auth::new_totp_secret())
         .unwrap();
-    state
-        .admin_login_limiter()
-        .replace_active_admins(state.db().active_admin_usernames().unwrap());
     let _capacity = state.acquire_all_argon2_for_test().await;
     let app = crate::web::router(state.clone());
 
@@ -221,9 +218,6 @@ async fn known_and_unknown_login_errors_are_identical_english_with_a_german_cook
         .db()
         .create_admin("admin", &hash, &auth::new_totp_secret())
         .unwrap();
-    state
-        .admin_login_limiter()
-        .replace_active_admins(state.db().active_admin_usernames().unwrap());
     let app = crate::web::router(state);
 
     let login = |username: &str| {

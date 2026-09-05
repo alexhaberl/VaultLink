@@ -170,6 +170,16 @@ fn validated_rename_paths(
     new_name: &str,
 ) -> Result<(String, String), FileOperationError> {
     let plan = plan_rename(path, new_name)?;
+    RequiredAuditEvent::new(
+        AuditAction::PathRenamed,
+        Some(plan.destination),
+        Some(format!(
+            "old_path={};updated_shares={};recovery=false",
+            plan.path,
+            usize::MAX
+        )),
+    )
+    .validate()?;
     Ok((plan.path, plan.new_name))
 }
 
@@ -201,6 +211,17 @@ pub(crate) async fn create_directory(
 ) -> Result<RequiredAuditFileOutcome<CreateDirectoryResult>, FileOperationError> {
     let parent = normalize(parent, true)?;
     let name = validate_name(name)?;
+    audit_context.validate()?;
+    RequiredAuditEvent::new(
+        AuditAction::DirectoryCreated,
+        Some(if parent.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent}/{name}")
+        }),
+        None,
+    )
+    .validate()?;
     let guard = acquire_storage_mutation(state).await?;
     let secure_root = state.secure_root().clone();
     let database = state.db().clone();
@@ -567,6 +588,7 @@ pub(crate) async fn delete(
     audit_context: AuditContext,
 ) -> Result<RequiredAuditFileOutcome<DeleteResult>, FileOperationError> {
     let path = normalize(path, false)?;
+    RequiredAuditEvent::new(AuditAction::PathDeleted, Some(path.clone()), None).validate()?;
     let confirmation = confirm_name.map(str::to_string);
     let guard = acquire_storage_mutation(state).await?;
     let secure_root = state.secure_root().clone();

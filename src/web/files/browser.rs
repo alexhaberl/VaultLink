@@ -113,18 +113,16 @@ fn acquire_admin_browser_admission(
 ) -> Result<(ClientActivityPermit, tokio::sync::OwnedSemaphorePermit)> {
     let peer = state
         .try_acquire_expensive_peer(current_client_limit_key())
-    .ok_or(AppError(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Too many concurrent expensive operations from this client",
-    ))?;
-    let search = state
-        .try_acquire_search()
-        .map_err(|_| {
-            AppError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Too many concurrent file searches",
-            )
-        })?;
+        .ok_or(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many concurrent expensive operations from this client",
+        ))?;
+    let search = state.try_acquire_search().map_err(|_| {
+        AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many concurrent file searches",
+        )
+    })?;
     Ok((peer, search))
 }
 
@@ -133,13 +131,14 @@ async fn load_admin_browser_listing(
     request: &AdminBrowseRequest,
     settings: &crate::runtime::RuntimeSettings,
 ) -> Result<AdminBrowserListing> {
-    let (_peer_permit, _search_permit) = acquire_admin_browser_admission(state)?;
+    let (peer_permit, search_permit) = acquire_admin_browser_admission(state)?;
+    let admission = super::common::ScanAdmission::new(peer_permit, search_permit);
     let storage_guard = file_ops::acquire_storage_read(state)
         .await
         .map_err(storage_recovery_app_error)?;
     let storage_generation = storage_guard.generation();
     if let Some(search) = request.search.as_deref() {
-        load_admin_search_results(state, request, settings, search, storage_guard).await
+        load_admin_search_results(state, request, settings, search, storage_guard, admission).await
     } else {
         load_admin_directory_page(
             state,
@@ -148,6 +147,7 @@ async fn load_admin_browser_listing(
             settings.max_search_entries,
             storage_generation,
             storage_guard,
+            admission,
         )
         .await
     }
@@ -159,28 +159,32 @@ async fn load_admin_search_results(
     settings: &crate::runtime::RuntimeSettings,
     search: &str,
     storage_guard: crate::storage_authority::StorageReadGuard,
+    admission: std::sync::Arc<super::common::ScanAdmission>,
 ) -> Result<AdminBrowserListing> {
     let root = state.secure_root().clone();
     let base = request.relative.clone();
     let search = search.to_string();
     let search_settings = settings.clone();
-    let mut hits = tokio::task::spawn_blocking(move || {
-        let _storage_guard = storage_guard;
-        search_tree(&root, &base, &search, &search_settings)
-    })
-    .await
-    .map_err(|error| {
-        AppError::from(report_internal(
-            InternalOperation::WebAdminSearchTaskJoin,
-            error,
-        ))
-    })?
-    .map_err(|error| {
-        AppError::from(report_internal(
-            InternalOperation::WebAdminSearchFailure,
-            error,
-        ))
-    })?;
+    let mut hits = admission
+        .spawn_blocking(move || {
+            let _storage_guard = storage_guard;
+            search_tree(&root, &base, &search, &search_settings)
+        })
+        .await
+        .map_err(|error| {
+            AppError::from(report_internal(
+                InternalOperation::WebAdminSearchTaskJoin,
+                error,
+            ))
+        })?
+        .map_err(|error| {
+            AppError::storage_io(error, |error| {
+                AppError::from(report_internal(
+                    InternalOperation::WebAdminSearchFailure,
+                    error,
+                ))
+            })
+        })?;
     sort_search_hits(&mut hits, request.sort, request.direction);
     let rows = hits
         .into_iter()
@@ -210,6 +214,7 @@ async fn load_admin_directory_page(
     scan_limit: usize,
     storage_generation: u64,
     storage_guard: crate::storage_authority::StorageReadGuard,
+    admission: std::sync::Arc<super::common::ScanAdmission>,
 ) -> Result<AdminBrowserListing> {
     let listing_path = request.relative.clone();
     let cursor_after = request.after.clone();
@@ -227,32 +232,36 @@ async fn load_admin_directory_page(
         scan_limit,
         storage_generation,
     };
+    let snapshot_admission = admission.clone();
     let snapshot = state
         .directory_snapshot_cache()
         .get_or_try_load(snapshot_key, || async move {
-            tokio::task::spawn_blocking(move || {
-                let _storage_guard = storage_guard;
-                build_directory_snapshot(
-                    &snapshot_root,
-                    &snapshot_path,
-                    scan_limit,
-                    sort,
-                    direction,
-                )
-            })
-            .await
-            .map_err(|error| {
-                AppError::from(report_internal(
-                    InternalOperation::WebAdminDirectoryListTaskJoin,
-                    error,
-                ))
-            })?
-            .map_err(|error| {
-                AppError::from(report_internal(
-                    InternalOperation::WebAdminDirectoryListFailure,
-                    error,
-                ))
-            })
+            snapshot_admission
+                .spawn_blocking(move || {
+                    let _storage_guard = storage_guard;
+                    build_directory_snapshot(
+                        &snapshot_root,
+                        &snapshot_path,
+                        scan_limit,
+                        sort,
+                        direction,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    AppError::from(report_internal(
+                        InternalOperation::WebAdminDirectoryListTaskJoin,
+                        error,
+                    ))
+                })?
+                .map_err(|error| {
+                    AppError::storage_io(error, |error| {
+                        AppError::from(report_internal(
+                            InternalOperation::WebAdminDirectoryListFailure,
+                            error,
+                        ))
+                    })
+                })
         })
         .await?;
     let page = match snapshot {
@@ -267,25 +276,26 @@ async fn load_admin_directory_page(
             let fallback_guard = file_ops::acquire_storage_read(state)
                 .await
                 .map_err(storage_recovery_app_error)?;
-            tokio::task::spawn_blocking(move || {
-                let _storage_guard = fallback_guard;
-                list_directory_cursor_page(
-                    &root,
-                    &listing_path,
-                    cursor_after.as_deref(),
-                    cursor_before.as_deref(),
-                    scan_limit,
-                    sort,
-                    direction,
-                )
-            })
-            .await
-            .map_err(|error| {
-                AppError::from(report_internal(
-                    InternalOperation::WebAdminDirectoryListTaskJoin,
-                    error,
-                ))
-            })?
+            admission
+                .spawn_blocking(move || {
+                    let _storage_guard = fallback_guard;
+                    list_directory_cursor_page(
+                        &root,
+                        &listing_path,
+                        cursor_after.as_deref(),
+                        cursor_before.as_deref(),
+                        scan_limit,
+                        sort,
+                        direction,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    AppError::from(report_internal(
+                        InternalOperation::WebAdminDirectoryListTaskJoin,
+                        error,
+                    ))
+                })?
         }
     }
     .map_err(admin_directory_page_error)?;
@@ -316,10 +326,12 @@ fn admin_directory_page_error(error: std::io::Error) -> AppError {
     if error.kind() == std::io::ErrorKind::InvalidInput {
         AppError(StatusCode::BAD_REQUEST, "Invalid directory cursor")
     } else {
-        AppError::from(report_internal(
-            InternalOperation::WebAdminDirectoryListFailure,
-            error,
-        ))
+        AppError::storage_io(error, |error| {
+            AppError::from(report_internal(
+                InternalOperation::WebAdminDirectoryListFailure,
+                error,
+            ))
+        })
     }
 }
 
