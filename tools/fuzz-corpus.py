@@ -67,8 +67,12 @@ def add_input(destination: Path, data: bytes) -> str:
         raise ValueError(f"corpus directory may not be a symlink: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
     path = destination / digest
+    # exists() follows links and returns False for a dangling link. Reject the
+    # link itself before deciding whether a digest file needs to be created.
+    if path.is_symlink():
+        raise ValueError(f"corpus input may not be a symlink: {path}")
     if path.exists():
-        if path.is_symlink() or path.read_bytes() != data:
+        if path.read_bytes() != data:
             raise ValueError(f"conflicting corpus input: {path}")
     else:
         path.write_bytes(data)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -62,6 +63,30 @@ class CorpusTests(unittest.TestCase):
         self.assertEqual({path.read_bytes() for path in CORPUS.files(destination / "alpha")}, {b"interesting", b"fixed regression"})
         self.assertTrue(all(len(path.name) == 64 for path in CORPUS.files(destination / "alpha")))
         self.assertEqual((self.root / "fuzz/corpus/alpha/seed").read_bytes(), b"fixed regression")
+
+    def test_add_input_rejects_dangling_and_existing_digest_symlinks(self):
+        data = b"new regression"
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                destination = self.base / f"runtime-{existing}"
+                destination.mkdir()
+                outside = self.base / f"outside-{existing}"
+                if existing:
+                    outside.write_bytes(b"must stay unchanged")
+                link = destination / hashlib.sha256(data).hexdigest()
+                try:
+                    link.symlink_to(outside)
+                except OSError as error:
+                    if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                        self.skipTest("Windows account lacks the symlink creation privilege")
+                    raise
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    CORPUS.add_input(destination, data)
+                self.assertTrue(link.is_symlink())
+                if existing:
+                    self.assertEqual(outside.read_bytes(), b"must stay unchanged")
+                else:
+                    self.assertFalse(outside.exists())
 
     def test_schema_change_skips_previous_inputs_with_explicit_record(self):
         old = self.fixture(schema=2)
