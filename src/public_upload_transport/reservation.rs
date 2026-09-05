@@ -1,6 +1,6 @@
 use crate::{
     db::{Database, UploadReservationBeginOutcome},
-    http_auth::{database, database_runtime_permit},
+    http_auth::{transfer_database, transfer_database_runtime_permit},
     internal_reporting::{report_internal, InternalOperation},
 };
 
@@ -57,7 +57,7 @@ impl UploadQuotaReservation {
     pub(super) async fn cancel(mut self) -> Result<()> {
         let token = self.token.clone();
         let database_handle = self.database.clone();
-        database(database_handle, move |database| {
+        transfer_database(database_handle, move |database| {
             database.cancel_upload_reservation(&token)
         })
         .await?;
@@ -74,9 +74,9 @@ impl Drop for UploadQuotaReservation {
         self.armed = false;
         let token = std::mem::take(&mut self.token);
         let database = self.database.clone();
-        spawn_drop_database_cleanup(database, "upload_reservation_cancel", move |database| {
-            let _ = database.cancel_upload_reservation(&token);
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            database.enqueue_upload_reservation_cleanup(&handle, token);
+        }
     }
 }
 
@@ -88,7 +88,8 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
 ) -> Result<PendingReservationOwnership<UploadReservationBeginOutcome>> {
     let queue_started = std::time::Instant::now();
     let permit =
-        database_runtime_permit(&database, "upload_reservation_begin", queue_started).await?;
+        transfer_database_runtime_permit(&database, "upload_reservation_begin", queue_started)
+            .await?;
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
@@ -127,35 +128,4 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
         outcome,
         ownership_sender: Some(ownership_sender),
     })
-}
-
-fn spawn_drop_database_cleanup<F>(database: Database, class: &'static str, cleanup: F)
-where
-    F: FnOnce(&Database) + Send + 'static,
-{
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    match database.try_acquire_runtime_permit() {
-        Ok(permit) => {
-            drop(handle.spawn_blocking(move || {
-                let _permit = permit;
-                cleanup(&database);
-            }));
-        }
-        Err(_) => {
-            drop(handle.spawn(async move {
-                let queue_started = std::time::Instant::now();
-                let Ok(permit) = database_runtime_permit(&database, class, queue_started).await
-                else {
-                    return;
-                };
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    cleanup(&database);
-                })
-                .await;
-            }));
-        }
-    }
 }

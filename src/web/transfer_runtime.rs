@@ -37,7 +37,7 @@ use crate::{
         AuditContext, Database, TransferLeaseBeginOutcome, TransferLeaseCompleteOutcome,
         UploadReservationBeginOutcome,
     },
-    http_auth::{database, database_runtime_permit},
+    http_auth::{transfer_database, transfer_database_runtime_permit},
     internal_reporting::report_invariant,
     AppState,
 };

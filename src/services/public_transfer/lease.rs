@@ -12,7 +12,7 @@ use crate::{
     state::ShareActivityPermit,
 };
 
-use super::{prepare::run_database_read, PublicTransferError, PublicTransferService};
+use super::{PublicTransferError, PublicTransferService};
 
 pub(crate) struct PublicTransferClient {
     pub(crate) client_key: String,
@@ -75,7 +75,7 @@ impl PublicTransferLease {
         self.heartbeat_stop.take();
         let lease_token = self.lease_token.clone();
         let cancellation_database = self.database.clone();
-        if run_database_read(cancellation_database, move |database| {
+        if run_transfer_database_write(cancellation_database, move |database| {
             database.cancel_transfer_lease(&lease_token).map(|_| ())
         })
         .await
@@ -109,7 +109,7 @@ impl Drop for PublicTransferLease {
         self.heartbeat_stop.take();
         if self.armed {
             self.armed = false;
-            spawn_transfer_cancel(self.database.clone(), std::mem::take(&mut self.lease_token));
+            spawn_transfer_cancel(&self.database, std::mem::take(&mut self.lease_token));
         }
     }
 }
@@ -187,7 +187,7 @@ impl PublicTransferService {
     ) -> Result<(), PublicTransferError> {
         let session_token = session_token.unwrap_or_else(|| auth::random_token(32));
         let share_id = share.id;
-        let outcome = run_database_read(self.state().db().clone(), move |database| {
+        let outcome = run_transfer_database_write(self.state().db().clone(), move |database| {
             database.check_transfer_availability(&session_token, share_id, &resource_key, action)
         })
         .await?;
@@ -212,7 +212,7 @@ async fn begin_transfer_lease_cancellation_safe(
     resource_key: String,
     action: &'static str,
 ) -> Result<PendingLeaseOwnership, PublicTransferError> {
-    let permit = acquire_database_permit(&database).await?;
+    let permit = acquire_transfer_database_permit(&database).await?;
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
@@ -297,7 +297,7 @@ async fn heartbeat_once(
     share_id: i64,
     client_ip: Option<String>,
 ) -> bool {
-    let Ok(permit) = acquire_database_permit(&database).await else {
+    let Ok(permit) = acquire_transfer_database_permit(&database).await else {
         return true;
     };
     match tokio::task::spawn_blocking(move || {
@@ -351,9 +351,11 @@ pub(super) fn transfer_complete_future(
     Box<dyn Future<Output = Result<(), crate::internal_reporting::ReportedInternalError>> + Send>,
 > {
     Box::pin(async move {
-        let permit = acquire_database_permit(&database).await.map_err(|error| {
-            report_internal(InternalOperation::WebTransferCompleteDatabase, error)
-        })?;
+        let permit = acquire_transfer_database_permit(&database)
+            .await
+            .map_err(|error| {
+                report_internal(InternalOperation::WebTransferCompleteDatabase, error)
+            })?;
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             database.complete_transfer_lease_and_audit(
@@ -383,48 +385,47 @@ pub(super) fn transfer_complete_future(
     })
 }
 
-pub(super) fn spawn_transfer_cancel(database: Database, lease_token: String) {
-    spawn_drop_database_cleanup(database, "transfer_cancel", move |database| {
-        let _ = database.cancel_transfer_lease(&lease_token);
-    });
-}
-
-fn spawn_drop_database_cleanup<F>(database: Database, class: &'static str, cleanup: F)
-where
-    F: FnOnce(&Database) + Send + 'static,
-{
+pub(super) fn spawn_transfer_cancel(database: &Database, lease_token: String) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    match database.try_acquire_runtime_permit() {
-        Ok(permit) => drop(handle.spawn_blocking(move || {
-            let _permit = permit;
-            cleanup(&database);
-        })),
-        Err(_) => drop(handle.spawn(async move {
-            let Ok(permit) = acquire_database_permit(&database).await else {
-                return;
-            };
-            let _ = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                cleanup(&database);
-            })
-            .await;
-            tracing::trace!(class, "public transfer cleanup finished");
-        })),
-    }
+    database.enqueue_transfer_lease_cleanup(&handle, lease_token);
 }
 
-async fn acquire_database_permit(
+async fn acquire_transfer_database_permit(
     database: &Database,
-) -> Result<tokio::sync::OwnedSemaphorePermit, PublicTransferError> {
+) -> Result<crate::db::TransferDatabasePermit, PublicTransferError> {
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        database.acquire_runtime_permit(),
+        database.acquire_transfer_runtime_permit(),
     )
     .await
     .map_err(|_| PublicTransferError::Capacity)?
     .map_err(|_| PublicTransferError::Capacity)
+}
+
+async fn run_transfer_database_write<T, F>(
+    database: Database,
+    operation: F,
+) -> Result<T, PublicTransferError>
+where
+    T: Send + 'static,
+    F: FnOnce(&Database) -> rusqlite::Result<T> + Send + 'static,
+{
+    match crate::db::execute_transfer_database_operation(
+        database,
+        "transfer_write",
+        move |database| operation(&database),
+    )
+    .await
+    {
+        Ok(value) => Ok(value),
+        Err(crate::db::DatabaseExecutionError::Admission(_)) => Err(PublicTransferError::Capacity),
+        Err(crate::db::DatabaseExecutionError::Join(error)) => Err(PublicTransferError::Internal(
+            report_internal(InternalOperation::HttpAuthDatabaseReadJoin, error),
+        )),
+        Err(crate::db::DatabaseExecutionError::Operation(error)) => Err(database_error(error)),
+    }
 }
 
 fn database_error(error: rusqlite::Error) -> PublicTransferError {

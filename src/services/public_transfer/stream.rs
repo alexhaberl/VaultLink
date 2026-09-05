@@ -107,7 +107,7 @@ impl PublicTransferStream {
     fn cancel_with_error(&mut self, error: io::Error) -> Poll<Option<io::Result<Bytes>>> {
         self.heartbeat_stop.take();
         if let Some(token) = self.lease_token.take() {
-            spawn_transfer_cancel(self.database.clone(), token);
+            spawn_transfer_cancel(&self.database, token);
         }
         Poll::Ready(Some(Err(error)))
     }
@@ -116,7 +116,7 @@ impl PublicTransferStream {
         if let Some(token) = self.finalizing_lease_token.take() {
             // This detached cleanup retains DB admission inside its blocking
             // worker, so dropping the HTTP body cannot cancel or over-admit it.
-            spawn_transfer_cancel(self.database.clone(), token);
+            spawn_transfer_cancel(&self.database, token);
         }
     }
 }
@@ -196,7 +196,7 @@ impl Drop for PublicTransferStream {
     fn drop(&mut self) {
         self.heartbeat_stop.take();
         if let Some(token) = self.lease_token.take() {
-            spawn_transfer_cancel(self.database.clone(), token);
+            spawn_transfer_cancel(&self.database, token);
         }
     }
 }

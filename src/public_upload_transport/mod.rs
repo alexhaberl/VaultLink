@@ -37,8 +37,9 @@ use crate::{
     file_ops,
     http_auth::{
         audit_observation, current_audit_client_ip, current_client_limit_key, database,
-        enabled_audit_client_ip, required_audited_database, runtime_settings, share_is_unlocked,
-        share_unlock_csrf, with_audit_client_ip, ClientActivityPermit, ShareActivityPermit,
+        enabled_audit_client_ip, required_audited_transfer_database, runtime_settings,
+        share_is_unlocked, share_unlock_csrf, transfer_database, with_audit_client_ip,
+        ClientActivityPermit, ShareActivityPermit,
     },
     http_contract::{
         request_body_timed_out, MAX_UPLOAD_OPTION_FIELD_BYTES, MAX_UPLOAD_PATH_FIELD_BYTES,
@@ -466,7 +467,7 @@ impl StagedUpload {
                 self.reservation.reserved_bytes
             };
             let reservation_token = self.reservation.token().to_string();
-            let outcome = database(state.db().clone(), move |database| {
+            let outcome = transfer_database(state.db().clone(), move |database| {
                 database.extend_upload_reservation(&reservation_token, rounded_target)
             })
             .await
@@ -477,7 +478,7 @@ impl StagedUpload {
             {
                 accepted_target = new_total;
                 let reservation_token = self.reservation.token().to_string();
-                database(state.db().clone(), move |database| {
+                transfer_database(state.db().clone(), move |database| {
                     database.extend_upload_reservation(&reservation_token, new_total)
                 })
                 .await
@@ -662,7 +663,7 @@ impl PreparedUpload {
     ) -> Result<PublicUploadCommit> {
         let reservation_token = self.reservation.token().to_string();
         let total = self.total;
-        let quota_commit = required_audited_database(database_handle, move |database| {
+        let quota_commit = required_audited_transfer_database(database_handle, move |database| {
             database.commit_upload_reservation_and_audit_audited(
                 &reservation_token,
                 total,
