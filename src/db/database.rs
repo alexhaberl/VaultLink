@@ -149,7 +149,10 @@ impl Database {
         let pool = r2d2::Pool::builder()
             .max_size(pool_capacity)
             .connection_timeout(std::time::Duration::from_secs(1))
-            .build(manager)
+            .build_unchecked(manager);
+        // Startup must tolerate SQLite's five-second busy handler and pool
+        // worker scheduling without extending the runtime checkout budget.
+        warm_connection_pool(&pool, std::time::Duration::from_secs(10))
             .map_err(DatabaseError::Pool)?;
         let mut conn = pool.get().map_err(DatabaseError::Pool)?;
         if persistent {
@@ -397,6 +400,22 @@ fn blocking_acquire_transfer_runtime_permit(
             std::task::Poll::Pending => std::thread::park_timeout(remaining),
         }
     }
+}
+
+fn warm_connection_pool(
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+    timeout: std::time::Duration,
+) -> Result<(), r2d2::Error> {
+    let deadline = std::time::Instant::now() + timeout;
+    // Retain every checkout until the entire pool is ready. Returning each
+    // connection immediately would repeatedly check out the same member and
+    // let startup succeed with only part of the pool initialized.
+    let mut connections = Vec::with_capacity(pool.max_size() as usize);
+    for _ in 0..pool.max_size() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        connections.push(pool.get_timeout(remaining)?);
+    }
+    Ok(())
 }
 
 fn configure_connection(connection: &mut Connection) -> rusqlite::Result<()> {

@@ -432,6 +432,67 @@ fn persistent_database_uses_four_connections_and_memory_uses_one() {
 }
 
 #[test]
+fn persistent_database_startup_waits_for_sqlite_lock_beyond_checkout_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("data.sqlite");
+    let blocker = Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        blocker.execute_batch("ROLLBACK").unwrap();
+    });
+
+    let opened = Database::open(&path);
+    release.join().unwrap();
+    let database = opened.unwrap();
+    assert_eq!(database.admin_count().unwrap(), 0);
+    assert_eq!(database.0.pool.state().connections, 4);
+    assert_eq!(database.0.pool.state().idle_connections, 4);
+    assert_eq!(
+        database.0.pool.connection_timeout(),
+        std::time::Duration::from_secs(1)
+    );
+
+    let connections: Vec<_> = (0..4).map(|_| database.0.pool.get().unwrap()).collect();
+    for connection in &connections {
+        let journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        let foreign_keys: i64 = connection
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+    }
+    assert!(database.try_conn().is_err());
+}
+
+#[test]
+fn database_pool_startup_rejects_partial_initialization_at_its_deadline() {
+    let opened = std::sync::atomic::AtomicUsize::new(0);
+    let manager = SqliteConnectionManager::memory().with_init(move |connection| {
+        if opened.fetch_add(1, Ordering::SeqCst) == 0 {
+            configure_connection(connection)
+        } else {
+            Err(rusqlite::Error::InvalidQuery)
+        }
+    });
+    let pool = r2d2::Pool::builder()
+        .max_size(2)
+        .connection_timeout(std::time::Duration::from_secs(1))
+        .build_unchecked(manager);
+    // Wait for the one successful member so the startup check exercises a
+    // partially ready pool even when CI schedules its workers slowly.
+    drop(
+        pool.get_timeout(std::time::Duration::from_secs(10))
+            .unwrap(),
+    );
+    assert!(warm_connection_pool(&pool, std::time::Duration::from_millis(100)).is_err());
+    assert_eq!(pool.state().connections, 1);
+    assert_eq!(pool.state().idle_connections, 1);
+}
+
+#[test]
 fn queued_transfer_writers_do_not_exhaust_persistent_read_pool() {
     let directory = tempfile::tempdir().unwrap();
     let database = Database::open(directory.path().join("data.sqlite")).unwrap();
