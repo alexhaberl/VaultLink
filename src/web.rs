@@ -21,6 +21,8 @@ mod admin;
 mod admission;
 mod auth_ui;
 mod common;
+#[cfg(feature = "fuzzing")]
+pub(crate) use common::fuzz::check_directory_cursor;
 mod files;
 mod preview_zip;
 mod public;

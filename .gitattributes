@@ -21,3 +21,4 @@ Caddyfile text eol=lf
 .gitignore text eol=lf
 .dockerignore text eol=lf
 .gitleaksignore text eol=lf
+fuzz/corpus/** -text

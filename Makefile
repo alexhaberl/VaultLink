@@ -1,4 +1,4 @@
-.PHONY: dev-setup sample-data test login-timing-check security-test secret-check web-assets-check architecture-check performance-evidence-check refactoring-contracts-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check package-manifest-bootstrap package-manifest-check native-package verify-native-package docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test docker-update-safety-test docker-real-package-update-smoke
+.PHONY: dev-setup sample-data test login-timing-check security-test secret-check web-assets-check architecture-check performance-evidence-check refactoring-contracts-check fuzz-policy-check fuzz fuzz-parallel fuzz-sequential lint build run policy-check package-manifest-bootstrap package-manifest-check native-package verify-native-package docker-smoke-build docker-test docker-smoke docker-setup-smoke docker-api-smoke docker-load-fixture-smoke docker-soak-evidence-smoke docker-soak-remote-smoke docker-upgrade-safety-test docker-update-safety-test docker-real-package-update-smoke
 
 CONFIG ?= config/development.toml
 DOCKER_SMOKE_IMAGE ?= vaultlink:smoke
@@ -17,7 +17,7 @@ REAL_PACKAGE_NEW_VERSION ?= 0.7.1
 REAL_PACKAGE_BUILDER_IMAGE ?= $(shell $(PYTHON) tools/package-targets.py get "$(REAL_PACKAGE_TARGET)" builder_image 2>/dev/null)
 REAL_PACKAGE_OLD_PACKAGE ?= $(PACKAGE_OUTPUT)/$(shell $(PYTHON) tools/package-targets.py asset "$(REAL_PACKAGE_TARGET)" "$(REAL_PACKAGE_OLD_VERSION)" --allow-unprovisioned 2>/dev/null)
 REAL_PACKAGE_NEW_PACKAGE ?= $(PACKAGE_OUTPUT)/$(shell $(PYTHON) tools/package-targets.py asset "$(REAL_PACKAGE_TARGET)" "$(REAL_PACKAGE_NEW_VERSION)" --allow-unprovisioned 2>/dev/null)
-FUZZ_TARGETS := path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_request_state share_request_policy file_mutation_policy multipart_guard
+FUZZ_TARGETS = $(shell $(PYTHON) tools/fuzz-corpus.py targets)
 
 dev-setup: sample-data
 	@command -v cargo >/dev/null || (echo "Rust is missing; install it from https://rustup.rs" && exit 1)
@@ -72,8 +72,14 @@ refactoring-contracts-check:
 
 fuzz: fuzz-parallel
 
+fuzz-policy-check:
+	$(PYTHON) tools/test-fuzz-corpus.py
+	$(PYTHON) tools/test-fuzz-policy.py
+	$(PYTHON) tools/generate-fuzz-seeds.py --check
+	$(PYTHON) tools/check-fuzz-policy.py
+
 fuzz-parallel:
-	@FUZZ_JOBS="$(FUZZ_JOBS)" FUZZ_MAX_TOTAL_TIME="$(FUZZ_MAX_TOTAL_TIME)" FUZZ_LOG_DIR="$(FUZZ_LOG_DIR)" \
+	@PYTHON="$(PYTHON)" FUZZ_JOBS="$(FUZZ_JOBS)" FUZZ_MAX_TOTAL_TIME="$(FUZZ_MAX_TOTAL_TIME)" FUZZ_LOG_DIR="$(FUZZ_LOG_DIR)" \
 		sh tools/run-fuzz-targets.sh $(FUZZ_TARGETS)
 
 fuzz-sequential:
@@ -81,7 +87,7 @@ fuzz-sequential:
 
 lint:
 	sh tools/check-web-assets.sh
-	$(MAKE) architecture-check performance-evidence-check refactoring-contracts-check
+	$(MAKE) architecture-check performance-evidence-check refactoring-contracts-check fuzz-policy-check
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
 

@@ -84,6 +84,9 @@ fail-closed until checked against the exact release commit.
 - [ ] `cargo fmt --check`, Clippy, locked unit/integration tests, coverage,
   dependency audits, fuzz compilation/campaigns, secret scan, and policy checks
   pass at the exact candidate commit.
+- [ ] Both 600-second fuzz gates include all thirteen targets, validated corpus
+  replays, successful minimization, and retained evidence. Review the separate
+  per-target source coverage report; its percentages are not a release gate.
 - [ ] Route inventory and API smoke include all new routes, token creation,
   monitoring reads, redaction, negative route access, restart persistence,
   revocation, and log leak checks.

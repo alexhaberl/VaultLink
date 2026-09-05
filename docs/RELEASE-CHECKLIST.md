@@ -128,7 +128,7 @@ performing Git-based release checks.
 
 ## Remaining release gates
 
-- [ ] Ten-minute fuzz gate on amd64 and arm64 for path normalization, byte range, filenames, ZIP/search/preview paths, overwrite policy, real upload-request state, real Share-request policy, file mutation/subtree policy, and multipart streaming boundaries. The weekly native matrix runs all nine targets with two workers while private and four when public, with a 120-minute timeout; the manual final-commit run remains the release gate.
+- [ ] Ten-minute fuzz gate on amd64 and arm64 for all thirteen targets in `docs/FUZZING.md`, including authentication headers, journal recovery, directory cursors, and real ZIP/preview I/O. Each campaign restores validated corpora, replays inputs, fuzzes every target for 600 seconds, and minimizes the result. The weekly native matrix uses two workers while private and four when public, with a 180-minute timeout including bounded builds/replays/minimization; the manual final-commit run remains the release gate. Retain both corpus snapshots and inspect the per-target statistics. The separate AMD64 source-coverage report is informational.
 - [ ] Repeat `cargo-audit 0.22.2 --deny warnings --ignore RUSTSEC-2023-0071`, inspect the shared `Cargo.lock`, and confirm no additional exception exists.
 - [ ] GitHub Actions CI green on final `main`.
 - [ ] Locked release dry-run green on GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm`, using exactly the digest-pinned multi-arch Debian 13 builder with no runtime APT/Cargo installation. The tag-only signing and publishing job runs on a fresh `ubuntu-24.04` VM behind the protected `release-signing` environment.

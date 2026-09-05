@@ -35,8 +35,7 @@ enum ExactHeader<'a> {
     Ambiguous,
 }
 
-fn exact_session_cookie<'a>(state: &AppState, headers: &'a HeaderMap) -> ExactHeader<'a> {
-    let name = session_cookie_name(state);
+fn exact_session_cookie<'a>(headers: &'a HeaderMap, name: &str) -> ExactHeader<'a> {
     let mut found = None;
     for header_value in headers.get_all(header::COOKIE) {
         let Ok(value) = header_value.to_str() else {
@@ -96,14 +95,18 @@ fn strict_service_token(value: &str) -> Option<&str> {
     Some(token)
 }
 
-/// Authorizes the deliberately narrow monitoring API with exactly one
-/// authentication mechanism. All other administrator routes remain cookie-only.
-pub(crate) async fn authorize_monitoring(
-    state: &(impl Borrow<AppState> + ?Sized),
-    headers: &HeaderMap,
-) -> Result<()> {
-    let state = borrowed_app_state(state);
-    let cookie = exact_session_cookie(state, headers);
+enum MonitoringCredentials<'a> {
+    Session,
+    ServiceToken(&'a str),
+}
+
+// Keep syntax/ambiguity selection independent of database work. Both the HTTP
+// adapter and the fuzz harness exercise this exact decision.
+fn monitoring_credentials<'a>(
+    headers: &'a HeaderMap,
+    cookie_name: &str,
+) -> Result<MonitoringCredentials<'a>> {
+    let cookie = exact_session_cookie(headers, cookie_name);
     let authorization = exact_authorization(headers);
     match (cookie, authorization) {
         (ExactHeader::One(_), ExactHeader::One(_) | ExactHeader::Malformed)
@@ -118,19 +121,32 @@ pub(crate) async fn authorize_monitoring(
             StatusCode::UNAUTHORIZED,
             "Invalid authentication",
         )),
-        (ExactHeader::One(_), ExactHeader::Missing) => {
+        (ExactHeader::One(_), ExactHeader::Missing) => Ok(MonitoringCredentials::Session),
+        (ExactHeader::Missing, ExactHeader::One(value)) => strict_service_token(value)
+            .map(MonitoringCredentials::ServiceToken)
+            .ok_or_else(|| HttpAuthError::status(StatusCode::UNAUTHORIZED, "Invalid authentication")),
+        (ExactHeader::Missing, ExactHeader::Missing) => Err(HttpAuthError::status(
+            StatusCode::UNAUTHORIZED,
+            "Authentication required",
+        )),
+    }
+}
+
+/// Authorizes the deliberately narrow monitoring API with exactly one
+/// authentication mechanism. All other administrator routes remain cookie-only.
+pub(crate) async fn authorize_monitoring(
+    state: &(impl Borrow<AppState> + ?Sized),
+    headers: &HeaderMap,
+) -> Result<()> {
+    let state = borrowed_app_state(state);
+    match monitoring_credentials(headers, session_cookie_name(state))? {
+        MonitoringCredentials::Session => {
             session(state, headers, true, MissingSession::Unauthorized)
                 .await
                 .map(drop)
         }
-        (ExactHeader::Missing, ExactHeader::One(value)) => {
-            let token = zeroize::Zeroizing::new(
-                strict_service_token(value)
-                    .ok_or_else(|| {
-                        HttpAuthError::status(StatusCode::UNAUTHORIZED, "Invalid authentication")
-                    })?
-                    .to_owned(),
-            );
+        MonitoringCredentials::ServiceToken(value) => {
+            let token = zeroize::Zeroizing::new(value.to_owned());
             let outcome = database(state.db().clone(), move |database| {
                 database.authorize_service_token(
                     token.as_str(),
@@ -152,10 +168,6 @@ pub(crate) async fn authorize_monitoring(
                 }
             }
         }
-        (ExactHeader::Missing, ExactHeader::Missing) => Err(HttpAuthError::status(
-            StatusCode::UNAUTHORIZED,
-            "Authentication required",
-        )),
     }
 }
 

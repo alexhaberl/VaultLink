@@ -1,0 +1,1 @@
+{"operation": "rename", "original_path": "before", "new_path": "after", "kind": "file", "device": 1, "inode": 1, "phase": "moved"}

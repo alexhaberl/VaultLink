@@ -4,13 +4,13 @@ use std::{convert::Infallible, sync::OnceLock};
 
 use axum::{
     body::{to_bytes, Body, Bytes},
-    http::{header::CONTENT_TYPE, Request},
+    extract::{FromRequest, Multipart},
+    http::{header::CONTENT_TYPE, HeaderValue, Request},
 };
 use futures_util::stream;
 use libfuzzer_sys::fuzz_target;
 use vaultlink::multipart_guard::{guard_multipart_request_with_limits, MultipartGuardLimits};
 
-const BOUNDARY: &str = "vaultlink-fuzz-boundary";
 const MAX_FUZZ_BODY_BYTES: usize = 256 * 1024;
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -18,78 +18,193 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("fuzz runtime")
+            .unwrap()
     })
 }
 
-fuzz_target!(|input: &[u8]| {
-    let control = |index: usize, default: u8| input.get(index).copied().unwrap_or(default);
+fn request(raw: &[u8], content_type: &HeaderValue, chunk_size: usize) -> Request<Body> {
+    let chunks: Vec<_> = raw
+        .chunks(chunk_size)
+        .map(|chunk| Ok::<_, Infallible>(Bytes::copy_from_slice(chunk)))
+        .collect();
+    Request::builder()
+        .header(CONTENT_TYPE, content_type)
+        .body(Body::from_stream(stream::iter(chunks)))
+        .unwrap()
+}
 
-    let payload = input.get(5..).unwrap_or_default();
+type ExtractedField = (String, Option<String>, Vec<u8>);
+
+async fn extract(request: Request<Body>) -> Result<Vec<ExtractedField>, ()> {
+    let mut multipart = Multipart::from_request(request, &())
+        .await
+        .map_err(|_| ())?;
+    let mut fields = Vec::new();
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| ())? {
+        let name = field.name().unwrap_or_default().to_owned();
+        let filename = field.file_name().map(str::to_owned);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = field.chunk().await.map_err(|_| ())? {
+            bytes.extend_from_slice(&chunk);
+        }
+        fields.push((name, filename, bytes));
+    }
+    Ok(fields)
+}
+
+fuzz_target!(|input: &[u8]| {
+    // Wire format for reproducible seeds: mode/flags, LE u16 preamble/header
+    // limits, LE u32 EOF offset, chunk-size byte, boundary-length byte,
+    // boundary bytes, then payload. Flag 0x80 truncates; 0x10 quotes boundaries.
+    let control = |index: usize| input.get(index).copied().unwrap_or(0);
+    let mode = control(0) & 7;
+    let limits = MultipartGuardLimits {
+        max_preamble_bytes: usize::from(u16::from_le_bytes([control(1), control(2)])),
+        max_header_bytes: usize::from(u16::from_le_bytes([control(3), control(4)])),
+    };
+    let boundary_len = (1 + usize::from(control(10)) % 70).min(input.len().saturating_sub(11));
+    let boundary_bytes = input.get(11..11 + boundary_len).unwrap_or_default();
+    let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut boundary: String = boundary_bytes
+        .iter()
+        .map(|byte| char::from(alphabet[usize::from(*byte) % alphabet.len()]))
+        .collect();
+    if boundary.is_empty() {
+        boundary.push('x');
+    }
+    let payload = input.get(11 + boundary_len..).unwrap_or_default();
     let payload = &payload[..payload.len().min(MAX_FUZZ_BODY_BYTES)];
-    let mut raw = Vec::with_capacity(payload.len().saturating_add(192));
-    match control(0, 1) % 4 {
-        // Fully arbitrary input exercises missing/opening boundaries and malformed EOF.
+    let content_type = if mode == 7 {
+        // Exercise the actual Content-Type parser, including duplicate/quoted
+        // parameters, invalid lengths, and escaped boundary values.
+        let Ok(value) = HeaderValue::from_bytes(payload) else {
+            return;
+        };
+        value
+    } else if control(0) & 0x10 != 0 {
+        HeaderValue::from_str(&format!(
+            "multipart/form-data; boundary=\"{boundary}\"; charset=utf-8"
+        ))
+        .unwrap()
+    } else {
+        HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap()
+    };
+
+    let header = b"Content-Disposition: form-data; name=\"file\"; filename=\"fuzz.bin\"";
+    let mut raw = Vec::new();
+    let mut expected_fields = Vec::new();
+    let mut expected_success = None;
+    let mut closing_end = 0usize;
+    match mode {
         0 => raw.extend_from_slice(payload),
-        // Arbitrary file data inside a valid multipart envelope reaches body scanning.
-        1 => {
-            raw.extend_from_slice(format!("--{BOUNDARY}\r\nX-Fuzz: value\r\n\r\n").as_bytes());
-            raw.extend_from_slice(payload);
-            raw.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
-        }
-        // Arbitrary header bytes exercise exact and over-limit header termination.
         2 => {
-            raw.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+            raw.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
             raw.extend_from_slice(payload);
-            raw.extend_from_slice(format!("\r\n\r\nbody\r\n--{BOUNDARY}--\r\n").as_bytes());
+            raw.extend_from_slice(format!("\r\n\r\nbody\r\n--{boundary}--\r\n").as_bytes());
         }
-        // Arbitrary preamble bytes exercise the opening-boundary search and limit.
-        _ => {
+        3 => {
             raw.extend_from_slice(payload);
             raw.extend_from_slice(
-                format!("--{BOUNDARY}\r\nX: y\r\n\r\nbody\r\n--{BOUNDARY}--\r\n").as_bytes(),
+                format!("\r\n--{boundary}\r\nX: y\r\n\r\nbody\r\n--{boundary}--\r\n").as_bytes(),
+            );
+        }
+        7 => raw.extend_from_slice(b"--x--\r\n"),
+        _ => {
+            // Structured cases cannot contain an accidental body boundary, so
+            // acceptance and extracted bytes have an independent exact oracle.
+            let data: Vec<_> = payload
+                .iter()
+                .map(|byte| if *byte == b'\r' { b'~' } else { *byte })
+                .collect();
+            let preamble_len = if mode == 5 {
+                limits
+                    .max_preamble_bytes
+                    .saturating_add(usize::from(control(0) & 8 != 0))
+            } else {
+                0
+            };
+            if preamble_len != 0 {
+                raw.resize(preamble_len, b'p');
+                raw.extend_from_slice(b"\r\n");
+            }
+            raw.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            if mode == 6 {
+                let path_header = b"Content-Disposition: form-data; name=\"path\"";
+                raw.extend_from_slice(path_header);
+                raw.extend_from_slice(format!("\r\n\r\ndocs\r\n--{boundary}\r\n").as_bytes());
+                expected_fields.push(("path".into(), None, b"docs".to_vec()));
+            }
+            raw.extend_from_slice(header);
+            let mut header_len = header.len();
+            if mode == 4 {
+                raw.extend_from_slice(b"\r\nX-Pad: ");
+                header_len += 9;
+                let desired = limits
+                    .max_header_bytes
+                    .saturating_add(usize::from(control(0) & 8 != 0));
+                let padding = desired.saturating_sub(header_len);
+                raw.resize(raw.len() + padding, b'h');
+                header_len += padding;
+            }
+            raw.extend_from_slice(b"\r\n\r\n");
+            raw.extend_from_slice(&data);
+            raw.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
+            closing_end = raw.len();
+            raw.extend_from_slice(b"\r\n");
+            expected_fields.push(("file".into(), Some("fuzz.bin".into()), data));
+            expected_success = Some(
+                preamble_len <= limits.max_preamble_bytes && header_len <= limits.max_header_bytes,
             );
         }
     }
-
-    // Odd values simulate transport EOF at an arbitrary byte; even values drain
-    // the complete request. This reaches every scanner finish-state.
-    if control(3, 0) & 1 == 1 && !raw.is_empty() {
-        raw.truncate(usize::from(control(4, 0)) % (raw.len() + 1));
+    if control(0) & 0x80 != 0 {
+        let eof = u32::from_le_bytes([control(5), control(6), control(7), control(8)]) as usize;
+        raw.truncate(eof % (raw.len() + 1));
+        expected_success = expected_success.map(|valid| valid && raw.len() >= closing_end);
     }
 
-    // Preserve transport chunking rather than coalescing the generated body.
-    // Mutating the control bytes yields one-byte chunks as well as boundary and
-    // header splits at many offsets.
-    let mut chunks = Vec::new();
-    let mut offset = 0usize;
-    let mut chunk_control = 0usize;
-    while offset < raw.len() {
-        let chunk_len = 1 + usize::from(input.get(chunk_control % 5).copied().unwrap_or(0)) % 31;
-        let end = offset.saturating_add(chunk_len).min(raw.len());
-        chunks.push(Ok::<_, Infallible>(Bytes::copy_from_slice(
-            &raw[offset..end],
-        )));
-        offset = end;
-        chunk_control += 1;
-    }
-
-    let request = Request::builder()
-        .header(
-            CONTENT_TYPE,
-            format!("multipart/form-data; boundary={BOUNDARY}"),
-        )
-        .body(Body::from_stream(stream::iter(chunks)))
-        .expect("static request is valid");
-    let guarded = guard_multipart_request_with_limits(
-        request,
-        MultipartGuardLimits {
-            max_preamble_bytes: usize::from(control(1, 64)),
-            max_header_bytes: usize::from(control(2, 64)),
-        },
-    )
-    .expect("static multipart Content-Type is valid");
-
-    let body_limit = raw.len().saturating_add(1);
-    let _ = runtime().block_on(to_bytes(guarded.into_body(), body_limit));
+    runtime().block_on(async {
+        // Compare coalesced input with transport chunking. Error results are
+        // intentionally compared as classifications, not chunk-dependent text.
+        let mut previous = None;
+        for chunk_size in [raw.len().max(1), 1 + usize::from(control(9))] {
+            let guarded = guard_multipart_request_with_limits(
+                request(&raw, &content_type, chunk_size),
+                limits,
+            );
+            let guarded = match guarded {
+                Ok(request) => request,
+                Err(_) => {
+                    assert_eq!(mode, 7, "generated Content-Type is valid");
+                    return;
+                }
+            };
+            let drained = to_bytes(guarded.into_body(), raw.len() + 1).await;
+            if let Some(expected) = expected_success {
+                assert_eq!(drained.is_ok(), expected);
+            }
+            if let Ok(bytes) = &drained {
+                assert_eq!(bytes.as_ref(), raw);
+            }
+            let parsed = extract(
+                guard_multipart_request_with_limits(
+                    request(&raw, &content_type, chunk_size),
+                    limits,
+                )
+                .unwrap(),
+            )
+            .await;
+            if expected_success == Some(true) {
+                assert_eq!(parsed.as_ref(), Ok(&expected_fields));
+            }
+            let outcome = (drained.is_ok(), parsed);
+            if let Some(previous) = &previous {
+                assert_eq!(
+                    &outcome, previous,
+                    "chunking must preserve guard and extractor semantics"
+                );
+            }
+            previous = Some(outcome);
+        }
+    });
 });

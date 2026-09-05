@@ -77,3 +77,31 @@ path = "fuzz_targets/multipart_guard.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "auth_headers"
+path = "fuzz_targets/auth_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_journal"
+path = "fuzz_targets/recovery_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "directory_cursor"
+path = "fuzz_targets/directory_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zip_preview"
+path = "fuzz_targets/zip_preview.rs"
+test = false
+doc = false
+bench = false

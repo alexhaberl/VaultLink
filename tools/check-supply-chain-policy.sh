@@ -1111,11 +1111,9 @@ for pattern in /config.toml .env '.env.*' '*.sqlite*' .agents .codex .tmp dist; 
     fi
 done
 
-for target in path_normalization byte_range filename zip_search_preview_paths upload_overwrite_policy upload_request_state share_request_policy file_mutation_policy multipart_guard; do
-    if ! grep -E -q "(^|[[:space:]])${target}([[:space:]]|$)" Makefile; then
-        report "Makefile fuzz target list is missing $target"
-    fi
-done
+if ! python3 tools/check-fuzz-policy.py; then
+    report "fuzz target inventory, corpora, or workflow execution policy failed"
+fi
 
 for workflow in .github/workflows/soak-start.yml .github/workflows/soak-collect.yml; do
     if ! grep -F -q 'runs-on: ubuntu-24.04' "$workflow" \
@@ -2483,8 +2481,8 @@ if ! grep -E -q '^[[:space:]]+CARGO_BUILD_JOBS:[[:space:]]+2$' .github/workflows
     report "fuzz workflow must bound memory-intensive instrumented builds to two jobs"
 fi
 
-if ! grep -E -q '^[[:space:]]+timeout-minutes:[[:space:]]+120$' .github/workflows/fuzz.yml; then
-    report "fuzz workflow must allow two hours for instrumented builds and three target waves"
+if ! grep -E -q '^[[:space:]]+timeout-minutes:[[:space:]]+180$' .github/workflows/fuzz.yml; then
+    report "fuzz workflow must allow three hours for instrumented builds, thirteen targets, replay and minimization"
 fi
 
 if ! grep -F -x -q 'LimitNOFILE=4096' deploy/vaultlink.service; then
