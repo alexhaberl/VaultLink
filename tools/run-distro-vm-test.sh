@@ -465,6 +465,7 @@ if [ "$package_format" = deb ]; then
     case "$quiescence_wait" in ''|*[!0-9]*) exit 77 ;; esac
     [ "$quiescence_wait" -le 900 ]
 fi
+grep -F -x -q 'load_profile=full' "$evidence/runtime/load/result.env"
 grep -F -x -q 'metadata_clients=100' "$evidence/runtime/load/result.env"
 grep -F -x -q 'metadata_requests=2000' "$evidence/runtime/load/result.env"
 grep -F -x -q 'metadata_capacity_retry_limit_per_client=3' \

@@ -105,9 +105,8 @@ migration_pid=
 [ "$(sqlite3 "$database" 'PRAGMA integrity_check;')" = ok ]
 
 # The exact installed package payload is then exercised natively on the
-# target's same-architecture runner. This is the authoritative per-target
-# latency gate; the full-system VM gate remains authoritative for systemd and
-# distribution integration behavior.
+# target's same-architecture runner with the smaller CI smoke workload.
+# Full-load performance is qualified by the dedicated 72-hour soak VM.
 sh tools/package-native-load-smoke.sh \
     "$target_id" "$version" "$package" "$api_work" "$native_load_evidence"
 
@@ -119,3 +118,4 @@ printf 'target=%s\nversion=%s\nnetwork=none\nlifecycle=ok\n' \
     "$target_id" "$version"
 printf 'systemd_analyze=ok\napi_smoke=ok\nreal_migration=ok\nupgrade_migration_backup_rollback=ok\n'
 printf 'native_package_load=ok\nmetadata_p95_limit_seconds=2.000\n'
+printf 'load_profile=50_metadata_20_ranges_5_uploads\nload_authority=ci_smoke\n'

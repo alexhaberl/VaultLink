@@ -252,7 +252,8 @@ for load_result in "$evidence"/load-*/result.env; do
         echo "soak load evidence is not systemd-supervised with the strict p95 gate" >&2
         exit 1
     fi
-    if [ "$(load_value metadata_clients)" != 100 ] \
+    if [ "$(load_value load_profile)" != full ] \
+        || [ "$(load_value metadata_clients)" != 100 ] \
         || [ "$(load_value metadata_requests)" != 2000 ] \
         || [ "$(load_value range_streams)" != 40 ] \
         || [ "$(load_value uploads)" != 10 ]; then
@@ -290,6 +291,7 @@ for load_result in "$evidence"/load-*/result.env; do
         exit 1
     fi
     for profile_line in \
+        'load_profile=full' \
         'metadata_status=0' \
         'download_status=0' \
         'upload_status=0' \
@@ -318,6 +320,19 @@ for load_result in "$evidence"/load-*/result.env; do
             echo "load evidence is missing $phase report" >&2
             exit 1
         fi
+        snapshot_cpu_count=$(evidence_field_value "$snapshot" host_cpu_count)
+        snapshot_mem_total_kib=$(evidence_field_value "$snapshot" host_mem_total_kib)
+        for resource_value in "$snapshot_cpu_count" "$snapshot_mem_total_kib"; do
+            case "$resource_value" in
+                ''|*[!0-9]*) echo "soak host resource evidence is invalid" >&2; exit 1 ;;
+            esac
+        done
+        if ! [ "$snapshot_cpu_count" -ge 8 ] || ! [ "$snapshot_mem_total_kib" -ge 15728640 ]; then
+            echo "full load qualification requires 8 available vCPUs and at least 15 GiB MemTotal" >&2
+            exit 1
+        fi
+        [ "$(evidence_field_value "$snapshot" load_profile)" = full ] \
+            || { echo "soak snapshot is not a full load profile" >&2; exit 1; }
         snapshot_epoch=$(evidence_field_value "$snapshot" epoch)
         snapshot_pid=$(evidence_field_value "$snapshot" pid)
         snapshot_starttime=$(evidence_field_value "$snapshot" process_starttime_ticks)
@@ -400,17 +415,39 @@ for load_result in "$evidence"/load-*/result.env; do
     range_bytes=$(load_value range_bytes)
     fixture_bytes=$(load_value fixture_bytes)
     range_hash=$(load_value range_sha256)
-    case "$range_bytes:$fixture_bytes" in
-        *[!0-9:]*|:*|*::*) echo "load evidence contains invalid range sizes" >&2; exit 1 ;;
-    esac
+    if [ "$range_bytes" != 67108864 ] || [ "$fixture_bytes" != 53687091200 ]; then
+        echo "full load requires 64-MiB ranges from the 50-GiB fixture" >&2
+        exit 1
+    fi
+    case "$range_hash" in *[!0-9a-f]*|'') echo "load range hash is invalid" >&2; exit 1 ;; esac
+    [ "${#range_hash}" -eq 64 ] || { echo "load range hash is invalid" >&2; exit 1; }
     range_end=$((range_bytes - 1))
     expected_range="bytes 0-$range_end/$fixture_bytes"
     [ "$(wc -l <"$load_dir/range-results.csv")" -eq 40 ] \
         || { echo "load range sample count mismatch" >&2; exit 1; }
     awk -F, -v bytes="$range_bytes" -v hash="$range_hash" -v expected="$expected_range" '
+        NF != 9 || $1 !~ /^([0-9]|[1-3][0-9])$/ || seen[$1]++ { exit 1 }
         $2 != sprintf("198.18.2.%d", $1 + 1) || $3 != 206 || $4 != bytes || $5 != hash || $6 != expected { exit 1 }
+        $7 !~ /^[0-9]+([.][0-9]+)?$/ || $7 + 0 < 0 \
+            || $8 !~ /^[0-9]+([.][0-9]+)?$/ || $8 + 0 <= 0 \
+            || $9 !~ /^[0-9]+([.][0-9]+)?$/ || $9 + 0 <= 0 { exit 1 }
+        END { if (NR != 40) exit 1 }
     ' "$load_dir/range-results.csv" \
         || { echo "range status, length, hash, or Content-Range mismatch" >&2; exit 1; }
+    calculated_range_p95=$(awk -F, '{print $7}' "$load_dir/range-results.csv" \
+        | sort -n | awk 'NR == 38 {print; exit}')
+    if [ "$(load_value range_ttfb_p95_seconds)" != "$calculated_range_p95" ] \
+        || [ "$(evidence_field_value "$profile_status" range_ttfb_observed_p95_seconds)" != "$calculated_range_p95" ] \
+        || ! awk -v value="$calculated_range_p95" 'BEGIN {exit !(value < 2.000)}'; then
+        echo "recomputed range TTFB p95 is inconsistent or not below two seconds" >&2
+        exit 1
+    fi
+    for range_report in "$load_result" "$profile_status"; do
+        for range_field in range_ttfb_p95_limit_seconds=2.000 range_ttfb_p95_within_limit=true range_ttfb_p95_enforced=true; do
+            [ "$(evidence_field_value "$range_report" "${range_field%%=*}")" = "${range_field#*=}" ] \
+                || { echo "range report violates $range_field" >&2; exit 1; }
+        done
+    done
 
     upload_hash=$(load_value upload_sha256)
     case "$upload_hash" in *[!0-9a-f]*|'') echo "load upload hash is invalid" >&2; exit 1 ;; esac
@@ -421,9 +458,11 @@ for load_result in "$evidence"/load-*/result.env; do
     [ "$(wc -l <"$load_dir/upload-results.csv")" -eq 10 ] \
         || { echo "load upload sample count mismatch" >&2; exit 1; }
     awk -F, -v hash="$upload_hash" -v soak_namespace="$namespace" -v run_id="$run_id" '
+        NF != 8 || $1 !~ /^[0-9]$/ || seen[$1]++ { exit 1 }
         $2 != sprintf("198.18.3.%d", $1 + 1) || $3 != 303 || $4 != "created" \
             || $5 != hash || $6 != 200 || $7 != hash \
             || $8 != sprintf("load-%s-%s-%d.bin", soak_namespace, run_id, $1) { exit 1 }
+        END { if (NR != 10) exit 1 }
     ' \
         "$load_dir/upload-results.csv" \
         || { echo "upload status or payload hash mismatch" >&2; exit 1; }

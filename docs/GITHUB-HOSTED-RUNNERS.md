@@ -27,11 +27,11 @@ or inconsistent.
 | Phase | Execution environment | Network policy | Authority |
 | --- | --- | --- | --- |
 | Rust/package build | Target distro builder container on matching native CPU | immutable build inputs only | authoritative |
-| Fast package tests and 100-user performance gate | Target distro builder container on a qualified public 4-vCPU matching-architecture runner with at least 8 GiB host RAM, using the exact installed package payload | package installed offline; runtime network isolated; hardened client tmpfs and server storage separated | authoritative for package lifecycle and p95 `<2 s` when resource qualification succeeds |
+| Fast package tests and 50/20/5 smoke gate | Target distro builder container on a qualified public 4-vCPU matching-architecture runner with at least 8 GiB host RAM, using the exact installed package payload | package installed offline; runtime network isolated; hardened client tmpfs and server storage separated | authoritative for package lifecycle and smoke-profile p95 `<2 s` |
 | Reproducibility | two empty build roots using the same target builder | immutable build inputs only | authoritative |
 | Full-system test | target guest booted by QEMU on matching native CPU | isolated host package channel; no free guest Internet | authoritative for full-system functionality, security, integrity, SELinux, upgrade, and rollback; p95 is diagnostic |
 | Local Docker | all x86_64 distro builders/containers | isolated runtime | development evidence only |
-| 72-hour soak | dedicated Debian 13 amd64 system | controlled public application path plus collector bridge | final Debian reference evidence, including strict p95 `<2 s` |
+| 72-hour soak and full load | dedicated Debian 13 amd64 VM, 8 vCPUs / 16 GiB RAM | controlled public application path plus collector bridge | final Debian reference evidence, including twelve full 100/40/10 profiles with strict p95 `<2 s` |
 
 QEMU never compiles a release binary. The commit-bound `distro-vms` workflow
 forces TCG for every one of the nine matrix targets and does not expose
@@ -120,7 +120,7 @@ at runtime.
 
 ## Package, VM, and load gates
 
-The native package performance phase qualifies its public hosted runner for
+The native package CI smoke phase qualifies its public hosted runner for
 four available vCPUs and at least 8 GiB of host RAM before accepting a timing
 result. Docker restricts the builder container to logical CPUs 0-3. Inside that
 container, the VaultLink server is restricted to CPUs 0-1 and uses its own
@@ -135,13 +135,13 @@ error, and `integrity_check=ok`. The probe state is removed before the runtime
 fixture. The evidence bundle records the runner and storage qualifications,
 container and process CPU placement, memory and storage separation, workload
 counts, latency result, RSS result, and integrity result. A runner that cannot
-provide and prove this layout fails the native performance gate.
+provide and prove this layout fails the native CI smoke gate.
 
 This qualification and placement make the harness's resource contract
 reproducible and limit in-job client/server contention; they are not a claim
 that arbitrary GitHub standard-runner timings are deterministic across
 machines or runs. The exact workload and strict threshold, rather than a
-general runner-performance guarantee, define the release gate.
+general runner-performance guarantee, define the CI smoke gate.
 Qualification failures are reported as such and are not automatically rerun
 until a favorable runner produces a pass.
 
@@ -153,14 +153,14 @@ Every one of the nine targets performs:
 - an offline fresh install with no service or timer autostart;
 - setup, systemd analysis, API smoke, migration, backup, upgrade, rollback,
   reinstall, and state-preserving remove tests;
-- the unchanged overlapping workload of 100 metadata clients, 40 range
-  streams, and ten upload/readback clients against the exact package payload
+- the overlapping `ci-smoke` workload of 50 metadata clients, 20 range
+  streams, and five upload/readback clients against the exact package payload
   in its digest-pinned distribution builder with the qualified 4-vCPU resource
   layout above on a native matching-architecture GitHub runner; this is the
-  authoritative p95 `<2 s` result; and
+  strict p95 `<2 s` result for the smaller smoke profile; and
 - a full guest boot with OS, kernel, package database, active-binary hash,
-  systemd, journal, readiness, SQLite, upgrade, rollback, and the same complete
-  load-workload evidence. The QEMU gate remains authoritative for request
+  systemd, journal, readiness, SQLite, upgrade, rollback, and complete
+  100/40/10 `full` load-workload evidence. The QEMU gate remains authoritative for request
   counts and statuses, transfer and upload hashes, absence of corruption,
   process and RSS limits, and all other functional and security assertions;
   only its recorded p95 and threshold comparison are diagnostic. Forced-TCG
@@ -178,7 +178,13 @@ Every one of the nine targets performs:
 Native arm64 jobs are the only authoritative arm64 evidence. Architecture-
 independent security, policy, aggregation, signing, and publication work stays
 on `ubuntu-24.04`. The managed `ubuntu-24.04-arm` runner therefore supplies the
-authoritative arm64 performance evidence; private ARM hardware is not required.
+arm64 package smoke evidence; private ARM hardware is not required for that
+check. Full-load performance qualification now belongs to the existing
+Debian 13 amd64 soak VM (8 vCPUs, 16 GiB RAM), not to standard hosted runners.
+The `vaultlink/72h-soak` gate requires at least twelve strict 100/40/10 runs
+and revalidates their evidence at release time. The smaller CI profile is
+never accepted in its place; this full-load result makes no arm64 performance
+claim.
 Fuzz parallelism remains bounded by the runner resources.
 
 Three aggregate, commit-bound checks are published:

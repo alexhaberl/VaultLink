@@ -80,7 +80,7 @@ if [ "$actual_os_id" != "$SOAK_OS_ID" ] || [ "$actual_os_version_id" != "$SOAK_O
     exit 64
 fi
 
-for command in awk curl journalctl sha256sum sort sqlite3 systemctl; do
+for command in nproc awk curl journalctl sha256sum sort sqlite3 systemctl; do
     command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 69; }
 done
 [ -x "$load_script" ] || { echo "soak load script is not executable" >&2; exit 69; }
@@ -163,11 +163,20 @@ printf 'commit=%s\nnamespace=%s\nbinary_sha256=%s\norchestration_sha256=%s\narch
 run_load_loop() {
     run=0
     while [ "$(date +%s)" -lt "$deadline" ]; do
+        # Recheck at each six-hour run; collector/tag revalidate both snapshots.
+        if ! [ "$(nproc)" -ge 8 ] \
+            || ! [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -ge 15728640 ]; then
+            printf '%s\n' 'full load requires 8 vCPUs and at least 15 GiB MemTotal' >"$load_failure"
+            return 1
+        fi
         run=$((run + 1))
         run_dir="$SOAK_EVIDENCE_DIR/load-$run"
         mkdir -p "$run_dir"
         if ! LOAD_RUN_ID="$(printf '%03d' "$run")" \
             LOAD_TEST_EVIDENCE_DIR="$run_dir" \
+            LOAD_PROFILE=full \
+            DOWNLOAD_RANGE_BYTES=67108864 \
+            DOWNLOAD_FIXTURE_BYTES=53687091200 \
             LOAD_P95_POLICY=strict \
             LOAD_CONNECT_TIMEOUT_SECONDS=5 \
             LOAD_METADATA_MAX_TIME_SECONDS=30 \

@@ -1170,9 +1170,9 @@ if ! grep -F -q 'SOAK_ORCHESTRATION_SHA256' deploy/vaultlink-soak-control.sh \
     || ! grep -F -q 'case $((upload % 5)) in' tools/load-test.sh \
     || ! grep -F -q '4) upload_token=$UPLOAD_TOKEN_5' tools/load-test.sh \
     || ! grep -F -q 'range_share_count=3' tools/load-test.sh \
-    || ! grep -F -q 'range_streams_per_share_max=14' tools/load-test.sh \
+    || ! grep -F -q 'range_streams_per_share_max=$range_streams_per_share_max' tools/load-test.sh \
     || ! grep -F -q 'upload_share_count=5' tools/load-test.sh \
-    || ! grep -F -q 'uploads_per_share=2' tools/load-test.sh \
+    || ! grep -F -q 'uploads_per_share=$uploads_per_share' tools/load-test.sh \
     || ! grep -F -q 'soak load result does not prove bounded per-share sharding' tools/check-soak-evidence.sh \
     || ! grep -F -q 'ADMISSION_DOWNLOAD_TOKEN' docs/SOAK-RUNNER.md \
     || ! grep -F -q 'RANGE_DOWNLOAD_TOKEN' docs/SOAK-RUNNER.md \
@@ -1211,7 +1211,12 @@ if ! grep -F -x -q 'p95_limit=2.000' tools/load-test.sh \
     || ! grep -F -q 'p95 `<2 s`' docs/RELEASE-CHECKLIST-0.6.0.md; then
     report "native/soak load execution, soak evidence verification, and release documentation must share the strict 2-second metadata p95 gate"
 fi
-if ! grep -F -q 'LOAD_P95_POLICY=strict' tools/soak-monitor.sh \
+if ! grep -F -q 'LOAD_PROFILE=full' tools/soak-monitor.sh \
+    || ! grep -F -q 'LOAD_PROFILE=full' tools/distro-vm-runtime-smoke.sh \
+    || ! grep -F -q 'load_profile=full' tools/check-soak-evidence.sh \
+    || ! grep -F -q 'snapshot_mem_total_kib' tools/check-soak-evidence.sh \
+    || ! grep -F -q '15728640' deploy/vaultlink-soak-control.sh \
+    || ! grep -F -q 'LOAD_P95_POLICY=strict' tools/soak-monitor.sh \
     || ! grep -F -q 'LOAD_CONNECT_TIMEOUT_SECONDS=5' tools/soak-monitor.sh \
     || ! grep -F -q 'LOAD_METADATA_MAX_TIME_SECONDS=30' tools/soak-monitor.sh \
     || ! grep -F -q 'LOAD_TRANSFER_MAX_TIME_SECONDS=300' tools/soak-monitor.sh \
@@ -2268,22 +2273,26 @@ if ! grep -F -q 'if [ "$native_status" -ne 0 ]; then' "$package_native_load_smok
     report "native package failures must upload bounded secret-redacted diagnostics before deleting private runtime state"
 fi
 for native_result_line in \
+    'LOAD_PROFILE=ci-smoke' \
+    'assert_field "$result" load_profile ci-smoke' \
+    'assert_field "$profile" load_profile ci-smoke' \
+    'load_authority=ci_smoke' \
     'assert_field "$result" supervision_mode direct_pid' \
     'assert_field "$result" metadata_p95_policy strict' \
     'assert_field "$result" metadata_p95_limit_seconds 2.000' \
     'assert_field "$result" metadata_p95_within_limit true' \
     'assert_field "$result" metadata_p95_enforced true' \
-    'assert_field "$result" metadata_clients 100' \
-    'assert_field "$result" metadata_requests 2000' \
+    'assert_field "$result" metadata_clients 50' \
+    'assert_field "$result" metadata_requests 1000' \
     'assert_field "$result" metadata_capacity_retry_limit_per_client 3' \
     'assert_field "$result" metadata_capacity_retry_after_seconds 1' \
     'assert_field "$result" metadata_capacity_response_limit_seconds 1.100' \
-    'assert_field "$result" range_streams 40' \
+    'assert_field "$result" range_streams 20' \
     'assert_field "$result" range_share_count 3' \
-    'assert_field "$result" range_streams_per_share_max 14' \
-    'assert_field "$result" uploads 10' \
+    'assert_field "$result" range_streams_per_share_max 7' \
+    'assert_field "$result" uploads 5' \
     'assert_field "$result" upload_share_count 5' \
-    'assert_field "$result" uploads_per_share 2' \
+    'assert_field "$result" uploads_per_share 1' \
     'assert_field "$result" upload_integrity server_readback' \
     'assert_field "$load_command" stage complete' \
     'assert_field "$load_command" exit_status 0' \
@@ -2291,9 +2300,9 @@ for native_result_line in \
     'assert_field "$profile" download_status 0' \
     'assert_field "$profile" upload_status 0' \
     'assert_field "$profile" rss_status 0' \
-    'assert_field "$profile" metadata_rows 2000' \
-    'assert_field "$profile" range_rows 40' \
-    'assert_field "$profile" upload_rows 10' \
+    'assert_field "$profile" metadata_rows 1000' \
+    'assert_field "$profile" range_rows 20' \
+    'assert_field "$profile" upload_rows 5' \
     'assert_field "$profile" supervision_mode direct_pid' \
     'assert_field "$profile" metadata_p95_policy strict' \
     'assert_field "$profile" metadata_p95_limit_seconds 2.000' \
@@ -2315,12 +2324,12 @@ for native_result_line in \
         || report "native package load evidence is missing hard assertion: $native_result_line"
 done
 if ! grep -F -q 'value < 2.000' "$package_native_load_smoke" \
-    || ! grep -F -q 'NR != 2000' "$package_native_load_smoke" \
+    || ! grep -F -q 'NR != 1000' "$package_native_load_smoke" \
     || ! grep -F -q '$2 !~ /^2[0-9][0-9]$/' "$package_native_load_smoke" \
     || ! grep -F -q 'seen["198.18.1." client] != 20' "$package_native_load_smoke" \
-    || ! grep -F -q 'NR == 1900 { print; exit }' "$package_native_load_smoke" \
+    || ! grep -F -q 'NR == 950 { print; exit }' "$package_native_load_smoke" \
     || ! grep -F -q '[ "$recomputed_p95" = "$p95" ]' "$package_native_load_smoke" \
-    || ! grep -F -q '[ "$metadata_capacity_retries" -le 300 ]' \
+    || ! grep -F -q '[ "$metadata_capacity_retries" -le 150 ]' \
         "$package_native_load_smoke" \
     || ! grep -F -q 'metadata-capacity-retries.csv' "$package_native_load_smoke" \
     || ! grep -F -q '$5 + 0 > 1.100 || $6 != 1' "$package_native_load_smoke" \
@@ -2335,11 +2344,11 @@ if ! grep -F -q 'value < 2.000' "$package_native_load_smoke" \
     || ! grep -F -q 'NF != 9' "$package_native_load_smoke" \
     || ! grep -F -q '$5 != expected_hash' "$package_native_load_smoke" \
     || ! grep -F -q '$6 != expected_content_range || seen[$1]++' "$package_native_load_smoke" \
-    || ! grep -F -q 'if (NR != 40) exit 1' "$package_native_load_smoke" \
+    || ! grep -F -q 'if (NR != 20) exit 1' "$package_native_load_smoke" \
     || ! grep -F -q '$2 != "198.18.3." ($1 + 1) || $3 != 303 || $4 != "created"' \
         "$package_native_load_smoke" \
     || ! grep -F -q '$6 != 200 || $7 != expected_hash' "$package_native_load_smoke" \
-    || ! grep -F -q 'if (NR != 10) exit 1' "$package_native_load_smoke" \
+    || ! grep -F -q 'if (NR != 5) exit 1' "$package_native_load_smoke" \
     || ! grep -F -q "sqlite3 \"\$runtime_data/data.sqlite\" 'PRAGMA integrity_check;'" \
         "$package_native_load_smoke" \
     || ! grep -F -q 'install -m 0644 "$runtime_base/readiness.json" "$evidence/readiness.json"' \
@@ -2350,13 +2359,13 @@ if ! grep -F -q 'value < 2.000' "$package_native_load_smoke" \
         "$package_native_load_smoke" \
     || ! grep -F -q 'package service identity or payload changed during native load' \
         "$package_native_load_smoke" \
-    || ! grep -F -q 'load_profile=100_metadata_40_ranges_10_uploads' "$package_native_load_smoke" \
+    || ! grep -F -q 'load_profile=50_metadata_20_ranges_5_uploads' "$package_native_load_smoke" \
     || ! grep -F -q 'package_database_parity=ok' "$package_native_load_smoke" \
     || ! grep -F -q 'payload_integrity=ok' "$package_native_load_smoke" \
     || ! grep -F -q 'readiness=ok' "$package_native_load_smoke" \
     || ! grep -F -q 'readiness_sha256=$readiness_sha256' "$package_native_load_smoke" \
     || ! grep -F -q 'sqlite_integrity=ok' "$package_native_load_smoke"; then
-    report "native exact-package evidence must independently enforce p95, status/hash, RSS, PID, readiness, SQLite, and 100/40/10 completeness"
+    report "native exact-package evidence must independently enforce p95, status/hash, RSS, PID, readiness, SQLite, and 50/20/5 CI smoke completeness"
 fi
 if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.7.1' "$package_workflow" \
     || ! grep -F -x -q 'REAL_PACKAGE_NEW_VERSION ?= 0.7.1' Makefile \

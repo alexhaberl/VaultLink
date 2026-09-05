@@ -158,8 +158,8 @@ jobs:
           fi
           case "$COLLECTED_STATE" in
             pending) state=pending; description='Host-side 72-hour soak is running' ;;
-            success) state=success; description='Exact-commit 72-hour soak passed' ;;
-            failure) state=failure; description='Exact-commit 72-hour soak failed' ;;
+            success) state=success; description='72-hour soak and full 100/40/10 load passed' ;;
+            failure) state=failure; description='72-hour soak or full 100/40/10 load failed' ;;
             *) echo "unsupported collector state: $COLLECTED_STATE" >&2; exit 1 ;;
           esac
           gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$COMMIT_SHA" \
