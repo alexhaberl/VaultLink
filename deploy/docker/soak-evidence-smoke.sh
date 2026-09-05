@@ -165,6 +165,8 @@ while [ "$run" -le 12 ]; do
         printf '198.18.1.%s,200,0.100000\n' "$client" >>"$load/metadata-load.csv"
         request=$((request + 1))
     done
+    printf '198.18.1.1,1,1,503,1.000000,1\n' \
+        >"$load/metadata-capacity-retries.csv"
     stream=0
     while [ "$stream" -lt 40 ]; do
         printf '%s,198.18.2.%s,206,64,%s,bytes 0-63/128\n' \
@@ -197,6 +199,11 @@ while [ "$run" -le 12 ]; do
         'metadata_p95_seconds=0.100000' \
         'metadata_clients=100' \
         'metadata_requests=2000' \
+        'metadata_attempts=2001' \
+        'metadata_capacity_retries=1' \
+        'metadata_capacity_retry_limit_per_client=3' \
+        'metadata_capacity_retry_after_seconds=1' \
+        'metadata_capacity_response_limit_seconds=1.100' \
         'range_streams=40' \
         'range_share_count=3' \
         'range_streams_per_share_max=14' \
@@ -216,6 +223,8 @@ while [ "$run" -le 12 ]; do
         'upload_status=0' \
         'rss_status=0' \
         'metadata_rows=2000' \
+        'metadata_attempts=2001' \
+        'metadata_capacity_retries=1' \
         'range_rows=40' \
         'upload_rows=10' \
         'rss_rows=2' \
@@ -268,6 +277,19 @@ sh tools/check-soak-evidence.sh "$commit" "$destination" >/dev/null
 [ "$(stat -c '%a' "$active")" = 2750 ] \
     || fail "synthetic evidence directory lost its setgid group-readable mode"
 
+zero_capacity_evidence="$work/zero-capacity-evidence"
+cp -R "$destination" "$zero_capacity_evidence"
+: >"$zero_capacity_evidence/load-1/metadata-capacity-retries.csv"
+sed -i 's/^metadata_attempts=2001$/metadata_attempts=2000/' \
+    "$zero_capacity_evidence/load-1/result.env" \
+    "$zero_capacity_evidence/load-1/profile-status.env"
+sed -i 's/^metadata_capacity_retries=1$/metadata_capacity_retries=0/' \
+    "$zero_capacity_evidence/load-1/result.env" \
+    "$zero_capacity_evidence/load-1/profile-status.env"
+refresh_evidence_manifest "$zero_capacity_evidence"
+sh tools/check-soak-evidence.sh "$commit" "$zero_capacity_evidence" >/dev/null \
+    || fail "evidence verifier rejected a successful profile without capacity retries"
+
 latency_evidence="$work/latency-evidence"
 cp -R "$destination" "$latency_evidence"
 sed -i 's/,0\.100000$/,1.999999/' "$latency_evidence/load-1/metadata-load.csv"
@@ -286,6 +308,25 @@ sed -i 's/^metadata_observed_p95_seconds=1\.999999$/metadata_observed_p95_second
 refresh_evidence_manifest "$latency_evidence"
 if sh tools/check-soak-evidence.sh "$commit" "$latency_evidence" >/dev/null 2>&1; then
     fail "evidence verifier accepted metadata p95 at the strict 2-second boundary"
+fi
+
+capacity_evidence="$work/capacity-evidence"
+cp -R "$destination" "$capacity_evidence"
+sed -i 's/,503,1\.000000,1$/,503,1.100001,1/' \
+    "$capacity_evidence/load-1/metadata-capacity-retries.csv"
+refresh_evidence_manifest "$capacity_evidence"
+if sh tools/check-soak-evidence.sh "$commit" "$capacity_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted a capacity response beyond 1.1 seconds"
+fi
+
+unterminated_capacity_evidence="$work/unterminated-capacity-evidence"
+cp -R "$destination" "$unterminated_capacity_evidence"
+printf '198.18.1.1,2,2,503,1.000000,1' \
+    >>"$unterminated_capacity_evidence/load-1/metadata-capacity-retries.csv"
+refresh_evidence_manifest "$unterminated_capacity_evidence"
+if sh tools/check-soak-evidence.sh \
+    "$commit" "$unterminated_capacity_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted an uncounted unterminated capacity row"
 fi
 
 diagnostic_evidence="$work/diagnostic-evidence"

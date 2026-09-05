@@ -259,6 +259,29 @@ for load_result in "$evidence"/load-*/result.env; do
         echo "soak load result does not retain the full 100/40/10 workload" >&2
         exit 1
     fi
+    if [ "$(load_value metadata_capacity_retry_limit_per_client)" != 3 ] \
+        || [ "$(load_value metadata_capacity_retry_after_seconds)" != 1 ] \
+        || [ "$(load_value metadata_capacity_response_limit_seconds)" != 1.100 ]; then
+        echo "soak load result does not retain the bounded capacity retry contract" >&2
+        exit 1
+    fi
+    metadata_capacity_retries=$(load_value metadata_capacity_retries)
+    metadata_attempts=$(load_value metadata_attempts)
+    case "$metadata_capacity_retries:$metadata_attempts" in
+        *[!0-9:]*|:*|*::*|*:)
+            echo "soak load result contains invalid metadata attempt counts" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$metadata_capacity_retries" -gt 300 ] \
+        || [ "$metadata_attempts" -ne $((2000 + metadata_capacity_retries)) ] \
+        || [ "$(evidence_field_value "$profile_status" metadata_capacity_retries)" \
+            != "$metadata_capacity_retries" ] \
+        || [ "$(evidence_field_value "$profile_status" metadata_attempts)" \
+            != "$metadata_attempts" ]; then
+        echo "soak load metadata retry counts are inconsistent" >&2
+        exit 1
+    fi
     if [ "$(load_value range_share_count)" != 3 ] \
         || [ "$(load_value range_streams_per_share_max)" != 14 ] \
         || [ "$(load_value upload_share_count)" != 5 ] \
@@ -352,6 +375,27 @@ for load_result in "$evidence"/load-*/result.env; do
         || { echo "load metadata client identities or statuses are invalid" >&2; exit 1; }
     awk -v p95="$calculated_p95" 'BEGIN { exit !(p95 < 2.000) }' \
         || { echo "recomputed metadata p95 is not below 2 seconds" >&2; exit 1; }
+
+    metadata_retry_file="$load_dir/metadata-capacity-retries.csv"
+    if [ ! -f "$metadata_retry_file" ] || [ -L "$metadata_retry_file" ] \
+        || [ "$(wc -l <"$metadata_retry_file")" -ne "$metadata_capacity_retries" ]; then
+        echo "load metadata capacity retry evidence is missing or inconsistent" >&2
+        exit 1
+    fi
+    awk -F, -v expected="$metadata_capacity_retries" '
+        NF != 6 || $1 !~ /^198\.18\.1\.[0-9]+$/ \
+            || $2 !~ /^([1-9]|1[0-9]|20)$/ \
+            || $3 !~ /^[1-3]$/ || $4 != 503 \
+            || $5 !~ /^[0-9]+([.][0-9]+)?$/ || $5 + 0 <= 0 \
+            || $5 + 0 > 1.100 || $6 != 1 { exit 1 }
+        {
+            split($1, octets, ".")
+            if (octets[4] < 1 || octets[4] > 100) exit 1
+            if ($3 != ++retries[$1]) exit 1
+        }
+        END { if (NR != expected) exit 1 }
+    ' "$metadata_retry_file" \
+        || { echo "load metadata capacity retry evidence is invalid" >&2; exit 1; }
 
     range_bytes=$(load_value range_bytes)
     fixture_bytes=$(load_value fixture_bytes)

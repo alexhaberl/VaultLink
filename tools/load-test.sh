@@ -49,6 +49,9 @@ validate_distinct_token_set "upload token set" \
 
 p95_limit=2.000
 range_ttfb_p95_limit=2.000
+metadata_capacity_retry_limit_per_client=3
+metadata_capacity_retry_after_seconds=1
+metadata_capacity_response_limit=1.100
 p95_policy=${LOAD_P95_POLICY:-strict}
 case "$p95_policy" in
     strict) p95_enforced=true ;;
@@ -282,6 +285,7 @@ persist_load_evidence() {
 
     for partial_evidence in \
         'metadata.csv:metadata-load.partial.csv' \
+        'metadata-capacity-retries.csv:metadata-capacity-retries.partial.csv' \
         'ranges.csv:range-results.partial.csv' \
         'uploads.csv:upload-results.partial.csv' \
         'rss-samples.csv:rss-samples.partial.csv' \
@@ -498,14 +502,60 @@ metadata_profile() {
     while [ "$client" -lt 100 ]; do
         (
             identity="198.18.1.$((client + 1))"
+            capacity_evidence="$work/capacity-retry-client-$client.csv"
+            headers="$work/metadata-$client.headers"
+            : >"$capacity_evidence"
             wait_for_profile_go
             request=0
+            capacity_retries=0
             while [ "$request" -lt 20 ]; do
-                soak_curl "$identity" --silent --show-error \
-                    --connect-timeout "$connect_timeout" \
-                    --max-time "$metadata_max_time" -o /dev/null \
-                    -w "$identity,%{http_code},%{time_total}\n" \
-                    "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN"
+                while :; do
+                    metrics=$(soak_curl "$identity" --silent --show-error \
+                        --connect-timeout "$connect_timeout" \
+                        --max-time "$metadata_max_time" -o /dev/null \
+                        --dump-header "$headers" \
+                        -w '%{http_code},%{time_total}' \
+                        "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN")
+                    status=${metrics%%,*}
+                    duration=${metrics#*,}
+                    case "$status" in
+                        2??)
+                            printf '%s,%s,%s\n' "$identity" "$status" "$duration"
+                            break
+                            ;;
+                        503)
+                            retry_after=$(awk '
+                                { sub(/\r$/, "") }
+                                tolower($1) == "retry-after:" {
+                                    values++
+                                    value = $2
+                                    if (NF != 2) invalid = 1
+                                }
+                                END {
+                                    if (values != 1 || invalid) exit 1
+                                    print value
+                                }
+                            ' "$headers")
+                            [ "$retry_after" = "$metadata_capacity_retry_after_seconds" ] \
+                                || exit 1
+                            awk -v value="$duration" \
+                                -v limit="$metadata_capacity_response_limit" 'BEGIN {
+                                    exit !(value ~ /^[0-9]+([.][0-9]+)?$/ \
+                                        && value + 0 > 0 && value + 0 <= limit)
+                                }' || exit 1
+                            capacity_retries=$((capacity_retries + 1))
+                            printf '%s,%s,%s,%s,%s,%s\n' \
+                                "$identity" "$((request + 1))" "$capacity_retries" \
+                                "$status" "$duration" "$retry_after" \
+                                >>"$capacity_evidence"
+                            [ "$capacity_retries" \
+                                -le "$metadata_capacity_retry_limit_per_client" ] \
+                                || exit 1
+                            sleep "$retry_after"
+                            ;;
+                        *) exit 1 ;;
+                    esac
+                done
                 request=$((request + 1))
             done
         ) >"$work/metadata-$client.csv" &
@@ -521,10 +571,12 @@ metadata_profile() {
     # Aggregate every completed client result before returning a profile
     # failure so the EXIT evidence retains the available partial measurements.
     cat "$work"/metadata-*.csv >"$work/metadata.csv"
+    cat "$work"/capacity-retry-client-*.csv >"$work/metadata-capacity-retries.csv"
     [ "$metadata_failed" -eq 0 ] || return 1
     [ "$(wc -l <"$work/metadata.csv")" -eq 2000 ] || return 1
     awk -F, '
-        $1 !~ /^198\.18\.1\.[0-9]+$/ || $2 !~ /^2[0-9][0-9]$/ { exit 1 }
+        $1 !~ /^198\.18\.1\.[0-9]+$/ || $2 !~ /^2[0-9][0-9]$/ \
+            || $3 !~ /^[0-9]+([.][0-9]+)?$/ || $3 + 0 <= 0 { exit 1 }
         { if (!seen[$1]++) clients++ }
         END {
             if (clients != 100) exit 1
@@ -532,6 +584,20 @@ metadata_profile() {
                 if (seen["198.18.1." client] != 20) exit 1
         }
     ' "$work/metadata.csv" || return 1
+    awk -F, -v retry_limit="$metadata_capacity_retry_limit_per_client" \
+        -v duration_limit="$metadata_capacity_response_limit" \
+        -v retry_after="$metadata_capacity_retry_after_seconds" '
+        NF != 6 || $1 !~ /^198\.18\.1\.[0-9]+$/ \
+            || $2 !~ /^([1-9]|1[0-9]|20)$/ \
+            || $3 !~ /^[1-9][0-9]*$/ || $3 > retry_limit || $4 != 503 \
+            || $5 !~ /^[0-9]+([.][0-9]+)?$/ || $5 + 0 <= 0 \
+            || $5 + 0 > duration_limit || $6 != retry_after { exit 1 }
+        {
+            split($1, octets, ".")
+            if (octets[4] < 1 || octets[4] > 100) exit 1
+            if ($3 != ++retries[$1]) exit 1
+        }
+    ' "$work/metadata-capacity-retries.csv" || return 1
     p95=$(awk -F, '{ print $3 }' "$work/metadata.csv" \
         | sort -n | awk 'NR == 1900 { print; exit }')
     [ -n "$p95" ] || return 1
@@ -774,10 +840,14 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     range_rows=0
     upload_rows=0
     rss_rows=0
+    metadata_capacity_retries=0
     [ ! -f "$work/metadata.csv" ] || metadata_rows=$(wc -l <"$work/metadata.csv")
     [ ! -f "$work/ranges.csv" ] || range_rows=$(wc -l <"$work/ranges.csv")
     [ ! -f "$work/uploads.csv" ] || upload_rows=$(wc -l <"$work/uploads.csv")
     [ ! -f "$work/rss-samples.csv" ] || rss_rows=$(wc -l <"$work/rss-samples.csv")
+    [ ! -f "$work/metadata-capacity-retries.csv" ] \
+        || metadata_capacity_retries=$(wc -l <"$work/metadata-capacity-retries.csv")
+    metadata_attempts=$((metadata_rows + metadata_capacity_retries))
     observed_p95=unavailable
     observed_p95_within_limit=unavailable
     observed_range_ttfb_p95=unavailable
@@ -812,6 +882,8 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         "upload_status=$upload_status" \
         "rss_status=$rss_status" \
         "metadata_rows=$metadata_rows" \
+        "metadata_attempts=$metadata_attempts" \
+        "metadata_capacity_retries=$metadata_capacity_retries" \
         "range_rows=$range_rows" \
         "upload_rows=$upload_rows" \
         "rss_rows=$rss_rows" \
@@ -858,6 +930,8 @@ fi
 load_stage=evidence-finalization
 if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     install -m 0640 "$work/metadata.csv" "$LOAD_TEST_EVIDENCE_DIR/metadata-load.csv"
+    install -m 0640 "$work/metadata-capacity-retries.csv" \
+        "$LOAD_TEST_EVIDENCE_DIR/metadata-capacity-retries.csv"
     install -m 0640 "$work/ranges.csv" "$LOAD_TEST_EVIDENCE_DIR/range-results.csv"
     install -m 0640 "$work/uploads.csv" "$LOAD_TEST_EVIDENCE_DIR/upload-results.csv"
     install -m 0640 "$work/rss-samples.csv" "$LOAD_TEST_EVIDENCE_DIR/rss-samples.csv"
@@ -882,6 +956,11 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         "range_duration_p95_seconds=$range_duration_p95" \
         'metadata_clients=100' \
         'metadata_requests=2000' \
+        "metadata_attempts=$metadata_attempts" \
+        "metadata_capacity_retries=$metadata_capacity_retries" \
+        "metadata_capacity_retry_limit_per_client=$metadata_capacity_retry_limit_per_client" \
+        "metadata_capacity_retry_after_seconds=$metadata_capacity_retry_after_seconds" \
+        "metadata_capacity_response_limit_seconds=$metadata_capacity_response_limit" \
         'range_streams=40' \
         'range_share_count=3' \
         'range_streams_per_share_max=14' \

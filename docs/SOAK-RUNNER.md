@@ -119,6 +119,13 @@ pressure groups overlap. This is separate from the diagnostic p95 recorded by
 full-system QEMU gates; QEMU still runs the identical workload and enforces all
 of its functional, security, integrity, and RSS assertions.
 
+Metadata p95 is calculated from exactly 2,000 successful responses (20 per
+client). A client may retry at most three capacity responses across its whole
+profile, and only when the response is HTTP 503 with exactly `Retry-After: 1`
+within 1.1 seconds. Every such attempt is retained separately in
+`metadata-capacity-retries.csv`; any other response or an exhausted retry
+budget fails the profile.
+
 `DOWNLOAD_TOKEN`, `ADMISSION_DOWNLOAD_TOKEN`, and `RANGE_DOWNLOAD_TOKEN` must
 be three distinct, independent download shares for the same large fixture.
 The admission probe spreads one forwarded client's streams evenly across the
