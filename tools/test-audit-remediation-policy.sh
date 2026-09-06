@@ -12,6 +12,7 @@ mkdir -p \
     "$base/.github/workflows" \
     "$base/assets/web" \
     "$base/deploy/docker" \
+    "$base/docs" \
     "$base/src/setup"
 
 for fixture in \
@@ -24,6 +25,7 @@ for fixture in \
     deploy/docker/Dockerfile.qemu-runner \
     deploy/docker/Dockerfile.distro-vm-image \
     README.md \
+    docs/INSTALLATION.md \
     src/setup/routes.rs; do
     cp "$fixture" "$base/$fixture"
 done
@@ -134,7 +136,13 @@ expect_rejected() {
                 "$case_root/.github/workflows/ci.yml"
             ;;
         query_setup_token)
-            sed -i 's|/#token=|/?token=|' "$case_root/README.md"
+            sed -i 's|/#token=|/?token=|' "$case_root/docs/INSTALLATION.md"
+            ;;
+        readme_query_setup_token)
+            printf '%s\n' 'http://127.0.0.1:8090/?token=example' >>"$case_root/README.md"
+            ;;
+        missing_installation_link)
+            sed -i '/docs\/INSTALLATION.md#native-package-deployment/d' "$case_root/README.md"
             ;;
         *)
             echo "unknown negative policy fixture: $case_name" >&2
@@ -169,7 +177,9 @@ for case_name in \
     missing_native_parse \
     commented_native_parse \
     commented_native_recipe \
-    query_setup_token; do
+    query_setup_token \
+    readme_query_setup_token \
+    missing_installation_link; do
     expect_rejected "$case_name"
 done
 

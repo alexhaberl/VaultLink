@@ -1,7 +1,11 @@
 # Native package support
 
-VaultLink 0.7.0 is distributed only as a native, signed operating-system
-package. GitHub's automatically generated source archives are source material,
+This document describes the **0.7.0 development package contract**; 0.7.0 is
+unreleased. To install the supported **0.6.0** release, follow the
+[installation guide](INSTALLATION.md).
+
+VaultLink releases are distributed only as native, signed operating-system
+packages. GitHub's automatically generated source archives are source material,
 not supported installation artifacts. VaultLink does not publish a package
 repository, a standalone binary, or a project tar archive.
 
@@ -21,7 +25,8 @@ than repeat target lists in workflow YAML.
 | Fedora 44 | x86_64, aarch64 | RPM |
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
-For version 0.7.0 the manifest resolves those targets to these exact assets:
+For the unreleased version 0.7.0, the manifest defines these asset names; they
+are not currently published installation packages:
 
 | Target | Release asset |
 | --- | --- |

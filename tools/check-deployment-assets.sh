@@ -80,18 +80,21 @@ for update_asset in \
 done
 [ "$(sed -n 's/^auto_install=//p' deploy/vaultlink-update.conf.example)" = false ] \
     || fail "automatic release installation must be opt-in"
-if ! grep -F -q "if sudo test ! -e /etc/vaultlink/update.conf && \\" README.md \
-    || ! grep -F -q 'sudo test ! -L /etc/vaultlink/update.conf; then' README.md \
-    || ! grep -F -q "sudo install -o root -g root -m 0644 \\" README.md \
-    || ! grep -F -q '/usr/share/vaultlink/update.conf.example /etc/vaultlink/update.conf' README.md \
-    || ! grep -F -q 'sudoedit /etc/vaultlink/update.conf' README.md; then
-    fail "README must bootstrap updater configuration from the packaged example without overwriting files or symlinks"
+if ! grep -F -q '(docs/INSTALLATION.md#native-package-deployment)' README.md; then
+    fail "README must link to the native package installation guide"
 fi
-if ! grep -F -q "Open \`http://127.0.0.1:8090/#token=...\` locally." README.md \
-    || grep -F -q '?token=' README.md \
+if ! grep -F -q "if sudo test ! -e /etc/vaultlink/update.conf && \\" docs/INSTALLATION.md \
+    || ! grep -F -q 'sudo test ! -L /etc/vaultlink/update.conf; then' docs/INSTALLATION.md \
+    || ! grep -F -q "sudo install -o root -g root -m 0644 \\" docs/INSTALLATION.md \
+    || ! grep -F -q '/usr/share/vaultlink/update.conf.example /etc/vaultlink/update.conf' docs/INSTALLATION.md \
+    || ! grep -F -q 'sudoedit /etc/vaultlink/update.conf' docs/INSTALLATION.md; then
+    fail "installation guide must bootstrap updater configuration from the packaged example without overwriting files or symlinks"
+fi
+if ! grep -F -q "Open \`http://127.0.0.1:8090/#token=...\` locally." docs/INSTALLATION.md \
+    || grep -F -q '?token=' README.md docs/INSTALLATION.md \
     || ! grep -F -q 'http://127.0.0.1:{port}/#token={token}' src/setup/routes.rs \
     || ! grep -F -q "new URLSearchParams(location.hash.slice(1))" assets/web/setup.js; then
-    fail "README and setup implementation must pass the one-time setup token in the URL fragment, never the query string"
+    fail "installation guide and setup implementation must pass the one-time setup token in the URL fragment, never the query string"
 fi
 grep -F -x -q 'repository=alexhaberl/VaultLink' deploy/vaultlink-update.sh \
     || fail "the updater repository must be fixed"

@@ -1,6 +1,7 @@
 # Monitoring API
 
-VaultLink 0.7.0 exposes two read-only resources for local monitoring clients.
+VaultLink **0.7.0 (unreleased)** exposes two read-only resources for local monitoring
+clients. These endpoints and service tokens are unavailable in **0.6.0**.
 The intended first client is the separate Home Assistant HACS integration;
 VaultLink itself contains no Home Assistant code.
 
@@ -127,3 +128,15 @@ Errors use the normal v2 envelope:
 
 Clients must treat the code and HTTP status as authoritative, must not include
 the credential in diagnostics, and must honor `Retry-After` after `429`.
+
+## Local service-token recovery
+
+With VaultLink stopped, a host administrator can atomically revoke every monitoring token. The mandatory `--all` flag prevents accidental invocation; stdout contains only the revoked count:
+
+```sh
+sudo -u vaultlink /opt/vaultlink/vaultlink revoke-all-service-tokens \
+  --config /etc/vaultlink/config.toml \
+  --all
+```
+
+Use `--database /var/lib/vaultlink/data.sqlite` instead of `--config` only when configuration resolution is unavailable. An older manual database restore can resurrect a token that was revoked after the backup: keep traffic stopped, run this command, issue replacement tokens, update every monitoring client, and only then reopen traffic. Normal verified upgrade rollback does not revoke tokens automatically.

@@ -52,7 +52,55 @@ def validate(root: Path, value: dict[str, object]) -> list[str]:
     return errors
 
 
+def test_installation_docs() -> None:
+    state = json.loads((REPOSITORY / "release/release-state.json").read_text(encoding="utf-8"))
+    development = state["development_version"]
+    supported = state["supported_version"]
+    releases = {entry["version"]: entry for entry in state["releases"]}
+    documents = ["README.md", "SECURITY.md", "CHANGELOG.md", "THREAT_MODEL.md",
+                 "docs/INSTALLATION.md"]
+    documents.extend(entry["checklist"] for entry in releases.values())
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        for name in documents:
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text((REPOSITORY / name).read_text(encoding="utf-8"), encoding="utf-8")
+        original_root = MODULE.ROOT
+        MODULE.ROOT = root
+        try:
+            def errors() -> list[str]:
+                result: list[str] = []
+                MODULE.validate_docs(development, supported, releases, result)
+                return result
+
+            assert errors() == []
+            readme = root / "README.md"
+            baseline_readme = readme.read_text(encoding="utf-8")
+            readme.write_text(baseline_readme.replace(
+                "(docs/INSTALLATION.md#native-package-deployment)", "(docs/MISSING.md)"
+            ), encoding="utf-8")
+            assert any("must link" in error for error in errors())
+            readme.write_text(baseline_readme, encoding="utf-8")
+
+            install = root / "docs/INSTALLATION.md"
+            baseline_install = install.read_text(encoding="utf-8")
+            for broken, expected in [
+                (baseline_install.replace("## Native package deployment", "## Other"), "section is missing"),
+                (baseline_install.replace(f"VaultLink {supported} supports", "VaultLink 0.0.0 supports"), "does not use supported_version"),
+                (baseline_install.replace(f"vaultlink-release-{supported}.", "vaultlink-release-0.0.0."), "staging example"),
+                (baseline_install + f"\nInstall {development} instead.\n", "offers the unreleased version"),
+            ]:
+                install.write_text(broken, encoding="utf-8")
+                assert any(expected in error for error in errors()), expected
+            install.unlink()
+            assert errors(), "a missing installation guide must fail closed"
+        finally:
+            MODULE.ROOT = original_root
+
+
 def main() -> None:
+    test_installation_docs()
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         write_json(

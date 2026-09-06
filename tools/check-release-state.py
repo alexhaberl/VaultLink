@@ -309,18 +309,17 @@ def validate_docs(development: str, supported: str, releases: dict[str, dict[str
         require(f"## {version} — {item.get('release_date')}" in changelog
                 and "Withdrawn and unsupported" in changelog,
                 f"CHANGELOG lacks withdrawn status for {version}", errors)
-    install_start = readme.find("## 8. Native package deployment")
-    install_end = readme.find("\n## 9.", install_start + 1)
-    require(install_start >= 0 and install_end > install_start,
-            "README native package section is missing", errors)
-    if install_start >= 0 and install_end > install_start:
-        install = readme[install_start:install_end]
-        require(f"VaultLink {supported} supports" in install,
-                "README installation section does not use supported_version", errors)
-        require(f"vaultlink-release-{supported}." in install,
-                "README staging example does not use supported_version", errors)
-        require(development not in install,
-                "README installation section offers the unreleased version", errors)
+    require("(docs/INSTALLATION.md#native-package-deployment)" in readme,
+            "README must link to the native package installation guide", errors)
+    install = text("docs/INSTALLATION.md", errors)
+    require("## Native package deployment" in install,
+            "installation guide native package section is missing", errors)
+    require(f"VaultLink {supported} supports" in install,
+            "installation guide does not use supported_version", errors)
+    require(f"vaultlink-release-{supported}." in install,
+            "installation staging example does not use supported_version", errors)
+    require(development not in install,
+            "installation guide offers the unreleased version", errors)
     require("RA-10" in threat_model and "Closed historical risks" in threat_model,
             "THREAT_MODEL does not historicize RA-10", errors)
     require("Reconfirmed for 0.7.0" in threat_model,
