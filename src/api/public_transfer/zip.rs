@@ -1,3 +1,8 @@
+#[cfg(test)]
+use crate::services::public_transfer::zip_test_hooks::{
+    block_zip_for_test, zip_test_phase_active, ZipBlockingTestPhase,
+};
+
 use std::path::Path;
 
 use axum::{
@@ -187,15 +192,20 @@ async fn prepare_body(
     let settings = runtime_settings(state);
     let directory = prepared.directory.clone();
     let path = prepared.subpath.clone();
-    let (resources, plan) =
-        blocking_with_resources(resources, move || plan_zip(&directory, &path, &settings))
-            .await
-            .map_err(|error| {
-                ApiError::from(report_internal(
-                    InternalOperation::WebZipPlanTaskJoin,
-                    error,
-                ))
-            })?;
+    #[cfg(test)]
+    let test_path = prepared.share.relative_path.clone();
+    let (resources, plan) = blocking_with_resources(resources, move || {
+        #[cfg(test)]
+        block_zip_for_test(&test_path, ZipBlockingTestPhase::Plan);
+        plan_zip(&directory, &path, &settings)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::from(report_internal(
+            InternalOperation::WebZipPlanTaskJoin,
+            error,
+        ))
+    })?;
     let plan = match plan {
         Ok(plan) => plan,
         Err(error) => {
@@ -208,6 +218,22 @@ async fn prepare_body(
     } else {
         ZipTempReservation::acquire(state, plan.estimated_archive_size).await
     };
+    #[cfg(test)]
+    let reservation =
+        if zip_test_phase_active(&prepared.share.relative_path, ZipBlockingTestPhase::Direct) {
+            drop(reservation);
+            Ok(None)
+        } else if zip_test_phase_active(
+            &prepared.share.relative_path,
+            ZipBlockingTestPhase::Materialize,
+        ) {
+            drop(reservation);
+            Ok(Some(ZipTempReservation::acquire_unchecked_for_test(
+                plan.estimated_archive_size,
+            )))
+        } else {
+            reservation
+        };
     let reservation = match reservation {
         Ok(reservation) => reservation,
         Err(_) => {
@@ -238,7 +264,11 @@ async fn materialize(
         reservation,
     };
     let directory = prepared.directory.clone();
+    #[cfg(test)]
+    let test_path = prepared.share.relative_path.clone();
     let (materialization, (plan, result)) = blocking_with_resources(materialization, move || {
+        #[cfg(test)]
+        block_zip_for_test(&test_path, ZipBlockingTestPhase::Materialize);
         let result = build_zip_temp(&directory, &plan).and_then(|file| {
             let length = file.metadata().map_err(ZipBuildError::Output)?.len();
             Ok((file, length))
@@ -314,8 +344,18 @@ fn direct_body(
     prepared: crate::services::public_transfer::PreparedZipScope,
     plan: ZipPlan,
 ) -> Body {
+    #[cfg(test)]
+    let test_path = prepared.share.relative_path.clone();
     Body::from_stream(transfer_stream(
-        direct_zip_stream_with_resources(prepared.directory, plan, resources.generation, || {}),
+        direct_zip_stream_with_resources(
+            prepared.directory,
+            plan,
+            resources.generation,
+            move || {
+                #[cfg(test)]
+                block_zip_for_test(&test_path, ZipBlockingTestPhase::Direct);
+            },
+        ),
         state,
         resources.transfer,
         "zip_download",

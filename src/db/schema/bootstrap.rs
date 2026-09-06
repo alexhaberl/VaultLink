@@ -4,7 +4,7 @@ CREATE TABLE vaultlink_schema(
     fingerprint TEXT NOT NULL
 );
 INSERT INTO vaultlink_schema(singleton,fingerprint)
-VALUES(1,'vaultlink-schema-9-pending-transfer-index-2026-09-05');
+VALUES(1,'vaultlink-schema-10-share-filter-indexes-2026-09-06');
 
 CREATE TABLE vaultlink_schema_migrations(
     target_version INTEGER PRIMARY KEY CHECK(target_version > 0),
@@ -286,12 +286,19 @@ fn initialize_empty_database(conn: &mut Connection) -> rusqlite::Result<()> {
         [Utc::now().to_rfc3339()],
     )?;
     tx.execute_batch(PENDING_TRANSFER_INDEX_SQL)?;
+    for (_, sql) in SHARE_FILTER_INDEXES {
+        tx.execute_batch(sql)?;
+    }
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(10,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(9,?1)",
         [Utc::now().to_rfc3339()],
     )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    validate_schema_9(&tx)?;
+    validate_schema_10(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }

@@ -1,72 +1,3 @@
-fn share_page_sql(options: &ShareListOptions, needle: Option<&str>) -> String {
-    const SELECT: &str = "SELECT shares.id,token_hash,token_key_id,token_ciphertext,alias,relative_path,is_directory,permission,expires_at,max_downloads,max_upload_size,max_upload_total_size,max_upload_files,COALESCE(usage.uploaded_bytes,0),COALESCE(usage.uploaded_files,0),download_count,active,password_hash,upload_conflict_strategy,created_at,upload_policy_epoch FROM shares LEFT JOIN public_upload_usage usage ON usage.share_id=shares.id";
-    let status_predicate = match options.status {
-        super::ShareListStatus::All => "1",
-        super::ShareListStatus::Active => {
-            "shares.active=1 AND (shares.expires_at IS NULL OR shares.expires_at>?1)
-                 AND (shares.max_downloads IS NULL OR shares.download_count<shares.max_downloads)"
-        }
-        super::ShareListStatus::Protected => "shares.password_hash IS NOT NULL",
-        super::ShareListStatus::Expired => {
-            "shares.expires_at IS NOT NULL AND shares.expires_at<=?1"
-        }
-        super::ShareListStatus::LimitReached => {
-            "shares.max_downloads IS NOT NULL
-                 AND shares.download_count>=shares.max_downloads"
-        }
-        super::ShareListStatus::Inactive => "shares.active=0",
-    };
-    let (cursor_predicate, order_by) = match (options.sort, options.cursor.is_some()) {
-        (ShareListSort::Newest, true) => ("shares.id<?2", "shares.id DESC"),
-        (ShareListSort::Oldest, true) => ("shares.id>?2", "shares.id ASC"),
-        (ShareListSort::Newest, false) => ("1=1", "shares.id DESC"),
-        (ShareListSort::Oldest, false) => ("1=1", "shares.id ASC"),
-    };
-    match needle {
-        Some(needle) if needle.chars().count() >= 3 => {
-            // Give FTS5 its own rowid bound and order so it can seek and stop
-            // after LIMIT instead of sorting the full matching posting list.
-            let (cursor_predicate, order_by) = match (options.sort, options.cursor.is_some()) {
-                (ShareListSort::Newest, true) => {
-                    ("share_search_fts.rowid<?2", "share_search_fts.rowid DESC")
-                }
-                (ShareListSort::Oldest, true) => {
-                    ("share_search_fts.rowid>?2", "share_search_fts.rowid ASC")
-                }
-                (ShareListSort::Newest, false) => ("1=1", "share_search_fts.rowid DESC"),
-                (ShareListSort::Oldest, false) => ("1=1", "share_search_fts.rowid ASC"),
-            };
-            format!(
-                "{SELECT}
-                     JOIN share_search_fts ON share_search_fts.rowid=shares.id
-                     WHERE {status_predicate}
-                       AND {cursor_predicate}
-                       AND share_search_fts MATCH ?4
-                       AND (instr(shares.alias_search_key,?5)>0
-                            OR instr(shares.path_search_key,?5)>0)
-                     ORDER BY {order_by}
-                     LIMIT ?3"
-            )
-        }
-        Some(_) => {
-            format!(
-                "{SELECT} WHERE {status_predicate}
-                       AND {cursor_predicate}
-                       AND (instr(shares.alias_search_key,?4)>0
-                            OR instr(shares.path_search_key,?4)>0)
-                     ORDER BY {order_by}
-                     LIMIT ?3"
-            )
-        }
-        None => {
-            format!(
-                "{SELECT} WHERE {status_predicate} AND {cursor_predicate}
-                 ORDER BY {order_by} LIMIT ?3"
-            )
-        }
-    }
-}
-
 impl Database {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
@@ -436,59 +367,6 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(shares)
     }
-    pub fn list_share_page(&self, options: &ShareListOptions) -> rusqlite::Result<SharePage> {
-        let query = options
-            .query
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(unicode_search_key);
-        let limit = options.limit.clamp(1, 200);
-        let fetch_limit = limit.saturating_add(1) as i64;
-        let connection = self.try_conn()?;
-        let now = options.now.to_rfc3339();
-        let sql = share_page_sql(options, query.as_deref());
-        let mut shares = if let Some(needle) = query.as_deref() {
-            if needle.chars().count() >= 3 {
-                let fts_query = fts5_phrase(needle);
-                connection
-                    .prepare(&sql)?
-                    .query_map(
-                        params![now, options.cursor, fetch_limit, fts_query, needle],
-                        |row| self.map_share(row),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                // FTS5's trigram tokenizer intentionally emits no tokens for
-                // one- and two-character terms. Keep those compatible using
-                // the normalized content columns, while still applying LIMIT
-                // before any encrypted token is loaded or decrypted.
-                connection
-                    .prepare(&sql)?
-                    .query_map(params![now, options.cursor, fetch_limit, needle], |row| {
-                        self.map_share(row)
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-        } else {
-            connection
-                .prepare(&sql)?
-                .query_map(params![now, options.cursor, fetch_limit], |row| {
-                    self.map_share(row)
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let next_cursor = if shares.len() > limit {
-            shares.pop();
-            shares.last().map(|share| share.id)
-        } else {
-            None
-        };
-        Ok(SharePage {
-            shares,
-            next_cursor,
-        })
-    }
     pub fn share_summary(&self, now: DateTime<Utc>) -> rusqlite::Result<ShareSummary> {
         self.try_conn()?.query_row(
             "SELECT
@@ -528,7 +406,3 @@ impl Database {
         )
     }
 }
-
-#[cfg(test)]
-#[path = "query_tests.rs"]
-mod query_tests;

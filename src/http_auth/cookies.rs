@@ -124,7 +124,9 @@ fn monitoring_credentials<'a>(
         (ExactHeader::One(_), ExactHeader::Missing) => Ok(MonitoringCredentials::Session),
         (ExactHeader::Missing, ExactHeader::One(value)) => strict_service_token(value)
             .map(MonitoringCredentials::ServiceToken)
-            .ok_or_else(|| HttpAuthError::status(StatusCode::UNAUTHORIZED, "Invalid authentication")),
+            .ok_or_else(|| {
+                HttpAuthError::status(StatusCode::UNAUTHORIZED, "Invalid authentication")
+            }),
         (ExactHeader::Missing, ExactHeader::Missing) => Err(HttpAuthError::status(
             StatusCode::UNAUTHORIZED,
             "Authentication required",

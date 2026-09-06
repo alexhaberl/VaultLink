@@ -6,12 +6,20 @@ upgrade, or migration path from the withdrawn 0.5.0 archive installation. A
 markerless or mismatched installation fails closed before package files or
 runtime state are changed.
 
-The current development binary creates schema 9 and migrates supported schemas
-1 through 8 forward. The 8-to-9 step adds the partial pending-transfer index in
-an atomic `IMMEDIATE` transaction; a failed step leaves a valid schema-8 database.
-An older schema-8 binary cannot open a schema-9 database. Rollback therefore
-restores the matching pre-upgrade binary, configuration, database and keyring
-backup; do not downgrade `PRAGMA user_version` in an operational database.
+The current development binary creates schema 10 and migrates supported schemas
+1 through 9 forward. The 9-to-10 step adds partial Share status indexes and
+expiry/ID indexes in an atomic `IMMEDIATE` transaction. A failed step leaves a
+valid schema-9 database, including its fingerprint and migration history.
+Older binaries cannot open schema 10. Rollback restores the matching pre-upgrade
+binary, configuration, database and keyring backup; never downgrade
+`PRAGMA user_version` in an operational database.
+
+Share searches now require at least three Unicode characters after trimming;
+empty searches still list all matching Shares. A shorter nonempty search returns
+HTTP 400 in HTML and API v2. The HTML form preserves the input and explains how
+to correct it. The existing byte limit, ordering and cursor format are unchanged.
+Displayed available/protected counters may lag by one second. Authorization,
+expiry and transfer quotas continue to read current database state.
 
 ## Installation and package identity
 

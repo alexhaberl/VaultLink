@@ -21,14 +21,37 @@ use super::zip::DirectoryAccess;
 const TEXT_PREVIEW_STREAM_MARKER: &str = "<!--VAULTLINK_ESCAPED_TEXT_PREVIEW_STREAM-->";
 const MAX_RENDERED_TEXT_PREVIEW_BYTES: usize = crate::config::MAX_TEXT_PREVIEW_SIZE as usize;
 
+#[cfg(test)]
+#[path = "preview_resource_tests.rs"]
+mod resource_tests;
+
 pub(crate) enum PreviewContent {
     TooLarge { size: u64 },
     Text(String),
     Media { kind: PreviewKind, size: u64 },
 }
 
+/// Keep admission and lease ownership in the operation that cannot be cancelled.
+/// Dropping the awaiting HTTP future detaches the blocking task; its resources
+/// must survive until the read returns or unwinds, including discarded results.
+pub(crate) async fn read_preview_with_resources<R, F>(
+    resources: R,
+    read: F,
+) -> Result<(R, io::Result<PreviewContent>), tokio::task::JoinError>
+where
+    R: Send + 'static,
+    F: FnOnce() -> io::Result<PreviewContent> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let content = read();
+        (resources, content)
+    })
+    .await
+}
+
 #[cfg(test)]
 pub(crate) struct TextPreviewReadTestHook {
+    pub(crate) panic_after_release: bool,
     pub(crate) path: String,
     pub(crate) entered: std::sync::atomic::AtomicUsize,
     pub(crate) released: std::sync::Mutex<bool>,
@@ -81,10 +104,16 @@ fn block_text_preview_read_for_test(path: &str) {
         return;
     };
     hook.entered.fetch_add(1, Ordering::AcqRel);
-    let mut released = hook.released.lock().unwrap();
-    while !*released {
-        released = hook.wake.wait(released).unwrap();
-    }
+    let released = hook.released.lock().unwrap();
+    let (released, timeout) = hook
+        .wake
+        .wait_timeout_while(released, std::time::Duration::from_secs(10), |released| {
+            !*released
+        })
+        .unwrap();
+    drop(released);
+    assert!(!timeout.timed_out(), "preview hook timed out");
+    assert!(!hook.panic_after_release, "injected preview read panic");
 }
 
 pub(crate) struct EscapedTextPageStream {

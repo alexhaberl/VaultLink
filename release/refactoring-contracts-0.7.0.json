@@ -33,22 +33,22 @@
   "locked_files": [
     {
       "path": "src/db/schema.rs",
-      "sha256": "2822115866f8fdf928d5186dfd3c0a762eac7c467382e9e4dd074df57f25998b",
+      "sha256": "ce0c48ca5ea35bdd52055cf10469f29c1f1e53f4bea6c35b33643807197d7479",
       "contract": "schema version and fingerprints"
     },
     {
       "path": "src/db/schema/bootstrap.rs",
-      "sha256": "e115a7d7e333c774fa415f44ca48718ee1381a5b78a0ae3b72cc05707b7107fb",
+      "sha256": "ba7f09d633feb6ebe6332b1faa43ecdcc859e5e10024152b2ee3f9a15fc1c57a",
       "contract": "bootstrap SQL"
     },
     {
       "path": "src/db/schema/migrations.rs",
-      "sha256": "784de2b6a4fd4060046375dd6adc887f877b589f2879f8be9ac0f85d7eaf51e2",
+      "sha256": "ef5b423209ccdae1d92cba9cde833ad5dd86141b71dfae0af762e9ef5023ac33",
       "contract": "migration SQL"
     },
     {
       "path": "src/db/schema/validation.rs",
-      "sha256": "507930edfae8de031f75ad9f42348c694af44b32ae5f42afd663ff79e5249c36",
+      "sha256": "4c7a2699bff25642e04956c2ab526ecdb0ff131e3acc22c2057040e7b2141db1",
       "contract": "schema validation SQL"
     },
     {
@@ -58,12 +58,12 @@
     },
     {
       "path": "src/db/shares/query.rs",
-      "sha256": "40bbced51a594d4abfecc5498cccffb222b1b773ef9f2bad70cf3b29113896c5",
+      "sha256": "b3ad1c377250b3fa6d50a9f4a79292e2df83cb269a9a6220eab625818fb141c3",
       "contract": "share-token AAD"
     },
     {
       "path": "src/db/tests/schema_fixtures.rs",
-      "sha256": "1926a6837c33b05e0f49e8c55a309309e9127117553f6d2088c95c0225fb1d41",
+      "sha256": "dbcde01e0861944478b81d82674a9eff3b70a5701c33e6adb77eed59d014ac7b",
       "contract": "historical schema fixtures"
     },
     {
@@ -101,7 +101,7 @@
         "src/i18n/messages.rs",
         "src/i18n/render.rs"
       ],
-      "sha256": "ebf6b979ad51abbca9bd7c73a6b7195e10cbb1760515bd2eaca59f353857fda2"
+      "sha256": "f657f77ca7e377851e1e7ca5306e040b49cc8a3c2340d154426642c6839bd2fb"
     },
     {
       "name": "service domain source bundle",
@@ -154,7 +154,7 @@
         "src/db/schema/migrations.rs",
         "src/db/schema/validation.rs"
       ],
-      "sha256": "f223242e89177f016e5c36100a1bcba0809e88f005b7fc540aed2f20b01dada4"
+      "sha256": "6cfebdcb3bb0bcc0d948b49eac47bae84f5a8e308abaeb9cf0edd1bf0f3bc1db"
     },
     {
       "name": "database transfer method sequence",
@@ -204,7 +204,7 @@
         "src/web/files/admin_upload.rs",
         "src/web/files/admin_upload_flow.rs"
       ],
-      "sha256": "5c06ed8a776cd3bf66e1f304312ed14cd424a4514d282775e13711999d06c1bb"
+      "sha256": "c06562c3b30caa92b0aa275b721a598fcd07a64e75ed5d3eb08ade5635d4f3ab"
     },
     {
       "name": "shared public upload transport and adapters",

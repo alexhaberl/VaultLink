@@ -126,16 +126,9 @@ pub(super) async fn list_shares(
     if query.cursor.is_some_and(|cursor| cursor <= 0) {
         return Err(ApiError::bad_request("Share list cursor is invalid"));
     }
-    let query_text = query
-        .q
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if query_text
-        .as_ref()
-        .is_some_and(|value| value.len() > super::MAX_SEARCH_QUERY_BYTES)
-    {
-        return Err(ApiError::bad_request("Share search query is too long"));
-    }
+    let query_text = crate::share_search::validate_share_search(query.q.as_deref())
+        .map_err(|error| ApiError::bad_request(error.message()))?
+        .map(str::to_owned);
     let status = ShareListStatus::parse(query.status.as_deref().unwrap_or("all"))
         .ok_or_else(|| ApiError::bad_request("Share list status is invalid"))?;
     let sort = match query.sort.as_deref().unwrap_or("newest") {

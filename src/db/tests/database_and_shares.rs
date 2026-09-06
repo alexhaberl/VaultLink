@@ -283,7 +283,7 @@ fn share_search_filters_and_limits_before_decrypting_tokens() {
         "FTS search must map/decrypt at most limit + 1 rows"
     );
     super::shares::reset_share_map_count();
-    let short_query_page = database
+    assert!(database
         .list_share_page(&ShareListOptions {
             query: Some("ma".to_owned()),
             status: ShareListStatus::All,
@@ -292,13 +292,11 @@ fn share_search_filters_and_limits_before_decrypting_tokens() {
             limit: 1,
             now: Utc::now(),
         })
-        .unwrap();
-    assert_eq!(short_query_page.shares.len(), 1);
-    assert!(short_query_page.next_cursor.is_some());
+        .is_err());
     assert_eq!(
         super::shares::share_map_count(),
-        2,
-        "short-query fallback must map/decrypt at most limit + 1 rows"
+        0,
+        "invalid searches must not decrypt rows"
     );
 }
 

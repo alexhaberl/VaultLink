@@ -237,11 +237,17 @@ async fn service_token_api_requires_reauthentication_and_never_lists_the_secret(
         r#"{"error":{"code":"unauthorized","message":"Authentication required"}}"#
     );
     assert_eq!(
-        state.db().count_audit(Some("service_token_created")).unwrap(),
+        state
+            .db()
+            .count_audit(Some("service_token_created"))
+            .unwrap(),
         1
     );
     assert_eq!(
-        state.db().count_audit(Some("service_token_revoked")).unwrap(),
+        state
+            .db()
+            .count_audit(Some("service_token_revoked"))
+            .unwrap(),
         1
     );
 }
@@ -299,7 +305,10 @@ async fn service_token_api_enforces_expiration_boundaries() {
     assert!(created["token"].as_str().unwrap().starts_with("vlk_st_v1_"));
     assert_eq!(state.db().list_service_tokens().unwrap().len(), 1);
     assert_eq!(
-        state.db().count_audit(Some("service_token_created")).unwrap(),
+        state
+            .db()
+            .count_audit(Some("service_token_created"))
+            .unwrap(),
         1
     );
 }

@@ -328,11 +328,14 @@ async fn public_folder_upload_propagates_first_and_later_mkdir_uncertainty() {
     );
 
     let fault_root = state.secure_root().clone();
-    state.secure_root().after_next_directory_tree_create(move || {
-        fault_root
-            .fail_next_create_directory_mkdir_after_success(std::io::ErrorKind::ConnectionReset);
-        fault_root.fail_next_create_directory_probe(std::io::ErrorKind::WouldBlock);
-    });
+    state
+        .secure_root()
+        .after_next_directory_tree_create(move || {
+            fault_root.fail_next_create_directory_mkdir_after_success(
+                std::io::ErrorKind::ConnectionReset,
+            );
+            fault_root.fail_next_create_directory_probe(std::io::ErrorKind::WouldBlock);
+        });
     let later = app
         .oneshot(public_folder_upload_request(
             "/v/mkdir-response-loss/upload/queue",
@@ -386,9 +389,11 @@ async fn public_folder_partial_creation_after_quota_commit_is_audited_outcome_no
         )
         .unwrap();
     let external_root = root.path().to_path_buf();
-    state.secure_root().after_next_directory_tree_create(move || {
-        std::fs::write(external_root.join("uploads/partial/blocker"), b"external").unwrap();
-    });
+    state
+        .secure_root()
+        .after_next_directory_tree_create(move || {
+            std::fs::write(external_root.join("uploads/partial/blocker"), b"external").unwrap();
+        });
     let app = router(state.clone());
 
     let response = app
@@ -412,7 +417,11 @@ async fn public_folder_partial_creation_after_quota_commit_is_audited_outcome_no
         .path()
         .join("uploads/partial/blocker/child/not-published.txt")
         .exists());
-    let share = state.db().share_by_token("partial-folder").unwrap().unwrap();
+    let share = state
+        .db()
+        .share_by_token("partial-folder")
+        .unwrap()
+        .unwrap();
     assert_eq!((share.uploaded_bytes, share.uploaded_files), (7, 1));
     let events = state
         .db()
@@ -545,7 +554,10 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
         [100, 100]
     );
     assert_eq!(
-        state.db().audit_priorities("admin_upload_replaced").unwrap(),
+        state
+            .db()
+            .audit_priorities("admin_upload_replaced")
+            .unwrap(),
         [100]
     );
     assert_eq!(
@@ -664,6 +676,7 @@ async fn admin_upload_rechecks_the_exact_mfa_session_before_publish() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn text_preview_reserves_transfer_and_render_capacity_before_reading() {
+    let _serial = TEXT_PREVIEW_TEST_SERIAL.lock().await;
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("docs")).unwrap();
@@ -688,6 +701,7 @@ async fn text_preview_reserves_transfer_and_render_capacity_before_reading() {
         )
         .unwrap();
     let hook = Arc::new(TextPreviewReadTestHook {
+        panic_after_release: false,
         path: preview_path.to_string(),
         entered: std::sync::atomic::AtomicUsize::new(0),
         released: std::sync::Mutex::new(false),
@@ -786,6 +800,7 @@ async fn text_preview_reserves_transfer_and_render_capacity_before_reading() {
         )
         .unwrap();
     let render_hook = Arc::new(TextPreviewReadTestHook {
+        panic_after_release: false,
         path: render_path.to_string(),
         entered: std::sync::atomic::AtomicUsize::new(0),
         released: std::sync::Mutex::new(false),

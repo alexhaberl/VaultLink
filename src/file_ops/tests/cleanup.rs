@@ -113,7 +113,10 @@ async fn cleanup_shutdown_waits_for_a_running_blocking_batch() {
         .unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        state.storage_cleanup().serialization_for_test().lock_owned(),
+        state
+            .storage_cleanup()
+            .serialization_for_test()
+            .lock_owned(),
     )
     .await
     .expect("cleanup mutex was not released after the worker stopped");

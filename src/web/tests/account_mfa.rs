@@ -77,7 +77,10 @@ async fn account_totp_mutation_redirects_when_session_is_revoked_before_commit()
         "request did not complete its initial session check"
     );
 
-    state.db().delete_session("revoked-account-session").unwrap();
+    state
+        .db()
+        .delete_session("revoked-account-session")
+        .unwrap();
     drop(settings_guard);
     let response = queued.await.unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -118,7 +121,10 @@ async fn revoked_security_key_finish_preserves_pending_challenge_and_audit() {
             Utc::now() + Duration::hours(1),
         )
         .unwrap();
-    state.db().verify_mfa("revoked-registration-session").unwrap();
+    state
+        .db()
+        .verify_mfa("revoked-registration-session")
+        .unwrap();
     let webauthn = state.webauthn_snapshot_for_test();
     webauthn
         .start_registration("revoked-registration-session", 1, "admin", &[])
@@ -294,7 +300,10 @@ async fn invalid_security_key_finish_remains_a_bad_request_without_success_audit
             Utc::now() + Duration::hours(1),
         )
         .unwrap();
-    state.db().verify_mfa("invalid-registration-session").unwrap();
+    state
+        .db()
+        .verify_mfa("invalid-registration-session")
+        .unwrap();
     let webauthn = state.webauthn_snapshot_for_test();
     webauthn
         .start_registration("invalid-registration-session", 1, "admin", &[])
@@ -491,7 +500,11 @@ async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compa
         .session("account-security-session")
         .unwrap()
         .is_none());
-    assert!(state.db().session("key-only-mfa-session").unwrap().is_none());
+    assert!(state
+        .db()
+        .session("key-only-mfa-session")
+        .unwrap()
+        .is_none());
 
     state
         .db()
@@ -872,7 +885,10 @@ async fn service_token_ui_requires_mfa_reauth_and_shows_secret_only_once() {
     assert_eq!(plaintext_token.len(), "vlk_st_v1_".len() + 43);
     assert!(created_html.contains(&format!(r#"data-copy="{plaintext_token}""#)));
     assert_eq!(
-        state.db().count_audit(Some("service_token_created")).unwrap(),
+        state
+            .db()
+            .count_audit(Some("service_token_created"))
+            .unwrap(),
         1
     );
 
@@ -968,7 +984,10 @@ async fn service_token_ui_requires_mfa_reauth_and_shows_secret_only_once() {
     );
     assert!(state.db().list_service_tokens().unwrap().is_empty());
     assert_eq!(
-        state.db().count_audit(Some("service_token_revoked")).unwrap(),
+        state
+            .db()
+            .count_audit(Some("service_token_revoked"))
+            .unwrap(),
         1
     );
     let revoke_events = state

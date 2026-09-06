@@ -25,6 +25,7 @@ struct ShareRowView {
 #[derive(Template)]
 #[template(path = "web/shares/index.html")]
 struct ShareIndexTemplate {
+    search_error: Option<&'static str>,
     active_count: usize,
     protected_count: usize,
     monthly_download: u64,

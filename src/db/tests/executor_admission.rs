@@ -1,6 +1,5 @@
 const EXECUTOR_ADMISSION_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const EXECUTOR_ADMISSION_FAILSAFE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(10);
+const EXECUTOR_ADMISSION_FAILSAFE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn await_after_first_pending<F>(
     future: F,
@@ -11,8 +10,8 @@ where
 {
     tokio::pin!(future);
     let mut pending_sender = Some(pending_sender);
-    std::future::poll_fn(|context| {
-        match std::future::Future::poll(future.as_mut(), context) {
+    std::future::poll_fn(
+        |context| match std::future::Future::poll(future.as_mut(), context) {
             std::task::Poll::Pending => {
                 let _ = pending_sender
                     .take()
@@ -23,8 +22,8 @@ where
             std::task::Poll::Ready(_) => {
                 panic!("the synchronized test future completed before reaching Pending")
             }
-        }
-    })
+        },
+    )
     .await;
     future.await
 }
@@ -37,16 +36,12 @@ async fn queued_transfer_writers_leave_runtime_capacity_for_reads() {
     let (release_holder_sender, release_holder_receiver) = std::sync::mpsc::channel();
     let holder_database = database.clone();
     let holder = tokio::spawn(async move {
-        execute_transfer_database_operation(
-            holder_database,
-            "transfer_write",
-            move |database| {
-                let _write_guard = database.transfer_write_guard()?;
-                let _ = holder_entered_sender.send(());
-                let _ = release_holder_receiver.recv_timeout(EXECUTOR_ADMISSION_FAILSAFE_TIMEOUT);
-                Ok::<_, rusqlite::Error>(())
-            },
-        )
+        execute_transfer_database_operation(holder_database, "transfer_write", move |database| {
+            let _write_guard = database.transfer_write_guard()?;
+            let _ = holder_entered_sender.send(());
+            let _ = release_holder_receiver.recv_timeout(EXECUTOR_ADMISSION_FAILSAFE_TIMEOUT);
+            Ok::<_, rusqlite::Error>(())
+        })
         .await
     });
     tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, holder_entered_receiver)
@@ -239,17 +234,13 @@ async fn cancelled_transfer_writer_waiter_releases_its_queue_position() {
     let (holder_finished_sender, holder_finished_receiver) = tokio::sync::oneshot::channel();
     let holder_database = database.clone();
     let holder = tokio::spawn(async move {
-        execute_transfer_database_operation(
-            holder_database,
-            "transfer_write",
-            move |database| {
-                let _write_guard = database.transfer_write_guard()?;
-                let _ = holder_entered_sender.send(());
-                let _ = release_holder_receiver.recv_timeout(EXECUTOR_ADMISSION_FAILSAFE_TIMEOUT);
-                let _ = holder_finished_sender.send(());
-                Ok::<_, rusqlite::Error>(())
-            },
-        )
+        execute_transfer_database_operation(holder_database, "transfer_write", move |database| {
+            let _write_guard = database.transfer_write_guard()?;
+            let _ = holder_entered_sender.send(());
+            let _ = release_holder_receiver.recv_timeout(EXECUTOR_ADMISSION_FAILSAFE_TIMEOUT);
+            let _ = holder_finished_sender.send(());
+            Ok::<_, rusqlite::Error>(())
+        })
         .await
     });
     tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, holder_entered_receiver)
@@ -269,11 +260,9 @@ async fn cancelled_transfer_writer_waiter_releases_its_queue_position() {
     let (queued_started_sender, queued_started_receiver) = tokio::sync::oneshot::channel();
     let queued = tokio::spawn(async move {
         await_after_first_pending(
-            execute_transfer_database_operation(
-                queued_database,
-                "transfer_write",
-                |database| database.cancel_upload_reservation("cancelled-queued-writer"),
-            ),
+            execute_transfer_database_operation(queued_database, "transfer_write", |database| {
+                database.cancel_upload_reservation("cancelled-queued-writer")
+            }),
             queued_started_sender,
         )
         .await
@@ -293,20 +282,15 @@ async fn cancelled_transfer_writer_waiter_releases_its_queue_position() {
     let permits_after_queued_cancellation = database.runtime_available_permits();
 
     let _ = release_holder_sender.send(());
-    tokio::time::timeout(
-        EXECUTOR_ADMISSION_TEST_TIMEOUT,
-        holder_finished_receiver,
-    )
-    .await
-    .expect("the detached blocking holder must finish after release")
-    .expect("the detached blocking holder must announce completion");
+    tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, holder_finished_receiver)
+        .await
+        .expect("the detached blocking holder must finish after release")
+        .expect("the detached blocking holder must announce completion");
     let replacement = tokio::time::timeout(
         EXECUTOR_ADMISSION_TEST_TIMEOUT,
-        execute_transfer_database_operation(
-            database,
-            "transfer_write",
-            |database| database.cancel_upload_reservation("replacement-writer"),
-        ),
+        execute_transfer_database_operation(database, "transfer_write", |database| {
+            database.cancel_upload_reservation("replacement-writer")
+        }),
     )
     .await
     .expect("a replacement writer must not inherit a cancelled queue position")
@@ -358,8 +342,8 @@ async fn transfer_writer_admission_uses_one_timeout_across_both_queues() {
             catcher_database.acquire_runtime_permit(),
             catcher_started_sender,
         )
-            .await
-            .expect("runtime admission must remain open");
+        .await
+        .expect("runtime admission must remain open");
         let _ = catcher_acquired_sender.send(());
         let _ = release_catcher_receiver.await;
     });
@@ -409,7 +393,9 @@ async fn transfer_writer_admission_uses_one_timeout_across_both_queues() {
 
     drop(held_runtime_permits);
     let _ = release_catcher_sender.send(());
-    catcher.await.expect("the global waiter task must not panic");
+    catcher
+        .await
+        .expect("the global waiter task must not panic");
     tokio::time::resume();
 
     match candidate_result {
@@ -456,10 +442,7 @@ fn typed_transfer_cleanup_queue_survives_immediate_runtime_shutdown() {
             .expect("the transfer holder must acquire admission");
         let handle = tokio::runtime::Handle::current();
         database.enqueue_transfer_lease_cleanup(&handle, "shutdown-lease".into());
-        database.enqueue_upload_reservation_cleanup(
-            &handle,
-            "shutdown-upload-reservation".into(),
-        );
+        database.enqueue_upload_reservation_cleanup(&handle, "shutdown-upload-reservation".into());
         drop(transfer_holder);
     });
     drop(runtime);
@@ -570,7 +553,9 @@ async fn expired_transfer_cleanup_releases_admission_and_allows_worker_restart()
         "an expired job must not leave worker_active set or stall a replacement cleanup"
     );
     assert_eq!(database.runtime_available_permits(), runtime_capacity);
-    assert!(database.cancel_upload_reservation("expired-cleanup").unwrap());
+    assert!(database
+        .cancel_upload_reservation("expired-cleanup")
+        .unwrap());
 }
 
 async fn wait_for_transfer_cleanup_queue_to_idle(database: &Database) {

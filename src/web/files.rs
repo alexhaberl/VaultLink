@@ -40,7 +40,7 @@ use crate::{
     directory_cache::{DirectoryCacheLookup, DirectorySnapshotKey},
     file_ops,
     http_auth::{
-        audit_observation, csrf, current_audit_client_ip, current_client_limit_key, database,
+        audit_observation, csrf, current_audit_client_ip, current_client_limit_key,
         enabled_audit_client_ip, mfa_session, runtime_settings, session, with_audit_client_ip,
         ClientActivityPermit, MissingSession,
     },
