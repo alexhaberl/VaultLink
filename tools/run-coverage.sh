@@ -19,7 +19,9 @@ done
 process_work=$(mktemp -d "${TMPDIR:-/tmp}/vaultlink-coverage.XXXXXXXXXX")
 trap 'rm -rf -- "$process_work"' EXIT
 export VAULTLINK_BIN="$CARGO_TARGET_DIR/debug/vaultlink"
-export VAULTLINK_CONTAINER_ENTRYPOINT="$PWD/deploy/docker/container-entrypoint.sh"
+export VAULTLINK_CONTAINER_ENTRYPOINT="$process_work/container-entrypoint.sh"
+# Git archives retain this script as 0644; the Docker image normally installs it.
+install -m 0755 deploy/docker/container-entrypoint.sh "$VAULTLINK_CONTAINER_ENTRYPOINT"
 run_process() {
     local name=$1
     shift
