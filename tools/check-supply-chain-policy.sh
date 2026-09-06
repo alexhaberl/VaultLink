@@ -243,9 +243,10 @@ check_audit_remediation_policy() {
         fi
     done
 
-    if ! grep -F -q 'Open `http://127.0.0.1:8090/#token=...` locally.' \
-            "$audit_root/README.md" \
-        || grep -F -q '?token=' "$audit_root/README.md" \
+    if ! grep -F -q '(docs/INSTALLATION.md#native-package-deployment)' "$audit_root/README.md" \
+        || ! grep -F -q 'Open `http://127.0.0.1:8090/#token=...` locally.' \
+            "$audit_root/docs/INSTALLATION.md" \
+        || grep -F -q '?token=' "$audit_root/README.md" "$audit_root/docs/INSTALLATION.md" \
         || ! grep -F -q 'http://127.0.0.1:{port}/#token={token}' \
             "$audit_root/src/setup/routes.rs" \
         || ! grep -F -q 'new URLSearchParams(location.hash.slice(1))' \
