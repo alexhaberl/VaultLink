@@ -8,6 +8,7 @@ use crate::{
 pub(super) struct Probes {
     readiness: ReadinessProbe,
     monitoring_summary_cache: MonitoringSummaryCache,
+    share_summary_cache: crate::share_summary_cache::ShareSummaryCache,
 }
 
 impl Probes {
@@ -15,6 +16,7 @@ impl Probes {
         Self {
             readiness: ReadinessProbe::new(),
             monitoring_summary_cache: MonitoringSummaryCache::new(),
+            share_summary_cache: crate::share_summary_cache::ShareSummaryCache::default(),
         }
     }
 
@@ -24,6 +26,10 @@ impl Probes {
 
     pub(super) fn monitoring_summary_cache(&self) -> &MonitoringSummaryCache {
         &self.monitoring_summary_cache
+    }
+
+    pub(super) fn share_summary_cache(&self) -> &crate::share_summary_cache::ShareSummaryCache {
+        &self.share_summary_cache
     }
 
     #[cfg(test)]

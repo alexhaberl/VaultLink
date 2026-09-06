@@ -38,6 +38,7 @@ pub(crate) mod sensitive;
 pub(crate) mod services;
 pub mod setup;
 mod share_search;
+mod share_summary_cache;
 mod state;
 mod storage_authority;
 pub mod storage_cleanup;

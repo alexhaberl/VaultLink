@@ -218,6 +218,10 @@ impl AppState {
         self.0.probes.monitoring_summary_cache()
     }
 
+    pub(crate) fn share_summary_cache(&self) -> &crate::share_summary_cache::ShareSummaryCache {
+        self.0.probes.share_summary_cache()
+    }
+
     pub(crate) fn readiness_probe(&self) -> &ReadinessProbe {
         self.0.probes.readiness()
     }

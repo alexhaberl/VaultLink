@@ -91,6 +91,7 @@ pub(crate) trait SecuritySettingsCapability {}
 pub(crate) trait AdmissionCapability {}
 pub(crate) trait DirectoryCacheCapability {}
 pub(crate) trait MonitoringCapability {}
+pub(crate) trait ShareSummaryCapability {}
 
 macro_rules! grant {
     ($capability:ident => $($domain:ty),+ $(,)?) => {
@@ -153,6 +154,13 @@ grant!(SecuritySettingsCapability => AccountRoutes, AdminRoutes, SettingsRoutes)
 grant!(AdmissionCapability => AdmissionRoutes, FileRoutes, PublicRoutes, PublicTransferRoutes);
 grant!(DirectoryCacheCapability => FileRoutes, PublicRoutes);
 grant!(MonitoringCapability => MonitoringRoutes);
+grant!(ShareSummaryCapability => FileRoutes, ShareRoutes);
+
+impl<Domain: ShareSummaryCapability> RouteState<Domain> {
+    pub(crate) fn share_summary_cache(&self) -> &crate::share_summary_cache::ShareSummaryCache {
+        self.inner.share_summary_cache()
+    }
+}
 
 impl<Domain: ConfigCapability> RouteState<Domain> {
     pub(crate) fn config(&self) -> &Config {

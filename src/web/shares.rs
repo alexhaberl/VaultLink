@@ -257,10 +257,11 @@ pub(super) async fn share_index_page(
         })
         .await?
     };
-    let summary = database(state.db().clone(), move |database| {
-        database.share_summary(now)
-    })
-    .await?;
+    let summary = state
+        .share_summary_cache()
+        .get(state.db().clone())
+        .await
+        .map_err(|error| crate::http_auth::share_summary_error(&error))?;
     let active_count = summary.available;
     let protected_count = summary.protected;
     let locale = i18n::current_locale();
