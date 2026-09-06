@@ -164,7 +164,7 @@ fn parse_automatic_config(value: &str) -> io::Result<bool> {
 async fn status() -> io::Result<Status> {
     let guard = lock()?;
     let mut state = load()?;
-    state.installed = installed_version().await?;
+    state.refresh_installed(installed_version().await?);
     state.automatic = automatic_config()?
         && output(
             "/usr/bin/systemctl",
@@ -232,7 +232,7 @@ async fn submit(request_id: String, action: Operation) -> io::Result<Status> {
     let _ = status().await?;
     let guard = lock()?;
     let mut state = load()?;
-    state.installed = installed_version().await?;
+    state.refresh_installed(installed_version().await?);
     if state.request_id.as_ref() == Some(&request_id) {
         if state.operation.as_ref() != Some(&action) {
             return Err(failure("request identifier reused"));
@@ -537,7 +537,7 @@ async fn job() -> io::Result<()> {
     let _guard = lock()?;
     state.phase = if result.is_ok() { "complete" } else { "failed" }.into();
     state.error = result.as_ref().err().map(|_| "operation_failed".into());
-    state.installed = installed_version().await.unwrap_or_default();
+    state.refresh_installed(installed_version().await.unwrap_or_default());
     state.automatic = automatic_config().unwrap_or(false);
     save(&state)?;
     result

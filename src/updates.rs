@@ -64,6 +64,19 @@ impl Status {
     fn busy(&self) -> bool {
         matches!(self.phase.as_str(), "queued" | "running")
     }
+    fn refresh_installed(&mut self, installed: String) {
+        self.installed = installed;
+        // A timer or CLI installation can overtake the GUI's last check.
+        if self
+            .latest
+            .as_deref()
+            .and_then(version_parts)
+            .zip(version_parts(&self.installed))
+            .is_none_or(|(latest, installed)| latest <= installed)
+        {
+            self.update_available = false;
+        }
+    }
 }
 
 pub(crate) fn version_parts(value: &str) -> Option<[u64; 3]> {
@@ -112,6 +125,19 @@ pub(crate) async fn exchange(request: &Request) -> io::Result<Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_installation_clears_an_obsolete_update_offer() {
+        for installed in ["0.7.1", "0.7.2"] {
+            let mut state = Status {
+                latest: Some("0.7.1".into()),
+                update_available: true,
+                ..Status::default()
+            };
+            state.refresh_installed(installed.into());
+            assert!(!state.update_available);
+            assert_eq!(state.installed, installed);
+        }
+    }
     #[test]
     fn privileged_protocol_rejects_arguments_and_nonstable_versions() {
         for value in [
