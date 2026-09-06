@@ -20,8 +20,8 @@ fail-closed until checked against the exact release commit.
 
 ## Feature and schema contract
 
-- [ ] A fresh database is schema 9 and records migrations 2 through 9.
-- [ ] Every supported schema 1 through 8 migrates transactionally to schema 9;
+- [ ] A fresh database is schema 10 and records migrations 2 through 10.
+- [ ] Every supported schema 1 through 9 migrates transactionally to schema 10;
   the injected 7→8 failure leaves a complete, valid schema-7 database.
 - [ ] Schema validation rejects missing/extra service-token objects, malformed
   hashes, unsupported scope bits, corrupt history/fingerprint state, future
@@ -91,10 +91,10 @@ fail-closed until checked against the exact release commit.
   monitoring reads, redaction, negative route access, restart persistence,
   revocation, and log leak checks.
 - [ ] Every offline native-package gate performs real populated migrations
-  through schema 9 and checks service-token/search state plus history 8 and 9; its separate
+  through schema 10 and checks service-token/search state plus history 8, 9 and 10; its separate
   upgrade-safety suite verifies backup and rollback behavior. Every full-system
   distro VM gate additionally verifies the populated schema-7 backup, rolls it
-  back, and returns cleanly to schema 9.
+  back, and returns cleanly to schema 10.
 - [ ] Upgrade, backup, automatic recovery, explicit rollback, runtime guard,
   package lifecycle, and 50/20/5 CI smoke gates remain green for all nine targets.
 - [ ] The existing Debian 13 amd64 soak VM (8 vCPUs, 16 GiB RAM) supplies at
@@ -107,7 +107,7 @@ fail-closed until checked against the exact release commit.
   QEMU functional coverage.
 - [ ] `Cargo.toml`, `Cargo.lock`, health/monitoring version output, README,
   SECURITY, threat model, packaging, upgrade/restore documentation, SBOMs,
-  changelog, and release metadata all identify 0.7.0/schema 9.
+  changelog, and release metadata all identify 0.7.0/schema 10.
 - [ ] No static realistic service token is committed; test credentials are
   assembled from runtime randomness or non-secret components and the unchanged
   full-history secret scan passes.

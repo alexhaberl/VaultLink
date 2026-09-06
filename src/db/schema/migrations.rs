@@ -349,8 +349,32 @@ fn migrate_schema_8_to_9(conn: &mut Connection) -> rusqlite::Result<()> {
     if FAIL_NEXT_SCHEMA_8_TO_9_MIGRATION.with(|flag| flag.replace(false)) {
         return Err(schema_error("injected schema 8 to 9 migration failure"));
     }
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", 9)?;
     validate_schema_9(&tx)?;
+    validate_database(&tx)?;
+    tx.commit()
+}
+
+fn migrate_schema_9_to_10(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_schema_9(&tx)?;
+    for (_, sql) in SHARE_FILTER_INDEXES {
+        tx.execute_batch(sql)?;
+    }
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(10,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+        [SCHEMA_10_FINGERPRINT],
+    )?;
+    #[cfg(test)]
+    if FAIL_NEXT_SCHEMA_9_TO_10_MIGRATION.with(|flag| flag.replace(false)) {
+        return Err(schema_error("injected schema 9 to 10 migration failure"));
+    }
+    tx.pragma_update(None, "user_version", 10)?;
+    validate_schema_10(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }

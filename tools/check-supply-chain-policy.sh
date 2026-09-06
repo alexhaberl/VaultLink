@@ -2393,12 +2393,12 @@ if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.7.1' "$package_workflow" \
     || ! grep -F -q 'sh tools/real-package-update-smoke.sh' Makefile; then
     report "all native package targets must run the same-commit real package-manager update/recovery gate and upload evidence"
 fi
-fresh_schema_security_test='db::tests::fresh_database_is_exactly_schema_nine_without_plaintext_secret_columns'
+fresh_schema_security_test='db::tests::fresh_database_is_exactly_schema_ten_without_plaintext_secret_columns'
 if ! grep -F -q "fresh_schema_test='$fresh_schema_security_test'" Makefile \
     || ! grep -F -q 'cargo test -- --list >"$$listed_tests"' Makefile \
     || ! grep -F -q 'test "$$match_count" -eq 1' Makefile \
     || ! grep -F -q 'cargo test "$$fresh_schema_test" -- --exact' Makefile; then
-    report "security-test must fail closed unless the exact fresh schema-9 secret-column test exists and runs"
+    report "security-test must fail closed unless the exact fresh schema-10 secret-column test exists and runs"
 fi
 if ! grep -F -q '[ -f /.dockerenv ]' "$real_package_smoke" \
     || ! grep -F -q 'minisign -G -W' "$real_package_smoke" \

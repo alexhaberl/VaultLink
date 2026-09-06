@@ -215,6 +215,11 @@ fn validate_schema_8(conn: &Connection) -> rusqlite::Result<()> {
 
 fn validate_schema_9(conn: &Connection) -> rusqlite::Result<()> {
     validate_fingerprint(conn, SCHEMA_9_FINGERPRINT)?;
+    validate_pending_transfer_index(conn)?;
+    validate_indexed_schema(conn, 9)
+}
+
+fn validate_pending_transfer_index(conn: &Connection) -> rusqlite::Result<()> {
     let sql: Option<String> = conn.query_row(
         "SELECT sql FROM sqlite_schema WHERE type='index' AND name='idx_transfer_grants_pending_id'",
         [], |row| row.get(0),
@@ -224,7 +229,22 @@ fn validate_schema_9(conn: &Connection) -> rusqlite::Result<()> {
             "schema 9 pending transfer index is missing or invalid",
         ));
     }
-    validate_indexed_schema(conn, 9)
+    Ok(())
+}
+
+fn validate_schema_10(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_10_FINGERPRINT)?;
+    validate_pending_transfer_index(conn)?;
+    for (name, expected) in SHARE_FILTER_INDEXES {
+        let actual: Option<String> = conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
+            [name], |row| row.get(0),
+        ).optional()?;
+        if actual.as_deref().map(normalize_schema_sql) != Some(normalize_schema_sql(expected)) {
+            return Err(schema_error(format!("schema 10 index {name} is missing or invalid")));
+        }
+    }
+    validate_indexed_schema(conn, 10)
 }
 
 fn validate_indexed_schema(conn: &Connection, version: i64) -> rusqlite::Result<()> {

@@ -224,6 +224,7 @@ pub(super) async fn share_index_page(
         .map(|value| format_utc_minute(value.with_timezone(&Utc)))
         .unwrap_or(statistics_started_at);
     let query = q.q.as_deref().unwrap_or("").trim().to_string();
+    let search_error = crate::share_search::validate_share_search(Some(&query)).err();
     let status = match q.status.as_deref().unwrap_or("all") {
         "active" => "active",
         "protected" => "protected",
@@ -245,10 +246,17 @@ pub(super) async fn share_index_page(
         limit: 50,
         now,
     };
-    let page_data = database(state.db().clone(), move |database| {
-        database.list_share_page(&options)
-    })
-    .await?;
+    let page_data = if search_error.is_some() {
+        crate::db::SharePage {
+            shares: Vec::new(),
+            next_cursor: None,
+        }
+    } else {
+        database(state.db().clone(), move |database| {
+            database.list_share_page(&options)
+        })
+        .await?
+    };
     let summary = database(state.db().clone(), move |database| {
         database.share_summary(now)
     })
@@ -269,6 +277,15 @@ pub(super) async fn share_index_page(
         .next_cursor
         .map(|cursor| share_list_url(&query, status, sort, Some(cursor)));
     let body = ShareIndexTemplate {
+        search_error: search_error.map(|error| {
+            i18n::text(
+                locale,
+                match error {
+                    crate::share_search::ShareSearchError::TooShort => i18n::SHARE_SEARCH_TOO_SHORT,
+                    crate::share_search::ShareSearchError::TooLong => i18n::SEARCH_QUERY_TOO_LONG,
+                },
+            )
+        }),
         active_count,
         protected_count,
         monthly_download: monthly.download,
@@ -286,15 +303,22 @@ pub(super) async fn share_index_page(
         password_min_length: settings.share_password_min_length,
         password_max_length: settings.share_password_max_length,
     };
-    Ok(Html(templates::admin_page(
-        &state,
-        PageId::Links,
-        &body,
-        false,
-        &session_data.csrf_token,
-        true,
-    )?)
-    .into_response())
+    Ok((
+        if search_error.is_some() {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::OK
+        },
+        Html(templates::admin_page(
+            &state,
+            PageId::Links,
+            &body,
+            false,
+            &session_data.csrf_token,
+            true,
+        )?),
+    )
+        .into_response())
 }
 
 pub(super) async fn share_create_page(

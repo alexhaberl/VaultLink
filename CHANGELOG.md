@@ -2,6 +2,10 @@
 
 ## 0.7.0 — Unreleased
 
+- Hold text preview memory and transfer reservations inside blocking reads through request cancellation; release them on completion, failure, panic or discarded results.
+- Require three Unicode characters for nonempty Share searches in HTML/API/database access; preserve empty searches, literal matching and cursor order.
+- Migrate schema 9 to 10 atomically with partial protected/exhausted and expiry indexes; bound nearby candidate probes and decrypt only the final page.
+
 - Keep search/scan admission permits until blocking workers finish, including cancelled HTML requests.
 - Share the administrator login IP budget across all usernames and Web/API; bound failed-login audit identities and historical audit projections.
 - Retry transient safe path-resolution contention within a fixed budget and return `503` with `Retry-After: 1` when exhausted.

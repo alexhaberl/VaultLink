@@ -1,4 +1,37 @@
 #[tokio::test]
+async fn html_and_api_share_search_validate_original_unicode_and_keep_empty_searches() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db().create_admin("admin", "hash", "secret").unwrap();
+    state.db().create_session("search-session", 1, "csrf", Utc::now()+Duration::hours(1)).unwrap();
+    state.db().verify_mfa("search-session").unwrap();
+    let app = router(state);
+    for locale in ["de", "en"] {
+        for (query, expected) in [("a",400), ("ab",400), ("ßa",400), ("界界",400),
+            ("  ab  ",400), ("<x",400), ("Äß界",200), ("",200), ("  ",200), ("file",200)] {
+            for path in ["/admin/shares", "/api/v2/shares"] {
+                let mut req = request(Method::GET, &format!("{path}?q={}", encoded(query)), "");
+                req.headers_mut().insert(header::COOKIE, HeaderValue::from_str(&format!(
+                    "vaultlink_session=search-session; vaultlink_locale={locale}")).unwrap());
+                let response = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(response.status().as_u16(), expected, "{path}: {query:?}");
+                let body = response_text(response).await;
+                if expected == 400 && path == "/admin/shares" {
+                    assert!(body.contains(if locale == "de" { "mindestens drei Zeichen" } else { "at least three characters" }));
+                    if query == "ab" { assert!(body.contains("value=\"ab\"")); }
+                    assert!(!body.contains("value=\"<x\""));
+                }
+                if expected == 400 && path == "/api/v2/shares" {
+                    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    assert!(error.get("error").is_some());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn share_creation_page_uses_browser_selected_path() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
