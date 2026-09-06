@@ -12,7 +12,7 @@ pub(super) async fn admin_preview(
         .to_string_lossy()
         .replace('\\', "/");
     let settings = runtime_settings(&state);
-    let mut text_render_permit = if preview_kind(&rel, &settings) == Some(PreviewKind::Text) {
+    let text_render_permit = if preview_kind(&rel, &settings) == Some(PreviewKind::Text) {
         Some(
             state
                 .try_acquire_preview_render(text_preview_render_permits(settings.max_preview_size))
@@ -31,7 +31,7 @@ pub(super) async fn admin_preview(
     let storage_guard = file_ops::acquire_storage_read(&state)
         .await
         .map_err(storage_recovery_app_error)?;
-    let content = tokio::task::spawn_blocking(move || {
+    let (mut text_render_permit, content) = crate::services::public_transfer::read_preview_with_resources(text_render_permit, move || {
         let _storage_guard = storage_guard;
         read_preview(&secure_root, &preview_path, &settings)
     })
@@ -41,8 +41,8 @@ pub(super) async fn admin_preview(
             InternalOperation::WebAdminPreviewReadTaskJoin,
             error,
         ))
-    })?
-    .map_err(admin_preview_read_error)?;
+    })?;
+    let content = content.map_err(admin_preview_read_error)?;
     let content = match content {
         PreviewContent::Text(text)
             if escaped_html_len(&text)

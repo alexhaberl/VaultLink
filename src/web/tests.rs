@@ -8,6 +8,7 @@ include!("tests/auth_router.rs");
 include!("tests/shares_transfers.rs");
 include!("tests/account_mfa.rs");
 include!("tests/admin_settings.rs");
+include!("tests/preview_cancellation.rs");
 include!("tests/zip_directories.rs");
 include!("tests/public_upload.rs");
 include!("tests/public_upload_policy.rs");

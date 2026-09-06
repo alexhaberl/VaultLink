@@ -133,7 +133,8 @@ pub(crate) async fn public_preview(
     };
     let share = prepared.share.clone();
     let requested_path = prepared.requested_path.clone();
-    let content = read_content(prepared, settings).await?;
+    let ((text_permit, text_transfer), content) =
+        read_content(prepared, settings, (text_permit, text_transfer)).await?;
     render_preview(
         &state,
         PreviewContext {
@@ -194,38 +195,45 @@ fn transfer_client(
     }
 }
 
-async fn read_content(
+async fn read_content<R: Send + 'static>(
     prepared: PreparedPreview,
     settings: crate::runtime::RuntimeSettings,
-) -> ApiResult<PreviewContent> {
+    resources: R,
+) -> ApiResult<(R, PreviewContent)> {
     let path = prepared.relative_file;
-    let content = match prepared.target {
-        PreparedPreviewTarget::Directory(directory) => {
-            tokio::task::spawn_blocking(move || read_preview(&directory, &path, &settings)).await
-        }
-        PreparedPreviewTarget::File(file) => {
-            tokio::task::spawn_blocking(move || read_preview_secure_file(file, &path, &settings))
-                .await
-        }
-    }
-    .map_err(|error| {
-        ApiError::from(report_internal(
-            InternalOperation::WebPublicPreviewReadJoin,
-            error,
-        ))
-    })?
-    .map_err(|error| preview_io_error(&error))?;
-    Ok(match content {
-        PreviewContent::Text(text)
-            if escaped_html_len(&text)
-                .is_none_or(|length| length > MAX_RENDERED_TEXT_PREVIEW_BYTES) =>
-        {
-            PreviewContent::TooLarge {
-                size: text.len() as u64,
+    let (resources, content) =
+        crate::services::public_transfer::read_preview_with_resources(resources, move || {
+            match prepared.target {
+                PreparedPreviewTarget::Directory(directory) => {
+                    read_preview(&directory, &path, &settings)
+                }
+                PreparedPreviewTarget::File(file) => {
+                    read_preview_secure_file(file, &path, &settings)
+                }
             }
-        }
-        content => content,
-    })
+        })
+        .await
+        .map_err(|error| {
+            ApiError::from(report_internal(
+                InternalOperation::WebPublicPreviewReadJoin,
+                error,
+            ))
+        })?;
+    let content = content.map_err(|error| preview_io_error(&error))?;
+    Ok((
+        resources,
+        match content {
+            PreviewContent::Text(text)
+                if escaped_html_len(&text)
+                    .is_none_or(|length| length > MAX_RENDERED_TEXT_PREVIEW_BYTES) =>
+            {
+                PreviewContent::TooLarge {
+                    size: text.len() as u64,
+                }
+            }
+            content => content,
+        },
+    ))
 }
 
 fn preview_io_error(error: &io::Error) -> ApiError {

@@ -21,7 +21,7 @@ pub(crate) use prepare::{
 };
 pub(crate) use preview::{
     escaped_html_len, escaped_text_page_stream, read_preview, read_preview_secure_file,
-    PreviewContent,
+    read_preview_with_resources, PreviewContent,
 };
 #[cfg(test)]
 pub(crate) use preview::{

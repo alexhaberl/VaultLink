@@ -664,6 +664,7 @@ async fn admin_upload_rechecks_the_exact_mfa_session_before_publish() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn text_preview_reserves_transfer_and_render_capacity_before_reading() {
+    let _serial = TEXT_PREVIEW_TEST_SERIAL.lock().await;
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("docs")).unwrap();
