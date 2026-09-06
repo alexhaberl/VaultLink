@@ -18,74 +18,163 @@ VaultLink 0.6.0 supports only the exact native packages listed in
 amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch snapshot on
 x86_64. Install the matching package from the GitHub release after verifying
 both its direct Minisign signature and its digest in the signed global
-`SHA256SUMS`:
+`SHA256SUMS`.
+
+### Install prerequisites for your operating system
+
+Use an administrator account with `sudo`. Run only the subsection matching
+your host, before verifying or installing VaultLink. These commands install
+tools and runtime dependencies from your operating system's repositories;
+the subsequent VaultLink package transaction is offline.
+
+#### Debian 13 or Ubuntu 24.04 / 26.04
 
 ```sh
-# Set PACKAGE to exactly one matching release asset, for example
-# vaultlink_0.6.0-1+deb13_amd64.deb,
+sudo apt-get update && sudo apt-get install -y \
+  ca-certificates curl libc6 libgcc-s1 mawk minisign sqlite3 systemd
+```
+
+#### Fedora 44
+
+```sh
+sudo dnf install -y \
+  bash ca-certificates coreutils cpio curl diffutils findutils gawk glibc \
+  grep gzip libgcc minisign rpm sed sqlite systemd tar util-linux
+```
+
+#### Arch Linux, supported release-date snapshot
+
+Use repositories and a host synchronized to the supported release-date
+snapshot. Later rolling snapshots are unsupported; do not change snapshots
+or perform a partial system upgrade as part of this installation.
+
+```sh
+sudo pacman -S --needed \
+  bash ca-certificates coreutils curl diffutils findutils gawk gcc-libs \
+  glibc grep gzip libarchive minisign sed sqlite systemd tar util-linux zstd
+```
+
+Install `cifs-utils` separately with your operating system's package manager
+if VaultLink will provision or mount SMB storage.
+
+### Download the package and verification files
+
+From the [supported release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.6.0),
+download the package for your host, its matching `.minisig`, `SHA256SUMS`, and
+`SHA256SUMS.minisig` into one directory. Obtain `minisign.pub` through a
+separately trusted copy of this repository; its key ID is `EC6AEC772F7CDDEC`.
+Open a terminal in the download directory and set these two values:
+
+```sh
+# Replace this Debian 13 amd64 example with the exact asset for your host:
 # vaultlink_0.6.0-1+ubuntu24.04_arm64.deb,
 # vaultlink-0.6.0-1.fc44.x86_64.rpm, or
 # vaultlink-0.6.0-1-x86_64.pkg.tar.zst.
-: "${PACKAGE:?set PACKAGE to the exact asset for this host}"
-# Obtain minisign.pub through a separately trusted copy of this repository;
-# its key ID is EC6AEC772F7CDDEC.
+PACKAGE=vaultlink_0.6.0-1+deb13_amd64.deb
 PUBLIC_KEY=/path/to/trusted/minisign.pub
-
-# Freeze every input in one root-only staging directory *before* verification.
-# PACKAGE must be a basename, not a path containing '/'.
-case "$PACKAGE" in */*|'') exit 64 ;; esac
-STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.6.0.XXXXXXXX)
-test "$(sudo stat -c '%u:%g:%a' "$STAGE")" = 0:0:700
-sudo install -o root -g root -m 0600 \
-  "$PACKAGE" "$PACKAGE.minisig" SHA256SUMS SHA256SUMS.minisig \
-  "$PUBLIC_KEY" "$STAGE/"
-ROOT_PACKAGE="$STAGE/$PACKAGE"
-ROOT_PUBLIC_KEY="$STAGE/$(basename -- "$PUBLIC_KEY")"
-test "$(sudo sha256sum "$ROOT_PUBLIC_KEY" | awk '{ print $1 }')" = \
-  200d64c2f2e42ace790a6d74f8b101801065b2d9a51c8fdda5b47b4f2b2f9809
-
-sudo env STAGE="$STAGE" PACKAGE="$PACKAGE" ROOT_PUBLIC_KEY="$ROOT_PUBLIC_KEY" \
-  sh -eu -c '
-    cd "$STAGE"
-    minisign -V -q -p "$ROOT_PUBLIC_KEY" -m SHA256SUMS -x SHA256SUMS.minisig
-    awk -v package="$PACKAGE" \
-      '\''NF == 2 && $2 == package && $1 ~ /^[0-9a-f]{64}$/ { print }'\'' \
-      SHA256SUMS > package.sha256
-    test "$(wc -l < package.sha256)" -eq 1
-    sha256sum -c package.sha256
-    minisign -V -q -p "$ROOT_PUBLIC_KEY" -m "$PACKAGE" -x "$PACKAGE.minisig"
-    rm -f package.sha256
-  '
-
-# Debian or Ubuntu: require the exact signed-package dependency set and prove
-# every dependency fully installed before dpkg is allowed to unpack anything.
-DEB_DEPENDS=$(sudo dpkg-deb -f "$ROOT_PACKAGE" Depends)
-test "$DEB_DEPENDS" = \
-  'ca-certificates, curl, libc6, libgcc-s1, mawk, minisign, sqlite3, systemd'
-for dependency in ca-certificates curl libc6 libgcc-s1 mawk minisign sqlite3 systemd; do
-  test "$(dpkg-query -W -f='${db:Status-Status}' "$dependency" 2>/dev/null)" = \
-    installed
-done
-sudo dpkg -i "$ROOT_PACKAGE"
-
-# Fedora
-sudo rpm -Uvh "$ROOT_PACKAGE"
-
-# Arch Linux: extract the installer from that same verified root-owned copy.
-ROOT_INSTALLER="$STAGE/vaultlink-package-install.sh"
-sudo sh -eu -c '
-  bsdtar -xOf "$1" \
-    usr/lib/vaultlink/package/deploy/vaultlink-package-install.sh >"$2"
-  chown root:root "$2"
-  chmod 0700 "$2"
-' sh "$ROOT_PACKAGE" "$ROOT_INSTALLER"
-sudo "$ROOT_INSTALLER" "$ROOT_PACKAGE"
 ```
 
-Remove the staging directory after the package manager or Arch wrapper has
-completed. Never verify a user-writable pathname and later pass that pathname
-to a privileged package operation; the verified object and installed object
-must be the same root-owned file.
+### Verify and install the matching package
+
+Run this entire block in the same terminal. It selects only the installer for
+the detected operating system and checks the exact package name for its
+architecture. Verification and installation run in one error-stopping shell:
+a failed key, signature, checksum, or dependency check prevents installation.
+The block runs in child shells, so a failure does not close your terminal.
+
+```sh
+sh -eu -s -- "${PACKAGE:?set PACKAGE}" "${PUBLIC_KEY:?set PUBLIC_KEY}" <<'INSTALL'
+PACKAGE=$1
+PUBLIC_KEY=$2
+. /etc/os-release
+case "$ID:${VERSION_ID:-}" in
+  debian:13)
+    FORMAT=deb
+    EXPECTED="vaultlink_0.6.0-1+deb13_$(dpkg --print-architecture).deb"
+    ;;
+  ubuntu:24.04|ubuntu:26.04)
+    FORMAT=deb
+    EXPECTED="vaultlink_0.6.0-1+ubuntu${VERSION_ID}_$(dpkg --print-architecture).deb"
+    ;;
+  fedora:44)
+    FORMAT=rpm
+    EXPECTED="vaultlink-0.6.0-1.fc44.$(uname -m).rpm"
+    ;;
+  arch:*)
+    FORMAT=arch
+    test "$(uname -m)" = x86_64
+    EXPECTED=vaultlink-0.6.0-1-x86_64.pkg.tar.zst
+    ;;
+  *) echo 'Unsupported operating system or version' >&2; exit 64 ;;
+esac
+test "$PACKAGE" = "$EXPECTED"
+
+# Freeze every input before verification, then install that same root-owned file.
+STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.6.0.XXXXXXXX)
+test "$(sudo stat -c '%u:%g:%a' "$STAGE")" = 0:0:700
+printf 'Verification and recovery directory: %s\n' "$STAGE"
+sudo install -o root -g root -m 0600 \
+  -- "$PACKAGE" "$PACKAGE.minisig" SHA256SUMS SHA256SUMS.minisig "$STAGE/"
+sudo install -o root -g root -m 0600 -- "$PUBLIC_KEY" "$STAGE/minisign.pub"
+
+sudo env STAGE="$STAGE" PACKAGE="$PACKAGE" FORMAT="$FORMAT" \
+  sh -eu <<'VERIFY_AND_INSTALL'
+cd "$STAGE"
+ROOT_PACKAGE="$STAGE/$PACKAGE"
+test "$(sha256sum minisign.pub | awk '{ print $1 }')" = \
+  200d64c2f2e42ace790a6d74f8b101801065b2d9a51c8fdda5b47b4f2b2f9809
+minisign -V -q -p minisign.pub -m SHA256SUMS -x SHA256SUMS.minisig
+awk -v package="$PACKAGE" \
+  'NF == 2 && $2 == package && length($1) == 64 && $1 ~ /^[0-9a-f]+$/ { print }' \
+  SHA256SUMS > package.sha256
+test "$(wc -l < package.sha256)" -eq 1
+sha256sum -c package.sha256
+minisign -V -q -p minisign.pub -m "$PACKAGE" -x "$PACKAGE.minisig"
+
+case "$FORMAT" in
+  deb)
+    # Require the exact dependency set and installed state before unpacking.
+    DEB_DEPENDS=$(dpkg-deb -f "$ROOT_PACKAGE" Depends)
+    test "$DEB_DEPENDS" = \
+      'ca-certificates, curl, libc6, libgcc-s1, mawk, minisign, sqlite3, systemd'
+    for dependency in ca-certificates curl libc6 libgcc-s1 mawk minisign sqlite3 systemd; do
+      test "$(dpkg-query -W -f='${db:Status-Status}' "$dependency" 2>/dev/null)" = \
+        installed
+    done
+    dpkg -i "$ROOT_PACKAGE"
+    ;;
+  rpm)
+    # Check dependencies and transaction validity before the normal SELinux install.
+    rpm -Uvh --test "$ROOT_PACKAGE"
+    rpm -Uvh "$ROOT_PACKAGE"
+    ;;
+  arch)
+    # The signed wrapper checks dependencies and state before invoking Pacman.
+    ROOT_INSTALLER="$STAGE/vaultlink-package-install.sh"
+    bsdtar -xOf "$ROOT_PACKAGE" \
+      usr/lib/vaultlink/package/deploy/vaultlink-package-install.sh >"$ROOT_INSTALLER"
+    chown root:root "$ROOT_INSTALLER"
+    chmod 0700 "$ROOT_INSTALLER"
+    "$ROOT_INSTALLER" "$ROOT_PACKAGE"
+    rm -- "$ROOT_INSTALLER"
+    ;;
+  *) exit 64 ;;
+esac
+
+# Clean up only after successful installation; retain inputs on any failure.
+rm -- "$PACKAGE" "$PACKAGE.minisig" SHA256SUMS SHA256SUMS.minisig \
+  minisign.pub package.sha256
+cd /
+rmdir -- "$STAGE"
+VERIFY_AND_INSTALL
+INSTALL
+```
+
+If the block fails, stop and use the printed staging directory for diagnosis
+and recovery. Do not run a package-manager command to bypass a failed check.
+Never verify a user-writable pathname and later pass that pathname to a
+privileged package operation; the verified object and installed object must
+be the same root-owned file.
 
 These commands do not use a VaultLink package repository. The DEB dependency
 check above is a mandatory offline preflight of the exact `Depends` field; do
@@ -229,11 +318,14 @@ Never expose setup with `--listen 0.0.0.0:8090`; no non-loopback exception exist
 ### Configuration without browser setup
 
 Adapt the matching release's configuration example to your storage mount, public
-HTTPS URL, and trusted proxy before installing it. The commands below assume
-you are in that release's source checkout.
+HTTPS URL, and trusted proxy before starting VaultLink. Use the example
+included in the installed package; no source checkout is needed.
 
 ```sh
-sudo install -o root -g vaultlink -m 0640 config/production-reverse-proxy.toml /etc/vaultlink/config.toml
+sudo install -o root -g vaultlink -m 0640 \
+  /usr/share/doc/vaultlink/examples/config/production-reverse-proxy.toml \
+  /etc/vaultlink/config.toml
+sudoedit /etc/vaultlink/config.toml
 sudo -u vaultlink /opt/vaultlink/vaultlink init-admin --config /etc/vaultlink/config.toml --username admin
 sudo systemctl enable --now vaultlink
 ```
