@@ -7,6 +7,21 @@ native storage and CIFS. `tools/check-performance-evidence.py` enforces all
 19 metrics, runner equality, absolute thresholds and median/p95 regression
 limits. Missing metrics, schema-v1 files and edited summaries fail closed.
 
+The first real Debian/CIFS setup exposed a blocker in that historical binary:
+its mount validator requires a standalone `sign` entry in Linux mountinfo,
+which Linux does not emit. It therefore refuses the signed, encrypted test
+mount before serving requests. Fixing the candidate does not repair the
+historical binary. The baseline reference remains unchanged pending an explicit
+review of a reproducible replacement; do not patch the measured binary, alter
+mountinfo, or register partial runs as baseline evidence.
+
+The repository also still needs an executable measurement suite for all 19
+metrics. The existing load generator covers only part of the required profile;
+the collector and producer import and validate completed runs. Internal stream,
+decryption, and allocation counts require measured instrumentation, not values
+inferred from source code or synthetic unit-test fixtures. These gaps must be
+resolved before a baseline lock or candidate performance success is published.
+
 ## Measurement identity and protected collection
 
 Each schema-v2 run contains `commit`, `binary_sha256`, `package_target`

@@ -544,7 +544,6 @@ fn validate_cifs_options(mount: &MountInfo) -> Result<(), StorageMountError> {
         "noexec",
         "vers=3.1.1",
         "cache=strict",
-        "sign",
         "seal",
         "serverino",
     ] {
@@ -555,12 +554,29 @@ fn validate_cifs_options(mount: &MountInfo) -> Result<(), StorageMountError> {
             )));
         }
     }
+    // Linux cifs_show_security reports negotiated signing as the `i` suffix
+    // of sec=ntlmsspi/sec=krb5i, not as a standalone `sign` mount option.
+    // An unspecified authentication mode can omit sec= entirely, so require
+    // explicit, unambiguous kernel evidence rather than the mount command.
+    let security_modes: Vec<_> = mount
+        .mount_options
+        .iter()
+        .chain(&mount.super_options)
+        .filter_map(|option| option.strip_prefix("sec="))
+        .collect();
+    if !matches!(security_modes.as_slice(), ["ntlmsspi" | "krb5i"]) {
+        return Err(mount_error(format!(
+            "CIFS mount {} must report exactly one signed authentication mode (sec=ntlmsspi or sec=krb5i); configure an explicit signed sec= mount option",
+            mount.mount_point.display(),
+        )));
+    }
     for forbidden in [
         "cache=loose",
         "nostrictsync",
         "noperm",
         "noserverino",
         "multiuser",
+        "signloosely",
     ] {
         if has_option(forbidden) {
             return Err(mount_error(format!(

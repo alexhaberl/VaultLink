@@ -28,7 +28,7 @@ mod tests {
 
     fn mounts() -> Vec<MountInfo> {
         parse_mountinfo(
-            b"41 23 0:42 / /mnt rw,nosuid,nodev,noexec,relatime - cifs //nas.example/vault\\040link rw,vers=3.1.1,cache=strict,sign,seal,serverino\n\
+            b"41 23 0:42 / /mnt rw,nosuid,nodev,noexec,relatime - cifs //nas.example/vault\\040link rw,vers=3.1.1,cache=strict,sec=ntlmsspi,seal,serverino\n\
               23 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n",
         )
         .unwrap()
@@ -69,9 +69,9 @@ mod tests {
     #[test]
     fn discovers_supported_read_write_mounts_and_filters_weak_cifs() {
         let detected = discover_supported_mounts_from(
-            b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - cifs //nas.example/vault rw,vers=3.1.1,cache=strict,sign,seal,serverino\n\
+            b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - cifs //nas.example/vault rw,vers=3.1.1,cache=strict,sec=ntlmsspi,seal,serverino\n\
               42 23 0:43 / /mnt/weak rw,nosuid,nodev,noexec - cifs //nas.example/weak rw,vers=3.0,cache=loose,noserverino\n\
-              43 23 0:44 / /mnt/read-only ro,nosuid,nodev,noexec - cifs //nas.example/readonly ro,vers=3.1.1,cache=strict,sign,seal,serverino\n\
+              43 23 0:44 / /mnt/read-only ro,nosuid,nodev,noexec - cifs //nas.example/readonly ro,vers=3.1.1,cache=strict,sec=ntlmsspi,seal,serverino\n\
               44 23 8:2 / /mnt/local rw,nosuid,nodev,noexec - ext4 /dev/mapper/storage rw\n\
               45 23 0:45 / /mnt/overlay rw,nosuid,nodev,noexec - overlay overlay rw\n",
         )
@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn normalizes_smb3_mountinfo_to_the_cifs_policy_name() {
         let detected = discover_supported_mounts_from(
-            b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - smb3 //nas.example/vault rw,vers=3.1.1,cache=strict,sign,seal,serverino\n",
+            b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - smb3 //nas.example/vault rw,vers=3.1.1,cache=strict,sec=ntlmsspi,seal,serverino\n",
         )
         .unwrap();
         assert_eq!(detected[0].filesystem_type, "cifs");
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn active_mount_lookup_requires_one_exact_utf8_mount_point() {
-        let mountinfo = b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - cifs //nas.example/vault rw,vers=3.1.1,cache=strict,sign,seal,serverino\n\
+        let mountinfo = b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - cifs //nas.example/vault rw,vers=3.1.1,cache=strict,sec=ntlmsspi,seal,serverino\n\
               23 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n";
         let active = active_mount_at_from(mountinfo, Path::new("/mnt/storage"))
             .unwrap()
@@ -267,7 +267,7 @@ mod tests {
         nested.internal_directory = Some("/mnt/storage/.vaultlink-internal".into());
         nested.expected_mount_source = Some("//nas.example/vault".into());
         let mounts = parse_mountinfo(
-            b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - cifs //nas.example/vault rw,vers=3.1.1,cache=strict,sign,seal,serverino\n\
+            b"41 23 0:42 / /mnt/storage rw,nosuid,nodev,noexec - cifs //nas.example/vault rw,vers=3.1.1,cache=strict,sec=ntlmsspi,seal,serverino\n\
               23 1 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n",
         )
         .unwrap();
@@ -438,8 +438,59 @@ mod tests {
     }
 
     #[test]
+    fn accepts_linux_signed_security_modes_without_a_sign_option() {
+        for security in ["sec=ntlmsspi", "sec=krb5i"] {
+            let mut signed = mounts();
+            signed[0]
+                .super_options
+                .retain(|option| !option.starts_with("sec="));
+            signed[0].super_options.push(security.into());
+            assert!(!signed[0]
+                .super_options
+                .iter()
+                .any(|option| option == "sign"));
+            validate_cifs_options(&signed[0]).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_missing_unsigned_legacy_or_ambiguous_security_modes() {
+        for security in [
+            vec![],
+            vec!["sign"],
+            vec!["sec=ntlmssp"],
+            vec!["sec=krb5"],
+            vec!["sec=none"],
+            vec!["sec=ntlmv2i"],
+            vec!["sec=unknowni"],
+            vec!["sec=ntlmsspi", "sec=ntlmssp"],
+            vec!["sec=ntlmsspi", "sec=ntlmsspi"],
+        ] {
+            let mut weak = mounts();
+            weak[0]
+                .super_options
+                .retain(|option| !option.starts_with("sec="));
+            weak[0]
+                .super_options
+                .extend(security.iter().map(|option| (*option).to_owned()));
+            let error = validate_cifs_options(&weak[0]).unwrap_err();
+            assert!(error.to_string().contains("signed authentication mode"));
+        }
+
+        let mut conflicting = mounts();
+        conflicting[0].mount_options.push("sec=ntlmssp".into());
+        assert!(validate_cifs_options(&conflicting[0]).is_err());
+    }
+
+    #[test]
     fn rejects_weak_or_incoherent_cifs_options() {
-        for forbidden in ["cache=loose", "nostrictsync", "noperm", "multiuser"] {
+        for forbidden in [
+            "cache=loose",
+            "nostrictsync",
+            "noperm",
+            "multiuser",
+            "signloosely",
+        ] {
             let mut weak = mounts();
             weak[0].super_options.push(forbidden.into());
             let error = validate_identity(

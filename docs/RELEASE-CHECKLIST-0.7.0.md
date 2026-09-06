@@ -129,3 +129,13 @@ fail-closed until checked against the exact release commit.
 - [ ] Archive effective qualification as an Actions artifact. Do not commit
   candidate measurements or change qualification flags after the soak; that
   would create a different candidate requiring a new qualification cycle.
+
+## After publication
+
+- [ ] Once the immutable 0.7.0 release and its assets are verified, mark 0.6.0
+  as superseded and no longer supported, recommend upgrading to 0.7.0, and
+  synchronize the release-state model, README, SECURITY, installation guidance,
+  and release notices. Until publication, retain 0.6.0 as the supported version
+  with its documented CIFS startup limitation. Keep historical release evidence
+  intact; apply the support-status transition after publication, outside the
+  frozen candidate qualification cycle.
