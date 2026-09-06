@@ -221,28 +221,9 @@ The package also installs the root-owned updater as
 `/usr/sbin/vaultlink-update`. Its daily timer and automatic installation remain
 disabled until the administrator explicitly opts in.
 
-Starting with **0.7.0**, native-package installations also expose
-**Settings → Updates** in the administrator GUI. Check for a stable GitHub
-release, review the version and restart notice, then confirm installation.
-The page reconnects after a restart and retrieves the host's persisted job
-status. Automatic updates can be enabled or disabled there as well; changing
-the preference requires the native updater to be idle. The 0.6.0 GUI does not
-include these controls. Containers and manually started development builds
-without the native host controller display unavailable controls.
-
-The web process remains unprivileged. The existing root startup guard first
-verifies package/runtime parity, then starts a fixed transient
-`vaultlink-update-control.service`. Its local Unix socket accepts only the
-VaultLink service identity and only status, check, confirmed install and
-automatic-preference operations. Each mutation requires a live MFA session,
-CSRF validation and a committed audit event before dispatch. Installation runs
-in a separate `vaultlink-gui-update.service`, survives the web service restart,
-and retains the existing Minisign, backup, readiness and rollback checks.
-The confirmed version must still be the latest release when installation
-begins. Status is retained under `/var/lib/vaultlink-update-control`; failures
-can be diagnosed with `journalctl -u vaultlink-gui-update.service`.
-
-The command-line alternative remains:
+The upcoming GUI controls are documented separately in the
+[upgrade guide](UPGRADE-ROLLBACK.md#gui-updates-starting-with-070-unreleased).
+For the currently published version, use the command line:
 
 ```sh
 sudo vaultlink-update check

@@ -21,6 +21,29 @@ to correct it. The existing byte limit, ordering and cursor format are unchanged
 Displayed available/protected counters may lag by one second. Authorization,
 expiry and transfer quotas continue to read current database state.
 
+## GUI updates starting with 0.7.0 (unreleased)
+
+Native-package installations expose **Settings → Updates** in the
+administrator GUI. Check for a stable GitHub release, review the version and
+restart notice, then confirm installation. The page reconnects after a restart
+and retrieves the host's persisted job status. Automatic updates can be enabled
+or disabled there as well; changing the preference requires the native updater
+to be idle. The published 0.6.0 GUI does not include these controls. Containers
+and manually started development builds without the native host controller
+display unavailable controls.
+
+The web process remains unprivileged. The existing root startup guard first
+verifies package/runtime parity, then starts a fixed transient
+`vaultlink-update-control.service`. Its local Unix socket accepts only the
+VaultLink service identity and only status, check, confirmed install and
+automatic-preference operations. Each mutation requires a live MFA session,
+CSRF validation and a committed audit event before dispatch. Installation runs
+in a separate `vaultlink-gui-update.service`, survives the web service restart,
+and retains the existing Minisign, backup, readiness and rollback checks.
+The confirmed version must still be the latest release when installation
+begins. Status is retained under `/var/lib/vaultlink-update-control`; failures
+can be diagnosed with `journalctl -u vaultlink-gui-update.service`.
+
 ## Installation and package identity
 
 The native package owns the release candidate at
