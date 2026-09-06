@@ -2,6 +2,9 @@
 
 ## 0.7.0 — Unreleased
 
+- Check every tracked Rust file with the pinned formatter, including embedded fragments; remove the disabled public-page reference copy.
+- Add preview/ZIP cancellation and raw-preview regressions, real server/TLS/shutdown process-smokes, merged unit/process coverage and measured local coverage floors.
+
 - Share one cancellation-safe, one-second snapshot of displayed Share counts between both administrator pages; keep authorization and quotas live.
 - Hold text preview memory and transfer reservations inside blocking reads through request cancellation; release them on completion, failure, panic or discarded results.
 - Require three Unicode characters for nonempty Share searches in HTML/API/database access; preserve empty searches, literal matching and cursor order.

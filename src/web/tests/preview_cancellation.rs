@@ -114,38 +114,9 @@ async fn preview_tcp_cancellation(route: PreviewTestRoute) {
     let _serial = TEXT_PREVIEW_TEST_SERIAL.lock().await;
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
-    std::fs::create_dir(root.path().join("docs")).unwrap();
-    std::fs::write(root.path().join("docs/preview.txt"), b"preview content").unwrap();
-    let state = test_state(root.path(), data.path());
-    state.mutate_runtime_for_test(|runtime| runtime.max_preview_size = MAX_TEXT_PREVIEW_SIZE);
-    state.db().create_admin("admin", "hash", "secret").unwrap();
-    state
-        .db()
-        .create_session(
-            "preview-admin-session",
-            1,
-            "csrf",
-            Utc::now() + Duration::hours(1),
-        )
-        .unwrap();
-    state.db().verify_mfa("preview-admin-session").unwrap();
-    let share_id = state
-        .db()
-        .create_share(
-            "preview-cancel",
-            None,
-            "docs",
-            true,
-            &Permission::DownloadOnly,
-            None,
-            None,
-            None,
-            1,
-            None,
-            &UploadConflictStrategy::Reject,
-        )
-        .unwrap();
+    let (state, share_id) = preview_test_state(root.path(), data.path());
     let hook = Arc::new(TextPreviewReadTestHook {
+        panic_after_release: false,
         path: if matches!(route, PreviewTestRoute::Admin) {
             "docs/preview.txt"
         } else {
@@ -160,13 +131,21 @@ async fn preview_tcp_cancellation(route: PreviewTestRoute) {
     assert!(slot.lock().unwrap().replace(hook.clone()).is_none());
     let hook_guard = TextPreviewReadTestGuard(hook.clone());
     let app = router(state.clone());
-    let (handle, server) = disconnect_preview_request(&app, &state, &hook, route).await;
+    let (handle, server) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        disconnect_preview_request(&app, &state, &hook, route),
+    )
+    .await
+    .expect("TCP preview test timed out");
     let budget_held = state.try_acquire_preview_render(64).is_err();
     // Clean up before asserting so a failing regression cannot strand a reader.
     if !budget_held {
         hook.release();
         handle.shutdown();
-        server.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
         panic!("HTTP disconnect released the memory budget before its blocking read finished");
     }
     assert_eq!(
@@ -198,7 +177,10 @@ async fn preview_tcp_cancellation(route: PreviewTestRoute) {
     assert!(state.try_acquire_preview_render(64).is_ok());
     drop(hook_guard);
     handle.shutdown();
-    server.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -214,4 +196,102 @@ async fn disconnected_api_preview_retains_its_read_resources() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disconnected_admin_preview_retains_its_read_resources() {
     preview_tcp_cancellation(PreviewTestRoute::Admin).await;
+}
+
+fn preview_test_state(root: &Path, data: &Path) -> (AppState, i64) {
+    std::fs::create_dir(root.join("docs")).unwrap();
+    std::fs::write(root.join("docs/preview.txt"), b"preview content").unwrap();
+    let state = test_state(root, data);
+    state.mutate_runtime_for_test(|runtime| runtime.max_preview_size = MAX_TEXT_PREVIEW_SIZE);
+    state.db().create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db()
+        .create_session(
+            "preview-admin-session",
+            1,
+            "csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db().verify_mfa("preview-admin-session").unwrap();
+    let share_id = state
+        .db()
+        .create_share(
+            "preview-cancel",
+            None,
+            "docs",
+            true,
+            &Permission::DownloadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    (state, share_id)
+}
+
+#[tokio::test]
+async fn preview_read_errors_panics_oversize_and_response_cancellation_release_resources() {
+    let _serial = TEXT_PREVIEW_TEST_SERIAL.lock().await;
+    for route in [
+        PreviewTestRoute::Web,
+        PreviewTestRoute::Api,
+        PreviewTestRoute::Admin,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let (state, share_id) = preview_test_state(root.path(), data.path());
+        let app = router(state.clone());
+        std::fs::write(root.path().join("docs/preview.txt"), b"invalid\0text").unwrap();
+        assert_eq!(
+            app.clone().oneshot(route.request()).await.unwrap().status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        wait_for_preview_resources(&state, share_id).await;
+        std::fs::write(root.path().join("docs/preview.txt"), b"valid preview").unwrap();
+        let hook = Arc::new(TextPreviewReadTestHook {
+            panic_after_release: true,
+            path: if matches!(route, PreviewTestRoute::Admin) {
+                "docs/preview.txt"
+            } else {
+                "preview.txt"
+            }
+            .into(),
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            released: std::sync::Mutex::new(true),
+            wake: std::sync::Condvar::new(),
+        });
+        let slot = TEXT_PREVIEW_READ_TEST_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+        assert!(slot.lock().unwrap().replace(hook.clone()).is_none());
+        let guard = TextPreviewReadTestGuard(hook);
+        assert_eq!(
+            app.clone().oneshot(route.request()).await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        drop(guard);
+        wait_for_preview_resources(&state, share_id).await;
+        state.mutate_runtime_for_test(|runtime| runtime.max_preview_size = 1);
+        let response = app.clone().oneshot(route.request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        wait_for_preview_resources(&state, share_id).await;
+        state.mutate_runtime_for_test(|runtime| runtime.max_preview_size = MAX_TEXT_PREVIEW_SIZE);
+        let response = app.oneshot(route.request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.try_acquire_preview_render(64).is_err());
+        drop(response);
+        wait_for_preview_resources(&state, share_id).await;
+        assert_eq!(
+            state
+                .db()
+                .share_by_token("preview-cancel")
+                .unwrap()
+                .unwrap()
+                .download_count,
+            0
+        );
+    }
 }

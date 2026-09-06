@@ -9,6 +9,8 @@ mod prepare;
 mod preview;
 mod stream;
 mod zip;
+#[cfg(test)]
+pub(crate) mod zip_test_hooks;
 
 #[cfg(feature = "fuzzing")]
 #[path = "../../fuzzing/zip_preview.rs"]

@@ -434,7 +434,10 @@ async fn api_share_mutation_rechecks_the_exact_session_after_waiting_for_storage
             .unwrap()
             .active
     );
-    assert_eq!(state.db().count_audit(Some("share_deactivated")).unwrap(), 0);
+    assert_eq!(
+        state.db().count_audit(Some("share_deactivated")).unwrap(),
+        0
+    );
 }
 
 #[tokio::test]

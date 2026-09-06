@@ -536,12 +536,17 @@ fn database_capacity_unavailable(
     )
 }
 
-pub(crate) fn share_summary_error(error: &crate::db::DatabaseExecutionError<rusqlite::Error>) -> HttpAuthError {
+pub(crate) fn share_summary_error(
+    error: &crate::db::DatabaseExecutionError<rusqlite::Error>,
+) -> HttpAuthError {
     match error {
-        crate::db::DatabaseExecutionError::Admission(error) =>
-            database_capacity_unavailable(error.class(), error.queue_duration()),
+        crate::db::DatabaseExecutionError::Admission(error) => {
+            database_capacity_unavailable(error.class(), error.queue_duration())
+        }
         crate::db::DatabaseExecutionError::Join(error) => HttpAuthError::from(report_internal(
-            InternalOperation::HttpAuthDatabaseReadJoin, error)),
+            InternalOperation::HttpAuthDatabaseReadJoin,
+            error,
+        )),
         crate::db::DatabaseExecutionError::Operation(error) => database_error(error),
     }
 }
@@ -551,7 +556,7 @@ pub(crate) fn database_error(error: impl std::borrow::Borrow<rusqlite::Error>) -
     if crate::db::is_audit_unavailable(error) {
         tracing::error!(
             operation = "http_auth.database.audit_unavailable",
-            error_type = std::any::type_name_of_val(&error),
+            error_type = std::any::type_name_of_val(error),
             "required audit transaction rolled back"
         );
         HttpAuthError::with_kind(
@@ -562,7 +567,7 @@ pub(crate) fn database_error(error: impl std::borrow::Borrow<rusqlite::Error>) -
     } else if crate::db::is_sqlite_busy_or_locked(error) {
         tracing::warn!(
             operation = "http_auth.database.sqlite_capacity",
-            error_type = std::any::type_name_of_val(&error),
+            error_type = std::any::type_name_of_val(error),
             "database operation timed out waiting for SQLite capacity"
         );
         HttpAuthError::with_kind(

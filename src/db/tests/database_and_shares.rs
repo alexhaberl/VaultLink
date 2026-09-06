@@ -283,11 +283,21 @@ fn share_search_filters_and_limits_before_decrypting_tokens() {
         "FTS search must map/decrypt at most limit + 1 rows"
     );
     super::shares::reset_share_map_count();
-    assert!(database.list_share_page(&ShareListOptions {
-        query: Some("ma".to_owned()), status: ShareListStatus::All,
-        sort: ShareListSort::Newest, cursor: None, limit: 1, now: Utc::now(),
-    }).is_err());
-    assert_eq!(super::shares::share_map_count(), 0, "invalid searches must not decrypt rows");
+    assert!(database
+        .list_share_page(&ShareListOptions {
+            query: Some("ma".to_owned()),
+            status: ShareListStatus::All,
+            sort: ShareListSort::Newest,
+            cursor: None,
+            limit: 1,
+            now: Utc::now(),
+        })
+        .is_err());
+    assert_eq!(
+        super::shares::share_map_count(),
+        0,
+        "invalid searches must not decrypt rows"
+    );
 }
 
 #[test]

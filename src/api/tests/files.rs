@@ -62,9 +62,7 @@ async fn api_file_search_filters_before_pagination() {
 
     let peer = "127.0.0.1".parse().unwrap();
     let peer_permits = (0..crate::MAX_EXPENSIVE_OPERATIONS_PER_CLIENT)
-        .map(|_| {
-            state.try_acquire_expensive_peer(peer).unwrap()
-        })
+        .map(|_| state.try_acquire_expensive_peer(peer).unwrap())
         .collect::<Vec<_>>();
     let mut request = json_request(Method::GET, "/api/v2/files?path=", "");
     request.headers_mut().insert(
@@ -360,7 +358,11 @@ async fn api_reports_active_upload_reservations_as_quota_conflict() {
     assert!(response_text(response)
         .await
         .contains(r#""code":"upload_quota_in_use""#));
-    let share = state.db().share_by_token("quota-conflict").unwrap().unwrap();
+    let share = state
+        .db()
+        .share_by_token("quota-conflict")
+        .unwrap()
+        .unwrap();
     assert_eq!(
         share.upload_conflict_strategy,
         UploadConflictStrategy::Reject

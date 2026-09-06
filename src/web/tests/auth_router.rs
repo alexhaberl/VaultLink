@@ -217,7 +217,11 @@ async fn http_login_mfa_csrf_session_and_logout() {
         .unwrap()
         .to_string();
     let session_token = cookie.split_once('=').unwrap().1.to_string();
-    assert!(state.db().session(&pre_mfa_session_token).unwrap().is_none());
+    assert!(state
+        .db()
+        .session(&pre_mfa_session_token)
+        .unwrap()
+        .is_none());
 
     let mut admin_request = request(Method::GET, "/admin", "");
     admin_request

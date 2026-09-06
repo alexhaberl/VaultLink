@@ -124,7 +124,10 @@ async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_adm
     wait_for_upload_fragment(root.path()).await;
     let storage_guard = state.acquire_storage_test_exclusive().await;
     finish_controlled_multipart(sender).await;
-    state.db().expire_session_for_test("expiry-session").unwrap();
+    state
+        .db()
+        .expire_session_for_test("expiry-session")
+        .unwrap();
     drop(storage_guard);
     let response = upload.await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -141,7 +144,10 @@ async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_adm
     assert_eq!(state.upload_peer_admission_count_for_test(), 0);
     assert_eq!(state.db().count_audit(Some("admin_upload")).unwrap(), 0);
     assert_eq!(
-        state.db().count_audit(Some("admin_upload_replaced")).unwrap(),
+        state
+            .db()
+            .count_audit(Some("admin_upload_replaced"))
+            .unwrap(),
         0
     );
 }
@@ -360,7 +366,10 @@ async fn revoked_admin_settings_preserve_sqlite_runtime_webauthn_and_audit() {
     let app = router(state.clone());
     let update = tokio::spawn(async move { app.oneshot(update).await.unwrap() });
     wait_for_initial_session_check(&probe, "settings-csrf", &stale_activity).await;
-    state.db().delete_session("settings-revoked-session").unwrap();
+    state
+        .db()
+        .delete_session("settings-revoked-session")
+        .unwrap();
     drop(settings_guard);
 
     let response = update.await.unwrap();
@@ -448,5 +457,9 @@ async fn authorized_settings_publication_finishes_before_waiting_logout_returns(
         .any(|(key, value)| key == "public_base_url" && value == "http://localhost:9999"));
     assert_eq!(state.db().count_audit(Some("settings_updated")).unwrap(), 1);
     assert_eq!(state.db().count_audit(Some("logout")).unwrap(), 1);
-    assert!(state.db().session("settings-wins-session").unwrap().is_none());
+    assert!(state
+        .db()
+        .session("settings-wins-session")
+        .unwrap()
+        .is_none());
 }

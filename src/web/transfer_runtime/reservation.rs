@@ -54,12 +54,9 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
     expected_upload_policy_epoch: i64,
 ) -> Result<PendingReservationOwnership<UploadReservationBeginOutcome>> {
     let queue_started = std::time::Instant::now();
-    let permit = transfer_database_runtime_permit(
-        &database,
-        "upload_reservation_begin",
-        queue_started,
-    )
-    .await?;
+    let permit =
+        transfer_database_runtime_permit(&database, "upload_reservation_begin", queue_started)
+            .await?;
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {

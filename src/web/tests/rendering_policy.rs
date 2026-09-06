@@ -577,7 +577,10 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
     let data = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("Dateien"), b"public").unwrap();
     let state = test_state(root.path(), data.path());
-    state.db().create_admin("Abmelden", "hash", "secret").unwrap();
+    state
+        .db()
+        .create_admin("Abmelden", "hash", "secret")
+        .unwrap();
     state
         .db()
         .create_session(

@@ -97,8 +97,12 @@ async fn load_admin_storage_summary(state: &FileRouteState) -> Result<AdminStora
         .as_ref()
         .map(|stats| human(stats.free))
         .unwrap_or_else(|| "n/v".into());
-    let active_links = state.share_summary_cache().get(state.db().clone()).await
-        .map_err(|error| crate::http_auth::share_summary_error(&error))?.available;
+    let active_links = state
+        .share_summary_cache()
+        .get(state.db().clone())
+        .await
+        .map_err(|error| crate::http_auth::share_summary_error(&error))?
+        .available;
     Ok(AdminStorageSummary {
         used,
         free,

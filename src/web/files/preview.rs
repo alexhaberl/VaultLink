@@ -31,17 +31,21 @@ pub(super) async fn admin_preview(
     let storage_guard = file_ops::acquire_storage_read(&state)
         .await
         .map_err(storage_recovery_app_error)?;
-    let (mut text_render_permit, content) = crate::services::public_transfer::read_preview_with_resources(text_render_permit, move || {
-        let _storage_guard = storage_guard;
-        read_preview(&secure_root, &preview_path, &settings)
-    })
-    .await
-    .map_err(|error| {
-        AppError::from(report_internal(
-            InternalOperation::WebAdminPreviewReadTaskJoin,
-            error,
-        ))
-    })?;
+    let (mut text_render_permit, content) =
+        crate::services::public_transfer::read_preview_with_resources(
+            text_render_permit,
+            move || {
+                let _storage_guard = storage_guard;
+                read_preview(&secure_root, &preview_path, &settings)
+            },
+        )
+        .await
+        .map_err(|error| {
+            AppError::from(report_internal(
+                InternalOperation::WebAdminPreviewReadTaskJoin,
+                error,
+            ))
+        })?;
     let content = content.map_err(admin_preview_read_error)?;
     let content = match content {
         PreviewContent::Text(text)
@@ -54,17 +58,12 @@ pub(super) async fn admin_preview(
         }
         content => content,
     };
-    let preview_detail = match &content {
-        PreviewContent::TooLarge { size } => format!("kind=too_large;bytes={size}"),
-        PreviewContent::Text(text) => format!("kind=text;bytes={}", text.len()),
-        PreviewContent::Media { kind, size } => format!("kind={kind:?};bytes={size}"),
-    };
     audit_observation(
         &state,
         session.username.clone(),
         AuditAction::AdminPreview,
         Some(rel.clone()),
-        Some(preview_detail),
+        Some(admin_preview_detail(&content)),
     )
     .await;
     match content {
@@ -187,4 +186,12 @@ fn admin_preview_read_error(error: std::io::Error) -> AppError {
     AppError::storage_io(error, |_| {
         AppError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Preview not allowed")
     })
+}
+
+fn admin_preview_detail(content: &PreviewContent) -> String {
+    match content {
+        PreviewContent::TooLarge { size } => format!("kind=too_large;bytes={size}"),
+        PreviewContent::Text(text) => format!("kind=text;bytes={}", text.len()),
+        PreviewContent::Media { kind, size } => format!("kind={kind:?};bytes={size}"),
+    }
 }

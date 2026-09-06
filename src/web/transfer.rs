@@ -89,96 +89,10 @@ where
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ZipBlockingTestPhase {
-    Plan,
-    Materialize,
-    Direct,
-}
-
-#[cfg(test)]
-pub(super) struct ZipBlockingTestHook {
-    pub(super) path: String,
-    pub(super) phase: ZipBlockingTestPhase,
-    pub(super) panic_after_release: bool,
-    pub(super) entered: std::sync::atomic::AtomicUsize,
-    pub(super) released: std::sync::Mutex<bool>,
-    pub(super) wake: std::sync::Condvar,
-}
-
-#[cfg(test)]
-impl ZipBlockingTestHook {
-    pub(super) fn release(&self) {
-        *self.released.lock().unwrap() = true;
-        self.wake.notify_all();
-    }
-}
-
-#[cfg(test)]
-pub(super) struct ZipBlockingTestGuard(pub(super) std::sync::Arc<ZipBlockingTestHook>);
-
-#[cfg(test)]
-impl Drop for ZipBlockingTestGuard {
-    fn drop(&mut self) {
-        self.0.release();
-        let mut hooks = ZIP_BLOCKING_TEST_HOOK
-            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        hooks.retain(|active| !std::sync::Arc::ptr_eq(active, &self.0));
-    }
-}
-
-#[cfg(test)]
-static ZIP_BLOCKING_TEST_HOOK: std::sync::OnceLock<
-    std::sync::Mutex<Vec<std::sync::Arc<ZipBlockingTestHook>>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-pub(super) fn install_zip_blocking_test_hook(
-    hook: std::sync::Arc<ZipBlockingTestHook>,
-) -> ZipBlockingTestGuard {
-    ZIP_BLOCKING_TEST_HOOK
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(hook.clone());
-    ZipBlockingTestGuard(hook)
-}
-
-#[cfg(test)]
-fn zip_test_phase_active(path: &str, phase: ZipBlockingTestPhase) -> bool {
-    ZIP_BLOCKING_TEST_HOOK
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .any(|hook| hook.path == path && hook.phase == phase)
-}
-
-#[cfg(test)]
-fn block_zip_for_test(path: &str, phase: ZipBlockingTestPhase) {
-    let hook = ZIP_BLOCKING_TEST_HOOK
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .find(|hook| hook.path == path && hook.phase == phase)
-        .cloned();
-    let Some(hook) = hook else {
-        return;
-    };
-    hook.entered
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let mut released = hook.released.lock().unwrap();
-    while !*released {
-        released = hook.wake.wait(released).unwrap();
-    }
-    drop(released);
-    if hook.panic_after_release {
-        panic!("injected ZIP blocking task panic");
-    }
-}
+pub(super) use crate::services::public_transfer::zip_test_hooks::{
+    block_zip_for_test, install_zip_blocking_test_hook, zip_test_phase_active, ZipBlockingTestHook,
+    ZipBlockingTestPhase,
+};
 
 #[path = "transfer/download.rs"]
 mod download_adapter;

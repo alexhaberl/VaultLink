@@ -9,6 +9,8 @@ include!("tests/shares_transfers.rs");
 include!("tests/share_summary.rs");
 include!("tests/account_mfa.rs");
 include!("tests/admin_settings.rs");
+include!("tests/admin_raw_preview.rs");
+include!("tests/api_zip.rs");
 include!("tests/preview_cancellation.rs");
 include!("tests/zip_directories.rs");
 include!("tests/public_upload.rs");

@@ -62,6 +62,7 @@ jobs:
           python3 tools/test-release-state.py
           python3 tools/test-performance-evidence.py
           python3 tools/test-release-evidence.py
+          python3 tools/test-module-coverage.py
           python3 tools/test-refactoring-contracts.py
           python3 tools/check-refactoring-contracts.py --root .
           python3 tools/test-fuzz-corpus.py
@@ -95,7 +96,7 @@ jobs:
           tar -xzf "$archive" -C "$work" gitleaks
           GITLEAKS_BIN="$work/gitleaks" make secret-check
       - name: Formatting
-        run: cargo fmt --all -- --check
+        run: make format-check
       - name: Lints
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Mythos lints
@@ -106,6 +107,7 @@ jobs:
         run: |
           cargo build --locked --bin vaultlink
           sh tools/check-version-consistency.sh --binary target/debug/vaultlink
+          VAULTLINK_BIN="$PWD/target/debug/vaultlink" python3 tools/runtime-smoke.py
       - name: Deployment artifacts
         run: shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh
       - name: Install pinned cargo-audit
@@ -142,15 +144,13 @@ jobs:
         run: cargo install --locked cargo-llvm-cov --version 0.8.6
       - name: Coverage
         run: |
-          # Baseline measured on 2026-07-14: 83.74% lines. The initial
-          # regression floor is floor(83.74) - 2 percentage points.
-          cargo llvm-cov --locked --package vaultlink --all-targets --all-features \
-            --lcov --output-path coverage.lcov --fail-under-lines 81
+          bash tools/run-coverage.sh
       - name: Upload coverage report
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-${{ github.sha }}
-          path: coverage.lcov
+          path: coverage/*.lcov
           if-no-files-found: error
           retention-days: 14
 

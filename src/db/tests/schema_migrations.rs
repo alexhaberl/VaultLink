@@ -3,19 +3,45 @@ fn schema_nine_upgrade_reopens_and_preserves_encrypted_share_data() {
     let (_directory, path, ciphertext, _) = populated_schema_one_fixture();
     drop(Database::open(&path).unwrap());
     let connection = Connection::open(&path).unwrap();
-    connection.execute_batch("DROP INDEX idx_shares_protected_id;
+    connection
+        .execute_batch(
+            "DROP INDEX idx_shares_protected_id;
         DROP INDEX idx_shares_limit_id; DROP INDEX idx_shares_expires_id;
         DROP INDEX idx_shares_available_expires_id;
         DELETE FROM vaultlink_schema_migrations WHERE target_version=10;
-        PRAGMA user_version=9;").unwrap();
-    connection.execute("UPDATE vaultlink_schema SET fingerprint=?1", [schema::SCHEMA_9_FINGERPRINT]).unwrap();
+        PRAGMA user_version=9;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1",
+            [schema::SCHEMA_9_FINGERPRINT],
+        )
+        .unwrap();
     drop(connection);
     for _ in 0..2 {
         let database = Database::open(&path).unwrap();
-        assert_eq!(database.share_by_token("share-token").unwrap().unwrap().alias.as_deref(), Some("fixture"));
-        let actual: Vec<u8> = database.conn().query_row("SELECT token_ciphertext FROM shares", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            database
+                .share_by_token("share-token")
+                .unwrap()
+                .unwrap()
+                .alias
+                .as_deref(),
+            Some("fixture")
+        );
+        let actual: Vec<u8> = database
+            .conn()
+            .query_row("SELECT token_ciphertext FROM shares", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(actual, ciphertext);
-        assert_eq!(database.conn().pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0)).unwrap(), 10);
+        assert_eq!(
+            database
+                .conn()
+                .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            10
+        );
     }
 }
 

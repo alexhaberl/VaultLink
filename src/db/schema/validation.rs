@@ -236,12 +236,17 @@ fn validate_schema_10(conn: &Connection) -> rusqlite::Result<()> {
     validate_fingerprint(conn, SCHEMA_10_FINGERPRINT)?;
     validate_pending_transfer_index(conn)?;
     for (name, expected) in SHARE_FILTER_INDEXES {
-        let actual: Option<String> = conn.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
-            [name], |row| row.get(0),
-        ).optional()?;
+        let actual: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
         if actual.as_deref().map(normalize_schema_sql) != Some(normalize_schema_sql(expected)) {
-            return Err(schema_error(format!("schema 10 index {name} is missing or invalid")));
+            return Err(schema_error(format!(
+                "schema 10 index {name} is missing or invalid"
+            )));
         }
     }
     validate_indexed_schema(conn, 10)

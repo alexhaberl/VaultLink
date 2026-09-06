@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "modules": {
+    "src/server/runtime.rs": {
+      "lines": 56,
+      "functions": 77
+    },
+    "src/web/preview_zip.rs": {
+      "lines": 72,
+      "functions": 59
+    },
+    "src/api/public_transfer/zip.rs": {
+      "lines": 90,
+      "functions": 90
+    },
+    "src/web/files/preview.rs": {
+      "lines": 81,
+      "functions": 85
+    },
+    "src/services/public_transfer/preview.rs": {
+      "lines": 85,
+      "functions": 78
+    },
+    "src/db/shares/listing.rs": {
+      "lines": 98,
+      "functions": 100
+    },
+    "src/share_search.rs": {
+      "lines": 96,
+      "functions": 100
+    },
+    "src/share_summary_cache.rs": {
+      "lines": 94,
+      "functions": 85
+    },
+    "src/db/schema/migrations.rs": {
+      "lines": 99,
+      "functions": 100
+    },
+    "src/db/schema/validation.rs": {
+      "lines": 86,
+      "functions": 96
+    }
+  }
+}

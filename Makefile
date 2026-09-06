@@ -89,7 +89,7 @@ fuzz-sequential:
 lint:
 	sh tools/check-web-assets.sh
 	$(MAKE) architecture-check performance-evidence-check refactoring-contracts-check fuzz-policy-check
-	cargo fmt --all -- --check
+	$(PYTHON) tools/check-rust-format.py
 	cargo clippy --all-targets --all-features -- -D warnings
 
 build:
@@ -176,3 +176,11 @@ docker-real-package-update-smoke:
 			"$(REAL_PACKAGE_TARGET)" "$(REAL_PACKAGE_OLD_VERSION)" \
 			"/work/$(REAL_PACKAGE_OLD_PACKAGE)" "$(REAL_PACKAGE_NEW_VERSION)" \
 			"/work/$(REAL_PACKAGE_NEW_PACKAGE)"
+
+.PHONY: format-check coverage
+format-check:
+	$(PYTHON) tools/check-rust-format.py
+	$(PYTHON) tools/test-rust-format-check.py
+
+coverage:
+	bash tools/run-coverage.sh

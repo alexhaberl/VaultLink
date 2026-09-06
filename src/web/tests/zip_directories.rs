@@ -1,3 +1,18 @@
+static ZIP_ADAPTER_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[derive(Clone, Copy)]
+enum ZipTestRoute {
+    Web,
+    Api,
+}
+impl ZipTestRoute {
+    fn uri(self, token: &str) -> String {
+        match self {
+            Self::Web => format!("/v/{token}/download.zip"),
+            Self::Api => format!("/api/v2/public/shares/{token}/download.zip"),
+        }
+    }
+}
+
 fn active_expensive_peer_operations(state: &AppState) -> usize {
     state.expensive_peer_admission_count_for_test()
 }
@@ -32,11 +47,23 @@ async fn wait_for_zip_resources_released(state: &AppState, share_id: i64) {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(state.zip_generation_admission_available_for_test(), 1);
     assert_eq!(active_expensive_peer_operations(state), 0);
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 0);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_zip_plan_retains_permits_and_lease_until_blocking_work_finishes() {
+    let _serial = ZIP_ADAPTER_TEST_SERIAL.lock().await;
+    for route in [ZipTestRoute::Web, ZipTestRoute::Api] {
+        cancelled_zip_plan_retains_permits_and_lease_until_blocking_work_finishes_for(route).await;
+    }
+}
+
+async fn cancelled_zip_plan_retains_permits_and_lease_until_blocking_work_finishes_for(
+    route: ZipTestRoute,
+) {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let share_path = "zip-plan-cancellation-docs";
@@ -74,7 +101,7 @@ async fn cancelled_zip_plan_retains_permits_and_lease_until_blocking_work_finish
     let request = tokio::spawn(async move {
         app.oneshot(request(
             Method::GET,
-            "/v/zip-plan-cancellation/download.zip",
+            &route.uri("zip-plan-cancellation"),
             "",
         ))
         .await
@@ -84,13 +111,19 @@ async fn cancelled_zip_plan_retains_permits_and_lease_until_blocking_work_finish
 
     assert_eq!(state.zip_generation_admission_available_for_test(), 0);
     assert_eq!(active_expensive_peer_operations(&state), 1);
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        1
+    );
     request.abort();
     let _ = request.await;
     tokio::task::yield_now().await;
     assert_eq!(state.zip_generation_admission_available_for_test(), 0);
     assert_eq!(active_expensive_peer_operations(&state), 1);
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        1
+    );
 
     hook.release();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -120,6 +153,15 @@ async fn cancelled_zip_plan_retains_permits_and_lease_until_blocking_work_finish
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zip_blocking_join_error_releases_transfer_lease_and_admission_once() {
+    let _serial = ZIP_ADAPTER_TEST_SERIAL.lock().await;
+    for route in [ZipTestRoute::Web, ZipTestRoute::Api] {
+        zip_blocking_join_error_releases_transfer_lease_and_admission_once_for(route).await;
+    }
+}
+
+async fn zip_blocking_join_error_releases_transfer_lease_and_admission_once_for(
+    route: ZipTestRoute,
+) {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let share_path = "zip-blocking-panic-docs";
@@ -155,18 +197,17 @@ async fn zip_blocking_join_error_releases_transfer_lease_and_admission_once() {
     let hook_guard = install_zip_blocking_test_hook(hook.clone());
     let app = router(state.clone());
     let request = tokio::spawn(async move {
-        app.oneshot(request(
-            Method::GET,
-            "/v/zip-blocking-panic/download.zip",
-            "",
-        ))
-        .await
-        .unwrap()
+        app.oneshot(request(Method::GET, &route.uri("zip-blocking-panic"), ""))
+            .await
+            .unwrap()
     });
     wait_for_zip_hook(&hook).await;
     assert_eq!(state.zip_generation_admission_available_for_test(), 0);
     assert_eq!(active_expensive_peer_operations(&state), 1);
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        1
+    );
 
     hook.release();
     let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
@@ -189,6 +230,13 @@ async fn zip_blocking_join_error_releases_transfer_lease_and_admission_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_capacity_zip_materialization_error_releases_resources_once() {
+    let _serial = ZIP_ADAPTER_TEST_SERIAL.lock().await;
+    for route in [ZipTestRoute::Web, ZipTestRoute::Api] {
+        non_capacity_zip_materialization_error_releases_resources_once_for(route).await;
+    }
+}
+
+async fn non_capacity_zip_materialization_error_releases_resources_once_for(route: ZipTestRoute) {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let share_path = "zip-materialization-error-docs";
@@ -227,7 +275,7 @@ async fn non_capacity_zip_materialization_error_releases_resources_once() {
     let request = tokio::spawn(async move {
         app.oneshot(request(
             Method::GET,
-            "/v/zip-materialization-error/download.zip",
+            &route.uri("zip-materialization-error"),
             "",
         ))
         .await
@@ -236,7 +284,10 @@ async fn non_capacity_zip_materialization_error_releases_resources_once() {
     wait_for_zip_hook(&hook).await;
     assert_eq!(state.zip_generation_admission_available_for_test(), 0);
     assert_eq!(active_expensive_peer_operations(&state), 1);
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        1
+    );
 
     // Planning has completed, so removing the source here deterministically
     // produces ZipBuildError::Source rather than the capacity fallback.
@@ -262,6 +313,13 @@ async fn non_capacity_zip_materialization_error_releases_resources_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_zip_error_before_first_chunk_releases_resources_once() {
+    let _serial = ZIP_ADAPTER_TEST_SERIAL.lock().await;
+    for route in [ZipTestRoute::Web, ZipTestRoute::Api] {
+        direct_zip_error_before_first_chunk_releases_resources_once_for(route).await;
+    }
+}
+
+async fn direct_zip_error_before_first_chunk_releases_resources_once_for(route: ZipTestRoute) {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let share_path = "zip-direct-error-docs";
@@ -297,14 +355,17 @@ async fn direct_zip_error_before_first_chunk_releases_resources_once() {
     });
     let hook_guard = install_zip_blocking_test_hook(hook.clone());
     let response = router(state.clone())
-        .oneshot(request(Method::GET, "/v/zip-direct-error/download.zip", ""))
+        .oneshot(request(Method::GET, &route.uri("zip-direct-error"), ""))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     wait_for_zip_hook(&hook).await;
     assert_eq!(state.zip_generation_admission_available_for_test(), 0);
     assert_eq!(active_expensive_peer_operations(&state), 1);
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        1
+    );
 
     std::fs::remove_file(source_path).unwrap();
     let mut body = response.into_body().into_data_stream();
@@ -331,6 +392,16 @@ async fn direct_zip_error_before_first_chunk_releases_resources_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_zip_materialization_retains_capacity_until_blocking_work_finishes() {
+    let _serial = ZIP_ADAPTER_TEST_SERIAL.lock().await;
+    for route in [ZipTestRoute::Web, ZipTestRoute::Api] {
+        cancelled_zip_materialization_retains_capacity_until_blocking_work_finishes_for(route)
+            .await;
+    }
+}
+
+async fn cancelled_zip_materialization_retains_capacity_until_blocking_work_finishes_for(
+    route: ZipTestRoute,
+) {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let share_path = "zip-cancellation-docs";
@@ -372,7 +443,7 @@ async fn cancelled_zip_materialization_retains_capacity_until_blocking_work_fini
     let hook_guard = install_zip_blocking_test_hook(hook.clone());
     let app = router(state.clone());
     let request = tokio::spawn(async move {
-        app.oneshot(request(Method::GET, "/v/zip-cancellation/download.zip", ""))
+        app.oneshot(request(Method::GET, &route.uri("zip-cancellation"), ""))
             .await
             .unwrap()
     });
@@ -389,7 +460,10 @@ async fn cancelled_zip_materialization_retains_capacity_until_blocking_work_fini
         crate::MAX_CONCURRENT_ZIP_GENERATIONS - 1
     );
     assert!(zip_temp_reserved_bytes_for_test() >= expected_temp_reservation);
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        1
+    );
 
     request.abort();
     let _ = request.await;
@@ -403,7 +477,10 @@ async fn cancelled_zip_materialization_retains_capacity_until_blocking_work_fini
         zip_temp_reserved_bytes_for_test() >= expected_temp_reservation,
         "request cancellation released the temp budget around live materialization"
     );
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        1
+    );
 
     hook.release();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -424,6 +501,13 @@ async fn cancelled_zip_materialization_retains_capacity_until_blocking_work_fini
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_direct_zip_keeps_permits_in_the_blocking_producer() {
+    let _serial = ZIP_ADAPTER_TEST_SERIAL.lock().await;
+    for route in [ZipTestRoute::Web, ZipTestRoute::Api] {
+        cancelled_direct_zip_keeps_permits_in_the_blocking_producer_for(route).await;
+    }
+}
+
+async fn cancelled_direct_zip_keeps_permits_in_the_blocking_producer_for(route: ZipTestRoute) {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let share_path = "zip-direct-cancellation-docs";
@@ -460,7 +544,7 @@ async fn cancelled_direct_zip_keeps_permits_in_the_blocking_producer() {
     let response = router(state.clone())
         .oneshot(request(
             Method::GET,
-            "/v/zip-direct-cancellation/download.zip",
+            &route.uri("zip-direct-cancellation"),
             "",
         ))
         .await
@@ -469,7 +553,10 @@ async fn cancelled_direct_zip_keeps_permits_in_the_blocking_producer() {
     wait_for_zip_hook(&hook).await;
     assert_eq!(state.zip_generation_admission_available_for_test(), 0);
     assert_eq!(active_expensive_peer_operations(&state), 1);
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 1);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        1
+    );
 
     drop(response);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -504,7 +591,10 @@ async fn cancelled_direct_zip_keeps_permits_in_the_blocking_producer() {
     })
     .await
     .expect("direct ZIP permits should outlive the cancelled body but not the producer");
-    assert_eq!(state.db().active_transfer_reservations(share_id).unwrap(), 0);
+    assert_eq!(
+        state.db().active_transfer_reservations(share_id).unwrap(),
+        0
+    );
     assert_eq!(
         state
             .db()

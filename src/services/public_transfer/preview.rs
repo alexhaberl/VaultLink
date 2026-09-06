@@ -51,6 +51,7 @@ where
 
 #[cfg(test)]
 pub(crate) struct TextPreviewReadTestHook {
+    pub(crate) panic_after_release: bool,
     pub(crate) path: String,
     pub(crate) entered: std::sync::atomic::AtomicUsize,
     pub(crate) released: std::sync::Mutex<bool>,
@@ -103,10 +104,16 @@ fn block_text_preview_read_for_test(path: &str) {
         return;
     };
     hook.entered.fetch_add(1, Ordering::AcqRel);
-    let mut released = hook.released.lock().unwrap();
-    while !*released {
-        released = hook.wake.wait(released).unwrap();
-    }
+    let released = hook.released.lock().unwrap();
+    let (released, timeout) = hook
+        .wake
+        .wait_timeout_while(released, std::time::Duration::from_secs(10), |released| {
+            !*released
+        })
+        .unwrap();
+    drop(released);
+    assert!(!timeout.timed_out(), "preview hook timed out");
+    assert!(!hook.panic_after_release, "injected preview read panic");
 }
 
 pub(crate) struct EscapedTextPageStream {
