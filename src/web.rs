@@ -34,6 +34,7 @@ mod shares;
 pub(crate) mod templates;
 mod transfer;
 mod transfer_runtime;
+mod updates;
 #[path = "web/public_upload/mod.rs"]
 mod upload;
 
@@ -396,6 +397,10 @@ crate::declare_routes! {
     "/admin/settings" {
         GET => settings_audit::settings_page, [AdminSession, VerifiedSession, None, None, None, ReadOnly];
         POST => settings_audit::update_settings, [AdminSession, MutationContext, FormField, Required, Form, Privileged];
+    }
+    "/admin/settings/updates" {
+        GET => updates::status, [AdminSession, VerifiedSession, None, None, None, ReadOnly];
+        POST => updates::submit, [AdminSession, MutationContext, FormField, Required, Form, Privileged];
     }
     "/admin/settings/audit-ips/delete" {
         GET => settings_audit::audit_ips_delete_confirmation, [AdminSession, VerifiedSession, None, None, None, ReadOnly];

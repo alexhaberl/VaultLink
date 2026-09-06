@@ -202,6 +202,60 @@ async fn admin_ui_creates_admin_and_updates_runtime_settings() {
 }
 
 #[tokio::test]
+async fn software_updates_reject_unverified_sessions_bad_csrf_and_extra_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db().create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db()
+        .create_session(
+            "update-session",
+            1,
+            "csrf-token",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    let app = router(state.clone());
+    let make_request = |body: &str| {
+        let mut request = request(Method::POST, "/admin/settings/updates", body);
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=update-session"),
+        );
+        request
+    };
+    let response = app
+        .clone()
+        .oneshot(make_request("csrf=csrf-token&operation=check"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    state.db().verify_mfa("update-session").unwrap();
+    let response = app
+        .clone()
+        .oneshot(make_request("csrf=wrong&operation=install&version=0.7.1"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app
+        .clone()
+        .oneshot(make_request(
+            "csrf=csrf-token&operation=install&version=0.7.1-rc1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = app
+        .oneshot(make_request(
+            "csrf=csrf-token&operation=install&version=0.7.1&url=https%3A%2F%2Fevil.invalid",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn upload_only_never_exposes_target_paths_or_existing_content() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();

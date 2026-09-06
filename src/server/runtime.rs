@@ -14,6 +14,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|value| matches!(value.as_str(), "update-control" | "update-job"))
+    {
+        if args.len() != 2 {
+            return Err("internal update commands do not accept arguments".into());
+        }
+        return vaultlink::updates::run_host(&args[1])
+            .await
+            .map_err(Into::into);
+    }
     if args.get(1).is_some_and(|value| value == "--version") {
         if args.len() != 2 {
             return Err("--version does not accept additional arguments".into());

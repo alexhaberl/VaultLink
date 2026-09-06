@@ -1,4 +1,8 @@
-<section class="vl-panel">
+<nav class="vl-settings-nav" aria-label='<vl-i18n key="updates.settings_sections"/>' data-settings-nav>
+  <a href="#general" aria-current="page"><vl-i18n key="updates.general"/></a>
+  <a href="#updates"><vl-i18n key="updates.title"/></a>
+</nav>
+<section class="vl-panel" id="general" data-settings-section>
   <h2><vl-i18n key="settings.runtime"/></h2>
   {% if message.is_some() %}<p class="vl-muted">{{ message.as_ref().unwrap() }}</p>{% endif %}
   <p class="vl-muted"><vl-i18n key="settings.runtime_help"/></p>
@@ -24,3 +28,4 @@
   </form>
   {% if show_purge_link %}<p><a class="vl-button vl-button--danger" href="/admin/settings/audit-ips/delete">{{ audit_ip_count }} <vl-i18n key="settings.delete_ips"/></a></p>{% endif %}
 </section>
+{% include "updates.html" %}

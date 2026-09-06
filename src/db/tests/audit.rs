@@ -326,7 +326,7 @@ fn audit_retention_keeps_only_the_newest_rows() {
 #[test]
 fn audit_action_policy_has_unique_names_and_explicit_priorities() {
     let mut names = std::collections::HashSet::new();
-    assert_eq!(AuditAction::ALL.len(), 55);
+    assert_eq!(AuditAction::ALL.len(), 56);
     for action in AuditAction::ALL {
         assert!(
             names.insert(action.as_str()),

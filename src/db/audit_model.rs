@@ -117,6 +117,7 @@ pub(crate) enum AuditAction {
     ServiceTokenRevoked,
     ServiceTokensRevokedAll,
     SettingsUpdated,
+    SoftwareUpdateRequested,
     ShareActivated,
     ShareCreated,
     ShareDeactivated,
@@ -177,6 +178,7 @@ impl AuditAction {
             Self::ServiceTokenRevoked => "service_token_revoked",
             Self::ServiceTokensRevokedAll => "service_tokens_revoked_all",
             Self::SettingsUpdated => "settings_updated",
+            Self::SoftwareUpdateRequested => "software_update_requested",
             Self::ShareActivated => "share_activated",
             Self::ShareCreated => "share_created",
             Self::ShareDeactivated => "share_deactivated",
@@ -239,6 +241,7 @@ impl AuditAction {
             | Self::ServiceTokenRevoked
             | Self::ServiceTokensRevokedAll
             | Self::SettingsUpdated
+            | Self::SoftwareUpdateRequested
             | Self::ShareActivated
             | Self::ShareCreated
             | Self::ShareDeactivated
@@ -297,6 +300,7 @@ impl AuditAction {
         Self::ServiceTokenRevoked,
         Self::ServiceTokensRevokedAll,
         Self::SettingsUpdated,
+        Self::SoftwareUpdateRequested,
         Self::ShareActivated,
         Self::ShareCreated,
         Self::ShareDeactivated,

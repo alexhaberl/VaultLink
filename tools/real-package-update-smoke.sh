@@ -965,6 +965,17 @@ assert_mutables_unchanged
 # transaction plus package database/candidate/live parity.
 publish_release "$new_version" "$normal_new/$new_asset"
 : >"$work/package-manager.log"
+if VAULTLINK_EXPECTED_VERSION="$old_version" run_production_updater \
+    >"$work/confirmation.stdout" 2>"$work/confirmation.stderr"; then
+    fail "the updater accepted a release different from the GUI confirmation"
+fi
+grep -F -q 'latest release changed after confirmation' "$work/confirmation.stderr" \
+    || fail "the confirmation mismatch failed at an unrelated guard"
+! grep -q '^MUTATE ' "$work/package-manager.log" \
+    || fail "confirmation mismatch reached package mutation"
+assert_parity "$old_version"
+assert_mutables_unchanged
+: >"$work/package-manager.log"
 if ! run_production_updater >"$work/success.stdout" \
     2>"$work/success.stderr"; then
     tail -n 100 "$work/success.stderr" >&2

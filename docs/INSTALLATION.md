@@ -219,7 +219,11 @@ validated mount base. Packaged examples include the equivalent of
 
 The package also installs the root-owned updater as
 `/usr/sbin/vaultlink-update`. Its daily timer and automatic installation remain
-disabled until the administrator explicitly opts in:
+disabled until the administrator explicitly opts in.
+
+The upcoming GUI controls are documented separately in the
+[upgrade guide](UPGRADE-ROLLBACK.md#gui-updates-starting-with-070-unreleased).
+For the currently published version, use the command line:
 
 ```sh
 sudo vaultlink-update check

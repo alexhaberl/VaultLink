@@ -321,6 +321,24 @@ impl Database {
         })
     }
 
+    pub(crate) fn authorize_software_update(
+        &self,
+        proof: &MfaSessionProof,
+        context: &AuditContext,
+        detail: String,
+    ) -> rusqlite::Result<SessionBound<Audited<()>>> {
+        self.required_transaction_for_mfa_session_audited(proof, context, |_| {
+            Ok((
+                (),
+                vec![RequiredAuditEvent::new(
+                    AuditAction::SoftwareUpdateRequested,
+                    None,
+                    Some(detail),
+                )],
+            ))
+        })
+    }
+
     #[cfg(test)]
     fn delete_audit_client_ips_if_disabled_internal(
         &self,

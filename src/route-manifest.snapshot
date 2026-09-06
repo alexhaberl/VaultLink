@@ -45,6 +45,8 @@ web|POST|/admin/service-tokens|AdminSession|MutationContext|FormField|Required|F
 web|POST|/admin/service-tokens/{id}/revoke|AdminSession|MutationContext|FormField|Required|Form|Privileged
 web|GET|/admin/settings|AdminSession|VerifiedSession|None|None|None|ReadOnly
 web|POST|/admin/settings|AdminSession|MutationContext|FormField|Required|Form|Privileged
+web|GET|/admin/settings/updates|AdminSession|VerifiedSession|None|None|None|ReadOnly
+web|POST|/admin/settings/updates|AdminSession|MutationContext|FormField|Required|Form|Privileged
 web|GET|/admin/settings/audit-ips/delete|AdminSession|VerifiedSession|None|None|None|ReadOnly
 web|POST|/admin/settings/audit-ips/delete|AdminSession|MutationContext|FormField|Required|Form|Privileged
 web|GET|/admin/audit|AdminSession|VerifiedSession|None|None|None|ReadOnly

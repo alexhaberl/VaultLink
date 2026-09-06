@@ -326,6 +326,7 @@ run_scp \
     "$package" \
     tools/distro-vm-guest-smoke.sh \
     tools/distro-vm-runtime-smoke.sh \
+    tools/gui-update-control-smoke.py \
     tools/check-vm-root-capacity.sh \
     deploy/docker/api-smoke.sh \
     tools/load-test.sh \

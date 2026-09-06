@@ -104,7 +104,7 @@ grep -F -q "minisign -V -q -p \"\$public_key\"" deploy/vaultlink-update.sh \
     || fail "the updater must verify release assets with the pinned Minisign key"
 grep -F -x -q 'ExecStart=/usr/sbin/vaultlink-update auto' deploy/vaultlink-update.service \
     || fail "the update service must use the configured automatic mode"
-grep -F -x -q 'ExecStartPre=+/usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh' \
+grep -F -x -q 'ExecStartPre=+/usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh --start-update-control' \
     deploy/vaultlink.service \
     || fail "VaultLink service must enforce package/runtime parity before every start"
 [ "$(grep -F -c 'ExecStartPre=' deploy/vaultlink.service)" -eq 1 ] \

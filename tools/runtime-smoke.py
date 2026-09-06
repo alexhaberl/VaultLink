@@ -74,6 +74,14 @@ def start_and_shutdown(config: Path, url: str, log: Path) -> None:
 
 
 def main() -> None:
+    for mode in ("update-control", "update-job"):
+        result = subprocess.run([str(BIN), mode, "unexpected"], capture_output=True, timeout=10, check=False)
+        assert result.returncode != 0
+        assert b"do not accept arguments" in result.stderr
+        if os.geteuid() != 0:
+            result = subprocess.run([str(BIN), mode], capture_output=True, timeout=10, check=False)
+            assert result.returncode != 0
+            assert b"requires root" in result.stderr
     with tempfile.TemporaryDirectory(prefix="vaultlink-runtime-") as directory:
         work = Path(directory)
         mount = work / "mount"
