@@ -193,6 +193,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 args.phase = phase
                 errors = []
                 with patch.object(STATE, "load_release_evidence", return_value=EVIDENCE), \
+                        patch.object(EVIDENCE, "performance_required", return_value=True), \
                         patch.object(EVIDENCE, "verify_receipt") as performance, \
                         patch.object(EVIDENCE, "verify_soak") as soak, \
                         patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO}):
@@ -208,6 +209,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 args.phase = phase
                 errors = []
                 with patch.object(STATE, "load_release_evidence", return_value=EVIDENCE), \
+                        patch.object(EVIDENCE, "performance_required", return_value=True), \
                         patch.object(EVIDENCE, "verify_receipt", side_effect=EVIDENCE.EvidenceError("stale")):
                     self.assertFalse(STATE.validate_phase(args, errors))
                     self.assertTrue(errors)
@@ -216,6 +218,81 @@ class ReleaseEvidenceTests(unittest.TestCase):
             errors = []
             self.assertFalse(STATE.validate_phase(args, errors))
             self.assertTrue(errors, "legacy require-ready must remain strict")
+
+    def test_performance_deferral_applies_only_to_exactly_070(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "release/performance").mkdir(parents=True)
+            policy_path = root / "release/performance/policy.json"
+            policy = EVIDENCE.performance_policy()
+            policy_path.write_text(json.dumps(policy))
+            with patch.object(EVIDENCE, "ROOT", root):
+                for version, required in [("0.7.0", False), ("0.7.1", True),
+                                          ("0.8.0", True), ("1.0.0", True)]:
+                    (root / "Cargo.toml").write_text(f'[package]\nversion = "{version}"\n')
+                    self.assertEqual(EVIDENCE.performance_required(), required)
+                (root / "Cargo.toml").write_text('[package]\nversion = "0.7.0-rc1"\n')
+                self.assertRaises(EVIDENCE.EvidenceError, EVIDENCE.performance_required)
+                (root / "Cargo.toml").write_text('[package]\nversion = "0.7.1"\n')
+                policy_path.write_text(json.dumps({**policy, "deferred_release": "0.7.1"}))
+                self.assertRaises(EVIDENCE.EvidenceError, EVIDENCE.performance_required)
+                policy_path.unlink()
+                self.assertRaises(EVIDENCE.EvidenceError, EVIDENCE.performance_required)
+
+    def test_070_deferral_keeps_candidate_packages_and_soak_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = argparse.Namespace(phase="candidate", require_ready=False, expected_commit=COMMIT,
+                expected_binary_sha256=EXPECTED["binary_sha256"], expected_packages_run_id=123,
+                performance_receipt=None, output=Path(temporary) / "effective.json")
+            for phase in ("candidate", "soak", "evidence", "tag"):
+                args.phase = phase
+                errors = []
+                with patch.object(STATE, "load_release_evidence", return_value=EVIDENCE), \
+                        patch.object(EVIDENCE, "performance_required", return_value=False), \
+                        patch.object(EVIDENCE, "verify_candidate") as candidate, \
+                        patch.object(EVIDENCE, "verify_receipt") as performance, \
+                        patch.object(EVIDENCE, "verify_soak") as soak, \
+                        patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO}):
+                    self.assertEqual(STATE.validate_phase(args, errors), {"QUAL-006"})
+                    self.assertEqual(errors, [])
+                    self.assertEqual(candidate.call_count, int(phase != "candidate"))
+                    performance.assert_not_called()
+                    self.assertEqual(soak.call_count, int(phase in {"evidence", "tag"}))
+                    if phase != "candidate":
+                        effective = args.effective_qualification
+                        self.assertIsNone(effective["performance_receipt"])
+                        self.assertEqual(effective["performance_deferral"]["deferred_release"], "0.7.0")
+                        self.assertEqual(effective["accepted_findings"], ["QUAL-001"])
+                        self.assertNotIn("QUAL-001", effective["resolved_findings"])
+                    self.assertFalse(args.output.exists())
+            for verifier, phase in [("verify_candidate", "soak"), ("verify_soak", "evidence"),
+                                    ("verify_soak", "tag")]:
+                args.phase = phase
+                errors = []
+                with patch.object(STATE, "load_release_evidence", return_value=EVIDENCE), \
+                        patch.object(EVIDENCE, "performance_required", return_value=False), \
+                        patch.object(EVIDENCE, "verify_candidate"), \
+                        patch.object(EVIDENCE, verifier, side_effect=EVIDENCE.EvidenceError("missing proof")), \
+                        patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO}):
+                    self.assertFalse(STATE.validate_phase(args, errors))
+                    self.assertTrue(errors)
+                    self.assertIsNone(args.effective_qualification)
+            for required, supplied in [(True, None), (False, Path(temporary) / "pretend.json")]:
+                args.phase, args.performance_receipt = "soak", supplied
+                errors = []
+                with patch.object(STATE, "load_release_evidence", return_value=EVIDENCE), \
+                        patch.object(EVIDENCE, "performance_required", return_value=required):
+                    self.assertFalse(STATE.validate_phase(args, errors))
+                    self.assertTrue(errors)
+
+    def test_candidate_verification_rejects_a_different_packages_run(self):
+        from unittest.mock import Mock
+        api = Mock()
+        api.gate.side_effect = [{"id": 999}]
+        self.assertRaises(EVIDENCE.EvidenceError, EVIDENCE.verify_candidate, api, COMMIT, 123)
+        api.gate.side_effect = [{"id": 123}, {"id": 456}]
+        self.assertEqual(EVIDENCE.verify_candidate(api, COMMIT, 123), {"id": 456})
+        self.assertEqual(api.gate.call_args.args[1], "vaultlink/release-candidate-preflight")
 
 
 if __name__ == "__main__":

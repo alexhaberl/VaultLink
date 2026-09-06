@@ -70,14 +70,18 @@ if [ "$release_candidate" -eq 1 ] || [ -n "$release_tag" ]; then
     if [ "$phase" = candidate ]; then
         python3 tools/check-release-state.py --phase candidate --expected-commit "$candidate_commit" >/dev/null
     else
-        if [ -z "$binary" ] || [ -z "$performance_receipt" ] || [ -z "$packages_run_id" ]; then
-            echo "final version phases require the extracted binary, packages run, and performance receipt" >&2
+        if [ -z "$binary" ] || [ -z "$packages_run_id" ]; then
+            echo "final version phases require the extracted binary and packages run" >&2
             exit 1
         fi
         binary_sha256=$(sha256sum "$binary" | awk '{print $1}')
+        set --
+        if [ -n "$performance_receipt" ]; then
+            set -- --performance-receipt "$performance_receipt"
+        fi
         python3 tools/check-release-state.py --phase "$phase" \
             --expected-commit "$candidate_commit" --expected-binary-sha256 "$binary_sha256" \
-            --expected-packages-run-id "$packages_run_id" --performance-receipt "$performance_receipt" \
+            --expected-packages-run-id "$packages_run_id" "$@" \
             --output "${RUNNER_TEMP:-/tmp}/effective-qualification.json" >/dev/null
     fi
     [ "$package_version" = "$release_version" ] || {
