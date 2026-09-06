@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 — Unreleased
+## 0.7.0 — 2026-09-10
 
 - Check every tracked Rust file with the pinned formatter, including embedded fragments; remove the disabled public-page reference copy.
 - Add preview/ZIP cancellation and raw-preview regressions, real server/TLS/shutdown process-smokes, merged unit/process coverage and measured local coverage floors.
