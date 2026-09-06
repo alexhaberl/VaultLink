@@ -350,18 +350,28 @@ def validate_phase(args, errors: list[str]) -> frozenset[str]:
     if not re.fullmatch(r"[0-9a-f]{40}", args.expected_commit or ""):
         errors.append("release phases require the exact expected commit")
         return frozenset()
-    if phase == "candidate":
-        return frozenset({"QUAL-001", "QUAL-006"})
     try:
         import tempfile
         evidence = load_release_evidence()
+        performance_required = evidence.performance_required()
+        deferred = None if performance_required else evidence.performance_policy()
+        resolved = frozenset({"QUAL-001", "QUAL-006"} if performance_required else {"QUAL-006"})
+        if phase == "candidate":
+            return resolved
         evidence.PERF._sha256(args.expected_binary_sha256, "expected binary")
         evidence.positive(args.expected_packages_run_id, "expected packages run")
-        if args.performance_receipt is None:
-            raise evidence.EvidenceError("a verified performance receipt is required")
-        receipt, _ = evidence.PERF._read_json(args.performance_receipt)
-        evidence.verify_receipt(receipt, args.expected_commit, args.expected_binary_sha256,
-                                args.expected_packages_run_id)
+        receipt = None
+        if performance_required:
+            if args.performance_receipt is None:
+                raise evidence.EvidenceError("a verified performance receipt is required")
+            receipt, _ = evidence.PERF._read_json(args.performance_receipt)
+            evidence.verify_receipt(receipt, args.expected_commit, args.expected_binary_sha256,
+                                    args.expected_packages_run_id)
+        else:
+            if args.performance_receipt is not None:
+                raise evidence.EvidenceError("0.7.0 records a deferral, not performance qualification")
+            api = evidence.GitHub(__import__("os").environ.get("GITHUB_REPOSITORY", ""))
+            evidence.verify_candidate(api, args.expected_commit, args.expected_packages_run_id)
         soak_receipt = None
         if phase in {"evidence", "tag"}:
             api = evidence.GitHub(__import__("os").environ.get("GITHUB_REPOSITORY", ""))
@@ -374,10 +384,13 @@ def validate_phase(args, errors: list[str]) -> frozenset[str]:
                 "binary_sha256": args.expected_binary_sha256,
                 "packages_run_id": args.expected_packages_run_id,
                 "performance_receipt": receipt,
+                "performance_deferral": deferred,
                 "soak_receipt": soak_receipt,
-                "resolved_findings": ["QUAL-001"] + (["QUAL-006"] if phase != "soak" else []),
+                "resolved_findings": (["QUAL-001"] if performance_required else [])
+                    + (["QUAL-006"] if phase != "soak" else []),
+                "accepted_findings": [] if performance_required else ["QUAL-001"],
             }
-        return frozenset({"QUAL-001", "QUAL-006"})
+        return resolved
     except (OSError, ValueError, KeyError) as error:
         errors.append(f"release evidence: {error}")
         return frozenset()

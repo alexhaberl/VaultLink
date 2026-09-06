@@ -282,7 +282,7 @@ fn render_mount_unit(source: &str, uid: u32, gid: u32) -> String {
          What={source}\n\
          Where={MOUNT_POINT}\n\
          Type=cifs\n\
-         Options=_netdev,credentials={CREDENTIAL_PATH},vers=3.1.1,sign,seal,cache=strict,serverino,nosuid,nodev,noexec,uid={uid},gid={gid},file_mode=0600,dir_mode=0700\n\
+         Options=_netdev,credentials={CREDENTIAL_PATH},vers=3.1.1,sec=ntlmsspi,sign,seal,cache=strict,serverino,nosuid,nodev,noexec,uid={uid},gid={gid},file_mode=0600,dir_mode=0700\n\
          TimeoutSec=30s\n\n\
          [Install]\n\
          WantedBy=remote-fs.target\n"
@@ -558,6 +558,7 @@ mod tests {
             "Type=cifs",
             "vers=3.1.1",
             "sign",
+            "sec=ntlmsspi",
             "seal",
             "cache=strict",
             "serverino",

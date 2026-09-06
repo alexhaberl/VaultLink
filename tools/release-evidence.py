@@ -15,6 +15,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import tomllib
 import zipfile
 
 
@@ -27,6 +28,24 @@ EvidenceError = PERF.EvidenceError
 PERFORMANCE_WORKFLOW = ".github/workflows/performance-evidence.yml"
 PRODUCER_FILES = ("tools/load-test.sh", "tools/collect-performance-evidence.py",
                   "tools/check-performance-evidence.py")
+
+
+def performance_policy() -> dict:
+    policy, _ = PERF._read_json(ROOT / "release/performance/policy.json")
+    if (policy.get("schema_version") != 1 or policy.get("deferred_release") != "0.7.0"
+            or policy.get("required_after") != "0.7.0" or not policy.get("reason")):
+        raise EvidenceError("performance deferral must remain scoped to exactly 0.7.0")
+    return policy
+
+
+def performance_required() -> bool:
+    policy = performance_policy()
+    version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise EvidenceError("performance policy requires an explicit release version")
+    # No CLI/environment override: every version other than the one approved
+    # exception requires real evidence, including 0.7.1 and later releases.
+    return version != policy["deferred_release"]
 
 
 def producer_digest(root: Path = ROOT) -> str:
@@ -184,16 +203,20 @@ def performance_receipt(api: GitHub, commit: str, binary: str, packages_run: int
     return {**receipt, "identity": expected}
 
 
+def verify_candidate(api: GitHub, commit: str, packages_run: int) -> dict:
+    packages = api.gate(commit, "vaultlink/packages", ".github/workflows/packages.yml")
+    if packages["id"] != packages_run:
+        raise EvidenceError("packages run differs from the current successful gate")
+    return api.gate(commit, "vaultlink/release-candidate-preflight", ".github/workflows/release.yml",
+                    "workflow_dispatch", f"Release candidate {commit}")
+
+
 def verify_receipt(receipt: dict, commit: str, binary: str, packages_run: int) -> dict:
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     if receipt.get("repository") != repository:
         raise EvidenceError("receipt repository differs from the calling workflow")
     api = GitHub(repository)
-    packages = api.gate(commit, "vaultlink/packages", ".github/workflows/packages.yml")
-    if packages["id"] != packages_run:
-        raise EvidenceError("packages run differs from the current successful gate")
-    candidate = api.gate(commit, "vaultlink/release-candidate-preflight", ".github/workflows/release.yml",
-                         "workflow_dispatch", f"Release candidate {commit}")
+    candidate = verify_candidate(api, commit, packages_run)
     with tempfile.TemporaryDirectory() as temporary:
         verified = performance_receipt(api, commit, binary, packages_run, candidate["id"],
                                        Path(temporary) / "performance")
@@ -216,6 +239,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("producer-digest")
+    commands.add_parser("performance-required")
     verify = commands.add_parser("performance")
     verify.add_argument("--commit", required=True)
     verify.add_argument("--binary-sha256", required=True)
@@ -227,6 +251,9 @@ def main() -> int:
     register.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     try:
+        if args.command == "performance-required":
+            print("true" if performance_required() else "false")
+            return 0
         if args.command == "producer-digest":
             print(producer_digest())
             return 0

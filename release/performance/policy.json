@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "deferred_release": "0.7.0",
+  "required_after": "0.7.0",
+  "decision_date": "2026-09-06",
+  "reason": "Maintainer decision: defer the comparative performance baseline until the next release after 0.7.0. The historical reference cannot start on CIFS and the complete measurement suite is not implemented.",
+  "requirements": "release/performance/README.md"
+}

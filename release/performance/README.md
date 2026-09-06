@@ -1,11 +1,49 @@
-# Performance evidence
+# Performance requirements after 0.7.0
 
-The v0.7.0 baseline is commit
+The maintainer deferred comparative baseline qualification for **0.7.0 only**
+on 2026-09-06. `policy.json` records that decision; QUAL-001 is accepted as a
+deferral, not closed by measurement. No baseline lock, `vaultlink/performance`
+status, or performance receipt is required for the 0.7.0 candidate, soak start,
+or final evidence/tag phases. Those phases retain the exact package/candidate
+checks and the complete 72-hour soak with its existing load, latency, RSS,
+integrity, and transfer requirements. Effective qualification records the
+deferral separately and never claims a measured performance pass.
+
+The **next release after 0.7.0**, including a patch release such as 0.7.1,
+requires the full baseline gate. The policy has no caller/environment override;
+changing the package version re-enables the evidence requirement automatically.
+
+## Required work before the next release
+
+- Review a runnable replacement baseline and update its pinned identity.
+- Implement the complete 19-metric measurement suite with actual instrumentation
+  for internal counts and allocations; include that code in producer provenance.
+- Pin the immutable runner image, CPU allocation, memory, native storage, and
+  real CIFS configuration for all five baseline and all five candidate runs.
+- Register and review the protected baseline artifact before freezing that
+  release candidate, then enforce the sequence below.
+
+Replace and review the historical reference commit
 `a390dd9a2210a2e227655a562c541b2b4ebd493c`. Baseline and candidate each
 require exactly five real measurements from the same pinned runner, including
 native storage and CIFS. `tools/check-performance-evidence.py` enforces all
 19 metrics, runner equality, absolute thresholds and median/p95 regression
 limits. Missing metrics, schema-v1 files and edited summaries fail closed.
+
+The first real Debian/CIFS setup exposed a blocker in that historical binary:
+its mount validator requires a standalone `sign` entry in Linux mountinfo,
+which Linux does not emit. It therefore refuses the signed, encrypted test
+mount before serving requests. Fixing the candidate does not repair the
+historical binary. The tooling reference remains unchanged pending an explicit
+review of a reproducible replacement; do not patch the measured binary, alter
+mountinfo, or register partial runs as baseline evidence.
+
+The repository also still needs an executable measurement suite for all 19
+metrics. The existing load generator covers only part of the required profile;
+the collector and producer import and validate completed runs. Internal stream,
+decryption, and allocation counts require measured instrumentation, not values
+inferred from source code or synthetic unit-test fixtures. These gaps must be
+resolved before a baseline lock or candidate performance success is published.
 
 ## Measurement identity and protected collection
 
@@ -48,7 +86,7 @@ branch policy and reviewers, and these environment secrets:
 `PERFORMANCE_SSH_PRIVATE_KEY`, `PERFORMANCE_SSH_HOST_KEYS`.
 Host keys are pinned; the existing restricted SSH configuration tool is reused.
 
-## Release sequence without changing the qualified commit
+## Next-release sequence without changing the qualified commit
 
 1. Measure the baseline, then dispatch `performance-evidence.yml` from main with
    kind `baseline`, its historical commit, real binary hash and successful
@@ -106,6 +144,8 @@ trusted expected identity arguments; see `compare --help`. Existing conflicting
 files and symlink destinations fail closed. Unit test fixture values are
 synthetic test inputs and never constitute release evidence.
 
-QUAL-001 and QUAL-006 remain open in source until real runner evidence exists;
-the phase validator resolves their effective status only from verified Actions
-artifacts. Native package smoke and local Rust tests do not replace these gates.
+For releases after 0.7.0, QUAL-001 must again track the unresolved performance
+qualification. The phase validator resolves it only from verified Actions
+artifacts. In 0.7.0, QUAL-001 records the accepted deferral; QUAL-006 remains open
+until the real soak evidence is verified. Native package smoke and local Rust
+tests do not replace the remaining gates.

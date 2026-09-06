@@ -117,15 +117,25 @@ fail-closed until checked against the exact release commit.
 
 ## Candidate qualification phases
 
-- [ ] Review and commit `release/performance/baseline.lock.json` from the protected
-  baseline producer before freezing the candidate, as described in
-  `release/performance/README.md`. Never hand-author measurement values.
+- [x] Defer the comparative performance baseline to the next release after
+  0.7.0, per `release/performance/policy.json`. QUAL-001 records the accepted
+  deferral; 0.7.0 does not require a baseline lock or performance receipt.
+  The complete requirements remain in `release/performance/README.md`.
 - [ ] Finish the nine-target/native/fuzz/reproducibility/VM gates and the candidate
-  preflight. Only QUAL-001 (performance) and QUAL-006 (soak) may remain deferred.
-- [ ] Run the protected performance producer for the same commit and exact Debian
-  package binary; verify all five schema-v2 runs and the reviewed baseline lock.
-- [ ] Soak start verifies the immutable performance artifact before activation.
-  Evidence/tag phases additionally verify the full 72-hour soak on that binary.
+  preflight. Only QUAL-006 (soak) may remain open before the soak starts.
+- [ ] Soak start verifies the candidate and exact extracted package binary.
+  Evidence/tag phases verify the full 72-hour soak on that binary, including
+  all existing full-load latency, RSS, integrity, and transfer requirements.
 - [ ] Archive effective qualification as an Actions artifact. Do not commit
   candidate measurements or change qualification flags after the soak; that
   would create a different candidate requiring a new qualification cycle.
+
+## After publication
+
+- [ ] Once the immutable 0.7.0 release and its assets are verified, mark 0.6.0
+  as superseded and no longer supported, recommend upgrading to 0.7.0, and
+  synchronize the release-state model, README, SECURITY, installation guidance,
+  and release notices. Until publication, retain 0.6.0 as the supported version
+  with its documented CIFS startup limitation. Keep historical release evidence
+  intact; apply the support-status transition after publication, outside the
+  frozen candidate qualification cycle.

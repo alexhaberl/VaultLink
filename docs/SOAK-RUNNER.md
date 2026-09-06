@@ -229,9 +229,12 @@ the `active` state under an administrator-controlled maintenance procedure.
 Never remove or replace active evidence while the systemd unit is running.
 
 
-The v0.7.0 qualification sequence is candidate preflight, protected performance
-verification, soak start, and final evidence/tag verification. Soak start now
-requires `vaultlink/performance` for the exact extracted package binary. The
-final phases re-download immutable performance and soak artifacts and archive
-an effective qualification record without modifying the candidate commit.
-See `release/performance/README.md` for provisioning and baseline registration.
+The v0.7.0 qualification sequence is candidate preflight, soak start, and final
+evidence/tag verification. The maintainer deferred the comparative performance
+baseline to the next release after 0.7.0; this version does not require a
+baseline lock or `vaultlink/performance` receipt. Soak start still verifies the
+candidate and exact package binary. The final phases re-download the immutable
+72-hour soak artifact and archive effective qualification with the explicit
+performance deferral, without modifying the candidate commit. All existing
+soak load, latency, RSS, integrity, and transfer gates remain mandatory.
+See `release/performance/README.md` for the next-release baseline requirements.

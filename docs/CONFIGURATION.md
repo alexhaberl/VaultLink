@@ -7,6 +7,13 @@ Choose the storage layout and HTTPS mode before completing
 development branch; the configurable `[admission]` section is new in 0.7.0.
 Use configuration examples from the matching release when installing 0.6.0.
 
+Known 0.6.0 limitation: CIFS startup can fail with `missing required security
+option "sign"` even when the SMB session is signed and encrypted. That release
+checks for a standalone mountinfo entry that Linux does not emit. Changing only
+the mount command cannot fix the application check. Local ext4 installations
+are unaffected by this defect. The correction is included in the unreleased
+0.7.0 branch; 0.6.0 remains the supported release until its replacement is published.
+
 ## Configuration model
 
 Examples:
@@ -76,7 +83,7 @@ Audited co-writer mode requires:
 
 - `require_mount = true`, `external_writers = true`, `expected_filesystem_type = "cifs"`, and the exact UNC source. `allow_external_writer_replace = false` is the safe default.
 - Linux statx mount IDs (Linux 5.8 or newer), coherent exclusive locks, and the same checked mount ID for root/internal paths.
-- `vers=3.1.1`, `seal`, `cache=strict`, `serverino`, `nosuid`, `nodev`, `noexec`, read-write status, and none of `cache=loose`, `nostrictsync`, `noperm`, `noserverino`, or `multiuser`.
+- `vers=3.1.1`, `sec=ntlmsspi` (or `sec=krb5i` for Kerberos), `seal`, `cache=strict`, `serverino`, `nosuid`, `nodev`, `noexec`, read-write status, and none of `cache=loose`, `nostrictsync`, `noperm`, `noserverino`, `multiuser`, or `signloosely`.
 - No symlinks, nested mounts, or DFS submounts in user paths.
 - `data_directory` and SQLite/WAL on a separately supported local filesystem; CIFS/NFS SQLite is rejected.
 - External writers are trusted content publishers. Their changes bypass VaultLink authentication, audit, quotas, and link policy and therefore require SMB-server audit.
@@ -84,6 +91,14 @@ Audited co-writer mode requires:
 - The SMB server must require SMB 3.1.1 signing and encryption for every direct client session; VaultLink's `seal` protects only its own Linux mount.
 
 Other network filesystems with external writers are not approved in 0.7.0. Runtime-editable settings under `/admin/settings` include `public_base_url`, upload limits, blocked extensions, Share-password policy, unlock duration, ZIP/search/text/media preview limits and extensions, and PDF-preview status. Server mode, bind address, TLS paths, trusted proxies, storage paths, and ACME mode remain file/restart based.
+
+Set the signed authentication mode explicitly when mounting CIFS. Linux reports
+negotiated signing in `/proc/self/mountinfo` as the `i` suffix in `sec=ntlmsspi`
+or `sec=krb5i`, rather than a standalone `sign` entry. With an unspecified mode,
+the kernel can omit `sec=` entirely even for a signed session. VaultLink rejects
+that ambiguous state; update the mount options and unmount/remount before
+starting the service. The generated mount unit and example pin `sec=ntlmsspi`.
+See the kernel's [CIFS security option reporting](https://github.com/torvalds/linux/blob/v6.12/fs/smb/client/cifsfs.c#L446-L478).
 
 ## HTTPS and operating modes
 

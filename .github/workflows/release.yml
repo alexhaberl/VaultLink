@@ -138,7 +138,10 @@ jobs:
           if [[ "$release_stage" == evidence || "$release_stage" == tag ]]; then
             validate_gate vaultlink/release-candidate-preflight .github/workflows/release.yml \
               "Release candidate $candidate_commit" workflow_dispatch
-            validate_gate vaultlink/performance .github/workflows/performance-evidence.yml "" workflow_dispatch
+            performance_required=$(python3 tools/release-evidence.py performance-required)
+            if [[ "$performance_required" == true ]]; then
+              validate_gate vaultlink/performance .github/workflows/performance-evidence.yml "" workflow_dispatch
+            fi
             validate_gate vaultlink/72h-soak .github/workflows/soak-collect.yml
             soak_run=$VALIDATED_RUN_ID
             soak_dir=$(mktemp -d)
@@ -231,7 +234,7 @@ jobs:
           dpkg-deb -x "dist/$deb" "$root"
           test "$(sha256sum "$root/usr/lib/vaultlink/package/vaultlink" | awk '{print $1}')" \
             = "$SOAK_BINARY_SHA256"
-      - name: Verify final performance, soak, and qualification against the extracted binary
+      - name: Verify version-scoped performance requirements, soak, and qualification
         if: needs.prepare.outputs.release_stage == 'evidence' || needs.prepare.outputs.release_stage == 'tag'
         shell: bash
         env:
@@ -247,15 +250,20 @@ jobs:
           dpkg-deb -x "dist/$deb" "$extracted"
           binary="$extracted/usr/lib/vaultlink/package/vaultlink"
           binary_sha256=$(sha256sum "$binary" | awk '{print $1}')
-          receipt="$RUNNER_TEMP/performance-receipt.json"
-          python3 tools/release-evidence.py performance --commit "$CANDIDATE_COMMIT" \
-            --binary-sha256 "$binary_sha256" --packages-run-id "$PACKAGES_RUN" --output "$receipt"
+          performance_required=$(python3 tools/release-evidence.py performance-required)
+          performance_args=()
+          if [[ "$performance_required" == true ]]; then
+            receipt="$RUNNER_TEMP/performance-receipt.json"
+            python3 tools/release-evidence.py performance --commit "$CANDIDATE_COMMIT" \
+              --binary-sha256 "$binary_sha256" --packages-run-id "$PACKAGES_RUN" --output "$receipt"
+            performance_args=(--performance-receipt "$receipt")
+          fi
           if [[ "$RELEASE_STAGE" == tag ]]; then
             sh tools/check-version-consistency.sh --release-tag "$GITHUB_REF_NAME" --binary "$binary" \
-              --packages-run-id "$PACKAGES_RUN" --performance-receipt "$receipt"
+              --packages-run-id "$PACKAGES_RUN" "${performance_args[@]}"
           else
             sh tools/check-version-consistency.sh --release-evidence --binary "$binary" \
-              --packages-run-id "$PACKAGES_RUN" --performance-receipt "$receipt"
+              --packages-run-id "$PACKAGES_RUN" "${performance_args[@]}"
           fi
       - name: Archive effective qualification without changing the candidate commit
         if: needs.prepare.outputs.release_stage == 'evidence' || needs.prepare.outputs.release_stage == 'tag'
