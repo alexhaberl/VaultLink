@@ -78,7 +78,7 @@
     },
     {
       "path": "src/route-manifest.snapshot",
-      "sha256": "f7740ec0438ef5863ef0f7383a73bae91553dd540caa14fced257567e8904017",
+      "sha256": "bfaaec40e055c3a95955e4bc885420348ff3d22389d6771358748db98c420348",
       "contract": "route, auth, MFA, CSRF, audit, body and mutation inventory"
     },
     {
@@ -101,7 +101,7 @@
         "src/i18n/messages.rs",
         "src/i18n/render.rs"
       ],
-      "sha256": "f657f77ca7e377851e1e7ca5306e040b49cc8a3c2340d154426642c6839bd2fb"
+      "sha256": "830ba417b13bb772160985beebc913ea36d922b10720e459c29c93e3fe3126f0"
     },
     {
       "name": "service domain source bundle",

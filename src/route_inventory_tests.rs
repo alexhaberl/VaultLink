@@ -70,7 +70,7 @@ fn every_registered_method_has_one_complete_contract() {
         .map(|spec| (spec.surface, spec.method, spec.path))
         .collect::<HashSet<_>>();
     assert_eq!(unique.len(), specs.len(), "duplicate route method contract");
-    assert_eq!(crate::web::WEB_ROUTE_SPECS.len(), 67);
+    assert_eq!(crate::web::WEB_ROUTE_SPECS.len(), 69);
     assert_eq!(crate::api::API_ROUTE_SPECS.len(), 45);
     assert_eq!(crate::setup::SETUP_ROUTE_SPECS.len(), 13);
 
@@ -242,6 +242,7 @@ fn route_request_fixture(spec: &RouteSpec, csrf: &str) -> RouteRequestFixture {
                 "/admin/settings/audit-ips/delete" => {
                     format!("csrf={csrf}&confirmation=IP-DATEN+L%C3%96SCHEN")
                 }
+                "/admin/settings/updates" => format!("csrf={csrf}&operation=check"),
                 "/v/{token}/unlock" => "password=invalid".to_owned(),
                 _ => format!("csrf={csrf}"),
             };

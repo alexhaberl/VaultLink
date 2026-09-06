@@ -25,7 +25,8 @@ fail() {
 case "$#:${1:-}" in
     0:) guard_mode=full ;;
     1:--package-only) guard_mode=package-only ;;
-    *) fail "usage: vaultlink-runtime-guard.sh [--package-only]" ;;
+    1:--start-update-control) guard_mode=full ;;
+    *) fail "usage: vaultlink-runtime-guard.sh [--package-only|--start-update-control]" ;;
 esac
 for required_command in awk cat cmp dpkg-query grep id pacman rpm runuser sed \
     sha256sum stat timeout tr uname wc; do
@@ -175,4 +176,33 @@ if [ "$guard_mode" = full ]; then
         || fail "active runtime version probe failed"
     [ "$live_version" = "$package_version" ] \
         || fail "active runtime version diverges from package metadata"
+fi
+
+# Reuse an existing signed package entry point: adding payload filenames would
+# make this release incompatible with the 0.6.0 updater's exact file inventory.
+# Only the root ExecStartPre guard can bootstrap this fixed transient unit.
+# A propagated PartOf restart may already have loaded the transient unit; in
+# that case, wait for that fixed unit instead of creating a second definition.
+if [ "${1:-}" = --start-update-control ] \
+    && ! systemctl --quiet is-active vaultlink-update-control.service; then
+    systemd-run --quiet --collect --unit=vaultlink-update-control \
+        --service-type=exec \
+        --property=User=root --property=Group=vaultlink \
+        --property=PartOf=vaultlink.service \
+        --property=Restart=on-failure --property=RestartSec=5s \
+        --property=UMask=0077 --property=NoNewPrivileges=yes \
+        --property=RuntimeDirectory=vaultlink-update-control \
+        --property=RuntimeDirectoryMode=0750 \
+        --property=StateDirectory=vaultlink-update-control \
+        --property=StateDirectoryMode=0700 \
+        --property=ProtectSystem=strict --property=ProtectHome=yes \
+        --property=PrivateTmp=yes --property=PrivateDevices=yes \
+        --property=ProtectKernelTunables=yes --property=ProtectKernelModules=yes \
+        --property=ProtectControlGroups=yes --property=RestrictNamespaces=yes \
+        --property=RestrictRealtime=yes --property=LockPersonality=yes \
+        --property=CapabilityBoundingSet= --property=TasksMax=64 \
+        --property=MemoryMax=128M --property=RestrictAddressFamilies=AF_UNIX \
+        "$live_binary" update-control \
+        || systemctl start vaultlink-update-control.service \
+        || fail "could not start the local update controller"
 fi

@@ -15,6 +15,7 @@ use super::{
 #[derive(Template)]
 #[template(path = "web/settings/form.html")]
 pub(super) struct SettingsFormTemplate {
+    installed_version: &'static str,
     csrf_token: String,
     message: Option<String>,
     public_base_url: String,
@@ -154,6 +155,7 @@ pub(super) fn settings_form_template(
     public_url_locked: bool,
 ) -> SettingsFormTemplate {
     SettingsFormTemplate {
+        installed_version: env!("CARGO_PKG_VERSION"),
         csrf_token: session.csrf_token.clone(),
         message: (!message.is_empty())
             .then(|| i18n::localized_text(i18n::current_locale(), message).into_owned()),

@@ -1,3 +1,155 @@
+function initUpdateSettings() {
+  const panel = document.querySelector('[data-updates]');
+  const nav = document.querySelector('[data-settings-nav]');
+  if (!panel || !nav) return;
+  const q = selector => panel.querySelector(selector);
+  const showSection = () => {
+    const id = location.hash === '#updates' ? 'updates' : 'general';
+    document.querySelectorAll('[data-settings-section]').forEach(section => { section.hidden = section.id !== id; });
+    nav.querySelectorAll('a').forEach(link => {
+      if (link.hash === '#' + id) link.setAttribute('aria-current', 'page');
+      else link.removeAttribute('aria-current');
+    });
+  };
+  window.addEventListener('hashchange', showSection);
+  showSection();
+  const labels = {
+    ready: '<vl-i18n key="updates.ready"/>', ready_help: '<vl-i18n key="updates.ready_help"/>',
+    checking: '<vl-i18n key="updates.checking"/>', checking_help: '<vl-i18n key="updates.checking_help"/>',
+    available: '<vl-i18n key="updates.available"/>', available_help: '<vl-i18n key="updates.available_help"/>',
+    current: '<vl-i18n key="updates.current"/>', current_help: '<vl-i18n key="updates.current_help"/>',
+    checked: '<vl-i18n key="updates.checked"/>',
+    installing: '<vl-i18n key="updates.installing"/>', installing_help: '<vl-i18n key="updates.installing_help"/>',
+    success: '<vl-i18n key="updates.success"/>', success_help: '<vl-i18n key="updates.success_help"/>',
+    error: '<vl-i18n key="updates.error"/>', error_help: '<vl-i18n key="updates.error_help"/>',
+    install_failed: '<vl-i18n key="updates.install_failed"/>', install_failed_help: '<vl-i18n key="updates.install_failed_help"/>',
+    automatic_on: '<vl-i18n key="updates.automatic_on"/>', automatic_off: '<vl-i18n key="updates.automatic_off"/>',
+    saving: '<vl-i18n key="updates.saving"/>', save_failed: '<vl-i18n key="updates.save_failed"/>',
+    unavailable: '<vl-i18n key="updates.unavailable"/>', unavailable_help: '<vl-i18n key="updates.unavailable_help"/>',
+    reconnecting: '<vl-i18n key="updates.reconnecting"/>', reconnecting_help: '<vl-i18n key="updates.reconnecting_help"/>',
+    check_required: '<vl-i18n key="updates.check_required"/>'
+  };
+  const check = q('[data-update-check]');
+  const install = q('[data-update-install]');
+  const automatic = q('[data-update-auto]');
+  const dialog = q('[data-update-confirm]');
+  let state = null;
+  let submitting = false;
+  let timer;
+  let generation = 0;
+  let confirmedVersion = null;
+  let stopped = false;
+  const isBusy = () => submitting || !state?.available || ['queued', 'running'].includes(state.phase);
+  const status = (heading, detail, tone) => {
+    q('[data-update-heading]').textContent = labels[heading];
+    q('[data-update-detail]').textContent = labels[detail];
+    q('[data-update-status]').dataset.tone = tone;
+  };
+  const render = () => {
+    check.disabled = isBusy();
+    automatic.disabled = isBusy();
+    install.disabled = isBusy();
+    install.hidden = isBusy() || !state.update_available;
+    if (state.installed) q('[data-update-installed]').textContent = state.installed;
+    q('[data-update-latest]').textContent = state.latest || '—';
+    if (!dialog.open) {
+      q('[data-update-from]').textContent = state.installed;
+      q('[data-update-to]').textContent = state.latest || '—';
+    }
+    automatic.checked = state.automatic;
+    q('[data-update-auto-status]').textContent = labels[state.automatic ? 'automatic_on' : 'automatic_off'];
+    if (state.checked_at) q('[data-update-checked]').textContent = labels.checked + ' ' + new Intl.DateTimeFormat(document.documentElement.lang, {dateStyle:'short',timeStyle:'short'}).format(new Date(state.checked_at * 1000));
+    const operation = state.operation?.operation;
+    if (!state.available) status('unavailable', 'unavailable_help', 'neutral');
+    else if (['queued', 'running'].includes(state.phase)) {
+      if (operation === 'automatic') {
+        status('saving', 'installing_help', 'active');
+        q('[data-update-auto-status]').textContent = labels.saving;
+      } else status(operation === 'install' ? 'installing' : 'checking', operation === 'install' ? 'installing_help' : 'checking_help', 'active');
+    } else if (state.error) {
+      install.hidden = true;
+      if (state.error === 'check_required') status('error', 'check_required', 'error');
+      else if (operation === 'automatic') status('error', 'save_failed', 'error');
+      else status(operation === 'install' ? 'install_failed' : 'error', operation === 'install' ? 'install_failed_help' : 'error_help', 'error');
+    } else if (operation === 'install' && state.phase === 'complete') status('success', 'success_help', 'success');
+    else if (state.update_available) status('available', 'available_help', 'active');
+    else if (state.checked_at) status('current', 'current_help', 'success');
+    else status('ready', 'ready_help', 'neutral');
+  };
+  const request = async options => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch('/admin/settings/updates', {credentials:'same-origin',cache:'no-store',signal:controller.signal,...options});
+      if (response.redirected || response.status === 401 || response.status === 403) {
+        stopped = true;
+        location.assign('/login');
+        throw new Error('session unavailable');
+      }
+      if (!response.ok) throw new Error('update request failed');
+      return await response.json();
+    } finally { clearTimeout(timeout); }
+  };
+  const connectionLost = () => {
+    check.disabled = true;
+    install.hidden = true;
+    automatic.disabled = true;
+    status('reconnecting', 'reconnecting_help', 'neutral');
+  };
+  const schedule = delay => {
+    clearTimeout(timer);
+    if (!stopped) timer = setTimeout(poll, delay);
+  };
+  const poll = async () => {
+    if (submitting || stopped) return;
+    const current = generation;
+    try {
+      const result = await request({});
+      if (current !== generation) return;
+      state = result;
+      render();
+    } catch { if (current === generation) connectionLost(); }
+    finally { if (current === generation) schedule(state && !isBusy() ? 15000 : 2000); }
+  };
+  const submit = async values => {
+    if (isBusy()) return;
+    submitting = true;
+    generation++;
+    clearTimeout(timer);
+    check.disabled = true;
+    install.hidden = true;
+    automatic.disabled = true;
+    status(values.operation === 'install' ? 'installing' : values.operation === 'check' ? 'checking' : 'saving', 'installing_help', 'active');
+    try {
+      state = await request({method:'POST',body:new URLSearchParams({csrf:panel.dataset.csrf,...values})});
+      submitting = false;
+      render();
+    } catch {
+      submitting = false;
+      connectionLost();
+    } finally { schedule(1000); }
+  };
+  check.addEventListener('click', () => submit({operation:'check'}));
+  install.addEventListener('click', () => {
+    if (isBusy() || !state.update_available) return;
+    confirmedVersion = state.latest;
+    q('[data-update-from]').textContent = state.installed;
+    q('[data-update-to]').textContent = confirmedVersion;
+    dialog.returnValue = '';
+    dialog.showModal();
+  });
+  dialog.addEventListener('close', () => {
+    if (dialog.returnValue === 'install' && confirmedVersion) submit({operation:'install',version:confirmedVersion});
+    confirmedVersion = null;
+  });
+  automatic.addEventListener('change', () => submit({operation:'automatic',enabled:String(automatic.checked)}));
+  window.addEventListener('pagehide', () => { stopped = true; generation++; clearTimeout(timer); });
+  window.addEventListener('pageshow', event => { if (event.persisted) { stopped = false; poll(); } });
+  poll();
+}
+document.addEventListener('DOMContentLoaded', initUpdateSettings);
+
+
 function closeActionDetails(except){document.querySelectorAll('.vl-action-details[open]').forEach(details=>{if(details!==except)details.removeAttribute('open');});}
 document.addEventListener('click',async e=>{const closer=e.target.closest('[data-details-close]');if(closer){closer.closest('details')?.removeAttribute('open');return;}const action=e.target.closest('.vl-action-details');const summary=e.target.closest('.vl-action-details > summary');closeActionDetails(summary?.parentElement||action);const b=e.target.closest('[data-copy]');if(!b)return;try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='<vl-i18n key="common.copied"/>';}catch(_){b.textContent='<vl-i18n key="common.copy_failed"/>';}});
 document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;const open=[...document.querySelectorAll('.vl-action-details[open]')];if(open.length===0)return;e.preventDefault();const summary=open.at(-1).querySelector(':scope > summary');closeActionDetails();summary?.focus();});

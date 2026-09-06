@@ -298,6 +298,9 @@ for attempt in $(seq 1 120); do
 done
 grep -F -q '"ok":true' "$evidence/readiness.json"
 
+runtime_stage=gui-update-controller
+python3 /tmp/gui-update-control-smoke.py >"$evidence/gui-update-control.env" 2>&1
+
 runtime_stage=authenticated-load
 cookie="$evidence/cookies.txt"
 password='VaultLink api smoke password 123!'

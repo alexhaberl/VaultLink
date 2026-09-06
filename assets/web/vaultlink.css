@@ -1,6 +1,46 @@
 
 @layer vl-reset, vl-tokens, vl-base, vl-components, vl-layouts, vl-utilities;
 
+@layer vl-components {
+  .vl-settings-nav { display: flex; gap: 1.5rem; margin-bottom: 1.5rem; border-bottom: 1px solid var(--vl-border); }
+  .vl-settings-nav a { padding: .75rem .25rem; color: var(--vl-text-muted); text-decoration: none; border-bottom: 2px solid transparent; }
+  .vl-settings-nav a[aria-current="page"] { color: var(--vl-text); border-color: var(--vl-accent); }
+  .vl-update-panel { margin-bottom: 1.5rem; }
+  .vl-update-panel h2 { margin-bottom: .5rem; }
+  .vl-update-badge { display: inline-flex; flex-shrink: 0; padding: .4rem .75rem; border: 1px solid var(--vl-border); border-radius: var(--vl-radius-pill); color: var(--vl-text-soft); font-size: var(--vl-text-xs); }
+  .vl-update-version-grid { display: grid; grid-template-columns: 1fr 1fr; margin: 1.75rem 0; padding: 1.5rem; border: 1px solid var(--vl-border); border-radius: var(--vl-radius-md); background: var(--vl-control); }
+  .vl-update-version-grid > div { display: grid; gap: .5rem; }
+  .vl-update-version-grid > div + div { padding-left: 1.5rem; border-left: 1px solid var(--vl-border); }
+  .vl-update-label { color: var(--vl-text-muted); font-size: var(--vl-text-sm); font-weight: 600; }
+  .vl-update-version { font-size: 2rem; font-variant-numeric: tabular-nums; line-height: 1.2; }
+  .vl-update-version-grid .vl-muted { font-size: var(--vl-text-sm); }
+  .vl-update-status { display: flex; align-items: baseline; gap: .75rem; padding: 1rem; border-radius: var(--vl-radius-md); background: rgba(90,167,255,.06); }
+  .vl-update-status p { margin: .35rem 0 0; color: var(--vl-text-muted); }
+  .vl-update-dot { width: .6rem; height: .6rem; flex-shrink: 0; border-radius: 50%; background: var(--vl-text-muted); }
+  .vl-update-status[data-tone="success"] { background: rgba(85,214,154,.07); }
+  .vl-update-status[data-tone="success"] .vl-update-dot { background: var(--vl-success); }
+  .vl-update-status[data-tone="active"] .vl-update-dot { background: var(--vl-accent); }
+  .vl-update-status[data-tone="error"] { background: rgba(255,123,134,.08); }
+  .vl-update-status[data-tone="error"] .vl-update-dot { background: var(--vl-danger); }
+  .vl-update-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 1.5rem; }
+  .vl-update-actions > a { font-size: var(--vl-text-sm); }
+  .vl-update-trust { border-top: 1px solid var(--vl-border); padding-top: 1.25rem; margin-top: 1.5rem; margin-bottom: 0; font-size: var(--vl-text-sm); }
+  .vl-update-auto { margin-top: 1.25rem; }
+  .vl-update-auto:has(input:disabled) { opacity: .6; cursor: default; }
+  .vl-update-auto + p { font-size: var(--vl-text-sm); margin-bottom: 0; }
+  .vl-update-dialog { width: min(34rem, calc(100% - 2rem)); max-height: calc(100% - 2rem); overflow: auto; padding: 2rem; color: var(--vl-text); background: var(--vl-surface); border: 1px solid var(--vl-border-strong); border-radius: var(--vl-radius-xl); box-shadow: var(--vl-shadow-overlay); }
+  .vl-update-dialog::backdrop { background: rgba(3,7,16,.75); }
+  .vl-update-dialog h2 { margin: .75rem 0; }
+  .vl-update-dialog .vl-form-actions { justify-content: flex-end; margin-top: 1.5rem; }
+  .vl-update-confirm-versions { display: flex; gap: 1rem; align-items: center; font-size: 1.5rem; }
+  @media (max-width: 40rem) {
+    .vl-update-version-grid { padding: 1rem; gap: 1rem; }
+    .vl-update-version-grid > div + div { padding-left: 1rem; }
+    .vl-update-version { font-size: 1.5rem; }
+    .vl-update-dialog { padding: 1.25rem; }
+  }
+}
+
 @layer vl-tokens {
   :root {
     color-scheme: dark;
@@ -340,6 +380,10 @@
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 15.625rem), 1fr));
     gap: var(--vl-space-4);
     align-items: end;
+  }
+
+  form[action="/admin/service-tokens"] > .vl-form-grid {
+    align-items: start;
   }
 
   .vl-field,

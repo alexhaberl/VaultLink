@@ -12,6 +12,35 @@ fn mfa_session_proof_debug_never_exposes_token_material() {
 }
 
 #[test]
+fn software_update_authorization_requires_live_mfa_and_durable_audit() {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let proof = verified_mfa_proof(&database, "update-session", 1);
+    let context = AuditContext::new("admin", None);
+    let outcome = database
+        .authorize_software_update(&proof, &context, "operation=check".into())
+        .unwrap();
+    assert!(matches!(
+        release_session_audited(outcome),
+        SessionBound::Authorized(())
+    ));
+    database.conn().execute_batch("CREATE TRIGGER reject_update_audit BEFORE INSERT ON audit BEGIN SELECT RAISE(FAIL, 'audit unavailable'); END;").unwrap();
+    let error = database
+        .authorize_software_update(&proof, &context, "operation=install".into())
+        .unwrap_err();
+    assert!(is_audit_unavailable(&error));
+    database
+        .conn()
+        .execute_batch("DROP TRIGGER reject_update_audit;")
+        .unwrap();
+    database.delete_session("update-session").unwrap();
+    let outcome = database
+        .authorize_software_update(&proof, &context, "operation=automatic".into())
+        .unwrap();
+    assert!(matches!(outcome, SessionBound::SessionUnavailable));
+}
+
+#[test]
 fn audited_proof_debug_never_exposes_the_committed_value() {
     let database = Database::open(":memory:").unwrap();
     let audited = database

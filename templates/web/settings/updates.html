@@ -1,0 +1,46 @@
+<section id="updates" data-settings-section data-updates data-csrf="{{ csrf_token }}" data-installed-version="{{ installed_version }}" aria-labelledby="updates-title">
+  <div class="vl-panel vl-update-panel">
+    <div class="vl-panel-head">
+      <div><h2 id="updates-title"><vl-i18n key="updates.software"/></h2><p class="vl-muted"><vl-i18n key="updates.intro"/></p></div>
+      <span class="vl-update-badge">GitHub Releases · Stable</span>
+    </div>
+    <div class="vl-update-version-grid">
+      <div><span class="vl-update-label"><vl-i18n key="updates.installed"/></span><strong class="vl-update-version" data-update-installed>{{ installed_version }}</strong><span class="vl-muted"><vl-i18n key="updates.current_installation"/></span></div>
+      <div><span class="vl-update-label"><vl-i18n key="updates.latest"/></span><strong class="vl-update-version" data-update-latest>—</strong><span class="vl-muted" data-update-checked><vl-i18n key="updates.never_checked"/></span></div>
+    </div>
+    <div class="vl-update-status" data-update-status data-tone="neutral" role="status" aria-live="polite" aria-atomic="true">
+      <span class="vl-update-dot" aria-hidden="true"></span>
+      <div><strong data-update-heading><vl-i18n key="updates.unavailable"/></strong><p data-update-detail><vl-i18n key="updates.unavailable_help"/></p></div>
+    </div>
+    <div class="vl-update-actions">
+      <div class="vl-button-group">
+        <button type="button" class="vl-button vl-button--secondary" data-update-check disabled><vl-i18n key="updates.check"/></button>
+        <button type="button" class="vl-button" data-update-install hidden><vl-i18n key="updates.install"/></button>
+      </div>
+      <a href="https://github.com/alexhaberl/VaultLink/releases" target="_blank" rel="noopener noreferrer"><vl-i18n key="updates.release_notes"/> ↗</a>
+    </div>
+    <p class="vl-update-trust vl-muted"><vl-i18n key="updates.trust"/></p>
+  </div>
+  <div class="vl-panel vl-update-panel">
+    <h2><vl-i18n key="updates.automatic_title"/></h2>
+    <p class="vl-muted"><vl-i18n key="updates.automatic_help"/></p>
+    <label class="vl-toggle vl-update-auto">
+      <input type="checkbox" data-update-auto disabled>
+      <span><strong><vl-i18n key="updates.automatic_label"/></strong><small><vl-i18n key="updates.automatic_detail"/></small></span>
+    </label>
+    <p class="vl-muted" data-update-auto-status role="status"><vl-i18n key="updates.automatic_off"/></p>
+  </div>
+  <dialog class="vl-update-dialog" data-update-confirm aria-labelledby="update-confirm-title" aria-describedby="update-confirm-description">
+    <form method="dialog">
+      <span class="vl-update-label"><vl-i18n key="updates.confirm_eyebrow"/></span>
+      <h2 id="update-confirm-title"><vl-i18n key="updates.confirm_title"/></h2>
+      <p class="vl-update-confirm-versions"><span data-update-from>{{ installed_version }}</span><span aria-hidden="true"> → </span><strong data-update-to>—</strong></p>
+      <p id="update-confirm-description"><vl-i18n key="updates.confirm_help"/></p>
+      <p class="vl-alert"><vl-i18n key="updates.confirm_restart"/></p>
+      <div class="vl-form-actions">
+        <button class="vl-button vl-button--secondary" value="cancel" autofocus><vl-i18n key="updates.cancel"/></button>
+        <button class="vl-button" value="install"><vl-i18n key="updates.confirm_install"/></button>
+      </div>
+    </form>
+  </dialog>
+</section>

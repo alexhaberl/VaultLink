@@ -50,6 +50,7 @@ mod template_policy_tests;
 mod test_support;
 pub mod tls_files;
 pub mod ui;
+pub mod updates;
 pub mod web;
 pub mod webauthn;
 

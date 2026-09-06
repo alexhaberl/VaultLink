@@ -2,6 +2,9 @@
 
 ## 0.7.0 — 2026-09-10
 
+- Add Settings → Updates for signed GitHub-release checks, confirmed native-package installation, durable restart status, and automatic-update preferences. Require live MFA, CSRF and committed audit records before dispatching privileged requests through a restricted local controller.
+- Align the service-token name and expiration fields at their upper edge when help text wraps.
+
 - Defer the comparative performance baseline to the next release after 0.7.0. Keep package identity, candidate gates, and the complete 72-hour soak mandatory; record the accepted deferral without claiming measured baseline qualification.
 - Fix CIFS startup rejecting signed, encrypted Linux mounts: validate the kernel's signed `sec=` authentication mode and generate an explicit `sec=ntlmsspi` mount option. This also affects 0.6.0; local ext4 storage is unaffected by this defect.
 - Check every tracked Rust file with the pinned formatter, including embedded fragments; remove the disabled public-page reference copy.

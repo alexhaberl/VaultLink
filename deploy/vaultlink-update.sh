@@ -2069,6 +2069,10 @@ validate_open_lock 9 "$update_lock" \
 
 latest_tag=$(fetch_latest_tag) || fail "the latest stable GitHub release could not be resolved safely"
 latest_version=${latest_tag#v}
+if [ -n "${VAULTLINK_EXPECTED_VERSION:-}" ]; then
+    [ "$action" = install ] && [ "$latest_version" = "$VAULTLINK_EXPECTED_VERSION" ] \
+        || fail "the latest release changed after confirmation; check for updates again"
+fi
 version_order=$(compare_semver "$latest_version" "$installed_version") \
     || fail "installed or release version is not valid SemVer"
 printf 'installed_version=%s\n' "$installed_version"
