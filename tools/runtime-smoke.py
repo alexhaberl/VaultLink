@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import sqlite3
@@ -23,6 +24,21 @@ def unused_port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return listener.getsockname()[1]
+
+
+def mount_identity(path: Path) -> tuple[str, str]:
+    mount_id = subprocess.check_output(
+        ["findmnt", "--target", str(path), "--noheadings", "--output", "ID"],
+        text=True, timeout=5,
+    ).strip()
+    # findmnt can resolve /dev/root to /dev/sda1 on native runners. Production
+    # validates the literal kernel source, so select by ID and retain that name.
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields = line.split()
+        if fields[0] == mount_id:
+            filesystem, source = fields[fields.index("-") + 1:][:2]
+            return filesystem, re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), source)
+    raise RuntimeError(f"mount {mount_id} disappeared while preparing the TLS fixture")
 
 
 def rejects(config: Path, label: str) -> None:
@@ -105,9 +121,7 @@ def main() -> None:
             tls_data.mkdir(mode=0o700)
             for child in ["uploads", "tombstones"]:
                 (internal / child).mkdir(mode=0o700)
-            identity = subprocess.check_output(["findmnt", "--target", str(shared), "--noheadings",
-                                               "--output", "FSTYPE,SOURCE", "--nofsroot"], text=True, timeout=5)
-            filesystem, source = identity.strip().split(maxsplit=1)
+            filesystem, source = mount_identity(shared)
             tls = tls.replace(json.dumps(str(mount)), json.dumps(str(shared)))
             tls = tls.replace(json.dumps(str(mount / ".vaultlink-internal")), json.dumps(str(internal)))
             tls = tls.replace(json.dumps(str(work / "data")), json.dumps(str(tls_data)))
