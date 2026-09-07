@@ -8,6 +8,7 @@ restarts. Native package signature/transaction tests run in the package gate.
 
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import pwd
 import socket
@@ -67,6 +68,37 @@ def wait_ready():
     raise AssertionError("controller did not become ready")
 
 
+@contextmanager
+def delayed_job_start():
+    # This disposable VM deliberately exceeds the controller's five-second
+    # launch deadline. PID 1 must still finish the already submitted job.
+    directory = Path("/run/systemd/system/vaultlink-gui-update.service.d")
+    directory.mkdir(mode=0o700)
+    dropin = directory / "start-delay.conf"
+    try:
+        dropin.write_text("[Service]\nExecStartPre=/usr/bin/sleep 7\n")
+        command("systemctl", "daemon-reload")
+        yield
+    finally:
+        dropin.unlink(missing_ok=True)
+        directory.rmdir()
+        command("systemctl", "daemon-reload")
+
+
+def submit_and_wait(submission):
+    accepted = request(submission)
+    assert accepted["request_id"] == submission["request_id"]
+    assert accepted["phase"] in ("queued", "running", "complete"), accepted
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        result = status()
+        if result["phase"] not in ("queued", "running"):
+            break
+        time.sleep(1)
+    assert result["phase"] == "complete", result
+    assert result["error"] is None and not result["automatic"]
+
+
 def main():
     assert os.geteuid() == 0
     assert command("systemd-detect-virt", "--vm") == "qemu"
@@ -97,17 +129,10 @@ def main():
     assert status()["request_id"] == initial["request_id"]
     submission = {"command": "submit", "request_id": "vm-disable-automatic",
                   "action": {"operation": "automatic", "enabled": False}}
-    accepted = request(submission)
-    assert accepted["request_id"] == submission["request_id"]
-    assert accepted["phase"] in ("queued", "running", "complete")
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        result = status()
-        if result["phase"] not in ("queued", "running"):
-            break
-        time.sleep(1)
-    assert result["phase"] == "complete", result
-    assert result["error"] is None and not result["automatic"]
+    submit_and_wait(submission)
+    submission["request_id"] = "vm-delayed-automatic"
+    with delayed_job_start():
+        submit_and_wait(submission)
     assert Path("/etc/vaultlink/update.conf").read_text() == "auto_install=false\n"
     assert stat.S_IMODE(STATE.stat().st_mode) == 0o600
     assert STATE.stat().st_uid == 0
@@ -124,6 +149,7 @@ def main():
     print("gui_update_control=passed")
     print("peer_identity=checked\nstrict_protocol=checked\ndurable_result=checked")
     print("duplicate_submission=checked\ncontroller_restart=checked\nservice_restart=checked")
+    print("delayed_job_start=checked")
 
 
 if __name__ == "__main__":
