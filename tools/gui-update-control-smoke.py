@@ -99,6 +99,15 @@ def submit_and_wait(submission):
     assert result["error"] is None and not result["automatic"]
 
 
+def assert_peer_rejected(stream):
+    try:
+        stream.sendall(b'{"command":"status"}\n')
+        assert stream.recv(1) == b"", "root is not the authorized IPC client"
+    except (ConnectionResetError, BrokenPipeError):
+        # The controller can reject the peer before the client writes or reads.
+        pass
+
+
 def main():
     assert os.geteuid() == 0
     assert command("systemd-detect-virt", "--vm") == "qemu"
@@ -115,11 +124,7 @@ def main():
     with socket.socket(socket.AF_UNIX) as stream:
         stream.settimeout(5)
         stream.connect(SOCKET)
-        try:
-            stream.sendall(b'{"command":"status"}\n')
-            assert stream.recv(1) == b"", "root is not the authorized IPC client"
-        except ConnectionResetError:
-            pass
+        assert_peer_rejected(stream)
     assert not request({"command": "status", "path": "/etc/shadow"})["available"]
     assert not request({"command": "submit", "request_id": "vm-invalid-operation",
                         "action": {"operation": "check", "url": "https://invalid.test"}})["available"]
