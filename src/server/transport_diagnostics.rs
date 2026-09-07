@@ -47,6 +47,16 @@ pub(crate) struct TransportDiagnostics {
     last_write_ms: Option<u128>,
     failure: Option<&'static str>,
     io_error: Option<&'static str>,
+    write_operation: Option<&'static str>,
+    write_poll_result: Option<&'static str>,
+    write_requested_bytes: usize,
+    last_write_poll_ms: Option<u128>,
+    write_poll_gap_ms: Option<u128>,
+    write_pending_polls: u64,
+    write_deadline_late_ms: Option<u128>,
+    write_deadline_recoveries: u64,
+    last_write_recovery_late_ms: Option<u128>,
+    last_write_recovery_gap_ms: Option<u128>,
 }
 
 impl TransportDiagnostics {
@@ -62,6 +72,16 @@ impl TransportDiagnostics {
             last_write_ms: None,
             failure: None,
             io_error: None,
+            write_operation: None,
+            write_poll_result: None,
+            write_requested_bytes: 0,
+            last_write_poll_ms: None,
+            write_poll_gap_ms: None,
+            write_pending_polls: 0,
+            write_deadline_late_ms: None,
+            write_deadline_recoveries: 0,
+            last_write_recovery_late_ms: None,
+            last_write_recovery_gap_ms: None,
         }
     }
 
@@ -96,11 +116,47 @@ impl TransportDiagnostics {
         }
     }
 
+    pub(crate) fn write_poll(
+        &mut self,
+        operation: &'static str,
+        result: &'static str,
+        requested: usize,
+        deadline: Option<Instant>,
+    ) {
+        // Preserve the I/O observation associated with the first failure;
+        // subsequent cleanup polls must not overwrite its evidence.
+        if self.failure.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.started).as_millis();
+        self.write_poll_gap_ms = self.last_write_poll_ms.map(|last| elapsed - last);
+        self.last_write_poll_ms = Some(elapsed);
+        self.write_operation = Some(operation);
+        self.write_poll_result = Some(result);
+        self.write_requested_bytes = requested;
+        self.write_deadline_late_ms = deadline
+            .filter(|deadline| now >= *deadline)
+            .map(|deadline| now.duration_since(deadline).as_millis());
+        if result == "pending" {
+            self.write_pending_polls = self.write_pending_polls.saturating_add(1);
+        }
+        if self.write_deadline_late_ms.is_some() && matches!(result, "progress" | "complete") {
+            self.write_deadline_recoveries = self.write_deadline_recoveries.saturating_add(1);
+            self.last_write_recovery_late_ms = self.write_deadline_late_ms;
+            self.last_write_recovery_gap_ms = self.write_poll_gap_ms;
+        }
+    }
+
     fn reason(&self) -> Option<&'static str> {
         self.failure.or_else(|| {
             // Hyper may close an incomplete request without exposing its error.
             // Byte counts do not prove that a header timeout occurred.
-            (self.bytes_written == 0).then_some("closed_without_response")
+            if self.bytes_written == 0 {
+                Some("closed_without_response")
+            } else {
+                (self.write_deadline_recoveries > 0).then_some("write_idle_recovered")
+            }
         })
     }
 }
@@ -108,6 +164,9 @@ impl TransportDiagnostics {
 impl Drop for TransportDiagnostics {
     fn drop(&mut self) {
         let Some(reason) = self.reason() else { return };
+        if !tracing::enabled!(target: "vaultlink::transport", tracing::Level::WARN) {
+            return;
+        }
         let suppressed = BUDGET
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -125,8 +184,18 @@ impl Drop for TransportDiagnostics {
                 first_read_ms = ?self.first_read_ms,
                 last_write_ms = ?self.last_write_ms,
                 io_error = self.io_error,
+                write_operation = self.write_operation,
+                write_poll_result = self.write_poll_result,
+                write_requested_bytes = self.write_requested_bytes,
+                last_write_poll_ms = ?self.last_write_poll_ms,
+                write_poll_gap_ms = ?self.write_poll_gap_ms,
+                write_pending_polls = self.write_pending_polls,
+                write_deadline_late_ms = ?self.write_deadline_late_ms,
+                write_deadline_recoveries = self.write_deadline_recoveries,
+                last_write_recovery_late_ms = ?self.last_write_recovery_late_ms,
+                last_write_recovery_gap_ms = ?self.last_write_recovery_gap_ms,
                 suppressed_since_last_event = suppressed,
-                "HTTP connection ended without a response or with a transport error"
+                "HTTP connection transport summary"
             );
         }
     }

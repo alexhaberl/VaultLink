@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CHUNK: usize = 64 * 1024;
 
-fn connection(
+pub(super) fn connection(
     lifetime: Duration,
 ) -> (
     tokio::io::DuplexStream,
@@ -130,5 +130,54 @@ async fn stalled_writes_expire_after_last_progress() {
         assert!(error.to_string().contains("write made no progress"));
         assert!(chunk.iter().all(|byte| *byte == b'x'));
         assert_eq!(start.elapsed(), Duration::from_secs(50));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ready_writes_survive_delayed_repoll_without_extending_lifetime() {
+    for vectored in [false, true] {
+        for lifetime_expired in [false, true] {
+            let lifetime = Duration::from_secs(if lifetime_expired { 30 } else { 3600 });
+            let (mut client, mut limited) = connection(lifetime);
+            limited.write_all(&vec![b'x'; CHUNK]).await.unwrap();
+            let mut pending = Box::pin(write_payload(&mut limited, b"y", vectored));
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            drop(pending);
+            tokio::time::advance(Duration::from_secs(20)).await;
+            client.read_exact(&mut vec![0; CHUNK]).await.unwrap();
+            // The transport becomes writable before the idle deadline, but
+            // the connection task does not get polled again until later.
+            tokio::time::advance(Duration::from_secs(11)).await;
+            let result = write_payload(&mut limited, b"y", vectored).await;
+            if lifetime_expired {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert!(error
+                    .to_string()
+                    .contains("absolute HTTP connection lifetime"));
+            } else {
+                result.expect("restored writability must beat the idle timer");
+                let mut byte = [0];
+                client.read_exact(&mut byte).await.unwrap();
+                assert_eq!(&byte, b"y");
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ready_flush_and_shutdown_survive_elapsed_partial_write_timer() {
+    for shutdown in [false, true] {
+        let (mut client, mut limited) = connection(Duration::from_secs(3600));
+        assert_eq!(limited.write(&vec![b'x'; 2 * CHUNK]).await.unwrap(), CHUNK);
+        client.read_exact(&mut vec![0; CHUNK]).await.unwrap();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        if shutdown {
+            limited.shutdown().await.unwrap();
+            assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+        } else {
+            limited.flush().await.unwrap();
+        }
+        assert!(limited.write_timeout.is_none());
     }
 }

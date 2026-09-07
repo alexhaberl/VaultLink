@@ -234,12 +234,38 @@ library does not expose every close reason. No request bytes or peer addresses
 are retained. Warnings are capped at 60 per 60-second window per process; the
 next emitted warning reports how many events were suppressed.
 
+Write-idle timeouts are checked after an attempted I/O operation still returns
+`Pending`; restored progress wins over an elapsed idle timer. The absolute
+connection lifetime is checked first and remains strict. Transport summaries
+also report:
+
+| Fields | Meaning |
+| --- | --- |
+| `write_operation`, `write_poll_result` | Last attempted `write`, `write_vectored`, `flush` or `shutdown`; result is `pending`, `progress`, `complete`, `zero` or `error`. |
+| `write_requested_bytes` | Bytes offered to that write; zero for flush/shutdown. |
+| `last_write_poll_ms`, `write_poll_gap_ms` | Time since connection admission and interval between the last two recorded I/O polls, in milliseconds. |
+| `write_pending_polls` | Number of recorded Pending outcomes on the connection, up to its first failure. |
+| `write_deadline_late_ms` | Milliseconds past the active idle deadline at the last recorded poll; absent if no deadline had elapsed. |
+| `write_deadline_recoveries` | Operations that made progress or completed despite an already elapsed idle deadline. |
+| `last_write_recovery_late_ms`, `last_write_recovery_gap_ms` | Timing of the last such recovery, retained across later successful polls. |
+
+The first failure freezes these I/O fields so cleanup cannot replace its
+observation. A connection that recovers and then closes normally emits a bounded
+`write_idle_recovered` summary; this indicates recovery, not a failed request.
+The same process-wide warning budget applies, with no per-poll log output.
+`Pending` describes the underlying AsyncWrite result, including TLS or runtime
+readiness handling; it does not prove the remote receiver stopped reading.
+Poll gaps are not measurements of scheduler latency or continuous TCP blockage.
+Older timeout logs without these fields cannot distinguish continued Pending
+from restored writability that was never rechecked.
+
 VM failures retain a separate `transport-failure.journal` so ordinary audit
 entries cannot displace those warnings, plus CPU/I/O/memory pressure, load and
 TCP-state counts in `runtime-failure-pressure.txt`. These system snapshots are
 taken after failure and may miss a transient peak. The workflow prints a bounded
 summary directly in the job log; the complete diagnostic files remain in its
-artifact. Timeouts, connection limits, workload and success criteria are unchanged.
+artifact. Timeout durations, connection limits, workload and success criteria
+are unchanged.
 
 ## Release assembly
 
