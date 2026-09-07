@@ -140,6 +140,11 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_write(cx, buffer);
+        // Partial writes are progress too: measure idle time since the last
+        // successful write, not since the first buffer that could not fit.
+        if matches!(&result, Poll::Ready(Ok(written)) if *written > 0) {
+            this.write_timeout = None;
+        }
         let incomplete = match &result {
             Poll::Pending => true,
             Poll::Ready(Ok(written)) => *written < buffer.len(),
@@ -183,6 +188,9 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_write_vectored(cx, buffers);
+        if matches!(&result, Poll::Ready(Ok(written)) if *written > 0) {
+            this.write_timeout = None;
+        }
         let requested = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
         let incomplete = match &result {
             Poll::Pending => true,
