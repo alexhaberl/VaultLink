@@ -166,7 +166,11 @@ fn transfer_access_state(
         .query_row(
             "SELECT id,counted FROM public_transfer_grants
              WHERE session_token_hash=?1 AND share_id=?2
-               AND resource_key=?3 AND action=?4 AND expires_at>?5",
+               AND resource_key=?3 AND action=?4 AND expires_at>?5
+               AND (counted=1 OR EXISTS(
+                   SELECT 1 FROM public_transfer_leases leases
+                   WHERE leases.grant_id=public_transfer_grants.id AND leases.expires_at>?5
+               ))",
             params![session_token_hash, share_id, resource_key, action, now],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
         )

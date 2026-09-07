@@ -94,10 +94,11 @@ impl Database {
     ) -> rusqlite::Result<TransferAvailabilityOutcome> {
         let (now, _) = transfer_deadlines();
         let session_token_hash = token_hash(session_token);
-        let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        cleanup_transfer_state(&transaction, &now)?;
+        // A preflight must not compete with lease creation/heartbeats for the
+        // writer. One read snapshot keeps share limits and grants consistent;
+        // begin_transfer_lease still reserves quota in an immediate transaction.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let outcome = match transfer_access_state(
             &transaction,
             &session_token_hash,
