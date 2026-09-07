@@ -16,8 +16,11 @@ case "$VERSION" in
 esac
 
 cd /work
+# The minimal image needs a local signing key before keyring upgrade hooks run.
+pacman-key --init
+pacman-key --populate archlinux
 pacman -Syu --noconfirm --needed \
-    ca-certificates coreutils curl libarchive minisign sqlite systemd \
+    ca-certificates coreutils curl diffutils libarchive minisign sqlite systemd \
     tar util-linux zstd
 minisign -V -q -p release/minisign.pub \
     -m arch-release/SHA256SUMS \
