@@ -111,6 +111,10 @@ finalize_runtime_evidence() {
                 >"$evidence/runtime-failure-systemd.env" 2>&1 || true
             journalctl -u vaultlink.service --no-pager -n 500 \
                 >"$evidence/runtime-failure.journal" 2>&1 || true
+            systemctl show vaultlink-update-control.service vaultlink-gui-update.service \
+                --no-pager >"$evidence/update-control-failure-systemd.env" 2>&1 || true
+            journalctl -u vaultlink-update-control.service -u vaultlink-gui-update.service \
+                --no-pager -n 500 >"$evidence/update-control-failure.journal" 2>&1 || true
         fi
         printf 'stage=%s\nexit_status=%s\n' "$runtime_stage" "$runtime_status" \
             >"$evidence/runtime-command.env" 2>/dev/null || true

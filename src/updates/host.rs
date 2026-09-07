@@ -90,8 +90,20 @@ fn save(state: &Status) -> io::Result<()> {
 }
 
 async fn output(program: &str, args: &[&str]) -> io::Result<String> {
+    output_with_timeout(program, args, Duration::from_secs(5)).await
+}
+
+async fn job_output(program: &str, args: &[&str]) -> io::Result<String> {
+    output_with_timeout(program, args, Duration::from_secs(60)).await
+}
+
+async fn output_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> io::Result<String> {
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        timeout,
         Command::new(program)
             .args(args)
             .env_clear()
@@ -103,13 +115,25 @@ async fn output(program: &str, args: &[&str]) -> io::Result<String> {
             .output(),
     )
     .await
-    .map_err(|_| failure("host command timed out"))??;
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "host command timed out"))??;
     if !result.status.success() || result.stdout.len() > MAX_MESSAGE {
         return Err(failure("host command failed"));
     }
     String::from_utf8(result.stdout)
         .map(|s| s.trim().to_owned())
         .map_err(|_| failure("invalid host output"))
+}
+
+fn reconcile_job_state(state: &mut Status, active: &io::Result<String>) -> bool {
+    // An unavailable or slow systemd query is not evidence that the job exited.
+    // Keep admission closed until a later query confirms its terminal state.
+    if state.busy() && matches!(active.as_deref(), Ok("inactive" | "failed")) {
+        state.phase = "failed".into();
+        state.error = Some("interrupted".into());
+        true
+    } else {
+        false
+    }
 }
 
 async fn installed_version() -> io::Result<String> {
@@ -183,14 +207,8 @@ async fn status() -> io::Result<Status> {
             "/usr/bin/systemctl",
             &["show", "--property=ActiveState", "--value", JOB],
         )
-        .await
-        .unwrap_or_default();
-        if !matches!(
-            active.as_str(),
-            "active" | "activating" | "reloading" | "deactivating"
-        ) {
-            state.phase = "failed".into();
-            state.error = Some("interrupted".into());
+        .await;
+        if reconcile_job_state(&mut state, &active) {
             save(&state)?;
         }
     }
@@ -263,7 +281,9 @@ async fn submit(request_id: String, action: Operation) -> io::Result<Status> {
         "--property=AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETGID CAP_SETUID",
         "/opt/vaultlink/vaultlink", "update-job",
     ]).await;
-    if result.is_err() {
+    // A timed-out systemd-run may already have submitted the unit to PID 1.
+    // Let status reconciliation observe it instead of admitting another job.
+    if result.is_err_and(|error| error.kind() != io::ErrorKind::TimedOut) {
         state.phase = "failed".into();
         state.error = Some("start_failed".into());
         save(&state)?;
@@ -428,18 +448,36 @@ async fn set_automatic(enabled: bool) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    let was_enabled = output(
+    let timer_enabled = job_output(
         "/usr/bin/systemctl",
-        &["is-enabled", "vaultlink-update.timer"],
+        &[
+            "show",
+            "--property=UnitFileState",
+            "--value",
+            "vaultlink-update.timer",
+        ],
     )
-    .await
-    .is_ok();
-    let was_active = output(
+    .await?;
+    let was_enabled = match timer_enabled.as_str() {
+        "enabled" | "enabled-runtime" => true,
+        "disabled" => false,
+        _ => return Err(failure("unsupported timer enablement state")),
+    };
+    let timer_active = job_output(
         "/usr/bin/systemctl",
-        &["is-active", "vaultlink-update.timer"],
+        &[
+            "show",
+            "--property=ActiveState",
+            "--value",
+            "vaultlink-update.timer",
+        ],
     )
-    .await
-    .is_ok();
+    .await?;
+    let was_active = match timer_active.as_str() {
+        "active" => true,
+        "inactive" | "failed" => false,
+        _ => return Err(failure("timer is changing state")),
+    };
     let write = |bytes: &[u8]| -> io::Result<()> {
         let mut stage = tempfile::NamedTempFile::new_in(directory)?;
         rustix::fs::fchown(stage.as_file(), None, Some(rustix::process::Gid::ROOT))?;
@@ -456,7 +494,7 @@ async fn set_automatic(enabled: bool) -> io::Result<()> {
     // The signed updater serializes package mutation. Its auto mode rechecks
     // this flag before beginning installation; disabling it does not kill jobs.
     write(format!("auto_install={enabled}\n").as_bytes())?;
-    if output(
+    if job_output(
         "/usr/bin/systemctl",
         &[
             if enabled { "enable" } else { "disable" },
@@ -473,15 +511,13 @@ async fn set_automatic(enabled: bool) -> io::Result<()> {
             fs::remove_file(directory.join("update.conf"))?;
             File::open(directory)?.sync_all()?;
         }
-        let _ = output(
-            "/usr/bin/systemctl",
-            &[
-                if was_enabled { "enable" } else { "disable" },
-                "vaultlink-update.timer",
-            ],
-        )
-        .await;
-        let _ = output(
+        let mut restore = vec![if was_enabled { "enable" } else { "disable" }];
+        if timer_enabled == "enabled-runtime" {
+            restore.push("--runtime");
+        }
+        restore.push("vaultlink-update.timer");
+        let _ = job_output("/usr/bin/systemctl", &restore).await;
+        let _ = job_output(
             "/usr/bin/systemctl",
             &[
                 if was_active { "start" } else { "stop" },
@@ -557,6 +593,70 @@ pub async fn run_host(mode: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn timed_out_status_query_keeps_the_running_job_and_rejects_a_second_job() {
+        let mut state = Status {
+            phase: "running".into(),
+            request_id: Some("original-request-id".into()),
+            operation: Some(Operation::Automatic { enabled: false }),
+            ..Status::default()
+        };
+        let query = output_with_timeout(
+            "/bin/sh",
+            &["-c", "exec sleep 1"],
+            Duration::from_millis(25),
+        )
+        .await;
+        assert_eq!(query.as_ref().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(!reconcile_job_state(&mut state, &query));
+        assert_eq!(state.phase, "running");
+        assert_eq!(state.request_id.as_deref(), Some("original-request-id"));
+        assert!(state.error.is_none());
+        assert_eq!(
+            validate_submission(&state, "second-request-id", &Operation::Check {}, now()),
+            Err("busy")
+        );
+        assert!(!reconcile_job_state(&mut state, &Ok("active".into())));
+        assert!(reconcile_job_state(&mut state, &Ok("failed".into())));
+        assert_eq!(state.error.as_deref(), Some("interrupted"));
+    }
+
+    #[test]
+    fn only_confirmed_terminal_unit_states_interrupt_busy_jobs() {
+        for active in [
+            "",
+            "active",
+            "activating",
+            "reloading",
+            "deactivating",
+            "unknown",
+        ] {
+            let mut state = Status {
+                phase: "queued".into(),
+                ..Status::default()
+            };
+            assert!(!reconcile_job_state(&mut state, &Ok(active.into())));
+            assert_eq!(state.phase, "queued");
+            assert!(!reconcile_job_state(
+                &mut state,
+                &Err(failure("query failed"))
+            ));
+        }
+        for active in ["inactive", "failed"] {
+            let mut state = Status {
+                phase: "queued".into(),
+                ..Status::default()
+            };
+            assert!(reconcile_job_state(&mut state, &Ok(active.into())));
+            assert_eq!(state.phase, "failed");
+            assert_eq!(state.error.as_deref(), Some("interrupted"));
+            state.phase = "complete".into();
+            state.error = None;
+            assert!(!reconcile_job_state(&mut state, &Ok(active.into())));
+            assert_eq!(state.phase, "complete");
+        }
+    }
+
     #[test]
     fn automatic_configuration_matches_the_signed_updater_grammar() {
         assert!(parse_automatic_config("# comment\n auto_install = true \n").unwrap());
