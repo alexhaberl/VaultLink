@@ -145,6 +145,18 @@ general runner-performance guarantee, define the CI smoke gate.
 Qualification failures are reported as such and are not automatically rerun
 until a favorable runner produces a pass.
 
+Each full-system guest retains four virtual CPUs and 6 GiB RAM. During the
+authenticated full load, a temporary systemd runtime drop-in restricts
+VaultLink to guest CPUs 0-1; `taskset` restricts the load generator and its
+children to guest CPUs 2-3. The harness verifies the effective affinity of the
+service and its threads before and after the load, as well as the generator's
+affinity before execution. Every target must provide this evidence. The
+drop-in is removed after the load or on failure and is never shipped in a
+package. This limits client/server CPU contention inside the guest without
+increasing guest resources, reducing the 100/40/10 workload, or changing
+application admission deadlines. It does not guarantee host scheduling
+latency under TCG.
+
 Every one of the nine targets performs:
 
 - two clean native builds with byte-identical payload, SBOM, and package;
