@@ -79,7 +79,7 @@ struct ConnectionLimitedIo<I> {
 }
 
 impl<I> ConnectionLimitedIo<I> {
-    fn poll_write_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    fn poll_connection_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         if self.connection_deadline.as_mut().poll(cx).is_ready() {
             self.diagnostics.failure("connection_lifetime_timeout");
             return Err(io::Error::new(
@@ -87,6 +87,10 @@ impl<I> ConnectionLimitedIo<I> {
                 "absolute HTTP connection lifetime exceeded",
             ));
         }
+        Ok(())
+    }
+
+    fn poll_write_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         if self
             .write_timeout
             .as_mut()
@@ -147,10 +151,21 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if let Err(error) = this.poll_write_deadline(cx) {
+        if let Err(error) = this.poll_connection_deadline(cx) {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_write(cx, buffer);
+        this.diagnostics.write_poll(
+            "write",
+            match &result {
+                Poll::Pending => "pending",
+                Poll::Ready(Ok(0)) => "zero",
+                Poll::Ready(Ok(_)) => "progress",
+                Poll::Ready(Err(_)) => "error",
+            },
+            buffer.len(),
+            this.write_timeout.as_ref().map(|timer| timer.deadline()),
+        );
         match &result {
             Poll::Ready(Ok(bytes)) => this.diagnostics.wrote(*bytes),
             Poll::Ready(Err(error)) => this.diagnostics.io_error(error),
@@ -166,18 +181,42 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
             Poll::Ready(Ok(written)) => *written < buffer.len(),
             Poll::Ready(Err(_)) => false,
         };
+        // Give restored writability a chance before treating elapsed time
+        // as proof that the transport is still blocked. Lifetime stays strict.
+        if result.is_pending() {
+            if let Err(error) = this.poll_write_deadline(cx) {
+                return Poll::Ready(Err(error));
+            }
+        }
         this.track_incomplete_write(cx, incomplete);
         result
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if let Err(error) = this.poll_write_deadline(cx) {
+        if let Err(error) = this.poll_connection_deadline(cx) {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_flush(cx);
+        this.diagnostics.write_poll(
+            "flush",
+            match &result {
+                Poll::Pending => "pending",
+                Poll::Ready(Ok(())) => "complete",
+                Poll::Ready(Err(_)) => "error",
+            },
+            0,
+            this.write_timeout.as_ref().map(|timer| timer.deadline()),
+        );
         if let Poll::Ready(Err(error)) = &result {
             this.diagnostics.io_error(error);
+        }
+        // Give restored writability a chance before treating elapsed time
+        // as proof that the transport is still blocked. Lifetime stays strict.
+        if result.is_pending() {
+            if let Err(error) = this.poll_write_deadline(cx) {
+                return Poll::Ready(Err(error));
+            }
         }
         this.track_incomplete_write(cx, result.is_pending());
         result
@@ -185,12 +224,29 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if let Err(error) = this.poll_write_deadline(cx) {
+        if let Err(error) = this.poll_connection_deadline(cx) {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.diagnostics.write_poll(
+            "shutdown",
+            match &result {
+                Poll::Pending => "pending",
+                Poll::Ready(Ok(())) => "complete",
+                Poll::Ready(Err(_)) => "error",
+            },
+            0,
+            this.write_timeout.as_ref().map(|timer| timer.deadline()),
+        );
         if let Poll::Ready(Err(error)) = &result {
             this.diagnostics.io_error(error);
+        }
+        // Give restored writability a chance before treating elapsed time
+        // as proof that the transport is still blocked. Lifetime stays strict.
+        if result.is_pending() {
+            if let Err(error) = this.poll_write_deadline(cx) {
+                return Poll::Ready(Err(error));
+            }
         }
         this.track_incomplete_write(cx, result.is_pending());
         result
@@ -206,10 +262,22 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
         buffers: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if let Err(error) = this.poll_write_deadline(cx) {
+        if let Err(error) = this.poll_connection_deadline(cx) {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_write_vectored(cx, buffers);
+        let requested = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+        this.diagnostics.write_poll(
+            "write_vectored",
+            match &result {
+                Poll::Pending => "pending",
+                Poll::Ready(Ok(0)) => "zero",
+                Poll::Ready(Ok(_)) => "progress",
+                Poll::Ready(Err(_)) => "error",
+            },
+            requested,
+            this.write_timeout.as_ref().map(|timer| timer.deadline()),
+        );
         match &result {
             Poll::Ready(Ok(bytes)) => this.diagnostics.wrote(*bytes),
             Poll::Ready(Err(error)) => this.diagnostics.io_error(error),
@@ -218,12 +286,18 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
         if matches!(&result, Poll::Ready(Ok(written)) if *written > 0) {
             this.write_timeout = None;
         }
-        let requested = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
         let incomplete = match &result {
             Poll::Pending => true,
             Poll::Ready(Ok(written)) => *written < requested,
             Poll::Ready(Err(_)) => false,
         };
+        // Give restored writability a chance before treating elapsed time
+        // as proof that the transport is still blocked. Lifetime stays strict.
+        if result.is_pending() {
+            if let Err(error) = this.poll_write_deadline(cx) {
+                return Poll::Ready(Err(error));
+            }
+        }
         this.track_incomplete_write(cx, incomplete);
         result
     }

@@ -2,6 +2,7 @@
 
 ## 0.7.0 — 2026-09-11
 
+- Recheck transport writability before rejecting an elapsed write-idle deadline; retain stalled-write and absolute lifetime limits, and report pending I/O, poll gaps and recovered deadlines in bounded transport summaries.
 - Preserve failed load-request timing, socket ports and actual attempt counts; add bounded server transport diagnostics and VM failure pressure/journal evidence without logging request contents.
 - Reset the HTTP write-idle timeout when partial writes make progress, preventing active slow downloads from being cut off while retaining stalled-write and absolute connection deadlines.
 - Add Settings → Updates for signed GitHub-release checks, confirmed native-package installation, durable restart status, and automatic-update preferences. Require live MFA, CSRF and committed audit records before dispatching privileged requests through a restricted local controller.
