@@ -37,6 +37,8 @@ rm -rf "$evidence"
 install -d -m 0755 "$evidence"
 runtime_stage=initialization
 runtime_config_work=
+cpu_affinity_dropin=/run/systemd/system/vaultlink.service.d/90-vaultlink-vm-load-cpus.conf
+cpu_affinity_installed=false
 download_token=
 admission_download_token=
 range_download_token=
@@ -46,6 +48,51 @@ upload_token_3=
 upload_token_4=
 upload_token_5=
 verify_token=
+
+remove_load_cpu_affinity() {
+    if [ "$cpu_affinity_installed" = true ]; then
+        rm -f "$cpu_affinity_dropin" || return 1
+        systemctl daemon-reload || return 1
+        cpu_affinity_installed=false
+    fi
+}
+
+record_service_cpu_affinity() {
+    affinity_phase=$1
+    affinity_pid=$(systemctl show vaultlink.service -p MainPID --value)
+    python3 - "$affinity_pid" "$affinity_phase" <<'PY'
+from pathlib import Path
+import sys
+
+pid, phase = sys.argv[1:]
+if not pid.isdecimal() or int(pid) <= 0:
+    raise SystemExit("CPU isolation: missing service process")
+
+
+def allowed(path):
+    values = [line.split(":", 1)[1].strip() for line in path.read_text().splitlines()
+              if line.startswith("Cpus_allowed_list:")]
+    if values != ["0-1"]:
+        raise SystemExit(f"CPU isolation: unexpected affinity in {path}: {values}")
+
+
+process = Path("/proc") / pid
+allowed(process / "status")
+threads = 0
+for status in (process / "task").glob("*/status"):
+    try:
+        allowed(status)
+        threads += 1
+    except FileNotFoundError:
+        # A worker may finish during the snapshot; new workers inherit affinity.
+        continue
+if threads == 0:
+    raise SystemExit("CPU isolation: no service threads observed")
+print(f"service_pid_{phase}={pid}")
+print(f"service_cpu_set_{phase}=0-1")
+print(f"service_threads_checked_{phase}={threads}")
+PY
+}
 
 redact_runtime_load_log() {
     runtime_load_log=$1
@@ -99,6 +146,9 @@ finalize_runtime_evidence() {
     trap - EXIT
     if [ -n "$runtime_config_work" ]; then
         rm -f "$runtime_config_work" || true
+    fi
+    if ! remove_load_cpu_affinity; then
+        [ "$runtime_status" -ne 0 ] || runtime_status=1
     fi
     if [ -d "$evidence" ] && [ ! -L "$evidence" ]; then
         rm -f "$evidence/cookies.txt" || true
@@ -290,6 +340,18 @@ systemd-analyze verify \
     /usr/lib/systemd/system/vaultlink-update.service \
     /usr/lib/systemd/system/vaultlink-update.timer \
     >"$evidence/systemd-analyze.txt" 2>&1
+# Test-only placement: keep load-client forks off the two service CPUs.
+# Install before startup so runtime and blocking-worker threads inherit it,
+# including the service restart exercised by the GUI updater smoke below.
+[ "$(cat /sys/devices/system/cpu/online)" = 0-3 ]
+taskset --cpu-list 0-1 true
+taskset --cpu-list 2-3 true
+[ ! -e "$cpu_affinity_dropin" ] && [ ! -L "$cpu_affinity_dropin" ] || exit 77
+install -d -o root -g root -m 0755 /run/systemd/system/vaultlink.service.d
+cpu_affinity_installed=true
+printf '[Service]\nCPUAffinity=\nCPUAffinity=0 1\n' >"$cpu_affinity_dropin"
+chmod 0644 "$cpu_affinity_dropin"
+systemctl daemon-reload
 systemctl start vaultlink.service
 for attempt in $(seq 1 120); do
     if curl --fail --silent --show-error \
@@ -384,6 +446,10 @@ if [ "$acceleration" = tcg ]; then
     load_admission_probe_max_time_seconds=120
     load_profile_ready_timeout_seconds=600
 fi
+printf 'guest_cpu_set=0-3\n' >"$evidence/resource-isolation.env"
+record_service_cpu_affinity before >>"$evidence/resource-isolation.env"
+# The single-quoted wrapper expands variables in the pinned child shell.
+# shellcheck disable=SC2016
 VAULTLINK_BASE_URL=http://127.0.0.1:18081 \
 VAULTLINK_HEALTH_URL=http://127.0.0.1:18081/api/v2/health/ready \
 DOWNLOAD_TOKEN=$download_token \
@@ -414,7 +480,18 @@ VAULTLINK_PROCESS_GID='' \
 VAULTLINK_EXPECTED_BINARY_PATH='' \
 VAULTLINK_EXPECTED_BINARY_SHA256='' \
 TMPDIR="$load_tmp" \
-sh /tmp/load-test.sh >"$evidence/load.log" 2>&1
+taskset --cpu-list 2-3 sh -c '
+    # Check the very process that execs the generator, not a separate probe.
+    cpu_set=$(sed -n "s/^Cpus_allowed_list:[[:space:]]*//p" /proc/self/status)
+    [ "$cpu_set" = 2-3 ] || exit 77
+    printf "load_generator_cpu_set=%s\n" "$cpu_set" >>"$1"
+    exec sh /tmp/load-test.sh
+' sh "$evidence/resource-isolation.env" >"$evidence/load.log" 2>&1
+record_service_cpu_affinity after >>"$evidence/resource-isolation.env"
+[ "$(evidence_value "$evidence/resource-isolation.env" service_pid_before)" \
+    = "$(evidence_value "$evidence/resource-isolation.env" service_pid_after)" ]
+remove_load_cpu_affinity
+printf 'runtime_dropin_removed=true\n' >>"$evidence/resource-isolation.env"
 rmdir "$load_tmp"
 grep -F -x -q 'integrity=ok' "$evidence/load/post-load.env"
 p95=$(evidence_value "$evidence/load/result.env" metadata_p95_seconds)

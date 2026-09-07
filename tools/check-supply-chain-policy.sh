@@ -1442,6 +1442,13 @@ if ! grep -F -q 'tools/package-offline-smoke.sh' .github/workflows/packages.yml 
     || ! grep -F -q -- '-device virtio-net-pci,netdev=verify-net,romfile=' tools/provision-distro-vm-image.sh \
     || ! grep -F -q -- '-device virtio-net-pci,netdev=net0,romfile=' tools/run-distro-vm-test.sh \
     || ! grep -F -q 'metadata_clients=100' tools/run-distro-vm-test.sh \
+    || ! grep -F -q -- '-smp 4 -m 6144' "$vm_harness" \
+    || ! grep -F -q 'CPUAffinity=0 1' "$vm_runtime_smoke" \
+    || ! grep -F -q 'taskset --cpu-list 2-3 sh -c' "$vm_runtime_smoke" \
+    || ! grep -F -q 'record_service_cpu_affinity before' "$vm_runtime_smoke" \
+    || ! grep -F -q 'record_service_cpu_affinity after' "$vm_runtime_smoke" \
+    || ! grep -F -q 'cpu_evidence=$evidence/runtime/resource-isolation.env' "$vm_harness" \
+    || ! grep -F -q 'runtime_dropin_removed' "$vm_harness" \
     || ! grep -F -q 'cmp /usr/local/share/vaultlink-vm-packages.lock "$live_vm_packages"' tools/distro-vm-guest-smoke.sh \
     || ! grep -F -q 'cmp /usr/local/share/vaultlink-vm-packages.lock /run/vaultlink-vm-packages.live' tools/provision-distro-vm-image.sh \
     || ! grep -F -q '[ "$(getenforce)" = Enforcing ]' tools/distro-vm-runtime-smoke.sh \

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 — 2026-09-10
+## 0.7.0 — 2026-09-11
 
 - Add Settings → Updates for signed GitHub-release checks, confirmed native-package installation, durable restart status, and automatic-update preferences. Require live MFA, CSRF and committed audit records before dispatching privileged requests through a restricted local controller.
 - Align the service-token name and expiration fields at their upper edge when help text wraps.

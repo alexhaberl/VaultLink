@@ -439,6 +439,23 @@ grep -F -x -q 'metadata_p95_policy=diagnostic' "$evidence/harness.env"
 grep -F -x -q 'metadata_p95_limit_seconds=2.000' "$evidence/harness.env"
 grep -F -x -q 'metadata_p95_enforced=false' "$evidence/harness.env"
 grep -F -x -q 'readiness=ok' "$evidence/runtime/runtime.env"
+cpu_evidence=$evidence/runtime/resource-isolation.env
+[ "$(evidence_value "$cpu_evidence" guest_cpu_set)" = 0-3 ]
+[ "$(evidence_value "$cpu_evidence" service_cpu_set_before)" = 0-1 ]
+[ "$(evidence_value "$cpu_evidence" service_cpu_set_after)" = 0-1 ]
+[ "$(evidence_value "$cpu_evidence" load_generator_cpu_set)" = 2-3 ]
+[ "$(evidence_value "$cpu_evidence" runtime_dropin_removed)" = true ]
+service_pid_before=$(evidence_value "$cpu_evidence" service_pid_before)
+case "$service_pid_before" in ''|*[!0-9]*) exit 77 ;; esac
+[ "$service_pid_before" -gt 0 ]
+[ "$(evidence_value "$cpu_evidence" service_pid_after)" = "$service_pid_before" ]
+[ "$(evidence_value "$evidence/runtime/load/pre-load.env" pid)" = "$service_pid_before" ]
+[ "$(evidence_value "$evidence/runtime/load/post-load.env" pid)" = "$service_pid_before" ]
+for phase in before after; do
+    checked_threads=$(evidence_value "$cpu_evidence" "service_threads_checked_$phase")
+    case "$checked_threads" in ''|*[!0-9]*) exit 77 ;; esac
+    [ "$checked_threads" -gt 0 ]
+done
 grep -F -x -q "acceleration=$acceleration" "$evidence/runtime/runtime.env"
 grep -F -x -q 'upgrade=ok' "$evidence/runtime/runtime.env"
 grep -F -x -q 'migration=ok' "$evidence/runtime/runtime.env"
