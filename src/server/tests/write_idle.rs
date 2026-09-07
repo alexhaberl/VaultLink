@@ -13,6 +13,7 @@ fn connection(
     let (client, server) = tokio::io::duplex(CHUNK);
     let limited = ConnectionLimitedIo {
         inner: server,
+        diagnostics: TransportDiagnostics::new(12345, 18081, 0),
         _permit: ConnectionPermit {
             _global: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
             peer_connections: Arc::new(Mutex::new(HashMap::from([(peer, 1)]))),

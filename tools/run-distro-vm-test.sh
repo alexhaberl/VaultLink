@@ -361,6 +361,14 @@ printf 'guest_smoke_status=%s\nruntime_evidence_status=%s\nguest_system_status=%
     "$guest_smoke_status" "$runtime_evidence_status" "$guest_system_status" \
     "$sqlite_status" >"$evidence/guest-commands.env"
 if [ "$guest_smoke_status" -ne 0 ]; then
+    # Surface bounded, sanitized diagnostics in the job log as well as artifacts.
+    for diagnostic in runtime-command.env load/profile-status.env \
+        load/transport-failures.log transport-failure.journal runtime-failure-pressure.txt; do
+        if [ -f "$evidence/runtime/$diagnostic" ] && [ ! -L "$evidence/runtime/$diagnostic" ]; then
+            printf '\nVM failure evidence: %s\n' "$diagnostic" >&2
+            tail -n 80 "$evidence/runtime/$diagnostic" >&2 || true
+        fi
+    done
     cat "$evidence/guest-smoke.stderr" >&2 || true
     cat "$evidence/runtime-evidence-scp.stderr" >&2 || true
     cat "$evidence/guest-system.stderr" >&2 || true

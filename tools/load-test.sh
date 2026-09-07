@@ -282,6 +282,48 @@ soak_curl() {
     curl --interface 127.0.0.1 --header "X-Forwarded-For: $identity" "$@"
 }
 
+# Keep curl's numeric measurements even when it exits before the HTTP checks.
+# This runs inside each caller's command substitution; no request contents or
+# raw curl stderr are persisted. Only failed exchanges produce extra output.
+profile_curl() {
+    diagnostic_identity=$1
+    diagnostic_operation=$2
+    diagnostic_client=$3
+    diagnostic_request=$4
+    diagnostic_format=$5
+    shift 5
+    diagnostic_exit=0
+    diagnostic_output=$(soak_curl "$diagnostic_identity" "$@" --silent \
+        --write-out "$diagnostic_format|%{http_code},%{time_total},%{time_connect},%{time_pretransfer},%{time_starttransfer},%{size_download},%{size_upload},%{local_port},%{remote_port}" \
+        2>/dev/null) || diagnostic_exit=$?
+    diagnostic_metrics=${diagnostic_output#*|}
+    diagnostic_http=${diagnostic_metrics%%,*}
+    diagnostic_expected=false
+    case "$diagnostic_operation:$diagnostic_http" in
+        metadata:2??|metadata:503|range:206|upload:303|readback:200)
+            diagnostic_expected=true ;;
+    esac
+    if [ "$diagnostic_exit" -ne 0 ] || [ "$diagnostic_expected" = false ]; then
+        case "$diagnostic_metrics" in
+            *[!0-9.,-]*|'') diagnostic_metrics=unavailable ;;
+        esac
+        diagnostic_epoch=$(date +%s)
+        diagnostic_fields=$(printf '%s\n' "$diagnostic_metrics" | awk -F, '
+            NF == 9 {
+                printf "http_status=%s total_seconds=%s connect_seconds=%s pretransfer_seconds=%s first_byte_seconds=%s download_bytes=%s upload_bytes=%s local_port=%s remote_port=%s", $1,$2,$3,$4,$5,$6,$7,$8,$9
+                next
+            }
+            { print "curl_metrics=unavailable" }
+        ')
+        diagnostic_record="operation=$diagnostic_operation client=$diagnostic_client request=$diagnostic_request identity=$diagnostic_identity curl_exit=$diagnostic_exit ended_epoch=$diagnostic_epoch $diagnostic_fields"
+        printf 'load_request_failure %s\n' "$diagnostic_record" >&2
+        printf '%s\n' "$diagnostic_record" \
+            >"$work/transport-$diagnostic_operation-$diagnostic_client-$diagnostic_request.failure"
+    fi
+    printf '%s' "${diagnostic_output%%|*}"
+    return "$diagnostic_exit"
+}
+
 work=$(mktemp -d)
 load_stage=initialization
 admission_holders=""
@@ -305,9 +347,16 @@ persist_load_evidence() {
     mv "$load_command_tmp" "$LOAD_TEST_EVIDENCE_DIR/load-command.env" || return 1
     [ "$persist_status" -ne 0 ] || return 0
 
+    # Each worker owns its file, avoiding interleaved writes from 150 clients.
+    for diagnostic_file in "$work"/transport-*.failure; do
+        [ -f "$diagnostic_file" ] || continue
+        cat "$diagnostic_file"
+    done >"$LOAD_TEST_EVIDENCE_DIR/transport-failures.log"
+
     for partial_evidence in \
         'metadata.csv:metadata-load.partial.csv' \
         'metadata-capacity-retries.csv:metadata-capacity-retries.partial.csv' \
+        'metadata-request-counts.csv:metadata-request-counts.partial.csv' \
         'ranges.csv:range-results.partial.csv' \
         'uploads.csv:upload-results.partial.csv' \
         'rss-samples.csv:rss-samples.partial.csv' \
@@ -530,16 +579,21 @@ metadata_profile() {
             capacity_evidence="$work/capacity-retry-client-$client.csv"
             headers="$work/metadata-$client.headers"
             : >"$capacity_evidence"
-            wait_for_profile_go
             request=0
+            metadata_curl_attempts=0
+            started_requests=0
+            trap 'printf "%s,%s,%s,%s\n" "$client" "$metadata_curl_attempts" "$started_requests" "$request" >"$work/metadata-client-$client.counts"' EXIT
+            wait_for_profile_go
             capacity_retries=0
             while [ "$request" -lt 20 ]; do
                 while :; do
-                    metrics=$(soak_curl "$identity" --silent --show-error \
+                    metadata_curl_attempts=$((metadata_curl_attempts + 1))
+                    started_requests=$((request + 1))
+                    metrics=$(profile_curl "$identity" metadata "$client" "$started_requests" \
+                        '%{http_code},%{time_total}' \
                         --connect-timeout "$connect_timeout" \
                         --max-time "$metadata_max_time" -o /dev/null \
                         --dump-header "$headers" \
-                        -w '%{http_code},%{time_total}' \
                         "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN")
                     status=${metrics%%,*}
                     duration=${metrics#*,}
@@ -611,6 +665,7 @@ metadata_profile() {
     # Aggregate every completed client result before returning a profile
     # failure so the EXIT evidence retains the available partial measurements.
     cat "$work"/metadata-*.csv >"$work/metadata.csv"
+    cat "$work"/metadata-client-*.counts >"$work/metadata-request-counts.csv"
     cat "$work"/capacity-retry-client-*.csv >"$work/metadata-capacity-retries.csv"
     [ "$metadata_failed" -eq 0 ] || return 1
     [ "$(wc -l <"$work/metadata.csv")" -eq "$metadata_requests" ] || return 1
@@ -668,13 +723,13 @@ download_profile() {
             wait_for_profile_go
             headers="$work/range-$download.headers"
             body="$work/range-$download.bin"
-            metrics=$(soak_curl "$identity" --silent --show-error \
+            metrics=$(profile_curl "$identity" range "$download" 1 \
+                '%{http_code},%{time_starttransfer},%{speed_download},%{time_total}' \
                 --connect-timeout "$connect_timeout" \
                 --max-time "$transfer_max_time" \
                 --range "0-$range_end" \
                 --dump-header "$headers" \
                 --output "$body" \
-                --write-out '%{http_code},%{time_starttransfer},%{speed_download},%{time_total}' \
                 "$VAULTLINK_BASE_URL/v/$download_token/download")
             status=${metrics%%,*}
             remaining_metrics=${metrics#*,}
@@ -758,13 +813,12 @@ upload_profile() {
             wait_for_profile_go
             headers="$work/upload-$upload.headers"
             filename="load-$SOAK_NAMESPACE-$run_id-$upload.bin"
-            status=$(soak_curl "$identity" --silent --show-error \
+            status=$(profile_curl "$identity" upload "$upload" 1 '%{http_code}' \
                 --connect-timeout "$connect_timeout" \
                 --max-time "$transfer_max_time" \
                 --form "file=@$work/upload.bin;filename=$filename" \
                 --dump-header "$headers" \
                 --output /dev/null \
-                --write-out '%{http_code}' \
                 "$VAULTLINK_BASE_URL/v/$upload_token/upload")
             outcome=$(awk '
                 tolower($1) == "x-vaultlink-upload-outcome:" {
@@ -777,10 +831,10 @@ upload_profile() {
             [ "$status" = 303 ]
             [ "$outcome" = created ]
             verify_body="$work/upload-$upload.readback"
-            verify_status=$(soak_curl "$identity" --silent --show-error \
+            verify_status=$(profile_curl "$identity" readback "$upload" 1 '%{http_code}' \
                 --connect-timeout "$connect_timeout" \
                 --max-time "$transfer_max_time" \
-                --output "$verify_body" --write-out '%{http_code}' \
+                --output "$verify_body" \
                 "$VAULTLINK_BASE_URL/v/$UPLOAD_VERIFY_TOKEN/download?path=$filename")
             server_hash=$(sha256sum "$verify_body" | awk '{print $1}')
             printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
@@ -893,7 +947,9 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
     [ ! -f "$work/rss-samples.csv" ] || rss_rows=$(wc -l <"$work/rss-samples.csv")
     [ ! -f "$work/metadata-capacity-retries.csv" ] \
         || metadata_capacity_retries=$(wc -l <"$work/metadata-capacity-retries.csv")
-    metadata_attempts=$((metadata_rows + metadata_capacity_retries))
+    metadata_attempts=$(awk -F, '{ sum += $2 } END { print sum + 0 }' "$work/metadata-request-counts.csv")
+    metadata_started_requests=$(awk -F, '{ sum += $3 } END { print sum + 0 }' "$work/metadata-request-counts.csv")
+    metadata_unattempted_requests=$((metadata_requests - metadata_started_requests))
     observed_p95=unavailable
     observed_p95_within_limit=unavailable
     observed_range_ttfb_p95=unavailable
@@ -930,6 +986,8 @@ if [ -n "${LOAD_TEST_EVIDENCE_DIR:-}" ]; then
         "rss_status=$rss_status" \
         "metadata_rows=$metadata_rows" \
         "metadata_attempts=$metadata_attempts" \
+        "metadata_started_requests=$metadata_started_requests" \
+        "metadata_unattempted_requests=$metadata_unattempted_requests" \
         "metadata_capacity_retries=$metadata_capacity_retries" \
         "range_rows=$range_rows" \
         "upload_rows=$upload_rows" \

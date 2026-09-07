@@ -767,6 +767,7 @@ mod tests {
         let (_client, server) = tokio::io::duplex(1);
         let mut limited = ConnectionLimitedIo {
             inner: server,
+            diagnostics: TransportDiagnostics::new(12345, 18081, 0),
             _permit: ConnectionPermit {
                 _global: global,
                 peer_connections,
