@@ -11,6 +11,7 @@ include!("tests/secrets.rs");
 include!("tests/upload_reservations.rs");
 include!("tests/preview_sessions.rs");
 include!("tests/transfers.rs");
+include!("tests/transfer_availability.rs");
 include!("tests/webauthn.rs");
 
 include!("tests/audit_bounds.rs");

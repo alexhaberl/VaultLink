@@ -88,7 +88,7 @@
     },
     {
       "path": "src/db/transfers.rs",
-      "sha256": "24fdbe13ccb004c9573c6f6aec3941a9063d03d5be4ca6e605563962b45ffc18",
+      "sha256": "ed0cd9fa579ede8f3823d5005ccebad5772352d37b3639e7c0a0e9cb4b7e545c",
       "contract": "transfer split order and common SQL helpers"
     }
   ],
@@ -175,7 +175,7 @@
           "strip_suffix": "}\n"
         }
       ],
-      "sha256": "6d43f7b35e905fe52565bdbcf8b70cc6387dcd44a7e7184de534afbc3e261ef1"
+      "sha256": "8d1aca41aa49245fa9e817ef22eb3adafcef45ea02c60915ac8cdaf78376969e"
     },
     {
       "name": "secure filesystem model-root-directory-staging-recovery",

@@ -187,10 +187,16 @@ impl PublicTransferService {
     ) -> Result<(), PublicTransferError> {
         let session_token = session_token.unwrap_or_else(|| auth::random_token(32));
         let share_id = share.id;
-        let outcome = run_transfer_database_write(self.state().db().clone(), move |database| {
-            database.check_transfer_availability(&session_token, share_id, &resource_key, action)
-        })
-        .await?;
+        let outcome =
+            super::prepare::run_database_read(self.state().db().clone(), move |database| {
+                database.check_transfer_availability(
+                    &session_token,
+                    share_id,
+                    &resource_key,
+                    action,
+                )
+            })
+            .await?;
         match outcome {
             TransferAvailabilityOutcome::Available
             | TransferAvailabilityOutcome::AlreadyCounted => Ok(()),
