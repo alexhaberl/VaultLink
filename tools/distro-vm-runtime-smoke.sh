@@ -159,12 +159,37 @@ finalize_runtime_evidence() {
         if [ "$runtime_status" -ne 0 ]; then
             systemctl show vaultlink.service --no-pager \
                 >"$evidence/runtime-failure-systemd.env" 2>&1 || true
-            journalctl -u vaultlink.service --no-pager -n 500 \
+            journalctl -u vaultlink.service --no-pager -o short-precise -n 2000 \
                 >"$evidence/runtime-failure.journal" 2>&1 || true
+            # Keep transport reasons separate so ordinary audit entries cannot
+            # displace them from the bounded failure journal.
+            journalctl -u vaultlink.service --no-pager -o short-precise \
+                --grep 'vaultlink::transport' -n 2000 \
+                >"$evidence/transport-failure.journal" 2>&1 || true
+            {
+                date -u '+epoch=%s'
+                for pressure in /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory; do
+                    printf '\n%s\n' "$pressure"
+                    cat "$pressure" || true
+                done
+                printf '\n/proc/loadavg\n'
+                cat /proc/loadavg || true
+                printf '\n/proc/net/sockstat\n'
+                cat /proc/net/sockstat || true
+                printf '\nTCP state counts\n'
+                ss -H -tan '( sport = :18081 or dport = :18081 )' \
+                    | awk '{ counts[$1]++ } END { for (state in counts) print state, counts[state] }' || true
+            } >"$evidence/runtime-failure-pressure.txt" 2>&1
             systemctl show vaultlink-update-control.service vaultlink-gui-update.service \
                 --no-pager >"$evidence/update-control-failure-systemd.env" 2>&1 || true
             journalctl -u vaultlink-update-control.service -u vaultlink-gui-update.service \
                 --no-pager -n 500 >"$evidence/update-control-failure.journal" 2>&1 || true
+            for failure_journal in "$evidence/runtime-failure.journal" \
+                "$evidence/transport-failure.journal" "$evidence/update-control-failure.journal"; do
+                if ! redact_runtime_load_log "$failure_journal"; then
+                    rm -f "$failure_journal" || true
+                fi
+            done
         fi
         printf 'stage=%s\nexit_status=%s\n' "$runtime_stage" "$runtime_status" \
             >"$evidence/runtime-command.env" 2>/dev/null || true

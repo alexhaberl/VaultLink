@@ -5,6 +5,8 @@ mod log_safety;
 #[cfg(test)]
 #[path = "test_support.rs"]
 mod test_support;
+#[path = "server/transport_diagnostics.rs"]
+mod transport_diagnostics;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -38,6 +40,7 @@ use vaultlink::{
 use zeroize::Zeroizing;
 
 use log_safety::{EscapedLogPath, EscapedLogValue};
+use transport_diagnostics::TransportDiagnostics;
 
 include!("server/acceptor.rs");
 include!("server/runtime.rs");

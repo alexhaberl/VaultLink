@@ -209,6 +209,38 @@ Candidate, soak-start, and tag workflows require all three in addition to the
 existing CI, fuzz, security, and release checks. No missing or skipped matrix
 row is treated as success.
 
+## Diagnosing load failures
+
+Failed metadata, range, upload and readback exchanges produce a
+`load_request_failure` line and `load/transport-failures.log`. Each record
+identifies the operation, zero-based client, one-based request, curl exit code,
+completion epoch, HTTP status, total/connect/pretransfer/first-byte durations,
+transferred byte counts, and local/remote TCP ports. The measurements survive
+curl transport errors such as 52 (empty response) and 18 (partial transfer).
+URLs, tokens, headers, bodies and raw curl error strings are not included.
+Successful result CSV formats remain unchanged. Metadata attempt counts include
+failed exchanges; `metadata_unattempted_requests` distinguishes requests that
+were never started after a worker failed. Per-client counts are retained in
+`metadata-request-counts.partial.csv` on failure.
+
+The server's `vaultlink::transport` warnings identify confirmed global/per-peer
+connection rejection, untrusted proxy peers, accept errors/timeouts, write-idle
+timeouts, absolute connection expiry and I/O error kinds. They include socket
+ports, the active connection count at admission, elapsed time, read/write byte
+counts and first-read/last-write timing. Correlate the server's `peer_port` with
+curl's local port and the timestamp. `closed_without_response` describes an
+observed connection close; it does **not** prove a header timeout. The HTTP
+library does not expose every close reason. No request bytes or peer addresses
+are retained. Warnings are capped at 60 per 60-second window per process; the
+next emitted warning reports how many events were suppressed.
+
+VM failures retain a separate `transport-failure.journal` so ordinary audit
+entries cannot displace those warnings, plus CPU/I/O/memory pressure, load and
+TCP-state counts in `runtime-failure-pressure.txt`. These system snapshots are
+taken after failure and may miss a transient peak. The workflow prints a bounded
+summary directly in the job log; the complete diagnostic files remain in its
+artifact. Timeouts, connection limits, workload and success criteria are unchanged.
+
 ## Release assembly
 
 Unsigned target jobs upload only short-lived packages, target SBOMs, hashes,

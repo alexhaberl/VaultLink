@@ -71,6 +71,7 @@ fn connection_counts(
 
 struct ConnectionLimitedIo<I> {
     inner: I,
+    diagnostics: TransportDiagnostics,
     _permit: ConnectionPermit,
     write_timeout: Option<Pin<Box<tokio::time::Sleep>>>,
     write_idle_timeout: Duration,
@@ -80,6 +81,7 @@ struct ConnectionLimitedIo<I> {
 impl<I> ConnectionLimitedIo<I> {
     fn poll_write_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         if self.connection_deadline.as_mut().poll(cx).is_ready() {
+            self.diagnostics.failure("connection_lifetime_timeout");
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "absolute HTTP connection lifetime exceeded",
@@ -90,6 +92,7 @@ impl<I> ConnectionLimitedIo<I> {
             .as_mut()
             .is_some_and(|timeout| timeout.as_mut().poll(cx).is_ready())
         {
+            self.diagnostics.failure("write_idle_timeout");
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "HTTP response write made no progress before the deadline",
@@ -120,12 +123,20 @@ impl<I: AsyncRead + Unpin> AsyncRead for ConnectionLimitedIo<I> {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if this.connection_deadline.as_mut().poll(cx).is_ready() {
+            this.diagnostics.failure("connection_lifetime_timeout");
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "absolute HTTP connection lifetime exceeded",
             )));
         }
-        Pin::new(&mut this.inner).poll_read(cx, buffer)
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buffer);
+        match &result {
+            Poll::Ready(Ok(())) => this.diagnostics.read(buffer.filled().len() - before),
+            Poll::Ready(Err(error)) => this.diagnostics.io_error(error),
+            Poll::Pending => {}
+        }
+        result
     }
 }
 
@@ -140,6 +151,11 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_write(cx, buffer);
+        match &result {
+            Poll::Ready(Ok(bytes)) => this.diagnostics.wrote(*bytes),
+            Poll::Ready(Err(error)) => this.diagnostics.io_error(error),
+            Poll::Pending => {}
+        }
         // Partial writes are progress too: measure idle time since the last
         // successful write, not since the first buffer that could not fit.
         if matches!(&result, Poll::Ready(Ok(written)) if *written > 0) {
@@ -160,6 +176,9 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_flush(cx);
+        if let Poll::Ready(Err(error)) = &result {
+            this.diagnostics.io_error(error);
+        }
         this.track_incomplete_write(cx, result.is_pending());
         result
     }
@@ -170,6 +189,9 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_shutdown(cx);
+        if let Poll::Ready(Err(error)) = &result {
+            this.diagnostics.io_error(error);
+        }
         this.track_incomplete_write(cx, result.is_pending());
         result
     }
@@ -188,6 +210,11 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnectionLimitedIo<I> {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_write_vectored(cx, buffers);
+        match &result {
+            Poll::Ready(Ok(bytes)) => this.diagnostics.wrote(*bytes),
+            Poll::Ready(Err(error)) => this.diagnostics.io_error(error),
+            Poll::Pending => {}
+        }
         if matches!(&result, Poll::Ready(Ok(written)) if *written > 0) {
             this.write_timeout = None;
         }
@@ -215,16 +242,23 @@ where
         Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send + 'static>>;
 
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
-        let raw_peer = match stream.peer_addr() {
-            Ok(address) => address.ip(),
+        let peer_address = match stream.peer_addr() {
+            Ok(address) => address,
             Err(error) => return Box::pin(async move { Err(error) }),
         };
+        let raw_peer = peer_address.ip();
+        let mut diagnostics = TransportDiagnostics::new(
+            peer_address.port(),
+            stream.local_addr().map_or(0, |address| address.port()),
+            MAX_ACTIVE_CONNECTIONS.saturating_sub(self.permits.available_permits()),
+        );
         let canonical_peer = vaultlink::proxy::canonical_peer_ip(raw_peer);
         if self
             .trusted_proxy_peers
             .as_ref()
             .is_some_and(|trusted| !trusted.contains(&canonical_peer))
         {
+            diagnostics.failure("untrusted_proxy_peer");
             return Box::pin(async {
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
@@ -241,6 +275,7 @@ where
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
+                diagnostics.failure("global_connection_limit");
                 return Box::pin(async {
                     Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
@@ -253,6 +288,7 @@ where
             let mut peers = connection_counts(&self.peer_connections, max_connections_per_peer);
             let count = peers.entry(peer).or_default();
             if *count >= max_connections_per_peer {
+                diagnostics.failure("peer_connection_limit");
                 return Box::pin(async {
                     Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
@@ -273,17 +309,25 @@ where
         Box::pin(async move {
             // `inner.accept` includes the TLS/ACME handshake. HTTP header/body
             // deadlines only begin afterwards, so bound this phase separately.
-            let (inner, service) = tokio::time::timeout(accept_timeout, future)
-                .await
-                .map_err(|_| {
-                    io::Error::new(
+            let (inner, service) = match tokio::time::timeout(accept_timeout, future).await {
+                Ok(Ok(accepted)) => accepted,
+                Ok(Err(error)) => {
+                    diagnostics.failure("accept_error");
+                    diagnostics.io_error(&error);
+                    return Err(error);
+                }
+                Err(_) => {
+                    diagnostics.failure("accept_timeout");
+                    return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "connection accept or TLS handshake timed out",
-                    )
-                })??;
+                    ));
+                }
+            };
             Ok((
                 ConnectionLimitedIo {
                     inner,
+                    diagnostics,
                     _permit: connection_permit,
                     write_timeout: None,
                     write_idle_timeout: RESPONSE_WRITE_IDLE_TIMEOUT,
