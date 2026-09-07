@@ -49,3 +49,7 @@ include!("server/shutdown.rs");
 include!("server/tls.rs");
 
 include!("cli/tests.rs");
+
+#[cfg(test)]
+#[path = "server/tests/write_idle.rs"]
+mod write_idle_tests;
