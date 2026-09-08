@@ -24,6 +24,7 @@ class Server(http.server.ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), Handler)
         self.mode, self.clients = mode, clients
         self.condition = threading.Condition()
+        self.release = threading.Event()
         self.requests = collections.Counter()
         self.connections = 0
         self.first_seen = set()
@@ -47,6 +48,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         identity = self.headers["X-Forwarded-For"]
         with server.condition:
             server.requests[identity] += 1
+            server.condition.notify_all()
             request = server.requests[identity]
             if server.mode == "concurrent" and request == 1:
                 server.first_seen.add(identity)
@@ -55,6 +57,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     server.serialized = True
             if server.mode == "retry" and identity.endswith(".1") and request == 2:
                 server.other_completed_before_retry = server.requests["198.18.1.2"] == 20
+        if server.mode == "blocked":
+            server.release.wait(timeout=20)
+            self.close_connection = True
+            return
         if server.mode == "empty":
             self.close_connection = True
             return
@@ -81,34 +87,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class MetadataTests(unittest.TestCase):
-    def test_transfer_affinity_changes_background_workers_and_keeps_parent_placement(self):
-        source = SCRIPT.with_name("load-test.sh").read_text()
-        start = source.index("pin_transfer_profile() {")
-        function = source[start:source.index("\n}\n", start) + 3]
-        available = sorted(os.sched_getaffinity(0))
-        with tempfile.TemporaryDirectory(prefix="vaultlink-client-cpus-") as temporary:
-            result = subprocess.run(["sh", "-c", "set -eu\n" + function + r'''
-work=$TEST_WORK
-transfer_client_cpus=$TEST_CPU
-before=$(python3 -c 'import os; print(sorted(os.sched_getaffinity(0)))')
-( pin_transfer_profile download ) &
-download_pid=$!
-( pin_transfer_profile upload ) &
-upload_pid=$!
-wait "$download_pid"
-wait "$upload_pid"
-after=$(python3 -c 'import os; print(sorted(os.sched_getaffinity(0)))')
-[ "$before" = "$after" ]
-'''], env={**os.environ, "TEST_WORK": temporary, "TEST_CPU": str(available[-1])},
-                capture_output=True, text=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(set((Path(temporary) / "client-cpus.env").read_text().splitlines()),
-                             {f"download_cpu_set={available[-1]}", f"upload_cpu_set={available[-1]}"})
-
-    def test_termination_at_start_barrier_preserves_zero_attempt_counts(self):
+    def test_workers_inherit_affinity_and_stop_at_barrier_without_attempts(self):
         with tempfile.TemporaryDirectory(prefix="vaultlink-metadata-stop-") as temporary:
             work = Path(temporary)
-            process = subprocess.Popen([sys.executable, str(SCRIPT), temporary, "2", "5", "15", "10"],
+            cpu = str(min(os.sched_getaffinity(0)))
+            process = subprocess.Popen(["taskset", "--cpu-list", cpu, sys.executable,
+                                        str(SCRIPT), temporary, "2", "5", "15", "10"],
                 env={**os.environ, "VAULTLINK_BASE_URL": "http://127.0.0.1:1", "DOWNLOAD_TOKEN": "SECRET_TOKEN"},
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
@@ -117,6 +101,13 @@ after=$(python3 -c 'import os; print(sorted(os.sched_getaffinity(0)))')
                     self.assertIsNone(process.poll())
                     self.assertLess(time.monotonic(), deadline)
                     time.sleep(0.01)
+                threads = list(Path(f"/proc/{process.pid}/task").iterdir())
+                self.assertEqual(len(threads), 3)  # Main thread and two ready clients.
+                for thread in threads:
+                    affinity = next(line.split(":", 1)[1].strip() for line in
+                                    (thread / "status").read_text().splitlines()
+                                    if line.startswith("Cpus_allowed_list:"))
+                    self.assertEqual(affinity, cpu)
                 process.terminate()
                 stdout, stderr = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 143, stderr)
@@ -127,6 +118,39 @@ after=$(python3 -c 'import os; print(sorted(os.sched_getaffinity(0)))')
                 if process.poll() is None:
                     process.kill()
                 process.communicate()
+
+    def test_termination_aborts_inflight_requests_and_retains_attempts(self):
+        server = Server("blocked", 2)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory(prefix="vaultlink-metadata-inflight-") as temporary:
+                work = Path(temporary)
+                (work / "profile-go").touch()
+                process = subprocess.Popen([sys.executable, str(SCRIPT), temporary, "2", "5", "300", "10"],
+                    env={**os.environ, "VAULTLINK_BASE_URL": f"http://127.0.0.1:{server.server_port}",
+                         "DOWNLOAD_TOKEN": "SECRET_TOKEN", "NO_PROXY": "127.0.0.1"},
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    with server.condition:
+                        self.assertTrue(server.condition.wait_for(lambda: len(server.requests) == 2, timeout=5))
+                    process.terminate()
+                    stdout, stderr = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 143, stderr)
+                    for client in range(2):
+                        self.assertEqual((work / f"metadata-client-{client}.counts").read_text(), f"{client},1,1,0\n")
+                        self.assertIn("curl_exit=42 ", (work / f"transport-metadata-{client}-1.failure").read_text())
+                    self.assertEqual(set(server.requests.values()), {1})
+                    self.assertNotIn("SECRET", stdout + stderr)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate()
+        finally:
+            server.release.set()
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     def exercise(self, mode, clients):
         server = Server(mode, clients)
@@ -159,7 +183,7 @@ after=$(python3 -c 'import os; print(sorted(os.sched_getaffinity(0)))')
         for client in range(100):
             self.assertEqual(files[f"metadata-client-{client}.counts"], f"{client},20,20,20\n")
             self.assertEqual(len(list(csv.reader(files[f"metadata-{client}.csv"].splitlines()))), 20)
-        self.assertIn("engine=libcurl-multi\nprocesses=1\nclients=100\n", files["metadata-generator.env"])
+        self.assertIn("engine=libcurl-threads\nprocesses=1\nclients=100\n", files["metadata-generator.env"])
         self.assertFalse(any(name.endswith(".failure") for name in files))
 
     def test_capacity_retry_does_not_suspend_other_clients(self):

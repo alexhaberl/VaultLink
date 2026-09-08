@@ -2,7 +2,7 @@
 
 ## 0.7.0 — 2026-09-11
 
-- Drive concurrent load-test metadata clients with the installed libcurl multi interface, avoiding per-request process churn under emulation while retaining fresh connections, workload, strict retry rules and transport failure evidence.
+- Retain a libcurl handle and worker thread per load-test metadata client, avoiding per-request process churn under emulation while retaining fresh connections, workload, strict retry rules and transport failure evidence.
 
 - Recheck transport writability before rejecting an elapsed write-idle deadline; retain stalled-write and absolute lifetime limits, and report pending I/O, poll gaps and recovered deadlines in bounded transport summaries.
 - Preserve failed load-request timing, socket ports and actual attempt counts; add bounded server transport diagnostics and VM failure pressure/journal evidence without logging request contents.

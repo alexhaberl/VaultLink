@@ -210,16 +210,14 @@ existing CI, fuzz, security, and release checks. No missing or skipped matrix
 row is treated as success.
 
 The metadata portion of both load profiles uses `tools/load-metadata.py` and
-its distribution's existing libcurl multi interface. One process drives 100
-(full) or 50 (smoke) independent clients, each making 20 sequential requests.
+its distribution's existing libcurl easy interface. One process runs 100
+(full) or 50 (smoke) independent client threads, each making 20 sequential requests
+with its own retained libcurl handle.
 Every request still opens a fresh TCP connection. This avoids thousands of
 shell/curl process creations competing with download readers on the two client
-CPUs under TCG. Within the inherited client CPU set, metadata uses the first
-CPU and the transfer profiles use the remaining CPUs (sharing the one CPU
-when only one is available). Thus the usual two-client-CPU layout becomes
-metadata on CPU 2 and transfers on CPU 3, without increasing resources. This
-also prevents the single metadata process being outscheduled by the many
-transfer workers. `client-cpus.env` retains the selected and verified placement.
+CPUs under TCG. All workers inherit the original client CPU set. Each metadata
+client remains separately schedulable beside the transfer workers, without
+changing their CPU allocation or serializing all metadata I/O in one event loop.
 The range and upload/readback clients, simultaneous start barrier, byte counts,
 hashes, service CPU/RSS limits and application timeouts
 are unchanged. A 503 retry pauses only its own client; the existing three-retry
@@ -237,8 +235,8 @@ transferred byte counts, and local/remote TCP ports. The measurements survive
 curl transport errors such as 52 (empty response) and 18 (partial transfer).
 URLs, tokens, headers, bodies and raw curl error strings are not included.
 Successful result CSV formats remain unchanged. `metadata-generator.env`
-records the engine, client count, fresh-connection policy, elapsed/CPU time,
-maximum event-loop poll gap and maximum connect-to-pretransfer interval. These
+records the engine, client/thread count, inherited CPU set, fresh-connection
+policy, elapsed/CPU time and maximum connect-to-pretransfer interval. These
 are client diagnostics, not proof of server scheduling or a specific timeout.
 Metadata attempt counts include
 failed exchanges; `metadata_unattempted_requests` distinguishes requests that

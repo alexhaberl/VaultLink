@@ -2,18 +2,20 @@
 """Run the metadata clients with the distro's libcurl, without per-request exec.
 
 Only the load generator changes: each exchange uses a fresh HTTP connection.
-The public libcurl multi ABI drives all clients concurrently in one process.
-See https://curl.se/libcurl/c/libcurl-multi.html . No third-party Python module
-or build step is needed on the immutable guest or the soak host.
+Each client has its own thread and libcurl easy handle, retained for 20 requests.
+See https://curl.se/libcurl/c/threadsafe.html . No third-party Python module or
+build step is needed on the immutable guest or the soak host.
 """
 
 import ctypes as C
 import ctypes.util
+import concurrent.futures
 import os
 from pathlib import Path
 import re
 import signal
 import sys
+import threading
 import time
 
 
@@ -21,15 +23,8 @@ class CurlFailure(Exception):
     """A numeric library error; never include a URL or raw libcurl error."""
 
 
-class MessageData(C.Union):
-    _fields_ = [("whatever", C.c_void_p), ("result", C.c_int)]
-
-
-class Message(C.Structure):
-    _fields_ = [("message", C.c_int), ("easy", C.c_void_p), ("data", MessageData)]
-
-
 CALLBACK = C.CFUNCTYPE(C.c_size_t, C.c_void_p, C.c_size_t, C.c_size_t, C.c_void_p)
+PROGRESS = C.CFUNCTYPE(C.c_int, C.c_void_p, C.c_int64, C.c_int64, C.c_int64, C.c_int64)
 
 
 class Curl:
@@ -42,19 +37,13 @@ class Curl:
             "global_init": (C.c_int, [C.c_long]),
             "global_cleanup": (None, []),
             "easy_init": (C.c_void_p, []),
+            "easy_perform": (C.c_int, [C.c_void_p]),
             "easy_cleanup": (None, [C.c_void_p]),
             # Only the fixed arguments of these two variadic C APIs are listed.
             "easy_setopt": (C.c_int, [C.c_void_p, C.c_int]),
             "easy_getinfo": (C.c_int, [C.c_void_p, C.c_int]),
             "slist_append": (C.c_void_p, [C.c_void_p, C.c_char_p]),
             "slist_free_all": (None, [C.c_void_p]),
-            "multi_init": (C.c_void_p, []),
-            "multi_cleanup": (C.c_int, [C.c_void_p]),
-            "multi_add_handle": (C.c_int, [C.c_void_p, C.c_void_p]),
-            "multi_remove_handle": (C.c_int, [C.c_void_p, C.c_void_p]),
-            "multi_perform": (C.c_int, [C.c_void_p, C.POINTER(C.c_int)]),
-            "multi_poll": (C.c_int, [C.c_void_p, C.c_void_p, C.c_uint, C.c_int, C.POINTER(C.c_int)]),
-            "multi_info_read": (C.POINTER(Message), [C.c_void_p, C.POINTER(C.c_int)]),
         }
         for name, (result, arguments) in signatures.items():
             function = getattr(self.lib, "curl_" + name)
@@ -85,7 +74,7 @@ class Client:
         self.curl, self.work, self.index = curl, work, index
         self.identity = f"198.18.1.{index + 1}"
         self.attempts = self.completed = self.started = self.retries = 0
-        self.active = self.failed = False
+        self.failed = False
         self.ready_at = 0.0
         self.max_pretransfer_gap = 0.0
         self.header_bytes = 0
@@ -128,13 +117,14 @@ class Client:
             self.retry_headers.append(line.partition(b":")[2].strip())
         return length
 
-    def start(self, multi):
+    def perform(self):
         self.attempts += 1
         self.started = self.completed + 1
         self.header_bytes = 0
         self.retry_headers.clear()
-        self.curl.check(self.curl.multi_add_handle(multi, self.easy))
-        self.active = True
+        # CDLL releases the GIL during libcurl's blocking I/O. No handle is ever
+        # accessed by two workers, and the main thread cleans up only after join.
+        return self.curl.easy_perform(self.easy)
 
     def diagnostic(self, code, status, duration):
         curl = self.curl
@@ -195,67 +185,59 @@ class Client:
 def run(work, count, connect_timeout, request_timeout, ready_timeout):
     curl = Curl()
     clients = []
-    multi = curl.multi_init()
-    max_poll_gap = 0.0
-    started = time.monotonic()
-    cpu_started = time.process_time()
+    stop = threading.Event()
+    go = threading.Event()
+    assembled = threading.Barrier(count + 1)
+    result_lock = threading.Lock()
+    started, cpu_started = time.monotonic(), time.process_time()
+    progress = PROGRESS(lambda *_args: int(stop.is_set()))
+
+    def worker(client):
+        assembled.wait(timeout=ready_timeout)
+        go.wait()
+        while not stop.is_set() and not client.failed and client.completed < 20:
+            delay = max(0, client.ready_at - time.monotonic())
+            if delay and stop.wait(delay):
+                break
+            code = client.perform()
+            with result_lock:
+                client.finish(code)
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=count)
     try:
-        if not multi:
-            raise CurlFailure("libcurl multi allocation failed")
         url = os.environ["VAULTLINK_BASE_URL"] + "/v/" + os.environ["DOWNLOAD_TOKEN"]
         for index in range(count):
-            clients.append(Client(curl, work, index, url, connect_timeout, request_timeout))
+            client = Client(curl, work, index, url, connect_timeout, request_timeout)
+            clients.append(client)
+            # CURLOPT_NOPROGRESS / XFERINFOFUNCTION allow SIGTERM to interrupt
+            # stalled requests, rather than waiting for the request deadline.
+            curl.option(client.easy, 43, 0)
+            curl.option(client.easy, 20219, progress)
+        futures = [executor.submit(worker, client) for client in clients]
+        assembled.wait(timeout=ready_timeout)
         (work / "metadata-ready").touch()
         deadline = time.monotonic() + ready_timeout
         while not (work / "profile-go").exists():
             if time.monotonic() >= deadline:
                 raise CurlFailure("metadata profile start barrier timed out")
             time.sleep(0.05)
-        started = time.monotonic()
-        cpu_started = time.process_time()
-        by_handle = {client.easy: client for client in clients}
-        previous_poll = time.monotonic()
-        while True:
-            now = time.monotonic()
-            pending = [client for client in clients if not client.failed and client.completed < 20]
-            if not pending:
-                break
-            for client in pending:
-                if not client.active and now >= client.ready_at:
-                    client.start(multi)
-            max_poll_gap = max(max_poll_gap, time.monotonic() - previous_poll)
-            previous_poll = time.monotonic()
-            running = C.c_int()
-            curl.check(curl.multi_perform(multi, C.byref(running)))
-            queued = C.c_int()
-            while message := curl.multi_info_read(multi, C.byref(queued)):
-                # Copy before removal: libcurl owns and may invalidate the message.
-                event, handle, code = message.contents.message, message.contents.easy, message.contents.data.result
-                if event != 1:
-                    raise CurlFailure("unexpected libcurl completion event")
-                client = by_handle[handle]
-                client.finish(code)
-                curl.check(curl.multi_remove_handle(multi, handle))
-                client.active = False
-            # Handles completed above are rescheduled immediately on the next
-            # iteration. Otherwise libcurl waits for sockets/timers, not a spin.
-            if any(not client.active and not client.failed and client.completed < 20
-                   and client.ready_at <= time.monotonic() for client in clients):
-                continue
-            curl.check(curl.multi_poll(multi, None, 0, 100, None))
+        started, cpu_started = time.monotonic(), time.process_time()
+        go.set()
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
         return int(any(client.failed or client.completed != 20 for client in clients))
     finally:
+        stop.set()
+        go.set()
+        assembled.abort()
+        executor.shutdown(wait=True)
         for client in clients:
-            if client.active:
-                curl.multi_remove_handle(multi, client.easy)
             client.close()
-        if multi:
-            curl.multi_cleanup(multi)
         curl.global_cleanup()
         (work / "metadata-generator.env").write_text(
-            f"engine=libcurl-multi\nprocesses=1\nclients={count}\nrequests_per_client=20\n"
+            f"engine=libcurl-threads\nprocesses=1\nclients={count}\nrequests_per_client=20\n"
             f"cpu_set={','.join(map(str, sorted(os.sched_getaffinity(0))))}\n"
-            f"fresh_connections=true\nmax_poll_gap_seconds={max_poll_gap:.6f}\n"
+            f"fresh_connections=true\nworker_threads={count}\n"
             f"elapsed_seconds={time.monotonic() - started:.6f}\ncpu_seconds={time.process_time() - cpu_started:.6f}\n"
             f"max_pretransfer_gap_seconds={max((client.max_pretransfer_gap for client in clients), default=0):.6f}\n",
             encoding="ascii")
@@ -282,7 +264,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda _signal, _frame: sys.exit(143))
     try:
         sys.exit(main())
-    except (CurlFailure, OSError, KeyError, ValueError, AttributeError) as error:
+    except (CurlFailure, OSError, KeyError, ValueError, AttributeError, RuntimeError,
+            threading.BrokenBarrierError) as error:
         # Exception strings from environment/path parsing may contain tokens.
         detail = str(error) if isinstance(error, CurlFailure) else type(error).__name__
         print(f"metadata generator failed: {detail}", file=sys.stderr)

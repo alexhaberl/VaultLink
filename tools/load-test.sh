@@ -18,7 +18,6 @@ export LC_ALL LANG
 : "${VAULTLINK_CONFIG:?set VAULTLINK_CONFIG}"
 command -v curl >/dev/null
 command -v python3 >/dev/null
-command -v taskset >/dev/null
 metadata_script=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/load-metadata.py
 if [ ! -f "$metadata_script" ] || [ -L "$metadata_script" ]; then
     echo "metadata generator helper is missing or unsafe" >&2
@@ -332,11 +331,6 @@ profile_curl() {
 }
 
 work=$(mktemp -d)
-client_cpu_layout=$(python3 -c 'import os; cpus = sorted(os.sched_getaffinity(0)); print(str(cpus[0]) + " " + ",".join(map(str, cpus[1:] or cpus)))')
-metadata_client_cpus=${client_cpu_layout%% *}
-transfer_client_cpus=${client_cpu_layout#* }
-printf 'metadata_cpu_set=%s\ntransfer_cpu_set=%s\n' \
-    "$metadata_client_cpus" "$transfer_client_cpus" >"$work/client-cpus.env"
 load_stage=initialization
 admission_holders=""
 stop_admission_holders() {
@@ -357,14 +351,12 @@ persist_load_evidence() {
         >"$load_command_tmp" || return 1
     chmod 0640 "$load_command_tmp" || return 1
     mv "$load_command_tmp" "$LOAD_TEST_EVIDENCE_DIR/load-command.env" || return 1
-    for diagnostic_context in metadata-generator.env client-cpus.env; do
-        if [ -f "$work/$diagnostic_context" ] && [ ! -L "$work/$diagnostic_context" ]; then
-            install -m 0640 "$work/$diagnostic_context" \
-                "$LOAD_TEST_EVIDENCE_DIR/$diagnostic_context" || return 1
-        elif [ "$persist_status" -eq 0 ]; then
-            return 1
-        fi
-    done
+    if [ -f "$work/metadata-generator.env" ] && [ ! -L "$work/metadata-generator.env" ]; then
+        install -m 0640 "$work/metadata-generator.env" \
+            "$LOAD_TEST_EVIDENCE_DIR/metadata-generator.env" || return 1
+    elif [ "$persist_status" -eq 0 ]; then
+        return 1
+    fi
     [ "$persist_status" -ne 0 ] || return 0
 
     # Each worker owns its file, avoiding interleaved writes from 150 clients.
@@ -593,11 +585,12 @@ wait_for_profile_go() {
 metadata_profile() {
     # Preserve 100/50 independent clients and fresh connections while avoiding
     # thousands of fork/execs competing with the download readers under TCG.
-    taskset --cpu-list "$metadata_client_cpus" \
-        python3 "$metadata_script" "$work" "$metadata_clients" \
+    python3 "$metadata_script" "$work" "$metadata_clients" \
         "$connect_timeout" "$metadata_max_time" "$profile_ready_timeout" &
     metadata_worker=$!
-    trap 'kill "$metadata_worker" 2>/dev/null || true' HUP INT TERM
+    # A signal interrupts the shell's outer wait. Join again in the trap so
+    # libcurl workers finish cancellation and flush counts before aggregation.
+    trap 'kill "$metadata_worker" 2>/dev/null || true; wait "$metadata_worker" 2>/dev/null || true' HUP INT TERM
     metadata_failed=0
     wait "$metadata_worker" || metadata_failed=1
     trap - HUP INT TERM
@@ -649,18 +642,7 @@ metadata_profile() {
     printf '%s\n' "$p95_within_limit" >"$work/metadata.p95-within-limit"
 }
 
-pin_transfer_profile() {
-    # POSIX shells retain the parent's $$ in background functions. Reading
-    # /proc/self/stat with a shell builtin identifies this actual worker.
-    IFS=' ' read -r profile_pid _ </proc/self/stat
-    case "$profile_pid" in ''|*[!0-9]*) return 1 ;; esac
-    taskset -pc "$transfer_client_cpus" "$profile_pid" >/dev/null
-    profile_cpus=$(python3 -c 'import os, sys; cpus = sorted(os.sched_getaffinity(0)); assert cpus == list(map(int, sys.argv[1].split(","))); print(",".join(map(str, cpus)))' "$transfer_client_cpus")
-    printf '%s_cpu_set=%s\n' "$1" "$profile_cpus" >>"$work/client-cpus.env"
-}
-
 download_profile() {
-    pin_transfer_profile download
     download_pids=""
     download=0
     while [ "$download" -lt "$range_streams" ]; do
@@ -749,7 +731,6 @@ download_profile() {
 }
 
 upload_profile() {
-    pin_transfer_profile upload
     upload_pids=""
     upload=0
     while [ "$upload" -lt "$upload_clients" ]; do

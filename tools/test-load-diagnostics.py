@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 
 SOURCE = Path(__file__).with_name("load-test.sh").read_text()
 
@@ -105,7 +106,6 @@ work=$TEST_WORK
 load_stage=parallel-profiles
 metadata_clients=2
 metadata_script=$TEST_METADATA_SCRIPT
-metadata_client_cpus=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
 profile_ready_timeout=5
 : >"$work/profile-go"
 connect_timeout=2
@@ -128,6 +128,34 @@ metadata_profile
         diagnostics = (evidence / "transport-failures.log").read_text()
         assert "curl_exit=52" in diagnostics and "request=10" in diagnostics
         assert "SECRET" not in diagnostics + result.stderr
+
+        # SIGTERM interrupts the shell's wait before the Python worker has
+        # flushed counts. The profile must join it before persisting evidence.
+        work = root / "metadata-cancel"
+        work.mkdir()
+        evidence = root / "cancel-evidence"
+        process = subprocess.Popen(["sh", "-c", script.replace(': >"$work/profile-go"', ":")],
+            env={**os.environ, "TEST_WORK": str(work), "LOAD_TEST_EVIDENCE_DIR": str(evidence),
+                 "TEST_METADATA_SCRIPT": str(Path(__file__).with_name("load-metadata.py").resolve()),
+                 "VAULTLINK_BASE_URL": base, "DOWNLOAD_TOKEN": "SECRET_TOKEN"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not (work / "metadata-ready").exists():
+                assert process.poll() is None
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=5)
+            assert process.returncode == 1, stderr
+            counts = sorted(csv.reader((evidence / "metadata-request-counts.partial.csv").open()))
+            assert counts == [["0", "0", "0", "0"], ["1", "0", "0", "0"]], counts
+            assert (evidence / "metadata-generator.env").is_file()
+            assert "SECRET" not in stdout + stderr
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
 finally:
     server.shutdown()
     server.server_close()
