@@ -2,10 +2,12 @@
 
 ## 0.7.0 — 2026-09-12
 
+- Dispatch queued metadata and transfer database work independently of HTTP task polling, retaining FIFO admission, pool capacity, the shared one-second queue deadline, and cancellation-safe quota/audit handling.
+- Record bounded slow database worker and ownership timings at INFO, with separate unsuppressed admission-failure timings and no request contents.
 - Serve unprotected public metadata with one fresh share lookup when clean storage authority is immediately available; preserve revocation and password rechecks after waiting for storage authority or validating an unlock cookie.
 - Service blocking database and filesystem completions promptly while bulk-transfer tasks keep local scheduler queues busy, retaining worker counts and deadlines; isolate transport log tests from unrelated tests consuming the global warning budget.
 - Prioritize transfer progress in one existing database runtime slot while allowing general work to borrow it when idle, preventing queued metadata readers from starving serialized upload and lease writes without reducing idle read capacity or increasing the pool size and admission deadline.
-- Retain a libcurl handle and worker thread per load-test metadata client, avoiding per-request process churn under emulation while retaining fresh connections, workload, strict retry rules and transport failure evidence.
+- Retain a libcurl handle and worker process per load-test metadata client, isolating callbacks and avoiding per-request process churn under emulation while retaining fresh connections, workload, strict retry rules and transport failure evidence.
 - Recheck transport writability before rejecting an elapsed write-idle deadline; retain stalled-write and absolute lifetime limits, and report pending I/O, poll gaps and recovered deadlines in bounded transport summaries.
 - Preserve failed load-request timing, socket ports and actual attempt counts; add bounded server transport diagnostics and VM failure pressure/journal evidence without logging request contents.
 - Reset the HTTP write-idle timeout when partial writes make progress, preventing active slow downloads from being cut off while retaining stalled-write and absolute connection deadlines.

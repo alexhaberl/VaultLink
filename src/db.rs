@@ -1,6 +1,7 @@
 mod admission_diagnostics;
 mod audit;
 mod auth;
+mod dispatch;
 mod executor;
 mod keyring;
 mod public_sessions;
@@ -9,9 +10,11 @@ mod runtime_settings;
 mod schema;
 mod service_tokens;
 mod shares;
+mod slow_diagnostics;
 mod transfer_handoff;
 mod transfers;
 
+pub(crate) use dispatch::{dispatch_database_work, dispatch_transfer_database_work};
 pub(crate) use executor::{
     execute_database_operation, execute_transfer_database_operation, DatabaseExecutionError,
     DatabaseExecutorAdmission,

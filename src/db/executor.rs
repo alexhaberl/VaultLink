@@ -1,8 +1,6 @@
 use super::Database;
 use std::{error::Error, fmt, time::Duration};
 
-const DATABASE_EXECUTOR_QUEUE_TIMEOUT: Duration = Duration::from_secs(1);
-
 /// Transport-neutral admission failure produced before a database task starts.
 ///
 /// The class and elapsed queue time are retained so an adapter can preserve
@@ -16,6 +14,14 @@ pub(crate) struct DatabaseExecutorAdmission {
 }
 
 impl DatabaseExecutorAdmission {
+    pub(super) fn new(database: &Database, class: &'static str, queue_duration: Duration) -> Self {
+        Self {
+            class,
+            queue_duration,
+            state: database.runtime_admission_state(),
+        }
+    }
+
     pub(crate) fn class(&self) -> &'static str {
         self.class
     }
@@ -47,7 +53,7 @@ pub(crate) enum DatabaseExecutionError<E> {
     Operation(E),
 }
 
-/// Runs synchronous database work behind the fair per-database semaphore.
+/// Queues synchronous database work behind the fair per-database semaphore.
 ///
 /// The permit is moved into the blocking task. Dropping the request future can
 /// therefore never admit replacement work while SQLite is still running.
@@ -61,17 +67,15 @@ where
     E: Send + 'static,
     F: FnOnce(Database) -> Result<T, E> + Send + 'static,
 {
-    let queue_started = std::time::Instant::now();
-    let permit = tokio::time::timeout(
-        DATABASE_EXECUTOR_QUEUE_TIMEOUT,
-        database.acquire_runtime_permit(),
-    )
+    super::dispatch_database_work(database, class, move |database, permit| {
+        let _permit = permit;
+        operation(database)
+    })
     .await
-    .map_err(|_| admission(&database, class, queue_started.elapsed()))?
-    .map_err(|_| admission(&database, class, queue_started.elapsed()))?;
-
-    execute_admitted_database_operation(database, class, queue_started.elapsed(), permit, operation)
-        .await
+    .map_err(DatabaseExecutionError::Admission)?
+    .await
+    .map_err(DatabaseExecutionError::Join)?
+    .map_err(DatabaseExecutionError::Operation)
 }
 
 /// Runs a synchronous transfer write after serializing writers ahead of the
@@ -86,63 +90,13 @@ where
     E: Send + 'static,
     F: FnOnce(Database) -> Result<T, E> + Send + 'static,
 {
-    let queue_started = std::time::Instant::now();
-    let permit = tokio::time::timeout(
-        DATABASE_EXECUTOR_QUEUE_TIMEOUT,
-        database.acquire_transfer_runtime_permit(),
-    )
-    .await
-    .map_err(|_| admission(&database, class, queue_started.elapsed()))?
-    .map_err(|_| admission(&database, class, queue_started.elapsed()))?;
-
-    execute_admitted_database_operation(database, class, queue_started.elapsed(), permit, operation)
-        .await
-}
-
-async fn execute_admitted_database_operation<T, E, F, P>(
-    database: Database,
-    class: &'static str,
-    queue_duration: Duration,
-    permit: P,
-    operation: F,
-) -> Result<T, DatabaseExecutionError<E>>
-where
-    T: Send + 'static,
-    E: Send + 'static,
-    F: FnOnce(Database) -> Result<T, E> + Send + 'static,
-    P: super::admission_diagnostics::DatabaseWorkPermit,
-{
-    tokio::task::spawn_blocking(move || {
-        permit.begin_work(class);
+    super::dispatch_transfer_database_work(database, class, move |database, permit| {
         let _permit = permit;
-        let operation_started = std::time::Instant::now();
-        let result = operation(database);
-        tracing::debug!(
-            operation = "database.executor",
-            class,
-            queue_duration_ms = duration_millis(queue_duration),
-            operation_duration_ms = duration_millis(operation_started.elapsed()),
-            "database operation completed"
-        );
-        result
+        operation(database)
     })
+    .await
+    .map_err(DatabaseExecutionError::Admission)?
     .await
     .map_err(DatabaseExecutionError::Join)?
     .map_err(DatabaseExecutionError::Operation)
-}
-
-fn admission<E>(
-    database: &Database,
-    class: &'static str,
-    queue_duration: Duration,
-) -> DatabaseExecutionError<E> {
-    DatabaseExecutionError::Admission(DatabaseExecutorAdmission {
-        class,
-        queue_duration,
-        state: database.runtime_admission_state(),
-    })
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }

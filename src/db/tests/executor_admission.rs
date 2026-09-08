@@ -312,89 +312,9 @@ async fn cancelled_transfer_writer_waiter_releases_its_queue_position() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn transfer_writer_admission_uses_one_timeout_across_both_queues() {
-    let database = Database::open(":memory:").unwrap();
-    let transfer_holder = database
-        .acquire_transfer_runtime_permit()
-        .await
-        .expect("the transfer holder must acquire writer and runtime admission");
-    // Queue a general runtime waiter before the candidate can reach the
-    // global queue. It deterministically takes the transfer holder's global
-    // permit after release and forces the candidate through both stages.
-    let (catcher_started_sender, catcher_started_receiver) = tokio::sync::oneshot::channel();
-    let (catcher_acquired_sender, catcher_acquired_receiver) = tokio::sync::oneshot::channel();
-    let (release_catcher_sender, release_catcher_receiver) = tokio::sync::oneshot::channel();
-    let catcher_database = database.clone();
-    let catcher = tokio::spawn(async move {
-        let _permit = await_after_first_pending(
-            catcher_database.acquire_runtime_permit(),
-            catcher_started_sender,
-        )
-        .await
-        .expect("runtime admission must remain open");
-        let _ = catcher_acquired_sender.send(());
-        let _ = release_catcher_receiver.await;
-    });
-    tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, catcher_started_receiver)
-        .await
-        .expect("the global waiter must be polled")
-        .expect("the global waiter must announce its start");
-    assert!(!catcher.is_finished());
-
-    let (candidate_started_sender, candidate_started_receiver) = tokio::sync::oneshot::channel();
-    let candidate_database = database.clone();
-    let candidate = tokio::spawn(async move {
-        await_after_first_pending(
-            execute_transfer_database_operation(
-                candidate_database,
-                "two_queue_transfer_write",
-                |_| -> Result<(), rusqlite::Error> {
-                    panic!("a writer exceeding the shared queue budget must not run")
-                },
-            ),
-            candidate_started_sender,
-        )
-        .await
-    });
-    tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, candidate_started_receiver)
-        .await
-        .expect("the candidate writer must be polled")
-        .expect("the candidate writer must announce its start");
-    assert!(!candidate.is_finished());
-
-    tokio::time::pause();
-    tokio::time::advance(std::time::Duration::from_millis(750)).await;
-    drop(transfer_holder);
-    catcher_acquired_receiver
-        .await
-        .expect("the global waiter must acquire the released runtime permit");
-
-    tokio::time::advance(std::time::Duration::from_millis(300)).await;
-    tokio::task::yield_now().await;
-    assert!(
-        candidate.is_finished(),
-        "writer admission must use one one-second budget across both queues"
-    );
-    let candidate_result = candidate
-        .await
-        .expect("the candidate writer task must not panic");
-
-    let _ = release_catcher_sender.send(());
-    catcher
-        .await
-        .expect("the global waiter task must not panic");
-    tokio::time::resume();
-
-    match candidate_result {
-        Err(DatabaseExecutionError::Admission(admission)) => {
-            assert_eq!(admission.class(), "two_queue_transfer_write");
-            assert_eq!(admission.state().runtime_available, 0);
-            assert_eq!(admission.state().general_available, 0);
-        }
-        result => panic!("writer admission must time out after the shared budget: {result:?}"),
-    }
-}
+// The shared-deadline regression lives beside DatabaseJob in dispatch.rs. It
+// polls the real composite admission with a controlled monotonic clock because
+// Tokio's paused timer driver deliberately does not control the dispatcher.
 
 #[test]
 fn typed_transfer_cleanup_queue_survives_immediate_runtime_shutdown() {

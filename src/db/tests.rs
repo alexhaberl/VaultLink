@@ -1,5 +1,7 @@
 include!("tests/test_support.rs");
 include!("tests/executor_admission.rs");
+include!("tests/executor_dispatch.rs");
+include!("tests/dispatch_diagnostics.rs");
 include!("tests/required_audit.rs");
 include!("tests/database_and_shares.rs");
 include!("tests/auth_sessions.rs");

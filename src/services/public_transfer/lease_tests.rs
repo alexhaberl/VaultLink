@@ -87,7 +87,10 @@ async fn public_transfer_capacity_reports_waiter_and_owner_phase() {
         .with_writer(move || writer.clone())
         .finish();
     let _subscriber = tracing::subscriber::set_default(subscriber);
-    let result = acquire_transfer_database_permit(&database, "transfer_complete").await;
+    let result = dispatch_transfer_work::<(), _>(database.clone(), "transfer_complete", |_, _| {
+        panic!("an operation rejected by admission must not start")
+    })
+    .await;
     drop(holder);
     assert!(matches!(result, Err(PublicTransferError::Capacity)));
     let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();

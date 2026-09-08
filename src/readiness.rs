@@ -99,35 +99,40 @@ impl ReadinessProbe {
             if let Some(ready) = self.cached() {
                 return Ok(ready);
             }
-            let database_permit =
-                tokio::time::timeout(Duration::from_secs(1), database.acquire_runtime_permit())
-                    .await
-                    .map_err(|_| "database readiness admission timed out")?
-                    .map_err(|_| "database readiness admission closed")?;
             let cache = self.inner.cache.clone();
             let runner = self.inner.runner.clone();
-            tokio::task::spawn_blocking(move || {
-                // The permit deliberately lives inside the blocking task. A timed-out
-                // caller cannot start more probes while this one remains stuck.
-                let _permit = permit;
-                let _database_permit = database_permit;
-                let result = runner(&database, &storage);
-                let ready = result.is_ok();
-                *cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedReadiness {
-                    checked_at: Instant::now(),
-                    ready,
-                });
-                if let Err(failure) = result {
-                    tracing::warn!(
-                        component = failure.component,
-                        error = %EscapedLogValue::new(&failure.error),
-                        "readiness probe failed"
-                    );
-                }
-                ready
-            })
+            crate::db::dispatch_database_work(
+                database,
+                "readiness",
+                move |database, database_permit| {
+                    // The permit deliberately lives inside the blocking task. A timed-out
+                    // caller cannot start more probes while this one remains stuck.
+                    let _permit = permit;
+                    let _database_permit = database_permit;
+                    let result = runner(&database, &storage);
+                    let ready = result.is_ok();
+                    *cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(CachedReadiness {
+                            checked_at: Instant::now(),
+                            ready,
+                        });
+                    if let Err(failure) = result {
+                        tracing::warn!(
+                            component = failure.component,
+                            error = %EscapedLogValue::new(&failure.error),
+                            "readiness probe failed"
+                        );
+                    }
+                    ready
+                },
+            )
+            .await
+            .map_err(|error| {
+                error.state().report(error.class(), error.queue_duration());
+                "database readiness admission unavailable"
+            })?
             .await
             .map_err(|error| {
                 tracing::error!(error = %error, "readiness probe task failed");
