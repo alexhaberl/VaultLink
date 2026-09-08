@@ -592,7 +592,30 @@ mod tests {
         );
 
         drop(surviving_clone);
-        AppState::new(second_config).expect("dropping the final state must release the lock");
+        AppState::new(second_config).unwrap_or_else(|error| {
+            let category = match error.downcast_ref::<StorageInstanceLockError>() {
+                Some(StorageInstanceLockError::Contended { .. }) => "lock_contended",
+                Some(_) => "storage_lock_other",
+                None if error.is::<db::DatabaseError>() => "database",
+                None if error.is::<std::io::Error>() => "io",
+                None => "startup_other",
+            };
+            eprintln!("storage_lock_test_failure stage=last_state_drop category={category}");
+            if let Some(database) = error.downcast_ref::<db::DatabaseError>() {
+                let (kind, source) = match database {
+                    db::DatabaseError::Pool(_) => ("pool", None),
+                    db::DatabaseError::Busy(source) => ("busy", Some(source)),
+                    db::DatabaseError::Invariant(source) => ("invariant", Some(source)),
+                    db::DatabaseError::Schema(source) => ("schema", Some(source)),
+                    db::DatabaseError::Cryptography(source) => ("cryptography", Some(source)),
+                    db::DatabaseError::Corruption(source) => ("corruption", Some(source)),
+                    db::DatabaseError::Sqlite(source) => ("sqlite", Some(source)),
+                };
+                let code = source.and_then(rusqlite::Error::sqlite_error_code);
+                eprintln!("storage_lock_test_database_failure kind={kind} code={code:?}");
+            }
+            panic!("dropping the final state must release the lock");
+        });
     }
 
     #[test]
