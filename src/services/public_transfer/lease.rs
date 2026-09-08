@@ -218,33 +218,38 @@ async fn begin_transfer_lease_cancellation_safe(
     resource_key: String,
     action: &'static str,
 ) -> Result<PendingLeaseOwnership, PublicTransferError> {
-    let permit = acquire_transfer_database_permit(&database, "transfer_lease_begin").await?;
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
-    tokio::task::spawn_blocking(move || {
-        let admission = permit;
-        admission.begin_work("lease_begin");
-        let outcome = database.begin_transfer_lease(
-            &session_token,
-            &lease_token,
-            share_id,
-            &resource_key,
-            action,
-        );
-        let reserved = matches!(
-            outcome,
-            Ok(TransferLeaseBeginOutcome::NewLease | TransferLeaseBeginOutcome::AlreadyCounted)
-        );
-        if outcome_sender.send(outcome).is_err() {
-            if reserved {
-                let _ = database.cancel_transfer_lease(&lease_token);
+    let worker = dispatch_transfer_work(
+        database,
+        "transfer_lease_begin",
+        move |database, admission| {
+            let outcome = database.begin_transfer_lease(
+                &session_token,
+                &lease_token,
+                share_id,
+                &resource_key,
+                action,
+            );
+            let reserved = matches!(
+                outcome,
+                Ok(TransferLeaseBeginOutcome::NewLease | TransferLeaseBeginOutcome::AlreadyCounted)
+            );
+            if outcome_sender.send(outcome).is_err() {
+                if reserved {
+                    let _ = database.cancel_transfer_lease(&lease_token);
+                }
+                return;
             }
-            return;
-        }
-        if reserved {
-            database.finish_lease_handoff(admission, ownership_receiver, lease_token);
-        }
-    });
+            if reserved {
+                database.finish_lease_handoff(admission, ownership_receiver, lease_token);
+            }
+        },
+    )
+    .await?;
+    // The blocking worker waits for HTTP ownership after publishing its outcome.
+    // Await only dispatch; joining before claim would deadlock this handoff.
+    drop(worker);
     let outcome = outcome_receiver
         .await
         .map_err(|error| {
@@ -304,19 +309,19 @@ async fn heartbeat_once(
     share_id: i64,
     client_ip: Option<String>,
 ) -> bool {
-    let Ok(permit) = acquire_transfer_database_permit(&database, "transfer_heartbeat").await else {
+    let Ok(worker) =
+        dispatch_transfer_work(database, "transfer_heartbeat", move |database, permit| {
+            let _permit = permit;
+            database.heartbeat_transfer_lease_and_audit(
+                &lease_token,
+                &AuditContext::new("public", client_ip),
+            )
+        })
+        .await
+    else {
         return true;
     };
-    match tokio::task::spawn_blocking(move || {
-        permit.begin_work("transfer_heartbeat");
-        let _permit = permit;
-        database.heartbeat_transfer_lease_and_audit(
-            &lease_token,
-            &AuditContext::new("public", client_ip),
-        )
-    })
-    .await
-    {
+    match worker.await {
         Ok(Ok(crate::db::TransferLeaseHeartbeatOutcome::Extended)) => true,
         Ok(Ok(crate::db::TransferLeaseHeartbeatOutcome::CappedAndCounted)) => {
             tracing::warn!(
@@ -359,23 +364,21 @@ pub(super) fn transfer_complete_future(
     Box<dyn Future<Output = Result<(), crate::internal_reporting::ReportedInternalError>> + Send>,
 > {
     Box::pin(async move {
-        let permit = acquire_transfer_database_permit(&database, "transfer_complete")
+        let worker =
+            dispatch_transfer_work(database, "transfer_complete", move |database, permit| {
+                let _permit = permit;
+                database.complete_transfer_lease_and_audit(
+                    &lease_token,
+                    &AuditContext::new("public", client_ip),
+                    action,
+                    share_id,
+                )
+            })
             .await
             .map_err(|error| {
                 report_internal(InternalOperation::WebTransferCompleteDatabase, error)
             })?;
-        let result = tokio::task::spawn_blocking(move || {
-            permit.begin_work("transfer_complete");
-            let _permit = permit;
-            database.complete_transfer_lease_and_audit(
-                &lease_token,
-                &AuditContext::new("public", client_ip),
-                action,
-                share_id,
-            )
-        })
-        .await
-        .map_err(|error| {
+        let result = worker.await.map_err(|error| {
             report_internal(InternalOperation::WebTransferCompleteWorkerJoin, error)
         })?;
         match result {
@@ -401,28 +404,21 @@ pub(super) fn spawn_transfer_cancel(database: &Database, lease_token: String) {
     database.enqueue_transfer_lease_cleanup(&handle, lease_token);
 }
 
-async fn acquire_transfer_database_permit(
-    database: &Database,
+async fn dispatch_transfer_work<T, F>(
+    database: Database,
     class: &'static str,
-) -> Result<crate::db::TransferDatabasePermit, PublicTransferError> {
-    let started = std::time::Instant::now();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        database.acquire_transfer_runtime_permit(),
-    )
-    .await
-    .map_err(|_| {
-        database
-            .runtime_admission_state()
-            .report(class, started.elapsed());
-        PublicTransferError::Capacity
-    })?
-    .map_err(|_| {
-        database
-            .runtime_admission_state()
-            .report(class, started.elapsed());
-        PublicTransferError::Capacity
-    })
+    operation: F,
+) -> Result<tokio::task::JoinHandle<T>, PublicTransferError>
+where
+    T: Send + 'static,
+    F: FnOnce(Database, crate::db::TransferDatabasePermit) -> T + Send + 'static,
+{
+    crate::db::dispatch_transfer_database_work(database, class, operation)
+        .await
+        .map_err(|error| {
+            error.state().report(error.class(), error.queue_duration());
+            PublicTransferError::Capacity
+        })
 }
 
 async fn run_transfer_database_write<T, F>(
@@ -441,7 +437,10 @@ where
     .await
     {
         Ok(value) => Ok(value),
-        Err(crate::db::DatabaseExecutionError::Admission(_)) => Err(PublicTransferError::Capacity),
+        Err(crate::db::DatabaseExecutionError::Admission(error)) => {
+            error.state().report(error.class(), error.queue_duration());
+            Err(PublicTransferError::Capacity)
+        }
         Err(crate::db::DatabaseExecutionError::Join(error)) => Err(PublicTransferError::Internal(
             report_internal(InternalOperation::HttpAuthDatabaseReadJoin, error),
         )),

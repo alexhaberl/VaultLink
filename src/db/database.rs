@@ -188,6 +188,8 @@ impl Database {
         drop(conn);
         Ok(Self(Arc::new(DatabaseInner {
             pool,
+            dispatch: dispatch::DatabaseDispatcher::default(),
+            work_diagnostics: slow_diagnostics::DatabaseWorkDiagnostics::default(),
             runtime_admission: Arc::new(tokio::sync::Semaphore::new(pool_capacity as usize)),
             general_runtime_admission: Arc::new(tokio::sync::Semaphore::new(
                 pool_capacity.saturating_sub(1).max(1) as usize,

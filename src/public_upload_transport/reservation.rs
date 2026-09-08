@@ -1,6 +1,6 @@
 use crate::{
     db::{Database, UploadReservationBeginOutcome},
-    http_auth::{transfer_database, transfer_database_runtime_permit},
+    http_auth::{dispatch_transfer_database_work, transfer_database},
     internal_reporting::{report_internal, InternalOperation},
 };
 
@@ -86,31 +86,33 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
     share_id: i64,
     expected_upload_policy_epoch: i64,
 ) -> Result<PendingReservationOwnership<UploadReservationBeginOutcome>> {
-    let queue_started = std::time::Instant::now();
-    let permit =
-        transfer_database_runtime_permit(&database, "upload_reservation_begin", queue_started)
-            .await?;
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
-    tokio::task::spawn_blocking(move || {
-        let admission = permit;
-        admission.begin_work("upload_begin");
-        let outcome = database.begin_upload_reservation(
-            &reservation_token,
-            share_id,
-            expected_upload_policy_epoch,
-        );
-        let reserved = matches!(outcome, Ok(UploadReservationBeginOutcome::Reserved));
-        if outcome_sender.send(outcome).is_err() {
-            if reserved {
-                let _ = database.cancel_upload_reservation(&reservation_token);
+    let worker = dispatch_transfer_database_work(
+        database,
+        "upload_reservation_begin",
+        move |database, admission| {
+            let outcome = database.begin_upload_reservation(
+                &reservation_token,
+                share_id,
+                expected_upload_policy_epoch,
+            );
+            let reserved = matches!(outcome, Ok(UploadReservationBeginOutcome::Reserved));
+            if outcome_sender.send(outcome).is_err() {
+                if reserved {
+                    let _ = database.cancel_upload_reservation(&reservation_token);
+                }
+                return;
             }
-            return;
-        }
-        if reserved {
-            database.finish_upload_handoff(admission, ownership_receiver, reservation_token);
-        }
-    });
+            if reserved {
+                database.finish_upload_handoff(admission, ownership_receiver, reservation_token);
+            }
+        },
+    )
+    .await?;
+    // The worker waits for HTTP ownership after publishing its outcome.
+    // Await only dispatch here; joining before claim would deadlock the handoff.
+    drop(worker);
     let outcome = outcome_receiver
         .await
         .map_err(|error| {

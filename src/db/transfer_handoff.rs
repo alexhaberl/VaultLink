@@ -45,6 +45,9 @@ impl Database {
             abandoned,
             "transfer ownership handoff finished"
         );
+        self.0
+            .work_diagnostics
+            .record_ownership(kind.class(), started.elapsed(), abandoned);
         if abandoned {
             // Compensation is a new DB operation: use the existing FIFO and
             // bounded deadline, never perform an unadmitted write after release.

@@ -20,8 +20,11 @@ pub struct Database(Arc<DatabaseInner>);
 
 struct DatabaseInner {
     pool: r2d2::Pool<SqliteConnectionManager>,
-    // Admission mirrors the pool capacity and is acquired while still on the
-    // async runtime. This prevents an unbounded number of blocking workers
+    dispatch: dispatch::DatabaseDispatcher,
+    work_diagnostics: slow_diagnostics::DatabaseWorkDiagnostics,
+    // Admission mirrors the pool capacity and precedes worker submission.
+    // The dispatcher polls queued acquisitions without depending on the HTTP
+    // runtime being polled. This prevents an unbounded number of blocking workers
     // from queueing inside r2d2 when SQLite or all pooled connections are
     // saturated. Tokio's semaphore queue is FIFO/fair.
     runtime_admission: Arc<tokio::sync::Semaphore>,

@@ -454,25 +454,25 @@ where
     T: Send + 'static,
     F: FnOnce(&Database) -> rusqlite::Result<T> + Send + 'static,
 {
-    let permit = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        database.acquire_runtime_permit(),
-    )
-    .await
-    .map_err(|_| PublicTransferError::Capacity)?
-    .map_err(|_| PublicTransferError::Capacity)?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+    let result = crate::db::execute_database_operation(database, "read", move |database| {
         operation(&database)
     })
-    .await
-    .map_err(|error| {
-        PublicTransferError::Internal(report_internal(
-            InternalOperation::HttpAuthDatabaseReadJoin,
-            error,
-        ))
-    })?
-    .map_err(|error| {
+    .await;
+    let result = match result {
+        Ok(value) => return Ok(value),
+        Err(crate::db::DatabaseExecutionError::Admission(error)) => {
+            error.state().report(error.class(), error.queue_duration());
+            return Err(PublicTransferError::Capacity);
+        }
+        Err(crate::db::DatabaseExecutionError::Join(error)) => {
+            return Err(PublicTransferError::Internal(report_internal(
+                InternalOperation::HttpAuthDatabaseReadJoin,
+                error,
+            )));
+        }
+        Err(crate::db::DatabaseExecutionError::Operation(error)) => Err(error),
+    };
+    result.map_err(|error| {
         if crate::db::is_audit_unavailable(&error) {
             PublicTransferError::AuditUnavailable
         } else if crate::db::is_sqlite_busy_or_locked(&error) {

@@ -45,18 +45,19 @@ impl TransferSlotPermit {
 
 impl TransferDatabasePermit {
     pub(crate) fn begin_work(&self, class: &'static str) {
-        // At debug level this separates the queued worker from its DB work.
-        if let Some(o) = self
+        // Copy the numeric observation before invoking a tracing subscriber.
+        let worker_queue_ms = self
             ._transfer
             .observation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-        {
+            .map(|o| o.phase_started.elapsed().as_millis() as u64);
+        if let Some(worker_queue_ms) = worker_queue_ms {
             tracing::debug!(
                 operation = "database.transfer_worker",
                 class,
-                worker_queue_ms = o.phase_started.elapsed().as_millis() as u64,
+                worker_queue_ms,
                 "transfer database worker started"
             );
         }

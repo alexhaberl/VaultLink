@@ -517,30 +517,20 @@ pub(crate) async fn database_runtime_permit(
     })
 }
 
-pub(crate) async fn transfer_database_runtime_permit(
-    database: &Database,
+pub(crate) async fn dispatch_transfer_database_work<T, F>(
+    database: Database,
     class: &'static str,
-    queue_started: std::time::Instant,
-) -> Result<crate::db::TransferDatabasePermit> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        database.acquire_transfer_runtime_permit(),
-    )
-    .await
-    .map_err(|_| {
-        database_capacity_unavailable(
-            class,
-            queue_started.elapsed(),
-            database.runtime_admission_state(),
-        )
-    })?
-    .map_err(|_| {
-        database_capacity_unavailable(
-            class,
-            queue_started.elapsed(),
-            database.runtime_admission_state(),
-        )
-    })
+    operation: F,
+) -> Result<tokio::task::JoinHandle<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(Database, crate::db::TransferDatabasePermit) -> T + Send + 'static,
+{
+    crate::db::dispatch_transfer_database_work(database, class, operation)
+        .await
+        .map_err(|error| {
+            database_capacity_unavailable(error.class(), error.queue_duration(), error.state())
+        })
 }
 
 fn database_capacity_unavailable(

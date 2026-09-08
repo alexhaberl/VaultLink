@@ -89,35 +89,38 @@ pub(super) async fn begin_transfer_lease_cancellation_safe(
     resource_key: String,
     action: &'static str,
 ) -> Result<PendingReservationOwnership<TransferLeaseBeginOutcome>> {
-    let queue_started = std::time::Instant::now();
-    let permit =
-        transfer_database_runtime_permit(&database, "transfer_lease_begin", queue_started).await?;
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
-    tokio::task::spawn_blocking(move || {
-        let admission = permit;
-        admission.begin_work("lease_begin");
-        let outcome = database.begin_transfer_lease(
-            &session_token,
-            &lease_token,
-            share_id,
-            &resource_key,
-            action,
-        );
-        let reserved = matches!(
-            outcome,
-            Ok(TransferLeaseBeginOutcome::NewLease) | Ok(TransferLeaseBeginOutcome::AlreadyCounted)
-        );
-        if outcome_sender.send(outcome).is_err() {
-            if reserved {
-                let _ = database.cancel_transfer_lease(&lease_token);
+    let worker = dispatch_transfer_database_work(
+        database,
+        "transfer_lease_begin",
+        move |database, admission| {
+            let outcome = database.begin_transfer_lease(
+                &session_token,
+                &lease_token,
+                share_id,
+                &resource_key,
+                action,
+            );
+            let reserved = matches!(
+                outcome,
+                Ok(TransferLeaseBeginOutcome::NewLease)
+                    | Ok(TransferLeaseBeginOutcome::AlreadyCounted)
+            );
+            if outcome_sender.send(outcome).is_err() {
+                if reserved {
+                    let _ = database.cancel_transfer_lease(&lease_token);
+                }
+                return;
             }
-            return;
-        }
-        if reserved {
-            database.finish_lease_handoff(admission, ownership_receiver, lease_token);
-        }
-    });
+            if reserved {
+                database.finish_lease_handoff(admission, ownership_receiver, lease_token);
+            }
+        },
+    )
+    .await?;
+    // Await launch only: the worker cannot finish until HTTP claims ownership.
+    drop(worker);
     let outcome = outcome_receiver
         .await
         .map_err(|error| {
@@ -146,23 +149,22 @@ pub(super) fn transfer_complete_future(
     client_ip: Option<String>,
 ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
     Box::pin(async move {
-        let queue_started = std::time::Instant::now();
-        let permit =
-            transfer_database_runtime_permit(&database, "transfer_complete", queue_started)
-                .await
-                .map_err(|_| io::Error::other("database completion admission unavailable"))?;
-        let result = tokio::task::spawn_blocking(move || {
-            permit.begin_work("transfer_complete");
-            let _permit = permit;
-            database.complete_transfer_lease_and_audit(
-                &lease_token,
-                &AuditContext::new("public", client_ip),
-                action,
-                share_id,
-            )
-        })
+        let worker = dispatch_transfer_database_work(
+            database,
+            "transfer_complete",
+            move |database, permit| {
+                let _permit = permit;
+                database.complete_transfer_lease_and_audit(
+                    &lease_token,
+                    &AuditContext::new("public", client_ip),
+                    action,
+                    share_id,
+                )
+            },
+        )
         .await
-        .map_err(|error| {
+        .map_err(|_| io::Error::other("database completion admission unavailable"))?;
+        let result = worker.await.map_err(|error| {
             let _reported =
                 report_internal(InternalOperation::WebTransferCompleteWorkerJoin, error);
             io::Error::other("transfer completion worker failed")
