@@ -213,6 +213,9 @@ The metadata portion of both load profiles uses `tools/load-metadata.py` and
 its distribution's existing libcurl easy interface. One process runs 100
 (full) or 50 (smoke) independent client threads, each making 20 sequential requests
 with its own retained libcurl handle.
+Workers record results independently. Short libcurl result-field reads retain
+the Python interpreter lock; network I/O releases it. This avoids thread
+handoffs for each timing field and a shared lock around result-file writes.
 Every request still opens a fresh TCP connection. This avoids thousands of
 shell/curl process creations competing with download readers on the two client
 CPUs under TCG. All workers inherit the original client CPU set. Each metadata
@@ -233,6 +236,8 @@ Queued transfer writers still wait before acquiring global capacity, so they
 cannot consume the three slots needed by reads. A single-connection in-memory
 database continues to share its one slot. Both classes retain the existing
 one-second admission deadline and hold their permits until blocking work ends.
+A borrower cancels its unused general queue entry before global admission so
+it cannot reserve a second class slot while waiting.
 
 The application scheduler checks its global task queue every two ticks so
 database and filesystem completions from blocking workers are serviced even

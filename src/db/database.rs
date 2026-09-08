@@ -225,26 +225,30 @@ impl Database {
     pub async fn acquire_runtime_permit(
         &self,
     ) -> Result<RuntimeDatabasePermit, tokio::sync::AcquireError> {
-        let general = self.0.general_runtime_admission.clone().acquire_owned();
-        tokio::pin!(general);
-        // Retain one FIFO general waiter across wakeups. Never enqueue a
-        // general reader in the transfer semaphore: queued writers must
-        // receive its next released slot before any new borrower.
-        let (general, borrowed_transfer) = tokio::select! {
-            biased;
-            permit = &mut general => (Some(permit?), None),
-            borrowed = async {
-                loop {
-                    let released = self.0.transfer_slot_released.notified();
-                    if let Ok(permit) = self.0.transfer_runtime_admission.clone().try_acquire_owned() {
-                        break TransferSlotPermit {
-                            permit: Some(permit),
-                            released: self.0.transfer_slot_released.clone(),
-                        };
+        let (general, borrowed_transfer) = {
+            let general = self.0.general_runtime_admission.clone().acquire_owned();
+            tokio::pin!(general);
+            // Retain one FIFO general waiter across wakeups. Never enqueue a
+            // general reader in the transfer semaphore: queued writers must
+            // receive its next released slot before any new borrower.
+            // Drop the unused waiter before global admission so a borrower
+            // cannot reserve a second class slot while waiting there.
+            tokio::select! {
+                biased;
+                permit = &mut general => (Some(permit?), None),
+                borrowed = async {
+                    loop {
+                        let released = self.0.transfer_slot_released.notified();
+                        if let Ok(permit) = self.0.transfer_runtime_admission.clone().try_acquire_owned() {
+                            break TransferSlotPermit {
+                                permit: Some(permit),
+                                released: self.0.transfer_slot_released.clone(),
+                            };
+                        }
+                        released.await;
                     }
-                    released.await;
-                }
-            }, if self.0.general_can_borrow_transfer => (None, Some(borrowed)),
+                }, if self.0.general_can_borrow_transfer => (None, Some(borrowed)),
+            }
         };
         let runtime = self.0.runtime_admission.clone().acquire_owned().await?;
         Ok(RuntimeDatabasePermit {

@@ -750,3 +750,33 @@ async fn cancelled_transfer_waiter_allows_general_work_to_borrow_released_capaci
     drop(general_holders);
     assert_eq!(database.runtime_available_permits(), 4);
 }
+#[tokio::test]
+async fn borrowed_transfer_slot_releases_the_unused_general_waiter() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("data.sqlite")).unwrap();
+    let runtime = database
+        .0
+        .runtime_admission
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap();
+    let general = database
+        .0
+        .general_runtime_admission
+        .clone()
+        .acquire_many_owned(3)
+        .await
+        .unwrap();
+    let mut borrower = Box::pin(database.acquire_runtime_permit());
+    assert!(futures_util::poll!(&mut borrower).is_pending());
+    assert_eq!(database.0.transfer_runtime_admission.available_permits(), 0);
+    drop(general);
+    assert_eq!(
+        database.general_runtime_available_permits(),
+        3,
+        "borrowing the transfer lane must cancel the unused general queue entry"
+    );
+    drop(borrower);
+    drop(runtime);
+}

@@ -33,6 +33,11 @@ class Curl:
         if not library:
             raise CurlFailure("libcurl is unavailable")
         self.lib = C.CDLL(library)
+        # getinfo only copies fields from this worker's completed handle. Keep
+        # the GIL for that short call; releasing it invites a thread handoff for
+        # each field while other clients are completing their HTTP callbacks.
+        # easy_perform still releases the GIL during the actual network I/O.
+        self.info_lib = C.PyDLL(library)
         signatures = {
             "global_init": (C.c_int, [C.c_long]),
             "global_cleanup": (None, []),
@@ -46,7 +51,8 @@ class Curl:
             "slist_free_all": (None, [C.c_void_p]),
         }
         for name, (result, arguments) in signatures.items():
-            function = getattr(self.lib, "curl_" + name)
+            library_api = self.info_lib if name == "easy_getinfo" else self.lib
+            function = getattr(library_api, "curl_" + name)
             function.restype, function.argtypes = result, arguments
             setattr(self, name, function)
         self.check(self.global_init(3))
@@ -189,7 +195,6 @@ def run(work, count, connect_timeout, request_timeout, ready_timeout):
     stop = threading.Event()
     go = threading.Event()
     assembled = threading.Barrier(count + 1)
-    result_lock = threading.Lock()
     started, cpu_started = time.monotonic(), time.process_time()
     progress = PROGRESS(lambda *_args: int(stop.is_set()))
 
@@ -201,8 +206,9 @@ def run(work, count, connect_timeout, request_timeout, ready_timeout):
             if delay and stop.wait(delay):
                 break
             code = client.perform()
-            with result_lock:
-                client.finish(code)
+            # Handles, result files and counters belong to individual clients.
+            # A slow result write must not hold up all other clients.
+            client.finish(code)
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=count)
     try:
