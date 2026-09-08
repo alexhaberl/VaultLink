@@ -61,6 +61,7 @@ actual_orchestration_hash=$(
         /usr/local/sbin/vaultlink-soak-remote \
         /usr/local/libexec/vaultlink/soak-monitor.sh \
         /usr/local/libexec/vaultlink/load-test.sh \
+        /usr/local/libexec/vaultlink/load-metadata.py \
         /usr/local/libexec/vaultlink/collect-soak-evidence.sh \
         /etc/systemd/system/vaultlink-soak@.service; do
         [ -f "$file" ] || fail "installed orchestration file is missing: $file"

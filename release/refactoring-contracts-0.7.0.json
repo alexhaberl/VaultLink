@@ -53,7 +53,7 @@
     },
     {
       "path": "src/db/database.rs",
-      "sha256": "8443c306819c207481e309d6c7c99e268665a67344209126d2215627b69a8b69",
+      "sha256": "1df9e6e6b0fdd85e8c72394a1c3041420824c0f6a6c6f2cc969c0e2b83d2fa20",
       "contract": "encrypted-secret AAD and database ownership"
     },
     {
@@ -204,7 +204,7 @@
         "src/web/files/admin_upload.rs",
         "src/web/files/admin_upload_flow.rs"
       ],
-      "sha256": "c06562c3b30caa92b0aa275b721a598fcd07a64e75ed5d3eb08ade5635d4f3ab"
+      "sha256": "ef774dee08ced78f7046b56e574df1c154079f7f0ad01d22da2b6dd0085304cd"
     },
     {
       "name": "shared public upload transport and adapters",

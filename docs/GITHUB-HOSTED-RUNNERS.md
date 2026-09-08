@@ -209,7 +209,58 @@ Candidate, soak-start, and tag workflows require all three in addition to the
 existing CI, fuzz, security, and release checks. No missing or skipped matrix
 row is treated as success.
 
+The metadata portion of both load profiles uses `tools/load-metadata.py` and
+its distribution's existing libcurl easy interface. One process runs 100
+(full) or 50 (smoke) independent client threads, each making 20 sequential requests
+with its own retained libcurl handle.
+Workers record results independently. Short libcurl result-field reads retain
+the Python interpreter lock; network I/O releases it. This avoids thread
+handoffs for each timing field and a shared lock around result-file writes.
+Every request still opens a fresh TCP connection. This avoids thousands of
+shell/curl process creations competing with download readers on the two client
+CPUs under TCG. All workers inherit the original client CPU set. Each metadata
+client remains separately schedulable beside the transfer workers, without
+changing their CPU allocation or serializing all metadata I/O in one event loop.
+The range and upload/readback clients, simultaneous start barrier, byte counts,
+hashes, service CPU/RSS limits and application timeouts
+are unchanged. A 503 retry pauses only its own client; the existing three-retry
+budget, exact `Retry-After: 1` and 1.1-second response limit remain enforced.
+Transport errors are never retried. The helper is part of the approved soak
+orchestration hash and must be installed beside `load-test.sh`.
+
+The persistent database keeps its four runtime slots. Three serve general work;
+the fourth prioritizes serialized transfer quota/lease writes. General work can
+borrow that fourth slot while no transfer writer is waiting. A queued writer
+receives it after its current operation finishes, ahead of general waiters.
+Queued transfer writers still wait before acquiring global capacity, so they
+cannot consume the three slots needed by reads. A single-connection in-memory
+database continues to share its one slot. Both classes retain the existing
+one-second admission deadline and hold their permits until blocking work ends.
+A borrower cancels its unused general queue entry before global admission so
+it cannot reserve a second class slot while waiting.
+
+The application scheduler checks its global task queue every two ticks so
+database and filesystem completions from blocking workers are serviced even
+while transfer tasks keep the worker-local queues busy. This also retains
+local-task progress; worker counts and application deadlines are unchanged.
+
+Unprotected public metadata uses one fresh share lookup when it can acquire
+clean storage authority immediately, before that lookup. This avoids two
+consecutive database admission waits in the common case. If storage authority
+requires waiting or recovery, or the share requires an unlock cookie, the
+existing access check and fresh-share recheck remain in place. The strict
+1.1-second capacity-response limit remains unchanged.
+
 ## Diagnosing load failures
+
+Database admission failures retain the operation class and queue duration, plus
+`runtime_available_permits`, `general_available_permits` and
+`transfer_available_permits`. These are snapshots when admission fails, not a
+history of the entire wait; they contain no query, request or database contents.
+The same event records `scheduler_global_queue_depth` and
+`scheduler_alive_tasks` when a runtime is available. Free global database slots
+alongside exhausted class permits can indicate assigned wakeups awaiting a
+runtime poll; the snapshot alone does not measure their full scheduling delay.
 
 Failed metadata, range, upload and readback exchanges produce a
 `load_request_failure` line and `load/transport-failures.log`. Each record
@@ -218,7 +269,11 @@ completion epoch, HTTP status, total/connect/pretransfer/first-byte durations,
 transferred byte counts, and local/remote TCP ports. The measurements survive
 curl transport errors such as 52 (empty response) and 18 (partial transfer).
 URLs, tokens, headers, bodies and raw curl error strings are not included.
-Successful result CSV formats remain unchanged. Metadata attempt counts include
+Successful result CSV formats remain unchanged. `metadata-generator.env`
+records the engine, client/thread count, inherited CPU set, fresh-connection
+policy, elapsed/CPU time and maximum connect-to-pretransfer interval. These
+are client diagnostics, not proof of server scheduling or a specific timeout.
+Metadata attempt counts include
 failed exchanges; `metadata_unattempted_requests` distinguishes requests that
 were never started after a worker failed. Per-client counts are retained in
 `metadata-request-counts.partial.csv` on failure.

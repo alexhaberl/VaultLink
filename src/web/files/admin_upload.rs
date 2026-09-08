@@ -195,7 +195,7 @@ async fn ensure_admin_upload_directory(
 fn create_admin_upload_directory_blocking(
     creation: AdminDirectoryCreation,
     guard: crate::storage_authority::StorageMutationGuard,
-    database_permit: tokio::sync::OwnedSemaphorePermit,
+    database_permit: crate::db::RuntimeDatabasePermit,
 ) -> AdminDirectoryResult<(AdminDirectoryOutcome, AdminUploadPermits)> {
     let _database_permit = database_permit;
     let database = creation.state.db().clone();

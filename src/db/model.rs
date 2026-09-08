@@ -25,6 +25,12 @@ struct DatabaseInner {
     // from queueing inside r2d2 when SQLite or all pooled connections are
     // saturated. Tokio's semaphore queue is FIFO/fair.
     runtime_admission: Arc<tokio::sync::Semaphore>,
+    // Persistent pools prioritize transfer progress in one existing slot,
+    // borrowing it for general work when no writer is queued. Otherwise every
+    // serialized writer rejoins a large metadata queue and can time out.
+    general_runtime_admission: Arc<tokio::sync::Semaphore>,
+    transfer_slot_released: Arc<tokio::sync::Notify>,
+    general_can_borrow_transfer: bool,
     // Runtime transfer writers must serialize before they can consume a
     // general database permit. Otherwise several blocking workers can occupy
     // every general permit while all but one wait on the synchronous SQLite
@@ -53,8 +59,38 @@ struct DatabaseInner {
 /// Runtime admission owned by one transfer writer until its blocking database
 /// operation, including any same-worker compensation, has fully completed.
 pub(crate) struct TransferDatabasePermit {
-    _transfer: tokio::sync::OwnedSemaphorePermit,
+    _transfer: TransferSlotPermit,
     _runtime: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct TransferSlotPermit {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    released: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for TransferSlotPermit {
+    fn drop(&mut self) {
+        // Semaphore release hands capacity to queued writers first. General
+        // waiters may only borrow an unclaimed slot with try_acquire_owned.
+        drop(self.permit.take());
+        self.released.notify_one();
+    }
+}
+
+/// Runtime capacity retained until general blocking database work completes.
+#[doc(hidden)]
+pub struct RuntimeDatabasePermit {
+    _general: Option<tokio::sync::OwnedSemaphorePermit>,
+    _borrowed_transfer: Option<TransferSlotPermit>,
+    _runtime: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Numeric snapshot at admission failure, without request or database contents.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DatabaseAdmissionState {
+    pub(crate) runtime_available: usize,
+    pub(crate) general_available: usize,
+    pub(crate) transfer_available: usize,
 }
 
 #[derive(Default)]

@@ -12,6 +12,7 @@ const DATABASE_EXECUTOR_QUEUE_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) struct DatabaseExecutorAdmission {
     class: &'static str,
     queue_duration: Duration,
+    state: super::DatabaseAdmissionState,
 }
 
 impl DatabaseExecutorAdmission {
@@ -21,6 +22,10 @@ impl DatabaseExecutorAdmission {
 
     pub(crate) fn queue_duration(&self) -> Duration {
         self.queue_duration
+    }
+
+    pub(crate) fn state(&self) -> super::DatabaseAdmissionState {
+        self.state
     }
 }
 
@@ -62,8 +67,8 @@ where
         database.acquire_runtime_permit(),
     )
     .await
-    .map_err(|_| admission(class, queue_started.elapsed()))?
-    .map_err(|_| admission(class, queue_started.elapsed()))?;
+    .map_err(|_| admission(&database, class, queue_started.elapsed()))?
+    .map_err(|_| admission(&database, class, queue_started.elapsed()))?;
 
     execute_admitted_database_operation(database, class, queue_started.elapsed(), permit, operation)
         .await
@@ -87,8 +92,8 @@ where
         database.acquire_transfer_runtime_permit(),
     )
     .await
-    .map_err(|_| admission(class, queue_started.elapsed()))?
-    .map_err(|_| admission(class, queue_started.elapsed()))?;
+    .map_err(|_| admission(&database, class, queue_started.elapsed()))?
+    .map_err(|_| admission(&database, class, queue_started.elapsed()))?;
 
     execute_admitted_database_operation(database, class, queue_started.elapsed(), permit, operation)
         .await
@@ -125,10 +130,15 @@ where
     .map_err(DatabaseExecutionError::Operation)
 }
 
-fn admission<E>(class: &'static str, queue_duration: Duration) -> DatabaseExecutionError<E> {
+fn admission<E>(
+    database: &Database,
+    class: &'static str,
+    queue_duration: Duration,
+) -> DatabaseExecutionError<E> {
     DatabaseExecutionError::Admission(DatabaseExecutorAdmission {
         class,
         queue_duration,
+        state: database.runtime_admission_state(),
     })
 }
 

@@ -60,6 +60,11 @@ async fn incomplete_connection_is_not_mislabelled_as_a_header_timeout() {
 
 #[test]
 fn failure_logs_correlate_ports_and_exclude_raw_error_messages() {
+    if run_in_isolated_process(
+        "transport_diagnostics::tests::failure_logs_correlate_ports_and_exclude_raw_error_messages",
+    ) {
+        return;
+    }
     let _guard = crate::test_support::tracing_subscriber_guard();
     let logs = Logs::default();
     let subscriber = tracing_subscriber::fmt()
@@ -102,6 +107,11 @@ fn failure_logs_correlate_ports_and_exclude_raw_error_messages() {
 #[test]
 fn actual_io_logs_distinguish_pending_timeout_from_recovered_progress() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if run_in_isolated_process(
+        "transport_diagnostics::tests::actual_io_logs_distinguish_pending_timeout_from_recovered_progress",
+    ) {
+        return;
+    }
     let _guard = crate::test_support::tracing_subscriber_guard();
     let logs = Logs::default();
     let subscriber = tracing_subscriber::fmt()
@@ -179,6 +189,11 @@ fn actual_io_logs_distinguish_pending_timeout_from_recovered_progress() {
 #[test]
 fn real_http_header_close_records_ports_and_received_bytes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if run_in_isolated_process(
+        "transport_diagnostics::tests::real_http_header_close_records_ports_and_received_bytes",
+    ) {
+        return;
+    }
     let _guard = crate::test_support::tracing_subscriber_guard();
     let logs = Logs::default();
     let subscriber = tracing_subscriber::fmt()
@@ -230,4 +245,30 @@ fn real_http_header_close_records_ports_and_received_bytes() {
         assert!(!output.contains("SECRET_TOKEN"));
         assert!(!output.contains("header_timeout"));
     });
+}
+
+// Tests that assert process-wide log budgets need their own process: other
+// parallel tests can legitimately consume those budgets without installing a
+// subscriber or taking the dispatcher lock above.
+fn run_in_isolated_process(test: &str) -> bool {
+    const CHILD_TEST: &str = "VAULTLINK_ISOLATED_LOG_TEST";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD_TEST, test)
+        .output()
+        .expect("isolated log test process must start");
+    assert!(
+        output.status.success(),
+        "isolated test {test} failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+        "isolated test {test} must execute exactly one test"
+    );
+    true
 }

@@ -53,6 +53,10 @@ impl StorageContext {
         self.authority.acquire_read().await
     }
 
+    pub(super) fn try_acquire_clean_read(&self) -> Option<StorageReadGuard> {
+        self.authority.try_acquire_clean_read()
+    }
+
     pub(super) async fn acquire_mutation(&self) -> StorageMutationGuard {
         self.authority.acquire_mutation().await
     }

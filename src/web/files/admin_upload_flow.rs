@@ -541,7 +541,7 @@ async fn publish_admin_upload(
 
 fn publish_admin_upload_blocking(
     database: &crate::db::Database,
-    database_permit: tokio::sync::OwnedSemaphorePermit,
+    database_permit: crate::db::RuntimeDatabasePermit,
     committed: CommittedAdminUpload,
     audit_context: &AuditContext,
 ) -> std::result::Result<SessionBound<PublishedAdminUpload>, file_ops::FileOperationError> {

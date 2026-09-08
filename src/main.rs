@@ -56,3 +56,7 @@ include!("cli/tests.rs");
 #[cfg(test)]
 #[path = "server/tests/write_idle.rs"]
 mod write_idle_tests;
+
+#[cfg(test)]
+#[path = "server/tests/scheduler.rs"]
+mod scheduler_tests;

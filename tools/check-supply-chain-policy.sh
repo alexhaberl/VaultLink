@@ -1733,11 +1733,14 @@ fi
 if ! grep -F -q 'metadata_capacity_retry_limit_per_client=3' "$load_test" \
     || ! grep -F -q 'metadata_capacity_retry_after_seconds=1' "$load_test" \
     || ! grep -F -q 'metadata_capacity_response_limit=1.100' "$load_test" \
-    || ! grep -F -q -- '--dump-header "$headers"' "$load_test" \
-    || ! grep -F -q '[ "$retry_after" = "$metadata_capacity_retry_after_seconds" ]' \
-        "$load_test" \
-    || ! grep -F -q 'value + 0 <= limit' "$load_test" \
-    || ! grep -F -q 'sleep "$retry_after"' "$load_test" \
+    || ! grep -F -q 'self.retry_headers == [b"1"] and 0 < duration <= 1.100' \
+        tools/load-metadata.py \
+    || ! grep -F -q 'self.retries > 3' tools/load-metadata.py \
+    || ! grep -F -q 'self.ready_at = time.monotonic() + 1' tools/load-metadata.py \
+    || ! grep -F -q 'test_capacity_retry_does_not_suspend_other_clients' \
+        tools/test-load-metadata.py \
+    || ! grep -F -q 'test_invalid_capacity_responses_and_exhaustion_fail' \
+        tools/test-load-metadata.py \
     || ! grep -F -q 'metadata-capacity-retries.csv' "$load_test" \
     || ! grep -F -q 'metadata_attempts=$metadata_attempts' "$load_test" \
     || ! grep -F -q 'soak load result does not retain the bounded capacity retry contract' \

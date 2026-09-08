@@ -86,6 +86,7 @@ approved_orchestration_sha256=$(
         deploy/vaultlink-soak-remote.sh \
         tools/soak-monitor.sh \
         tools/load-test.sh \
+        tools/load-metadata.py \
         tools/collect-soak-evidence.sh \
         deploy/vaultlink-soak@.service; do
         [ -f "$file" ] || { echo "approved orchestration file is missing: $file" >&2; exit 1; }

@@ -178,6 +178,10 @@ impl AppState {
         self.0.storage.acquire_read().await
     }
 
+    pub(crate) fn try_acquire_clean_storage_read(&self) -> Option<StorageReadGuard> {
+        self.0.storage.try_acquire_clean_read()
+    }
+
     pub(crate) async fn acquire_storage_mutation(&self) -> StorageMutationGuard {
         self.0.storage.acquire_mutation().await
     }

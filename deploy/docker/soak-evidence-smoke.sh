@@ -78,6 +78,7 @@ orchestration_hash=$(
         deploy/vaultlink-soak-remote.sh \
         tools/soak-monitor.sh \
         tools/load-test.sh \
+        tools/load-metadata.py \
         tools/collect-soak-evidence.sh \
         deploy/vaultlink-soak@.service; do
         sha256sum "$file" | awk '{print $1}'

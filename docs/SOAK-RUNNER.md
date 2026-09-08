@@ -44,6 +44,7 @@ Install the root-owned orchestration files from the same reviewed commit:
 sudo install -d -o root -g root -m 0755 /usr/local/libexec/vaultlink
 sudo install -m 0755 tools/soak-monitor.sh /usr/local/libexec/vaultlink/soak-monitor.sh
 sudo install -m 0755 tools/load-test.sh /usr/local/libexec/vaultlink/load-test.sh
+sudo install -m 0644 tools/load-metadata.py /usr/local/libexec/vaultlink/load-metadata.py
 sudo install -m 0755 tools/collect-soak-evidence.sh /usr/local/libexec/vaultlink/collect-soak-evidence.sh
 sudo install -m 0755 deploy/vaultlink-soak-control.sh /usr/local/sbin/vaultlink-soak-control
 sudo install -m 0755 deploy/vaultlink-soak-remote.sh /usr/local/sbin/vaultlink-soak-remote
