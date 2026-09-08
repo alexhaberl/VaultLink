@@ -6,6 +6,7 @@ include!("tests/upload_test_support.rs");
 include!("tests/rendering_policy.rs");
 include!("tests/auth_router.rs");
 include!("tests/shares_transfers.rs");
+include!("tests/public_metadata.rs");
 include!("tests/transfer_availability.rs");
 include!("tests/share_summary.rs");
 include!("tests/account_mfa.rs");

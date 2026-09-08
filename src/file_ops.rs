@@ -793,7 +793,7 @@ pub(crate) async fn acquire_storage_read(
 
 pub(crate) async fn acquire_database_permit(
     database: &crate::db::Database,
-) -> Result<tokio::sync::OwnedSemaphorePermit, FileOperationError> {
+) -> Result<crate::db::RuntimeDatabasePermit, FileOperationError> {
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
         database.acquire_runtime_permit(),

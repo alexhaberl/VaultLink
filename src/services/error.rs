@@ -38,6 +38,7 @@ impl ServiceFailure {
         let executor_context = Some(DatabaseExecutorFailureContext::Admission {
             class: error.class(),
             queue_duration: error.queue_duration(),
+            state: error.state(),
         });
         Self {
             _source: Box::new(error),
@@ -57,12 +58,17 @@ impl ServiceFailure {
 
     pub(crate) fn database_executor_admission_context(
         &self,
-    ) -> Option<(&'static str, std::time::Duration)> {
+    ) -> Option<(
+        &'static str,
+        std::time::Duration,
+        crate::db::DatabaseAdmissionState,
+    )> {
         match self.executor_context {
             Some(DatabaseExecutorFailureContext::Admission {
                 class,
                 queue_duration,
-            }) => Some((class, queue_duration)),
+                state,
+            }) => Some((class, queue_duration, state)),
             None | Some(DatabaseExecutorFailureContext::Join { .. }) => None,
         }
     }
@@ -80,6 +86,7 @@ enum DatabaseExecutorFailureContext {
     Admission {
         class: &'static str,
         queue_duration: std::time::Duration,
+        state: crate::db::DatabaseAdmissionState,
     },
     Join {
         class: &'static str,

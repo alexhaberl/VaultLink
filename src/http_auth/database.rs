@@ -216,7 +216,7 @@ where
     match crate::db::execute_transfer_database_operation(database, class, operation).await {
         Ok(value) => Ok(value),
         Err(crate::db::DatabaseExecutionError::Admission(error)) => Err(
-            database_capacity_unavailable(error.class(), error.queue_duration()),
+            database_capacity_unavailable(error.class(), error.queue_duration(), error.state()),
         ),
         Err(crate::db::DatabaseExecutionError::Join(error)) => {
             Err(HttpAuthError::from(report_internal(join_operation, error)))
@@ -241,7 +241,7 @@ where
     match crate::db::execute_database_operation(database, class, operation).await {
         Ok(value) => Ok(value),
         Err(crate::db::DatabaseExecutionError::Admission(error)) => Err(
-            database_capacity_unavailable(error.class(), error.queue_duration()),
+            database_capacity_unavailable(error.class(), error.queue_duration(), error.state()),
         ),
         Err(crate::db::DatabaseExecutionError::Join(error)) => {
             Err(HttpAuthError::from(report_internal(join_operation, error)))
@@ -495,14 +495,26 @@ pub(crate) async fn database_runtime_permit(
     database: &Database,
     class: &'static str,
     queue_started: std::time::Instant,
-) -> Result<tokio::sync::OwnedSemaphorePermit> {
+) -> Result<crate::db::RuntimeDatabasePermit> {
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
         database.acquire_runtime_permit(),
     )
     .await
-    .map_err(|_| database_capacity_unavailable(class, queue_started.elapsed()))?
-    .map_err(|_| database_capacity_unavailable(class, queue_started.elapsed()))
+    .map_err(|_| {
+        database_capacity_unavailable(
+            class,
+            queue_started.elapsed(),
+            database.runtime_admission_state(),
+        )
+    })?
+    .map_err(|_| {
+        database_capacity_unavailable(
+            class,
+            queue_started.elapsed(),
+            database.runtime_admission_state(),
+        )
+    })
 }
 
 pub(crate) async fn transfer_database_runtime_permit(
@@ -515,18 +527,39 @@ pub(crate) async fn transfer_database_runtime_permit(
         database.acquire_transfer_runtime_permit(),
     )
     .await
-    .map_err(|_| database_capacity_unavailable(class, queue_started.elapsed()))?
-    .map_err(|_| database_capacity_unavailable(class, queue_started.elapsed()))
+    .map_err(|_| {
+        database_capacity_unavailable(
+            class,
+            queue_started.elapsed(),
+            database.runtime_admission_state(),
+        )
+    })?
+    .map_err(|_| {
+        database_capacity_unavailable(
+            class,
+            queue_started.elapsed(),
+            database.runtime_admission_state(),
+        )
+    })
 }
 
 fn database_capacity_unavailable(
     class: &'static str,
     queue_duration: std::time::Duration,
+    state: crate::db::DatabaseAdmissionState,
 ) -> HttpAuthError {
+    let metrics = tokio::runtime::Handle::try_current()
+        .ok()
+        .map(|handle| handle.metrics());
     tracing::warn!(
         operation = "database.admission",
         class,
         queue_duration_ms = duration_millis(queue_duration),
+        runtime_available_permits = state.runtime_available,
+        general_available_permits = state.general_available,
+        transfer_available_permits = state.transfer_available,
+        scheduler_global_queue_depth = ?metrics.as_ref().map(|metrics| metrics.global_queue_depth()),
+        scheduler_alive_tasks = ?metrics.as_ref().map(|metrics| metrics.num_alive_tasks()),
         "database executor admission timed out"
     );
     HttpAuthError::with_kind(
@@ -541,7 +574,7 @@ pub(crate) fn share_summary_error(
 ) -> HttpAuthError {
     match error {
         crate::db::DatabaseExecutionError::Admission(error) => {
-            database_capacity_unavailable(error.class(), error.queue_duration())
+            database_capacity_unavailable(error.class(), error.queue_duration(), error.state())
         }
         crate::db::DatabaseExecutionError::Join(error) => HttpAuthError::from(report_internal(
             InternalOperation::HttpAuthDatabaseReadJoin,
@@ -591,8 +624,10 @@ pub(crate) fn service_error<V, C>(
 
     match error {
         ServiceError::Capacity(cause) => {
-            if let Some((class, queue_duration)) = cause.database_executor_admission_context() {
-                return database_capacity_unavailable(class, queue_duration);
+            if let Some((class, queue_duration, state)) =
+                cause.database_executor_admission_context()
+            {
+                return database_capacity_unavailable(class, queue_duration, state);
             }
             tracing::warn!(
                 operation = "http_auth.database.sqlite_capacity",

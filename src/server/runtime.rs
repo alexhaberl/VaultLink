@@ -1,9 +1,19 @@
+fn server_runtime_builder() -> tokio::runtime::Builder {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .enable_all()
+        // Database/filesystem completions arrive from blocking threads in
+        // the global queue. Service them promptly even while bulk-transfer
+        // tasks keep worker-local queues busy. Alternate queues so a stream
+        // of external completions cannot starve older local work either.
+        .global_queue_interval(2)
+        .max_blocking_threads(MAX_BLOCKING_THREADS);
+    builder
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     vaultlink::install_safe_panic_reporting();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .max_blocking_threads(MAX_BLOCKING_THREADS)
-        .build()?;
+    let runtime = server_runtime_builder().build()?;
     let result = runtime.block_on(run());
     // A timed-out blocking operation cannot be cancelled by Tokio. Do not let
     // runtime teardown extend the externally enforced 25s + 10s shutdown

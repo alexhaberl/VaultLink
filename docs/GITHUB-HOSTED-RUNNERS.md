@@ -225,7 +225,37 @@ budget, exact `Retry-After: 1` and 1.1-second response limit remain enforced.
 Transport errors are never retried. The helper is part of the approved soak
 orchestration hash and must be installed beside `load-test.sh`.
 
+The persistent database keeps its four runtime slots. Three serve general work;
+the fourth prioritizes serialized transfer quota/lease writes. General work can
+borrow that fourth slot while no transfer writer is waiting. A queued writer
+receives it after its current operation finishes, ahead of general waiters.
+Queued transfer writers still wait before acquiring global capacity, so they
+cannot consume the three slots needed by reads. A single-connection in-memory
+database continues to share its one slot. Both classes retain the existing
+one-second admission deadline and hold their permits until blocking work ends.
+
+The application scheduler checks its global task queue every two ticks so
+database and filesystem completions from blocking workers are serviced even
+while transfer tasks keep the worker-local queues busy. This also retains
+local-task progress; worker counts and application deadlines are unchanged.
+
+Unprotected public metadata uses one fresh share lookup when it can acquire
+clean storage authority immediately, before that lookup. This avoids two
+consecutive database admission waits in the common case. If storage authority
+requires waiting or recovery, or the share requires an unlock cookie, the
+existing access check and fresh-share recheck remain in place. The strict
+1.1-second capacity-response limit remains unchanged.
+
 ## Diagnosing load failures
+
+Database admission failures retain the operation class and queue duration, plus
+`runtime_available_permits`, `general_available_permits` and
+`transfer_available_permits`. These are snapshots when admission fails, not a
+history of the entire wait; they contain no query, request or database contents.
+The same event records `scheduler_global_queue_depth` and
+`scheduler_alive_tasks` when a runtime is available. Free global database slots
+alongside exhausted class permits can indicate assigned wakeups awaiting a
+runtime poll; the snapshot alone does not measure their full scheduling delay.
 
 Failed metadata, range, upload and readback exchanges produce a
 `load_request_failure` line and `load/transport-failures.log`. Each record

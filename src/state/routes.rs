@@ -258,6 +258,12 @@ impl<Domain: AdmissionCapability> RouteState<Domain> {
 }
 
 impl RouteState<PublicRoutes> {
+    pub(crate) fn try_acquire_clean_storage_read(
+        &self,
+    ) -> Option<crate::storage_authority::StorageReadGuard> {
+        self.inner.try_acquire_clean_storage_read()
+    }
+
     pub(crate) fn share_limiter(&self) -> &LoginLimiter {
         self.inner.share_limiter()
     }

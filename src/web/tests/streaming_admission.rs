@@ -679,9 +679,12 @@ async fn reservation_drop_uses_fair_async_cleanup_when_database_executor_is_satu
         .unwrap();
 
     let mut permits = Vec::new();
-    while state.db().runtime_available_permits() > 0 {
+    while state.db().general_runtime_available_permits() > 0 {
         permits.push(state.db().acquire_runtime_permit().await.unwrap());
     }
+    // General work leaves the transfer slot available. Saturate that slot too
+    // so this still tests deferred cleanup while all runtime capacity is held.
+    let transfer_permit = state.db().acquire_transfer_runtime_permit().await.unwrap();
     drop(UploadQuotaReservation::new(
         state.db().clone(),
         "saturated-cleanup-reservation".into(),
@@ -692,7 +695,7 @@ async fn reservation_drop_uses_fair_async_cleanup_when_database_executor_is_satu
         1
     );
 
-    drop(permits.pop());
+    drop(transfer_permit);
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while state.db().active_upload_reservations(upload_share).unwrap() != 0 {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;

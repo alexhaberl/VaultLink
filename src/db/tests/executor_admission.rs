@@ -314,22 +314,11 @@ async fn cancelled_transfer_writer_waiter_releases_its_queue_position() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn transfer_writer_admission_uses_one_timeout_across_both_queues() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = Database::open(directory.path().join("data.sqlite")).unwrap();
+    let database = Database::open(":memory:").unwrap();
     let transfer_holder = database
         .acquire_transfer_runtime_permit()
         .await
         .expect("the transfer holder must acquire writer and runtime admission");
-    let mut held_runtime_permits = Vec::new();
-    for _ in 0..3 {
-        held_runtime_permits.push(
-            database
-                .acquire_runtime_permit()
-                .await
-                .expect("three runtime permits must be available"),
-        );
-    }
-
     // Queue a general runtime waiter before the candidate can reach the
     // global queue. It deterministically takes the transfer holder's global
     // permit after release and forces the candidate through both stages.
@@ -391,7 +380,6 @@ async fn transfer_writer_admission_uses_one_timeout_across_both_queues() {
         .await
         .expect("the candidate writer task must not panic");
 
-    drop(held_runtime_permits);
     let _ = release_catcher_sender.send(());
     catcher
         .await
@@ -401,6 +389,8 @@ async fn transfer_writer_admission_uses_one_timeout_across_both_queues() {
     match candidate_result {
         Err(DatabaseExecutionError::Admission(admission)) => {
             assert_eq!(admission.class(), "two_queue_transfer_write");
+            assert_eq!(admission.state().runtime_available, 0);
+            assert_eq!(admission.state().general_available, 0);
         }
         result => panic!("writer admission must time out after the shared budget: {result:?}"),
     }
@@ -521,7 +511,10 @@ async fn expired_transfer_cleanup_releases_admission_and_allows_worker_restart()
     for _ in 0..runtime_capacity {
         held_runtime_permits.push(
             database
-                .acquire_runtime_permit()
+                .0
+                .runtime_admission
+                .clone()
+                .acquire_owned()
                 .await
                 .expect("all runtime permits must be acquirable"),
         );
@@ -619,4 +612,141 @@ fn cleanup_queue_test_database() -> (tempfile::TempDir, Database, i64, i64) {
         )
         .unwrap();
     (directory, database, transfer_share, upload_share)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_reads_leave_runtime_capacity_for_transfer_progress() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("data.sqlite")).unwrap();
+    let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let (borrowed_release_sender, borrowed_release_receiver) = std::sync::mpsc::channel();
+    let mut borrowed_release_receiver = Some(borrowed_release_receiver);
+    let mut readers = Vec::new();
+    for index in 0..24 {
+        let reader_database = database.clone();
+        let reader_release = release.clone();
+        let borrowed_release = (index == 3).then(|| borrowed_release_receiver.take().unwrap());
+        let (pending_sender, pending_receiver) = tokio::sync::oneshot::channel();
+        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+        readers.push(tokio::spawn(async move {
+            await_after_first_pending(
+                execute_database_operation(reader_database, "held_read", move |database| {
+                    let _ = entered_sender.send(());
+                    if let Some(release) = borrowed_release {
+                        release
+                            .recv_timeout(EXECUTOR_ADMISSION_FAILSAFE_TIMEOUT)
+                            .unwrap();
+                    } else {
+                        let (lock, condition) = &*reader_release;
+                        let _ = condition
+                            .wait_timeout_while(
+                                lock.lock().unwrap(),
+                                EXECUTOR_ADMISSION_FAILSAFE_TIMEOUT,
+                                |released| !*released,
+                            )
+                            .unwrap();
+                    }
+                    database.readiness_check()
+                }),
+                pending_sender,
+            )
+            .await
+        }));
+        tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, pending_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        if index < 4 {
+            tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, entered_receiver)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        database.runtime_available_permits(),
+        0,
+        "reads must use all four idle slots"
+    );
+    let (transfer_pending_sender, transfer_pending_receiver) = tokio::sync::oneshot::channel();
+    let writer_database = database.clone();
+    let writer = tokio::spawn(async move {
+        await_after_first_pending(
+            execute_transfer_database_operation(writer_database, "transfer_progress", |database| {
+                database.cancel_upload_reservation("fairness-test-absent-reservation")
+            }),
+            transfer_pending_sender,
+        )
+        .await
+    });
+    transfer_pending_receiver.await.unwrap();
+    // Even with twenty earlier general waiters, the transfer receives the
+    // borrowed slot as soon as its current blocking operation completes.
+    borrowed_release_sender.send(()).unwrap();
+    let transfer = tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, writer)
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+    }
+    let mut read_failures = 0;
+    for reader in readers {
+        let result = tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, reader)
+            .await
+            .unwrap()
+            .unwrap();
+        read_failures += usize::from(result.is_err());
+    }
+    assert!(
+        matches!(transfer, Ok(false)),
+        "metadata readers starved transfer progress: {transfer:?}"
+    );
+    assert_eq!(read_failures, 0);
+    assert_eq!(database.runtime_available_permits(), 4);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_transfer_waiter_allows_general_work_to_borrow_released_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open(directory.path().join("data.sqlite")).unwrap();
+    let mut general_holders = Vec::new();
+    for _ in 0..3 {
+        general_holders.push(database.acquire_runtime_permit().await.unwrap());
+    }
+    let writer_holder = database.acquire_transfer_runtime_permit().await.unwrap();
+    let (writer_pending_sender, writer_pending_receiver) = tokio::sync::oneshot::channel();
+    let writer_database = database.clone();
+    let writer = tokio::spawn(async move {
+        await_after_first_pending(
+            writer_database.acquire_transfer_runtime_permit(),
+            writer_pending_sender,
+        )
+        .await
+    });
+    writer_pending_receiver.await.unwrap();
+    let (reader_pending_sender, reader_pending_receiver) = tokio::sync::oneshot::channel();
+    let reader_database = database.clone();
+    let reader = tokio::spawn(async move {
+        await_after_first_pending(
+            reader_database.acquire_runtime_permit(),
+            reader_pending_sender,
+        )
+        .await
+    });
+    reader_pending_receiver.await.unwrap();
+    writer.abort();
+    assert!(writer.await.err().unwrap().is_cancelled());
+    drop(writer_holder);
+    let borrowed = tokio::time::timeout(EXECUTOR_ADMISSION_TEST_TIMEOUT, reader)
+        .await
+        .expect("a released transfer slot must wake a general borrower")
+        .unwrap()
+        .unwrap();
+    assert_eq!(database.runtime_available_permits(), 0);
+    drop(borrowed);
+    drop(general_holders);
+    assert_eq!(database.runtime_available_permits(), 4);
 }

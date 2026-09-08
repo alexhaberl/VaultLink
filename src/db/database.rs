@@ -189,6 +189,11 @@ impl Database {
         Ok(Self(Arc::new(DatabaseInner {
             pool,
             runtime_admission: Arc::new(tokio::sync::Semaphore::new(pool_capacity as usize)),
+            general_runtime_admission: Arc::new(tokio::sync::Semaphore::new(
+                pool_capacity.saturating_sub(1).max(1) as usize,
+            )),
+            transfer_slot_released: Arc::new(tokio::sync::Notify::new()),
+            general_can_borrow_transfer: persistent,
             transfer_runtime_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_retention_admission: Mutex::new(()),
             transfer_write_admission: Mutex::new(()),
@@ -219,8 +224,42 @@ impl Database {
     #[doc(hidden)]
     pub async fn acquire_runtime_permit(
         &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
-        self.0.runtime_admission.clone().acquire_owned().await
+    ) -> Result<RuntimeDatabasePermit, tokio::sync::AcquireError> {
+        let general = self.0.general_runtime_admission.clone().acquire_owned();
+        tokio::pin!(general);
+        // Retain one FIFO general waiter across wakeups. Never enqueue a
+        // general reader in the transfer semaphore: queued writers must
+        // receive its next released slot before any new borrower.
+        let (general, borrowed_transfer) = tokio::select! {
+            biased;
+            permit = &mut general => (Some(permit?), None),
+            borrowed = async {
+                loop {
+                    let released = self.0.transfer_slot_released.notified();
+                    if let Ok(permit) = self.0.transfer_runtime_admission.clone().try_acquire_owned() {
+                        break TransferSlotPermit {
+                            permit: Some(permit),
+                            released: self.0.transfer_slot_released.clone(),
+                        };
+                    }
+                    released.await;
+                }
+            }, if self.0.general_can_borrow_transfer => (None, Some(borrowed)),
+        };
+        let runtime = self.0.runtime_admission.clone().acquire_owned().await?;
+        Ok(RuntimeDatabasePermit {
+            _general: general,
+            _borrowed_transfer: borrowed_transfer,
+            _runtime: runtime,
+        })
+    }
+
+    pub(crate) fn runtime_admission_state(&self) -> DatabaseAdmissionState {
+        DatabaseAdmissionState {
+            runtime_available: self.0.runtime_admission.available_permits(),
+            general_available: self.0.general_runtime_admission.available_permits(),
+            transfer_available: self.0.transfer_runtime_admission.available_permits(),
+        }
     }
 
     /// Admits one runtime transfer writer before it enters the fair general
@@ -236,6 +275,10 @@ impl Database {
             .clone()
             .acquire_owned()
             .await?;
+        let transfer = TransferSlotPermit {
+            permit: Some(transfer),
+            released: self.0.transfer_slot_released.clone(),
+        };
         let runtime = self.0.runtime_admission.clone().acquire_owned().await?;
         Ok(TransferDatabasePermit {
             _transfer: transfer,
@@ -365,6 +408,11 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn runtime_available_permits(&self) -> usize {
         self.0.runtime_admission.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn general_runtime_available_permits(&self) -> usize {
+        self.0.general_runtime_admission.available_permits()
     }
 
     #[cfg(test)]

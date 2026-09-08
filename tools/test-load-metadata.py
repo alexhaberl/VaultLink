@@ -203,6 +203,13 @@ class MetadataTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(server.requests["198.18.1.1"], attempts)
                 self.assertEqual(files["metadata-client-0.counts"], f"0,{attempts},1,0\n")
+                metrics = dict(field.split("=", 1) for field in
+                               files["transport-metadata-0-1.failure"].split())
+                self.assertEqual(metrics["http_status"], "503")
+                self.assertEqual(metrics["curl_exit"], "0")
+                self.assertGreater(int(metrics["local_port"]), 0)
+                if mode == "late":
+                    self.assertGreater(float(metrics["total_seconds"]), 1.1)
 
     def test_transport_and_http_errors_are_never_retried(self):
         for mode, curl_code, http_status in (("empty", 52, "000"), ("partial", 18, "200"), ("error", 0, "500")):

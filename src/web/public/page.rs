@@ -24,15 +24,36 @@ pub(in crate::web) async fn public_page(
     AxPath(token): AxPath<String>,
     Query(query): Query<BrowseQuery>,
 ) -> Result<Html<String>> {
+    // If clean storage authority is immediately available, acquire it before
+    // reading the share so one fresh lookup is already inside that authority.
+    // This does no I/O or recovery before the access check. When a mutation or
+    // recovery intervenes, retain the existing check/acquire/recheck path.
+    let clean_guard = state.try_acquire_clean_storage_read();
     let share = get_share(&state, &token).await?;
+    let clean_guard = if share.password_hash.is_none() {
+        clean_guard
+    } else {
+        // Cookie validation performs another database operation. Retain the
+        // existing fresh-share/password recheck after that asynchronous step.
+        drop(clean_guard);
+        None
+    };
     if !share_is_unlocked(&state, &headers, &share).await? {
         return Ok(protected_share_page(&token));
     }
-    let expected_id = share.id;
-    let (share, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
-    if !share_is_unlocked(&state, &headers, &share).await? {
-        return Ok(protected_share_page(&token));
-    }
+    let (share, storage_guard) = match clean_guard {
+        Some(guard) => {
+            usable(&share)?;
+            (share, guard)
+        }
+        None => {
+            let (current, guard) = get_storage_share(&state, &token, share.id).await?;
+            if !share_is_unlocked(&state, &headers, &current).await? {
+                return Ok(protected_share_page(&token));
+            }
+            (current, guard)
+        }
+    };
 
     let settings = runtime_settings(&state);
     let upload_csrf = share_unlock_csrf(&state, &headers, &share).await?;

@@ -68,6 +68,19 @@ impl StorageAuthorityCoordinator {
         }
     }
 
+    /// Obtains existing clean authority without waiting or running recovery.
+    /// A queued writer takes precedence, just as for acquire_read.
+    pub(crate) fn try_acquire_clean_read(&self) -> Option<StorageReadGuard> {
+        let guard = self.inner.lock.clone().try_read_owned().ok()?;
+        if self.recovery_required() {
+            return None;
+        }
+        Some(StorageReadGuard {
+            _guard: guard,
+            generation: self.generation(),
+        })
+    }
+
     /// Acquires fair exclusive authority and marks it dirty before returning.
     pub(crate) async fn acquire_mutation(&self) -> StorageMutationGuard {
         #[cfg(test)]
@@ -187,12 +200,15 @@ mod tests {
     #[tokio::test]
     async fn clean_reads_run_in_parallel_and_share_generation() {
         let coordinator = StorageAuthorityCoordinator::new();
+        assert!(coordinator.try_acquire_clean_read().is_none());
         coordinator.acquire_mutation().await.finish_clean();
         let first = coordinator.acquire_read().await;
         let second = tokio::time::timeout(Duration::from_millis(100), coordinator.acquire_read())
             .await
             .expect("readers must not serialize");
         assert_eq!(first.generation(), second.generation());
+        let third = coordinator.try_acquire_clean_read().unwrap();
+        assert_eq!(third.generation(), first.generation());
     }
 
     #[tokio::test]
@@ -204,6 +220,7 @@ mod tests {
         let writer = tokio::spawn(async move { writer_coordinator.acquire_mutation().await });
         tokio::task::yield_now().await;
 
+        assert!(coordinator.try_acquire_clean_read().is_none());
         assert!(
             tokio::time::timeout(Duration::from_millis(50), coordinator.acquire_read())
                 .await
@@ -212,6 +229,7 @@ mod tests {
         drop(first_reader);
         let writer = writer.await.unwrap();
         writer.finish_clean();
+        assert!(coordinator.try_acquire_clean_read().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

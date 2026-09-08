@@ -157,6 +157,7 @@ class Client:
                 self.capacity.write(f"{self.identity},{self.started},{self.retries},503,{duration:.6f},1\n")
                 self.capacity.flush()
             if not valid or self.retries > 3:
+                self.diagnostic(code, status, duration)
                 print(f"metadata client {self.index} request {self.started}: invalid capacity response or retry budget exhausted", file=sys.stderr)
                 self.failed = True
             else:
