@@ -193,6 +193,7 @@ impl Database {
                 pool_capacity.saturating_sub(1).max(1) as usize,
             )),
             transfer_slot_released: Arc::new(tokio::sync::Notify::new()),
+            transfer_observation: Arc::new(Mutex::new(None)),
             general_can_borrow_transfer: persistent,
             transfer_runtime_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_retention_admission: Mutex::new(()),
@@ -240,10 +241,7 @@ impl Database {
                     loop {
                         let released = self.0.transfer_slot_released.notified();
                         if let Ok(permit) = self.0.transfer_runtime_admission.clone().try_acquire_owned() {
-                            break TransferSlotPermit {
-                                permit: Some(permit),
-                                released: self.0.transfer_slot_released.clone(),
-                            };
+                            break TransferSlotPermit::observed(self, permit, "general_borrow");
                         }
                         released.await;
                     }
@@ -259,10 +257,22 @@ impl Database {
     }
 
     pub(crate) fn runtime_admission_state(&self) -> DatabaseAdmissionState {
+        let observation = self
+            .0
+            .transfer_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         DatabaseAdmissionState {
             runtime_available: self.0.runtime_admission.available_permits(),
             general_available: self.0.general_runtime_admission.available_permits(),
             transfer_available: self.0.transfer_runtime_admission.available_permits(),
+            transfer_phase: observation.as_ref().map(|o| o.phase),
+            transfer_held_ms: observation
+                .as_ref()
+                .map_or(0, |o| o.started.elapsed().as_millis() as u64),
+            transfer_phase_ms: observation
+                .as_ref()
+                .map_or(0, |o| o.phase_started.elapsed().as_millis() as u64),
         }
     }
 
@@ -279,11 +289,9 @@ impl Database {
             .clone()
             .acquire_owned()
             .await?;
-        let transfer = TransferSlotPermit {
-            permit: Some(transfer),
-            released: self.0.transfer_slot_released.clone(),
-        };
+        let transfer = TransferSlotPermit::observed(self, transfer, "runtime_queue");
         let runtime = self.0.runtime_admission.clone().acquire_owned().await?;
+        transfer.phase("worker_queue");
         Ok(TransferDatabasePermit {
             _transfer: transfer,
             _runtime: runtime,
@@ -363,14 +371,13 @@ impl Database {
 
     fn run_transfer_cleanup_job(&self, job: TransferCleanupJob) {
         let class = job.kind.class();
+        let started = std::time::Instant::now();
         let Some(permit) = blocking_acquire_transfer_runtime_permit(self, job.deadline) else {
-            tracing::trace!(
-                operation = "database.transfer_cleanup",
-                class,
-                "transfer database cleanup admission expired"
-            );
+            self.runtime_admission_state()
+                .report(class, started.elapsed());
             return;
         };
+        permit.begin_work(class);
         let result = job.kind.run(self);
         drop(permit);
         if result.is_err() {

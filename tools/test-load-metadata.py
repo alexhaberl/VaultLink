@@ -4,6 +4,7 @@ import collections
 import csv
 import http.server
 import os
+import select
 from pathlib import Path
 import subprocess
 import sys
@@ -13,7 +14,7 @@ import time
 import unittest
 
 
-SCRIPT = Path(__file__).with_name("load-metadata.py").resolve()
+SCRIPT = Path(os.environ.get("TEST_METADATA_SCRIPT", Path(__file__).with_name("load-metadata.py"))).resolve()
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -57,6 +58,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     server.serialized = True
             if server.mode == "retry" and identity.endswith(".1") and request == 2:
                 server.other_completed_before_retry = server.requests["198.18.1.2"] == 20
+        if server.mode == "callback" and identity.endswith(".2") and request == 1:
+            server.release.wait(timeout=20)
         if server.mode == "blocked":
             server.release.wait(timeout=20)
             self.close_connection = True
@@ -101,13 +104,16 @@ class MetadataTests(unittest.TestCase):
                     self.assertIsNone(process.poll())
                     self.assertLess(time.monotonic(), deadline)
                     time.sleep(0.01)
-                threads = list(Path(f"/proc/{process.pid}/task").iterdir())
-                self.assertEqual(len(threads), 3)  # Main thread and two ready clients.
-                for thread in threads:
-                    affinity = next(line.split(":", 1)[1].strip() for line in
-                                    (thread / "status").read_text().splitlines()
-                                    if line.startswith("Cpus_allowed_list:"))
-                    self.assertEqual(affinity, cpu)
+                children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+                self.assertEqual(len(children), 2)
+                for pid in [str(process.pid), *children]:
+                    threads = list(Path(f"/proc/{pid}/task").iterdir())
+                    self.assertEqual(len(threads), 1)
+                    for thread in threads:
+                        affinity = next(line.split(":", 1)[1].strip() for line in
+                                        (thread / "status").read_text().splitlines()
+                                        if line.startswith("Cpus_allowed_list:"))
+                        self.assertEqual(affinity, cpu)
                 process.terminate()
                 stdout, stderr = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 143, stderr)
@@ -183,8 +189,67 @@ class MetadataTests(unittest.TestCase):
         for client in range(100):
             self.assertEqual(files[f"metadata-client-{client}.counts"], f"{client},20,20,20\n")
             self.assertEqual(len(list(csv.reader(files[f"metadata-{client}.csv"].splitlines()))), 20)
-        self.assertIn("engine=libcurl-threads\nprocesses=1\nclients=100\n", files["metadata-generator.env"])
+        self.assertIn("engine=libcurl-processes\nprocesses=101\nclients=100\n", files["metadata-generator.env"])
         self.assertFalse(any(name.endswith(".failure") for name in files))
+
+    def test_blocked_python_callback_cannot_suspend_another_client(self):
+        # A real native call holding client0's GIL waits for an external signal.
+        # Client1 must finish all requests before we release that callback. The
+        # old shared-interpreter threads deterministically fail this handshake.
+        server = Server("callback", 2)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        notify_read, notify_write = os.pipe()
+        release_read, release_write = os.pipe()
+        process = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="vaultlink-metadata-callback-") as temporary:
+                work = Path(temporary)
+                (work / "profile-go").touch()
+                wrapper = work / "blocked-callback.py"
+                wrapper.write_text(
+                    "import ctypes, importlib.util, os, sys\n"
+                    "spec = importlib.util.spec_from_file_location('metadata', sys.argv.pop(1))\n"
+                    "module = importlib.util.module_from_spec(spec)\n"
+                    "spec.loader.exec_module(module)\n"
+                    "original = module.Client.header\n"
+                    "def header(self, *args):\n"
+                    "    if self.index == 0 and not getattr(self, 'blocked_once', False):\n"
+                    "        self.blocked_once = True\n"
+                    "        os.write(int(os.environ['NOTIFY_FD']), b'1')\n"
+                    "        buffer = ctypes.create_string_buffer(1)\n"
+                    "        ctypes.PyDLL(None).read(int(os.environ['RELEASE_FD']), buffer, 1)\n"
+                    "    return original(self, *args)\n"
+                    "module.Client.header = header\n"
+                    "sys.exit(module.main())\n", encoding="ascii")
+                process = subprocess.Popen(
+                    [sys.executable, str(wrapper), str(SCRIPT), temporary, "2", "5", "30", "10"],
+                    env={**os.environ, "VAULTLINK_BASE_URL": f"http://127.0.0.1:{server.server_port}",
+                         "DOWNLOAD_TOKEN": "SECRET_TOKEN", "NO_PROXY": "127.0.0.1",
+                         "NOTIFY_FD": str(notify_write), "RELEASE_FD": str(release_read)},
+                    pass_fds=(notify_write, release_read), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.assertTrue(select.select([notify_read], [], [], 10)[0], "first callback never entered")
+                os.read(notify_read, 1)
+                server.release.set()
+                with server.condition:
+                    independent = server.condition.wait_for(
+                        lambda: server.requests["198.18.1.2"] == 20, timeout=5)
+                os.write(release_write, b'1')
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertNotIn("SECRET", stdout + stderr)
+                self.assertTrue(independent, "one client's GIL prevented another client from making HTTP progress")
+        finally:
+            if process is not None and process.poll() is None:
+                os.write(release_write, b'1')
+                process.kill()
+                process.communicate()
+            for fd in (notify_read, notify_write, release_read, release_write):
+                os.close(fd)
+            server.release.set()
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     def test_capacity_retry_does_not_suspend_other_clients(self):
         result, files, server = self.exercise("retry", 2)

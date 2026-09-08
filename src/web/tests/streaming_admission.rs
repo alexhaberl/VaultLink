@@ -387,6 +387,14 @@ async fn request_cancellation_releases_unclaimed_transfer_and_upload_begins() {
             .unwrap(),
         1
     );
+    // SQLite has committed, but this request deliberately never claims its
+    // owner. Unrelated transfers must not wait for the HTTP task to resume.
+    let transfer_progress = crate::db::execute_transfer_database_operation(
+        state.db().clone(),
+        "handoff_progress",
+        |_database| Ok::<_, rusqlite::Error>(()),
+    )
+    .await;
     transfer_request.abort();
     let _ = transfer_request.await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -430,6 +438,12 @@ async fn request_cancellation_releases_unclaimed_transfer_and_upload_begins() {
         state.db().active_upload_reservations(upload_share).unwrap(),
         1
     );
+    let upload_progress = crate::db::execute_transfer_database_operation(
+        state.db().clone(),
+        "handoff_progress",
+        |_database| Ok::<_, rusqlite::Error>(()),
+    )
+    .await;
     upload_request.abort();
     let _ = upload_request.await;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -442,6 +456,14 @@ async fn request_cancellation_releases_unclaimed_transfer_and_upload_begins() {
     assert_eq!(
         state.db().active_upload_reservations(upload_share).unwrap(),
         0
+    );
+    assert!(
+        transfer_progress.is_ok(),
+        "unclaimed transfer held admission: {transfer_progress:?}"
+    );
+    assert!(
+        upload_progress.is_ok(),
+        "unclaimed upload held admission: {upload_progress:?}"
     );
 }
 

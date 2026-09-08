@@ -2,20 +2,20 @@
 """Run the metadata clients with the distro's libcurl, without per-request exec.
 
 Only the load generator changes: each exchange uses a fresh HTTP connection.
-Each client has its own thread and libcurl easy handle, retained for 20 requests.
+Each client has its own process and libcurl easy handle, retained for 20 requests.
+Independent interpreters keep Python callbacks from serializing unrelated I/O.
 See https://curl.se/libcurl/c/threadsafe.html . No third-party Python module or
 build step is needed on the immutable guest or the soak host.
 """
 
 import ctypes as C
 import ctypes.util
-import concurrent.futures
+import multiprocessing
 import os
 from pathlib import Path
 import re
 import signal
 import sys
-import threading
 import time
 
 
@@ -28,15 +28,12 @@ PROGRESS = C.CFUNCTYPE(C.c_int, C.c_void_p, C.c_int64, C.c_int64, C.c_int64, C.c
 
 
 class Curl:
-    def __init__(self):
-        library = ctypes.util.find_library("curl")
+    def __init__(self, library):
         if not library:
             raise CurlFailure("libcurl is unavailable")
         self.lib = C.CDLL(library)
-        # getinfo only copies fields from this worker's completed handle. Keep
-        # the GIL for that short call; releasing it invites a thread handoff for
-        # each field while other clients are completing their HTTP callbacks.
-        # easy_perform still releases the GIL during the actual network I/O.
+        # getinfo only copies fields from this client's completed handle.
+        # No other client shares this interpreter or its callback execution.
         self.info_lib = C.PyDLL(library)
         signatures = {
             "global_init": (C.c_int, [C.c_long]),
@@ -130,7 +127,10 @@ class Client:
         self.retry_headers.clear()
         # CDLL releases the GIL during libcurl's blocking I/O. No handle is ever
         # accessed by two workers, and the main thread cleans up only after join.
-        return self.curl.easy_perform(self.easy)
+        self.started_epoch = time.time()
+        code = self.curl.easy_perform(self.easy)
+        self.ended_epoch = time.time()
+        return code
 
     def diagnostic(self, code, status, duration):
         curl = self.curl
@@ -142,7 +142,8 @@ class Client:
         for name, key in (("local_port", 42), ("remote_port", 40)):
             fields[name] = curl.info(self.easy, 0x200000 + key, C.c_long)
         record = (f"operation=metadata client={self.index} request={self.started} "
-                  f"identity={self.identity} curl_exit={code} ended_epoch={int(time.time())} "
+                  f"identity={self.identity} curl_exit={code} started_epoch={self.started_epoch:.6f} "
+                  f"ended_epoch={self.ended_epoch:.6f} diagnostic_epoch={time.time():.6f} "
                   + " ".join(f"{name}={value}" for name, value in fields.items()))
         (self.work / f"transport-metadata-{self.index}-{self.started}.failure").write_text(record + "\n", encoding="ascii")
         print("load_request_failure " + record, file=sys.stderr, flush=True)
@@ -189,65 +190,109 @@ class Client:
             f"{self.index},{self.attempts},{self.started},{self.completed}\n", encoding="ascii")
 
 
-def run(work, count, connect_timeout, request_timeout, ready_timeout):
-    curl = Curl()
-    clients = []
-    stop = threading.Event()
-    go = threading.Event()
-    assembled = threading.Barrier(count + 1)
-    started, cpu_started = time.monotonic(), time.process_time()
-    progress = PROGRESS(lambda *_args: int(stop.is_set()))
-
-    def worker(client):
-        assembled.wait(timeout=ready_timeout)
+def run_client(work, index, url, library, connect_timeout, request_timeout, ready, go, stop):
+    # Fork only from the single-threaded supervisor; initialize libcurl in each
+    # child. A client keeps its interpreter, callbacks and handle for all 20
+    # requests, with no per-request exec and no shared Python GIL.
+    signal.signal(signal.SIGTERM, lambda *_args: setattr(stop, "value", 1))
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+    curl = client = None
+    cpu_started = time.process_time()
+    try:
+        curl = Curl(library)
+        client = Client(curl, work, index, url, connect_timeout, request_timeout)
+        progress = PROGRESS(lambda *_args: int(stop.value))
+        curl.option(client.easy, 43, 0)
+        curl.option(client.easy, 20219, progress)
+        ready[index] = 1
         go.wait()
-        while not stop.is_set() and not client.failed and client.completed < 20:
-            delay = max(0, client.ready_at - time.monotonic())
-            if delay and stop.wait(delay):
-                break
-            code = client.perform()
-            # Handles, result files and counters belong to individual clients.
-            # A slow result write must not hold up all other clients.
-            client.finish(code)
+        cpu_started = time.process_time()
+        while not stop.value and not client.failed and client.completed < 20:
+            delay = client.ready_at - time.monotonic()
+            if delay > 0:
+                time.sleep(min(delay, 0.05))
+                continue
+            client.finish(client.perform())
+        if client.failed or client.completed != 20:
+            raise SystemExit(1)
+    except Exception as error:
+        # Child failures must follow the same redaction rule as the supervisor.
+        detail = str(error) if isinstance(error, CurlFailure) else type(error).__name__
+        print(f"metadata client {index} failed: {detail}", file=sys.stderr)
+        raise SystemExit(1) from None
+    finally:
+        if client:
+            client.close()
+        if curl:
+            curl.global_cleanup()
+        (work / f"metadata-generator-{index}.env").write_text(
+            f"cpu_seconds={time.process_time() - cpu_started:.6f}\n"
+            f"max_pretransfer_gap_seconds={client.max_pretransfer_gap if client else 0:.6f}\n",
+            encoding="ascii")
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=count)
+
+def run(work, count, connect_timeout, request_timeout, ready_timeout):
+    context = multiprocessing.get_context("fork")
+    ready = context.Array("b", count, lock=False)
+    stop = context.Value("b", 0, lock=False)
+    go = context.Event()
+    processes = []
+    started, cpu_started = time.monotonic(), time.process_time()
     try:
         url = os.environ["VAULTLINK_BASE_URL"] + "/v/" + os.environ["DOWNLOAD_TOKEN"]
+        # Resolve the library once, avoiding 100 concurrent ldconfig probes.
+        # Actual libcurl initialization remains strictly after fork.
+        library = ctypes.util.find_library("curl")
+        if not library:
+            raise CurlFailure("libcurl is unavailable")
         for index in range(count):
-            client = Client(curl, work, index, url, connect_timeout, request_timeout)
-            clients.append(client)
-            # CURLOPT_NOPROGRESS / XFERINFOFUNCTION allow SIGTERM to interrupt
-            # stalled requests, rather than waiting for the request deadline.
-            curl.option(client.easy, 43, 0)
-            curl.option(client.easy, 20219, progress)
-        futures = [executor.submit(worker, client) for client in clients]
-        assembled.wait(timeout=ready_timeout)
-        (work / "metadata-ready").touch()
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            try:
+                process = context.Process(target=run_client, args=(
+                    work, index, url, library, connect_timeout, request_timeout, ready, go, stop))
+                process.start()
+                processes.append(process)
+            finally:
+                # A pending cancellation is delivered only after registration,
+                # so the supervisor can join every child it started.
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         deadline = time.monotonic() + ready_timeout
+        while not all(ready):
+            if any(process.exitcode is not None for process in processes):
+                raise CurlFailure("metadata client exited before readiness")
+            if time.monotonic() >= deadline:
+                raise CurlFailure("metadata client readiness timed out")
+            time.sleep(0.01)
+        (work / "metadata-ready").touch()
         while not (work / "profile-go").exists():
             if time.monotonic() >= deadline:
                 raise CurlFailure("metadata profile start barrier timed out")
             time.sleep(0.05)
         started, cpu_started = time.monotonic(), time.process_time()
         go.set()
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
-        return int(any(client.failed or client.completed != 20 for client in clients))
+        for process in processes:
+            process.join()
+        return int(any(process.exitcode != 0 for process in processes))
     finally:
-        stop.set()
+        stop.value = 1
         go.set()
-        assembled.abort()
-        executor.shutdown(wait=True)
-        for client in clients:
-            client.close()
-        curl.global_cleanup()
+        # In-flight libcurl callbacks observe stop; join before the shell can
+        # aggregate partial results. No surviving clients may mutate evidence.
+        for process in processes:
+            process.join()
+        statistics = []
+        for index in range(len(processes)):
+            path = work / f"metadata-generator-{index}.env"
+            if path.exists():
+                statistics.append(dict(line.split("=", 1) for line in path.read_text().splitlines()))
+        cpu = time.process_time() - cpu_started + sum(float(s["cpu_seconds"]) for s in statistics)
+        gap = max((float(s["max_pretransfer_gap_seconds"]) for s in statistics), default=0)
         (work / "metadata-generator.env").write_text(
-            f"engine=libcurl-threads\nprocesses=1\nclients={count}\nrequests_per_client=20\n"
-            f"cpu_set={','.join(map(str, sorted(os.sched_getaffinity(0))))}\n"
-            f"fresh_connections=true\nworker_threads={count}\n"
-            f"elapsed_seconds={time.monotonic() - started:.6f}\ncpu_seconds={time.process_time() - cpu_started:.6f}\n"
-            f"max_pretransfer_gap_seconds={max((client.max_pretransfer_gap for client in clients), default=0):.6f}\n",
-            encoding="ascii")
+            f"engine=libcurl-processes\nprocesses={len(processes) + 1}\nclients={count}\n"
+            f"requests_per_client=20\ncpu_set={','.join(map(str, sorted(os.sched_getaffinity(0))))}\n"
+            f"fresh_connections=true\nworker_processes={len(processes)}\nthreads_per_client=1\n"
+            f"elapsed_seconds={time.monotonic() - started:.6f}\ncpu_seconds={cpu:.6f}\n"
+            f"max_pretransfer_gap_seconds={gap:.6f}\n", encoding="ascii")
 
 
 def main():
@@ -271,8 +316,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda _signal, _frame: sys.exit(143))
     try:
         sys.exit(main())
-    except (CurlFailure, OSError, KeyError, ValueError, AttributeError, RuntimeError,
-            threading.BrokenBarrierError) as error:
+    except (CurlFailure, OSError, KeyError, ValueError, AttributeError, RuntimeError) as error:
         # Exception strings from environment/path parsing may contain tokens.
         detail = str(error) if isinstance(error, CurlFailure) else type(error).__name__
         print(f"metadata generator failed: {detail}", file=sys.stderr)

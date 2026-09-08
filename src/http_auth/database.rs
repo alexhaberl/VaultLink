@@ -548,20 +548,7 @@ fn database_capacity_unavailable(
     queue_duration: std::time::Duration,
     state: crate::db::DatabaseAdmissionState,
 ) -> HttpAuthError {
-    let metrics = tokio::runtime::Handle::try_current()
-        .ok()
-        .map(|handle| handle.metrics());
-    tracing::warn!(
-        operation = "database.admission",
-        class,
-        queue_duration_ms = duration_millis(queue_duration),
-        runtime_available_permits = state.runtime_available,
-        general_available_permits = state.general_available,
-        transfer_available_permits = state.transfer_available,
-        scheduler_global_queue_depth = ?metrics.as_ref().map(|metrics| metrics.global_queue_depth()),
-        scheduler_alive_tasks = ?metrics.as_ref().map(|metrics| metrics.num_alive_tasks()),
-        "database executor admission timed out"
-    );
+    state.report(class, queue_duration);
     HttpAuthError::with_kind(
         StatusCode::SERVICE_UNAVAILABLE,
         DATABASE_BUSY_MESSAGE,
