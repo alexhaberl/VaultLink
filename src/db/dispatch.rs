@@ -35,7 +35,7 @@ struct DispatchQueue {
 }
 
 trait PendingDatabaseJob: Send {
-    fn dispatcher_started(&mut self);
+    fn dispatcher_started(&mut self, pending_jobs: usize);
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<()>;
     fn deadline(&self) -> Instant;
 }
@@ -66,11 +66,16 @@ where
         drop(self.admission.take());
         let error =
             DatabaseExecutorAdmission::new(&self.database, self.class, self.started.elapsed());
-        if let Some(timing) = self.timing.take() {
-            tracing::dispatcher::with_default(&self.subscriber, || timing.rejected(reason));
-        }
+        let rejected_at = Instant::now();
+        // Deliver the admission failure before optional telemetry is queued.
+        // Its subscriber may start immediately on the detached logging worker.
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(Err(error));
+        }
+        if let Some(timing) = self.timing.take() {
+            tracing::dispatcher::with_default(&self.subscriber, || {
+                timing.rejected(reason, rejected_at)
+            });
         }
         Poll::Ready(())
     }
@@ -151,9 +156,10 @@ where
     F: FnOnce(Database, P) -> T + Send + 'static,
     T: Send + 'static,
 {
-    fn dispatcher_started(&mut self) {
+    fn dispatcher_started(&mut self, pending_jobs: usize) {
         if let Some(timing) = self.timing.as_mut() {
             timing.dispatcher_started();
+            timing.dispatcher_polled(pending_jobs);
         }
     }
 
@@ -392,7 +398,7 @@ fn drain(mut guard: DispatcherGuard) {
         }
         for _ in 0..pending.len() {
             let mut job = pending.pop_front().expect("pending job count is stable");
-            job.dispatcher_started();
+            job.dispatcher_started(pending.len() + 1);
             if job.poll(&mut context).is_pending() {
                 pending.push_back(job);
             }
@@ -485,5 +491,141 @@ mod tests {
         drop(catcher_permit);
         assert_eq!(database.runtime_available_permits(), 1);
         assert_eq!(database.general_runtime_available_permits(), 1);
+    }
+}
+
+#[cfg(test)]
+mod rejection_logging_regression {
+    use super::*;
+    use std::{
+        io,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+    };
+
+    #[derive(Clone)]
+    struct BlockFirstWrite {
+        first: Arc<AtomicBool>,
+        entered: mpsc::Sender<()>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl io::Write for BlockFirstWrite {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.first.swap(true, Ordering::SeqCst) {
+                self.entered.send(()).unwrap();
+                // Deadlock failsafe only; the test releases this explicitly.
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BlockFirstWrite {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn slow_rejection_log_must_not_block_following_admitted_work() {
+        let _tracing_guard = crate::test_support::tracing_subscriber_guard();
+        let database = Database::open(":memory:").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()
+            .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_env_filter("warn")
+                .without_time()
+                .with_ansi(false)
+                .with_writer(BlockFirstWrite {
+                    first: Arc::new(AtomicBool::new(false)),
+                    entered: entered_tx,
+                    release: Arc::new(Mutex::new(release_rx)),
+                })
+                .finish(),
+        );
+        let now = Instant::now();
+        let (rejected_tx, mut rejected_rx) = oneshot::channel::<LaunchedWork<()>>();
+        let admission_db = database.clone();
+        let expired = DatabaseJob {
+            database: database.clone(),
+            class: "expired_probe",
+            started: now - Duration::from_secs(2),
+            deadline: now - Duration::from_secs(1),
+            admission: Some(Box::pin(async move {
+                admission_db.acquire_runtime_permit().await
+            })),
+            operation: Some(|_: Database, _: RuntimeDatabasePermit| panic!("expired job ran")),
+            sender: Some(rejected_tx),
+            handle: runtime.handle().clone(),
+            subscriber: subscriber.clone(),
+            span: tracing::Span::none(),
+            timing: Some(database.0.work_diagnostics.start("expired_probe")),
+        };
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let (launched_tx, launched_rx) = oneshot::channel::<LaunchedWork<()>>();
+        let admission_db = database.clone();
+        let ready = DatabaseJob {
+            database: database.clone(),
+            class: "ready_probe",
+            started: now,
+            deadline: now + Duration::from_secs(30),
+            admission: Some(Box::pin(async move {
+                admission_db.acquire_runtime_permit().await
+            })),
+            operation: Some(move |database: Database, permit: RuntimeDatabasePermit| {
+                assert_eq!(database.admin_count().unwrap(), 0);
+                drop(permit);
+                worker_tx.send(()).unwrap();
+            }),
+            sender: Some(launched_tx),
+            handle: runtime.handle().clone(),
+            subscriber,
+            span: tracing::Span::none(),
+            timing: Some(database.0.work_diagnostics.start("ready_probe")),
+        };
+        {
+            let mut queue = database.0.dispatch.queue.lock().unwrap();
+            queue.active = true;
+            queue.jobs.push_back(Box::new(expired));
+            queue.jobs.push_back(Box::new(ready));
+        }
+        let guard = DispatcherGuard::new(database);
+        let dispatcher = std::thread::spawn(move || drain(guard));
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        // The barrier guarantees the first WARN really is blocked. Neither
+        // slow SQL, an HTTP poll nor unavailable DB admission explains this.
+        let rejection_delivered = rejected_rx.try_recv().is_ok();
+        let progressed = worker_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+
+        // Clean up before asserting the regression, avoiding a hung test runtime.
+        let _ = release_tx.send(());
+        dispatcher.join().unwrap();
+        runtime.block_on(async {
+            launched_rx.await.unwrap().unwrap().await.unwrap();
+        });
+        entered.expect("rejection did not enter the test writer");
+        assert!(crate::best_effort_telemetry::flush(Duration::from_secs(5)));
+        assert!(
+            rejection_delivered,
+            "the error response waited for WARN logging"
+        );
+        assert!(progressed, "the sole dispatcher blocked on WARN despite free DB capacity and a ready queued SQL job");
     }
 }

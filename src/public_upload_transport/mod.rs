@@ -467,9 +467,13 @@ impl StagedUpload {
                 self.reservation.reserved_bytes
             };
             let reservation_token = self.reservation.token().to_string();
-            let outcome = transfer_database(state.db().clone(), move |database| {
-                database.extend_upload_reservation(&reservation_token, rounded_target)
-            })
+            let outcome = transfer_database(
+                state.db().clone(),
+                "upload_reservation_extend",
+                move |database| {
+                    database.extend_upload_reservation(&reservation_token, rounded_target)
+                },
+            )
             .await
             .map_err(AppError::from)?;
             let mut accepted_target = rounded_target;
@@ -478,9 +482,13 @@ impl StagedUpload {
             {
                 accepted_target = new_total;
                 let reservation_token = self.reservation.token().to_string();
-                transfer_database(state.db().clone(), move |database| {
-                    database.extend_upload_reservation(&reservation_token, new_total)
-                })
+                transfer_database(
+                    state.db().clone(),
+                    "upload_reservation_extend_exact",
+                    move |database| {
+                        database.extend_upload_reservation(&reservation_token, new_total)
+                    },
+                )
                 .await
                 .map_err(AppError::from)?
             } else {

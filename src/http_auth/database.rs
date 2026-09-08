@@ -176,14 +176,18 @@ where
     .await
 }
 
-pub(crate) async fn transfer_database<T, F>(database: Database, operation: F) -> Result<T>
+pub(crate) async fn transfer_database<T, F>(
+    database: Database,
+    class: &'static str,
+    operation: F,
+) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(Database) -> rusqlite::Result<T> + Send + 'static,
 {
     run_transfer_database_operation(
         database,
-        "transfer_write",
+        class,
         InternalOperation::HttpAuthDatabaseReadJoin,
         operation,
     )

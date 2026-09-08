@@ -2,6 +2,7 @@
 
 ## 0.7.0 — 2026-09-12
 
+- Move optional audit and database timing logs to a bounded nonblocking telemetry worker so a slow log sink cannot stall the transfer writer or admission dispatcher. Preserve recent transfer phases across the regular log budget and include their bounded snapshot on admission failure; distinguish upload quota extensions from cleanup.
 - Dispatch queued metadata and transfer database work independently of HTTP task polling, retaining FIFO admission, pool capacity, the shared one-second queue deadline, and cancellation-safe quota/audit handling.
 - Record bounded slow database worker and ownership timings at INFO, with separate unsuppressed admission-failure timings and no request contents.
 - Serve unprotected public metadata with one fresh share lookup when clean storage authority is immediately available; preserve revocation and password rechecks after waiting for storage authority or validating an unlock cookie.

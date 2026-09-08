@@ -24,9 +24,11 @@ impl UploadQuotaReservation {
     pub(super) async fn cancel(mut self) -> Result<()> {
         let token = self.token.clone();
         let database_handle = self.database.clone();
-        transfer_database(database_handle, move |database| {
-            database.cancel_upload_reservation(&token)
-        })
+        transfer_database(
+            database_handle,
+            "upload_reservation_cancel",
+            move |database| database.cancel_upload_reservation(&token),
+        )
         .await?;
         self.armed = false;
         Ok(())

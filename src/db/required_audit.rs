@@ -302,20 +302,43 @@ pub(super) fn insert_required_audits(
 
 pub(super) fn trace_required_audits(context: &AuditContext, events: &[RequiredAuditEvent]) {
     for event in events {
-        // Client IP retention is SQLite-only. Never mirror it into tracing/journald.
-        // A third-party tracing subscriber is allowed to fail, but it must not
-        // unwind across an already-committed security transaction and make the
-        // caller observe a false rollback. SQLite remains the required audit
-        // sink; tracing is explicitly best-effort fallback telemetry.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tracing::info!(
-                target: "vaultlink::audit",
-                actor = %EscapedLogValue::new(&context.actor),
-                action = event.action.as_str(),
-                object_id = %EscapedLogValue::new(event.object_id.as_deref().unwrap_or("")),
-                detail = %EscapedLogValue::new(event.detail.as_deref().unwrap_or("")),
-                "audit event"
-            );
-        }));
+        trace_committed_audit(
+            event.action,
+            &context.actor,
+            event.object_id.as_deref(),
+            event.detail.as_deref(),
+        );
     }
+}
+
+/// SQLite is the required, already-committed audit sink. Its optional log
+/// mirror must not keep a caller's write mutex, connection or admission slot
+/// waiting for a slow subscriber. Never capture client IP or the request span.
+pub(super) fn trace_committed_audit(
+    action: AuditAction,
+    actor: &str,
+    object: Option<&str>,
+    detail: Option<&str>,
+) {
+    let (actor, actor_truncated) = bounded_log_field(actor);
+    let (object, object_truncated) = bounded_log_field(object.unwrap_or(""));
+    let (detail, detail_truncated) = bounded_log_field(detail.unwrap_or(""));
+    let fields_truncated = actor_truncated || object_truncated || detail_truncated;
+    let observed_at = std::time::Instant::now();
+    crate::best_effort_telemetry::emit(move || {
+        tracing::info!(target: "vaultlink::audit", parent: None,
+            actor = %EscapedLogValue::new(&actor),
+            action = action.as_str(),
+            object_id = %EscapedLogValue::new(&object),
+            detail = %EscapedLogValue::new(&detail),
+            fields_truncated,
+            telemetry_delay_ms = observed_at.elapsed().as_millis() as u64,
+            "audit event");
+    });
+}
+
+fn bounded_log_field(value: &str) -> (String, bool) {
+    const MAX_BYTES: usize = 1024;
+    let end = value.floor_char_boundary(value.len().min(MAX_BYTES));
+    (value[..end].to_owned(), end < value.len())
 }

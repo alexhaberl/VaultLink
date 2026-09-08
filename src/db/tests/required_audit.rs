@@ -167,6 +167,9 @@ fn committed_publication_survives_a_panicking_fallback_tracing_subscriber() {
         )
     });
 
+    assert!(crate::flush_best_effort_telemetry(
+        std::time::Duration::from_secs(5)
+    ));
     assert!(matches!(&outcome, Ok(SessionBound::Authorized(_))));
     drop(outcome);
     assert_eq!(value.load(std::sync::atomic::Ordering::SeqCst), 1);
