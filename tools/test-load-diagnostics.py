@@ -104,6 +104,10 @@ profile_curl 198.18.1.3 "$TEST_OPERATION" 2 10 "$TEST_FORMAT" \
 work=$TEST_WORK
 load_stage=parallel-profiles
 metadata_clients=2
+metadata_script=$TEST_METADATA_SCRIPT
+metadata_client_cpus=$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')
+profile_ready_timeout=5
+: >"$work/profile-go"
 connect_timeout=2
 metadata_max_time=5
 wait_for_profile_go() { :; }
@@ -112,6 +116,7 @@ metadata_profile
 '''
         result = subprocess.run(["sh", "-c", script], env={**os.environ,
             "TEST_WORK": str(work), "LOAD_TEST_EVIDENCE_DIR": str(evidence),
+            "TEST_METADATA_SCRIPT": str(Path(__file__).with_name("load-metadata.py").resolve()),
             "VAULTLINK_BASE_URL": base, "DOWNLOAD_TOKEN": "SECRET_TOKEN"},
             capture_output=True, text=True, timeout=30)
         assert result.returncode == 1, result

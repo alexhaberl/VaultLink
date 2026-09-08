@@ -330,6 +330,7 @@ run_scp \
     tools/check-vm-root-capacity.sh \
     deploy/docker/api-smoke.sh \
     tools/load-test.sh \
+    tools/load-metadata.py \
     vaultlink-ci@127.0.0.1:/tmp/
 remote_package=/tmp/$(basename "$package")
 # All expanded arguments are manifest-constrained and intentionally become

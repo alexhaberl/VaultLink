@@ -26,7 +26,7 @@ PERF = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PERF)
 EvidenceError = PERF.EvidenceError
 PERFORMANCE_WORKFLOW = ".github/workflows/performance-evidence.yml"
-PRODUCER_FILES = ("tools/load-test.sh", "tools/collect-performance-evidence.py",
+PRODUCER_FILES = ("tools/load-test.sh", "tools/load-metadata.py", "tools/collect-performance-evidence.py",
                   "tools/check-performance-evidence.py")
 
 

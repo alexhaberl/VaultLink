@@ -17,6 +17,13 @@ export LC_ALL LANG
 : "${SOAK_NAMESPACE:?set SOAK_NAMESPACE from vaultlink-soak-control}"
 : "${VAULTLINK_CONFIG:?set VAULTLINK_CONFIG}"
 command -v curl >/dev/null
+command -v python3 >/dev/null
+command -v taskset >/dev/null
+metadata_script=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/load-metadata.py
+if [ ! -f "$metadata_script" ] || [ -L "$metadata_script" ]; then
+    echo "metadata generator helper is missing or unsafe" >&2
+    exit 69
+fi
 
 validate_distinct_token_set() {
     token_set_name=$1
@@ -325,6 +332,11 @@ profile_curl() {
 }
 
 work=$(mktemp -d)
+client_cpu_layout=$(python3 -c 'import os; cpus = sorted(os.sched_getaffinity(0)); print(str(cpus[0]) + " " + ",".join(map(str, cpus[1:] or cpus)))')
+metadata_client_cpus=${client_cpu_layout%% *}
+transfer_client_cpus=${client_cpu_layout#* }
+printf 'metadata_cpu_set=%s\ntransfer_cpu_set=%s\n' \
+    "$metadata_client_cpus" "$transfer_client_cpus" >"$work/client-cpus.env"
 load_stage=initialization
 admission_holders=""
 stop_admission_holders() {
@@ -345,6 +357,14 @@ persist_load_evidence() {
         >"$load_command_tmp" || return 1
     chmod 0640 "$load_command_tmp" || return 1
     mv "$load_command_tmp" "$LOAD_TEST_EVIDENCE_DIR/load-command.env" || return 1
+    for diagnostic_context in metadata-generator.env client-cpus.env; do
+        if [ -f "$work/$diagnostic_context" ] && [ ! -L "$work/$diagnostic_context" ]; then
+            install -m 0640 "$work/$diagnostic_context" \
+                "$LOAD_TEST_EVIDENCE_DIR/$diagnostic_context" || return 1
+        elif [ "$persist_status" -eq 0 ]; then
+            return 1
+        fi
+    done
     [ "$persist_status" -ne 0 ] || return 0
 
     # Each worker owns its file, avoiding interleaved writes from 150 clients.
@@ -571,97 +591,17 @@ wait_for_profile_go() {
 }
 
 metadata_profile() {
-    metadata_pids=""
-    client=0
-    while [ "$client" -lt "$metadata_clients" ]; do
-        (
-            identity="198.18.1.$((client + 1))"
-            capacity_evidence="$work/capacity-retry-client-$client.csv"
-            headers="$work/metadata-$client.headers"
-            : >"$capacity_evidence"
-            request=0
-            metadata_curl_attempts=0
-            started_requests=0
-            trap 'printf "%s,%s,%s,%s\n" "$client" "$metadata_curl_attempts" "$started_requests" "$request" >"$work/metadata-client-$client.counts"' EXIT
-            wait_for_profile_go
-            capacity_retries=0
-            while [ "$request" -lt 20 ]; do
-                while :; do
-                    metadata_curl_attempts=$((metadata_curl_attempts + 1))
-                    started_requests=$((request + 1))
-                    metrics=$(profile_curl "$identity" metadata "$client" "$started_requests" \
-                        '%{http_code},%{time_total}' \
-                        --connect-timeout "$connect_timeout" \
-                        --max-time "$metadata_max_time" -o /dev/null \
-                        --dump-header "$headers" \
-                        "$VAULTLINK_BASE_URL/v/$DOWNLOAD_TOKEN")
-                    status=${metrics%%,*}
-                    duration=${metrics#*,}
-                    case "$status" in
-                        2??)
-                            printf '%s,%s,%s\n' "$identity" "$status" "$duration"
-                            break
-                            ;;
-                        503)
-                            retry_after=$(awk '
-                                { sub(/\r$/, "") }
-                                tolower($1) == "retry-after:" {
-                                    values++
-                                    value = $2
-                                    if (NF != 2) invalid = 1
-                                }
-                                END {
-                                    if (values != 1 || invalid) exit 1
-                                    print value
-                                }
-                            ' "$headers") || {
-                                echo "metadata client $client request $((request + 1)): 503 with invalid Retry-After shape" >&2
-                                exit 1
-                            }
-                            [ "$retry_after" = "$metadata_capacity_retry_after_seconds" ] \
-                                || {
-                                    echo "metadata client $client request $((request + 1)): 503 with unexpected Retry-After value" >&2
-                                    exit 1
-                                }
-                            awk -v value="$duration" \
-                                -v limit="$metadata_capacity_response_limit" 'BEGIN {
-                                    exit !(value ~ /^[0-9]+([.][0-9]+)?$/ \
-                                        && value + 0 > 0 && value + 0 <= limit)
-                                }' || {
-                                    echo "metadata client $client request $((request + 1)): 503 duration ${duration}s exceeds ${metadata_capacity_response_limit}s response limit" >&2
-                                    exit 1
-                                }
-                            capacity_retries=$((capacity_retries + 1))
-                            printf '%s,%s,%s,%s,%s,%s\n' \
-                                "$identity" "$((request + 1))" "$capacity_retries" \
-                                "$status" "$duration" "$retry_after" \
-                                >>"$capacity_evidence"
-                            [ "$capacity_retries" \
-                                -le "$metadata_capacity_retry_limit_per_client" ] \
-                                || {
-                                    echo "metadata client $client request $((request + 1)): 503 retry budget exhausted" >&2
-                                    exit 1
-                                }
-                            sleep "$retry_after"
-                            ;;
-                        *)
-                            echo "metadata client $client request $((request + 1)): unexpected HTTP $status after ${duration}s" >&2
-                            exit 1
-                            ;;
-                    esac
-                done
-                request=$((request + 1))
-            done
-        ) >"$work/metadata-$client.csv" &
-        metadata_pids="$metadata_pids $!"
-        client=$((client + 1))
-    done
-    : >"$work/metadata-ready"
-    trap 'kill $metadata_pids 2>/dev/null || true' HUP INT TERM
+    # Preserve 100/50 independent clients and fresh connections while avoiding
+    # thousands of fork/execs competing with the download readers under TCG.
+    taskset --cpu-list "$metadata_client_cpus" \
+        python3 "$metadata_script" "$work" "$metadata_clients" \
+        "$connect_timeout" "$metadata_max_time" "$profile_ready_timeout" &
+    metadata_worker=$!
+    trap 'kill "$metadata_worker" 2>/dev/null || true' HUP INT TERM
     metadata_failed=0
-    for wait_pid in $metadata_pids; do
-        wait "$wait_pid" || metadata_failed=1
-    done
+    wait "$metadata_worker" || metadata_failed=1
+    trap - HUP INT TERM
+    [ "$metadata_failed" -eq 0 ] || : >"$work/metadata-failed"
     # Aggregate every completed client result before returning a profile
     # failure so the EXIT evidence retains the available partial measurements.
     cat "$work"/metadata-*.csv >"$work/metadata.csv"
@@ -709,7 +649,18 @@ metadata_profile() {
     printf '%s\n' "$p95_within_limit" >"$work/metadata.p95-within-limit"
 }
 
+pin_transfer_profile() {
+    # POSIX shells retain the parent's $$ in background functions. Reading
+    # /proc/self/stat with a shell builtin identifies this actual worker.
+    IFS=' ' read -r profile_pid _ </proc/self/stat
+    case "$profile_pid" in ''|*[!0-9]*) return 1 ;; esac
+    taskset -pc "$transfer_client_cpus" "$profile_pid" >/dev/null
+    profile_cpus=$(python3 -c 'import os, sys; cpus = sorted(os.sched_getaffinity(0)); assert cpus == list(map(int, sys.argv[1].split(","))); print(",".join(map(str, cpus)))' "$transfer_client_cpus")
+    printf '%s_cpu_set=%s\n' "$1" "$profile_cpus" >>"$work/client-cpus.env"
+}
+
 download_profile() {
+    pin_transfer_profile download
     download_pids=""
     download=0
     while [ "$download" -lt "$range_streams" ]; do
@@ -798,6 +749,7 @@ download_profile() {
 }
 
 upload_profile() {
+    pin_transfer_profile upload
     upload_pids=""
     upload=0
     while [ "$upload" -lt "$upload_clients" ]; do
@@ -909,11 +861,11 @@ while [ ! -e "$work/metadata-ready" ] \
     || [ ! -e "$work/download-ready" ] \
     || [ ! -e "$work/upload-ready" ]; do
     ready_attempts=$((ready_attempts + 1))
-    if [ "$ready_attempts" -gt "$ready_max_attempts" ]; then
+    if [ "$ready_attempts" -gt "$ready_max_attempts" ] || [ -e "$work/metadata-failed" ]; then
         kill "$metadata_pid" "$download_pid" "$upload_pid" 2>/dev/null || true
         rm -f "$load_marker"
         wait "$rss_pid" 2>/dev/null || true
-        echo "load workers did not reach the concurrency barrier" >&2
+        echo "load workers failed or did not reach the concurrency barrier" >&2
         exit 1
     fi
     sleep 0.05
