@@ -210,17 +210,16 @@ existing CI, fuzz, security, and release checks. No missing or skipped matrix
 row is treated as success.
 
 The metadata portion of both load profiles uses `tools/load-metadata.py` and
-its distribution's existing libcurl easy interface. One process runs 100
-(full) or 50 (smoke) independent client threads, each making 20 sequential requests
-with its own retained libcurl handle.
-Workers record results independently. Short libcurl result-field reads retain
-the Python interpreter lock; network I/O releases it. This avoids thread
-handoffs for each timing field and a shared lock around result-file writes.
-Every request still opens a fresh TCP connection. This avoids thousands of
-shell/curl process creations competing with download readers on the two client
-CPUs under TCG. All workers inherit the original client CPU set. Each metadata
-client remains separately schedulable beside the transfer workers, without
-changing their CPU allocation or serializing all metadata I/O in one event loop.
+its distribution's existing libcurl easy interface. A single-threaded supervisor
+forks 100 (full) or 50 (smoke) persistent client processes before the start barrier.
+Each client initializes its own libcurl handle and makes 20 sequential requests.
+Independent Python interpreters prevent a slow callback in one client from
+holding up network progress in the other clients. The supervisor propagates
+cancellation and joins every client before partial results are collected.
+Every request still opens a fresh TCP connection. There is no per-request exec.
+All client processes inherit the original client CPU set and remain separately
+schedulable beside the transfer workers. Generator process count and aggregate
+CPU time are recorded separately from the application's resource limits.
 The range and upload/readback clients, simultaneous start barrier, byte counts,
 hashes, service CPU/RSS limits and application timeouts
 are unchanged. A 503 retry pauses only its own client; the existing three-retry
@@ -235,7 +234,11 @@ receives it after its current operation finishes, ahead of general waiters.
 Queued transfer writers still wait before acquiring global capacity, so they
 cannot consume the three slots needed by reads. A single-connection in-memory
 database continues to share its one slot. Both classes retain the existing
-one-second admission deadline and hold their permits until blocking work ends.
+one-second admission deadline and hold their permits until database work ends.
+A committed reservation releases admission before waiting for its HTTP owner.
+If that owner disappears, the same blocking worker reacquires bounded admission
+for compensation, including during runtime shutdown. It never writes without
+admission or retains a DB slot merely while waiting for ownership.
 A borrower cancels its unused general queue entry before global admission so
 it cannot reserve a second class slot while waiting.
 
@@ -253,7 +256,8 @@ existing access check and fresh-share recheck remain in place. The strict
 
 ## Diagnosing load failures
 
-Database admission failures retain the operation class and queue duration, plus
+Database admission failures, including public transfer begin/completion/heartbeat,
+retain the operation class and queue duration, plus
 `runtime_available_permits`, `general_available_permits` and
 `transfer_available_permits`. These are snapshots when admission fails, not a
 history of the entire wait; they contain no query, request or database contents.
@@ -334,3 +338,11 @@ hash/signature/package/key/count checks, and only then publishes it.
 The signing secret is not exposed to package, container, QEMU, load, soak, or
 pull-request jobs. Starting with 0.6.0, published package assets are immutable
 operational rollback inputs and must not be deleted.
+
+Transfer admission snapshots also retain the current slot owner's operation phase,
+total hold time and phase duration. Debug events distinguish worker-queue delay
+from database work and HTTP ownership acknowledgement. Only fixed operation names
+and numeric timing/capacity fields are logged. A slot can already be assigned to a
+semaphore waiter before that waiter runs; an occupied slot with no observed owner
+is not by itself a leak. Metadata failure records distinguish timestamps taken
+around libcurl execution from the later diagnostic emission time.

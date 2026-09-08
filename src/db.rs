@@ -1,3 +1,4 @@
+mod admission_diagnostics;
 mod audit;
 mod auth;
 mod executor;
@@ -8,6 +9,7 @@ mod runtime_settings;
 mod schema;
 mod service_tokens;
 mod shares;
+mod transfer_handoff;
 mod transfers;
 
 pub(crate) use executor::{

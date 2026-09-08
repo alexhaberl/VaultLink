@@ -110,9 +110,10 @@ where
     T: Send + 'static,
     E: Send + 'static,
     F: FnOnce(Database) -> Result<T, E> + Send + 'static,
-    P: Send + 'static,
+    P: super::admission_diagnostics::DatabaseWorkPermit,
 {
     tokio::task::spawn_blocking(move || {
+        permit.begin_work(class);
         let _permit = permit;
         let operation_started = std::time::Instant::now();
         let result = operation(database);

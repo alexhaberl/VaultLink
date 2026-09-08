@@ -95,7 +95,8 @@ pub(super) async fn begin_transfer_lease_cancellation_safe(
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let admission = permit;
+        admission.begin_work("lease_begin");
         let outcome = database.begin_transfer_lease(
             &session_token,
             &lease_token,
@@ -113,11 +114,8 @@ pub(super) async fn begin_transfer_lease_cancellation_safe(
             }
             return;
         }
-        if reserved && ownership_receiver.blocking_recv().is_err() {
-            // The async receiver disappeared after SQLite committed but before
-            // a PublicTransferLease could take ownership. Cancel synchronously
-            // in this already-blocking worker so no detached lease survives.
-            let _ = database.cancel_transfer_lease(&lease_token);
+        if reserved {
+            database.finish_lease_handoff(admission, ownership_receiver, lease_token);
         }
     });
     let outcome = outcome_receiver
@@ -154,6 +152,7 @@ pub(super) fn transfer_complete_future(
                 .await
                 .map_err(|_| io::Error::other("database completion admission unavailable"))?;
         let result = tokio::task::spawn_blocking(move || {
+            permit.begin_work("transfer_complete");
             let _permit = permit;
             database.complete_transfer_lease_and_audit(
                 &lease_token,

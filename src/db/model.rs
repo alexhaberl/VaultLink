@@ -30,6 +30,7 @@ struct DatabaseInner {
     // serialized writer rejoins a large metadata queue and can time out.
     general_runtime_admission: Arc<tokio::sync::Semaphore>,
     transfer_slot_released: Arc<tokio::sync::Notify>,
+    transfer_observation: Arc<Mutex<Option<admission_diagnostics::TransferObservation>>>,
     general_can_borrow_transfer: bool,
     // Runtime transfer writers must serialize before they can consume a
     // general database permit. Otherwise several blocking workers can occupy
@@ -66,12 +67,17 @@ pub(crate) struct TransferDatabasePermit {
 struct TransferSlotPermit {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     released: Arc<tokio::sync::Notify>,
+    observation: Arc<Mutex<Option<admission_diagnostics::TransferObservation>>>,
 }
 
 impl Drop for TransferSlotPermit {
     fn drop(&mut self) {
         // Semaphore release hands capacity to queued writers first. General
         // waiters may only borrow an unclaimed slot with try_acquire_owned.
+        *self
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         drop(self.permit.take());
         self.released.notify_one();
     }
@@ -91,6 +97,9 @@ pub(crate) struct DatabaseAdmissionState {
     pub(crate) runtime_available: usize,
     pub(crate) general_available: usize,
     pub(crate) transfer_available: usize,
+    pub(crate) transfer_phase: Option<&'static str>,
+    pub(crate) transfer_held_ms: u64,
+    pub(crate) transfer_phase_ms: u64,
 }
 
 #[derive(Default)]

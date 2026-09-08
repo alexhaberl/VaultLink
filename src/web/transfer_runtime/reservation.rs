@@ -60,7 +60,8 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
     let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
     let (ownership_sender, ownership_receiver) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let admission = permit;
+        admission.begin_work("upload_begin");
         let outcome = database.begin_upload_reservation(
             &reservation_token,
             share_id,
@@ -73,10 +74,8 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
             }
             return;
         }
-        if reserved && ownership_receiver.blocking_recv().is_err() {
-            // See the transfer counterpart above: ownership either reaches an
-            // RAII guard or the reservation is removed before this worker exits.
-            let _ = database.cancel_upload_reservation(&reservation_token);
+        if reserved {
+            database.finish_upload_handoff(admission, ownership_receiver, reservation_token);
         }
     });
     let outcome = outcome_receiver
