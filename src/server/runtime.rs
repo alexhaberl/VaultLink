@@ -19,6 +19,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // runtime teardown extend the externally enforced 25s + 10s shutdown
     // budget; systemd retains a separate ten-second termination margin.
     runtime.shutdown_timeout(Duration::ZERO);
+    // Optional telemetry cannot extend the service's bounded shutdown when
+    // its output sink is stuck. Required audit records are already in SQLite.
+    let _ = vaultlink::flush_best_effort_telemetry(Duration::from_millis(250));
     result
 }
 

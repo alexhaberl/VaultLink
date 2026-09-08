@@ -72,43 +72,52 @@ impl Write for Output {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn public_transfer_capacity_reports_waiter_and_owner_phase() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = Database::open(directory.path().join("SECRET_DATABASE.sqlite")).unwrap();
-    let holder = database.acquire_transfer_runtime_permit().await.unwrap();
-    holder.begin_work("upload_reservation_begin");
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let writer = Output(bytes.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(move || writer.clone())
-        .finish();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
-    let result = dispatch_transfer_work::<(), _>(database.clone(), "transfer_complete", |_, _| {
-        panic!("an operation rejected by admission must not start")
-    })
-    .await;
-    drop(holder);
-    assert!(matches!(result, Err(PublicTransferError::Capacity)));
-    let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-    for expected in [
-        "database.admission",
-        "class=\"transfer_complete\"",
-        "transfer_phase=\"upload_reservation_begin\"",
-        "transfer_held_ms=",
-        "transfer_phase_ms=",
-        "runtime_available_permits=3",
-        "general_available_permits=3",
-        "transfer_available_permits=0",
-        "scheduler_global_queue_depth=",
-    ] {
-        assert!(output.contains(expected), "missing {expected}: {output}");
-    }
-    assert!(!output.contains("SECRET"));
-    let released = database.runtime_admission_state();
-    assert_eq!(released.transfer_phase, None);
-    assert_eq!(released.transfer_available, 1);
+#[test]
+fn public_transfer_capacity_reports_waiter_and_owner_phase() {
+    let _tracing_guard = crate::test_support::tracing_subscriber_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("SECRET_DATABASE.sqlite")).unwrap();
+        let holder = database.acquire_transfer_runtime_permit().await.unwrap();
+        holder.begin_work("upload_reservation_begin");
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Output(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let result =
+            dispatch_transfer_work::<(), _>(database.clone(), "transfer_complete", |_, _| {
+                panic!("an operation rejected by admission must not start")
+            })
+            .await;
+        drop(holder);
+        assert!(matches!(result, Err(PublicTransferError::Capacity)));
+        assert!(crate::flush_best_effort_telemetry(Duration::from_secs(5)));
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        for expected in [
+            "database.admission",
+            "class=\"transfer_complete\"",
+            "transfer_phase=\"upload_reservation_begin\"",
+            "transfer_held_ms=",
+            "transfer_phase_ms=",
+            "runtime_available_permits=3",
+            "general_available_permits=3",
+            "transfer_available_permits=0",
+            "scheduler_global_queue_depth=",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+        assert!(!output.contains("SECRET"));
+        let released = database.runtime_admission_state();
+        assert_eq!(released.transfer_phase, None);
+        assert_eq!(released.transfer_available, 1);
+    });
 }

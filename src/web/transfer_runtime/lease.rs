@@ -46,7 +46,7 @@ impl PublicTransferLease {
         self.heartbeat_stop.take();
         let lease_token = self.lease_token.clone();
         let cancellation_database = self.database.clone();
-        if transfer_database(cancellation_database, move |database| {
+        if transfer_database(cancellation_database, "transfer_cancel", move |database| {
             database.cancel_transfer_lease(&lease_token).map(|_| ())
         })
         .await

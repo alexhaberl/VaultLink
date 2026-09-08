@@ -107,6 +107,7 @@ mod dispatch_diagnostics {
             assert_eq!(database.runtime_available_permits(), 4);
         });
 
+        assert!(crate::best_effort_telemetry::flush(Duration::from_secs(5)));
         let output = String::from_utf8(logs.bytes.lock().unwrap().clone()).unwrap();
         let summaries: Vec<_> = output
             .lines()

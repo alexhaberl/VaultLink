@@ -38,16 +38,22 @@ impl Database {
         drop(permit);
         let started = std::time::Instant::now();
         let abandoned = receiver.blocking_recv().is_err();
-        tracing::debug!(
-            operation = "database.handoff",
-            class = kind.class(),
-            ownership_wait_ms = started.elapsed().as_millis() as u64,
-            abandoned,
-            "transfer ownership handoff finished"
-        );
+        let observed_at = std::time::Instant::now();
+        let ownership_wait = observed_at.saturating_duration_since(started);
+        let class = kind.class();
+        crate::best_effort_telemetry::emit(move || {
+            tracing::debug!(parent: None,
+                operation = "database.handoff",
+                class,
+                ownership_wait_ms = ownership_wait.as_millis() as u64,
+                telemetry_delay_ms = observed_at.elapsed().as_millis() as u64,
+                abandoned,
+                "transfer ownership handoff finished"
+            )
+        });
         self.0
             .work_diagnostics
-            .record_ownership(kind.class(), started.elapsed(), abandoned);
+            .record_ownership(class, ownership_wait, abandoned);
         if abandoned {
             // Compensation is a new DB operation: use the existing FIFO and
             // bounded deadline, never perform an unadmitted write after release.

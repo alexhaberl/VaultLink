@@ -6,6 +6,7 @@ compile_error!("VaultLink supports Linux only");
 
 pub mod api;
 pub mod auth;
+mod best_effort_telemetry;
 pub mod cifs_provision;
 pub mod config;
 pub mod container_proxy;
@@ -54,6 +55,7 @@ pub mod updates;
 pub mod web;
 pub mod webauthn;
 
+pub use best_effort_telemetry::flush as flush_best_effort_telemetry;
 pub use state::AppState;
 pub(crate) use state::{
     AccountRouteState, AdminRouteState, AdmissionRouteState, AuthRouteState, FileRouteState,

@@ -53,15 +53,17 @@ impl TransferDatabasePermit {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|o| o.phase_started.elapsed().as_millis() as u64);
-        if let Some(worker_queue_ms) = worker_queue_ms {
-            tracing::debug!(
-                operation = "database.transfer_worker",
-                class,
-                worker_queue_ms,
-                "transfer database worker started"
-            );
-        }
         self._transfer.phase(class);
+        if let Some(worker_queue_ms) = worker_queue_ms {
+            crate::best_effort_telemetry::emit(move || {
+                tracing::debug!(parent: None,
+                    operation = "database.transfer_worker",
+                    class,
+                    worker_queue_ms,
+                    "transfer database worker started"
+                )
+            });
+        }
     }
 }
 
@@ -70,7 +72,11 @@ impl DatabaseAdmissionState {
         let metrics = tokio::runtime::Handle::try_current()
             .ok()
             .map(|h| h.metrics());
-        tracing::warn!(operation = "database.admission", class,
+        let scheduler_global_queue_depth = metrics.as_ref().map(|m| m.global_queue_depth());
+        let scheduler_alive_tasks = metrics.as_ref().map(|m| m.num_alive_tasks());
+        let observed_at = Instant::now();
+        crate::best_effort_telemetry::emit(move || {
+            tracing::warn!(parent: None, operation = "database.admission", class,
             queue_duration_ms = queue_duration.as_millis() as u64,
             runtime_available_permits = self.runtime_available,
             general_available_permits = self.general_available,
@@ -78,9 +84,11 @@ impl DatabaseAdmissionState {
             transfer_phase = self.transfer_phase,
             transfer_held_ms = self.transfer_phase.map(|_| self.transfer_held_ms),
             transfer_phase_ms = self.transfer_phase.map(|_| self.transfer_phase_ms),
-            scheduler_global_queue_depth = ?metrics.as_ref().map(|m| m.global_queue_depth()),
-            scheduler_alive_tasks = ?metrics.as_ref().map(|m| m.num_alive_tasks()),
-            "database executor admission timed out");
+            scheduler_global_queue_depth = ?scheduler_global_queue_depth,
+            scheduler_alive_tasks = ?scheduler_alive_tasks,
+            telemetry_delay_ms = observed_at.elapsed().as_millis() as u64,
+            "database executor admission timed out")
+        });
     }
 }
 

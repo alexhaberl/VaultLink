@@ -10,8 +10,6 @@ use chrono::Utc;
 use rusqlite::Connection;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
-use crate::log_safety::EscapedLogValue;
-
 pub(super) fn validate_audit_fields(
     actor: &str,
     action: &str,
@@ -195,15 +193,7 @@ impl Database {
         insert_audit_event(&transaction, action, actor, object, detail, client_ip)?;
         transaction.commit()?;
         drop(connection);
-        // Client IP retention is SQLite-only. Never mirror it into tracing/journald.
-        tracing::info!(
-            target: "vaultlink::audit",
-            actor = %EscapedLogValue::new(actor),
-            action = action.as_str(),
-            object_id = %EscapedLogValue::new(object.unwrap_or("")),
-            detail = %EscapedLogValue::new(detail.unwrap_or("")),
-            "audit event"
-        );
+        super::required_audit::trace_committed_audit(action, actor, object, detail);
         Ok(())
     }
 
@@ -671,6 +661,9 @@ mod log_safety_tests {
         let database = Database::open(":memory:").unwrap();
 
         tracing::subscriber::with_default(subscriber, || {
+            let request_span =
+                tracing::info_span!("private_request", credential = "SECRET_REQUEST_VALUE");
+            let _entered = request_span.enter();
             database
                 .audit_action_with_client_ip(
                     AuditAction::SettingsUpdated,
@@ -681,6 +674,10 @@ mod log_safety_tests {
                 )
                 .unwrap();
         });
+
+        assert!(crate::flush_best_effort_telemetry(
+            std::time::Duration::from_secs(5)
+        ));
 
         let output = String::from_utf8(
             captured
@@ -696,11 +693,50 @@ mod log_safety_tests {
         assert!(line.contains("admin\\r\\nforged"));
         assert!(line.contains("file\\tname"));
         assert!(line.contains("C1:\\u{85};line:\\u{2028}next"));
+        assert!(!line.contains("SECRET_REQUEST_VALUE"));
+        assert!(!line.contains("private_request"));
 
         let events = database.list_audit(None, 1, 0).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].actor, actor);
         assert_eq!(events[0].object_id.as_deref(), Some(object));
         assert_eq!(events[0].detail.as_deref(), Some(detail));
+    }
+
+    #[test]
+    fn optional_audit_field_bound_does_not_truncate_required_sqlite_record() {
+        let _tracing_guard = crate::test_support::tracing_subscriber_guard();
+        let detail = "é".repeat(1200);
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(captured.clone())
+            .finish();
+        let database = Database::open(":memory:").unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            database
+                .audit_action_with_client_ip(
+                    AuditAction::SettingsUpdated,
+                    "admin",
+                    None,
+                    Some(&detail),
+                    None,
+                )
+                .unwrap();
+        });
+        assert!(crate::flush_best_effort_telemetry(
+            std::time::Duration::from_secs(5)
+        ));
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("fields_truncated=true"));
+        assert_eq!(output.matches('é').count(), 512);
+        assert_eq!(
+            database.list_audit(None, 1, 0).unwrap()[0]
+                .detail
+                .as_deref(),
+            Some(detail.as_str())
+        );
     }
 }
