@@ -85,6 +85,20 @@ SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and
 
 `shares.max_upload_size` is the optional per-file limit; `NULL` uses the global runtime limit. Upload shares also have cumulative `max_upload_total_size` and `max_upload_files` limits, with baseline defaults of 100,000,000,000 bytes and 1,000 fail-closed accounted files. Byte and file usage is recorded atomically before visible publication; if publication later fails, quota use deliberately remains so a visible file can never be unaccounted.
 
+Streaming uploads reserve quota ahead in adaptive 1, 2, 4, then at most 8 MiB
+steps, based on bytes already received. This reduces durable reservation
+transactions for large uploads. The same SQLite write transaction chooses the
+preferred target or, when it does not fit, the exact required bytes. Concurrent
+uploads cannot overbook the cumulative quota. Compared with the former 1 MiB
+steps, an upload may temporarily hold more unused quota (less than 8 MiB ahead
+of the current chunk), so scarce quota is not distributed identically. The
+per-file maximum still applies. Heartbeats keep the existing reservation size;
+the five-minute heartbeat and fifteen-minute expiry remain unchanged. Cancel
+and expiry release the reservation, and successful accounting releases unused
+reserved bytes. Authority and policy epoch are checked on extension and again
+before publication, including when an upload finishes inside its existing
+reservation. Ahead reservation never authorizes publication after revocation.
+
 The supported 0.6.0 release uses schema 6. Fresh installations of the 0.7.0 development build create schema 10 and version-2 through version-10 migration records. Valid schema-1 through schema-9 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, schema 8 adds normalized trigram Share search plus composite audit-pagination indexes, schema 9 adds an index for pending transfer cleanup, and schema 10 adds partial indexes for protected and exhausted Shares plus expiry indexes. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
 
 Concurrent filesystem renames can temporarily prevent a confined lookup.

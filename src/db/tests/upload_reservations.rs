@@ -79,6 +79,164 @@ fn upload_quota_reservations_are_atomic_cumulative_and_cancellable() {
     );
 }
 
+fn batching_quota_database() -> (Database, i64) {
+    let database = Database::open(":memory:").unwrap();
+    database.create_admin("admin", "hash", "secret").unwrap();
+    let share_id = database
+        .create_share_with_upload_limits(
+            "batching-share",
+            None,
+            "folder",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            Some(10),
+            Some(10),
+            Some(2),
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    for token in ["one", "two"] {
+        assert_eq!(
+            database
+                .begin_upload_reservation(token, share_id, 0)
+                .unwrap(),
+            UploadReservationBeginOutcome::Reserved
+        );
+    }
+    (database, share_id)
+}
+
+#[test]
+fn upload_reservation_batching_falls_back_atomically_and_keeps_exact_quota() {
+    let (database, share_id) = batching_quota_database();
+    assert_eq!(
+        database
+            .extend_upload_reservation_up_to("one", 4, 6)
+            .unwrap(),
+        (UploadReservationExtendOutcome::Extended, 6)
+    );
+    assert_eq!(
+        database
+            .extend_upload_reservation_up_to("two", 4, 8)
+            .unwrap(),
+        (UploadReservationExtendOutcome::Extended, 4)
+    );
+    assert_eq!(
+        database
+            .extend_upload_reservation_up_to("two", 5, 8)
+            .unwrap(),
+        (UploadReservationExtendOutcome::ByteQuotaReached, 4)
+    );
+    assert_eq!(
+        database.commit_upload_reservation("one", 4).unwrap(),
+        UploadReservationCommitOutcome::Committed
+    );
+    // Commit accounts actual bytes and releases unused speculative quota.
+    assert_eq!(
+        database
+            .extend_upload_reservation_up_to("two", 6, 8)
+            .unwrap(),
+        (UploadReservationExtendOutcome::Extended, 6)
+    );
+    assert_eq!(
+        database.commit_upload_reservation("two", 6).unwrap(),
+        UploadReservationCommitOutcome::Committed
+    );
+    let share = database.share_by_id(share_id).unwrap().unwrap();
+    assert_eq!((share.uploaded_bytes, share.uploaded_files), (10, 2));
+}
+
+#[test]
+fn upload_reservation_batching_serializes_competing_quota_requests() {
+    let (database, share_id) = batching_quota_database();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = ["one", "two"]
+        .into_iter()
+        .map(|token| {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                database
+                    .extend_upload_reservation_up_to(token, 4, 6)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut accepted: Vec<_> = workers
+        .into_iter()
+        .map(|worker| {
+            let (outcome, bytes) = worker.join().unwrap();
+            assert_eq!(outcome, UploadReservationExtendOutcome::Extended);
+            bytes
+        })
+        .collect();
+    accepted.sort_unstable();
+    assert_eq!(accepted, [4, 6]);
+    for token in ["one", "two"] {
+        assert!(database.cancel_upload_reservation(token).unwrap());
+    }
+    assert_eq!(database.active_upload_reservations(share_id).unwrap(), 0);
+    database
+        .begin_upload_reservation("after", share_id, 0)
+        .unwrap();
+    assert_eq!(
+        database
+            .extend_upload_reservation_up_to("after", 10, 10)
+            .unwrap(),
+        (UploadReservationExtendOutcome::Extended, 10)
+    );
+}
+
+#[test]
+fn upload_reservation_batching_validates_targets_and_expiry() {
+    let (database, _) = batching_quota_database();
+    assert!(database
+        .extend_upload_reservation_up_to("one", 5, 4)
+        .is_err());
+    assert_eq!(
+        database
+            .extend_upload_reservation_up_to("one", 1, u64::MAX)
+            .unwrap(),
+        (UploadReservationExtendOutcome::Extended, 1)
+    );
+    assert!(database
+        .extend_upload_reservation_up_to("one", 0, 2)
+        .is_err());
+    assert_eq!(
+        database
+            .extend_upload_reservation_up_to("one", u64::MAX, u64::MAX)
+            .unwrap(),
+        (UploadReservationExtendOutcome::ByteQuotaReached, 1)
+    );
+    database
+        .conn()
+        .execute(
+            "UPDATE public_upload_reservations SET expires_at=?1 WHERE token_hash=?2",
+            params![
+                (Utc::now() - Duration::seconds(1)).to_rfc3339(),
+                token_hash("one")
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .extend_upload_reservation_up_to("one", 1, 8)
+            .unwrap(),
+        (UploadReservationExtendOutcome::NotFound, 0)
+    );
+    assert_eq!(
+        database
+            .extend_upload_reservation_up_to("two", 10, 10)
+            .unwrap(),
+        (UploadReservationExtendOutcome::Extended, 10)
+    );
+}
+
 #[test]
 fn upload_quota_commit_rolls_back_usage_and_reservation_when_audit_fails() {
     let database = Database::open(":memory:").unwrap();
@@ -202,17 +360,27 @@ fn upload_reservations_are_revoked_when_share_authority_changes() {
                 .unwrap(),
             UploadReservationBeginOutcome::Reserved
         );
+        // Revocation must invalidate unused quota already granted in advance,
+        // including a final commit that would fit entirely inside that grant.
+        for token in [&extend_token, &commit_token] {
+            assert_eq!(
+                database
+                    .extend_upload_reservation_up_to(token, 1, 8)
+                    .unwrap(),
+                (UploadReservationExtendOutcome::Extended, 8)
+            );
+        }
         database.conn().execute(revocation, [share_id]).unwrap();
 
         assert_eq!(
             database
-                .extend_upload_reservation(&extend_token, 1)
+                .extend_upload_reservation(&extend_token, 8)
                 .unwrap(),
             UploadReservationExtendOutcome::ShareUnavailable
         );
         assert_eq!(
             database
-                .commit_upload_reservation(&commit_token, 0)
+                .commit_upload_reservation(&commit_token, 1)
                 .unwrap(),
             UploadReservationCommitOutcome::ShareUnavailable
         );
