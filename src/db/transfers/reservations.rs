@@ -95,6 +95,21 @@ impl Database {
         token: &str,
         reserved_bytes: u64,
     ) -> rusqlite::Result<UploadReservationExtendOutcome> {
+        self.extend_upload_reservation_up_to(token, reserved_bytes, reserved_bytes)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Atomically reserves the preferred target, or the required minimum when
+    /// quota is scarce. The returned byte count is authoritative on success.
+    pub(crate) fn extend_upload_reservation_up_to(
+        &self,
+        token: &str,
+        minimum_bytes: u64,
+        preferred_bytes: u64,
+    ) -> rusqlite::Result<(UploadReservationExtendOutcome, u64)> {
+        if preferred_bytes < minimum_bytes {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let expires = (now + Duration::seconds(UPLOAD_RESERVATION_TTL_SECONDS)).to_rfc3339();
@@ -122,7 +137,7 @@ impl Database {
             .optional()?;
         let Some((share_id, current_bytes, upload_policy_epoch)) = reservation else {
             transaction.commit()?;
-            return Ok(UploadReservationExtendOutcome::NotFound);
+            return Ok((UploadReservationExtendOutcome::NotFound, 0));
         };
         let Some(total_limit) = available_upload_share_total_limit(
             &transaction,
@@ -136,14 +151,17 @@ impl Database {
                 [&reservation_hash],
             )?;
             transaction.commit()?;
-            return Ok(UploadReservationExtendOutcome::ShareUnavailable);
+            return Ok((UploadReservationExtendOutcome::ShareUnavailable, 0));
         };
-        if reserved_bytes < current_bytes {
+        if minimum_bytes < current_bytes {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        if reserved_bytes > MAX_SQLITE_UNSIGNED {
+        if minimum_bytes > MAX_SQLITE_UNSIGNED {
             transaction.commit()?;
-            return Ok(UploadReservationExtendOutcome::ByteQuotaReached);
+            return Ok((
+                UploadReservationExtendOutcome::ByteQuotaReached,
+                current_bytes,
+            ));
         }
         let uploaded: u64 = transaction.query_row(
             "SELECT COALESCE((SELECT uploaded_bytes FROM public_upload_usage WHERE share_id=?1),0)",
@@ -157,21 +175,32 @@ impl Database {
             params![share_id, reservation_hash, upload_policy_epoch],
             |row| row.get(0),
         )?;
-        if uploaded
-            .checked_add(other_reserved)
-            .and_then(|value| value.checked_add(reserved_bytes))
-            .is_none_or(|value| value > total_limit)
-        {
+        let available = total_limit
+            .checked_sub(uploaded)
+            .and_then(|remaining| remaining.checked_sub(other_reserved));
+        if available.is_none_or(|remaining| minimum_bytes > remaining) {
             transaction.commit()?;
-            return Ok(UploadReservationExtendOutcome::ByteQuotaReached);
+            return Ok((
+                UploadReservationExtendOutcome::ByteQuotaReached,
+                current_bytes,
+            ));
         }
+        // Select the exact fallback while holding the same write transaction:
+        // no rejected speculative commit or intervening quota race is needed.
+        let reserved_bytes = if available.is_some_and(|remaining| preferred_bytes <= remaining)
+            && preferred_bytes <= MAX_SQLITE_UNSIGNED
+        {
+            preferred_bytes
+        } else {
+            minimum_bytes
+        };
         transaction.execute(
             "UPDATE public_upload_reservations
              SET reserved_bytes=?2,expires_at=?3 WHERE token_hash=?1",
             params![reservation_hash, reserved_bytes, expires],
         )?;
         transaction.commit()?;
-        Ok(UploadReservationExtendOutcome::Extended)
+        Ok((UploadReservationExtendOutcome::Extended, reserved_bytes))
     }
 
     #[cfg(test)]

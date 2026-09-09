@@ -6,6 +6,30 @@ use crate::{
 
 use super::{AppError, Result};
 
+const INITIAL_RESERVATION_STEP: u64 = 1024 * 1024;
+const MAX_RESERVATION_STEP: u64 = 8 * 1024 * 1024;
+
+pub(super) fn preferred_reservation_target(
+    received_bytes: u64,
+    required_bytes: u64,
+    reserved_bytes: u64,
+    maximum: u64,
+) -> u64 {
+    if required_bytes <= reserved_bytes {
+        return reserved_bytes;
+    }
+    // Grow with bytes actually received, never with heartbeat/retry count.
+    // At most 8 MiB of extra quota is held; small uploads start at 1 MiB.
+    let step = received_bytes
+        .clamp(INITIAL_RESERVATION_STEP, MAX_RESERVATION_STEP)
+        .next_power_of_two();
+    required_bytes
+        .checked_add(step - 1)
+        .map(|value| value / step * step)
+        .unwrap_or(required_bytes)
+        .min(maximum)
+}
+
 pub(super) struct PendingReservationOwnership<T> {
     outcome: T,
     ownership_sender: Option<tokio::sync::oneshot::Sender<()>>,
@@ -133,4 +157,43 @@ pub(super) async fn begin_upload_reservation_cancellation_safe(
         outcome,
         ownership_sender: Some(ownership_sender),
     })
+}
+
+#[cfg(test)]
+mod batching_tests {
+    use super::preferred_reservation_target;
+
+    #[test]
+    fn streaming_64_mib_needs_eleven_bounded_extensions() {
+        let mib = 1024 * 1024;
+        let maximum = 64 * mib;
+        let chunk = 64 * 1024;
+        let mut reserved = 0;
+        let mut extensions = 0;
+        for received in (0..maximum).step_by(chunk as usize) {
+            let required = received + chunk;
+            let target = preferred_reservation_target(received, required, reserved, maximum);
+            assert!(target >= required && target >= reserved && target <= maximum);
+            assert!(target - required < 8 * mib);
+            if required > reserved {
+                extensions += 1;
+                reserved = target;
+            }
+        }
+        assert_eq!(extensions, 11);
+        assert_eq!(reserved, maximum);
+    }
+
+    #[test]
+    fn heartbeat_small_limits_and_overflow_do_not_inflate_reservation() {
+        let mib = 1024 * 1024;
+        assert_eq!(preferred_reservation_target(0, 1, 0, 64 * mib), mib);
+        assert_eq!(preferred_reservation_target(0, 1, 0, 7), 7);
+        assert_eq!(preferred_reservation_target(3, 4, 7, 7), 7);
+        assert_eq!(preferred_reservation_target(7, 7, 7, 7), 7);
+        assert_eq!(
+            preferred_reservation_target(u64::MAX - 1, u64::MAX, u64::MAX - 1, u64::MAX),
+            u64::MAX
+        );
+    }
 }

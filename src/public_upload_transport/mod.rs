@@ -16,7 +16,10 @@ mod finalizer;
 use finalizer::{run_public_upload_finalizer, PublicUploadFinalizer};
 #[path = "reservation.rs"]
 mod reservation;
-use reservation::{begin_upload_reservation_cancellation_safe, UploadQuotaReservation};
+use reservation::{
+    begin_upload_reservation_cancellation_safe, preferred_reservation_target,
+    UploadQuotaReservation,
+};
 
 #[cfg(test)]
 #[path = "test_support.rs"]
@@ -61,7 +64,6 @@ use crate::{
 };
 
 const MAX_UPLOAD_MULTIPART_FIELDS: usize = 5;
-const UPLOAD_QUOTA_RESERVATION_STEP: u64 = 1024 * 1024;
 const UPLOAD_QUOTA_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
@@ -456,44 +458,27 @@ impl StagedUpload {
         if new_total > self.reservation.reserved_bytes
             || self.reservation.last_heartbeat.elapsed() >= UPLOAD_QUOTA_HEARTBEAT_INTERVAL
         {
-            let rounded_target = if new_total > self.reservation.reserved_bytes {
-                new_total
-                    .checked_add(UPLOAD_QUOTA_RESERVATION_STEP - 1)
-                    .map(|value| value / UPLOAD_QUOTA_RESERVATION_STEP)
-                    .and_then(|value| value.checked_mul(UPLOAD_QUOTA_RESERVATION_STEP))
-                    .unwrap_or(new_total)
-                    .min(maximum)
-            } else {
-                self.reservation.reserved_bytes
-            };
+            let minimum_target = new_total.max(self.reservation.reserved_bytes);
+            let preferred_target = preferred_reservation_target(
+                self.file.total(),
+                new_total,
+                self.reservation.reserved_bytes,
+                maximum,
+            );
             let reservation_token = self.reservation.token().to_string();
-            let outcome = transfer_database(
+            let (outcome, accepted_target) = transfer_database(
                 state.db().clone(),
                 "upload_reservation_extend",
                 move |database| {
-                    database.extend_upload_reservation(&reservation_token, rounded_target)
+                    database.extend_upload_reservation_up_to(
+                        &reservation_token,
+                        minimum_target,
+                        preferred_target,
+                    )
                 },
             )
             .await
             .map_err(AppError::from)?;
-            let mut accepted_target = rounded_target;
-            let outcome = if outcome == UploadReservationExtendOutcome::ByteQuotaReached
-                && rounded_target != new_total
-            {
-                accepted_target = new_total;
-                let reservation_token = self.reservation.token().to_string();
-                transfer_database(
-                    state.db().clone(),
-                    "upload_reservation_extend_exact",
-                    move |database| {
-                        database.extend_upload_reservation(&reservation_token, new_total)
-                    },
-                )
-                .await
-                .map_err(AppError::from)?
-            } else {
-                outcome
-            };
             match outcome {
                 UploadReservationExtendOutcome::Extended => {
                     self.reservation.reserved_bytes = accepted_target;
