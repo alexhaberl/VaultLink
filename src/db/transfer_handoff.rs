@@ -1,6 +1,6 @@
 use super::{
-    Database, TransferCleanupJob, TransferCleanupKind, TransferDatabasePermit,
-    TRANSFER_CLEANUP_QUEUE_TIMEOUT,
+    transfer_progress::TransferAdmissionBudget, Database, TransferCleanupJob, TransferCleanupKind,
+    TransferDatabasePermit,
 };
 
 impl Database {
@@ -58,7 +58,7 @@ impl Database {
             // Compensation is a new DB operation: use the existing FIFO and
             // bounded deadline, never perform an unadmitted write after release.
             self.run_transfer_cleanup_job(TransferCleanupJob {
-                deadline: std::time::Instant::now() + TRANSFER_CLEANUP_QUEUE_TIMEOUT,
+                budget: TransferAdmissionBudget::new(std::time::Instant::now()),
                 kind,
             });
         }

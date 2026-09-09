@@ -40,6 +40,8 @@ struct DatabaseInner {
     // every general permit while all but one wait on the synchronous SQLite
     // writer guard below, starving unrelated reads despite idle connections.
     transfer_runtime_admission: Arc<tokio::sync::Semaphore>,
+    transfer_queue_admission: Arc<tokio::sync::Semaphore>,
+    transfer_progress: Arc<transfer_progress::TransferProgress>,
     // The server starts one retention worker per instance. This guard also
     // serializes explicit cleanup calls made through clones of this handle.
     audit_retention_admission: Mutex<()>,
@@ -71,6 +73,8 @@ struct TransferSlotPermit {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     released: Arc<tokio::sync::Notify>,
     observation: Arc<Mutex<Option<admission_diagnostics::TransferObservation>>>,
+    progress: Arc<transfer_progress::TransferProgress>,
+    work_started: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for TransferSlotPermit {
@@ -81,6 +85,11 @@ impl Drop for TransferSlotPermit {
             .observation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        // Publishing before the semaphore release ensures a woken successor
+        // sees completed work, never merely a cancelled admission or borrower.
+        if self.work_started.load(Ordering::Relaxed) {
+            self.progress.completed();
+        }
         drop(self.permit.take());
         self.released.notify_one();
     }
@@ -112,7 +121,7 @@ struct TransferCleanupQueue {
 }
 
 struct TransferCleanupJob {
-    deadline: std::time::Instant,
+    budget: transfer_progress::TransferAdmissionBudget,
     kind: TransferCleanupKind,
 }
 

@@ -12,6 +12,7 @@ mod service_tokens;
 mod shares;
 mod slow_diagnostics;
 mod transfer_handoff;
+mod transfer_progress;
 mod transfers;
 
 pub(crate) use dispatch::{dispatch_database_work, dispatch_transfer_database_work};

@@ -218,6 +218,7 @@ fi
 # KVM is an optional acceleration only. restrict=on blocks guest egress while
 # retaining the explicit host-to-guest SSH forwarding channel. Network boot is
 # unsupported, so the VirtIO NIC must not depend on a packaged PXE option ROM.
+: >"$evidence/serial.log"
 # shellcheck disable=SC2086
 $qemu $machine_args $firmware_args $acceleration_args \
     -smp 4 -m 6144 -nographic -no-reboot \
@@ -245,7 +246,32 @@ run_scp() {
         -P 2222 "$@"
 }
 ssh_readiness_error="$work/ssh-readiness.stderr"
+: >"$ssh_readiness_error"
+capture_boot_host_diagnostic() {
+    # Fixed numeric/resource files only: never capture process environments or
+    # command lines, which may contain the ephemeral SSH key paths or secrets.
+    {
+        date -u '+timestamp=%Y-%m-%dT%H:%M:%SZ'
+        printf 'qemu_pid=%s\n' "$qemu_pid"
+        "$qemu" --version | head -n 1
+        uname -srmo
+        for resource_file in \
+            /proc/loadavg /proc/meminfo /proc/stat \
+            /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io \
+            /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/cpu.max \
+            /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.max \
+            /sys/fs/cgroup/memory.events \
+            "/proc/$qemu_pid/status" "/proc/$qemu_pid/stat" \
+            "/proc/$qemu_pid/schedstat" "/proc/$qemu_pid/io"; do
+            printf '\nresource=%s\n' "$resource_file"
+            head -n 100 "$resource_file" 2>/dev/null || true
+        done
+        printf '\nqemu_threads\n'
+        ps -L -p "$qemu_pid" -o pid,tid,psr,stat,pcpu,time,wchan:32 || true
+    } >"$evidence/boot-host-diagnostic.txt" 2>&1
+}
 capture_readiness_diagnostic() {
+    capture_boot_host_diagnostic || true
     install -m 0644 "$ssh_readiness_error" \
         "$evidence/ssh-readiness-last.stderr"
     ssh_status=0
@@ -287,6 +313,14 @@ capture_readiness_diagnostic() {
 }
 deadline=$(( $(date +%s) + ssh_timeout ))
 while :; do
+    boot_failure=$(python3 tools/classify-vm-boot-failure.py "$evidence/serial.log")
+    if [ -n "$boot_failure" ]; then
+        printf 'stage=boot\nreason=%s\napplication_test_started=false\n' \
+            "$boot_failure" >"$evidence/boot-failure.env"
+        capture_readiness_diagnostic \
+            "terminal guest boot failure: $boot_failure; VaultLink test was not started" || true
+        exit 70
+    fi
     if run_ssh vaultlink-ci@127.0.0.1 true 2>"$ssh_readiness_error" \
         && grep -F -q VAULTLINK_VM_STORAGE_READY "$evidence/serial.log" \
         && grep -F -q VAULTLINK_VM_READY "$evidence/serial.log"; then
