@@ -1,3 +1,4 @@
+use super::transfer_progress::TransferAdmissionBudget;
 use super::{
     admission_diagnostics::DatabaseWorkPermit, slow_diagnostics::WorkTiming, Database,
     DatabaseExecutorAdmission, RuntimeDatabasePermit, TransferDatabasePermit,
@@ -45,6 +46,8 @@ struct DatabaseJob<P, F, T> {
     class: &'static str,
     started: Instant,
     deadline: Instant,
+    progress_budget: Option<TransferAdmissionBudget>,
+    pending_transfer: Option<tokio::sync::OwnedSemaphorePermit>,
     admission: Option<AdmissionFuture<P>>,
     operation: Option<F>,
     sender: Option<oneshot::Sender<LaunchedWork<T>>>,
@@ -64,6 +67,7 @@ where
         // An incomplete composite acquisition may already own a class permit.
         // Release that before taking the failure snapshot or reporting it.
         drop(self.admission.take());
+        drop(self.pending_transfer.take());
         let error =
             DatabaseExecutorAdmission::new(&self.database, self.class, self.started.elapsed());
         let rejected_at = Instant::now();
@@ -81,6 +85,9 @@ where
     }
 
     fn launch(&mut self, permit: P) -> Poll<()> {
+        // A running operation owns runtime capacity; only unadmitted work
+        // consumes the separate bounded transfer queue.
+        drop(self.pending_transfer.take());
         let database = self.database.clone();
         let class = self.class;
         let operation = self.operation.take().expect("a database job launches once");
@@ -123,8 +130,12 @@ where
         if sender.poll_closed(context).is_ready() {
             return Poll::Ready(());
         }
-        if now() >= self.deadline {
-            return self.reject("queue_timeout");
+        if let Some(budget) = &mut self.progress_budget {
+            self.deadline = budget.refresh(&self.database.0.transfer_progress);
+        }
+        let polled_at = now();
+        if polled_at >= self.deadline {
+            return self.reject_expired(polled_at);
         }
         match self
             .admission
@@ -136,9 +147,15 @@ where
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(_)) => self.reject("admission_closed"),
             Poll::Ready(Ok(permit)) => {
-                if now() >= self.deadline {
+                // A predecessor may publish completion during acquisition.
+                // Use that timestamp before checking the shared queue budget.
+                if let Some(budget) = &mut self.progress_budget {
+                    self.deadline = budget.refresh(&self.database.0.transfer_progress);
+                }
+                let admitted_at = now();
+                if admitted_at >= self.deadline {
                     drop(permit);
-                    return self.reject("queue_timeout");
+                    return self.reject_expired(admitted_at);
                 }
                 if self.sender.as_ref().is_none_or(oneshot::Sender::is_closed) {
                     return Poll::Ready(());
@@ -147,6 +164,14 @@ where
                 self.launch(permit)
             }
         }
+    }
+
+    fn reject_expired(&mut self, now: Instant) -> Poll<()> {
+        let reason = self
+            .progress_budget
+            .as_ref()
+            .map_or("queue_timeout", |budget| budget.reason(now));
+        self.reject(reason)
     }
 }
 
@@ -193,8 +218,8 @@ where
     .await
 }
 
-/// Uses the existing transfer-then-global FIFO admission, with one deadline
-/// spanning enqueue, dispatcher startup, and both admission stages.
+/// Uses transfer-then-global FIFO admission. Completed transfer work can
+/// renew the inactivity budget, within a fixed total deadline and queue cap.
 pub(crate) async fn dispatch_transfer_database_work<T, F>(
     database: Database,
     class: &'static str,
@@ -226,12 +251,38 @@ where
     T: Send + 'static,
 {
     let started = Instant::now();
+    let pending_transfer = if P::IS_TRANSFER {
+        match database
+            .0
+            .transfer_queue_admission
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                database
+                    .0
+                    .work_diagnostics
+                    .start(class)
+                    .rejected("transfer_queue_full", started);
+                return Err(DatabaseExecutorAdmission::new(
+                    &database,
+                    class,
+                    started.elapsed(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let (sender, receiver) = oneshot::channel();
     let mut job = Box::new(DatabaseJob {
         database: database.clone(),
         class,
         started,
         deadline: started + DATABASE_QUEUE_TIMEOUT,
+        progress_budget: P::IS_TRANSFER.then(|| TransferAdmissionBudget::new(started)),
+        pending_transfer,
         admission: Some(Box::pin(admission)),
         operation: Some(operation),
         sender: Some(sender),
@@ -416,6 +467,67 @@ fn drain(mut guard: DispatcherGuard) {
 mod tests {
     use super::*;
 
+    include!("tests/transfer_progress_integration.rs");
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_transfer_queue_does_not_consume_general_capacity_or_execute_rejected_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("data.sqlite")).unwrap();
+        let queued = database
+            .0
+            .transfer_queue_admission
+            .clone()
+            .acquire_many_owned(128)
+            .await
+            .unwrap();
+        let result =
+            dispatch_transfer_database_work(database.clone(), "full_transfer_queue", |_, _| {
+                panic!("queue-full work must never run")
+            })
+            .await;
+        assert!(result.is_err());
+        let reader = dispatch_database_work(
+            database.clone(),
+            "general_while_transfer_full",
+            |db, _permit| db.admin_count(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.await.unwrap().unwrap(), 0);
+        drop(queued);
+        let worker = dispatch_transfer_database_work(
+            database.clone(),
+            "transfer_after_queue_release",
+            |_, _| 42,
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.await.unwrap(), 42);
+        assert_eq!(database.0.transfer_queue_admission.available_permits(), 128);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_transfer_submission_returns_its_bounded_queue_capacity() {
+        let database = Database::open(":memory:").unwrap();
+        let holder = database.acquire_transfer_runtime_permit().await.unwrap();
+        let mut submission = Box::pin(dispatch_transfer_database_work(
+            database.clone(),
+            "cancelled_bounded_submission",
+            |_, _| panic!("cancelled unadmitted work must never run"),
+        ));
+        assert!(futures_util::poll!(submission.as_mut()).is_pending());
+        assert_eq!(database.0.transfer_queue_admission.available_permits(), 127);
+        drop(submission);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while database.0.transfer_queue_admission.available_permits() != 128 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation must return queue capacity without a new transfer");
+        drop(holder);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn transfer_writer_admission_uses_one_timeout_across_both_queues() {
         let database = Database::open(":memory:").unwrap();
@@ -434,6 +546,8 @@ mod tests {
             class: "two_queue_transfer_write",
             started,
             deadline: started + DATABASE_QUEUE_TIMEOUT,
+            progress_budget: Some(TransferAdmissionBudget::new(started)),
+            pending_transfer: None,
             admission: Some(Box::pin(async move {
                 admission_database.acquire_transfer_runtime_permit().await
             })),
@@ -539,6 +653,25 @@ mod rejection_logging_regression {
 
     #[test]
     fn slow_rejection_log_must_not_block_following_admitted_work() {
+        // The telemetry queue and tracing callsite interest are process-wide.
+        // Other parallel admission tests may legitimately produce/drop logs;
+        // isolate this test so its deliberately blocked writer is guaranteed
+        // to receive the rejection used as the synchronization barrier.
+        const CHILD: &str = "VAULTLINK_REJECTION_LOG_REGRESSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "db::dispatch::rejection_logging_regression::slow_rejection_log_must_not_block_following_admitted_work", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated rejection logging test failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let _tracing_guard = crate::test_support::tracing_subscriber_guard();
         let database = Database::open(":memory:").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -568,6 +701,8 @@ mod rejection_logging_regression {
             class: "expired_probe",
             started: now - Duration::from_secs(2),
             deadline: now - Duration::from_secs(1),
+            progress_budget: None,
+            pending_transfer: None,
             admission: Some(Box::pin(async move {
                 admission_db.acquire_runtime_permit().await
             })),
@@ -586,6 +721,8 @@ mod rejection_logging_regression {
             class: "ready_probe",
             started: now,
             deadline: now + Duration::from_secs(30),
+            progress_budget: None,
+            pending_transfer: None,
             admission: Some(Box::pin(async move {
                 admission_db.acquire_runtime_permit().await
             })),

@@ -27,6 +27,8 @@ impl TransferSlotPermit {
             permit: Some(permit),
             released: database.0.transfer_slot_released.clone(),
             observation: database.0.transfer_observation.clone(),
+            progress: database.0.transfer_progress.clone(),
+            work_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -45,6 +47,9 @@ impl TransferSlotPermit {
 
 impl TransferDatabasePermit {
     pub(crate) fn begin_work(&self, class: &'static str) {
+        self._transfer
+            .work_started
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // Copy the numeric observation before invoking a tracing subscriber.
         let worker_queue_ms = self
             ._transfer
@@ -93,10 +98,13 @@ impl DatabaseAdmissionState {
 }
 
 pub(super) trait DatabaseWorkPermit: Send + 'static {
+    const IS_TRANSFER: bool;
     fn begin_work(&self, class: &'static str);
 }
 
 impl DatabaseWorkPermit for super::RuntimeDatabasePermit {
+    const IS_TRANSFER: bool = false;
+
     fn begin_work(&self, class: &'static str) {
         if let Some(transfer) = &self._borrowed_transfer {
             transfer.phase(class);
@@ -105,6 +113,8 @@ impl DatabaseWorkPermit for super::RuntimeDatabasePermit {
 }
 
 impl DatabaseWorkPermit for TransferDatabasePermit {
+    const IS_TRANSFER: bool = true;
+
     fn begin_work(&self, class: &'static str) {
         TransferDatabasePermit::begin_work(self, class);
     }

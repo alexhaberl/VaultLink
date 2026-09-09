@@ -233,14 +233,28 @@ borrow that fourth slot while no transfer writer is waiting. A queued writer
 receives it after its current operation finishes, ahead of general waiters.
 Queued transfer writers still wait before acquiring global capacity, so they
 cannot consume the three slots needed by reads. A single-connection in-memory
-database continues to share its one slot. Both classes retain the existing
-one-second admission deadline and hold their permits until database work ends.
+database continues to share its one slot. General work retains its one-second
+admission deadline. Transfer admission allows a healthy FIFO backlog to drain:
+completed transfer workers renew a one-second inactivity budget, up to an
+absolute ten-second deadline from submission. A real gap of one second without
+transfer completion cannot be revived by a later completion or delayed polling.
+Unstarted cancellations, general borrowers, telemetry and HTTP ownership waits
+do not renew that budget. At most 128 foreground transfer submissions can wait;
+excess submissions fail immediately without entering the database worker pool.
+These are bounded overload policies, not a guarantee that any host can sustain
+the full load. All admitted operations retain their permits until database work ends.
 A committed reservation releases admission before waiting for its HTTP owner.
 If that owner disappears, the same blocking worker reacquires bounded admission
 for compensation, including during runtime shutdown. It never writes without
 admission or retains a DB slot merely while waiting for ownership.
 A borrower cancels its unused general queue entry before global admission so
 it cannot reserve a second class slot while waiting.
+
+The transfer failure reason distinguishes a stalled queue, the absolute wait
+limit and a full queue. Cleanup compensation uses the same progress budget;
+its own pending queue is bounded and existing reservation/lease expiry remains
+the fallback when cleanup cannot be admitted. Quotas, required audit and SQLite
+durability are unchanged.
 
 The application scheduler checks its global task queue every two ticks so
 database and filesystem completions from blocking workers are serviced even

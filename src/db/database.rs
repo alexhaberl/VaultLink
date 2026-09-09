@@ -1,5 +1,3 @@
-const TRANSFER_CLEANUP_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
 struct TransferCleanupThreadWake(std::thread::Thread);
 
 impl std::task::Wake for TransferCleanupThreadWake {
@@ -198,6 +196,10 @@ impl Database {
             transfer_observation: Arc::new(Mutex::new(None)),
             general_can_borrow_transfer: persistent,
             transfer_runtime_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            transfer_queue_admission: Arc::new(tokio::sync::Semaphore::new(
+                transfer_progress::TRANSFER_QUEUE_CAPACITY,
+            )),
+            transfer_progress: Arc::new(transfer_progress::TransferProgress::default()),
             audit_retention_admission: Mutex::new(()),
             transfer_write_admission: Mutex::new(()),
             transfer_cleanup_queue: Mutex::new(TransferCleanupQueue::default()),
@@ -279,9 +281,9 @@ impl Database {
     }
 
     /// Admits one runtime transfer writer before it enters the fair general
-    /// database queue. Callers apply one timeout around this whole acquisition
-    /// so the transfer and database queues share the existing one-second
-    /// overload budget.
+    /// database queue. Callers apply one progress-aware budget around this
+    /// whole acquisition, so changing queues never resets its idle or total
+    /// queue-time limit.
     pub(crate) async fn acquire_transfer_runtime_permit(
         &self,
     ) -> Result<TransferDatabasePermit, tokio::sync::AcquireError> {
@@ -317,10 +319,25 @@ impl Database {
     }
 
     fn enqueue_transfer_cleanup(&self, handle: &tokio::runtime::Handle, kind: TransferCleanupKind) {
-        let deadline = std::time::Instant::now() + TRANSFER_CLEANUP_QUEUE_TIMEOUT;
+        let budget = transfer_progress::TransferAdmissionBudget::new(std::time::Instant::now());
         let start_worker = {
             let mut queue = self.transfer_cleanup_queue_guard();
-            queue.jobs.push_back(TransferCleanupJob { deadline, kind });
+            if queue.jobs.len() >= transfer_progress::TRANSFER_QUEUE_CAPACITY {
+                // Keep Drop nonblocking and bounded under cancellation bursts.
+                // Persistent lease/reservation expiry remains the recovery path.
+                drop(queue);
+                let class = kind.class();
+                crate::best_effort_telemetry::emit(move || {
+                    tracing::warn!(parent: None,
+                        operation = "database.transfer_cleanup.queue_full",
+                        class,
+                        capacity = transfer_progress::TRANSFER_QUEUE_CAPACITY,
+                        "transfer cleanup queue is full; deferred to expiry recovery"
+                    )
+                });
+                return;
+            }
+            queue.jobs.push_back(TransferCleanupJob { budget, kind });
             if queue.worker_active {
                 false
             } else {
@@ -374,7 +391,7 @@ impl Database {
     fn run_transfer_cleanup_job(&self, job: TransferCleanupJob) {
         let class = job.kind.class();
         let started = std::time::Instant::now();
-        let Some(permit) = blocking_acquire_transfer_runtime_permit(self, job.deadline) else {
+        let Some(permit) = blocking_acquire_transfer_runtime_permit(self, job.budget) else {
             self.runtime_admission_state()
                 .report(class, started.elapsed());
             return;
@@ -448,15 +465,21 @@ impl Database {
 /// I/O drivers, which may already be shutting down, without busy-spinning.
 fn blocking_acquire_transfer_runtime_permit(
     database: &Database,
-    deadline: std::time::Instant,
+    mut budget: transfer_progress::TransferAdmissionBudget,
 ) -> Option<TransferDatabasePermit> {
     let waker = std::task::Waker::from(Arc::new(TransferCleanupThreadWake(std::thread::current())));
     let mut context = std::task::Context::from_waker(&waker);
     let mut acquisition = std::pin::pin!(database.acquire_transfer_runtime_permit());
     loop {
+        let deadline = budget.refresh(&database.0.transfer_progress);
         let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
         match std::future::Future::poll(acquisition.as_mut(), &mut context) {
-            std::task::Poll::Ready(Ok(permit)) => return Some(permit),
+            std::task::Poll::Ready(Ok(permit)) => {
+                if std::time::Instant::now() >= budget.refresh(&database.0.transfer_progress) {
+                    return None;
+                }
+                return Some(permit);
+            }
             std::task::Poll::Ready(Err(_)) => return None,
             std::task::Poll::Pending => std::thread::park_timeout(remaining),
         }
