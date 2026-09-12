@@ -16,9 +16,9 @@ stub_dir="$work/bin"
 mkdir "$stub_dir"
 
 # Run the real monitor at its persisted deadline with synthetic measurements.
-# Only host services and time are stubbed: its median calculations, both growth
+# Only host identity, services and time are stubbed: its median calculations, both growth
 # checks, candidate output and EXIT result writer execute without modification.
-# The architecture response also permits this Debian-13 smoke on arm64 CI.
+# A fixed Debian-13/amd64 identity permits this isolated smoke on Ubuntu and arm64 CI.
 cat >"$stub_dir/date" <<'EOF'
 #!/bin/sh
 [ "$#" -eq 1 ] && [ "$1" = +%s ] || exit 90
@@ -28,6 +28,16 @@ cat >"$stub_dir/uname" <<'EOF'
 #!/bin/sh
 [ "$#" -eq 1 ] && [ "$1" = -m ] || exit 90
 printf '%s\n' x86_64
+EOF
+cat >"$stub_dir/sed" <<'EOF'
+#!/bin/sh
+if [ "$#" -eq 3 ] && [ "$1" = -n ] && [ "$3" = /etc/os-release ]; then
+    case "$2" in
+        's/^ID=//p') printf '%s\n' debian; exit 0 ;;
+        's/^VERSION_ID=//p') printf '%s\n' 13; exit 0 ;;
+    esac
+fi
+exec /usr/bin/sed "$@"
 EOF
 cat >"$stub_dir/systemctl" <<'EOF'
 #!/bin/sh
@@ -45,7 +55,7 @@ set -eu
 # the test's completed measurement history before the actual RSS checks run.
 cp "$SMOKE_METRICS" "$SOAK_EVIDENCE_DIR/metrics.csv"
 EOF
-chmod 0755 "$stub_dir/date" "$stub_dir/uname" \
+chmod 0755 "$stub_dir/date" "$stub_dir/uname" "$stub_dir/sed" \
     "$stub_dir/systemctl" "$stub_dir/journalctl"
 
 assert_field() {
@@ -136,8 +146,8 @@ run_case() {
 }
 
 # Expected limits are fixed test values rather than recomputed by the test.
-run_case pass 35000 45000 49096 51384 49096 success passed 0
-run_case warm-failure 48948 68000 68528 65332 72096 failure rss_growth_exceeded_warm_allowance 1
-run_case late-failure 50000 55000 59097 66384 59096 failure rss_growth_exceeded_late_allowance 1
+run_case pass 35000 45000 49096 59576 49096 success passed 0
+run_case warm-failure 48948 72000 73525 73524 76096 failure rss_growth_exceeded_warm_allowance 1
+run_case late-failure 50000 55000 59097 74576 59096 failure rss_growth_exceeded_late_allowance 1
 
 echo "Soak monitor preserves RSS diagnostics for passing and failed growth checks"

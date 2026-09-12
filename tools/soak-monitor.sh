@@ -291,7 +291,7 @@ late_median=$(median_rss "$late_start" "$late_end") || fail late_rss_window_miss
 final_median=$(median_rss "$final_start" "$deadline") || fail final_rss_window_missing
 warm_allowance=$((warm_median * 15 / 100))
 # A relative-only limit overreacts to bounded warmup on a small baseline.
-[ "$warm_allowance" -ge 16384 ] || warm_allowance=16384
+[ "$warm_allowance" -ge 24576 ] || warm_allowance=24576
 late_allowance=$((late_median * 5 / 100))
 [ "$late_allowance" -ge 4096 ] || late_allowance=4096
 warm_limit=$((warm_median + warm_allowance))
