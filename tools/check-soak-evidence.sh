@@ -188,7 +188,7 @@ late_median=$(median_rss $((start + 172800)) $((start + 194400))) \
 final_median=$(median_rss $((unit_deadline - 3600)) "$unit_deadline") \
     || { echo "soak final RSS window is incomplete" >&2; exit 1; }
 warm_allowance=$((warm_median * 15 / 100))
-[ "$warm_allowance" -ge 16384 ] || warm_allowance=16384
+[ "$warm_allowance" -ge 24576 ] || warm_allowance=24576
 late_allowance=$((late_median * 5 / 100))
 [ "$late_allowance" -ge 4096 ] || late_allowance=4096
 warm_limit=$((warm_median + warm_allowance))

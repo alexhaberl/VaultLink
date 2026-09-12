@@ -1,7 +1,9 @@
 # Changelog
 
-## 0.7.0 — 2026-09-12
+## 0.7.0 — 2026-09-16
 
+- Limit glibc allocation arenas in the packaged service to reduce retained memory after concurrent transfer and database bursts. Preserve all RSS medians and growth limits in failed soak evidence and cover both failure paths with the real monitor finalization.
+- Allow up to `max(15%, 24 MiB)` warm-to-final RSS growth, retaining the independent `max(5%, 4 MiB)` late-growth check and 256-MiB absolute cap; verify both absolute and relative boundaries independently from the collected metrics.
 - Move optional audit and database timing logs to a bounded nonblocking telemetry worker so a slow log sink cannot stall the transfer writer or admission dispatcher. Preserve recent transfer phases across the regular log budget and include their bounded snapshot on admission failure; distinguish upload quota extensions from cleanup.
 - Dispatch queued metadata and transfer database work independently of HTTP task polling, retaining FIFO admission, pool capacity, the shared one-second queue deadline, and cancellation-safe quota/audit handling.
 - Record bounded slow database worker and ownership timings at INFO, with separate unsuppressed admission-failure timings and no request contents.

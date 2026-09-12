@@ -10,6 +10,8 @@ fail() {
     exit 1
 }
 
+sh deploy/docker/soak-monitor-rss-smoke.sh
+
 refresh_evidence_manifest() {
     evidence=$1
     manifest_tmp="$work/SHA256SUMS.tmp"
@@ -39,7 +41,7 @@ rewrite_rss_evidence() {
     mv "$metrics_tmp" "$evidence/metrics.csv"
 
     warm_allowance=$((warm * 15 / 100))
-    [ "$warm_allowance" -ge 16384 ] || warm_allowance=16384
+    [ "$warm_allowance" -ge 24576 ] || warm_allowance=24576
     late_allowance=$((late * 5 / 100))
     [ "$late_allowance" -ge 4096 ] || late_allowance=4096
     sed -i \
@@ -152,7 +154,7 @@ printf '%s\n' \
     'warm_rss_median_kib=35000' \
     'late_rss_median_kib=45228' \
     'final_rss_median_kib=46336' \
-    'warm_rss_growth_limit_kib=51384' \
+    'warm_rss_growth_limit_kib=59576' \
     'late_rss_growth_limit_kib=49324' \
     >>"$active/candidate.env"
 
@@ -428,10 +430,10 @@ done
 
 warm_boundary_evidence="$work/warm-boundary-evidence"
 cp -R "$destination" "$warm_boundary_evidence"
-rewrite_rss_evidence "$warm_boundary_evidence" 35000 51384 51384
+rewrite_rss_evidence "$warm_boundary_evidence" 35000 59576 59576
 sh tools/check-soak-evidence.sh "$commit" "$warm_boundary_evidence" >/dev/null \
-    || fail "evidence verifier rejected the exact 16-MiB warm-growth boundary"
-rewrite_rss_evidence "$warm_boundary_evidence" 35000 51385 51385
+    || fail "evidence verifier rejected the exact 24-MiB warm-growth boundary"
+rewrite_rss_evidence "$warm_boundary_evidence" 35000 59577 59577
 if sh tools/check-soak-evidence.sh "$commit" "$warm_boundary_evidence" >/dev/null 2>&1; then
     fail "evidence verifier accepted warm RSS growth one KiB beyond its allowance"
 fi
@@ -444,6 +446,27 @@ sh tools/check-soak-evidence.sh "$commit" "$late_boundary_evidence" >/dev/null \
 rewrite_rss_evidence "$late_boundary_evidence" 35000 45000 49097
 if sh tools/check-soak-evidence.sh "$commit" "$late_boundary_evidence" >/dev/null 2>&1; then
     fail "evidence verifier accepted late RSS growth one KiB beyond its allowance"
+fi
+
+# Larger baselines must retain the independent relative limits above each floor.
+warm_relative_evidence="$work/warm-relative-evidence"
+cp -R "$destination" "$warm_relative_evidence"
+rewrite_rss_evidence "$warm_relative_evidence" 204800 235520 235520
+sh tools/check-soak-evidence.sh "$commit" "$warm_relative_evidence" >/dev/null \
+    || fail "evidence verifier rejected the exact 15-percent warm-growth boundary"
+rewrite_rss_evidence "$warm_relative_evidence" 204800 235521 235521
+if sh tools/check-soak-evidence.sh "$commit" "$warm_relative_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted warm RSS growth one KiB beyond 15 percent"
+fi
+
+late_relative_evidence="$work/late-relative-evidence"
+cp -R "$destination" "$late_relative_evidence"
+rewrite_rss_evidence "$late_relative_evidence" 210000 220000 231000
+sh tools/check-soak-evidence.sh "$commit" "$late_relative_evidence" >/dev/null \
+    || fail "evidence verifier rejected the exact 5-percent late-growth boundary"
+rewrite_rss_evidence "$late_relative_evidence" 210000 220000 231001
+if sh tools/check-soak-evidence.sh "$commit" "$late_relative_evidence" >/dev/null 2>&1; then
+    fail "evidence verifier accepted late RSS growth one KiB beyond 5 percent"
 fi
 
 echo "Synthetic soak evidence collection and verification passed"

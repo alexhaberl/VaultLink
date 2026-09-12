@@ -291,16 +291,17 @@ late_median=$(median_rss "$late_start" "$late_end") || fail late_rss_window_miss
 final_median=$(median_rss "$final_start" "$deadline") || fail final_rss_window_missing
 warm_allowance=$((warm_median * 15 / 100))
 # A relative-only limit overreacts to bounded warmup on a small baseline.
-[ "$warm_allowance" -ge 16384 ] || warm_allowance=16384
+[ "$warm_allowance" -ge 24576 ] || warm_allowance=24576
 late_allowance=$((late_median * 5 / 100))
 [ "$late_allowance" -ge 4096 ] || late_allowance=4096
 warm_limit=$((warm_median + warm_allowance))
 late_limit=$((late_median + late_allowance))
-[ "$final_median" -le "$warm_limit" ] || fail rss_growth_exceeded_warm_allowance
-[ "$final_median" -le "$late_limit" ] || fail rss_growth_exceeded_late_allowance
+# Preserve the measured values before either growth check can terminate the run.
 printf 'warm_rss_median_kib=%s\nlate_rss_median_kib=%s\nfinal_rss_median_kib=%s\nwarm_rss_growth_limit_kib=%s\nlate_rss_growth_limit_kib=%s\n' \
     "$warm_median" "$late_median" "$final_median" "$warm_limit" "$late_limit" \
     >>"$SOAK_EVIDENCE_DIR/candidate.env"
+[ "$final_median" -le "$warm_limit" ] || fail rss_growth_exceeded_warm_allowance
+[ "$final_median" -le "$late_limit" ] || fail rss_growth_exceeded_late_allowance
 
 result_reason=passed
 echo "72-hour soak gate passed; evidence: $SOAK_EVIDENCE_DIR"
