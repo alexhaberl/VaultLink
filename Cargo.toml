@@ -17,7 +17,7 @@ fuzzing = []
 
 [dependencies]
 argon2 = "0.6"
-askama = "=0.16.0"
+askama = "=0.16.1"
 axum = { version = "0.8", features = ["multipart"] }
 bytes = "1"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
