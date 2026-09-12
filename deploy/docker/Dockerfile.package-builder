@@ -1,7 +1,7 @@
 # syntax=docker.io/docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # Application source is deliberately excluded. BASE_IMAGE must be an immutable
 # distro image selected by the protected image-refresh workflow.
-ARG RUST_IMAGE=rust:1.98.0-trixie@sha256:271849e998ffce5776454bbf98c5dc21baafc854ff8e566197908d3aca9a81e8
+ARG RUST_IMAGE=rust:1.98.1-trixie@sha256:462a9af3c54fb4718850d3c602fc0e54452c20b1c12a4e4080fdb001d4b9acbf
 ARG BASE_IMAGE
 FROM ${RUST_IMAGE} AS rust
 
@@ -31,7 +31,7 @@ RUN /bin/sh /tmp/install-package-builder-dependencies.sh \
         "$ARCH_SNAPSHOT_DATE" "$BASE_IMAGE" \
     && cargo install --locked cargo-cyclonedx --version 0.5.9 \
     && cargo install --locked cargo-audit --version 0.22.2 \
-    && test "$(rustc --version | awk '{print $2}')" = 1.98.0 \
+    && test "$(rustc --version | awk '{print $2}')" = 1.98.1 \
     && rm -f /tmp/install-package-builder-dependencies.sh
 
 WORKDIR /work
