@@ -11,6 +11,8 @@ StartLimitBurst=3
 Type=simple
 User=vaultlink
 Group=vaultlink
+# Bound glibc arena retention after concurrent transfer and database bursts.
+Environment=MALLOC_ARENA_MAX=4
 ExecStartPre=+/usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh --start-update-control
 ExecStart=/opt/vaultlink/vaultlink --config /etc/vaultlink/config.toml
 ExecReload=/bin/kill -HUP $MAINPID

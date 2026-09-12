@@ -10,6 +10,8 @@ fail() {
     exit 1
 }
 
+sh deploy/docker/soak-monitor-rss-smoke.sh
+
 refresh_evidence_manifest() {
     evidence=$1
     manifest_tmp="$work/SHA256SUMS.tmp"

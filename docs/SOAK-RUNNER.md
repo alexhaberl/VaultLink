@@ -220,10 +220,21 @@ the warm median by at most the larger of 15 percent or 16 MiB, and from the
 hour-48-through-54 median by at most the larger of 5 percent or 4 MiB. The
 absolute floor prevents a small, bounded allocator/cache warmup from dominating
 a low baseline, while the late-window check still rejects an ongoing trend.
+The monitor writes all three RSS medians and both growth limits to
+`candidate.env` before evaluating the growth checks, including on failure.
 Each load profile samples RSS every second, retains pre-/post-load state and the
 absolute peak, and uses its run-unique namespace so restarted soaks cannot
 collide with old uploads. Each collector job supplies a fresh GitHub token;
 neither the bridge nor the long-running service ever receives one.
+
+The packaged `vaultlink.service` sets `MALLOC_ARENA_MAX=4` to limit glibc's
+independent allocation arenas and reduce freed memory retained after concurrent
+transfer and database bursts. This is part of the deployed service configuration;
+it does not change thread counts, workloads, deadlines, or the RSS limits above.
+Before the next soak, install the candidate's service unit, reload systemd and
+restart VaultLink so the allocator setting is active from process startup.
+Local allocator comparisons help diagnose retention but do not replace the
+required 72-hour measurement of the exact candidate package.
 
 After the tag is published, archive the evidence outside the host and remove
 the `active` state under an administrator-controlled maintenance procedure.
