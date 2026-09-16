@@ -2,22 +2,42 @@ name: Security audit
 
 on:
   schedule:
-    - cron: "17 3 * * 1"
+    - cron: "43 3 * * *"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      commit_sha:
+        description: Frozen candidate commit reported by the soak collector
+        required: true
+        type: string
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
-  group: security-audit
-  cancel-in-progress: true
+  group: security-audit-${{ inputs.commit_sha || github.sha }}
+  cancel-in-progress: false
 
 jobs:
   rustsec:
     name: RustSec advisories
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
+    env:
+      AUDIT_COMMIT: ${{ inputs.commit_sha || github.sha }}
     steps:
+      - name: Mark security audit pending on the candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AUDIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$AUDIT_COMMIT" \
+            -f state=pending -f context='vaultlink/security-audit' \
+            -f description='Refreshing RustSec audit for the committed lockfile' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -30,5 +50,39 @@ jobs:
           toolchain: ${{ steps.rust_toolchain.outputs.channel }}
       - name: Install pinned cargo-audit
         run: cargo install --locked cargo-audit --version 0.22.2
-      - name: Audit workspace lockfile
-        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071
+      - name: Fetch frozen candidate without executing its code
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AUDIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags --depth=1 origin "$AUDIT_COMMIT"
+      - name: Audit committed candidate lockfile
+        id: audit
+        run: sh tools/audit-release-candidate.sh "$AUDIT_COMMIT" "$RUNNER_TEMP/security-audit"
+      - name: Archive security audit evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-audit-${{ env.AUDIT_COMMIT }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/security-audit/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Publish independent security result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AUDIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          state=failure
+          description='Security audit failed or could not complete; release needs a fresh successful audit'
+          if [[ "$AUDIT_OUTCOME" == success ]]; then
+            state=success
+            description='Committed lockfile passed a freshly fetched RustSec audit'
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$AUDIT_COMMIT" \
+            -f state="$state" -f context='vaultlink/security-audit' \
+            -f description="$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

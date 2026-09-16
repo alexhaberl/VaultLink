@@ -3,6 +3,7 @@ name: Collect 72-hour release soak
 on:
   schedule:
     - cron: '17 * * * *'
+    - cron: '29 3 * * *'
   workflow_dispatch:
 
 permissions:
@@ -19,6 +20,8 @@ jobs:
     runs-on: ubuntu-24.04
     environment: release-soak-collector
     timeout-minutes: 15
+    outputs:
+      commit_sha: ${{ steps.collect.outputs.commit_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -170,3 +173,16 @@ jobs:
       - name: Fail collector job after publishing failure evidence
         if: ${{ always() && steps.collect.outputs.commit_sha != '' && (steps.final.outputs.state == 'failure' || (steps.final.outputs.state != 'pending' && steps.artifact.outcome != 'success')) }}
         run: exit 1
+
+  security_audit:
+    name: Daily frozen-candidate security audit
+    needs: collect
+    # Read the host's actual candidate even if main has advanced. Hourly
+    # collection continues independently; manual collection also retries audit.
+    if: ${{ !cancelled() && needs.collect.outputs.commit_sha != '' && (github.event_name == 'workflow_dispatch' || github.event.schedule == '29 3 * * *') }}
+    permissions:
+      contents: read
+      statuses: write
+    uses: ./.github/workflows/security-audit.yml
+    with:
+      commit_sha: ${{ needs.collect.outputs.commit_sha }}

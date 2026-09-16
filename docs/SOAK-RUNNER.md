@@ -172,6 +172,39 @@ commit; changing them afterwards invalidates the evidence.
 
 ## Start, collection, and release binding
 
+Freeze the candidate commit before starting: leave routine Dependabot PRs open
+and defer all `main` merges until publication or an explicit candidate restart.
+The tag gate requires the release commit to equal `origin/main`; an update to
+the candidate needs new package qualification and a new soak.
+
+Security freshness is checked independently of the 72-hour measurements:
+
+- Soak start audits the candidate's committed `Cargo.lock` immediately before
+  opening the SSH bridge. A finding or audit error prevents starting the monitor.
+- In addition to hourly collection, the collector runs daily at 03:29 UTC and
+  audits the commit reported by the soak host, even if `main` has since advanced.
+  Manual collection also retries this audit. The separate `Security audit`
+  workflow audits `main` daily at 03:43 UTC and can also be run manually.
+- After release environment approval, signing, and remote draft verification,
+  the tag workflow audits again immediately before making the draft public.
+  Earlier green CI or scheduled audits cannot replace this final check.
+
+Each invocation fetches into an empty RustSec database and records the commit,
+lockfile SHA-256, database revision, timestamps, tool version, JSON results, and
+exit status as an Actions artifact. `RUSTSEC-2023-0071` remains the sole reviewed
+exception. Scheduled audits publish the independent `vaultlink/security-audit`
+status. A failure does not stop/reset the host monitor, change
+`vaultlink/72h-soak`, or delete its evidence, but the daily collector's Actions
+run can fail even when its separate longevity measurements succeeded.
+
+GitHub schedules can be delayed; the mandatory start and publication checks
+remain authoritative. Audit/network failures block those transitions. Retry
+an audit after a transient error; changing the candidate to fix an advisory
+requires a new qualification cycle. A final audit failure leaves a private
+draft. Re-running the publish job can resume it only after verifying the signed
+remote asset set and matching all unsigned inputs to the same candidate;
+already-public releases and mismatched drafts are rejected without alteration.
+
 1. Run the complete native, Docker, fuzz, package, upgrade, reproducibility,
    and distro-VM candidate gates for one exact commit. All nine native package
    targets must pass the 50/20/5 smoke profile with strict p95 `<2 s`, status,

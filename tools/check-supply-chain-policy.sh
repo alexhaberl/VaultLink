@@ -698,7 +698,7 @@ for tool in 'cargo-cyclonedx --version 0.5.9' 'cargo-audit --version 0.22.2'; do
 done
 
 audit_exception='--ignore RUSTSEC-2023-0071'
-audit_commands=$(grep -R -h -E 'cargo audit .*--deny warnings' .github/workflows || true)
+audit_commands=$(grep -R -h -E 'cargo audit .*--deny warnings' .github/workflows tools/audit-release-candidate.sh || true)
 audit_exceptions=$(printf '%s\n' "$audit_commands" \
     | grep -o -E -- '--ignore[[:space:]]+RUSTSEC-[0-9-]+' | sort -u || true)
 if [ "$(printf '%s\n' "$audit_commands" | grep -c . || true)" -ne 2 ] \
