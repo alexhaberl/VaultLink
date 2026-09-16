@@ -1,9 +1,17 @@
 # Release signing and immutable package inputs
 
 Lifecycle state and already-published evidence come exclusively from
-[`release-state.json`](release-state.json); review-finding closure for the
-unreleased 0.7.0 line comes from
-[`qualification-0.7.0.json`](qualification-0.7.0.json). Its required ID/title
+[`release-state.json`](release-state.json). Version 0.7.0 is supported;
+0.6.0 is superseded and unsupported, with its immutable evidence retained.
+`development_version` identifies the version in the checkout and equals
+`supported_version` after publication until a new development version is chosen.
+At that point there is no unreleased entry; a later version bump introduces one.
+
+The frozen pre-publication review-finding record for 0.7.0 remains in
+[`qualification-0.7.0.json`](qualification-0.7.0.json), including its original
+`unreleased` label and open soak finding. Final effective qualification was
+resolved by the commit-bound evidence gates linked in `release-state.json`;
+the candidate ledger is not rewritten after publication. Its required ID/title
 inventory is independently fixed in
 [`qualification-findings-0.7.0.json`](qualification-findings-0.7.0.json); local
 evidence entries must resolve to existing, non-symlink repository paths.
@@ -16,7 +24,7 @@ its split files. Missing, reordered, symlinked, or edited parts fail CI. Update
 that manifest only together with an explicit contract or architecture review;
 it is not a generated exception list.
 
-The VaultLink 0.7.0 release workflow will publish only the nine native packages declared in
+The VaultLink release workflow publishes only the nine native packages declared in
 `package-targets.json`. The release workflow must not publish project tar
 archives or standalone binaries. GitHub's automatic source archives are
 unsupported source material.

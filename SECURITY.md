@@ -7,7 +7,7 @@ operational requirements, advisory exceptions, and vulnerability reporting.
 
 ## Supported versions
 
-Release line: `0.7.0` is unreleased development. The currently supported release is `0.6.0`. Its native packages cover Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. The withdrawn `v0.5.0` archive remains unsupported; unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported. [`release/release-state.json`](release/release-state.json) is authoritative for lifecycle state and immutable release evidence.
+Release line: The currently supported release is `0.7.0`. Its native packages cover Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Version `0.6.0` is superseded and no longer supported; upgrade to `0.7.0`. The withdrawn `v0.5.0` archive remains unsupported; unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported. [`release/release-state.json`](release/release-state.json) is authoritative for lifecycle state and immutable release evidence.
 
 ## Build and release security
 

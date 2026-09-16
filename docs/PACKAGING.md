@@ -1,7 +1,7 @@
 # Native package support
 
-This document describes the **0.7.0 development package contract**; 0.7.0 is
-unreleased. To install the supported **0.6.0** release, follow the
+This document describes the supported **0.7.0 package contract**.
+To install the supported **0.7.0** release, follow the
 [installation guide](INSTALLATION.md).
 
 VaultLink releases are distributed only as native, signed operating-system
@@ -25,8 +25,8 @@ than repeat target lists in workflow YAML.
 | Fedora 44 | x86_64, aarch64 | RPM |
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
-For the unreleased version 0.7.0, the manifest defines these asset names; they
-are not currently published installation packages:
+For the supported version 0.7.0, the manifest defines these published
+installation packages:
 
 | Target | Release asset |
 | --- | --- |

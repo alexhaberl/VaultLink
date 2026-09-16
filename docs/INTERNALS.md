@@ -2,9 +2,9 @@
 
 [Back to README](../README.md)
 
-This reference describes the current **0.7.0 development branch**, which is unreleased.
-The supported release is **0.6.0**; its schema and feature differences are called
-out below. For supported versions and vulnerability reporting, see
+This reference describes the supported **0.7.0 release**. Schema and feature
+differences from the superseded **0.6.0** release are called out below.
+For supported versions and vulnerability reporting, see
 [Security Policy](../SECURITY.md).
 
 ## Security model
@@ -24,7 +24,7 @@ Application-owned password, TOTP, and Share-secret buffers use a zeroizing wrapp
 - Uploads are written to random `0600` temporary files in protected internal staging, flushed and synced, then atomically published with `renameat2(RENAME_NOREPLACE)`. With `external_writers = true`, overwrite remains disabled by default in the UI, API, and upload path. The separate `allow_external_writer_replace = true` opt-in accepts last-writer-wins behavior and its risk of losing a newer parallel SMB change.
 - Abandoned upload fragments and only committed delete tombstones are removed in resumable background batches. Uncommitted deletes and rollback conflicts remain recovery entries instead of risking data loss at restart.
 - Administrator passwords use Argon2id. Password verification is followed by TOTP or a registered WebAuthn/FIDO2 security key such as a YubiKey. Sessions are random server-side bearer tokens whose hashes are stored in SQLite; `session_hours` is the absolute cap and `session_idle_minutes` defaults to a 30-minute inactivity limit.
-- Since 0.7.0 (unreleased), instance-wide service tokens are restricted to the fixed `monitoring:read` scope. VaultLink stores only a SHA-256 hash, displays the random token once, accepts it only in the `Authorization` header on the two monitoring routes, and never grants it access to existing Share, file, administration, session, public, or HTML routes.
+- Since 0.7.0, instance-wide service tokens are restricted to the fixed `monitoring:read` scope. VaultLink stores only a SHA-256 hash, displays the random token once, accepts it only in the `Authorization` header on the two monitoring routes, and never grants it access to existing Share, file, administration, session, public, or HTML routes.
 - Cookies are `HttpOnly`, `SameSite=Strict`, and `Secure` in production.
 - Mutating administrator actions require CSRF. Login and Share unlock are rate-limited. Login counters are process-local; reverse-proxy or network limits are still required for volumetric attacks.
 - In reverse-proxy mode, `trusted_proxies` is an exact TCP-peer allowlist. Forwarded headers are evaluated only for those peers.
@@ -79,7 +79,7 @@ VaultLink/
 
 ## Data and persistence
 
-The following table inventory describes the 0.7.0 development schema.
+The following table inventory describes the 0.7.0 release schema.
 
 SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and crash-safe transactions. WAL is enabled. Core tables include `admins`, `sessions`, `service_tokens`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `public_upload_usage`, `public_upload_reservations`, `runtime_settings`, `audit`, `transfer_monthly_counts`, `transfer_statistics`, `admin_mfa_enrollments`, `admin_webauthn_credentials`, `admin_totp_replay`, `vaultlink_schema`, and `vaultlink_schema_migrations`.
 
@@ -99,7 +99,7 @@ reserved bytes. Authority and policy epoch are checked on extension and again
 before publication, including when an upload finishes inside its existing
 reservation. Ahead reservation never authorizes publication after revocation.
 
-The supported 0.6.0 release uses schema 6. Fresh installations of the 0.7.0 development build create schema 10 and version-2 through version-10 migration records. Valid schema-1 through schema-9 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, schema 8 adds normalized trigram Share search plus composite audit-pagination indexes, schema 9 adds an index for pending transfer cleanup, and schema 10 adds partial indexes for protected and exhausted Shares plus expiry indexes. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
+The superseded 0.6.0 release uses schema 6. Fresh installations of the supported 0.7.0 release create schema 10 and version-2 through version-10 migration records. Valid schema-1 through schema-9 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, schema 8 adds normalized trigram Share search plus composite audit-pagination indexes, schema 9 adds an index for pending transfer cleanup, and schema 10 adds partial indexes for protected and exhausted Shares plus expiry indexes. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
 
 Concurrent filesystem renames can temporarily prevent a confined lookup.
 VaultLink retries that lookup at most eight times without weakening path
