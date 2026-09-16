@@ -56,6 +56,10 @@ updates:
     open-pull-requests-limit: 5
   - package-ecosystem: rust-toolchain
     directory: "/"
+    # Dependabot does not attach publication dates to Rust toolchain versions.
+    # Opt out here; other ecosystems keep the default version-update cooldown.
+    cooldown:
+      default-days: 0
     patterns:
       - "*"
     multi-ecosystem-group: rust-runtime
