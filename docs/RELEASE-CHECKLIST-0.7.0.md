@@ -1,18 +1,27 @@
 # v0.7.0 native-package release checklist
 
-Status: unreleased. This checklist is intentionally separate from the
-withdrawn 0.5.0 historical record and the supported 0.6.0 release checklist.
+Status: supported package release, published on 2026-09-16. This checklist is
+separate from the withdrawn 0.5.0 and superseded 0.6.0 historical records.
 [`release/release-state.json`](../release/release-state.json) is authoritative
 for lifecycle state, and
 [`release/qualification-0.7.0.json`](../release/qualification-0.7.0.json) is
-authoritative for review-finding closure. Candidate, soak, and tag preflight
-must fail while any qualification entry is open. Every item remains
-fail-closed until checked against the exact release commit.
+the frozen pre-publication review-finding record. Its open soak finding was
+resolved in effective qualification by the successful commit-bound evidence
+gates; the candidate ledger is not rewritten after publication.
+
+The public release was verified read-only on 2026-09-16: GitHub validates the
+signed annotated `v0.7.0` tag object
+`0d6d6f16a7df35bc109cc26c659d45d24c6b6358`, targeting exact commit
+`0af4612bd3c32a995b19de4cd19ca05ac4fd4855`. The immutable release contains
+exactly 21 project assets and all eleven recorded commit gates succeeded.
+Detailed boxes left open below preserve the contemporaneous recording state;
+they are not retroactively asserted without their original fine-grained evidence.
 
 ## Release-state and finding contract
 
-- [x] The signed, immutable 21-asset `v0.6.0` package release is the supported
-  rollback input; withdrawn 0.5.0 remains unsupported.
+- [x] The signed, immutable 21-asset `v0.6.0` package release was the supported
+  rollback input during qualification; it is now superseded. Its assets remain
+  available for authenticated rollback; withdrawn 0.5.0 remains unsupported.
 - [ ] Every `SEC`, `REL`, `PERF`, `QUAL`, and `CI` qualification entry is
   `closed` or explicitly `accepted` with evidence; none is `open`.
 - [ ] README, SECURITY, changelog, package, soak, and tag checks agree with the
@@ -132,10 +141,8 @@ fail-closed until checked against the exact release commit.
 
 ## After publication
 
-- [ ] Once the immutable 0.7.0 release and its assets are verified, mark 0.6.0
-  as superseded and no longer supported, recommend upgrading to 0.7.0, and
-  synchronize the release-state model, README, SECURITY, installation guidance,
-  and release notices. Until publication, retain 0.6.0 as the supported version
-  with its documented CIFS startup limitation. Keep historical release evidence
-  intact; apply the support-status transition after publication, outside the
-  frozen candidate qualification cycle.
+- [x] Verified the immutable 0.7.0 release and its assets on 2026-09-16, marked
+  0.6.0 as superseded and unsupported, and recommended upgrading to 0.7.0.
+  Synchronized the release-state model, README, SECURITY, installation guidance,
+  and release notices after publication, outside the frozen candidate
+  qualification cycle. Historical release evidence remains intact.

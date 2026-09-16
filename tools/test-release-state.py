@@ -78,6 +78,12 @@ def test_installation_docs() -> None:
             readme = root / "README.md"
             baseline_readme = readme.read_text(encoding="utf-8")
             readme.write_text(baseline_readme.replace(
+                f"The currently supported release is `v{supported}`.",
+                "The currently supported release is `v0.0.0`."
+            ), encoding="utf-8")
+            assert any("README release status" in error for error in errors())
+            readme.write_text(baseline_readme, encoding="utf-8")
+            readme.write_text(baseline_readme.replace(
                 "(docs/INSTALLATION.md#native-package-deployment)", "(docs/MISSING.md)"
             ), encoding="utf-8")
             assert any("must link" in error for error in errors())
@@ -89,17 +95,103 @@ def test_installation_docs() -> None:
                 (baseline_install.replace("## Native package deployment", "## Other"), "section is missing"),
                 (baseline_install.replace(f"VaultLink {supported} supports", "VaultLink 0.0.0 supports"), "does not use supported_version"),
                 (baseline_install.replace(f"vaultlink-release-{supported}.", "vaultlink-release-0.0.0."), "staging example"),
-                (baseline_install + f"\nInstall {development} instead.\n", "offers the unreleased version"),
             ]:
                 install.write_text(broken, encoding="utf-8")
                 assert any(expected in error for error in errors()), expected
+
+            # A later development bump must still reject installation guidance
+            # pointing at the unpublished version; fixtures do not pick a real
+            # next release version for the repository.
+            install.write_text(baseline_install, encoding="utf-8")
+            future = "99.0.0"
+            current_notice = f"`{development}` is unreleased development. " if development != supported else ""
+            readme.write_text(baseline_readme.replace(
+                f"Status: {current_notice}", f"Status: `{future}` is unreleased development. "
+            ), encoding="utf-8")
+            security = root / "SECURITY.md"
+            security.write_text(security.read_text(encoding="utf-8").replace(
+                f"Release line: {current_notice}", f"Release line: `{future}` is unreleased development. "
+            ), encoding="utf-8")
+            changelog = root / "CHANGELOG.md"
+            changelog.write_text(f"## {future} — Unreleased\n\n" + changelog.read_text(encoding="utf-8"),
+                                 encoding="utf-8")
+            future_errors: list[str] = []
+            MODULE.validate_docs(future, supported, releases, future_errors)
+            assert future_errors == [], future_errors
+            install.write_text(baseline_install + f"\nInstall {future} instead.\n", encoding="utf-8")
+            MODULE.validate_docs(future, supported, releases, future_errors)
+            assert any("offers the unreleased version" in error for error in future_errors)
             install.unlink()
             assert errors(), "a missing installation guide must fail closed"
         finally:
             MODULE.ROOT = original_root
 
 
+def test_lifecycle() -> None:
+    published = json.loads((REPOSITORY / "release/release-state.json").read_text(encoding="utf-8"))
+    published["development_version"] = published["supported_version"]
+    published["releases"] = [entry for entry in published["releases"] if entry["status"] != "unreleased"]
+    superseded = next(entry["version"] for entry in published["releases"] if entry["status"] == "superseded")
+
+    def entry(state: dict[str, object], version: str | None = None) -> dict[str, object]:
+        return next(item for item in state["releases"]
+                    if item["version"] == (version or state["supported_version"]))
+
+    def errors(state: dict[str, object]) -> list[str]:
+        result: list[str] = []
+        MODULE.validate_state(state, result)
+        return result
+
+    assert errors(published) == []
+
+    future = copy.deepcopy(published)
+    future["development_version"] = "99.0.0"
+    future["releases"].insert(0, {
+        "version": "99.0.0", "status": "unreleased",
+        "checklist": "docs/RELEASE-CHECKLIST-0.7.0.md",
+    })
+    assert errors(future) == []
+
+    missing = copy.deepcopy(future)
+    missing["releases"].pop(0)
+    assert any("development_version must identify" in error for error in errors(missing))
+
+    extra_unreleased = copy.deepcopy(future)
+    extra_unreleased["development_version"] = extra_unreleased["supported_version"]
+    assert any("unreleased entry count" in error for error in errors(extra_unreleased))
+
+    multiple_supported = copy.deepcopy(published)
+    entry(multiple_supported, superseded)["status"] = "supported"
+    assert any("exactly one release must be supported" in error for error in errors(multiple_supported))
+
+    incorrect_current = copy.deepcopy(published)
+    entry(incorrect_current)["status"] = "unreleased"
+    assert any("supported_version must identify" in error for error in errors(incorrect_current))
+
+    missing_verification = copy.deepcopy(published)
+    entry(missing_verification)["tag_verification"]["verified"] = False
+    assert any("valid verification evidence" in error for error in errors(missing_verification))
+
+    missing_gate = copy.deepcopy(published)
+    entry(missing_gate)["required_commit_gates"].pop()
+    assert any("gate set is incomplete" in error for error in errors(missing_gate))
+
+    for replacement in [superseded, "0.0.1", "99.0.0"]:
+        invalid = copy.deepcopy(published)
+        entry(invalid, superseded)["superseded_by"] = replacement
+        assert errors(invalid), replacement
+
+    cycle = copy.deepcopy(published)
+    cycle["releases"].append({
+        "version": "0.0.1", "checklist": "docs/RELEASE-CHECKLIST-0.6.0.md",
+        "status": "superseded", "superseded_by": superseded, "superseded_at": "2026-09-16",
+    })
+    entry(cycle, superseded)["superseded_by"] = "0.0.1"
+    assert any("replacement must be newer" in error for error in errors(cycle))
+
+
 def main() -> None:
+    test_lifecycle()
     test_installation_docs()
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)

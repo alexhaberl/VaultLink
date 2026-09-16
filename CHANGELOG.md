@@ -45,6 +45,9 @@
 
 ## 0.6.0 — 2026-09-01
 
+**Superseded and unsupported since 2026-09-16.** Upgrade to 0.7.0. The immutable
+release assets remain available for authenticated rollback.
+
 - Withdrew the public `v0.5.0` release and archive assets on 2026-08-25 while retaining its annotated tag, commit, workflow evidence, and historical checklist. Version 0.5.0 is unsupported and has no in-place migration path to 0.6.0.
 - Replaced archive distribution with nine native packages: Debian 13 and Ubuntu 24.04/26.04 LTS DEBs on amd64/arm64, Fedora 44 RPMs on x86_64/aarch64, and one x86_64 Arch package built against the release-date snapshot.
 - Added a declarative target manifest, digest-pinned per-distro builders and full-system guests, twice-clean package/SBOM reproducibility, package linters and allowlists, isolated QEMU gates, per-target 100-user gates, and the aggregate `vaultlink/packages`, `vaultlink/package-reproducibility`, and `vaultlink/distro-vms` release checks.

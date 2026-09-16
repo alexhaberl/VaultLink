@@ -67,7 +67,7 @@ def release_map(state: dict[str, Any], errors: list[str]) -> dict[str, dict[str,
             continue
         require(version not in result, f"duplicate release version: {version}", errors)
         result[version] = release
-        require(release.get("status") in {"unreleased", "supported", "withdrawn"},
+        require(release.get("status") in {"unreleased", "supported", "superseded", "withdrawn"},
                 f"invalid status for {version}", errors)
         checklist = release.get("checklist")
         require(isinstance(checklist, str) and (ROOT / checklist).is_file(),
@@ -85,8 +85,9 @@ def validate_state(state: dict[str, Any], errors: list[str]) -> tuple[str, str, 
             "supported_version must be semantic", errors)
     releases = release_map(state, errors)
     if isinstance(development, str):
-        require(releases.get(development, {}).get("status") == "unreleased",
-                "development_version must identify an unreleased entry", errors)
+        expected_status = "supported" if development == supported else "unreleased"
+        require(releases.get(development, {}).get("status") == expected_status,
+                "development_version must identify an unreleased entry or the supported version", errors)
     if isinstance(supported, str):
         current = releases.get(supported, {})
         require(current.get("status") == "supported",
@@ -128,8 +129,22 @@ def validate_state(state: dict[str, Any], errors: list[str]) -> tuple[str, str, 
                 "supported release gate set is incomplete or contains extras", errors)
     require(sum(item.get("status") == "supported" for item in releases.values()) == 1,
             "exactly one release must be supported", errors)
-    require(sum(item.get("status") == "unreleased" for item in releases.values()) == 1,
-            "exactly one release must be unreleased", errors)
+    expected_unreleased = 0 if development == supported else 1
+    require(sum(item.get("status") == "unreleased" for item in releases.values()) == expected_unreleased,
+            "unreleased entry count must match development_version and supported_version", errors)
+    for version, release in releases.items():
+        if release.get("status") == "superseded":
+            replacement = release.get("superseded_by")
+            require(isinstance(replacement, str) and replacement != version
+                    and releases.get(replacement, {}).get("status") in {"supported", "superseded"},
+                    f"superseded release lacks a published replacement: {version}", errors)
+            require(isinstance(replacement, str) and SEMVER.fullmatch(replacement) is not None
+                    and SEMVER.fullmatch(version) is not None
+                    and tuple(map(int, replacement.split("."))) > tuple(map(int, version.split("."))),
+                    f"superseded replacement must be newer: {version}", errors)
+            require(isinstance(release.get("superseded_at"), str)
+                    and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", release["superseded_at"]) is not None,
+                    f"superseded release lacks a transition date: {version}", errors)
     return str(development or ""), str(supported or ""), releases
 
 
@@ -292,14 +307,15 @@ def validate_docs(development: str, supported: str, releases: dict[str, dict[str
     security = text("SECURITY.md", errors)
     changelog = text("CHANGELOG.md", errors)
     threat_model = text("THREAT_MODEL.md", errors)
+    development_notice = f"`{development}` is unreleased development. " if development != supported else ""
     require(
-        f"Status: `{development}` is unreleased development. The currently supported release is `v{supported}`." in readme,
+        f"Status: {development_notice}The currently supported release is `v{supported}`." in readme,
         "README release status is not derived from release-state", errors)
     require(
-        f"Release line: `{development}` is unreleased development. The currently supported release is `{supported}`." in security,
+        f"Release line: {development_notice}The currently supported release is `{supported}`." in security,
         "SECURITY supported-version statement is not derived from release-state", errors)
     require(f"## {development} — Unreleased" in changelog or re.search(rf"^## {re.escape(development)} — [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$", changelog, re.MULTILINE),
-            "CHANGELOG lacks the unreleased development heading", errors)
+            "CHANGELOG lacks the current checkout version heading", errors)
     supported_date = releases.get(supported, {}).get("release_date")
     require(f"## {supported} — {supported_date}" in changelog,
             "CHANGELOG lacks the supported release heading", errors)
@@ -318,8 +334,9 @@ def validate_docs(development: str, supported: str, releases: dict[str, dict[str
             "installation guide does not use supported_version", errors)
     require(f"vaultlink-release-{supported}." in install,
             "installation staging example does not use supported_version", errors)
-    require(development not in install,
-            "installation guide offers the unreleased version", errors)
+    if development != supported:
+        require(development not in install,
+                "installation guide offers the unreleased version", errors)
     require("RA-10" in threat_model and "Closed historical risks" in threat_model,
             "THREAT_MODEL does not historicize RA-10", errors)
     require("Reconfirmed for 0.7.0" in threat_model,

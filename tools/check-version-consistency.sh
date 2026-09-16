@@ -106,12 +106,10 @@ lock_version=$(awk '
     exit 1
 }
 
-grep -Fq "Status: \`$package_version\`" README.md || {
-    echo "README status does not identify $package_version" >&2
-    exit 1
-}
-grep -Fq "Release line: \`$package_version\`" SECURITY.md || {
-    echo "SECURITY.md does not identify the $package_version release line" >&2
+# check-release-state.py above validates the lifecycle-specific README and
+# SECURITY statements, including the interval after publication and before a bump.
+[ "$package_version" = "$development_version" ] || {
+    echo "Cargo.toml version $package_version does not match release-state $development_version" >&2
     exit 1
 }
 

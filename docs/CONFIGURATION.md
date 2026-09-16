@@ -3,16 +3,15 @@
 [Back to README](../README.md)
 
 Choose the storage layout and HTTPS mode before completing
-[installation](INSTALLATION.md). Examples in this checkout describe the 0.7.0
-development branch; the configurable `[admission]` section is new in 0.7.0.
-Use configuration examples from the matching release when installing 0.6.0.
+[installation](INSTALLATION.md). Examples in this checkout describe the supported
+0.7.0 release; the configurable `[admission]` section is new in 0.7.0.
 
 Known 0.6.0 limitation: CIFS startup can fail with `missing required security
 option "sign"` even when the SMB session is signed and encrypted. That release
 checks for a standalone mountinfo entry that Linux does not emit. Changing only
 the mount command cannot fix the application check. Local ext4 installations
-are unaffected by this defect. The correction is included in the unreleased
-0.7.0 branch; 0.6.0 remains the supported release until its replacement is published.
+are unaffected by this defect. The correction is included in the supported
+0.7.0 release. Version 0.6.0 is superseded; upgrade to 0.7.0.
 
 ## Configuration model
 
@@ -48,7 +47,7 @@ expected_mount_source = "/dev/mapper/vaultlink"
 
 `public_base_url` uses canonical `http://` or `https://` authority syntax without a trailing slash. Base paths, credentials, query strings, and fragments are unsupported.
 
-**Since 0.7.0 (unreleased):** the optional `[admission]` section protects the reserved administrator capacity and slow-client boundaries. Omitted sections use the shown defaults. Operators may only tighten them: reduce parallelism/duration or increase minimum DATA-byte throughput. The global ceilings remain 32 uploads and 128 streams, leaving at least four upload and 32 stream slots outside the public pools.
+**Since 0.7.0:** the optional `[admission]` section protects the reserved administrator capacity and slow-client boundaries. Omitted sections use the shown defaults. Operators may only tighten them: reduce parallelism/duration or increase minimum DATA-byte throughput. The global ceilings remain 32 uploads and 128 streams, leaving at least four upload and 32 stream slots outside the public pools.
 
 ```toml
 [admission]
