@@ -6,7 +6,7 @@ upgrade, or migration path from the withdrawn 0.5.0 archive installation. A
 markerless or mismatched installation fails closed before package files or
 runtime state are changed.
 
-The current development binary creates schema 10 and migrates supported schemas
+The supported 0.7.0 binary creates schema 10 and migrates supported schemas
 1 through 9 forward. The 9-to-10 step adds partial Share status indexes and
 expiry/ID indexes in an atomic `IMMEDIATE` transaction. A failed step leaves a
 valid schema-9 database, including its fingerprint and migration history.
@@ -21,7 +21,7 @@ to correct it. The existing byte limit, ordering and cursor format are unchanged
 Displayed available/protected counters may lag by one second. Authorization,
 expiry and transfer quotas continue to read current database state.
 
-## GUI updates starting with 0.7.0 (unreleased)
+## GUI updates starting with 0.7.0
 
 Native-package installations expose **Settings → Updates** in the
 administrator GUI. Check for a stable GitHub release, review the version and

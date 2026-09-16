@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-This guide installs the supported **VaultLink 0.6.0** native packages.
+This guide installs the supported **VaultLink 0.7.0** native packages.
 Start with [configuration and storage](CONFIGURATION.md) to prepare the mounted
 storage, private internal directory, local database directory, and HTTPS endpoint.
 Package installation leaves the service and automatic updates disabled.
@@ -13,7 +13,7 @@ Follow [package verification and installation](#native-package-deployment), then
 
 ## Native package deployment
 
-VaultLink 0.6.0 supports only the exact native packages listed in
+VaultLink 0.7.0 supports only the exact native packages listed in
 [docs/PACKAGING.md](../docs/PACKAGING.md): Debian 13 and Ubuntu 24.04/26.04 on
 amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch snapshot on
 x86_64. Install the matching package from the GitHub release after verifying
@@ -59,7 +59,7 @@ if VaultLink will provision or mount SMB storage.
 
 ### Download the package and verification files
 
-From the [supported release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.6.0),
+From the [supported release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.0),
 download the package for your host, its matching `.minisig`, `SHA256SUMS`, and
 `SHA256SUMS.minisig` into one directory. Obtain `minisign.pub` through a
 separately trusted copy of this repository; its key ID is `EC6AEC772F7CDDEC`.
@@ -67,10 +67,10 @@ Open a terminal in the download directory and set these two values:
 
 ```sh
 # Replace this Debian 13 amd64 example with the exact asset for your host:
-# vaultlink_0.6.0-1+ubuntu24.04_arm64.deb,
-# vaultlink-0.6.0-1.fc44.x86_64.rpm, or
-# vaultlink-0.6.0-1-x86_64.pkg.tar.zst.
-PACKAGE=vaultlink_0.6.0-1+deb13_amd64.deb
+# vaultlink_0.7.0-1+ubuntu24.04_arm64.deb,
+# vaultlink-0.7.0-1.fc44.x86_64.rpm, or
+# vaultlink-0.7.0-1-x86_64.pkg.tar.zst.
+PACKAGE=vaultlink_0.7.0-1+deb13_amd64.deb
 PUBLIC_KEY=/path/to/trusted/minisign.pub
 ```
 
@@ -90,27 +90,27 @@ PUBLIC_KEY=$2
 case "$ID:${VERSION_ID:-}" in
   debian:13)
     FORMAT=deb
-    EXPECTED="vaultlink_0.6.0-1+deb13_$(dpkg --print-architecture).deb"
+    EXPECTED="vaultlink_0.7.0-1+deb13_$(dpkg --print-architecture).deb"
     ;;
   ubuntu:24.04|ubuntu:26.04)
     FORMAT=deb
-    EXPECTED="vaultlink_0.6.0-1+ubuntu${VERSION_ID}_$(dpkg --print-architecture).deb"
+    EXPECTED="vaultlink_0.7.0-1+ubuntu${VERSION_ID}_$(dpkg --print-architecture).deb"
     ;;
   fedora:44)
     FORMAT=rpm
-    EXPECTED="vaultlink-0.6.0-1.fc44.$(uname -m).rpm"
+    EXPECTED="vaultlink-0.7.0-1.fc44.$(uname -m).rpm"
     ;;
   arch:*)
     FORMAT=arch
     test "$(uname -m)" = x86_64
-    EXPECTED=vaultlink-0.6.0-1-x86_64.pkg.tar.zst
+    EXPECTED=vaultlink-0.7.0-1-x86_64.pkg.tar.zst
     ;;
   *) echo 'Unsupported operating system or version' >&2; exit 64 ;;
 esac
 test "$PACKAGE" = "$EXPECTED"
 
 # Freeze every input before verification, then install that same root-owned file.
-STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.6.0.XXXXXXXX)
+STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.7.0.XXXXXXXX)
 test "$(sudo stat -c '%u:%g:%a' "$STAGE")" = 0:0:700
 printf 'Verification and recovery directory: %s\n' "$STAGE"
 sudo install -o root -g root -m 0600 \
@@ -221,9 +221,9 @@ The package also installs the root-owned updater as
 `/usr/sbin/vaultlink-update`. Its daily timer and automatic installation remain
 disabled until the administrator explicitly opts in.
 
-The upcoming GUI controls are documented separately in the
-[upgrade guide](UPGRADE-ROLLBACK.md#gui-updates-starting-with-070-unreleased).
-For the currently published version, use the command line:
+The GUI controls available in 0.7.0 are documented separately in the
+[upgrade guide](UPGRADE-ROLLBACK.md#gui-updates-starting-with-070).
+Alternatively, use the command line:
 
 ```sh
 sudo vaultlink-update check

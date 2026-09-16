@@ -4,8 +4,9 @@ VaultLink shares files from an existing Linux storage mount through download and
 upload links. Manage files in the web interface and let recipients open their
 links in a browser. Storage can be local or an existing SMB share.
 
-Status: `0.7.0` is unreleased development. The currently supported release is `v0.6.0`.
+Status: The currently supported release is `v0.7.0`.
 See the [changelog](CHANGELOG.md) and [release status](release/release-state.json).
+Version 0.6.0 is superseded and no longer supported; upgrade to 0.7.0.
 
 ## Screenshots
 
@@ -31,8 +32,8 @@ See the [changelog](CHANGELOG.md) and [release status](release/release-state.jso
 - Use the English or German interface, with HTTPS through a reverse proxy or
   built-in TLS, including Let's Encrypt.
 
-These features are available in 0.6.0. Monitoring endpoints and service tokens
-are part of the unreleased 0.7.0 development line.
+These features, monitoring endpoints, service tokens, and GUI update controls
+are available in the supported 0.7.0 release.
 
 ## Installation
 
@@ -47,7 +48,7 @@ SMB clients are only needed for optional direct access to an external SMB share.
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
 1. Download the matching package from the
-   [supported 0.6.0 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.6.0).
+   [supported 0.7.0 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.0).
 2. Follow the [verification and installation instructions](docs/INSTALLATION.md#native-package-deployment)
    to verify both the signature and signed checksum before installing.
 3. Prepare the [storage mount and HTTPS configuration](docs/CONFIGURATION.md).
@@ -69,7 +70,7 @@ Its smoke image includes build tools and is intended for development and testing
 Use the configuration examples from your installed release. The
 [configuration guide](docs/CONFIGURATION.md) covers reverse proxies, standalone
 TLS, Let's Encrypt, local storage, and shared SMB access. The `[admission]`
-configuration section in this development checkout requires 0.7.0.
+configuration section requires 0.7.0.
 
 - Run one VaultLink instance per storage root; overlapping active instances are unsupported.
 - Use HTTPS in production. Keep the setup interface on loopback and access it through SSH.
@@ -89,7 +90,7 @@ CSRF protection. Health probes are unauthenticated:
 | `/api/v2/health/live` | Process liveness |
 | `/api/v2/health/ready` | Database and storage readiness; HTTP 503 when unavailable |
 
-**0.7.0, unreleased:** [read-only monitoring](docs/MONITORING-API.md) adds instance
+**Since 0.7.0:** [read-only monitoring](docs/MONITORING-API.md) adds instance
 and Share summaries plus service tokens restricted to `monitoring:read`.
 These endpoints and tokens are unavailable in 0.6.0. The 0.7.0 Share search also
 requires at least three characters for a nonempty query; see the [API reference](docs/API.md#json-api-routes).
@@ -116,17 +117,17 @@ make run
 | [Installation](docs/INSTALLATION.md) | Signed package installation, initial setup, updates, and administrator recovery |
 | [Configuration](docs/CONFIGURATION.md) | Storage layouts, SMB permissions, HTTPS, and configuration examples |
 | [API reference](docs/API.md) | Browser routes, JSON endpoints, authentication, and search parameters |
-| [Monitoring API — 0.7.0, unreleased](docs/MONITORING-API.md) | Monitoring resources, service tokens, and token recovery |
+| [Monitoring API](docs/MONITORING-API.md) | Monitoring resources, service tokens, and token recovery |
 | [Architecture and internals](docs/INTERNALS.md) | Security mechanisms, project layout, persistence, and schema migrations |
 | [Updates and rollback](docs/UPGRADE-ROLLBACK.md) | Package-bound updates, backups, and recovery |
 | [Package contract](docs/PACKAGING.md) | Package contents, target matrix, and build/release requirements |
 | [Threat model](THREAT_MODEL.md) | Trust boundaries, security invariants, and accepted risks |
 
-The supported 0.6.0 release uses database schema 6; this 0.7.0 development branch
-uses schema 10. See [data and persistence](docs/INTERNALS.md#data-and-persistence)
+The supported 0.7.0 release uses database schema 10; the superseded 0.6.0 release
+used schema 6. See [data and persistence](docs/INTERNALS.md#data-and-persistence)
 for migration details. Release evidence is linked from
 [release/release-state.json](release/release-state.json), including the supported
-release checklist and the development qualification ledger.
+release checklist and the frozen candidate qualification ledger.
 
 ## Troubleshooting
 

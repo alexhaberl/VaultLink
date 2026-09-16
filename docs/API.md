@@ -2,9 +2,9 @@
 
 [Back to README](../README.md)
 
-This reference covers the current 0.7.0 development branch. Monitoring and
-service-token routes are new in **0.7.0 (unreleased)** and are unavailable in the
-supported **0.6.0** release. The Share-search change is marked separately.
+This reference covers the supported **0.7.0** release. Monitoring and
+service-token routes are new in **0.7.0** and are unavailable in the
+superseded **0.6.0** release. The Share-search change is marked separately.
 Health probes and the `/api/v2` prefix are already available in 0.6.0.
 
 ## Browser routes and authentication
@@ -22,7 +22,7 @@ Health probes and the `/api/v2` prefix are already available in 0.6.0.
 | `/admin/preview`, `/admin/preview/raw` | GET/HEAD | administrator preview page/raw media |
 | `/admin/shares` | GET/POST | list and create Shares |
 | `/admin/admins` | GET/POST | list and create administrators |
-| `/admin/service-tokens` | GET/POST | **0.7.0, unreleased.** List/create monitoring tokens and revoke them through the per-token POST route |
+| `/admin/service-tokens` | GET/POST | **Since 0.7.0.** List/create monitoring tokens and revoke them through the per-token POST route |
 | `/admin/settings` | GET/POST | runtime settings |
 | `/admin/audit` | GET | audit events |
 | `/v/:token`, `/s/:alias` | GET | public Share landing page |
@@ -32,7 +32,7 @@ Health probes and the `/api/v2` prefix are already available in 0.6.0.
 
 `max_downloads` counts completed content transfers (download, ZIP, counted preview), not public metadata/landing requests or uploads. `HEAD` returns metadata only when the equivalent `GET` could begin under the current transfer session and does not itself consume quota.
 
-The JSON API under `/api/v2` normally uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Mutating administrator API routes require `X-CSRF-Token`. Since 0.7.0 (unreleased), the only bearer-token exception is read-only access to `/api/v2/monitoring/summary` and `/api/v2/monitoring/shares` with an instance-wide `monitoring:read` token. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
+The JSON API under `/api/v2` normally uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Mutating administrator API routes require `X-CSRF-Token`. Since 0.7.0, the only bearer-token exception is read-only access to `/api/v2/monitoring/summary` and `/api/v2/monitoring/shares` with an instance-wide `monitoring:read` token. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
 
 For those 0.7.0 monitoring routes, bearer authentication is deliberately narrow: send exactly one `Authorization: Bearer <token>` header, never a query parameter or cookie. Supplying both an administrator session cookie and a bearer credential is rejected as ambiguous. Unknown, expired, and revoked credentials share the same `401 unauthorized` response; missing scope is `403 insufficient_scope`; the monitoring limit is 120 requests per effective client IP per minute and `429` includes `Retry-After`. VaultLink does not enable CORS for these routes. Successful polling reads are not written to the audit log.
 
@@ -50,10 +50,10 @@ After `/api/v2/session/mfa`, clients must retain both the rotated `Set-Cookie` v
 | `/api/v2/files` | GET/PATCH/DELETE | JSON file browser and mutations |
 | `/api/v2/shares` | GET/POST | list and create Shares |
 | `/api/v2/shares/:id` | PATCH/DELETE | update and delete a Share |
-| `/api/v2/monitoring/summary` | GET | **0.7.0, unreleased.** Redacted instance, Share, transfer, and storage summary; MFA session or `monitoring:read` token |
-| `/api/v2/monitoring/shares` | GET | **0.7.0, unreleased.** Redacted, cursor-paginated Share monitoring data; MFA session or `monitoring:read` token |
-| `/api/v2/service-tokens` | GET/POST | **0.7.0, unreleased.** List/create tokens; MFA/CSRF administrator-only; plaintext is returned only by create |
-| `/api/v2/service-tokens/:id` | DELETE | **0.7.0, unreleased.** Revoke a token; MFA/CSRF administrator-only |
+| `/api/v2/monitoring/summary` | GET | **Since 0.7.0.** Redacted instance, Share, transfer, and storage summary; MFA session or `monitoring:read` token |
+| `/api/v2/monitoring/shares` | GET | **Since 0.7.0.** Redacted, cursor-paginated Share monitoring data; MFA session or `monitoring:read` token |
+| `/api/v2/service-tokens` | GET/POST | **Since 0.7.0.** List/create tokens; MFA/CSRF administrator-only; plaintext is returned only by create |
+| `/api/v2/service-tokens/:id` | DELETE | **Since 0.7.0.** Revoke a token; MFA/CSRF administrator-only |
 | `/api/v2/admins` | GET/POST | administrator lifecycle |
 | `/api/v2/settings` | GET/PUT | runtime settings |
 | `/api/v2/audit` | GET | paginated audit events |
@@ -69,7 +69,7 @@ After `/api/v2/session/mfa`, clients must retain both the rotated `Set-Cookie` v
 `sort=newest|oldest`. It returns
 `{"shares":[...],"next_cursor":<id|null>}`. There is no v1 compatibility router.
 
-**Since 0.7.0 (unreleased):** `q` is trimmed and must contain at least three
+**Since 0.7.0:** `q` is trimmed and must contain at least three
 Unicode characters when nonempty; an omitted, empty, or whitespace-only query
 lists Shares without a search filter. Queries exceeding 256 UTF-8 bytes are
 rejected. Invalid queries return HTTP `400 bad_request`. The same minimum
@@ -83,6 +83,6 @@ JSON errors have this envelope:
 
 Internal absolute paths, password hashes, session/unlock/preview/transfer hashes, and TOTP secrets are not returned. TOTP secrets are shown once after administrator creation or MFA reset.
 
-**Since 0.7.0 (unreleased):** create service tokens from **Service tokens** in the administrator navigation. Names are trimmed and unique, the inventory is capped at 64 entries including expired entries, and the default UI expiry is one year. An unlimited token requires the explicit no-expiry warning option. Store the one-time value in the monitoring client's secret store and rotate it by creating a replacement, updating the client, and revoking the old entry. The complete response and authentication contract is in [docs/MONITORING-API.md](MONITORING-API.md). Home Assistant belongs in the separate `alexhaberl/vaultlink-home-assistant` HACS repository; no integration code is bundled with VaultLink.
+**Since 0.7.0:** create service tokens from **Service tokens** in the administrator navigation. Names are trimmed and unique, the inventory is capped at 64 entries including expired entries, and the default UI expiry is one year. An unlimited token requires the explicit no-expiry warning option. Store the one-time value in the monitoring client's secret store and rotate it by creating a replacement, updating the client, and revoking the old entry. The complete response and authentication contract is in [docs/MONITORING-API.md](MONITORING-API.md). Home Assistant belongs in the separate `alexhaberl/vaultlink-home-assistant` HACS repository; no integration code is bundled with VaultLink.
 
 All three health routes are unauthenticated. Liveness does not touch SQLite or storage. Readiness returns `503` with `{"ok":false,"version":"..."}` when either dependency is unavailable, while details are written only to structured logs. Operators and orchestrators should use `/api/v2/health/live` for liveness and `/api/v2/health/ready` for traffic admission and upgrade checks.
