@@ -41,7 +41,7 @@ jobs:
         id: rust_toolchain
         shell: bash
         run: echo "channel=$(sh tools/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ steps.rust_toolchain.outputs.channel }}
           components: rustfmt, clippy
@@ -88,8 +88,8 @@ jobs:
         if: matrix.architecture == 'arm64'
         shell: bash
         env:
-          GITLEAKS_VERSION: 8.30.0
-          GITLEAKS_SHA256: b4cbbb6ddf7d1b2a603088cd03a4e3f7ce48ee7fd449b51f7de6ee2906f5fa2f
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
         run: |
           set -euo pipefail
           work=$(mktemp -d "$RUNNER_TEMP/vaultlink-gitleaks.XXXXXXXXXX")
@@ -140,14 +140,14 @@ jobs:
         id: rust_toolchain
         shell: bash
         run: echo "channel=$(sh tools/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ steps.rust_toolchain.outputs.channel }}
           components: llvm-tools-preview
       - name: Verify native architecture
         run: test "$(uname -m)" = aarch64
       - name: Install pinned coverage tool
-        run: cargo install --locked cargo-llvm-cov --version 0.8.6
+        run: cargo install --locked cargo-llvm-cov --version 0.9.1
       - name: Coverage
         run: |
           bash tools/run-coverage.sh
@@ -184,7 +184,7 @@ jobs:
         id: rust_toolchain
         shell: bash
         run: echo "channel=$(sh tools/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ steps.rust_toolchain.outputs.channel }}
       - name: Verify native architecture

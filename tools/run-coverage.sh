@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR="$PWD/target/coverage"
 report_dir="$PWD/coverage"
 mkdir -p "$report_dir"
-# External-test workflow for the pinned cargo-llvm-cov 0.8.6.
+# External-test workflow for the pinned cargo-llvm-cov 0.9.1.
 eval "$(cargo llvm-cov show-env --sh)"
 cargo llvm-cov clean --workspace
 cargo test --locked --package vaultlink --all-targets --all-features

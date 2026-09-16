@@ -35,9 +35,9 @@ overlay storage is deliberately rejected by the production mount policy.
 
 ## Coverage
 
-Install `llvm-tools-preview` and the pinned `cargo-llvm-cov` **0.8.6**, then run
+Install `llvm-tools-preview` and the pinned `cargo-llvm-cov` **0.9.1**, then run
 `make coverage`. The script follows the tool's
-[external-test procedure](https://github.com/taiki-e/cargo-llvm-cov/blob/v0.8.6/README.md#get-coverage-of-external-tests):
+[external-test procedure](https://github.com/taiki-e/cargo-llvm-cov/blob/v0.9.1/README.md#get-coverage-of-external-tests):
 
 1. Select `target/coverage`, evaluate `cargo llvm-cov show-env --sh`, and clean
    that coverage workspace.
