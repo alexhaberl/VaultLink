@@ -14,6 +14,9 @@ updates:
       day: monday
       time: "03:30"
       timezone: Europe/Vienna
+    # Include transitive Cargo.lock dependencies such as rustls in version updates.
+    allow:
+      - dependency-type: all
     # Keep unmatched 0.x-minor and major updates visible as individual PRs.
     # These groups organize routine updates; they do not filter update findings.
     open-pull-requests-limit: 10
