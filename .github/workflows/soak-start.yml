@@ -141,6 +141,18 @@ jobs:
           sh tools/check-version-consistency.sh --release-soak --binary "$candidate_binary" \
             --packages-run-id "$packages_run" "${performance_args[@]}"
           echo "binary_sha256=$candidate_binary_sha256" >> "$GITHUB_OUTPUT"
+      - name: Fresh security audit before starting the soak
+        env:
+          AUDIT_COMMIT: ${{ inputs.commit_sha }}
+        run: sh tools/audit-release-candidate.sh "$AUDIT_COMMIT" "$RUNNER_TEMP/pre-soak-audit"
+      - name: Archive pre-soak security evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pre-soak-audit-${{ inputs.commit_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pre-soak-audit/
+          if-no-files-found: warn
+          retention-days: 90
       - name: Configure pinned soak-host SSH transport
         id: ssh
         shell: bash

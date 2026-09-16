@@ -426,23 +426,27 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" \
             = "$remote_tag_commit"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME already exists" >&2
-            exit 73
+            # A failed final audit can leave a verified private draft. Resume
+            # only that draft; never overwrite a published release or its assets.
+            test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
+              --title "VaultLink $GITHUB_REF_NAME" --notes-file CHANGELOG.md dist/*
           fi
-          gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
-            --title "VaultLink $GITHUB_REF_NAME" --notes-file CHANGELOG.md dist/*
           remote=$(mktemp -d)
           gh release download "$GITHUB_REF_NAME" --dir "$remote"
           sh tools/verify-package-release.sh \
             "$remote" '${{ needs.prepare.outputs.package_version }}' --signed
           (
             cd dist
-            find . -mindepth 1 -maxdepth 1 -type f -print0 \
+            # Existing draft signatures may have different signing timestamps;
+            # --signed above verifies them, and all eleven unsigned inputs must match.
+            find . -mindepth 1 -maxdepth 1 -type f ! -name '*.minisig' -print0 \
               | sort -z | xargs -0 sha256sum
           ) >local-assets.sha256
           (
             cd "$remote"
-            find . -mindepth 1 -maxdepth 1 -type f -print0 \
+            find . -mindepth 1 -maxdepth 1 -type f ! -name '*.minisig' -print0 \
               | sort -z | xargs -0 sha256sum
           ) >remote-assets.sha256
           cmp local-assets.sha256 remote-assets.sha256
@@ -452,9 +456,20 @@ jobs:
           # verified release remains a private draft.
           test "$(GH_TOKEN="$RELEASE_ADMIN_READ_TOKEN" gh api \
             "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true
+          # Refresh after environment approval and remote asset verification.
+          # An advisory or a network failure leaves the verified release a draft.
+          sh tools/audit-release-candidate.sh "$remote_tag_commit" "$RUNNER_TEMP/pre-publish-audit"
           gh release edit "$GITHUB_REF_NAME" --draft=false
           test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
             --jq '.immutable')" = true
+      - name: Archive final security audit evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pre-publish-audit-${{ needs.prepare.outputs.candidate_commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pre-publish-audit/
+          if-no-files-found: warn
+          retention-days: 90
       - name: Restore host workspace ownership
         if: always()
         run: chown -R --reference="$GITHUB_WORKSPACE/.." "$GITHUB_WORKSPACE"

@@ -62,6 +62,7 @@ jobs:
           python3 tools/test-release-state.py
           python3 tools/test-performance-evidence.py
           python3 tools/test-release-evidence.py
+          python3 tools/test-release-security-audit.py
           python3 tools/test-module-coverage.py
           python3 tools/test-runtime-smoke.py
           python3 tools/test-vm-boot-failure.py
