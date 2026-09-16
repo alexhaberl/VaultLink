@@ -1008,12 +1008,27 @@ if ! awk '
         cargo = 0
     }
     !cargo { next }
-    /^    (allow|ignore):/ {
-        print "dependabot policy: Cargo updates must not be filtered by allow or ignore" > "/dev/stderr"
+    /^    ignore:/ {
+        print "dependabot policy: Cargo updates must not be filtered by ignore" > "/dev/stderr"
         failed = 1
+    }
+    /^    allow:/ {
+        allow_blocks++
+        in_allow = 1
+        if ($0 != "    allow:") failed = 1
+        next
+    }
+    /^    [^[:space:]]/ { in_allow = 0 }
+    in_allow && $0 !~ /^[[:space:]]*(#|$)/ {
+        if ($0 == "      - dependency-type: all") all_rules++
+        else failed = 1
     }
     $0 == "    open-pull-requests-limit: 10" { open_limit++ }
     END {
+        if (allow_blocks != 1 || all_rules != 1) {
+            print "dependabot policy: Cargo must allow all direct and transitive updates without filters" > "/dev/stderr"
+            failed = 1
+        }
         if (!cargo_found || open_limit != 1) {
             print "dependabot policy: Cargo updates need ten visible PR slots" > "/dev/stderr"
             failed = 1
