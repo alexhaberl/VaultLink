@@ -112,7 +112,7 @@ check_audit_refresh_build() {
 check_audit_remediation_policy() {
     audit_root=$1
     audit_ci="$audit_root/.github/workflows/ci.yml"
-    audit_frontend='docker.io/docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e'
+    audit_frontend='docker.io/docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e'
     audit_frontend_line="# syntax=$audit_frontend"
     audit_package_builder="$audit_root/deploy/docker/Dockerfile.package-builder"
     audit_qemu_builder="$audit_root/deploy/docker/Dockerfile.qemu-runner"
@@ -425,7 +425,7 @@ else
         fi
     done
 fi
-if ! grep -F -x -q 'expected_gitleaks_version=8.30.0' "$gitleaks_script" \
+if ! grep -F -x -q 'expected_gitleaks_version=8.30.1' "$gitleaks_script" \
     || ! grep -F -q -- '--redact=100' "$gitleaks_script" \
     || ! grep -F -q -- '--max-decode-depth=5' "$gitleaks_script" \
     || ! grep -F -q -- '--max-archive-depth=2' "$gitleaks_script" \
@@ -433,8 +433,8 @@ if ! grep -F -x -q 'expected_gitleaks_version=8.30.0' "$gitleaks_script" \
     report "secret scan must use pinned Gitleaks with redacted full-history, decoding, and archive coverage"
 fi
 if ! grep -F -q 'fetch-depth: 0' "$ci_workflow" \
-    || ! grep -F -q 'GITLEAKS_VERSION: 8.30.0' "$ci_workflow" \
-    || ! grep -F -q 'GITLEAKS_SHA256: b4cbbb6ddf7d1b2a603088cd03a4e3f7ce48ee7fd449b51f7de6ee2906f5fa2f' "$ci_workflow" \
+    || ! grep -F -q 'GITLEAKS_VERSION: 8.30.1' "$ci_workflow" \
+    || ! grep -F -q 'GITLEAKS_SHA256: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080' "$ci_workflow" \
     || ! grep -F -q "GITLEAKS_BIN=\"\$work/gitleaks\" make secret-check" "$ci_workflow"; then
     report "native CI must run the checksum-pinned Gitleaks full-history gate"
 fi

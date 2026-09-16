@@ -1,4 +1,4 @@
-# syntax=docker.io/docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# syntax=docker.io/docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
 # Application source is deliberately excluded. BASE_IMAGE must be an immutable
 # distro image selected by the protected image-refresh workflow.
 ARG RUST_IMAGE=rust:1.98.1-trixie@sha256:462a9af3c54fb4718850d3c602fc0e54452c20b1c12a4e4080fdb001d4b9acbf

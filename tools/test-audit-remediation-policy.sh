@@ -44,31 +44,31 @@ expect_rejected() {
 
     case "$case_name" in
         mutable_frontend)
-            sed -i '1c\# syntax=docker.io/docker/dockerfile:1.7.1' \
+            sed -i '1c\# syntax=docker.io/docker/dockerfile:1.27.0' \
                 "$case_root/deploy/docker/Dockerfile.package-builder"
             ;;
         wrong_index_digest)
-            sed -i '1s/a57df69d/b57df69d/' \
+            sed -i '1s/bde3983e/cde3983e/' \
                 "$case_root/deploy/docker/Dockerfile.package-builder"
             ;;
         platform_child_digest)
             sed -i \
-                '1c\# syntax=docker.io/docker/dockerfile:1.7.1@sha256:b5f3b260a9678e1d83d2fce86eeddf79420b79147eaba2a25986f47133d73720' \
+                '1c\# syntax=docker.io/docker/dockerfile:1.27.0@sha256:3103efd3bcfbdba49a003fb7ffa453047a4e59d432236ca4cca37e8079fb165e' \
                 "$case_root/deploy/docker/Dockerfile.package-builder"
             ;;
         spelling_variant)
             sed -i \
-                '1c\   # SyNtAx = docker.io/docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e' \
+                '1c\   # SyNtAx = docker.io/docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e' \
                 "$case_root/deploy/docker/Dockerfile.package-builder"
             ;;
         second_syntax_directive)
             printf '%s\n' \
-                '  # SyNtAx =docker.io/docker/dockerfile:1.7.1' \
+                '  # SyNtAx =docker.io/docker/dockerfile:1.27.0' \
                 >>"$case_root/deploy/docker/Dockerfile.package-builder"
             ;;
         additional_dockerfile)
             printf '%s\n' \
-                '# SYNTAX=docker.io/docker/dockerfile:1.7.1' \
+                '# SYNTAX=docker.io/docker/dockerfile:1.27.0' \
                 'FROM scratch' \
                 >"$case_root/deploy/docker/Dockerfile.release-extra"
             ;;

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-expected_gitleaks_version=8.30.0
+expected_gitleaks_version=8.30.1
 gitleaks_bin=${GITLEAKS_BIN:-gitleaks}
 
 if [ -x "$gitleaks_bin" ]; then
