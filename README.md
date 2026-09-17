@@ -7,8 +7,8 @@ links in a browser. Storage can be local or an existing SMB share.
 Status: `0.7.1` is unreleased development. The currently supported release is `v0.7.0`.
 See the [changelog](CHANGELOG.md) and [release status](release/release-state.json).
 The target date for 0.7.1 is **2026-09-22**, subject to the
-[release checklist](docs/RELEASE-CHECKLIST-0.7.1.md), including fresh performance
-evidence and the full 72-hour soak. Version 0.6.0 is superseded and unsupported.
+[release checklist](docs/RELEASE-CHECKLIST-0.7.1.md), including fresh package and
+VM qualification and the full 72-hour soak. Version 0.6.0 is superseded and unsupported.
 
 **Security update pending:** Published 0.7.0 packages contain rustls 0.23.41
 and omit the handshake-validation fix already present in the 0.7.1 source.

@@ -12,7 +12,8 @@
     {
       "id": "QUAL-001",
       "title": "Pinned performance baseline and compatibility fixtures",
-      "status": "open",
+      "status": "accepted",
+      "decision": "Maintainer decision on 2026-09-17: retire the comparative 19-metric performance test for all releases from 0.7.0 onward. No measured comparative performance qualification is claimed; package/VM load checks and the full 72-hour soak remain mandatory.",
       "evidence": [
         "release/performance/policy.json",
         "tools/load-test.sh",

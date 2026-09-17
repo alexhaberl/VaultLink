@@ -3,8 +3,8 @@
 ## 0.7.1 — 2026-09-22
 
 **Unreleased; target date only.** Publication requires fresh qualification of
-the final commit, including the mandatory performance comparison and 72-hour
-soak. See the [release checklist](docs/RELEASE-CHECKLIST-0.7.1.md).
+the final commit, including package/VM gates and the full 72-hour soak.
+See the [release checklist](docs/RELEASE-CHECKLIST-0.7.1.md).
 
 - Include the rustls 0.23.45 handshake-validation fix for
   [GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc),
@@ -17,7 +17,11 @@ soak. See the [release checklist](docs/RELEASE-CHECKLIST-0.7.1.md).
   soak start, during qualification, and immediately before publication;
   retain the audit evidence and block publication on findings or audit failure.
 - Prepare separate 0.7.1 qualification records, package checks, and soak
-  version bindings. The 0.7.0 performance deferral does not apply to 0.7.1.
+  version bindings.
+- Retire the comparative 19-metric performance test for every release from
+  0.7.0 onward, replacing the earlier one-release deferral. Baseline locks and
+  comparative performance receipts are no longer required. Existing native,
+  package, VM, load, latency, RSS, integrity, and 72-hour soak gates remain.
 
 ## 0.7.0 — 2026-09-16
 

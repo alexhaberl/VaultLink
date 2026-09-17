@@ -1,151 +1,52 @@
-# Performance requirements after 0.7.0
+# Retired comparative performance qualification
 
-The maintainer deferred comparative baseline qualification for **0.7.0 only**
-on 2026-09-06. `policy.json` records that decision; QUAL-001 is accepted as a
-deferral, not closed by measurement. No baseline lock, `vaultlink/performance`
-status, or performance receipt is required for the 0.7.0 candidate, soak start,
-or final evidence/tag phases. Those phases retain the exact package/candidate
-checks and the complete 72-hour soak with its existing load, latency, RSS,
-integrity, and transfer requirements. Effective qualification records the
-deferral separately and never claims a measured performance pass.
+On **2026-09-17**, the maintainer retired the comparative **19-metric performance
+test for every release from 0.7.0 onward**, including 0.7.1 and future patch,
+minor and major releases. [`policy.json`](policy.json) is authoritative.
+This decision replaces the 2026-09-06 deferral that applied only to 0.7.0;
+it does not postpone the test to another release.
 
-The **next release after 0.7.0**, including a patch release such as 0.7.1,
-requires the full baseline gate. The policy has no caller/environment override;
-changing the package version re-enables the evidence requirement automatically.
+## Release behavior
 
-## Required work before the next release
+Candidate, soak, final evidence and tag phases do not require a baseline lock,
+five baseline/candidate measurements, a `vaultlink/performance` status or a
+performance receipt for these versions. The supported-release manifest lists
+the eleven remaining release gates and rejects a comparative performance gate
+as an extra entry. No baseline or measured comparative pass is fabricated.
 
-- Review a runnable replacement baseline and update its pinned identity.
-- Implement the complete 19-metric measurement suite with actual instrumentation
-  for internal counts and allocations; include that code in producer provenance.
-- Pin the immutable runner image, CPU allocation, memory, native storage, and
-  real CIFS configuration for all five baseline and all five candidate runs.
-- Register and review the protected baseline artifact before freezing that
-  release candidate, then enforce the sequence below.
+QUAL-001 records the accepted retirement decision. Effective qualification
+reports use schema 2, include `performance_retirement`, leave
+`performance_receipt` null and list QUAL-001 as accepted rather than resolved
+by measurement. The archived 0.7.0 candidate ledger and published release
+records retain their historical decision and evidence.
 
-Replace and review the historical reference commit
-`a390dd9a2210a2e227655a562c541b2b4ebd493c`. Baseline and candidate each
-require exactly five real measurements from the same pinned runner, including
-native storage and CIFS. `tools/check-performance-evidence.py` enforces all
-19 metrics, runner equality, absolute thresholds and median/p95 regression
-limits. Missing metrics, schema-v1 files and edited summaries fail closed.
+The following qualification is still required against one frozen commit and
+the exact package binary:
 
-The first real Debian/CIFS setup exposed a blocker in that historical binary:
-its mount validator requires a standalone `sign` entry in Linux mountinfo,
-which Linux does not emit. It therefore refuses the signed, encrypted test
-mount before serving requests. Fixing the candidate does not repair the
-historical binary. The tooling reference remains unchanged pending an explicit
-review of a reproducible replacement; do not patch the measured binary, alter
-mountinfo, or register partial runs as baseline evidence.
+- Native amd64/arm64 CI, both full fuzz campaigns and all nine native packages.
+- Package reproducibility, all nine full-system VM gates and candidate preflight.
+- Existing native/VM load, admission, latency, RSS, integrity and transfer checks.
+- A fresh security audit before soak start, the complete 72-hour soak, and
+  final evidence/tag verification, including the fresh publication audit.
 
-The repository also still needs an executable measurement suite for all 19
-metrics. The existing load generator covers only part of the required profile;
-the collector and producer import and validate completed runs. Internal stream,
-decryption, and allocation counts require measured instrumentation, not values
-inferred from source code or synthetic unit-test fixtures. These gaps must be
-resolved before a baseline lock or candidate performance success is published.
+See the [0.7.1 release checklist](../../docs/RELEASE-CHECKLIST-0.7.1.md) and
+[soak-runner procedure](../../docs/SOAK-RUNNER.md). Removing the comparison does
+not replace or shorten the 72-hour soak.
 
-## Measurement identity and protected collection
+## Historical tools and records
 
-Each schema-v2 run contains `commit`, `binary_sha256`, `package_target`
-(`debian13-amd64`), positive `packages_run_id`, `candidate_preflight_run_id`,
-`producer_sha256`, `run_index` (1 through 5), `runner` and `metrics`.
-The baseline's candidate preflight ID is null. Measure and record
-`binary_sha256_before` and `binary_sha256_after` from the actual package binary;
-both must equal `binary_sha256`. Use the same producer revision for baseline
-and candidate measurements. Obtain its digest from:
+The original reference commit was
+`a390dd9a2210a2e227655a562c541b2b4ebd493c`. Its binary rejected signed CIFS
+mounts, and the complete executable measurement suite was never implemented.
+No replacement baseline is registered.
 
-```sh
-python3 tools/release-evidence.py producer-digest
-```
+The offline checker, collector and producer code remain for historical
+analysis and evidence-boundary regression tests. Their synthetic unit-test
+fixtures are not measurements. The manual performance workflow checks policy
+before entering its protected environment: for retired versions it skips
+collection and verification and publishes no performance status. Existing
+SSH secrets and host files are not used by the remaining release gates.
 
-The runner object records `id`, immutable image digest, `cpu_model`, `cpu_set`,
-`memory_bytes`, and `storage`. The complete metric keys and numerical limits
-are defined in `REQUIRED_METRICS` and `ABSOLUTE_LIMITS` in the checker.
-The collector imports completed measurements; it does not synthesize missing
-ZIP, CIFS, allocation, startup, SQLite or HTTP measurements from load-test logs.
-
-Provision the reviewed `tools/collect-performance-evidence.py` as a root-owned,
-non-writable executable on the measurement host. Use a dedicated SSH key with
-`restrict,command="/usr/bin/python3 /usr/local/libexec/vaultlink-performance-collect.py"`.
-All path components must be root-owned and not writable by group/others. Store
-five root-owned regular files, `run-1.json` through `run-5.json`, in:
-
-```
-/var/lib/vaultlink-performance/COMMIT/BINARY_SHA256/
-```
-
-Install complete measured runs atomically. The SSH identity may read them but
-cannot write them or obtain a shell. The forced command accepts only
-`performance-collect COMMIT BINARY_SHA256`; it exports the original JSON bytes.
-Symlinks, writable files, non-regular files and files over 1 MiB are rejected.
-
-Configure the `release-performance` GitHub environment with a main-only
-branch policy and reviewers, and these environment secrets:
-`PERFORMANCE_SSH_HOST`, `PERFORMANCE_SSH_PORT`, `PERFORMANCE_SSH_USER`,
-`PERFORMANCE_SSH_PRIVATE_KEY`, `PERFORMANCE_SSH_HOST_KEYS`.
-Host keys are pinned; the existing restricted SSH configuration tool is reused.
-
-## Next-release sequence without changing the qualified commit
-
-1. Measure the baseline, then dispatch `performance-evidence.yml` from main with
-   kind `baseline`, its historical commit, real binary hash and successful
-   Packages run ID. The workflow verifies the exact downloaded package binary
-   and archives a complete immutable bundle with a producer receipt.
-2. Register and review that successful artifact before freezing a candidate:
-
-   ```sh
-   export GITHUB_REPOSITORY=alexhaberl/VaultLink
-   python3 tools/release-evidence.py lock-baseline --run-id BASELINE_RUN_ID \
-     --workflow-sha BASELINE_PRODUCER_COMMIT \
-     --output release/performance/baseline.lock.json
-   ```
-
-   Commit the resulting reviewed lock, source fixes and release date (if known).
-   The lock binds the baseline aggregate, artifact digest, repository, run,
-   attempt and producer workflow commit. No placeholder lock is provided.
-3. Freeze the candidate. Run the existing native, packages, fuzz,
-   reproducibility and VM gates and the release candidate preflight. The
-   candidate phase defers only QUAL-001 and QUAL-006; other open findings block.
-4. Measure the exact candidate package binary five times. Dispatch the protected
-   producer with kind `candidate`, the frozen commit, binary hash and Packages
-   run ID. It verifies the candidate preflight, all identity fields and the
-   reviewed baseline before uploading its artifact and publishing
-   `vaultlink/performance`. Artifacts include commit, run and attempt in names.
-5. Soak start independently downloads and verifies that performance artifact
-   against the extracted candidate binary before activating the existing soak.
-   This phase requires performance and defers only the soak qualification.
-6. After the full 72-hour soak, release evidence/tag phases independently verify
-   both artifacts against that same commit and binary. Effective qualification
-   is archived externally; no candidate evidence or closed flags are committed.
-   The legacy `--require-ready` option remains strict and cannot bypass proof.
-
-Changing main or the package/producer/baseline identity requires a new candidate
-qualification. A final tag must point to the qualified main commit; commit its
-release date before starting the soak. An expired artifact must be regenerated
-and qualified, never replaced by a caller-supplied assertion. Performance
-artifacts are retained for 90 days; the reviewed baseline must still be
-available throughout the qualification cycle.
-
-## Portable bundles and local validation
-
-The aggregate command validates every run, copies its unchanged bytes to
-hash-derived adjacent filenames and publishes the aggregate last:
-
-```sh
-python3 tools/check-performance-evidence.py aggregate --kind candidate \
-  --output /tmp/performance/candidate.json \
-  run-1.json run-2.json run-3.json run-4.json run-5.json
-```
-
-Move/archive the whole output directory. Comparison re-hashes and recomputes
-all five source runs for both aggregates and requires all six independently
-trusted expected identity arguments; see `compare --help`. Existing conflicting
-files and symlink destinations fail closed. Unit test fixture values are
-synthetic test inputs and never constitute release evidence.
-
-For releases after 0.7.0, QUAL-001 must again track the unresolved performance
-qualification. The phase validator resolves it only from verified Actions
-artifacts. In 0.7.0, QUAL-001 records the accepted deferral; QUAL-006 remains open
-until the real soak evidence is verified. Native package smoke and local Rust
-tests do not replace the remaining gates.
+A missing or malformed policy and a non-release package version fail closed.
+Numeric version comparison covers all releases at or above 0.7.0; there is no
+CLI or environment switch that can silently change the committed decision.

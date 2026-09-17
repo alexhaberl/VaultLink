@@ -234,7 +234,7 @@ jobs:
           dpkg-deb -x "dist/$deb" "$root"
           test "$(sha256sum "$root/usr/lib/vaultlink/package/vaultlink" | awk '{print $1}')" \
             = "$SOAK_BINARY_SHA256"
-      - name: Verify version-scoped performance requirements, soak, and qualification
+      - name: Verify release qualification policy and exact-binary soak evidence
         if: needs.prepare.outputs.release_stage == 'evidence' || needs.prepare.outputs.release_stage == 'tag'
         shell: bash
         env:

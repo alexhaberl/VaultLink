@@ -33,9 +33,14 @@ PRODUCER_FILES = ("tools/load-test.sh", "tools/load-metadata.py", "tools/collect
 
 def performance_policy() -> dict:
     policy, _ = PERF._read_json(ROOT / "release/performance/policy.json")
-    if (policy.get("schema_version") != 1 or policy.get("deferred_release") != "0.7.0"
-            or policy.get("required_after") != "0.7.0" or not policy.get("reason")):
-        raise EvidenceError("performance deferral must remain scoped to exactly 0.7.0")
+    if (set(policy) != {"schema_version", "retired_from", "decision_date", "reason", "requirements"}
+            or policy.get("schema_version") != 2 or policy.get("retired_from") != "0.7.0"
+            or not isinstance(policy.get("reason"), str) or not policy["reason"].strip()
+            or policy.get("requirements") != "release/performance/README.md"):
+        raise EvidenceError("performance retirement must cover all releases from 0.7.0")
+    if not isinstance(policy.get("decision_date"), str):
+        raise EvidenceError("performance retirement requires a decision date")
+    datetime.strptime(policy["decision_date"], "%Y-%m-%d")
     return policy
 
 
@@ -44,9 +49,9 @@ def performance_required() -> bool:
     version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
     if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise EvidenceError("performance policy requires an explicit release version")
-    # No CLI/environment override: every version other than the one approved
-    # exception requires real evidence, including 0.7.1 and later releases.
-    return version != policy["deferred_release"]
+    # Compare numeric versions so patch, minor, and major releases all retain
+    # the maintainer's retirement decision. No CLI/environment override exists.
+    return tuple(map(int, version.split("."))) < tuple(map(int, policy["retired_from"].split(".")))
 
 
 def producer_digest(root: Path = ROOT) -> str:

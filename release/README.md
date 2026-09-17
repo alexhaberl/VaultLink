@@ -13,9 +13,11 @@ The [0.7.1 checklist](../docs/RELEASE-CHECKLIST-0.7.1.md),
 [`qualification-0.7.1.json`](qualification-0.7.1.json), and independent
 [`qualification-findings-0.7.1.json`](qualification-findings-0.7.1.json) track
 the new candidate. Source-level closures carry forward the unchanged feature
-contracts; they do not reuse measured release evidence. QUAL-001 (performance)
-and QUAL-006 (final qualification) remain open until verified artifacts resolve
-them. The performance exception was scoped to 0.7.0 only.
+contracts; they do not reuse measured release evidence. QUAL-006 (final
+qualification) remains open until verified artifacts resolve it. The maintainer
+retired the comparative 19-metric performance test for all releases from 0.7.0
+onward on 2026-09-17; QUAL-001 records that accepted decision, with no measured
+comparative pass. See the [performance policy](performance/README.md).
 
 The frozen pre-publication review-finding record for 0.7.0 remains in
 [`qualification-0.7.0.json`](qualification-0.7.0.json), including its original

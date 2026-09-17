@@ -17,20 +17,18 @@ signing key, native-package layout, and application feature contracts remain
 unchanged. The [security notice](../SECURITY.md#pending-tls-security-release)
 explains the difference between the patched source and published binaries.
 
-Two measured qualifications remain open:
+**QUAL-001** records the maintainer's 2026-09-17 decision to retire the
+comparative 19-metric performance test for every release from 0.7.0 onward.
+No baseline lock, comparative measurements or `vaultlink/performance` receipt
+is required or claimed. See the [performance policy](../release/performance/README.md).
 
-- **QUAL-001:** The full performance baseline is mandatory for 0.7.1. Review
-  a runnable replacement for the historical CIFS-incompatible baseline,
-  implement the complete 19-metric measurement suite, collect five real
-  baseline runs, and register their protected artifact in a reviewed lock.
-  See [performance requirements](../release/performance/README.md). The 0.7.0
-  deferral is not inherited, and no synthetic measurements count as evidence.
-- **QUAL-006:** Re-run the native, nine-target package, fuzz, reproducibility,
-  full-system VM, CIFS/load, and full 72-hour soak qualification against the
-  final candidate. Previous-release or different-commit success is insufficient.
+**QUAL-006** remains open: re-run the native, nine-target package, fuzz,
+reproducibility, full-system VM, CIFS/load, and full 72-hour soak qualification
+against the final candidate. Previous-release or different-commit success is
+insufficient.
 
-For publication on Tuesday 22 September, plan to complete the baseline work,
-freeze the candidate, finish its prerequisite gates and performance comparison,
+For publication on Tuesday 22 September, plan to complete the image refresh,
+freeze the candidate, finish its prerequisite gates,
 and start the soak by Friday 18 September where possible. A Saturday
 19 September start leaves only the corresponding time on Tuesday plus the
 remaining UTC publication window for collection, evidence verification and
@@ -52,8 +50,8 @@ the soak creates a different commit and requires fresh qualification.
   freezing. Update the signing-image variable to match the new manifest.
   Static lock validation alone does not prove that refresh has happened;
   do not change locks during qualification.
-- [ ] Complete QUAL-001's baseline implementation and protected measurements.
-  Commit the reviewed `release/performance/baseline.lock.json` before freezing.
+- [ ] Confirm that QUAL-001 records the accepted retirement decision and
+  QUAL-006 remains open for real final-candidate qualification.
 - [ ] Keep `development_version=0.7.1`, its status `unreleased`, Cargo.toml,
   Cargo.lock, package names and the dated changelog consistent. Keep 0.7.0's
   immutable release records intact until the post-publication transition.
@@ -64,7 +62,7 @@ the soak creates a different commit and requires fresh qualification.
   required audit, admission limits, stream/ZIP bounds and package recovery.
   A copied closed source finding does not certify fresh runtime measurements.
 - [ ] Freeze one reviewed main commit with the final date. All package,
-  binary, baseline, producer and orchestration identities must remain fixed.
+  binary, build-input and orchestration identities must remain fixed.
 
 ## Exact-commit qualification
 
@@ -75,27 +73,25 @@ the soak creates a different commit and requires fresh qualification.
    distro VMs. Validate the 50/20/5 native CI smoke and the full 100/40/10 VM
    workload, package operations, rollback and SELinux evidence. Native smoke
    latency remains strict; VM latency remains diagnostic. Neither substitutes
-   for the full-load performance and soak gates.
-3. Run the release candidate preflight. Only QUAL-001 and QUAL-006 may remain
-   open; other open findings block it. Do not treat candidate preflight as
+   for the full-load 72-hour soak.
+3. Run the release candidate preflight. Only QUAL-006 may remain open;
+   other open findings block it. QUAL-001 is accepted under the retirement
+   policy. Do not treat candidate preflight as
    permission to publish.
-4. Measure the exact Debian 13 amd64 candidate package binary five times on
-   the same pinned native/CIFS runner as the baseline. The protected producer
-   must verify all 19 metrics, identity and regression limits and publish the
-   commit-bound `vaultlink/performance` gate and artifact.
-5. Update the dedicated Debian 13 amd64 soak host with the candidate package,
+4. Update the dedicated Debian 13 amd64 soak host with the candidate package,
    service unit and all seven orchestration files from the frozen commit,
    following [SOAK-RUNNER.md](SOAK-RUNNER.md). Record the extracted payload hash
    and verify the running executable, orchestration hash and health version
    0.7.1. Keep the 8-vCPU/16-GiB resource requirement.
-6. Start the soak only after the verified performance receipt and a fresh
+5. Start the soak only after the exact-commit prerequisite gates and a fresh
    audit of the candidate's committed Cargo.lock pass. Run the entire 72 hours
    with at least twelve full load profiles, strict p95 below two seconds,
    unchanged RSS bounds, complete transfers, SQLite integrity and no restarts.
    Audit the same candidate again during collection.
-7. Run final evidence preflight against the same package and binary. Re-fetch
-   and verify performance and soak artifacts, and archive effective
-   qualification externally. Do not commit closed measurement flags or
+6. Run final evidence preflight against the same package and binary. Re-fetch
+   and verify the complete soak artifact, and archive effective qualification
+   externally. Its schema-v2 report records the performance retirement with
+   a null performance receipt. Do not commit closed measurement flags or
    generated results after the soak.
 
 ## Publish only after all gates pass
@@ -104,7 +100,7 @@ the soak creates a different commit and requires fresh qualification.
   matches the committed 2026-09-22 changelog heading. If either changed,
   stop and prepare a new candidate instead of bypassing the check.
 - [ ] Create the signed annotated `v0.7.1` tag at that exact commit only after
-  all required gates, including `vaultlink/performance`, are successful.
+  all eleven required release gates are successful.
 - [ ] Let the protected workflow assemble and verify exactly 21 assets:
   nine native packages, nine direct signatures, the SBOM bundle,
   `SHA256SUMS` and its signature. Re-download and verify the draft assets.
@@ -116,7 +112,7 @@ the soak creates a different commit and requires fresh qualification.
 ## After verified publication
 
 - [ ] Record the actual signed tag object, commit, publication timestamp,
-  immutable asset inventory and all twelve required gate run URLs in
+  immutable asset inventory and all eleven required gate run URLs in
   `release/release-state.json`. Mark 0.7.1 supported and 0.7.0 superseded;
   do not invent those records in this preparation PR.
 - [ ] In a subsequent documentation change, switch README, SECURITY,
