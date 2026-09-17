@@ -390,13 +390,13 @@ built and boot-tested against the release-date snapshot; a weekly read-only
 job checks the current rolling image without changing published support claims.
 
 
-The v0.7.1 qualification sequence is baseline registration, candidate
-preflight, measured performance comparison, soak start, and final evidence/tag
-verification. The 0.7.0 performance deferral does not apply: a reviewed baseline
-lock and a verified `vaultlink/performance` artifact are required before the
-soak. Final phases re-download both immutable performance and 72-hour soak
-artifacts and archive effective qualification without modifying the candidate.
-All existing load, latency, RSS, integrity, and transfer gates remain mandatory.
-See [performance requirements](../release/performance/README.md) for the open
-baseline and measurement work and the [0.7.1 checklist](RELEASE-CHECKLIST-0.7.1.md)
+The v0.7.1 qualification sequence is exact-commit package/VM qualification,
+candidate preflight, a fresh security audit, soak start, and final evidence/tag
+verification. The comparative 19-metric performance test is retired for all
+releases from 0.7.0 onward; no baseline lock or `vaultlink/performance` artifact
+is required. Final phases re-download the immutable 72-hour soak artifact,
+verify the actual package binary and archive effective qualification without
+modifying the candidate. All existing load, latency, RSS, integrity, and transfer
+gates remain mandatory. See the [performance policy](../release/performance/README.md)
+and the [0.7.1 checklist](RELEASE-CHECKLIST-0.7.1.md)
 for the publication and subsequent support transition.

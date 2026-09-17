@@ -113,8 +113,6 @@ def validate_state(state: dict[str, Any], errors: list[str]) -> tuple[str, str, 
             "vaultlink/release-dry-run",
             "vaultlink/release-evidence-preflight",
         }
-        if SEMVER.fullmatch(supported) and tuple(map(int, supported.split("."))) > (0, 7, 0):
-            required_contexts.add("vaultlink/performance")
         observed_contexts: set[str] = set()
         if isinstance(gates, list):
             for gate in gates:
@@ -373,7 +371,7 @@ def validate_phase(args, errors: list[str]) -> frozenset[str]:
         import tempfile
         evidence = load_release_evidence()
         performance_required = evidence.performance_required()
-        deferred = None if performance_required else evidence.performance_policy()
+        retirement = None if performance_required else evidence.performance_policy()
         resolved = frozenset({"QUAL-001", "QUAL-006"} if performance_required else {"QUAL-006"})
         if phase == "candidate":
             return resolved
@@ -388,7 +386,7 @@ def validate_phase(args, errors: list[str]) -> frozenset[str]:
                                     args.expected_packages_run_id)
         else:
             if args.performance_receipt is not None:
-                raise evidence.EvidenceError("0.7.0 records a deferral, not performance qualification")
+                raise evidence.EvidenceError("comparative performance qualification is retired for this release")
             api = evidence.GitHub(__import__("os").environ.get("GITHUB_REPOSITORY", ""))
             evidence.verify_candidate(api, args.expected_commit, args.expected_packages_run_id)
         soak_receipt = None
@@ -399,11 +397,11 @@ def validate_phase(args, errors: list[str]) -> frozenset[str]:
                                      Path(temporary) / "soak")
         if args.output:
             args.effective_qualification = {
-                "schema_version": 1, "phase": phase, "commit": args.expected_commit,
+                "schema_version": 2, "phase": phase, "commit": args.expected_commit,
                 "binary_sha256": args.expected_binary_sha256,
                 "packages_run_id": args.expected_packages_run_id,
                 "performance_receipt": receipt,
-                "performance_deferral": deferred,
+                "performance_retirement": retirement,
                 "soak_receipt": soak_receipt,
                 "resolved_findings": (["QUAL-001"] if performance_required else [])
                     + (["QUAL-006"] if phase != "soak" else []),

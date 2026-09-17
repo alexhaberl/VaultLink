@@ -280,12 +280,13 @@ the `active` state under an administrator-controlled maintenance procedure.
 Never remove or replace active evidence while the systemd unit is running.
 
 
-The v0.7.1 candidate requires a reviewed performance baseline lock and a
-verified `vaultlink/performance` artifact before soak start. The 0.7.0 deferral
-does not apply. Complete baseline registration, candidate preflight and five
-measured candidate runs before starting the full 72 hours; final evidence/tag
-phases independently verify both performance and soak artifacts.
-See [performance requirements](../release/performance/README.md) and the
+The comparative 19-metric performance test is retired for every release from
+0.7.0 onward. The v0.7.1 candidate needs no baseline lock or
+`vaultlink/performance` receipt. Complete the exact-commit candidate preflight
+and fresh security audit before starting the full 72 hours. Final evidence/tag
+phases independently verify the actual package binary and complete soak artifact;
+all load, latency, RSS, integrity, and transfer checks remain mandatory.
+See the [performance policy](../release/performance/README.md) and the
 [0.7.1 release checklist](RELEASE-CHECKLIST-0.7.1.md), targeted for 2026-09-22.
 
 Before starting this candidate, re-provision all seven orchestration files

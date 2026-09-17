@@ -33,8 +33,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  verify:
+  policy:
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      required: ${{ steps.policy.outputs.required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply comparative performance retirement policy
+        id: policy
+        run: |
+          set -euo pipefail
+          required=$(python3 tools/release-evidence.py performance-required)
+          printf 'required=%s\n' "$required" >>"$GITHUB_OUTPUT"
+          if [[ "$required" == false ]]; then
+            echo 'The comparative performance test is retired from 0.7.0 onward. No measurements or performance status are produced.' >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+  verify:
+    needs: policy
+    if: needs.policy.outputs.required == 'true'
     runs-on: ubuntu-24.04
     environment: release-performance
     timeout-minutes: 20
