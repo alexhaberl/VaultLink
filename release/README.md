@@ -1,11 +1,12 @@
 # Release signing and immutable package inputs
 
 Lifecycle state and already-published evidence come exclusively from
-[`release-state.json`](release-state.json). Version 0.7.0 is supported;
-0.6.0 is superseded and unsupported, with its immutable evidence retained.
-`development_version` identifies the version in the checkout and equals
-`supported_version` after publication until a new development version is chosen.
-At that point there is no unreleased entry; a later version bump introduces one.
+[`release-state.json`](release-state.json). Version 0.7.0 is withdrawn because
+its immutable packages omit the merged rustls handshake-validation security
+update. There is currently no supported release; 0.6.0 remains superseded and
+unsupported, with immutable evidence retained. `development_version` identifies
+the version in the checkout. `supported_version` is null during an emergency
+withdrawal and otherwise identifies the sole supported immutable release.
 
 The frozen pre-publication review-finding record for 0.7.0 remains in
 [`qualification-0.7.0.json`](qualification-0.7.0.json), including its original

@@ -2,7 +2,12 @@
 
 [Back to README](../README.md)
 
-This guide installs the supported **VaultLink 0.7.0** native packages.
+> **Security withdrawal:** There is currently no supported VaultLink release.
+> **Do not install these withdrawn packages.** The immutable 0.7.0 packages
+> omit a merged rustls handshake-validation security update. This guide is
+> retained only as historical package-verification and operating documentation.
+
+This guide previously installed the **VaultLink 0.7.0** native packages.
 Start with [configuration and storage](CONFIGURATION.md) to prepare the mounted
 storage, private internal directory, local database directory, and HTTPS endpoint.
 Package installation leaves the service and automatic updates disabled.

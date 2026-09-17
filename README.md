@@ -4,9 +4,11 @@ VaultLink shares files from an existing Linux storage mount through download and
 upload links. Manage files in the web interface and let recipients open their
 links in a browser. Storage can be local or an existing SMB share.
 
-Status: The currently supported release is `v0.7.0`.
+Status: There is currently no supported release. The immutable `v0.7.0`
+packages were withdrawn because they omit a merged rustls handshake-validation
+security update. Do not install or deploy them; wait for a later supported release.
 See the [changelog](CHANGELOG.md) and [release status](release/release-state.json).
-Version 0.6.0 is superseded and no longer supported; upgrade to 0.7.0.
+Versions 0.7.0 and 0.6.0 are unsupported.
 
 ## Screenshots
 
@@ -33,32 +35,37 @@ Version 0.6.0 is superseded and no longer supported; upgrade to 0.7.0.
   built-in TLS, including Let's Encrypt.
 
 These features, monitoring endpoints, service tokens, and GUI update controls
-are available in the supported 0.7.0 release.
+were introduced in 0.7.0, whose binary packages are now withdrawn.
 
 ## Installation
 
 VaultLink runs on Linux. Recipients use a browser on Windows, macOS, or Linux;
 SMB clients are only needed for optional direct access to an external SMB share.
 
-| Supported operating system | Architectures | Package |
+| Historical 0.7.0 package target | Architectures | Package |
 | --- | --- | --- |
 | Debian 13 | amd64, arm64 | DEB |
 | Ubuntu 24.04 / 26.04 LTS | amd64, arm64 | DEB |
 | Fedora 44 | x86_64, aarch64 | RPM |
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
-1. Download the matching package from the
-   [supported 0.7.0 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.0).
-2. Follow the [verification and installation instructions](docs/INSTALLATION.md#native-package-deployment)
-   to verify both the signature and signed checksum before installing.
-3. Prepare the [storage mount and HTTPS configuration](docs/CONFIGURATION.md).
+Do not install the withdrawn 0.7.0 packages. The
+[installation documentation](docs/INSTALLATION.md#native-package-deployment)
+is retained for historical verification details; deployment must wait for a
+later release that is marked supported in the release-state manifest.
+
+When a supported release is available:
+
+1. Follow its verification and installation instructions.
+2. Prepare the [storage mount and HTTPS configuration](docs/CONFIGURATION.md).
    Production requires a validated mount and private service-owned directories;
    keep SQLite on a supported local filesystem.
-4. Complete [browser setup through an SSH tunnel](docs/INSTALLATION.md#initial-browser-setup-through-an-ssh-tunnel),
+3. Complete [browser setup through an SSH tunnel](docs/INSTALLATION.md#initial-browser-setup-through-an-ssh-tunnel),
    save the initial TOTP secret, and start the service.
 
-The package leaves the service and automatic updates disabled until configured.
-Only the listed OS versions and architectures are supported. GitHub source
+Packages leave the service and automatic updates disabled until configured.
+Future support is limited to the OS versions and architectures listed by that
+release. GitHub source
 archives are not installation packages. The withdrawn 0.5.0 archive has no
 supported in-place upgrade path; see the [release history](CHANGELOG.md).
 

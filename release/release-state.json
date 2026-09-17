@@ -1,12 +1,14 @@
 {
   "schema_version": 1,
   "development_version": "0.7.0",
-  "supported_version": "0.7.0",
+  "supported_version": null,
   "expected_package_assets": 9,
   "releases": [
     {
       "version": "0.7.0",
-      "status": "supported",
+      "status": "withdrawn",
+      "withdrawn_at": "2026-09-17",
+      "withdrawal_reason": "The immutable packages omit the merged rustls handshake-validation security update; use a later supported release.",
       "release_date": "2026-09-16",
       "tag": "v0.7.0",
       "tag_object_sha": "0d6d6f16a7df35bc109cc26c659d45d24c6b6358",

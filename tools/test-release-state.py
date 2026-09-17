@@ -78,8 +78,8 @@ def test_installation_docs() -> None:
             readme = root / "README.md"
             baseline_readme = readme.read_text(encoding="utf-8")
             readme.write_text(baseline_readme.replace(
-                f"The currently supported release is `v{supported}`.",
-                "The currently supported release is `v0.0.0`."
+                "There is currently no supported release.",
+                "There is currently a supported release."
             ), encoding="utf-8")
             assert any("README release status" in error for error in errors())
             readme.write_text(baseline_readme, encoding="utf-8")
@@ -93,34 +93,12 @@ def test_installation_docs() -> None:
             baseline_install = install.read_text(encoding="utf-8")
             for broken, expected in [
                 (baseline_install.replace("## Native package deployment", "## Other"), "section is missing"),
-                (baseline_install.replace(f"VaultLink {supported} supports", "VaultLink 0.0.0 supports"), "does not use supported_version"),
-                (baseline_install.replace(f"vaultlink-release-{supported}.", "vaultlink-release-0.0.0."), "staging example"),
+                (baseline_install.replace("Do not install these withdrawn packages", "Installation is allowed"), "must block withdrawn packages"),
             ]:
                 install.write_text(broken, encoding="utf-8")
                 assert any(expected in error for error in errors()), expected
 
-            # A later development bump must still reject installation guidance
-            # pointing at the unpublished version; fixtures do not pick a real
-            # next release version for the repository.
             install.write_text(baseline_install, encoding="utf-8")
-            future = "99.0.0"
-            current_notice = f"`{development}` is unreleased development. " if development != supported else ""
-            readme.write_text(baseline_readme.replace(
-                f"Status: {current_notice}", f"Status: `{future}` is unreleased development. "
-            ), encoding="utf-8")
-            security = root / "SECURITY.md"
-            security.write_text(security.read_text(encoding="utf-8").replace(
-                f"Release line: {current_notice}", f"Release line: `{future}` is unreleased development. "
-            ), encoding="utf-8")
-            changelog = root / "CHANGELOG.md"
-            changelog.write_text(f"## {future} — Unreleased\n\n" + changelog.read_text(encoding="utf-8"),
-                                 encoding="utf-8")
-            future_errors: list[str] = []
-            MODULE.validate_docs(future, supported, releases, future_errors)
-            assert future_errors == [], future_errors
-            install.write_text(baseline_install + f"\nInstall {future} instead.\n", encoding="utf-8")
-            MODULE.validate_docs(future, supported, releases, future_errors)
-            assert any("offers the unreleased version" in error for error in future_errors)
             install.unlink()
             assert errors(), "a missing installation guide must fail closed"
         finally:
@@ -128,7 +106,19 @@ def test_installation_docs() -> None:
 
 
 def test_lifecycle() -> None:
-    published = json.loads((REPOSITORY / "release/release-state.json").read_text(encoding="utf-8"))
+    withdrawn = json.loads((REPOSITORY / "release/release-state.json").read_text(encoding="utf-8"))
+
+    def errors(state: dict[str, object]) -> list[str]:
+        result: list[str] = []
+        MODULE.validate_state(state, result)
+        return result
+
+    assert errors(withdrawn) == []
+
+    published = copy.deepcopy(withdrawn)
+    withdrawn_version = published["development_version"]
+    published["supported_version"] = withdrawn_version
+    next(item for item in published["releases"] if item["version"] == withdrawn_version)["status"] = "supported"
     published["development_version"] = published["supported_version"]
     published["releases"] = [entry for entry in published["releases"] if entry["status"] != "unreleased"]
     superseded = next(entry["version"] for entry in published["releases"] if entry["status"] == "superseded")
@@ -136,11 +126,6 @@ def test_lifecycle() -> None:
     def entry(state: dict[str, object], version: str | None = None) -> dict[str, object]:
         return next(item for item in state["releases"]
                     if item["version"] == (version or state["supported_version"]))
-
-    def errors(state: dict[str, object]) -> list[str]:
-        result: list[str] = []
-        MODULE.validate_state(state, result)
-        return result
 
     assert errors(published) == []
 
@@ -162,7 +147,7 @@ def test_lifecycle() -> None:
 
     multiple_supported = copy.deepcopy(published)
     entry(multiple_supported, superseded)["status"] = "supported"
-    assert any("exactly one release must be supported" in error for error in errors(multiple_supported))
+    assert any("supported entry count" in error for error in errors(multiple_supported))
 
     incorrect_current = copy.deepcopy(published)
     entry(incorrect_current)["status"] = "unreleased"
