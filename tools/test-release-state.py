@@ -144,6 +144,28 @@ def test_lifecycle() -> None:
 
     assert errors(published) == []
 
+    # The 0.7.0 exception must not allow a later supported release to omit
+    # its measured performance gate during the post-publication transition.
+    patched = copy.deepcopy(published)
+    previous = patched["supported_version"]
+    patched_version = "99.0.1"
+    current = entry(patched)
+    current["version"] = patched_version
+    current["tag"] = f"v{patched_version}"
+    current["required_commit_gates"] = [
+        gate for gate in current["required_commit_gates"] if gate["context"] != "vaultlink/performance"
+    ]
+    patched["development_version"] = patched["supported_version"] = patched_version
+    for item in patched["releases"]:
+        if item.get("superseded_by") == previous:
+            item["superseded_by"] = patched_version
+    assert any("gate set is incomplete" in error for error in errors(patched))
+    current["required_commit_gates"].append({
+        "context": "vaultlink/performance", "state": "success",
+        "run_url": "https://github.com/example/VaultLink/actions/runs/1",
+    })
+    assert errors(patched) == []
+
     future = copy.deepcopy(published)
     future["development_version"] = "99.0.0"
     future["releases"].insert(0, {

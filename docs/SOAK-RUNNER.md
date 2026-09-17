@@ -245,7 +245,7 @@ already-public releases and mismatched drafts are rejected without alteration.
    amd64 DEB. A status from another commit, an expired/missing artifact, or any
    package/payload/live hash mismatch blocks release.
 
-The monitor rejects restarts, inactive health, non-0.7.0 health responses,
+The monitor rejects restarts, inactive health, non-0.7.1 health responses,
 SQLite integrity failures, error-priority service journal entries, RSS over
 256 MiB, failed load profiles, and a changed executable hash. RSS retention must
 also pass both independent growth checks: the final-hour median may grow from
@@ -280,12 +280,16 @@ the `active` state under an administrator-controlled maintenance procedure.
 Never remove or replace active evidence while the systemd unit is running.
 
 
-The v0.7.0 qualification sequence is candidate preflight, soak start, and final
-evidence/tag verification. The maintainer deferred the comparative performance
-baseline to the next release after 0.7.0; this version does not require a
-baseline lock or `vaultlink/performance` receipt. Soak start still verifies the
-candidate and exact package binary. The final phases re-download the immutable
-72-hour soak artifact and archive effective qualification with the explicit
-performance deferral, without modifying the candidate commit. All existing
-soak load, latency, RSS, integrity, and transfer gates remain mandatory.
-See `release/performance/README.md` for the next-release baseline requirements.
+The v0.7.1 candidate requires a reviewed performance baseline lock and a
+verified `vaultlink/performance` artifact before soak start. The 0.7.0 deferral
+does not apply. Complete baseline registration, candidate preflight and five
+measured candidate runs before starting the full 72 hours; final evidence/tag
+phases independently verify both performance and soak artifacts.
+See [performance requirements](../release/performance/README.md) and the
+[0.7.1 release checklist](RELEASE-CHECKLIST-0.7.1.md), targeted for 2026-09-22.
+
+Before starting this candidate, re-provision all seven orchestration files
+from its frozen commit using the installation steps above. The controller,
+monitor, collector and verifier now expect version 0.7.1; old installed helpers
+will fail the orchestration hash check. Reuse no 0.7.0 result or active run.
+Archive previous evidence through the documented maintenance procedure first.

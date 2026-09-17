@@ -2,11 +2,11 @@
 
 | Field | Value |
 | --- | --- |
-| Last reviewed | 2026-08-30 |
-| Baseline commit | Unreleased 0.7.0 monitoring implementation; the exact final commit is recorded before release qualification |
-| Applies to | VaultLink 0.7.0 native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
-| Companion documents | [Security policy](SECURITY.md), [0.7.0 release checklist](docs/RELEASE-CHECKLIST-0.7.0.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
-| Release state | [`release/release-state.json`](release/release-state.json): 0.7.0 unreleased, 0.6.0 supported, 0.5.0 withdrawn |
+| Last reviewed | 2026-09-17 (0.7.1 release preparation) |
+| Baseline commit | Unreleased 0.7.1 security release preparation; the exact final commit is bound by release qualification |
+| Applies to | VaultLink 0.7.1 candidate native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
+| Companion documents | [Security policy](SECURITY.md), [0.7.1 release checklist](docs/RELEASE-CHECKLIST-0.7.1.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
+| Release state | [`release/release-state.json`](release/release-state.json): 0.7.1 unreleased (target 2026-09-22), 0.7.0 supported with a pending TLS fix, 0.6.0 superseded, 0.5.0 withdrawn |
 
 ## Purpose
 
@@ -272,7 +272,7 @@ this document alone:
   key rotation, and concurrency;
 - exact-commit nine-target package reproducibility, full-system VM, per-target
   load, staging, hardware-FIDO2, SMB, and Debian 72-hour soak gates in
-  `docs/RELEASE-CHECKLIST-0.7.0.md`.
+  `docs/RELEASE-CHECKLIST-0.7.1.md`.
 
 Passing CI validates tested controls but does not close unchecked release
 checklist items or change an accepted residual risk.
@@ -286,6 +286,7 @@ checklist items or change an accepted residual risk.
 | 2026-09-01 | `0d9d3f1e72c2b0aa57f3433c10457f4b7b9abdf8` (`v0.6.0`) | Nine-target native-package distribution, package-bound authenticated updater, per-distro builders and full-system guests, immutable 21-asset release, and withdrawal of 0.5.0 | First supported package release; signed tag and all required commit gates verified, closing historical RA-10 |
 | 2026-08-30 | Unreleased 0.7.0 monitoring implementation | Instance-wide `monitoring:read` tokens, redacted monitoring routes, schema 7, administrator lifecycle, local revoke-all recovery, and Home Assistant trust boundary | Bearer authentication is confined to two read-only projections; token plaintext and privileged Share fields remain excluded, and older manual restores require global token revocation/reissue before traffic |
 | 2026-09-04 | Unreleased 0.7.0 review-findings implementation | Release-state truth, qualification ledger, workflow linting, security/performance findings, schema 8, and architecture gates | RA-01 through RA-09 and RA-11 through RA-12 reconfirmed for 0.7.0; release remains fail closed until the qualification ledger has no open entry |
+| 2026-09-17 | Unreleased 0.7.1 preparation | TLS dependency fix, published-artifact gap, fresh security audits and release qualification | Schema and feature trust boundaries remain unchanged; the source fix does not repair immutable 0.7.0 packages. Performance and final soak qualification remain open; the existing residual-risk conditions still apply. |
 
 ## Review triggers
 

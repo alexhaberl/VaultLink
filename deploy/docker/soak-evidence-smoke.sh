@@ -68,7 +68,7 @@ mkdir -p "$active"
 chmod 2750 "$state" "$active"
 ln -s "$commit" "$state/active"
 
-health='{"ok":true,"version":"0.7.0"}'
+health='{"ok":true,"version":"0.7.1"}'
 printf '%s' "$health" >"$active/health.json"
 health_hash=$(printf '%s' "$health" | sha256sum | awk '{print $1}')
 binary_hash=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
@@ -100,7 +100,7 @@ printf '%s\n' \
     'architecture=amd64' \
     'os_id=debian' \
     'os_version_id=13' \
-    'expected_version=0.7.0' \
+    'expected_version=0.7.1' \
     "start_epoch=$start" \
     "end_epoch=$end" \
     'duration_seconds=259200' \
@@ -119,7 +119,7 @@ printf '%s\n' \
     'SOAK_SECONDS=259200' \
     'SOAK_INTERVAL_SECONDS=300' \
     'SOAK_LOAD_INTERVAL_SECONDS=21600' \
-    'SOAK_EXPECTED_VERSION=0.7.0' \
+    'SOAK_EXPECTED_VERSION=0.7.1' \
     >"$active/unit.env"
 printf '%s\n' \
     "commit=$commit" \
@@ -130,7 +130,7 @@ printf '%s\n' \
     'os_id=debian' \
     'os_version_id=13' \
     "config_sha256=$config_hash" \
-    'expected_version=0.7.0' \
+    'expected_version=0.7.1' \
     "health_sha256=$health_hash" \
     >"$active/candidate.env"
 printf '%s\n' 'VaultLink soak fixture started normally' >"$active/vaultlink-journal.log"
@@ -293,6 +293,16 @@ SOAK_STATE_ROOT="$state" GITHUB_OUTPUT="$outputs" \
 grep -F -x -q 'state=success' "$outputs" || fail "collector did not report success"
 grep -F -x -q "commit_sha=$commit" "$outputs" || fail "collector changed the commit"
 sh tools/check-soak-evidence.sh "$commit" "$destination" >/dev/null
+
+# A successful prior-version soak must never qualify the new package version.
+old_version_evidence="$work/old-version-evidence"
+cp -R "$destination" "$old_version_evidence"
+sed -i 's/^expected_version=0.7.1$/expected_version=0.7.0/' "$old_version_evidence/result.env"
+if sh tools/check-soak-evidence.sh "$commit" "$old_version_evidence" >"$work/old-version.log" 2>&1; then
+    fail "previous release version unexpectedly qualified the candidate"
+fi
+grep -F -q 'soak did not exercise VaultLink 0.7.1' "$work/old-version.log" \
+    || fail "previous release version was not rejected at the version boundary"
 [ "$(stat -c '%a' "$active")" = 2750 ] \
     || fail "synthetic evidence directory lost its setgid group-readable mode"
 

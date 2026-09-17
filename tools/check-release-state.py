@@ -113,6 +113,8 @@ def validate_state(state: dict[str, Any], errors: list[str]) -> tuple[str, str, 
             "vaultlink/release-dry-run",
             "vaultlink/release-evidence-preflight",
         }
+        if SEMVER.fullmatch(supported) and tuple(map(int, supported.split("."))) > (0, 7, 0):
+            required_contexts.add("vaultlink/performance")
         observed_contexts: set[str] = set()
         if isinstance(gates, list):
             for gate in gates:

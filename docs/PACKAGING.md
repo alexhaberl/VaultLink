@@ -1,8 +1,11 @@
 # Native package support
 
-This document describes the supported **0.7.0 package contract**.
-To install the supported **0.7.0** release, follow the
-[installation guide](INSTALLATION.md).
+This document describes the **unreleased 0.7.1 candidate package contract**.
+The target date is 2026-09-22, subject to the
+[release checklist](RELEASE-CHECKLIST-0.7.1.md). The
+[installation guide](INSTALLATION.md) still documents the published 0.7.0
+packages and their pending security update. Candidate asset names below are
+build inputs, not published downloads.
 
 VaultLink releases are distributed only as native, signed operating-system
 packages. GitHub's automatically generated source archives are source material,
@@ -25,20 +28,19 @@ than repeat target lists in workflow YAML.
 | Fedora 44 | x86_64, aarch64 | RPM |
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
-For the supported version 0.7.0, the manifest defines these published
-installation packages:
+For candidate version 0.7.1, the manifest defines these expected packages:
 
 | Target | Release asset |
 | --- | --- |
-| Debian 13 amd64 | `vaultlink_0.7.0-1+deb13_amd64.deb` |
-| Debian 13 arm64 | `vaultlink_0.7.0-1+deb13_arm64.deb` |
-| Ubuntu 24.04 amd64 | `vaultlink_0.7.0-1+ubuntu24.04_amd64.deb` |
-| Ubuntu 24.04 arm64 | `vaultlink_0.7.0-1+ubuntu24.04_arm64.deb` |
-| Ubuntu 26.04 amd64 | `vaultlink_0.7.0-1+ubuntu26.04_amd64.deb` |
-| Ubuntu 26.04 arm64 | `vaultlink_0.7.0-1+ubuntu26.04_arm64.deb` |
-| Fedora 44 x86_64 | `vaultlink-0.7.0-1.fc44.x86_64.rpm` |
-| Fedora 44 aarch64 | `vaultlink-0.7.0-1.fc44.aarch64.rpm` |
-| Arch Linux x86_64 | `vaultlink-0.7.0-1-x86_64.pkg.tar.zst` |
+| Debian 13 amd64 | `vaultlink_0.7.1-1+deb13_amd64.deb` |
+| Debian 13 arm64 | `vaultlink_0.7.1-1+deb13_arm64.deb` |
+| Ubuntu 24.04 amd64 | `vaultlink_0.7.1-1+ubuntu24.04_amd64.deb` |
+| Ubuntu 24.04 arm64 | `vaultlink_0.7.1-1+ubuntu24.04_arm64.deb` |
+| Ubuntu 26.04 amd64 | `vaultlink_0.7.1-1+ubuntu26.04_amd64.deb` |
+| Ubuntu 26.04 arm64 | `vaultlink_0.7.1-1+ubuntu26.04_arm64.deb` |
+| Fedora 44 x86_64 | `vaultlink-0.7.1-1.fc44.x86_64.rpm` |
+| Fedora 44 aarch64 | `vaultlink-0.7.1-1.fc44.aarch64.rpm` |
+| Arch Linux x86_64 | `vaultlink-0.7.1-1-x86_64.pkg.tar.zst` |
 
 Each binary is compiled inside its target distribution on a native runner of
 the same CPU architecture. Arch Linux ARM, distributions derived from the
@@ -113,7 +115,7 @@ an unbound markerless installation.
 ### Trusted staging and DEB initial-install boundary
 
 First create a new root-owned mode-`0700` staging directory with
-`sudo mktemp -d /var/tmp/vaultlink-release-0.7.0.XXXXXXXX`; never reuse a fixed
+`sudo mktemp -d /var/tmp/vaultlink-release-0.7.1.XXXXXXXX`; never reuse a fixed
 or pre-existing path. Copy the package, its direct signature, `SHA256SUMS`, its
 signature, and the separately trusted public key into it. Bind the staged key
 to SHA-256
@@ -134,7 +136,7 @@ The Fedora full-system gate exercises that exact path and requires no
 VaultLink-related AVC denials plus final package/runtime parity.
 
 For Debian and Ubuntu, read `Depends` from that exact verified, root-owned DEB
-with `dpkg-deb -f`. Version 0.7.0 requires the exact field
+with `dpkg-deb -f`. Version 0.7.1 requires the exact field
 `ca-certificates, curl, libc6, libgcc-s1, mawk, minisign, sqlite3, systemd`.
 Before running `dpkg -i`, query every one of those package names with
 `dpkg-query` and require the state `installed`; this is an offline preflight
@@ -388,12 +390,13 @@ built and boot-tested against the release-date snapshot; a weekly read-only
 job checks the current rolling image without changing published support claims.
 
 
-The v0.7.0 qualification sequence is candidate preflight, soak start, and final
-evidence/tag verification. The maintainer deferred the comparative performance
-baseline to the next release after 0.7.0; this version does not require a
-baseline lock or `vaultlink/performance` receipt. Soak start still verifies the
-candidate and exact package binary. The final phases re-download the immutable
-72-hour soak artifact and archive effective qualification with the explicit
-performance deferral, without modifying the candidate commit. All existing
-soak load, latency, RSS, integrity, and transfer gates remain mandatory.
-See `release/performance/README.md` for the next-release baseline requirements.
+The v0.7.1 qualification sequence is baseline registration, candidate
+preflight, measured performance comparison, soak start, and final evidence/tag
+verification. The 0.7.0 performance deferral does not apply: a reviewed baseline
+lock and a verified `vaultlink/performance` artifact are required before the
+soak. Final phases re-download both immutable performance and 72-hour soak
+artifacts and archive effective qualification without modifying the candidate.
+All existing load, latency, RSS, integrity, and transfer gates remain mandatory.
+See [performance requirements](../release/performance/README.md) for the open
+baseline and measurement work and the [0.7.1 checklist](RELEASE-CHECKLIST-0.7.1.md)
+for the publication and subsequent support transition.

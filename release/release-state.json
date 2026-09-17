@@ -1,9 +1,16 @@
 {
   "schema_version": 1,
-  "development_version": "0.7.0",
+  "development_version": "0.7.1",
   "supported_version": "0.7.0",
   "expected_package_assets": 9,
   "releases": [
+    {
+      "version": "0.7.1",
+      "status": "unreleased",
+      "release_date": "2026-09-22",
+      "checklist": "docs/RELEASE-CHECKLIST-0.7.1.md",
+      "qualification": "release/qualification-0.7.1.json"
+    },
     {
       "version": "0.7.0",
       "status": "supported",

@@ -4,9 +4,17 @@ VaultLink shares files from an existing Linux storage mount through download and
 upload links. Manage files in the web interface and let recipients open their
 links in a browser. Storage can be local or an existing SMB share.
 
-Status: The currently supported release is `v0.7.0`.
+Status: `0.7.1` is unreleased development. The currently supported release is `v0.7.0`.
 See the [changelog](CHANGELOG.md) and [release status](release/release-state.json).
-Version 0.6.0 is superseded and no longer supported; upgrade to 0.7.0.
+The target date for 0.7.1 is **2026-09-22**, subject to the
+[release checklist](docs/RELEASE-CHECKLIST-0.7.1.md), including fresh performance
+evidence and the full 72-hour soak. Version 0.6.0 is superseded and unsupported.
+
+**Security update pending:** Published 0.7.0 packages contain rustls 0.23.41
+and omit the handshake-validation fix already present in the 0.7.1 source.
+See the [security notice](SECURITY.md#pending-tls-security-release).
+New deployments should wait for the patched release. Support and download
+links switch only after the new immutable packages have been published and verified.
 
 ## Screenshots
 
@@ -47,8 +55,11 @@ SMB clients are only needed for optional direct access to an external SMB share.
 | Fedora 44 | x86_64, aarch64 | RPM |
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
-1. Download the matching package from the
-   [supported 0.7.0 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.0).
+The following references describe the published packages and existing
+installations; the security notice above applies before any new deployment.
+
+1. The matching packages are recorded in the
+   [published 0.7.0 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.0).
 2. Follow the [verification and installation instructions](docs/INSTALLATION.md#native-package-deployment)
    to verify both the signature and signed checksum before installing.
 3. Prepare the [storage mount and HTTPS configuration](docs/CONFIGURATION.md).

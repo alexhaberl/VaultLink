@@ -2,6 +2,7 @@
 """Offline regression tests for the release artifact and phase trust boundary."""
 
 import argparse
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -238,6 +239,23 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 self.assertRaises(EVIDENCE.EvidenceError, EVIDENCE.performance_required)
                 policy_path.unlink()
                 self.assertRaises(EVIDENCE.EvidenceError, EVIDENCE.performance_required)
+
+    def test_measurement_package_version_comes_from_each_exact_commit(self):
+        from unittest.mock import Mock
+        api = Mock()
+        for commit, version in [("a" * 40, "0.7.0"), ("b" * 40, "0.7.1")]:
+            cargo = f'[package]\nname = "vaultlink"\nversion = "{version}"\n'
+            encoded = base64.encodebytes(cargo.encode()).decode()
+            api.request.return_value = {"type": "file", "encoding": "base64", "content": encoded}
+            self.assertEqual(EVIDENCE.package_version_at(api, commit), version)
+            api.request.assert_called_with(f"contents/Cargo.toml?ref={commit}")
+        for version in ("0.7.1-rc1", "../0.7.1", "0.7"):
+            cargo = f'[package]\nversion = "{version}"\n'
+            api.request.return_value["content"] = base64.b64encode(cargo.encode()).decode()
+            self.assertRaises(EVIDENCE.EvidenceError, EVIDENCE.package_version_at, api, COMMIT)
+        self.assertRaises(EVIDENCE.EvidenceError, EVIDENCE.package_version_at, api, "main")
+        api.request.return_value = {"type": "symlink", "encoding": "base64"}
+        self.assertRaises(EVIDENCE.EvidenceError, EVIDENCE.package_version_at, api, COMMIT)
 
     def test_070_deferral_keeps_candidate_packages_and_soak_verification(self):
         with tempfile.TemporaryDirectory() as temporary:

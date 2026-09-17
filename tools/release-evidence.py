@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime
 import hashlib
 import importlib.util
@@ -140,6 +141,19 @@ class GitHub:
                 "run_attempt": run["run_attempt"], "workflow_sha": run["head_sha"],
                 "artifact_id": artifact["id"], "artifact_name": name,
                 "artifact_sha256": digest.removeprefix("sha256:")}
+
+
+def package_version_at(api: GitHub, commit: str) -> str:
+    """Read the package version from the verified measurement commit, not the producer."""
+    PERF._commit(commit, "measurement commit")
+    document = api.request(f"contents/Cargo.toml?ref={commit}")
+    if document.get("type") != "file" or document.get("encoding") != "base64":
+        raise EvidenceError("measurement commit lacks an encoded Cargo.toml")
+    raw = base64.b64decode("".join(document["content"].split()), validate=True)
+    version = tomllib.loads(raw.decode("utf-8"))["package"]["version"]
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise EvidenceError("measurement package version must be a stable release version")
+    return version
 
 
 def extract_artifact(raw: bytes, destination: Path) -> None:

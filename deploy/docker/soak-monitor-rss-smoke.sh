@@ -123,7 +123,7 @@ run_case() {
         SOAK_START_EPOCH=$start SOAK_DEADLINE_EPOCH=$deadline \
         SOAK_SECONDS=259200 SOAK_INTERVAL_SECONDS=300 SOAK_LOAD_INTERVAL_SECONDS=21600 \
         SOAK_ARCHITECTURE=amd64 SOAK_OS_ID=debian SOAK_OS_VERSION_ID=13 \
-        SOAK_EXPECTED_VERSION=0.7.0 SOAK_LOAD_SCRIPT=/bin/false \
+        SOAK_EXPECTED_VERSION=0.7.1 SOAK_LOAD_SCRIPT=/bin/false \
         VAULTLINK_CONFIG="$case_dir/config.toml" \
         sh tools/soak-monitor.sh >"$case_dir/monitor.log" 2>&1 || status=$?
     if [ "$status" -ne "$expected_status" ]; then

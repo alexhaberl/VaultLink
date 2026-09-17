@@ -1,11 +1,21 @@
 # Release signing and immutable package inputs
 
 Lifecycle state and already-published evidence come exclusively from
-[`release-state.json`](release-state.json). Version 0.7.0 is supported;
-0.6.0 is superseded and unsupported, with its immutable evidence retained.
-`development_version` identifies the version in the checkout and equals
-`supported_version` after publication until a new development version is chosen.
-At that point there is no unreleased entry; a later version bump introduces one.
+[`release-state.json`](release-state.json). Version 0.7.1 is unreleased, with
+2026-09-22 recorded as its target date. Version 0.7.0 remains the published
+supported release while the replacement is qualified; its packages omit the
+pending TLS fix described in [SECURITY.md](../SECURITY.md#pending-tls-security-release).
+Version 0.6.0 is superseded and unsupported, with its immutable evidence retained.
+`development_version` identifies the checkout; `supported_version` changes only
+after verification of the newly published immutable release.
+
+The [0.7.1 checklist](../docs/RELEASE-CHECKLIST-0.7.1.md),
+[`qualification-0.7.1.json`](qualification-0.7.1.json), and independent
+[`qualification-findings-0.7.1.json`](qualification-findings-0.7.1.json) track
+the new candidate. Source-level closures carry forward the unchanged feature
+contracts; they do not reuse measured release evidence. QUAL-001 (performance)
+and QUAL-006 (final qualification) remain open until verified artifacts resolve
+them. The performance exception was scoped to 0.7.0 only.
 
 The frozen pre-publication review-finding record for 0.7.0 remains in
 [`qualification-0.7.0.json`](qualification-0.7.0.json), including its original
@@ -98,7 +108,7 @@ the pinned frontend.
 The currently reviewed frontend identity is:
 
 ```text
-docker.io/docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+docker.io/docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
 ```
 
 That digest is the top-level multi-architecture index, not an amd64 or arm64
@@ -108,7 +118,7 @@ and record its displayed top-level `Digest`. Then use `docker buildx
 imagetools inspect docker.io/docker/dockerfile:<patch> --raw | jq
 '.manifests[].platform'` to confirm both `linux/amd64` and `linux/arm64`.
 Cross-check the index digest against the verified
-[`docker/dockerfile` publisher and exact tag in Docker Hub](https://hub.docker.com/r/docker/dockerfile/tags?name=1.7.1).
+[`docker/dockerfile` publisher and exact tag in Docker Hub](https://hub.docker.com/r/docker/dockerfile/tags?name=1.27.0).
 Update the patch version, digest, all three first-line directives, and the
 policy constant in one change.
 
@@ -223,8 +233,8 @@ runner. Two empty build roots use the same commit-derived
 `SOURCE_DATE_EPOCH`; payload binary, normalized target SBOM, and final package
 must be byte-identical. Format-specific lint and the common package allowlist
 run independently of the builder. The exact installed package payload also
-runs the unchanged overlapping workload of 100 metadata clients, 40 range
-streams, and ten upload/readback clients inside that digest-pinned distribution
+runs the overlapping CI smoke workload of 50 metadata clients, 20 range
+streams, and five upload/readback clients inside that digest-pinned distribution
 builder on the matching native GitHub runner. The job first qualifies its
 public hosted runner for four available vCPUs and at least 8 GiB of host RAM,
 then restricts Docker to logical CPUs 0-3. It restricts the server to CPUs 0-1
@@ -232,8 +242,9 @@ and the load generator to CPUs 2-3, keeps server storage separate, and provides
 the clients a dedicated hardened 4-GiB tmpfs. Its evidence records the
 qualification, placement, exact workload, latency, RSS, and integrity results;
 inability to prove the layout fails the gate. That qualified run is
-authoritative for strict p95 `<2 s` for all nine targets, including arm64 on
-the managed arm64 runner; private ARM hardware is not required. The resource
+authoritative for smoke-profile p95 `<2 s` for all nine targets, including arm64 on
+the managed arm64 runner; it does not claim full-load arm64 performance.
+Private ARM hardware is not required for these smoke results. The resource
 contract is reproducible, but it does not make arbitrary standard-runner
 timing deterministic.
 

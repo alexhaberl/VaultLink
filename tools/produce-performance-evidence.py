@@ -39,6 +39,7 @@ def main() -> int:
         if args.commit != (workflow_sha if args.kind == "candidate" else PERF.BASELINE_COMMIT):
             raise PERF.EvidenceError("unexpected measurement commit")
         packages = api.run(args.packages_run_id, args.commit, ".github/workflows/packages.yml")
+        package_version = EVIDENCE.package_version_at(api, args.commit)
         candidate_run = None
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
@@ -51,14 +52,14 @@ def main() -> int:
                                      f"Release candidate {args.commit}")
                 candidate_run = candidate["id"]
                 api.artifact(candidate, f"vaultlink-release-unsigned-{args.commit}", work / "packages")
-                subprocess.run(["sh", "tools/verify-package-release.sh", str(work / "packages"), "0.7.0"],
+                subprocess.run(["sh", "tools/verify-package-release.sh", str(work / "packages"), package_version],
                                cwd=ROOT, check=True)
             else:
                 api.artifact(packages, "vaultlink-package-debian13-amd64", work / "packages")
             debs = list((work / "packages").glob("*.deb"))
             # The final unsigned release contains multiple DEBs; choose the exact target filename.
             asset = subprocess.check_output(["python3", "tools/package-targets.py", "asset",
-                                             "debian13-amd64", "0.7.0"], cwd=ROOT, text=True).strip()
+                                             "debian13-amd64", package_version], cwd=ROOT, text=True).strip()
             deb = work / "packages" / asset
             if deb not in debs or deb.is_symlink():
                 raise PERF.EvidenceError("candidate lacks the expected Debian package")
