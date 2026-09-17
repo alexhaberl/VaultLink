@@ -3,6 +3,11 @@
 [Back to README](../README.md)
 
 This guide installs the supported **VaultLink 0.7.0** native packages.
+The published packages omit the pending TLS handshake-validation fix. New
+deployments should wait for a patched supported release; read the
+[security notice](../SECURITY.md#pending-tls-security-release) first.
+These versioned commands remain the reference for existing packages until
+the replacement release is published and verified.
 Start with [configuration and storage](CONFIGURATION.md) to prepare the mounted
 storage, private internal directory, local database directory, and HTTPS endpoint.
 Package installation leaves the service and automatic updates disabled.

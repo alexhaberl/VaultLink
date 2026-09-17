@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.1 — 2026-09-22
+
+**Unreleased; target date only.** Publication requires fresh qualification of
+the final commit, including the mandatory performance comparison and 72-hour
+soak. See the [release checklist](docs/RELEASE-CHECKLIST-0.7.1.md).
+
+- Include the rustls 0.23.45 handshake-validation fix for
+  [GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc),
+  rustls-webpki 0.103.15, and the associated TLS dependency updates missing
+  from the immutable 0.7.0 packages.
+- Include the merged dependency and pinned build-tool maintenance since
+  0.7.0. Database schema 10 and native-package upgrade/rollback contracts
+  remain unchanged.
+- Audit the exact committed lockfile against a fresh advisory database at
+  soak start, during qualification, and immediately before publication;
+  retain the audit evidence and block publication on findings or audit failure.
+- Prepare separate 0.7.1 qualification records, package checks, and soak
+  version bindings. The 0.7.0 performance deferral does not apply to 0.7.1.
+
 ## 0.7.0 — 2026-09-16
 
 - Limit glibc allocation arenas in the packaged service to reduce retained memory after concurrent transfer and database bursts. Preserve all RSS medians and growth limits in failed soak evidence and cover both failure paths with the real monitor finalization.

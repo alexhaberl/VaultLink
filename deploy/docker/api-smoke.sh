@@ -147,7 +147,7 @@ import sys
 response = json.load(sys.stdin)
 if set(response) != {"generated_at", "version", "shares", "transfers", "storage"}:
     raise SystemExit("monitoring summary has unexpected top-level fields")
-if response["version"] != "0.7.0":
+if response["version"] != "0.7.1":
     raise SystemExit("monitoring summary returned the wrong version")
 if set(response["shares"]) != {
     "total", "available", "inactive", "expired",
