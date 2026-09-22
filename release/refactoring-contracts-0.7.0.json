@@ -134,7 +134,7 @@
         "src/setup/discovery.rs",
         "src/setup/views.rs"
       ],
-      "sha256": "24f129cf08d59b3cb3902eb9eff0caab8c61eb3694542469ca52776fd4c05075"
+      "sha256": "0ee24616448f3b9cb4812db31d40bf58a25554f0d3af86229653cc570529395c"
     },
     {
       "name": "database auth common-admins-mfa-webauthn-sessions",
@@ -216,7 +216,7 @@
         "src/web/public_upload/mod.rs",
         "src/web/public_upload/presenter.rs"
       ],
-      "sha256": "3b1d9aeaa1e373b2fbac57c23d097551dc4fb07415ecc05153035df1543adcf9"
+      "sha256": "27e995221e986013a2e336a32ed570673e5a205d348e2bf1ffe583dfae4b0328"
     }
   ]
 }
