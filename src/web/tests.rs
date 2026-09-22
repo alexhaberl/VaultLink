@@ -15,6 +15,7 @@ include!("tests/admin_raw_preview.rs");
 include!("tests/api_zip.rs");
 include!("tests/preview_cancellation.rs");
 include!("tests/zip_directories.rs");
+include!("tests/public_upload_security.rs");
 include!("tests/public_upload.rs");
 include!("tests/public_upload_policy.rs");
 include!("tests/admin_revocation_support.rs");
