@@ -41,6 +41,7 @@ struct PublicationReady {
     upload: CommittedUpload,
     destination: SecureDirectory,
     directory_durability_uncertain: bool,
+    directory_audit_uncertain: bool,
     upload_subdir: String,
     audit_context: AuditContext,
 }
@@ -372,6 +373,7 @@ async fn prepare_publication(
         upload: context.upload,
         destination,
         directory_durability_uncertain: directory.durability_uncertain,
+        directory_audit_uncertain,
         upload_subdir: context.upload_subdir,
         audit_context: context.audit_context,
     }))
@@ -387,18 +389,14 @@ async fn audit_directory_outcome(
     let audit_uncertain = if directory.created.is_empty() {
         false
     } else if directory.complete {
-        audit_observation(
+        persist_required_file_audit(
             state,
-            "public".into(),
+            audit_context.clone(),
             AuditAction::UploadDirectoriesCreated,
-            Some(share_id.to_string()),
-            Some(format!(
-                "path={upload_subdir};created={}",
-                directory.created.len()
-            )),
+            share_id.to_string(),
+            format!("path={upload_subdir};created={}", directory.created.len()),
         )
-        .await;
-        false
+        .await
     } else {
         persist_required_file_audit(
             state,
@@ -463,6 +461,7 @@ async fn publish_and_audit(
         state,
         published,
         context.directory_durability_uncertain,
+        context.directory_audit_uncertain,
         context.audit_context,
     )
     .await
@@ -493,12 +492,14 @@ async fn record_publication(
     state: &AppState,
     published: PublishedUpload,
     directory_durability_uncertain: bool,
+    directory_audit_uncertain: bool,
     audit_context: AuditContext,
 ) -> Result<PublicUploadOutcome> {
     let (target, total, replaced, publish_outcome, _admission) = published.into_parts();
     let name = target.file_name;
     let durability_uncertain = directory_durability_uncertain || !publish_outcome.is_durable();
-    let audit_detail = format!("file={name};bytes={total}");
+    let path = join_display(&target.upload_subdir, &name);
+    let audit_detail = format!("file={name};bytes={total};path={path}");
     if let Some(error) = publish_outcome.uncertainty_error() {
         tracing::warn!(
             share_id = target.share_id,
@@ -537,7 +538,7 @@ async fn record_publication(
         name,
         target.upload_subdir,
         disposition,
-        audit_durability_uncertain,
+        directory_audit_uncertain || audit_durability_uncertain,
     )))
 }
 

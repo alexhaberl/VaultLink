@@ -10,7 +10,6 @@ CONFIG_PATH="$WORK_DIR/config.toml"
 ROOT_DIR="$WORK_DIR/root"
 DATA_DIR="$WORK_DIR/data"
 COOKIE_JAR="$WORK_DIR/cookies.txt"
-SETUP_COOKIE_JAR="$WORK_DIR/setup-cookies.txt"
 SETUP_LOG="$WORK_DIR/setup.log"
 APP_LOG="$WORK_DIR/app.log"
 SETUP_RESPONSE="$WORK_DIR/setup-response.html"
@@ -234,14 +233,13 @@ wait_http "http://$SETUP_ADDR/" "401"
 SETUP_TOKEN="$(sed -n 's|^http://[^#]*#token=||p' "$SETUP_LOG" | tail -n 1)"
 [[ -n "$SETUP_TOKEN" ]] || fail "setup token was not printed"
 curl -sS -o /dev/null -w '%{http_code}' \
-    -c "$SETUP_COOKIE_JAR" \
     -H 'Content-Type: application/json' \
     --data-binary "{\"token\":\"$SETUP_TOKEN\"}" \
     "http://$SETUP_ADDR/bootstrap" | grep -qx 204 \
     || fail "setup bootstrap failed"
 
 curl -sS -f -X POST "http://$SETUP_ADDR/" \
-    -b "$SETUP_COOKIE_JAR" \
+    -H "x-vaultlink-setup-token: $SETUP_TOKEN" \
     --data-urlencode "server_mode=development" \
     --data-urlencode "listen_address=$APP_ADDR" \
     --data-urlencode "public_base_url=http://localhost:18081" \
@@ -278,7 +276,7 @@ grep -q "Setup complete" "$SETUP_RESPONSE" || fail "setup did not complete"
 TOTP_SECRET="$(grep -Eo '[A-Z2-7]{32}' "$SETUP_RESPONSE" | head -n 1)"
 [[ -n "$TOTP_SECRET" ]] || fail "TOTP secret was not rendered"
 curl -sS -f -X POST "http://$SETUP_ADDR/complete" \
-    -b "$SETUP_COOKIE_JAR" \
+    -H "x-vaultlink-setup-token: $SETUP_TOKEN" \
     | grep -q "Setup confirmed" || fail "setup confirmation failed"
 
 cleanup

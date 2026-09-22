@@ -16,7 +16,6 @@ CONFIG_PATH="$WORK_DIR/config.toml"
 ROOT_DIR="$WORK_DIR/root"
 DATA_DIR="$WORK_DIR/data"
 CONTAINER_LOG="$WORK_DIR/container.log"
-COOKIE_JAR="$WORK_DIR/setup.cookies"
 ADMIN_PASSWORD="VaultLink setup smoke password 123!"
 
 cleanup() {
@@ -32,8 +31,8 @@ wait_http() {
     local expected="$2"
     for _ in $(seq 1 80); do
         local status
-        if [[ -f "$COOKIE_JAR" ]]; then
-            status="$(curl -sS -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' "$url" || true)"
+        if [[ -n "${TOKEN:-}" ]]; then
+            status="$(curl -sS -H "x-vaultlink-setup-token: $TOKEN" -o /dev/null -w '%{http_code}' "$url" || true)"
         else
             status="$(curl -sS -o /dev/null -w '%{http_code}' "$url" || true)"
         fi
@@ -65,14 +64,13 @@ if [[ -z "$TOKEN" ]]; then
     exit 1
 fi
 curl -sS -o /dev/null -w '%{http_code}' \
-    -c "$COOKIE_JAR" \
     -H 'Content-Type: application/json' \
     --data-binary "{\"token\":\"$TOKEN\"}" \
     "http://$PROXY_ADDR/bootstrap" | grep -qx 204
 wait_http "http://$PROXY_ADDR/" "200"
 
 curl -sS -f -X POST "http://$PROXY_ADDR/" \
-    -b "$COOKIE_JAR" \
+    -H "x-vaultlink-setup-token: $TOKEN" \
     --data-urlencode "server_mode=development" \
     --data-urlencode "listen_address=$INTERNAL_ADDR" \
     --data-urlencode "public_base_url=http://localhost:18081" \
@@ -106,7 +104,7 @@ curl -sS -f -X POST "http://$PROXY_ADDR/" \
     | grep -q "Setup complete"
 
 curl -sS -f -X POST "http://$PROXY_ADDR/complete" \
-    -b "$COOKIE_JAR" \
+    -H "x-vaultlink-setup-token: $TOKEN" \
     | grep -q "Setup confirmed"
 
 test -s "$CONFIG_PATH"
@@ -135,7 +133,7 @@ for required_storage_field in internal_directory require_mount external_writers 
 done
 
 curl -sS -f -X POST "http://$PROXY_ADDR/start" \
-    -b "$COOKIE_JAR" \
+    -H "x-vaultlink-setup-token: $TOKEN" \
     | grep -q "VaultLink is starting"
 
 wait_http "http://$PROXY_ADDR/login" "200"

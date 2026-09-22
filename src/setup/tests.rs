@@ -32,10 +32,7 @@ mod tests {
 
     fn setup_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            HeaderValue::from_static("vaultlink_setup=token"),
-        );
+        headers.insert(SETUP_TOKEN_HEADER, HeaderValue::from_static("token"));
         headers
     }
 
@@ -129,6 +126,41 @@ mod tests {
                 contract => panic!("unsupported setup auth contract {contract:?}: {spec:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_never_grants_setup_authority_through_a_cookie() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let app = setup_router(test_setup_state(config_dir.path().join("config.toml")));
+        let bootstrap = Request::builder()
+            .method(Method::POST)
+            .uri("/bootstrap")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"token":"token"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(bootstrap).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.contains("vaultlink_setup=;"));
+        assert!(cookie.contains("Max-Age=0"));
+        assert!(!cookie.contains("=token"));
+
+        let mut cookie_only = request(Method::GET, "/", "");
+        cookie_only.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_setup=token"),
+        );
+        let response = app.clone().oneshot(cookie_only).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response_text(response)
+            .await
+            .contains("data-setup-auth-required"));
+
+        let response = app
+            .oneshot(authorized_request(Method::GET, "/", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     async fn response_text(response: Response) -> String {
@@ -266,7 +298,9 @@ mod tests {
         assert!(!html.contains("name=\"production_mode\""));
         assert!(!html.contains("name=\"secure_cookie\""));
         assert!(SETUP_JAVASCRIPT.contains("fallbackToRoot"));
-        assert!(SETUP_JAVASCRIPT.contains("fetch('/mounts')"));
+        assert!(SETUP_JAVASCRIPT.contains("fetch('/mounts', {headers: setupHeaders()})"));
+        assert!(SETUP_JAVASCRIPT.contains("sessionStorage.setItem(tokenKey, bootstrapToken)"));
+        assert!(SETUP_JAVASCRIPT.contains("[tokenHeader]: setupToken"));
         assert!(!SETUP_JAVASCRIPT.contains("?token="));
         assert!(SETUP_JAVASCRIPT.contains("history.replaceState"));
         assert!(SETUP_JAVASCRIPT.contains("applyDetectedMount"));
@@ -329,7 +363,7 @@ mod tests {
         let mut german_cookie = authorized_request(Method::GET, "/", "");
         german_cookie.headers_mut().insert(
             header::COOKIE,
-            HeaderValue::from_static("vaultlink_setup=token; vaultlink_locale=de"),
+            HeaderValue::from_static("vaultlink_locale=de"),
         );
         let response = app.clone().oneshot(german_cookie).await.unwrap();
         assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "de");
@@ -355,7 +389,7 @@ mod tests {
         );
         cookie_override.headers_mut().insert(
             header::COOKIE,
-            HeaderValue::from_static("vaultlink_setup=token; vaultlink_locale=de"),
+            HeaderValue::from_static("vaultlink_locale=de"),
         );
         let response = app.oneshot(cookie_override).await.unwrap();
         assert_eq!(response.headers()[header::CONTENT_LANGUAGE], "de");

@@ -3,10 +3,10 @@
 | Field | Value |
 | --- | --- |
 | Last reviewed | 2026-09-17 (0.7.1 release preparation) |
-| Baseline commit | Unreleased 0.7.1 security release preparation; the exact final commit is bound by release qualification |
-| Applies to | VaultLink 0.7.1 candidate native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
+| Baseline commit | Published 0.7.1 package commit `efdbea07d0e77f9bd89cbde7fd1a706055739e36`; later `main` changes require separate qualification |
+| Applies to | VaultLink 0.7.1 native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
 | Companion documents | [Security policy](SECURITY.md), [0.7.1 release checklist](docs/RELEASE-CHECKLIST-0.7.1.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
-| Release state | [`release/release-state.json`](release/release-state.json): 0.7.1 unreleased (target 2026-09-22), 0.7.0 supported with a pending TLS fix, 0.6.0 superseded, 0.5.0 withdrawn |
+| Release state | [`release/release-state.json`](release/release-state.json): 0.7.1 supported (published 2026-09-22), 0.7.0 and 0.6.0 superseded, 0.5.0 withdrawn |
 
 ## Purpose
 

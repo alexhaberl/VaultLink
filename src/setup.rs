@@ -33,7 +33,6 @@ use crate::{
         Storage, Tls, MAX_TEXT_PREVIEW_SIZE,
     },
     db::{AuditContext, Database, InitialAdminOutcome},
-    http_auth::named_cookie,
     i18n::{self, Locale},
     internal_reporting::{report_internal, InternalOperation},
     runtime,
