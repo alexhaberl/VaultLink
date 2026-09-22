@@ -53,7 +53,11 @@ async fn public_upload_rejects_unreadable_or_excessively_deep_targets_before_sta
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!root.path().join("uploads/d").exists());
-    let share = state.db().share_by_token("bounded-upload").unwrap().unwrap();
+    let share = state
+        .db()
+        .share_by_token("bounded-upload")
+        .unwrap()
+        .unwrap();
     assert_eq!((share.uploaded_bytes, share.uploaded_files), (0, 0));
     assert_eq!(state.db().active_upload_reservations(share_id).unwrap(), 0);
     assert_eq!(upload_fragment_count(root.path()), 0);
@@ -132,8 +136,12 @@ async fn public_upload_audit_identifies_the_full_share_relative_target() {
         .iter()
         .map(|event| event.detail.as_deref().unwrap())
         .collect();
-    assert!(details.iter().any(|detail| detail.contains("path=a/same.txt")));
-    assert!(details.iter().any(|detail| detail.contains("path=b/same.txt")));
+    assert!(details
+        .iter()
+        .any(|detail| detail.contains("path=a/same.txt")));
+    assert!(details
+        .iter()
+        .any(|detail| detail.contains("path=b/same.txt")));
     assert_ne!(details[0], details[1]);
 }
 
@@ -184,6 +192,12 @@ async fn public_upload_reports_audit_uncertainty_when_created_directory_audit_fa
         .await
         .contains(r#""warning":"audit_durability_uncertain""#));
     assert!(root.path().join("uploads/new/file.txt").exists());
-    assert_eq!(state.db().count_audit(Some("upload_directories_created")).unwrap(), 0);
+    assert_eq!(
+        state
+            .db()
+            .count_audit(Some("upload_directories_created"))
+            .unwrap(),
+        0
+    );
     assert_eq!(state.db().count_audit(Some("upload")).unwrap(), 1);
 }

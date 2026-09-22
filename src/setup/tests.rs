@@ -32,10 +32,7 @@ mod tests {
 
     fn setup_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            SETUP_TOKEN_HEADER,
-            HeaderValue::from_static("token"),
-        );
+        headers.insert(SETUP_TOKEN_HEADER, HeaderValue::from_static("token"));
         headers
     }
 
@@ -155,7 +152,9 @@ mod tests {
         );
         let response = app.clone().oneshot(cookie_only).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(response_text(response).await.contains("data-setup-auth-required"));
+        assert!(response_text(response)
+            .await
+            .contains("data-setup-auth-required"));
 
         let response = app
             .oneshot(authorized_request(Method::GET, "/", ""))
