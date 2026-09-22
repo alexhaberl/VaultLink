@@ -37,7 +37,7 @@ struct MountDiscoveryResponse {
 }
 
 async fn setup_mounts(State(state): State<SetupState>, headers: HeaderMap) -> Response {
-    if !setup_cookie_authorized(&headers, &state) {
+    if !setup_token_authorized(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match storage_mount::discover_supported_mounts() {
@@ -101,7 +101,7 @@ async fn setup_browse(
     headers: HeaderMap,
     Query(query): Query<BrowseQuery>,
 ) -> Response {
-    if !setup_cookie_authorized(&headers, &state) {
+    if !setup_token_authorized(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let requested = query.path.unwrap_or_else(|| "/".to_string());

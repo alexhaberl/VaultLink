@@ -52,6 +52,15 @@ struct SetupMessageTemplate {
 
 #[derive(Template)]
 #[template(
+    source = r#"<section class="vl-panel" data-setup-auth-required><h1><vl-i18n key="common.error"/></h1><p><vl-i18n key="{{ message_key }}"/></p></section>"#,
+    ext = "html"
+)]
+struct SetupAuthRequiredTemplate {
+    message_key: &'static str,
+}
+
+#[derive(Template)]
+#[template(
     source = r#"<section class="vl-panel"><h1><vl-i18n key="setup.completed"/></h1><p><vl-i18n key="setup.config_admin_created"/></p><p><vl-i18n key="setup.totp_recovery_help"/></p><div class="vl-qr-card" aria-label="<vl-i18n key="setup.totp_qr_code"/>">{{ qr }}</div><div class="vl-secret-block"><code>{{ secret }}</code><code>{{ otpauth }}</code></div><form method="post" action="/complete"><button class="vl-button"><vl-i18n key="setup.secret_saved"/></button></form></section>"#,
     ext = "html"
 )]

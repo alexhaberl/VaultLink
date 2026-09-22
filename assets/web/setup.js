@@ -1,5 +1,7 @@
 
 document.addEventListener('DOMContentLoaded', () => {
+  const tokenKey = 'vaultlink.setup.token';
+  const tokenHeader = 'x-vaultlink-setup-token';
   const fragment = new URLSearchParams(location.hash.slice(1));
   const bootstrapToken = fragment.get('token');
   if (bootstrapToken) {
@@ -10,10 +12,53 @@ document.addEventListener('DOMContentLoaded', () => {
       body: JSON.stringify({token: bootstrapToken})
     }).then(response => {
       if (!response.ok) throw new Error('setup bootstrap rejected');
+      sessionStorage.setItem(tokenKey, bootstrapToken);
       location.replace('/');
     }).catch(() => {});
     return;
   }
+  const setupToken = sessionStorage.getItem(tokenKey);
+  const setupHeaders = () => ({[tokenHeader]: setupToken});
+  const replacePage = async response => {
+    if (response.status === 401) sessionStorage.removeItem(tokenKey);
+    const html = await response.text();
+    document.open();
+    document.write(html);
+    document.close();
+  };
+  if (document.querySelector('[data-setup-auth-required]')) {
+    if (setupToken) {
+      fetch('/', {headers: setupHeaders(), cache: 'no-store'})
+        .then(replacePage)
+        .catch(() => {});
+    }
+    return;
+  }
+  if (!setupToken) return;
+  document.addEventListener('submit', async event => {
+    const submitted = event.target;
+    if (!(submitted instanceof HTMLFormElement) || submitted.method.toLowerCase() !== 'post') return;
+    event.preventDefault();
+    const destination = new URL(submitted.action || location.href);
+    if (destination.origin !== location.origin) return;
+    const fields = event.submitter
+      ? new FormData(submitted, event.submitter)
+      : new FormData(submitted);
+    try {
+      const response = await fetch(destination, {
+        method: 'POST',
+        headers: {...setupHeaders(), 'content-type': 'application/x-www-form-urlencoded'},
+        body: new URLSearchParams(fields)
+      });
+      await replacePage(response);
+    } catch (_) {
+      const message = document.createElement('p');
+      message.className = 'vl-danger-text';
+      message.setAttribute('role', 'alert');
+      message.textContent = '<vl-i18n key="error.internal"/>';
+      submitted.before(message);
+    }
+  });
   const form = document.querySelector('[data-setup-form]');
   if (!form) return;
 
@@ -125,7 +170,7 @@ document.addEventListener('DOMContentLoaded', () => {
     refreshMountsButton.disabled = true;
     try {
       const previousMountPoint = detectedMountSelect.value;
-      const response = await fetch('/mounts');
+      const response = await fetch('/mounts', {headers: setupHeaders()});
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || 'mount discovery failed');
       detectedMounts = new Map(payload.mounts.map(mount => [mount.mount_point, mount]));
@@ -246,7 +291,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let pickerFileKind = '';
 
   async function load(requestedPath, fallbackToRoot = false) {
-    const response = await fetch(`/browse?path=${encodeURIComponent(requestedPath)}&mode=${pickerMode}&file_kind=${encodeURIComponent(pickerFileKind)}&server_mode=${encodeURIComponent(mode.value)}`);
+    const response = await fetch(`/browse?path=${encodeURIComponent(requestedPath)}&mode=${pickerMode}&file_kind=${encodeURIComponent(pickerFileKind)}&server_mode=${encodeURIComponent(mode.value)}`, {headers: setupHeaders()});
     if (!response.ok) {
       if (fallbackToRoot && requestedPath !== '/') return load('/', false);
       list.innerHTML = '<p class="vl-danger-text"><vl-i18n key="setup.directory_unreadable"/></p>';

@@ -46,6 +46,9 @@ pub(crate) enum InternalOperation {
     ApiShareServiceDatabaseFailure,
     ApiAdminServiceDatabaseFailure,
     SetupLocaleCookieHeader,
+    // Preserve the historical diagnostic code even though setup no longer
+    // grants authority through a cookie.
+    #[allow(dead_code)]
     SetupBootstrapCookieHeader,
     SetupQrRender,
     SetupConfigLoad,

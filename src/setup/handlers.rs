@@ -1,7 +1,9 @@
-const SETUP_COOKIE: &str = "vaultlink_setup";
+const SETUP_TOKEN_HEADER: &str = "x-vaultlink-setup-token";
 
-fn setup_cookie_authorized(headers: &HeaderMap, state: &SetupState) -> bool {
-    named_cookie(headers, SETUP_COOKIE)
+fn setup_token_authorized(headers: &HeaderMap, state: &SetupState) -> bool {
+    headers
+        .get(SETUP_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
         .is_some_and(|token| auth::constant_time_eq(state.token.as_str(), token))
 }
 
@@ -17,26 +19,22 @@ async fn setup_bootstrap(
     if !auth::constant_time_eq(state.token.as_str(), &request.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let cookie = format!(
-        "{SETUP_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600",
-        state.token
-    );
     let mut response = StatusCode::NO_CONTENT.into_response();
-    match HeaderValue::from_str(&cookie) {
-        Ok(cookie) => {
-            response.headers_mut().insert(header::SET_COOKIE, cookie);
-            response
-        }
-        Err(error) => setup_internal(InternalOperation::SetupBootstrapCookieHeader, error),
-    }
+    // Expire a cookie left by an older setup process. A cookie carrying setup
+    // authority would be sent to every 127.0.0.1 port, not just this origin.
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("vaultlink_setup=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
+    );
+    response
 }
 
 async fn setup_page(State(state): State<SetupState>, headers: HeaderMap) -> Response {
-    if !setup_cookie_authorized(&headers, &state) {
+    if !setup_token_authorized(&headers, &state) {
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
-                &SetupMessageTemplate {
+                &SetupAuthRequiredTemplate {
                     message_key: "setup.token_invalid",
                 },
                 None,
@@ -52,7 +50,7 @@ async fn submit_setup(
     headers: HeaderMap,
     Form(form): Form<SetupForm>,
 ) -> Response {
-    if !setup_cookie_authorized(&headers, &state) {
+    if !setup_token_authorized(&headers, &state) {
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
@@ -96,7 +94,7 @@ async fn submit_setup(
 }
 
 async fn complete_setup(State(state): State<SetupState>, headers: HeaderMap) -> Response {
-    if !setup_cookie_authorized(&headers, &state) {
+    if !setup_token_authorized(&headers, &state) {
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(
@@ -146,7 +144,7 @@ fn setup_confirmed_body<'a>(config: &Config, message: &'a str) -> SetupConfirmed
 }
 
 async fn start_server(State(state): State<SetupState>, headers: HeaderMap) -> Response {
-    if !setup_cookie_authorized(&headers, &state) {
+    if !setup_token_authorized(&headers, &state) {
         return (
             StatusCode::UNAUTHORIZED,
             Html(page(

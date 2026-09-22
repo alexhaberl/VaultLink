@@ -1,5 +1,11 @@
 use super::*;
 
+// Linux openat2 accepts at most PATH_MAX - 1 bytes in its path argument.
+// Keep the complete storage-root-relative name below that bound so a
+// successfully published upload remains readable by its public Share.
+const MAX_UPLOAD_TARGET_PATH_BYTES: usize = 4095;
+const MAX_UPLOAD_FOLDER_COMPONENTS: usize = 16;
+
 fn public_multipart_read_rejection(
     token: &str,
     upload_subdir: &str,
@@ -198,12 +204,22 @@ impl<'a> PublicUploadParser<'a> {
                 "Invalid folder path",
             )
             .await?;
-        self.folder_path = Some(
-            crate::path_security::validate_relative(&value)
-                .map_err(|_| self.rejection(StatusCode::BAD_REQUEST, "Invalid folder path"))?
-                .to_string_lossy()
-                .replace('\\', "/"),
-        );
+        let folder_path = crate::path_security::validate_relative(&value)
+            .map_err(|_| self.rejection(StatusCode::BAD_REQUEST, "Invalid folder path"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let components: Vec<_> = folder_path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect();
+        if components.len() > MAX_UPLOAD_FOLDER_COMPONENTS
+            || components
+                .iter()
+                .any(|component| crate::path_security::safe_admin_filename(component).is_err())
+        {
+            return Err(self.rejection(StatusCode::BAD_REQUEST, "Invalid folder path"));
+        }
+        self.folder_path = Some(folder_path);
         Ok(())
     }
 
@@ -303,6 +319,13 @@ impl<'a> PublicUploadParser<'a> {
         let upload_base = self.upload_subdir.clone();
         let folder_path = self.folder_path.clone().unwrap_or_default();
         let upload_subdir = join_display(&upload_base, &folder_path);
+        let target_path = join_display(
+            &join_display(&self.share.relative_path, &upload_subdir),
+            &file_name,
+        );
+        if target_path.len() > MAX_UPLOAD_TARGET_PATH_BYTES {
+            return Err(self.rejection(StatusCode::BAD_REQUEST, "Upload path is too long"));
+        }
         let authorized_upload = self
             .authorized_upload
             .take()
