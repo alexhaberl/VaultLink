@@ -2,9 +2,10 @@
 
 ## 0.7.1 — 2026-09-22
 
-**Unreleased; target date only.** Publication requires fresh qualification of
-the final commit, including package/VM gates and the full 72-hour soak.
-See the [release checklist](docs/RELEASE-CHECKLIST-0.7.1.md).
+[Published release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1),
+qualified with all nine packages and distro VMs and the full 72-hour soak.
+See the [release checklist](docs/RELEASE-CHECKLIST-0.7.1.md) and
+[publication evidence](release/publication-0.7.1.json).
 
 - Include the rustls 0.23.45 handshake-validation fix for
   [GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc),

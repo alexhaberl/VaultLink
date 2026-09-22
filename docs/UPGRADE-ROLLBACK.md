@@ -1,17 +1,18 @@
 # Upgrade, backup, and rollback
 
-VaultLink 0.7.0 supports upgrades only between native packages for the exact
+VaultLink 0.7.1 supports upgrades only between native packages for the exact
 same distribution, release, and architecture. There is no supported adoption,
 upgrade, or migration path from the withdrawn 0.5.0 archive installation. A
 markerless or mismatched installation fails closed before package files or
 runtime state are changed.
 
-The supported 0.7.0 binary creates schema 10 and migrates supported schemas
+The supported 0.7.1 binary creates schema 10 and migrates supported schemas
 1 through 9 forward. The 9-to-10 step adds partial Share status indexes and
 expiry/ID indexes in an atomic `IMMEDIATE` transaction. A failed step leaves a
 valid schema-9 database, including its fingerprint and migration history.
-Older binaries cannot open schema 10. Rollback restores the matching pre-upgrade
-binary, configuration, database and keyring backup; never downgrade
+The 0.6.0 binary cannot open schema 10; both 0.7.0 and 0.7.1 use schema 10.
+Rollback restores the matching pre-upgrade binary, configuration, database
+and keyring backup; never downgrade
 `PRAGMA user_version` in an operational database.
 
 Share searches now require at least three Unicode characters after trimming;

@@ -4,17 +4,14 @@ VaultLink shares files from an existing Linux storage mount through download and
 upload links. Manage files in the web interface and let recipients open their
 links in a browser. Storage can be local or an existing SMB share.
 
-Status: `0.7.1` is unreleased development. The currently supported release is `v0.7.0`.
+Status: The currently supported release is `v0.7.1`.
 See the [changelog](CHANGELOG.md) and [release status](release/release-state.json).
-The target date for 0.7.1 is **2026-09-22**, subject to the
-[release checklist](docs/RELEASE-CHECKLIST-0.7.1.md), including fresh package and
-VM qualification and the full 72-hour soak. Version 0.6.0 is superseded and unsupported.
+Published on **2026-09-22** after package and VM qualification and the full
+72-hour soak. Versions 0.7.0 and 0.6.0 are superseded and unsupported.
 
-**Security update pending:** Published 0.7.0 packages contain rustls 0.23.41
-and omit the handshake-validation fix already present in the 0.7.1 source.
-See the [security notice](SECURITY.md#pending-tls-security-release).
-New deployments should wait for the patched release. Support and download
-links switch only after the new immutable packages have been published and verified.
+**Security update:** Install or upgrade to 0.7.1 for the rustls 0.23.45
+TLS handshake-validation fix. See the
+[security notice](SECURITY.md#tls-security-update-in-071).
 
 ## Screenshots
 
@@ -41,7 +38,7 @@ links switch only after the new immutable packages have been published and verif
   built-in TLS, including Let's Encrypt.
 
 These features, monitoring endpoints, service tokens, and GUI update controls
-are available in the supported 0.7.0 release.
+are available in the supported 0.7.1 release.
 
 ## Installation
 
@@ -55,11 +52,8 @@ SMB clients are only needed for optional direct access to an external SMB share.
 | Fedora 44 | x86_64, aarch64 | RPM |
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
-The following references describe the published packages and existing
-installations; the security notice above applies before any new deployment.
-
 1. The matching packages are recorded in the
-   [published 0.7.0 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.0).
+   [published 0.7.1 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1).
 2. Follow the [verification and installation instructions](docs/INSTALLATION.md#native-package-deployment)
    to verify both the signature and signed checksum before installing.
 3. Prepare the [storage mount and HTTPS configuration](docs/CONFIGURATION.md).
@@ -134,7 +128,7 @@ make run
 | [Package contract](docs/PACKAGING.md) | Package contents, target matrix, and build/release requirements |
 | [Threat model](THREAT_MODEL.md) | Trust boundaries, security invariants, and accepted risks |
 
-The supported 0.7.0 release uses database schema 10; the superseded 0.6.0 release
+The supported 0.7.1 release uses database schema 10; the superseded 0.6.0 release
 used schema 6. See [data and persistence](docs/INTERNALS.md#data-and-persistence)
 for migration details. Release evidence is linked from
 [release/release-state.json](release/release-state.json), including the supported
