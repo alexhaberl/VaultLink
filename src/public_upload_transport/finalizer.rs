@@ -17,6 +17,7 @@ enum FinalizerStep<T> {
 struct StoragePreflight {
     current_base: SecureDirectory,
     current_destination: Option<SecureDirectory>,
+    directories_to_create: u64,
     existed: bool,
 }
 
@@ -194,7 +195,8 @@ fn inspect_storage_target_blocking(
     })? {
         return Err(PublicUploadStoragePreflightError::Changed);
     }
-    let current_destination = bind_current_destination(upload, &current_base)?;
+    let (current_destination, directories_to_create) =
+        bind_current_destination(upload, &current_base)?;
     if !upload
         .expected_destination_matches(current_destination.as_ref())
         .map_err(|error| {
@@ -219,6 +221,7 @@ fn inspect_storage_target_blocking(
     Ok(StoragePreflight {
         current_base,
         current_destination,
+        directories_to_create,
         existed,
     })
 }
@@ -226,15 +229,22 @@ fn inspect_storage_target_blocking(
 fn bind_current_destination(
     upload: &PreparedUpload,
     current_base: &SecureDirectory,
-) -> std::result::Result<Option<SecureDirectory>, PublicUploadStoragePreflightError> {
+) -> std::result::Result<(Option<SecureDirectory>, u64), PublicUploadStoragePreflightError> {
     if upload.folder_path().is_empty() {
-        return Ok(Some(current_base.clone()));
+        return Ok((Some(current_base.clone()), 0));
     }
-    match current_base.bind_directory(upload.folder_path()) {
-        Ok(directory) => Ok(Some(directory)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(PublicUploadStoragePreflightError::Changed),
+    let components: Vec<_> = upload.folder_path().split('/').collect();
+    let mut directory = current_base.clone();
+    for (index, component) in components.iter().enumerate() {
+        match directory.bind_directory(component) {
+            Ok(child) => directory = child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((None, (components.len() - index) as u64));
+            }
+            Err(_) => return Err(PublicUploadStoragePreflightError::Changed),
+        }
     }
+    Ok((Some(directory), 0))
 }
 
 async fn finish_preflight(
@@ -295,6 +305,7 @@ async fn commit_upload(
             audit_context.clone(),
             context.allow_replace,
             context.replaced,
+            context.storage.directories_to_create,
             context.storage_guard,
         )
         .await?;
@@ -312,6 +323,13 @@ async fn commit_upload(
                 &context.upload_subdir,
                 StatusCode::GONE,
                 "Share was disabled during upload",
+            )));
+        }
+        PublicUploadCommit::DirectoryQuotaReached => {
+            return Ok(FinalizerStep::Complete(rejected(
+                &context.upload_subdir,
+                StatusCode::INSUFFICIENT_STORAGE,
+                "Maximum number of upload folders reached",
             )));
         }
     };

@@ -4,7 +4,7 @@ CREATE TABLE vaultlink_schema(
     fingerprint TEXT NOT NULL
 );
 INSERT INTO vaultlink_schema(singleton,fingerprint)
-VALUES(1,'vaultlink-schema-10-share-filter-indexes-2026-09-06');
+VALUES(1,'vaultlink-schema-11-public-upload-directory-quota-2026-09-23');
 
 CREATE TABLE vaultlink_schema_migrations(
     target_version INTEGER PRIMARY KEY CHECK(target_version > 0),
@@ -199,7 +199,8 @@ CREATE TABLE admin_totp_replay(
 CREATE TABLE public_upload_usage(
     share_id INTEGER PRIMARY KEY REFERENCES shares(id) ON DELETE CASCADE,
     uploaded_bytes INTEGER NOT NULL DEFAULT 0 CHECK(uploaded_bytes >= 0),
-    uploaded_files INTEGER NOT NULL DEFAULT 0 CHECK(uploaded_files >= 0)
+    uploaded_files INTEGER NOT NULL DEFAULT 0 CHECK(uploaded_files >= 0),
+    created_directories INTEGER NOT NULL DEFAULT 0 CHECK(created_directories >= 0)
 );
 CREATE TABLE public_upload_reservations(
     token_hash TEXT PRIMARY KEY,
@@ -290,15 +291,19 @@ fn initialize_empty_database(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.execute_batch(sql)?;
     }
     tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(9,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(10,?1)",
         [Utc::now().to_rfc3339()],
     )?;
     tx.execute(
-        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(9,?1)",
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(11,?1)",
         [Utc::now().to_rfc3339()],
     )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    validate_schema_10(&tx)?;
+    validate_schema_11(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }

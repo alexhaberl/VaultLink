@@ -18,6 +18,7 @@ for required_file in \
     "$asset_directory/app.js" \
     "$asset_directory/upload-queue.js" \
     "$asset_directory/setup.js" \
+    tools/test-upload-queue.mjs \
     "$css_linter"; do
     if [ ! -f "$required_file" ] || [ -L "$required_file" ]; then
         echo "web assets: missing or unsafe regular file: $required_file" >&2
@@ -32,6 +33,8 @@ for javascript_asset in \
     "$asset_directory/setup.js"; do
     node --check "$javascript_asset"
 done
+node --check tools/test-upload-queue.mjs
+node tools/test-upload-queue.mjs
 node "$css_linter" "$asset_directory/vaultlink.css"
 
 lint_fixture_directory=$(mktemp -d "${TMPDIR:-/tmp}/vaultlink-css-lint.XXXXXXXXXX")

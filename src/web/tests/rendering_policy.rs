@@ -576,6 +576,7 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("Dateien"), b"public").unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
     let state = test_state(root.path(), data.path());
     state
         .db()
@@ -607,6 +608,22 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
             &UploadConflictStrategy::Reject,
         )
         .unwrap();
+    state
+        .db()
+        .create_share(
+            "locale-upload",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
     let app = router(state);
     let routes = [
         ("/login", false),
@@ -618,6 +635,7 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
         ("/admin/settings", true),
         ("/admin/audit", true),
         ("/v/locale-public", false),
+        ("/v/locale-upload", false),
     ];
     let forbidden_static_german = [
         "Zum Inhalt springen",
@@ -680,6 +698,13 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
         );
         if uri == "/admin" || uri == "/v/locale-public" {
             assert!(html.contains("Dateien"), "user file name changed on {uri}");
+        }
+        if uri == "/admin" || uri == "/v/locale-upload" {
+            assert!(html.contains("data-upload-audit-warning"), "route {uri}");
+            assert!(
+                html.contains("Do not retry it; recovery will finish it safely."),
+                "route {uri}"
+            );
         }
         if uri == "/admin/admins" {
             assert!(html.contains("Abmelden"), "user name was translated");

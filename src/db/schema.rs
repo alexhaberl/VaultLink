@@ -1,7 +1,7 @@
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-pub(super) const SCHEMA_VERSION: i64 = 10;
+pub(super) const SCHEMA_VERSION: i64 = 11;
 pub(super) const SCHEMA_1_FINGERPRINT: &str = "vaultlink-schema-1-encrypted-secrets-2026-07-17";
 pub(super) const SCHEMA_2_FINGERPRINT: &str = "vaultlink-schema-2-migration-history-2026-07-17";
 pub(super) const SCHEMA_3_FINGERPRINT: &str = "vaultlink-schema-3-share-indexes-2026-07-17";
@@ -21,6 +21,8 @@ const PENDING_TRANSFER_INDEX_SQL: &str =
 
 pub(super) const SCHEMA_10_FINGERPRINT: &str =
     "vaultlink-schema-10-share-filter-indexes-2026-09-06";
+pub(super) const SCHEMA_11_FINGERPRINT: &str =
+    "vaultlink-schema-11-public-upload-directory-quota-2026-09-23";
 const SHARE_FILTER_INDEXES: [(&str, &str); 4] = [
     ("idx_shares_protected_id", "CREATE INDEX idx_shares_protected_id ON shares(id) WHERE password_hash IS NOT NULL"),
     ("idx_shares_limit_id", "CREATE INDEX idx_shares_limit_id ON shares(id) WHERE max_downloads IS NOT NULL AND download_count>=max_downloads"),
@@ -30,6 +32,7 @@ const SHARE_FILTER_INDEXES: [(&str, &str); 4] = [
 
 #[cfg(test)]
 thread_local! {
+    static FAIL_NEXT_SCHEMA_10_TO_11_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_SCHEMA_9_TO_10_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_SCHEMA_1_TO_2_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_SCHEMA_2_TO_3_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -62,6 +65,7 @@ pub(super) fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             7 => migrate_schema_7_to_8(conn)?,
             8 => migrate_schema_8_to_9(conn)?,
             9 => migrate_schema_9_to_10(conn)?,
+            10 => migrate_schema_10_to_11(conn)?,
             _ => return Err(schema_error("missing forward migration")),
         }
     }
@@ -74,7 +78,7 @@ pub(super) fn validate_current(conn: &Connection) -> rusqlite::Result<()> {
             "backup schema {version} does not match this VaultLink binary's schema {SCHEMA_VERSION}"
         )));
     }
-    validate_schema_10(conn)?;
+    validate_schema_11(conn)?;
     validate_database(conn)
 }
 
@@ -86,9 +90,47 @@ include!("schema/validation.rs");
 mod pending_index_tests {
     use super::*;
     #[test]
+    fn schema_eleven_migration_is_atomic_and_validates_directory_quota() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE public_upload_usage DROP COLUMN created_directories;
+             DELETE FROM vaultlink_schema_migrations WHERE target_version=11;
+             PRAGMA user_version=10;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE vaultlink_schema SET fingerprint=?1",
+            [SCHEMA_10_FINGERPRINT],
+        )
+        .unwrap();
+        FAIL_NEXT_SCHEMA_10_TO_11_MIGRATION.with(|flag| flag.set(true));
+        assert!(migrate(&mut conn).is_err());
+        validate_schema_10(&conn).unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM pragma_table_info('public_upload_usage') WHERE name='created_directories'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        migrate(&mut conn).unwrap();
+        validate_current(&conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE public_upload_usage DROP COLUMN created_directories;
+             ALTER TABLE public_upload_usage ADD COLUMN created_directories INTEGER NOT NULL DEFAULT 0;",
+        )
+        .unwrap();
+        assert!(validate_current(&conn).is_err());
+    }
+
+    #[test]
     fn schema_ten_migration_rolls_back_every_index_and_validates_shape() {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
+        conn.execute_batch("ALTER TABLE public_upload_usage DROP COLUMN created_directories; DELETE FROM vaultlink_schema_migrations WHERE target_version=11;").unwrap();
         for (name, _) in SHARE_FILTER_INDEXES {
             conn.execute_batch(&format!("DROP INDEX {name}")).unwrap();
         }
@@ -126,6 +168,8 @@ mod pending_index_tests {
     fn schema_nine_migration_is_atomic_and_validates_index() {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
+        conn.execute_batch("ALTER TABLE public_upload_usage DROP COLUMN created_directories;")
+            .unwrap();
         conn.execute_batch(
             "DROP INDEX idx_shares_protected_id;
              DROP INDEX idx_shares_limit_id;

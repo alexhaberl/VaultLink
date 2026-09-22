@@ -29,6 +29,8 @@
     const dropzone = form.querySelector("[data-upload-dropzone]");
     const submit = form.querySelector("[data-upload-submit]");
     const endpoint = form.dataset.queueEndpoint;
+    const auditWarningText = form.querySelector("[data-upload-audit-warning]")?.textContent?.trim() ||
+      "The file operation completed, but its audit durability is uncertain. Do not retry.";
     if (!(input instanceof HTMLInputElement) || input.type !== "file" || !input.name ||
         !(list instanceof HTMLElement) || !endpoint) return;
 
@@ -106,7 +108,8 @@
           actions.append(actionButton('<vl-i18n key="upload.retry"/>', () => { void retryItem(item); }, running));
         }
         actions.append(actionButton(
-          item.status === "success" ? '<vl-i18n key="upload.remove_list"/>' : '<vl-i18n key="common.remove"/>',
+          item.status === "success" || item.status === "warning"
+            ? '<vl-i18n key="upload.remove_list"/>' : '<vl-i18n key="common.remove"/>',
           () => removeItem(item),
           running || item.status === "uploading"
         ));
@@ -184,10 +187,14 @@
           throw new Error('<vl-i18n key="upload.invalid_response"/>');
         }
 
-        item.status = "success";
+        const warning = response.status === 202 ||
+          (typeof payload.warning === "string" && payload.warning.length > 0);
+        item.status = warning ? "warning" : "success";
         item.serverFile = payload.file;
         item.outcome = payload.outcome;
-        item.message = outcomeText(payload.outcome);
+        item.message = payload.warning === "audit_durability_uncertain"
+          ? auditWarningText
+          : warning ? '<vl-i18n key="upload.persist_pending"/>' : outcomeText(payload.outcome);
       } catch (error) {
         item.status = "error";
         item.message = error instanceof Error ? error.message : '<vl-i18n key="upload.failed"/>';
@@ -208,8 +215,11 @@
       render();
 
       const successful = queue.filter((item) => item.status === "success").length;
+      const warned = queue.filter((item) => item.status === "warning");
       const failed = queue.filter((item) => item.status === "error").length;
-      const result = [`${successful} <vl-i18n key="upload.successful"/>`];
+      const result = [];
+      if (successful > 0) result.push(`${successful} <vl-i18n key="upload.successful"/>`);
+      if (warned.length > 0) result.push(...new Set(warned.map((item) => item.message)));
       if (failed > 0) result.push(`${failed} <vl-i18n key="upload.failed_retry"/>`);
       setFeedback(result.join(", "));
     }
@@ -234,7 +244,9 @@
       if (running) return;
       const queue = items.filter((item) => item.status === "ready" || item.status === "error");
       if (queue.length === 0) {
-        setFeedback(items.some((item) => item.status === "success")
+        setFeedback(items.some((item) => item.status === "warning")
+          ? items.find((item) => item.status === "warning").message
+          : items.some((item) => item.status === "success")
           ? '<vl-i18n key="upload.already_done"/>'
           : '<vl-i18n key="upload.select_one"/>');
         input.focus();

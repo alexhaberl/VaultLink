@@ -1133,6 +1133,7 @@
   .vl-upload-input { max-width: 100%; }
   .vl-upload-queue { display: grid; gap: var(--vl-space-2); margin: var(--vl-space-4) 0; }
   .vl-upload-item { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: var(--vl-space-3); padding: var(--vl-space-3); border: 1px solid var(--vl-border); border-radius: var(--vl-radius-md); }
+  .vl-upload-item[data-state="warning"] { border-color: var(--vl-warning); }
 
   .vl-audit-layout, .vl-public-share-layout, .vl-create-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(18rem, .8fr); gap: var(--vl-space-5); align-items: start; }
   .vl-audit-layout { grid-template-columns: minmax(0, 3.4fr) minmax(17rem, .8fr); }
