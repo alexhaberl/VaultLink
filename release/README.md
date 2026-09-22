@@ -1,20 +1,23 @@
 # Release signing and immutable package inputs
 
 Lifecycle state and already-published evidence come exclusively from
-[`release-state.json`](release-state.json). Version 0.7.1 is unreleased, with
-2026-09-22 recorded as its target date. Version 0.7.0 remains the published
-supported release while the replacement is qualified; its packages omit the
-pending TLS fix described in [SECURITY.md](../SECURITY.md#pending-tls-security-release).
-Version 0.6.0 is superseded and unsupported, with its immutable evidence retained.
+[`release-state.json`](release-state.json). Version 0.7.1 is the supported
+immutable release, published on 2026-09-22 with the TLS fix described in
+[SECURITY.md](../SECURITY.md#tls-security-update-in-071). Its signed tag,
+public asset digests and final audit are recorded in
+[`publication-0.7.1.json`](publication-0.7.1.json).
+Versions 0.7.0 and 0.6.0 are superseded and unsupported, with their immutable
+evidence and signed packages retained for authenticated rollback.
 `development_version` identifies the checkout; `supported_version` changes only
 after verification of the newly published immutable release.
 
 The [0.7.1 checklist](../docs/RELEASE-CHECKLIST-0.7.1.md),
 [`qualification-0.7.1.json`](qualification-0.7.1.json), and independent
 [`qualification-findings-0.7.1.json`](qualification-findings-0.7.1.json) track
-the new candidate. Source-level closures carry forward the unchanged feature
-contracts; they do not reuse measured release evidence. QUAL-006 (final
-qualification) remains open until verified artifacts resolve it. The maintainer
+the frozen pre-publication candidate. Its original `unreleased` label and open
+QUAL-006 finding are preserved; the commit-bound evidence preflight and tag
+workflow resolved final qualification in their effective-qualification artifacts.
+The gate URLs are recorded in `release-state.json`. The maintainer
 retired the comparative 19-metric performance test for all releases from 0.7.0
 onward on 2026-09-17; QUAL-001 records that accepted decision, with no measured
 comparative pass. See the [performance policy](performance/README.md).

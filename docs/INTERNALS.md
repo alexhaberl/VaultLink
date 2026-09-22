@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-This reference describes the supported **0.7.0 release**. Schema and feature
+This reference describes the supported **0.7.1 release**. Schema and feature
 differences from the superseded **0.6.0** release are called out below.
 For supported versions and vulnerability reporting, see
 [Security Policy](../SECURITY.md).
@@ -99,7 +99,7 @@ reserved bytes. Authority and policy epoch are checked on extension and again
 before publication, including when an upload finishes inside its existing
 reservation. Ahead reservation never authorizes publication after revocation.
 
-The superseded 0.6.0 release uses schema 6. Fresh installations of the supported 0.7.0 release create schema 10 and version-2 through version-10 migration records. Valid schema-1 through schema-9 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, schema 8 adds normalized trigram Share search plus composite audit-pagination indexes, schema 9 adds an index for pending transfer cleanup, and schema 10 adds partial indexes for protected and exhausted Shares plus expiry indexes. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
+The superseded 0.6.0 release uses schema 6. Fresh installations of the supported 0.7.1 release create schema 10 and version-2 through version-10 migration records. Valid schema-1 through schema-9 databases are migrated through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, schema 8 adds normalized trigram Share search plus composite audit-pagination indexes, schema 9 adds an index for pending transfer cleanup, and schema 10 adds partial indexes for protected and exhausted Shares plus expiry indexes. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup.
 
 Concurrent filesystem renames can temporarily prevent a confined lookup.
 VaultLink retries that lookup at most eight times without weakening path

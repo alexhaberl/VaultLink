@@ -7,25 +7,28 @@ operational requirements, advisory exceptions, and vulnerability reporting.
 
 ## Supported versions
 
-Release line: `0.7.1` is unreleased development. The currently supported release is `0.7.0`. Its native packages cover Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Version `0.6.0` is superseded and no longer supported. The withdrawn `v0.5.0` archive remains unsupported; unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported. [`release/release-state.json`](release/release-state.json) is authoritative for lifecycle state and immutable release evidence.
+Release line: The currently supported release is `0.7.1`. Its native packages cover Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Versions `0.7.0` and `0.6.0` are superseded and no longer supported. The withdrawn `v0.5.0` archive remains unsupported; unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported. [`release/release-state.json`](release/release-state.json) is authoritative for lifecycle state and immutable release evidence.
 
-## Pending TLS security release
+## TLS security update in 0.7.1
+
+[VaultLink 0.7.1](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1)
+was published on 2026-09-22 from qualified commit
+`efdbea07d0e77f9bd89cbde7fd1a706055739e36`. Its immutable native packages
+include rustls 0.23.45 and rustls-webpki 0.103.15. Install 0.7.1 for new
+deployments and upgrade existing supported-platform native installations.
 
 The immutable 0.7.0 packages were built at `0af4612bd3c32a995b19de4cd19ca05ac4fd4855`
 with rustls 0.23.41. They do not contain the later fix in
 `5ed3535f95c741af031205c39825c7a2ce860ef0`, which updates rustls to 0.23.45 and
-rustls-webpki to 0.103.15. That fix is included in the unreleased 0.7.1 source.
+rustls-webpki to 0.103.15. That fix is included in the published 0.7.1 packages.
 [GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc)
 covers rustls 0.23.13 through 0.23.44 accepting TLS 1.3 handshake messages
 across encryption-level boundaries. The upstream description does not establish
 a denial-of-service or authentication bypass in VaultLink.
 
-New deployments should wait for the patched release, targeted for 2026-09-22
-subject to [qualification](docs/RELEASE-CHECKLIST-0.7.1.md). Existing operators
-should plan the verified native-package upgrade once it is published. The
-current support designation records the published release; it does not claim
-that its binaries contain this fix. The updater follows GitHub's latest stable
-release, so a documentation or manifest change alone cannot deliver the patch.
+The updater now discovers 0.7.1 through GitHub's latest stable release.
+Follow the [verified native-package upgrade](docs/UPGRADE-ROLLBACK.md);
+the update takes effect only after the new package is installed and activated.
 Retain historical signed packages for authenticated rollback; never replace
 0.7.0 assets or delete the entire release.
 

@@ -1,11 +1,10 @@
 # Native package support
 
-This document describes the **unreleased 0.7.1 candidate package contract**.
-The target date is 2026-09-22, subject to the
-[release checklist](RELEASE-CHECKLIST-0.7.1.md). The
-[installation guide](INSTALLATION.md) still documents the published 0.7.0
-packages and their pending security update. Candidate asset names below are
-build inputs, not published downloads.
+This document describes the **supported 0.7.1 package contract**.
+The immutable [release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1)
+was published on 2026-09-22 after completing the
+[release checklist](RELEASE-CHECKLIST-0.7.1.md). Use the
+[installation guide](INSTALLATION.md) to verify and install the signed packages.
 
 VaultLink releases are distributed only as native, signed operating-system
 packages. GitHub's automatically generated source archives are source material,
@@ -28,7 +27,7 @@ than repeat target lists in workflow YAML.
 | Fedora 44 | x86_64, aarch64 | RPM |
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
-For candidate version 0.7.1, the manifest defines these expected packages:
+For the published 0.7.1 release, the manifest defines these packages:
 
 | Target | Release asset |
 | --- | --- |

@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-This reference covers the supported **0.7.0** release. Monitoring and
+This reference covers the supported **0.7.1** release. Monitoring and
 service-token routes are new in **0.7.0** and are unavailable in the
 superseded **0.6.0** release. The Share-search change is marked separately.
 Health probes and the `/api/v2` prefix are already available in 0.6.0.
