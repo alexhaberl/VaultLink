@@ -25,6 +25,11 @@ thiserror-impl
 # macro crates still require syn 2. Remove once the proc-macro graph converges.
 syn
 
+# asn1-rs-derive 0.6 still requires synstructure 0.13, while yoke-derive 0.8.3
+# and zerofrom-derive 0.1.8 require 0.14. Remove once their macro dependencies
+# converge on one version.
+synstructure
+
 # The ACME/TLS dependency graph still spans two webpki-roots generations.
 # Re-evaluate after the next stable rustls-acme/rustls upgrade.
 webpki-roots
@@ -33,4 +38,3 @@ webpki-roots
 # compiled together on one host. Re-evaluate after their parent crates converge.
 hashbrown
 r-efi
-windows-sys
