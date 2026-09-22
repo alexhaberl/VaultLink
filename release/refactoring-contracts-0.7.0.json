@@ -101,7 +101,7 @@
         "src/i18n/messages.rs",
         "src/i18n/render.rs"
       ],
-      "sha256": "49211269f9835d732bd6a70b19a0914c092003bf8c714b6dc09c25a8d49f3b2b"
+      "sha256": "d4ed9d2ed0bc3da200b6fd03be0b29d35aced5da337e9831205e248c1235d904"
     },
     {
       "name": "service domain source bundle",

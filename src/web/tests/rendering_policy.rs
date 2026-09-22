@@ -704,7 +704,7 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
         if uri == "/admin" || uri == "/v/locale-upload" {
             assert!(html.contains("data-upload-audit-warning"), "route {uri}");
             assert!(
-                html.contains("The file was uploaded, but its audit record is uncertain. Do not retry; check the result manually."),
+                html.contains("The file was uploaded, but the durability of its storage or audit record is uncertain. Do not retry; check the result manually."),
                 "route {uri}"
             );
             assert!(html.contains("data-upload-response-warning"), "route {uri}");
@@ -724,7 +724,7 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
                 .map(|(content, _)| content)
                 .expect("upload warning notice");
             assert!(
-                notice.contains("The file was uploaded, but its audit record is uncertain. Do not retry; check the result manually."),
+                notice.contains("The file was uploaded, but the durability of its storage or audit record is uncertain. Do not retry; check the result manually."),
                 "upload notice on {uri}"
             );
             assert!(

@@ -30,7 +30,7 @@
     const submit = form.querySelector("[data-upload-submit]");
     const endpoint = form.dataset.queueEndpoint;
     const auditWarningText = form.querySelector("[data-upload-audit-warning]")?.textContent?.trim() ||
-      "The file was uploaded, but its audit record is uncertain. Do not retry; check the result manually.";
+      "The file was uploaded, but the durability of its storage or audit record is uncertain. Do not retry; check the result manually.";
     const responseWarningText = form.querySelector("[data-upload-response-warning]")?.textContent?.trim() ||
       "The server response was incomplete. The file may already have been uploaded. Do not retry; check the result manually.";
     if (!(input instanceof HTMLInputElement) || input.type !== "file" || !input.name ||

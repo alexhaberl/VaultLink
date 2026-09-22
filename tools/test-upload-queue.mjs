@@ -54,8 +54,9 @@ class FormData {
   append(name, value) { this.fields.set(name, value); }
 }
 
-const auditWarningText = "The file was uploaded, but its audit record is uncertain. Do not retry; check the result manually.";
+const auditWarningText = "The file was uploaded, but the durability of its storage or audit record is uncertain. Do not retry; check the result manually.";
 const responseWarningText = "The server response was incomplete. The file may already have been uploaded. Do not retry; check the result manually.";
+assert.match(auditWarningText, /storage or audit record/);
 const source = readFileSync("assets/web/upload-queue.js", "utf8");
 
 async function runScenario(name, json, expectedMessage) {
