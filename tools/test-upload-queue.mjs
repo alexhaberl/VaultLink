@@ -54,61 +54,68 @@ class FormData {
   append(name, value) { this.fields.set(name, value); }
 }
 
-const form = new Form();
-const input = new Input();
-const list = new Element();
-const submit = new Button();
-const auditWarning = new Element("span");
-auditWarning.textContent = "The file operation completed, but its audit durability is uncertain. Do not retry.";
-form.elementsBySelector.set("[data-upload-input]", input);
-form.elementsBySelector.set("[data-upload-list]", list);
-form.elementsBySelector.set("[data-upload-submit]", submit);
-form.elementsBySelector.set("[data-upload-audit-warning]", auditWarning);
+const auditWarningText = "The file was uploaded, but its audit record is uncertain. Do not retry; check the result manually.";
+const responseWarningText = "The server response was incomplete. The file may already have been uploaded. Do not retry; check the result manually.";
+const source = readFileSync("assets/web/upload-queue.js", "utf8");
 
-const document = {
-  readyState: "complete",
-  documentElement: { lang: "en" },
-  querySelectorAll: (selector) => selector === "form[data-upload-queue]" ? [form] : [],
-  createElement: (tag) => tag === "button" ? new Button() : new Element(tag),
-  createDocumentFragment: () => new Element("fragment")
-};
-let requestCount = 0;
-const fetch = async () => {
-  requestCount += 1;
-  return {
-    ok: true,
-    status: 202,
-    json: async () => ({
-      file: "empty.txt",
-      outcome: "created",
-      warning: "audit_durability_uncertain"
-    })
+async function runScenario(name, json, expectedMessage) {
+  const form = new Form();
+  const input = new Input();
+  const list = new Element();
+  const submit = new Button();
+  const auditWarning = new Element("span");
+  auditWarning.textContent = auditWarningText;
+  const responseWarning = new Element("span");
+  responseWarning.textContent = responseWarningText;
+  form.elementsBySelector.set("[data-upload-input]", input);
+  form.elementsBySelector.set("[data-upload-list]", list);
+  form.elementsBySelector.set("[data-upload-submit]", submit);
+  form.elementsBySelector.set("[data-upload-audit-warning]", auditWarning);
+  form.elementsBySelector.set("[data-upload-response-warning]", responseWarning);
+
+  const document = {
+    readyState: "complete",
+    documentElement: { lang: "en" },
+    querySelectorAll: (selector) => selector === "form[data-upload-queue]" ? [form] : [],
+    createElement: (tag) => tag === "button" ? new Button() : new Element(tag),
+    createDocumentFragment: () => new Element("fragment")
   };
-};
+  let requestCount = 0;
+  const fetch = async () => {
+    requestCount += 1;
+    return { ok: true, status: 202, json };
+  };
 
-runInNewContext(readFileSync("assets/web/upload-queue.js", "utf8"), {
-  document, fetch, console, File, FormData,
-  HTMLElement: Element, HTMLFormElement: Form,
-  HTMLInputElement: Input, HTMLButtonElement: Button
-});
+  runInNewContext(source, {
+    document, fetch, console, File, FormData,
+    HTMLElement: Element, HTMLFormElement: Form,
+    HTMLInputElement: Input, HTMLButtonElement: Button
+  });
 
-input.files = [new File("empty.txt")];
-input.dispatch("change");
-form.dispatch("submit", { preventDefault() {} });
-for (let attempt = 0; attempt < 20 && form.attributes.get("aria-busy") !== "false"; attempt += 1) {
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  input.files = [new File("empty.txt")];
+  input.dispatch("change");
+  form.dispatch("submit", { preventDefault() {} });
+  for (let attempt = 0; attempt < 20 && form.attributes.get("aria-busy") !== "false"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  assert.equal(requestCount, 1, name);
+  assert.equal(form.attributes.get("aria-busy"), "false", name);
+  assert.equal(list.children.length, 1, name);
+  assert.equal(list.children[0].dataset.state, "warning", name);
+  assert.ok(list.children[0].children[0].children[1].textContent.includes(expectedMessage), name);
+  assert.equal(list.after.textContent, expectedMessage, name);
+  assert.doesNotMatch(list.after.textContent, /vl-i18n|recovery will finish|upload\.successful/, name);
+  assert.equal(list.children[0].children[1].children.length, 1, `${name}: warning must not offer retry`);
+
+  form.dispatch("submit", { preventDefault() {} });
+  assert.equal(requestCount, 1, `${name}: warning must never be uploaded again automatically`);
 }
 
-assert.equal(requestCount, 1);
-assert.equal(form.attributes.get("aria-busy"), "false");
-assert.equal(list.children.length, 1);
-assert.equal(list.children[0].dataset.state, "warning");
-assert.match(list.children[0].children[0].children[1].textContent, /Do not retry/);
-assert.match(list.after.textContent, /Do not retry/);
-assert.doesNotMatch(list.after.textContent, /vl-i18n/);
-assert.doesNotMatch(list.after.textContent, /upload\.successful/);
-assert.equal(list.children[0].children[1].children.length, 1, "warning must not offer retry");
-
-form.dispatch("submit", { preventDefault() {} });
-assert.equal(requestCount, 1, "warning must never be uploaded again automatically");
-console.log("Upload queue retains HTTP 202 audit warnings without retry");
+await runScenario("valid audit warning", async () => ({
+  file: "empty.txt", outcome: "created", warning: "audit_durability_uncertain"
+}), auditWarningText);
+await runScenario("truncated JSON", async () => { throw new SyntaxError("Unexpected end of JSON input"); }, responseWarningText);
+await runScenario("incomplete JSON object", async () => ({ file: "empty.txt" }), responseWarningText);
+await runScenario("error envelope with accepted status", async () => ({ error: { code: "unknown" } }), responseWarningText);
+console.log("Upload queue keeps HTTP 202 responses in a warning state without retry");

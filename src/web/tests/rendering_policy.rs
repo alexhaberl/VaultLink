@@ -628,6 +628,7 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
     let routes = [
         ("/login", false),
         ("/admin", true),
+        ("/admin?notice=upload_audit_uncertain", true),
         ("/admin/account", true),
         ("/admin/shares", true),
         ("/admin/admins", true),
@@ -636,6 +637,7 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
         ("/admin/audit", true),
         ("/v/locale-public", false),
         ("/v/locale-upload", false),
+        ("/v/locale-upload?upload=audit_uncertain", false),
     ];
     let forbidden_static_german = [
         "Zum Inhalt springen",
@@ -702,7 +704,31 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
         if uri == "/admin" || uri == "/v/locale-upload" {
             assert!(html.contains("data-upload-audit-warning"), "route {uri}");
             assert!(
-                html.contains("Do not retry it; recovery will finish it safely."),
+                html.contains("The file was uploaded, but its audit record is uncertain. Do not retry; check the result manually."),
+                "route {uri}"
+            );
+            assert!(html.contains("data-upload-response-warning"), "route {uri}");
+            assert!(
+                html.contains(
+                    "The server response was incomplete. The file may already have been uploaded."
+                ),
+                "route {uri}"
+            );
+        }
+        if uri == "/admin?notice=upload_audit_uncertain"
+            || uri == "/v/locale-upload?upload=audit_uncertain"
+        {
+            let notice = html
+                .split_once("<p class=\"vl-notice\">")
+                .and_then(|(_, remainder)| remainder.split_once("</p>"))
+                .map(|(content, _)| content)
+                .expect("upload warning notice");
+            assert!(
+                notice.contains("The file was uploaded, but its audit record is uncertain. Do not retry; check the result manually."),
+                "upload notice on {uri}"
+            );
+            assert!(
+                !notice.contains("recovery will finish it safely"),
                 "route {uri}"
             );
         }

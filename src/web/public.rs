@@ -139,6 +139,7 @@ struct PublicShareTemplate {
     quota: Option<PublicQuotaView>,
     transport_label: &'static str,
     upload_notice: Option<&'static str>,
+    upload_notice_uncertain: bool,
     split_layout: bool,
     directory: Option<PublicDirectoryView>,
     file: Option<PublicFileView>,

@@ -344,6 +344,7 @@ fn admin_browser_notice(notice: Option<&str>) -> (Option<&'static str>, bool) {
         Some("path_deleted") => (Some("files.entry_deleted"), true),
         Some("path_delete_queued") => (Some("files.entry_removed_cleanup"), true),
         Some("audit_durability_uncertain") => (Some("files.audit_durability_uncertain"), false),
+        Some("upload_audit_uncertain") => (Some("upload.audit_uncertain"), false),
         Some("upload_ok") => (Some("files.uploaded"), true),
         _ => (None, false),
     }

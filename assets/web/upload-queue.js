@@ -30,7 +30,9 @@
     const submit = form.querySelector("[data-upload-submit]");
     const endpoint = form.dataset.queueEndpoint;
     const auditWarningText = form.querySelector("[data-upload-audit-warning]")?.textContent?.trim() ||
-      "The file operation completed, but its audit durability is uncertain. Do not retry.";
+      "The file was uploaded, but its audit record is uncertain. Do not retry; check the result manually.";
+    const responseWarningText = form.querySelector("[data-upload-response-warning]")?.textContent?.trim() ||
+      "The server response was incomplete. The file may already have been uploaded. Do not retry; check the result manually.";
     if (!(input instanceof HTMLInputElement) || input.type !== "file" || !input.name ||
         !(list instanceof HTMLElement) || !endpoint) return;
 
@@ -172,7 +174,21 @@
         try {
           payload = await response.json();
         } catch (_) {
+          if (response.status === 202) {
+            item.status = "warning";
+            item.message = responseWarningText;
+            render();
+            return;
+          }
           throw new Error(response.ok ? '<vl-i18n key="upload.invalid_response"/>' : `<vl-i18n key="upload.failed"/> (${response.status})`);
+        }
+
+        if (response.status === 202 &&
+            (!payload || payload.error || typeof payload.file !== "string" || typeof payload.outcome !== "string")) {
+          item.status = "warning";
+          item.message = responseWarningText;
+          render();
+          return;
         }
 
         if (!response.ok || (payload && payload.error)) {
@@ -194,7 +210,7 @@
         item.outcome = payload.outcome;
         item.message = payload.warning === "audit_durability_uncertain"
           ? auditWarningText
-          : warning ? '<vl-i18n key="upload.persist_pending"/>' : outcomeText(payload.outcome);
+          : warning ? responseWarningText : outcomeText(payload.outcome);
       } catch (error) {
         item.status = "error";
         item.message = error instanceof Error ? error.message : '<vl-i18n key="upload.failed"/>';

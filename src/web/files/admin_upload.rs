@@ -322,7 +322,7 @@ pub(super) async fn admin_upload(
     let mut response = Redirect::to(&browser_redirect(
         &success.directory,
         if success.audit_durability_uncertain {
-            "audit_durability_uncertain"
+            "upload_audit_uncertain"
         } else {
             "upload_ok"
         },

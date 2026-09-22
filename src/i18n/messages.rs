@@ -388,6 +388,8 @@ catalog! {
     REPLACED, "upload.replaced", "Ersetzt", "Replaced";
     UPLOAD_PERSIST_PENDING, "upload.persist_pending", "Hochgeladen – Persistenzbestätigung ausstehend", "Uploaded – persistence confirmation pending";
     REPLACE_PERSIST_PENDING, "upload.replace_pending", "Ersetzt – Persistenzbestätigung ausstehend", "Replaced – persistence confirmation pending";
+    UPLOAD_AUDIT_UNCERTAIN, "upload.audit_uncertain", "Die Datei wurde hochgeladen, aber ihre Audit-Aufzeichnung ist unklar. Nicht erneut hochladen; den Zustand manuell prüfen.", "The file was uploaded, but its audit record is uncertain. Do not retry; check the result manually.";
+    UPLOAD_RESPONSE_UNCERTAIN, "upload.response_uncertain", "Die Serverantwort war unvollständig. Die Datei kann bereits hochgeladen sein. Nicht erneut hochladen; den Zustand manuell prüfen.", "The server response was incomplete. The file may already have been uploaded. Do not retry; check the result manually.";
     INVALID_SERVER_RESPONSE, "upload.invalid_response", "Ungültige Serverantwort", "Invalid server response";
     UPLOAD_FAILED, "upload.failed", "Upload fehlgeschlagen", "Upload failed";
     SUCCESSFUL, "upload.successful", "erfolgreich", "successful";
