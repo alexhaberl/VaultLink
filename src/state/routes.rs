@@ -300,6 +300,10 @@ impl RouteState<FileRoutes> {
         FileService::new(self.inner.clone())
     }
 
+    pub(crate) fn request_storage_cleanup(&self) {
+        self.inner.storage_cleanup().request_cleanup();
+    }
+
     #[cfg(test)]
     pub(crate) fn take_upload_directory_sync_failure_for_test(&self) -> Option<std::io::ErrorKind> {
         self.inner.take_upload_directory_sync_failure_for_test()

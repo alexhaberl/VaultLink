@@ -5,6 +5,7 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::Instrument as _;
 
@@ -34,8 +35,9 @@ use test_support::{upload_blocking_phase_test_checkpoint, upload_phase_test_chec
 use crate::{
     auth,
     db::{
-        AuditAction, AuditContext, Share, UploadReservationBeginOutcome,
-        UploadReservationCommitOutcome, UploadReservationExtendOutcome,
+        AuditAction, AuditContext, Share, UploadOperationClaim, UploadOperationScope,
+        UploadOperationView, UploadReservationBeginOutcome, UploadReservationCommitOutcome,
+        UploadReservationExtendOutcome,
     },
     file_ops,
     http_auth::{
@@ -63,7 +65,71 @@ use crate::{
     AppState,
 };
 
-const MAX_UPLOAD_MULTIPART_FIELDS: usize = 5;
+pub(crate) async fn create_public_upload_operation(
+    state: &AppState,
+    headers: &HeaderMap,
+    token: &str,
+) -> Result<Option<(String, String)>> {
+    let share = authorized_upload_share(state, headers, token).await?;
+    if let Some(expected) = share_unlock_csrf(state, headers, &share).await? {
+        let supplied = headers
+            .get("x-vaultlink-upload-csrf")
+            .and_then(|value| value.to_str().ok());
+        if !supplied.is_some_and(|value| auth::constant_time_eq(&expected, value)) {
+            return Err(AppError::new(
+                StatusCode::FORBIDDEN,
+                "Invalid upload CSRF proof",
+            ));
+        }
+    }
+    let share_id = share.id;
+    Ok(database(state.db().clone(), move |db| {
+        db.create_upload_operation(UploadOperationScope::Share(share_id))
+    })
+    .await?)
+}
+
+pub(crate) async fn public_upload_operation(
+    state: &AppState,
+    headers: &HeaderMap,
+    token: &str,
+    id: &str,
+) -> Result<Option<UploadOperationView>> {
+    let share = authorized_upload_share(state, headers, token).await?;
+    let share_id = share.id;
+    let id = id.to_owned();
+    Ok(database(state.db().clone(), move |db| {
+        db.upload_operation(UploadOperationScope::Share(share_id), &id)
+    })
+    .await?)
+}
+
+pub(crate) async fn preflight_upload_authorization(
+    state: &AppState,
+    headers: &HeaderMap,
+    token: &str,
+) -> Result<()> {
+    authorized_upload_share(state, headers, token)
+        .await
+        .map(|_| ())
+}
+
+async fn authorized_upload_share(
+    state: &AppState,
+    headers: &HeaderMap,
+    token: &str,
+) -> Result<Share> {
+    let share = get_share(state, token).await?;
+    if !share_is_unlocked(state, headers, &share).await? {
+        return Err(AppError::new(StatusCode::UNAUTHORIZED, "Share is locked"));
+    }
+    if !share.is_directory || !share.permission.can_upload() {
+        return Err(AppError::new(StatusCode::FORBIDDEN, "Upload not allowed"));
+    }
+    Ok(share)
+}
+
+const MAX_UPLOAD_MULTIPART_FIELDS: usize = 6;
 const UPLOAD_QUOTA_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
@@ -253,6 +319,24 @@ impl PublicUploadRejection {
     pub(crate) const fn message(&self) -> &'static str {
         self.message
     }
+
+    pub(crate) fn reason_code(&self) -> &'static str {
+        match self.message {
+            "Share changed during upload" => "share_changed",
+            "Upload target changed during upload" => "target_changed",
+            "File already exists." => "file_exists",
+            "Upload reservation has expired" => "reservation_expired",
+            "Share was disabled during upload" | "Share unavailable" => "share_unavailable",
+            "Maximum number of upload folders reached" => "directory_quota_exceeded",
+            "Not enough free storage" => "storage_full",
+            "Storage capacity could not be determined" => "storage_capacity_unavailable",
+            "Upload is too large" => "upload_too_large",
+            "Cumulative upload limit reached" => "byte_quota_exceeded",
+            "Maximum number of uploaded files reached" => "file_quota_exceeded",
+            "Target folder unavailable" => "target_unavailable",
+            _ => "upload_rejected",
+        }
+    }
 }
 
 pub(crate) enum PublicUploadOutcome {
@@ -317,6 +401,7 @@ struct StagedUpload {
     reservation: UploadQuotaReservation,
     target: PublicUploadTarget,
     admission: PublicUploadAdmission,
+    digest: Sha256,
 }
 
 fn map_staged_file_error(
@@ -437,6 +522,7 @@ impl StagedUpload {
             reservation,
             target,
             admission,
+            digest: Sha256::new(),
         })
     }
 
@@ -514,7 +600,9 @@ impl StagedUpload {
         self.file
             .write_chunk(state, maximum, &chunk)
             .await
-            .map_err(|error| map_staged_file_error(token, &self.target.upload_subdir, error))
+            .map_err(|error| map_staged_file_error(token, &self.target.upload_subdir, error))?;
+        self.digest.update(&chunk);
+        Ok(())
     }
 
     async fn finish_staging(&mut self, token: &str) -> PublicUploadPhaseResult<()> {
@@ -541,6 +629,7 @@ impl StagedUpload {
             reservation,
             target,
             admission,
+            digest,
         } = self;
         let (pending, total) = file.into_parts();
         PreparedUpload {
@@ -550,6 +639,7 @@ impl StagedUpload {
             intent,
             total,
             admission,
+            content_sha256: data_encoding::HEXLOWER.encode(digest.finalize().as_ref()),
         }
     }
 }
@@ -565,6 +655,7 @@ struct PreparedUpload {
     intent: PublicUploadIntent,
     total: u64,
     admission: PublicUploadAdmission,
+    content_sha256: String,
 }
 
 enum PublicUploadCommit {
@@ -574,6 +665,12 @@ enum PublicUploadCommit {
     DirectoryQuotaReached,
 }
 
+struct UploadCommitRecord {
+    database: crate::db::Database,
+    audit_context: AuditContext,
+    operation_hash: String,
+}
+
 struct CommittedUpload {
     pending: PendingUpload,
     target: PublicUploadTarget,
@@ -581,7 +678,6 @@ struct CommittedUpload {
     replace: bool,
     replaced: bool,
     admission: PublicUploadAdmission,
-    storage_guard: crate::storage_authority::StorageMutationGuard,
 }
 
 struct PublishedUpload {
@@ -593,6 +689,18 @@ struct PublishedUpload {
 }
 
 impl PreparedUpload {
+    fn fingerprint(&self) -> String {
+        let metadata = serde_json::to_vec(&(
+            &self.target.file_name,
+            &self.target.upload_base,
+            &self.target.folder_path,
+            self.intent.overwrite_requested,
+            self.total,
+            &self.content_sha256,
+        ))
+        .expect("upload fingerprint metadata is serializable");
+        data_encoding::HEXLOWER.encode(Sha256::digest(metadata).as_ref())
+    }
     fn share_id(&self) -> i64 {
         self.target.share_id
     }
@@ -649,21 +757,21 @@ impl PreparedUpload {
 
     async fn commit(
         self,
-        database_handle: crate::db::Database,
-        audit_context: AuditContext,
+        record: UploadCommitRecord,
         replace: bool,
         replaced: bool,
         directories_to_create: u64,
-        storage_guard: crate::storage_authority::StorageMutationGuard,
+        storage_guard: crate::upload_operation::UploadStorageGuard,
     ) -> Result<PublicUploadCommit> {
         let reservation_token = self.reservation.token().to_string();
         let total = self.total;
-        let quota_commit = required_audited_transfer_database(database_handle, move |database| {
+        let quota_commit = required_audited_transfer_database(record.database, move |database| {
             database.commit_upload_reservation_and_audit_audited(
                 &reservation_token,
                 total,
                 directories_to_create,
-                &audit_context,
+                &record.audit_context,
+                &record.operation_hash,
             )
         })
         .await?;
@@ -685,7 +793,6 @@ impl PreparedUpload {
                     replace,
                     replaced,
                     admission,
-                    storage_guard,
                 })))
             }
             UploadReservationCommitOutcome::NotFound => {
@@ -720,8 +827,8 @@ impl CommittedUpload {
         self,
     ) -> std::result::Result<std::io::Result<PublishedUpload>, tokio::task::JoinError> {
         tokio::task::spawn_blocking(move || {
-            // Publication owns the storage guard. Dropping the HTTP request or
-            // finalizer JoinHandle cannot release serialization mid-rename.
+            // The finalizer retains the storage guard through the durable
+            // result write; dropping the HTTP request cannot release it.
             let Self {
                 mut pending,
                 target,
@@ -729,7 +836,6 @@ impl CommittedUpload {
                 replace,
                 replaced,
                 admission,
-                storage_guard,
             } = self;
             let outcome = if replace {
                 pending.publish_replace(&target.file_name)
@@ -743,7 +849,6 @@ impl CommittedUpload {
                 outcome,
                 _admission: admission,
             };
-            storage_guard.finish_clean();
             Ok(published)
         })
         .await
@@ -777,150 +882,4 @@ struct PublicUploadAdmission {
     _share: ShareActivityPermit,
 }
 
-pub(crate) async fn execute_public_upload(
-    state: AppState,
-    headers: &HeaderMap,
-    token: String,
-    multipart: Multipart,
-) -> Result<PublicUploadOutcome> {
-    let share = get_share(&state, &token).await?;
-    if !share_is_unlocked(&state, headers, &share).await? {
-        return Err(AppError::new(StatusCode::UNAUTHORIZED, "Share is locked"));
-    }
-    if !share.is_directory || !share.permission.can_upload() {
-        return Err(AppError::new(StatusCode::FORBIDDEN, "Upload not allowed"));
-    }
-    let required_csrf = share_unlock_csrf(&state, headers, &share).await?;
-    if share.password_hash.is_some() && required_csrf.is_none() {
-        return Err(AppError::new(StatusCode::UNAUTHORIZED, "Share is locked"));
-    }
-
-    let expected_id = share.id;
-    let (share, storage_guard) = get_storage_share(&state, &token, expected_id).await?;
-    if !share_is_unlocked(&state, headers, &share).await? {
-        return Err(AppError::new(StatusCode::UNAUTHORIZED, "Share is locked"));
-    }
-    if !share.is_directory || !share.permission.can_upload() {
-        return Err(AppError::new(StatusCode::FORBIDDEN, "Upload not allowed"));
-    }
-    let required_csrf = share_unlock_csrf(&state, headers, &share).await?;
-    if share.password_hash.is_some() && required_csrf.is_none() {
-        return Err(AppError::new(StatusCode::UNAUTHORIZED, "Share is locked"));
-    }
-    let csrf_header_valid = required_csrf.as_deref().is_some_and(|expected| {
-        headers
-            .get("x-vaultlink-upload-csrf")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| auth::constant_time_eq(expected, value))
-    });
-
-    let public_upload_permit = state.try_acquire_public_upload().map_err(|_| {
-        AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent public uploads",
-        )
-    })?;
-    let upload_permit = state.try_acquire_upload().map_err(|_| {
-        AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent uploads",
-        )
-    })?;
-    let upload_peer_permit = state
-        .try_acquire_upload_peer(current_client_limit_key())
-        .ok_or(AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent uploads from this client",
-        ))?;
-    let upload_share_permit = state
-        .try_acquire_upload_share(share.id)
-        .ok_or(AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent uploads for this share",
-        ))?;
-    let authorized_upload = AuthorizedUpload::new(PublicUploadAdmission {
-        _public: public_upload_permit,
-        _upload: upload_permit,
-        _peer: upload_peer_permit,
-        _share: upload_share_permit,
-    });
-    let secure_root = state.secure_root().clone();
-    let share_path = share.relative_path.clone();
-    let share_scope = tokio::task::spawn_blocking(move || {
-        // The capability open can block on remote storage. Retain namespace
-        // authority in the detached blocking task if the HTTP request is
-        // cancelled, then release it as soon as the descriptor is bound.
-        let _storage_guard = storage_guard;
-        secure_root.bind_directory(&share_path)
-    })
-    .await
-    .map_err(|error| {
-        AppError::from(report_internal(
-            InternalOperation::WebPublicUploadBindDestination,
-            error,
-        ))
-    })?
-    .map_err(|_| AppError::new(StatusCode::NOT_FOUND, "Target folder unavailable"))?;
-    // The descriptor remains bound to the revalidated directory, so a long
-    // request body cannot block admin namespace operations.
-
-    let settings = runtime_settings(&state);
-    let maximum = share
-        .max_upload_size
-        .unwrap_or(settings.max_upload_size)
-        .min(crate::config::MAX_UPLOAD_SIZE);
-    if let Some(length) = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        match storage_has_room(&state, length).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(rejected(
-                    "",
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "Not enough free storage",
-                ))
-            }
-            Err(_) => {
-                return Ok(rejected(
-                    "",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Storage capacity could not be determined",
-                ))
-            }
-        }
-    }
-
-    let form_phase = PublicUploadFormPhase {
-        state: &state,
-        token: &token,
-        share: &share,
-        share_scope,
-        settings: &settings,
-        maximum,
-        required_csrf: required_csrf.as_deref(),
-        csrf_header_valid,
-        authorized_upload,
-    };
-    let upload = match form_phase.run(multipart).await {
-        Ok(upload) => upload,
-        Err(PublicUploadPhaseError::Rejection(rejection)) => {
-            return Ok(PublicUploadOutcome::Rejected(rejection))
-        }
-        Err(PublicUploadPhaseError::App(error)) => return Err(error),
-    };
-
-    let audit_client_ip = current_audit_client_ip();
-    let locale = i18n::current_locale();
-    let return_to = i18n::current_return_to();
-    let audit_context = AuditContext::new("public", enabled_audit_client_ip(&state));
-    let finalizer = PublicUploadFinalizer {
-        state,
-        token,
-        upload,
-        audit_context,
-    };
-    run_public_upload_finalizer(finalizer, audit_client_ip, locale, return_to).await
-}
+include!("execute.rs");

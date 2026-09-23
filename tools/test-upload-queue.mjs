@@ -26,6 +26,7 @@ class Form extends Element {
     super("form");
     this.dataset.uploadQueue = "";
     this.dataset.queueEndpoint = "/v/example/upload/queue";
+    this.dataset.operationEndpoint = "/v/example/upload/operations";
     this.elementsBySelector = new Map();
   }
 
@@ -56,22 +57,34 @@ class FormData {
 
 const auditWarningText = "The file was uploaded, but the durability of its storage or audit record is uncertain. Do not retry; check the result manually.";
 const responseWarningText = "The server response was incomplete. The file may already have been uploaded. Do not retry; check the result manually.";
+const storageWarningText = "The file was uploaded, but the durability of its storage is uncertain. Do not retry; check the result manually.";
+const auditOnlyWarningText = "The file was uploaded, but the durability of its audit record is uncertain. Do not retry; check the result manually.";
+const directoryWarningText = "The upload folder may have been created only partially. The file was not uploaded. Check the result manually.";
 assert.match(auditWarningText, /storage or audit record/);
 const source = readFileSync("assets/web/upload-queue.js", "utf8");
 
-async function runScenario(name, json, expectedMessage) {
+async function runScenario(name, status, json, expectedMessage, statusResult = null) {
   const form = new Form();
   const input = new Input();
   const list = new Element();
   const submit = new Button();
   const auditWarning = new Element("span");
   auditWarning.textContent = auditWarningText;
+  const storageWarning = new Element("span");
+  storageWarning.textContent = storageWarningText;
+  const auditOnlyWarning = new Element("span");
+  auditOnlyWarning.textContent = auditOnlyWarningText;
+  const directoryWarning = new Element("span");
+  directoryWarning.textContent = directoryWarningText;
   const responseWarning = new Element("span");
   responseWarning.textContent = responseWarningText;
   form.elementsBySelector.set("[data-upload-input]", input);
   form.elementsBySelector.set("[data-upload-list]", list);
   form.elementsBySelector.set("[data-upload-submit]", submit);
   form.elementsBySelector.set("[data-upload-audit-warning]", auditWarning);
+  form.elementsBySelector.set("[data-upload-storage-warning]", storageWarning);
+  form.elementsBySelector.set("[data-upload-audit-only-warning]", auditOnlyWarning);
+  form.elementsBySelector.set("[data-upload-directory-warning]", directoryWarning);
   form.elementsBySelector.set("[data-upload-response-warning]", responseWarning);
 
   const document = {
@@ -82,9 +95,20 @@ async function runScenario(name, json, expectedMessage) {
     createDocumentFragment: () => new Element("fragment")
   };
   let requestCount = 0;
-  const fetch = async () => {
+  const fetch = async (url, options) => {
     requestCount += 1;
-    return { ok: true, status: 202, json };
+    if (url === form.dataset.operationEndpoint) {
+      assert.equal(options.method, "POST", name);
+      return { ok: true, status: 201, json: async () => ({
+        upload_id: "a".repeat(43), status_url: `${url}/${"a".repeat(43)}`
+      }) };
+    }
+    if (url.startsWith(`${form.dataset.operationEndpoint}/`)) {
+      assert.equal(options.method, "GET", name);
+      return { ok: true, status: 200, json: async () => ({ state: "completed", result: statusResult }) };
+    }
+    assert.equal(options.headers["Idempotency-Key"], "a".repeat(43), name);
+    return { ok: true, status, json };
   };
 
   runInNewContext(source, {
@@ -100,7 +124,7 @@ async function runScenario(name, json, expectedMessage) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 
-  assert.equal(requestCount, 1, name);
+  assert.equal(requestCount, statusResult ? 3 : 2, name);
   assert.equal(form.attributes.get("aria-busy"), "false", name);
   assert.equal(list.children.length, 1, name);
   assert.equal(list.children[0].dataset.state, "warning", name);
@@ -110,13 +134,29 @@ async function runScenario(name, json, expectedMessage) {
   assert.equal(list.children[0].children[1].children.length, 1, `${name}: warning must not offer retry`);
 
   form.dispatch("submit", { preventDefault() {} });
-  assert.equal(requestCount, 1, `${name}: warning must never be uploaded again automatically`);
+  assert.equal(requestCount, statusResult ? 3 : 2, `${name}: warning must never be uploaded again automatically`);
 }
 
-await runScenario("valid audit warning", async () => ({
-  file: "empty.txt", outcome: "created", warning: "audit_durability_uncertain"
+await runScenario("valid audit warning", 202, async () => ({
+  file: "empty.txt", outcome: "created", warning: "audit_durability_uncertain", warnings: ["audit_durability_uncertain"]
+}), auditOnlyWarningText);
+await runScenario("storage warning at 200", 200, async () => ({
+  file: "empty.txt", outcome: "created_uncertain", warning: "audit_durability_uncertain", warnings: ["storage_durability_uncertain"]
+}), storageWarningText);
+await runScenario("audit warning at 202", 202, async () => ({
+  file: "empty.txt", outcome: "created", warning: "audit_durability_uncertain", warnings: ["audit_durability_uncertain"]
+}), auditOnlyWarningText);
+await runScenario("combined warning", 202, async () => ({
+  file: "empty.txt", outcome: "created_uncertain", warning: "audit_durability_uncertain", warnings: ["storage_durability_uncertain", "audit_durability_uncertain"]
 }), auditWarningText);
-await runScenario("truncated JSON", async () => { throw new SyntaxError("Unexpected end of JSON input"); }, responseWarningText);
-await runScenario("incomplete JSON object", async () => ({ file: "empty.txt" }), responseWarningText);
-await runScenario("error envelope with accepted status", async () => ({ error: { code: "unknown" } }), responseWarningText);
-console.log("Upload queue keeps HTTP 202 responses in a warning state without retry");
+await runScenario("partial directory", 202, async () => ({
+  file: "empty.txt", outcome: "directory_uncertain", warning: "audit_durability_uncertain", warnings: ["storage_durability_uncertain"]
+}), directoryWarningText);
+const storedAudit = { file: "empty.txt", outcome: "created", warning: "audit_durability_uncertain", warnings: ["audit_durability_uncertain"] };
+await runScenario("truncated JSON", 202, async () => { throw new SyntaxError("Unexpected end of JSON input"); }, auditOnlyWarningText, storedAudit);
+await runScenario("incomplete JSON object", 202, async () => ({ file: "empty.txt" }), auditOnlyWarningText, storedAudit);
+await runScenario("error envelope with accepted status", 202, async () => ({ error: { code: "unknown" } }), auditOnlyWarningText, storedAudit);
+await runScenario("contradictory warning fields", 200, async () => ({
+  file: "empty.txt", outcome: "created", warning: "audit_durability_uncertain", warnings: []
+}), auditOnlyWarningText, storedAudit);
+console.log("Upload queue issues one ID per file and resolves uncertain responses via status");

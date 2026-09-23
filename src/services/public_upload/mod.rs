@@ -14,6 +14,17 @@ pub(crate) enum UploadDisposition {
 }
 
 impl UploadDisposition {
+    pub(crate) fn from_outcome(outcome: &str) -> Option<Self> {
+        match outcome {
+            "created" => Some(Self::Created),
+            "created_uncertain" => Some(Self::CreatedUncertain),
+            "replaced" => Some(Self::Replaced),
+            "replaced_uncertain" => Some(Self::ReplacedUncertain),
+            "directory_uncertain" => Some(Self::DirectoryUncertain),
+            _ => None,
+        }
+    }
+
     pub(crate) const fn outcome(self) -> &'static str {
         match self {
             Self::Created => "created",
@@ -51,6 +62,25 @@ pub(crate) struct PublicUploadSuccess {
 }
 
 impl PublicUploadSuccess {
+    pub(crate) fn from_receipt(receipt: &serde_json::Value) -> Option<Self> {
+        let file = receipt.get("file")?.as_str()?.to_owned();
+        let upload_subdir = receipt.get("upload_subdir")?.as_str()?.to_owned();
+        let disposition = UploadDisposition::from_outcome(receipt.get("outcome")?.as_str()?)?;
+        let warnings = receipt
+            .get("warnings")
+            .and_then(serde_json::Value::as_array);
+        let audit_durability_uncertain = warnings
+            .into_iter()
+            .flatten()
+            .any(|warning| warning.as_str() == Some("audit_durability_uncertain"));
+        Some(Self::new(
+            file,
+            upload_subdir,
+            disposition,
+            audit_durability_uncertain,
+        ))
+    }
+
     pub(crate) fn new(
         file: String,
         upload_subdir: String,
@@ -79,6 +109,13 @@ impl PublicUploadSuccess {
 
     pub(crate) const fn audit_durability_uncertain(&self) -> bool {
         self.audit_durability_uncertain
+    }
+
+    pub(crate) const fn warnings(&self) -> crate::services::upload::UploadWarnings {
+        crate::services::upload::UploadWarnings {
+            storage: self.disposition.storage_durability_uncertain(),
+            audit: self.audit_durability_uncertain,
+        }
     }
 }
 

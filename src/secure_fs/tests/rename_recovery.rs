@@ -529,3 +529,30 @@ fn cleanup_skips_a_live_pending_upload() {
         b"active"
     );
 }
+#[test]
+fn upload_operation_fragment_survives_drop_and_protected_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = SecureRoot::open(directory.path()).unwrap();
+    let mut pending = root.begin_staged_upload().unwrap();
+    let name = pending.fragment_name().to_owned();
+    pending
+        .take_file()
+        .unwrap()
+        .write_all(b"operation evidence")
+        .unwrap();
+    pending.retain_for_upload_operation();
+    drop(pending);
+    let staging = directory
+        .path()
+        .join(INTERNAL_DIRECTORY_NAME)
+        .join(UPLOAD_STAGING_DIRECTORY_NAME)
+        .join(&name);
+    assert!(staging.is_file());
+    let mut protected = root.start_upload_fragment_cleanup().unwrap();
+    protected.protect_upload_fragments(std::collections::HashSet::from([name]));
+    while !protected.run_batch(100).unwrap().complete {}
+    assert!(staging.is_file());
+    let mut expired = root.start_upload_fragment_cleanup().unwrap();
+    while !expired.run_batch(100).unwrap().complete {}
+    assert!(!staging.exists());
+}

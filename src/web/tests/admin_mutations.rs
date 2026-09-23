@@ -45,6 +45,7 @@ async fn stale_session_cookies_use_revoked_contract_but_missing_cookie_stays_una
     state.db().verify_mfa("queue-stale-session").unwrap();
     state.db().delete_session("queue-stale-session").unwrap();
     let mut queue = admin_multipart_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "queue-stale-csrf",
@@ -282,6 +283,7 @@ async fn cancelled_authorized_to_staged_admin_upload_releases_every_phase_owner(
     state.db().verify_mfa("cancelled-staging-session").unwrap();
 
     let (request, sender) = controlled_admin_multipart_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "cancelled-staging-csrf",
@@ -356,6 +358,7 @@ async fn cancelled_admin_upload_retains_fence_resources_until_revocation_commits
     // the upload through Prepared into the detached finalizer; acquiring the
     // namespace fence below proves that finalizer reached Committed.
     let (upload, sender) = controlled_admin_multipart_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "cancelled-admin-upload-csrf",
@@ -363,15 +366,41 @@ async fn cancelled_admin_upload_retains_fence_resources_until_revocation_commits
         "cancelled-finalizer.txt",
         b"must never be published",
     );
+    let operation_hash = crate::db::token_hash(
+        upload
+            .headers()
+            .get("idempotency-key")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    );
     let app = router(state.clone());
     let upload = tokio::spawn(async move { app.oneshot(upload).await.unwrap() });
     wait_for_upload_fragment(root.path()).await;
     let initial_storage_guard = state.acquire_storage_test_exclusive().await;
+    finish_controlled_multipart(sender).await;
+    let observer = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let phase: String = observer
+                .query_row(
+                    "SELECT state FROM upload_operations WHERE id_hash=?1",
+                    [&operation_hash],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if phase == "committing" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upload must durably enter committing before publication");
     let mut writer = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
     let writer = writer
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
-    finish_controlled_multipart(sender).await;
     drop(initial_storage_guard);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while state.try_acquire_storage_test_exclusive().is_ok() {
@@ -451,6 +480,7 @@ async fn cancelled_folder_creation_retains_permits_proof_and_fence_until_commit(
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     state.install_upload_directory_creation_barrier_for_test((entered_sender, release_receiver));
     let mut upload = admin_folder_upload_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "cancelled-folder-csrf",
@@ -509,10 +539,15 @@ async fn cancelled_folder_creation_retains_permits_proof_and_fence_until_commit(
         .path()
         .join("uploads/committed/despite-cancellation")
         .is_dir());
-    assert!(!root
+    let published = root
         .path()
         .join("uploads/committed/despite-cancellation/never-staged.txt")
-        .exists());
+        .exists();
+    assert_eq!(
+        state.db().count_audit(Some("admin_upload")).unwrap(),
+        usize::from(published),
+        "publication and its audit must agree after the revocation race"
+    );
     assert_eq!(
         state
             .db()
@@ -559,6 +594,7 @@ async fn revoked_admin_folder_upload_creates_no_directory_or_success_audit() {
         .unwrap();
     let storage_guard = state.acquire_storage_test_exclusive().await;
     let mut upload = admin_folder_upload_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "revoked-folder-upload-csrf",
@@ -622,6 +658,7 @@ async fn streamed_admin_upload_keeps_storage_and_sqlite_writer_sections_short() 
         .unwrap();
     let content = vec![b's'; 128 * 1024];
     let (request, sender) = controlled_admin_multipart_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "streamed-admin-upload-csrf",

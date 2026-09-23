@@ -133,6 +133,13 @@ fuzz_target!(|input: &[u8]| {
                 raw.extend_from_slice(path_header);
                 raw.extend_from_slice(format!("\r\n\r\ndocs\r\n--{boundary}\r\n").as_bytes());
                 expected_fields.push(("path".into(), None, b"docs".to_vec()));
+                if control(0) & 8 != 0 {
+                    raw.extend_from_slice(b"Content-Disposition: form-data; name=\"upload_id\"");
+                    raw.extend_from_slice(
+                        format!("\r\n\r\nid-before-file\r\n--{boundary}\r\n").as_bytes(),
+                    );
+                    expected_fields.push(("upload_id".into(), None, b"id-before-file".to_vec()));
+                }
             }
             raw.extend_from_slice(header);
             let mut header_len = header.len();

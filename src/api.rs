@@ -67,6 +67,7 @@ struct ApiError {
     code: &'static str,
     message: &'static str,
     retry_after_seconds: Option<u64>,
+    status_url: Option<String>,
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -108,6 +109,7 @@ impl ApiError {
             code,
             message,
             retry_after_seconds: None,
+            status_url: None,
         }
     }
     fn storage_busy() -> Self {
@@ -265,6 +267,8 @@ impl IntoResponse for ApiError {
         #[derive(Serialize)]
         struct ErrorBody {
             error: ErrorObject,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            status_url: Option<String>,
         }
         #[derive(Serialize)]
         struct ErrorObject {
@@ -278,6 +282,7 @@ impl IntoResponse for ApiError {
                     code: self.code,
                     message: self.message,
                 },
+                status_url: self.status_url,
             }),
         )
             .into_response();
@@ -410,6 +415,12 @@ crate::declare_routes! {
         DefaultBodyLimit::max(crate::http_contract::HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize),
         middleware::from_fn(guard_api_multipart_upload),
     ];
+    "/public/shares/{token}/upload/operations" {
+        POST => public_upload::create_operation, [ShareCapability, None, Header, Required, None, Upload];
+    }
+    "/public/shares/{token}/upload/operations/{upload_id}" {
+        GET => public_upload::operation_status, [ShareCapability, None, None, Observation, None, ReadOnly];
+    }
 }
 
 pub fn router(state: AppState) -> Router<AppState> {

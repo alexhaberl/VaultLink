@@ -334,6 +334,12 @@ crate::declare_routes! {
         DefaultBodyLimit::max(HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize),
         middleware::from_fn(guard_multipart_upload),
     ];
+    "/admin/files/upload/operations" {
+        POST => files::create_admin_upload_operation, [AdminSession, MutationContext, Header, Required, None, Upload];
+    }
+    "/admin/files/upload/operations/{upload_id}" {
+        GET => files::admin_upload_operation_status, [AdminSession, None, None, Observation, None, ReadOnly];
+    }
     "/admin/files/rename" {
         POST => files::rename_file_ui, [AdminSession, MutationContext, FormField, Required, Form, Storage];
     }
@@ -443,6 +449,12 @@ crate::declare_routes! {
         DefaultBodyLimit::max(HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize),
         middleware::from_fn(guard_multipart_upload),
     ];
+    "/v/{token}/upload/operations" {
+        POST => upload::create_operation, [ShareCapability, None, Header, Required, None, Upload];
+    }
+    "/v/{token}/upload/operations/{upload_id}" {
+        GET => upload::operation_status, [ShareCapability, None, None, Observation, None, ReadOnly];
+    }
     "/s/{alias}" {
         GET => public::short_redirect, [Public, None, None, Observation, None, ReadOnly];
     }

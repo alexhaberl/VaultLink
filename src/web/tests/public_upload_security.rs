@@ -30,6 +30,7 @@ async fn public_upload_directory_quota_counts_across_zero_byte_uploads() {
         let response = app
             .clone()
             .oneshot(public_folder_upload_request(
+                &state,
                 "/v/directory-quota-upload/upload/queue",
                 "",
                 &folder,
@@ -50,6 +51,7 @@ async fn public_upload_directory_quota_counts_across_zero_byte_uploads() {
     let response = app
         .clone()
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/directory-quota-upload/upload/queue",
             "",
             denied_folder,
@@ -80,7 +82,7 @@ async fn public_upload_directory_quota_counts_across_zero_byte_uploads() {
 
     // Existing directories remain usable when no new directory is needed.
     let response = app
-        .oneshot(public_folder_upload_request(
+        .oneshot(public_folder_upload_request(&state,
             "/v/directory-quota-upload/upload/queue",
             "",
             "group-0-0/group-0-1/group-0-2/group-0-3/group-0-4/group-0-5/group-0-6/group-0-7/group-0-8/group-0-9/group-0-10/group-0-11/group-0-12/group-0-13/group-0-14/group-0-15",
@@ -122,6 +124,7 @@ async fn public_upload_rejects_unreadable_or_excessively_deep_targets_before_sta
     let response = app
         .clone()
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/bounded-upload/upload/queue",
             "",
             &long_folder,
@@ -137,6 +140,7 @@ async fn public_upload_rejects_unreadable_or_excessively_deep_targets_before_sta
     let response = app
         .clone()
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/bounded-upload/upload/queue",
             "",
             &deep_folder,
@@ -159,6 +163,7 @@ async fn public_upload_rejects_unreadable_or_excessively_deep_targets_before_sta
     let valid = app
         .clone()
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/bounded-upload/upload/queue",
             "",
             "a/b",
@@ -214,6 +219,7 @@ async fn public_upload_audit_identifies_the_full_share_relative_target() {
         let response = app
             .clone()
             .oneshot(public_folder_upload_request(
+                &state,
                 "/v/path-audit-upload/upload/queue",
                 "",
                 folder,
@@ -273,6 +279,7 @@ async fn public_upload_reports_audit_uncertainty_when_created_directory_audit_fa
         .unwrap();
     let response = router(state.clone())
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/directory-audit-upload/upload/queue",
             "",
             "new",

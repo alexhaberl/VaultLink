@@ -54,6 +54,9 @@ struct DatabaseInner {
     // shutdown without creating one waiting blocking worker per dropped owner.
     // One shared FIFO is drained by at most one blocking worker per database.
     transfer_cleanup_queue: Mutex<TransferCleanupQueue>,
+    // In-process finalizers are excluded when storage recovery reconciles
+    // abandoned receipts; startup begins with an empty set.
+    active_upload_operations: Mutex<std::collections::HashSet<String>>,
     keyring: keyring::Keyring,
     session_idle_minutes: AtomicI64,
     // Keep the descriptor behind /proc/self/fd alive for the whole connection

@@ -203,6 +203,7 @@ impl Database {
             audit_retention_admission: Mutex::new(()),
             transfer_write_admission: Mutex::new(()),
             transfer_cleanup_queue: Mutex::new(TransferCleanupQueue::default()),
+            active_upload_operations: Mutex::new(std::collections::HashSet::new()),
             keyring,
             session_idle_minutes: AtomicI64::new(30),
             _directory_capability: directory_capability,

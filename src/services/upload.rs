@@ -10,6 +10,47 @@ use crate::{secure_fs::PendingUpload, AppState};
 const STORAGE_RESERVE_BYTES: u64 = 64 * 1_000_000;
 static UPLOAD_BYTES_RESERVED: AtomicU64 = AtomicU64::new(0);
 
+/// Precise causes retained alongside the historical aggregate upload warning.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UploadWarnings {
+    pub(crate) storage: bool,
+    pub(crate) audit: bool,
+}
+
+impl UploadWarnings {
+    pub(crate) const fn any(self) -> bool {
+        self.storage || self.audit
+    }
+
+    pub(crate) fn codes(self) -> Vec<&'static str> {
+        let mut codes = Vec::with_capacity(2);
+        if self.storage {
+            codes.push("storage_durability_uncertain");
+        }
+        if self.audit {
+            codes.push("audit_durability_uncertain");
+        }
+        codes
+    }
+
+    pub(crate) const fn legacy_code(self) -> Option<&'static str> {
+        if self.any() {
+            Some("audit_durability_uncertain")
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn header(self) -> &'static str {
+        match (self.storage, self.audit) {
+            (true, true) => "storage_durability_uncertain,audit_durability_uncertain",
+            (true, false) => "storage_durability_uncertain",
+            (false, true) => "audit_durability_uncertain",
+            (false, false) => "",
+        }
+    }
+}
+
 pub(crate) async fn storage_has_room(
     state: &(impl Borrow<AppState> + ?Sized),
     needed: u64,
@@ -177,5 +218,29 @@ impl StagedUploadFile {
     pub(crate) fn into_parts(self) -> (PendingUpload, u64) {
         debug_assert!(self.output.is_none());
         (self.pending, self.total)
+    }
+}
+
+#[cfg(test)]
+mod warning_tests {
+    use super::UploadWarnings;
+
+    #[test]
+    fn warning_causes_keep_storage_before_audit_and_legacy_aggregate() {
+        let both = UploadWarnings {
+            storage: true,
+            audit: true,
+        };
+        assert_eq!(
+            both.codes(),
+            ["storage_durability_uncertain", "audit_durability_uncertain"]
+        );
+        assert_eq!(both.legacy_code(), Some("audit_durability_uncertain"));
+        assert_eq!(
+            both.header(),
+            "storage_durability_uncertain,audit_durability_uncertain"
+        );
+        assert!(UploadWarnings::default().codes().is_empty());
+        assert_eq!(UploadWarnings::default().legacy_code(), None);
     }
 }

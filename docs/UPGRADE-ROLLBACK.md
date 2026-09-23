@@ -15,6 +15,13 @@ Rollback restores the matching pre-upgrade binary, configuration, database
 and keyring backup; never downgrade
 `PRAGMA user_version` in an operational database.
 
+The upcoming upload-ID change advances the development schema from 11 to 12 in
+the same deployment that makes preissued upload IDs mandatory. Older clients
+must request a fresh ID before each logical upload. To return to a binary that
+supports only schema 11 or earlier, restore its matching database and keyring
+backup taken before the schema-12 migration. Changing the version pragma or
+dropping the operation table is not a rollback procedure.
+
 Share searches now require at least three Unicode characters after trimming;
 empty searches still list all matching Shares. A shorter nonempty search returns
 HTTP 400 in HTML and API v2. The HTML form preserves the input and explains how

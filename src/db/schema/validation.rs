@@ -243,6 +243,11 @@ fn validate_schema_11(conn: &Connection) -> rusqlite::Result<()> {
     validate_fingerprint(conn, SCHEMA_11_FINGERPRINT)?;
     validate_pending_transfer_index(conn)?;
     validate_share_filter_indexes(conn, 11)?;
+    validate_directory_quota_column(conn)?;
+    validate_indexed_schema(conn, 11)
+}
+
+fn validate_directory_quota_column(conn: &Connection) -> rusqlite::Result<()> {
     let columns = conn
         .prepare(
             "SELECT name,\"notnull\",dflt_value FROM pragma_table_info('public_upload_usage')
@@ -269,7 +274,52 @@ fn validate_schema_11(conn: &Connection) -> rusqlite::Result<()> {
     if !normalize_schema_sql(&table_sql).contains("check(created_directories >= 0)") {
         return Err(schema_error("schema 11 directory quota check is missing"));
     }
-    validate_indexed_schema(conn, 11)
+    Ok(())
+}
+
+fn validate_schema_12(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_12_FINGERPRINT)?;
+    validate_pending_transfer_index(conn)?;
+    validate_share_filter_indexes(conn, 12)?;
+    validate_directory_quota_column(conn)?;
+    let table: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='upload_operations'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let table = table.ok_or_else(|| schema_error("schema 12 upload operation table is missing"))?;
+    let expected = "CREATE TABLE upload_operations(
+        id_hash TEXT PRIMARY KEY,
+        scope_kind TEXT NOT NULL CHECK(scope_kind IN ('admin','share')),
+        scope_id INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('ready','processing','retryable','committing','completed','rejected','outcome_unknown')),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        fingerprint TEXT,
+        result_json TEXT,
+        fragment_name TEXT,
+        quota_charged INTEGER NOT NULL DEFAULT 0 CHECK(quota_charged IN (0,1)),
+        CHECK(scope_id > 0)
+    )";
+    if normalize_schema_sql(&table) != normalize_schema_sql(expected) {
+        return Err(schema_error("schema 12 upload operation table is invalid"));
+    }
+    for (name, expected) in [
+        ("idx_upload_operations_scope", "CREATE INDEX idx_upload_operations_scope ON upload_operations(scope_kind,scope_id,state)"),
+        ("idx_upload_operations_exp", "CREATE INDEX idx_upload_operations_exp ON upload_operations(expires_at)"),
+    ] {
+        let actual: Option<String> = conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
+            [name],
+            |row| row.get(0),
+        ).optional()?;
+        if actual.as_deref().map(normalize_schema_sql) != Some(normalize_schema_sql(expected)) {
+            return Err(schema_error("schema 12 upload operation index is missing or invalid"));
+        }
+    }
+    validate_indexed_schema(conn, 12)
 }
 
 fn validate_share_filter_indexes(conn: &Connection, version: i64) -> rusqlite::Result<()> {

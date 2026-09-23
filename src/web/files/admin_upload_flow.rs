@@ -4,9 +4,11 @@ struct AdminUploadParser {
     overwrite_existing: bool,
     saw_overwrite: bool,
     folder_path: Option<String>,
-    directory_durability_uncertain: bool,
+    directory_warnings: crate::services::upload::UploadWarnings,
     staged: Option<StagedAdminUpload>,
     fields_seen: usize,
+    upload_id: String,
+    id_seen: bool,
     authorization: Option<AuthorizedAdminUpload>,
 }
 
@@ -20,9 +22,12 @@ struct StagedAdminUpload {
     pending: PendingUpload,
     name: String,
     total: u64,
+    content_sha256: String,
     directory: String,
+    base: String,
+    folder_path: String,
     overwrite_existing: bool,
-    directory_durability_uncertain: bool,
+    directory_warnings: crate::services::upload::UploadWarnings,
     permits: AdminUploadPermits,
 }
 
@@ -31,16 +36,19 @@ struct PreparedAdminUpload {
     pending: PendingUpload,
     name: String,
     total: u64,
+    content_sha256: String,
     directory: String,
+    base: String,
+    folder_path: String,
     overwrite_existing: bool,
-    directory_durability_uncertain: bool,
+    directory_warnings: crate::services::upload::UploadWarnings,
     permits: AdminUploadPermits,
 }
 
 #[must_use = "a committed admin upload owns the namespace fence until publication finishes"]
 struct CommittedAdminUpload {
     upload: PreparedAdminUpload,
-    storage_guard: crate::storage_authority::StorageMutationGuard,
+    storage_guard: crate::upload_operation::UploadStorageGuard,
     existed: bool,
 }
 
@@ -51,7 +59,7 @@ struct PublishedAdminUpload {
     replaced: bool,
     durability_uncertain: bool,
     audit_uncertain: bool,
-    directory_durability_uncertain: bool,
+    directory_warnings: crate::services::upload::UploadWarnings,
 }
 
 fn admin_multipart_read_error(
@@ -76,28 +84,112 @@ fn admin_multipart_text_error(
 }
 
 impl AdminUploadParser {
-    fn new(authorization: AuthorizedAdminUpload) -> Self {
+    fn new(authorization: AuthorizedAdminUpload, upload_id: String) -> Self {
         Self {
             directory: None,
             csrf_seen: false,
             overwrite_existing: false,
             saw_overwrite: false,
             folder_path: None,
-            directory_durability_uncertain: false,
+            directory_warnings: Default::default(),
             staged: None,
             fields_seen: 0,
+            upload_id,
+            id_seen: false,
             authorization: Some(authorization),
         }
     }
 
     fn record_field(&mut self) -> Result<()> {
         self.fields_seen += 1;
-        if self.fields_seen > 5 {
+        if self.fields_seen > 6 {
             return Err(AppError(
                 StatusCode::BAD_REQUEST,
                 "Too many multipart fields",
             ));
         }
+        Ok(())
+    }
+
+    fn handle_prefix(
+        &mut self,
+        state: &FileRouteState,
+        admin: &crate::db::Session,
+        field: crate::upload_operation::UploadPrefixField,
+    ) -> Result<()> {
+        use crate::upload_operation::UploadPrefixKind;
+        match field.kind {
+            UploadPrefixKind::Id => {
+                if self.id_seen || !crate::auth::constant_time_eq(&field.value, &self.upload_id) {
+                    return Err(AppError(StatusCode::BAD_REQUEST, "Upload IDs disagree"));
+                }
+                self.id_seen = true;
+            }
+            UploadPrefixKind::Path | UploadPrefixKind::FolderPath => {
+                let message = if field.kind == UploadPrefixKind::Path {
+                    "Invalid upload path"
+                } else {
+                    "Invalid folder path"
+                };
+                let path = path_security::validate_relative(&field.value)
+                    .map_err(|_| AppError(StatusCode::BAD_REQUEST, message))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let slot = if field.kind == UploadPrefixKind::Path {
+                    &mut self.directory
+                } else {
+                    &mut self.folder_path
+                };
+                if slot.replace(path).is_some() {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "Upload path was submitted more than once",
+                    ));
+                }
+            }
+            UploadPrefixKind::Overwrite => {
+                if std::mem::replace(&mut self.saw_overwrite, true) {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "Upload option was submitted more than once",
+                    ));
+                }
+                self.overwrite_existing = field.value == "1";
+                if self.overwrite_existing && !state.config().storage.replacements_allowed() {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "Overwriting is disabled with external storage writers",
+                    ));
+                }
+            }
+            UploadPrefixKind::Csrf => {
+                if self.csrf_seen {
+                    return Err(AppError(
+                        StatusCode::BAD_REQUEST,
+                        "CSRF proof was submitted more than once",
+                    ));
+                }
+                csrf(admin, &field.value)?;
+                self.csrf_seen = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn upload_id_field(&mut self, field: axum::extract::multipart::Field<'_>) -> Result<()> {
+        if self.id_seen || self.staged.is_some() {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                "Upload ID was submitted more than once or too late",
+            ));
+        }
+        let value = limited_multipart_text(field, 64)
+            .await
+            .map_err(|error| admin_multipart_text_error(error.as_ref(), "Invalid upload ID"))?;
+        if !crate::auth::constant_time_eq(&value, &self.upload_id) {
+            return Err(AppError(StatusCode::BAD_REQUEST, "Upload IDs disagree"));
+        }
+        self.id_seen = true;
         Ok(())
     }
 
@@ -172,7 +264,7 @@ impl AdminUploadParser {
     async fn file_field(
         &mut self,
         state: &FileRouteState,
-        admin: &crate::db::Session,
+        _admin: &crate::db::Session,
         field: axum::extract::multipart::Field<'_>,
         settings: &crate::runtime::RuntimeSettings,
     ) -> Result<()> {
@@ -192,30 +284,28 @@ impl AdminUploadParser {
                 "CSRF proof must be submitted before the file",
             ));
         }
-        let mut authorization = self
+        let authorization = self
             .authorization
             .take()
             .expect("parser owns authorization until the file field is staged");
-        let target = if let Some(folder_path) = self.folder_path.clone() {
-            let (next, target, uncertain) = authorization
-                .ensure_directory(state, &base, &folder_path, &admin.username)
-                .await?;
-            authorization = next;
-            self.directory_durability_uncertain |= uncertain;
-            target
+        let folder_path = self.folder_path.clone().unwrap_or_default();
+        let target = if folder_path.is_empty() {
+            base.clone()
         } else {
-            base
+            join_display(&base, &folder_path)
         };
         self.staged = Some(
             authorization
                 .stage(
                     state,
                     target,
+                    base,
+                    folder_path,
                     field,
                     settings.max_upload_size,
                     &settings.blocked_extensions,
                     self.overwrite_existing,
-                    self.directory_durability_uncertain,
+                    self.directory_warnings,
                 )
                 .await?,
         );
@@ -237,44 +327,31 @@ impl AdminUploadParser {
 }
 
 impl AuthorizedAdminUpload {
-    async fn ensure_directory(
-        self,
-        state: &FileRouteState,
-        base: &str,
-        relative: &str,
-        actor: &str,
-    ) -> Result<(Self, String, bool)> {
-        let AdminUploadPermits {
-            global,
-            peer,
-            proof,
-        } = self.permits;
-        let (target, durability_uncertain, permits) =
-            ensure_admin_upload_directory(state, proof, base, relative, actor, global, peer)
-                .await?;
-        Ok((Self { permits }, target, durability_uncertain))
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn stage(
         self,
         state: &FileRouteState,
         directory: String,
+        base: String,
+        folder_path: String,
         field: axum::extract::multipart::Field<'_>,
         maximum: u64,
         blocked_extensions: &[String],
         overwrite_existing: bool,
-        directory_durability_uncertain: bool,
+        directory_warnings: crate::services::upload::UploadWarnings,
     ) -> Result<StagedAdminUpload> {
-        let (pending, name, total) =
+        let (pending, name, total, content_sha256) =
             stage_admin_upload(state, &directory, field, maximum, blocked_extensions).await?;
         Ok(StagedAdminUpload {
             pending,
             name,
             total,
+            content_sha256,
             directory,
+            base,
+            folder_path,
             overwrite_existing,
-            directory_durability_uncertain,
+            directory_warnings,
             permits: self.permits,
         })
     }
@@ -286,27 +363,48 @@ impl StagedAdminUpload {
             pending,
             name,
             total,
+            content_sha256,
             directory,
+            base,
+            folder_path,
             overwrite_existing,
-            directory_durability_uncertain,
+            directory_warnings,
             permits,
         } = self;
         PreparedAdminUpload {
             pending,
             name,
             total,
+            content_sha256,
             directory,
+            base,
+            folder_path,
             overwrite_existing,
-            directory_durability_uncertain,
+            directory_warnings,
             permits,
         }
     }
 }
 
 impl PreparedAdminUpload {
+    fn fingerprint(&self) -> String {
+        use sha2::Digest as _;
+        let metadata = serde_json::to_vec(&(
+            &self.name,
+            &self.directory,
+            self.overwrite_existing,
+            self.total,
+            &self.content_sha256,
+        ))
+        .expect("admin upload fingerprint metadata is serializable");
+        data_encoding::HEXLOWER.encode(sha2::Sha256::digest(metadata).as_ref())
+    }
+}
+
+impl PreparedAdminUpload {
     fn commit(
         self,
-        storage_guard: crate::storage_authority::StorageMutationGuard,
+        storage_guard: crate::upload_operation::UploadStorageGuard,
         existed: bool,
     ) -> CommittedAdminUpload {
         CommittedAdminUpload {
@@ -381,9 +479,15 @@ async fn parse_admin_upload(
     admin: &crate::db::Session,
     mut multipart: Multipart,
     authorization: AuthorizedAdminUpload,
+    upload_id: String,
+    prefix: Vec<crate::upload_operation::UploadPrefixField>,
 ) -> Result<PreparedAdminUpload> {
     let settings = runtime_settings(state);
-    let mut parser = AdminUploadParser::new(authorization);
+    let mut parser = AdminUploadParser::new(authorization, upload_id);
+    for field in prefix {
+        parser.record_field()?;
+        parser.handle_prefix(state, admin, field)?;
+    }
     while let Some(field) = multipart
         .next_field()
         .await
@@ -392,6 +496,7 @@ async fn parse_admin_upload(
         parser.record_field()?;
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
+            "upload_id" => parser.upload_id_field(field).await?,
             "path" => parser.path_field(field).await?,
             "csrf" => parser.csrf_field(admin, field).await?,
             "overwrite_existing" => parser.overwrite_field(state, field).await?,
@@ -401,35 +506,6 @@ async fn parse_admin_upload(
         }
     }
     parser.finish()
-}
-
-pub(super) async fn process_admin_upload(
-    state: &FileRouteState,
-    headers: &HeaderMap,
-    multipart: Multipart,
-) -> Result<AdminUploadSuccess> {
-    let authorization = mfa_session(state, headers, MissingSession::RedirectToLogin).await?;
-    let (admin, proof) = authorization.into_parts();
-    let authorization = AuthorizedAdminUpload {
-        permits: acquire_admin_upload_permits(state, headers, proof).await?,
-    };
-    let mut upload = parse_admin_upload(state, &admin, multipart, authorization).await?;
-    apply_admin_upload_test_fault(state, &mut upload);
-    let audit_client_ip = current_audit_client_ip();
-    let audit_context = AuditContext::new(admin.username, enabled_audit_client_ip(state));
-    let task_state = state.clone();
-    let finalizer = tokio::spawn(
-        with_audit_client_ip(audit_client_ip, async move {
-            finalize_admin_upload(&task_state, upload, audit_context).await
-        })
-        .instrument(tracing::Span::current()),
-    );
-    finalizer.await.map_err(|error| {
-        AppError::from(report_internal(
-            InternalOperation::WebAdminUploadFinalizerJoin,
-            error,
-        ))
-    })?
 }
 
 #[cfg(test)]
@@ -444,25 +520,94 @@ fn apply_admin_upload_test_fault(_state: &FileRouteState, _upload: &mut Prepared
 
 async fn finalize_admin_upload(
     state: &FileRouteState,
-    upload: PreparedAdminUpload,
+    mut upload: PreparedAdminUpload,
     audit_context: AuditContext,
-) -> Result<AdminUploadSuccess> {
-    let committed = commit_admin_upload(state, upload).await?;
-    let publication = publish_admin_upload(state, committed, audit_context).await?;
-    finish_admin_upload(publication)
+    operation_guard: &crate::upload_operation::UploadStorageGuard,
+) -> (Result<AdminUploadSuccess>, bool) {
+    let permits = upload.permits;
+    let directory_result = ensure_admin_upload_directory(
+        state,
+        &upload.base,
+        &upload.folder_path,
+        &audit_context.actor,
+        permits,
+        operation_guard,
+    )
+    .await;
+    let (directory, warnings, permits, complete, created) = match directory_result {
+        Ok(value) => value,
+        Err(error) => {
+            let retryable = matches!(
+                error,
+                AppError(StatusCode::UNAUTHORIZED, ADMIN_UPLOAD_SESSION_REVOKED)
+            );
+            return (Err(error), retryable);
+        }
+    };
+    upload.directory = directory;
+    upload.directory_warnings = warnings;
+    upload.permits = permits;
+    if !complete {
+        return (
+            Ok(AdminUploadSuccess {
+                file: upload.name,
+                disposition: UploadDisposition::DirectoryUncertain,
+                directory: upload.directory,
+                audit_durability_uncertain: warnings.audit,
+                warnings,
+            }),
+            false,
+        );
+    }
+    let committed = match commit_admin_upload(state, upload, operation_guard).await {
+        Ok(value) => value,
+        Err(error) => return (Err(error), false),
+    };
+    let publication = match publish_admin_upload(state, committed, audit_context).await {
+        Ok(value) => value,
+        Err(error) => {
+            let retryable = !created
+                && matches!(
+                    error,
+                    AppError(StatusCode::UNAUTHORIZED, ADMIN_UPLOAD_SESSION_REVOKED)
+                );
+            return (Err(error), retryable);
+        }
+    };
+    (finish_admin_upload(publication), false)
 }
 
 async fn commit_admin_upload(
     state: &FileRouteState,
-    upload: PreparedAdminUpload,
+    mut upload: PreparedAdminUpload,
+    operation_guard: &crate::upload_operation::UploadStorageGuard,
 ) -> Result<CommittedAdminUpload> {
-    let storage_guard = file_ops::acquire_storage_mutation(state)
-        .await
-        .map_err(storage_recovery_app_error)?;
+    if !operation_guard.is_held() {
+        let guard = file_ops::acquire_storage_mutation(state)
+            .await
+            .map_err(storage_recovery_app_error)?;
+        operation_guard.hold(guard);
+    }
+    let storage_guard = operation_guard.clone();
     let root = state.secure_root().clone();
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
+        let destination = root.bind_directory(&upload.directory).map_err(|_| {
+            AppError(
+                StatusCode::CONFLICT,
+                "Upload target changed in the meantime",
+            )
+        })?;
+        upload
+            .pending
+            .bind_destination(&destination)
+            .map_err(|error| {
+                AppError::from(report_internal(
+                    InternalOperation::WebAdminUploadDestinationMatch,
+                    error,
+                ))
+            })?;
         let existed = inspect_admin_upload_target(&root, &upload)?;
         Ok(upload.commit(storage_guard, existed))
     })
@@ -555,9 +700,12 @@ fn publish_admin_upload_blocking(
         mut pending,
         name,
         total,
+        content_sha256: _,
         directory,
+        base: _,
+        folder_path: _,
         overwrite_existing,
-        directory_durability_uncertain,
+        directory_warnings,
         permits,
     } = upload;
     let AdminUploadPermits {
@@ -593,9 +741,7 @@ fn publish_admin_upload_blocking(
     });
     let result =
         recover_admin_upload_audit_uncertainty(result, published_snapshot, action, &destination);
-    if result.is_ok() {
-        storage_guard.finish_clean();
-    }
+    let _storage_guard = storage_guard;
     Ok(match result? {
         SessionBound::Authorized((durability_uncertain, audit_uncertain)) => {
             SessionBound::Authorized(PublishedAdminUpload {
@@ -604,7 +750,7 @@ fn publish_admin_upload_blocking(
                 replaced,
                 durability_uncertain,
                 audit_uncertain,
-                directory_durability_uncertain,
+                directory_warnings,
             })
         }
         SessionBound::SessionUnavailable => SessionBound::SessionUnavailable,
@@ -702,8 +848,12 @@ fn finish_admin_upload(publication: PublishedAdminUpload) -> Result<AdminUploadS
         file: publication.name,
         disposition,
         directory: publication.directory,
-        audit_durability_uncertain: publication.directory_durability_uncertain
+        audit_durability_uncertain: publication.directory_warnings.any()
             || publication.durability_uncertain
             || publication.audit_uncertain,
+        warnings: crate::services::upload::UploadWarnings {
+            storage: publication.directory_warnings.storage || publication.durability_uncertain,
+            audit: publication.directory_warnings.audit || publication.audit_uncertain,
+        },
     })
 }

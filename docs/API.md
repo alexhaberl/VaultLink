@@ -29,6 +29,7 @@ Health probes and the `/api/v2` prefix are already available in 0.6.0.
 | `/v/:token/unlock` | POST | unlock a password-protected Share |
 | `/v/:token/download`, `/v/:token/download.zip` | GET/HEAD | streamed file or ZIP transfer |
 | `/v/:token/upload` | POST | streamed public upload |
+| `/admin/files/upload/operations`, `/v/:token/upload/operations` | POST/GET `/:upload_id` | create and inspect an upload operation |
 
 `max_downloads` counts completed content transfers (download, ZIP, counted preview), not public metadata/landing requests or uploads. `HEAD` returns metadata only when the equivalent `GET` could begin under the current transfer session and does not itself consume quota.
 
@@ -61,6 +62,7 @@ After `/api/v2/session/mfa`, clients must retain both the rotated `Set-Cookie` v
 | `/api/v2/public/shares/:token/unlock` | POST | unlock protected Share |
 | `/api/v2/public/shares/:token/download` | GET/HEAD | safe streamed download |
 | `/api/v2/public/shares/:token/upload` | POST | safe streamed upload |
+| `/api/v2/public/shares/:token/upload/operations` | POST/GET `/:upload_id` | create and inspect an upload operation |
 | `/api/v2/public/shares/:token/preview` | GET | safe preview |
 | `/api/v2/public/shares/:token/download.zip` | GET | safe ZIP transfer |
 
@@ -80,6 +82,16 @@ JSON errors have this envelope:
 ```json
 { "error": { "code": "forbidden", "message": "..." } }
 ```
+
+### Upload operation IDs (breaking change)
+
+Every new logical upload, including API uploads, must first create an operation with `POST` to the corresponding `/upload/operations` route. The response is HTTP `201` with `upload_id`, `expires_at`, and `status_url`. Administrator creation requires an MFA session and `X-CSRF-Token`; a password-protected public Share requires its unlock session and `X-VaultLink-Upload-CSRF`. Each status `GET` rechecks the current session or Share permission and unlock state.
+
+Send the returned ID as `Idempotency-Key` on the existing upload route, or as multipart `upload_id` before the file field. When both are sent, they must match. Missing or conflicting IDs return `400`; unknown, foreign, or expired IDs return `410`. Clients of earlier versions that POST directly to `/api/v2/public/shares/:token/upload` must change to this two-step flow. IDs do not replace authentication, Share authorization, or CSRF proof.
+
+`GET status_url` returns `state` (`ready`, `processing`, `retryable`, `completed`, `rejected`, or `outcome_unknown`), `expires_at`, and, for completed or rejected operations, `result`. Rejected results contain a stable reason code rather than localized response text. A simultaneous upload with a processing ID returns `409 upload_in_progress`, `status_url`, and `Retry-After: 1`. A repeated completed upload with identical file bytes, filename, path, and overwrite choice returns its original result without republishing or charging quota. A differing request returns `409 upload_id_conflict`. Compare content using a streamed SHA-256 and length; multipart boundaries and CSRF values are immaterial. A terminal `outcome_unknown` cannot be resent. If an upload response is lost or malformed, read `status_url` before offering a retry. Resend the exact same request and ID only after status confirms `ready` or `retryable` and the user requests it.
+
+Completed results remain queryable for 24 hours after completion. Unused and safely retryable IDs expire 24 hours after creation. Upload JSON has a canonical optional `warnings` array in storage-then-audit order: `storage_durability_uncertain`, `audit_durability_uncertain`. The legacy singular `warning` field is deprecated. Classic redirect responses also provide `X-VaultLink-Upload-Warnings`; older durability headers retain their previous meaning. `directory_uncertain` means that a directory may be partial and does not claim the file was uploaded.
 
 Internal absolute paths, password hashes, session/unlock/preview/transfer hashes, and TOTP secrets are not returned. TOTP secrets are shown once after administrator creation or MFA reset.
 

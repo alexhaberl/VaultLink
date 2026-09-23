@@ -57,6 +57,8 @@ pub(super) struct PublicUploadFormPhase<'a> {
     pub(super) required_csrf: Option<&'a str>,
     pub(super) csrf_header_valid: bool,
     pub(super) authorized_upload: AuthorizedUpload,
+    pub(super) upload_id: &'a str,
+    pub(super) prefix: Vec<crate::upload_operation::UploadPrefixField>,
 }
 
 impl PublicUploadFormPhase<'_> {
@@ -80,6 +82,8 @@ struct PublicUploadParser<'a> {
     csrf_validated: bool,
     authorized_upload: Option<AuthorizedUpload>,
     staged_upload: Option<StagedUpload>,
+    upload_id: &'a str,
+    prefix: Vec<crate::upload_operation::UploadPrefixField>,
 }
 
 impl<'a> PublicUploadParser<'a> {
@@ -99,10 +103,15 @@ impl<'a> PublicUploadParser<'a> {
             csrf_validated: phase.required_csrf.is_none() || phase.csrf_header_valid,
             authorized_upload: Some(phase.authorized_upload),
             staged_upload: None,
+            upload_id: phase.upload_id,
+            prefix: phase.prefix,
         }
     }
 
     async fn run(mut self, mut multipart: Multipart) -> PublicUploadPhaseResult<PreparedUpload> {
+        for field in std::mem::take(&mut self.prefix) {
+            self.handle_prefix(field)?;
+        }
         while let Some(field) = multipart.next_field().await.map_err(|error| {
             public_multipart_read_rejection(
                 self.token,
@@ -117,8 +126,39 @@ impl<'a> PublicUploadParser<'a> {
         self.finish()
     }
 
+    fn handle_prefix(
+        &mut self,
+        field: crate::upload_operation::UploadPrefixField,
+    ) -> PublicUploadPhaseResult<()> {
+        use crate::upload_operation::UploadPrefixKind;
+        let name = match field.kind {
+            UploadPrefixKind::Id => "upload_id",
+            UploadPrefixKind::Path => "path",
+            UploadPrefixKind::FolderPath => "folder_path",
+            UploadPrefixKind::Overwrite => "overwrite_existing",
+            UploadPrefixKind::Csrf => "csrf",
+        };
+        self.observe_field(name)?;
+        match field.kind {
+            UploadPrefixKind::Id => {
+                if !auth::constant_time_eq(&field.value, self.upload_id) {
+                    return Err(self.rejection(StatusCode::BAD_REQUEST, "Upload IDs disagree"));
+                }
+                Ok(())
+            }
+            UploadPrefixKind::Path => self.set_path(field.value),
+            UploadPrefixKind::FolderPath => self.set_folder_path(field.value),
+            UploadPrefixKind::Overwrite => self.set_overwrite(field.value),
+            UploadPrefixKind::Csrf if field.value.len() <= 256 => self.set_csrf(field.value),
+            UploadPrefixKind::Csrf => {
+                Err(self.rejection(StatusCode::FORBIDDEN, "Invalid CSRF token"))
+            }
+        }
+    }
+
     fn observe_field(&mut self, name: &str) -> PublicUploadPhaseResult<UploadFormField> {
         let field = match name {
+            "upload_id" => UploadFormField::UploadId,
             "path" => UploadFormField::Path,
             "folder_path" => UploadFormField::FolderPath,
             "overwrite_existing" => UploadFormField::Overwrite,
@@ -140,6 +180,15 @@ impl<'a> PublicUploadParser<'a> {
         field: axum::extract::multipart::Field<'_>,
     ) -> PublicUploadPhaseResult<()> {
         match field_kind {
+            UploadFormField::UploadId => {
+                let value = self
+                    .read_text(field, 64, StatusCode::BAD_REQUEST, "Invalid upload ID")
+                    .await?;
+                if !auth::constant_time_eq(&value, self.upload_id) {
+                    return Err(self.rejection(StatusCode::BAD_REQUEST, "Upload IDs disagree"));
+                }
+                Ok(())
+            }
             UploadFormField::Path => self.handle_path(field).await,
             UploadFormField::FolderPath => self.handle_folder_path(field).await,
             UploadFormField::Overwrite => self.handle_overwrite(field).await,
@@ -187,6 +236,10 @@ impl<'a> PublicUploadParser<'a> {
                 "Invalid upload path",
             )
             .await?;
+        self.set_path(value)
+    }
+
+    fn set_path(&mut self, value: String) -> PublicUploadPhaseResult<()> {
         self.upload_subdir = policy::normalize_public_upload_subdir(self.share.permission, &value)
             .map_err(|_| self.rejection(StatusCode::BAD_REQUEST, "Invalid upload path"))?;
         Ok(())
@@ -204,6 +257,10 @@ impl<'a> PublicUploadParser<'a> {
                 "Invalid folder path",
             )
             .await?;
+        self.set_folder_path(value)
+    }
+
+    fn set_folder_path(&mut self, value: String) -> PublicUploadPhaseResult<()> {
         let folder_path = crate::path_security::validate_relative(&value)
             .map_err(|_| self.rejection(StatusCode::BAD_REQUEST, "Invalid folder path"))?
             .to_string_lossy()
@@ -235,6 +292,10 @@ impl<'a> PublicUploadParser<'a> {
                 "Invalid upload",
             )
             .await?;
+        self.set_overwrite(value)
+    }
+
+    fn set_overwrite(&mut self, value: String) -> PublicUploadPhaseResult<()> {
         self.overwrite_requested = value == "1";
         if self.overwrite_requested && !self.state.config().storage.replacements_allowed() {
             return Err(self.rejection(
@@ -252,6 +313,10 @@ impl<'a> PublicUploadParser<'a> {
         let value = self
             .read_text(field, 256, StatusCode::FORBIDDEN, "Invalid CSRF token")
             .await?;
+        self.set_csrf(value)
+    }
+
+    fn set_csrf(&mut self, value: String) -> PublicUploadPhaseResult<()> {
         self.csrf_validated = self
             .required_csrf
             .is_none_or(|expected| auth::constant_time_eq(expected, &value));
@@ -458,6 +523,9 @@ impl PublicUploadTargetBinding {
 
 fn form_state_error_message(error: UploadFormStateError) -> &'static str {
     match error {
+        UploadFormStateError::DuplicateOrLateUploadId => {
+            "Upload ID was submitted more than once or too late"
+        }
         UploadFormStateError::TooManyFields => "Too many multipart fields",
         UploadFormStateError::DuplicateOrLatePath => {
             "Upload path was submitted more than once or too late"

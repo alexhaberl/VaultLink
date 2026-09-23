@@ -67,7 +67,7 @@ fn json_request(method: Method, uri: &str, body: &str) -> Request<Body> {
     request
 }
 
-fn multipart_request(uri: &str, name: &str, content: &[u8]) -> Request<Body> {
+fn multipart_request(state: &AppState, uri: &str, name: &str, content: &[u8]) -> Request<Body> {
     let boundary = "vaultlink-api-test-boundary";
     let mut body = Vec::new();
     body.extend_from_slice(format!(
@@ -87,6 +87,21 @@ fn multipart_request(uri: &str, name: &str, content: &[u8]) -> Request<Body> {
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
+    if let Some(token) = uri
+        .strip_prefix("/api/v2/public/shares/")
+        .and_then(|tail| tail.split('/').next())
+    {
+        if let Some(share) = state.db().share_by_token(token).unwrap() {
+            let (id, _) = state
+                .db()
+                .create_upload_operation(crate::db::UploadOperationScope::Share(share.id))
+                .unwrap()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("idempotency-key", id.parse().unwrap());
+        }
+    }
     request
 }
 

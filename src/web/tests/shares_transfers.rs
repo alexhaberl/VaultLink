@@ -521,6 +521,7 @@ async fn public_share_scope_blocks_sibling_symlink_http_flows() {
     }
     let upload = app
         .oneshot(multipart_request_with_path(
+            &state,
             "/v/scope/upload",
             "created.txt",
             b"blocked",
@@ -1015,6 +1016,7 @@ async fn detached_public_upload_finalizer_preserves_the_audit_client_ip() {
     state.mutate_runtime_for_test(|runtime| runtime.audit_client_ip_enabled = true);
     let response = router(state.clone())
         .oneshot(multipart_request(
+            &state,
             "/v/audit-upload/upload",
             "audit.txt",
             b"content",

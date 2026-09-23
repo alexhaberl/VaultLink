@@ -1,17 +1,52 @@
-fn multipart_request(uri: &str, name: &str, content: &[u8]) -> Request {
-    multipart_request_with_path(uri, name, content, None)
+fn with_test_upload_id(state: &AppState, mut request: Request) -> Request {
+    if request.headers().contains_key("idempotency-key") {
+        return request;
+    }
+    let path = request.uri().path();
+    let scope = if path.starts_with("/admin/files/upload") {
+        state
+            .db()
+            .list_admins()
+            .ok()
+            .and_then(|admins| admins.first().map(|admin| admin.id))
+            .map(crate::db::UploadOperationScope::Admin)
+    } else {
+        let token = path
+            .strip_prefix("/v/")
+            .and_then(|tail| tail.split('/').next())
+            .or_else(|| {
+                path.strip_prefix("/api/v2/public/shares/")
+                    .and_then(|tail| tail.split('/').next())
+            });
+        token
+            .and_then(|token| state.db().share_by_token(token).ok().flatten())
+            .map(|share| crate::db::UploadOperationScope::Share(share.id))
+    };
+    if let Some(scope) = scope {
+        let (id, _) = state.db().create_upload_operation(scope).unwrap().unwrap();
+        request
+            .headers_mut()
+            .insert("idempotency-key", id.parse().unwrap());
+    }
+    request
+}
+
+fn multipart_request(state: &AppState, uri: &str, name: &str, content: &[u8]) -> Request {
+    multipart_request_with_path(state, uri, name, content, None)
 }
 
 fn multipart_request_with_path(
+    state: &AppState,
     uri: &str,
     name: &str,
     content: &[u8],
     path: Option<&str>,
 ) -> Request {
-    multipart_request_with_options(uri, name, content, path, false)
+    multipart_request_with_options(state, uri, name, content, path, false)
 }
 
 fn multipart_request_with_options(
+    state: &AppState,
     uri: &str,
     name: &str,
     content: &[u8],
@@ -54,10 +89,15 @@ fn multipart_request_with_options(
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
-    request
+    with_test_upload_id(state, request)
 }
 
-fn multipart_request_with_late_overwrite(uri: &str, name: &str, content: &[u8]) -> Request {
+fn multipart_request_with_late_overwrite(
+    state: &AppState,
+    uri: &str,
+    name: &str,
+    content: &[u8],
+) -> Request {
     let boundary = "vaultlink-late-intent-boundary";
     let mut body = Vec::new();
     body.extend_from_slice(
@@ -86,20 +126,21 @@ fn multipart_request_with_late_overwrite(uri: &str, name: &str, content: &[u8]) 
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
-    request
+    with_test_upload_id(state, request)
 }
 
 fn public_folder_upload_request(
+    state: &AppState,
     uri: &str,
     path: &str,
     folder_path: &str,
     name: &str,
     content: &[u8],
 ) -> Request {
-    folder_upload_request(uri, path, None, folder_path, name, content)
+    folder_upload_request(state, uri, path, None, folder_path, name, content)
 }
 
-fn raw_multipart_request(uri: &str, boundary: &str, body: Vec<u8>) -> Request {
+fn raw_multipart_request(state: &AppState, uri: &str, boundary: &str, body: Vec<u8>) -> Request {
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(uri)
@@ -113,12 +154,13 @@ fn raw_multipart_request(uri: &str, boundary: &str, body: Vec<u8>) -> Request {
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
-    request
+    with_test_upload_id(state, request)
 }
 
 const CONTROLLED_UPLOAD_BOUNDARY: &str = "vaultlink-controlled-upload-boundary";
 
 fn controlled_multipart_request(
+    state: &AppState,
     uri: &str,
     name: &str,
     content: &[u8],
@@ -161,10 +203,11 @@ fn controlled_multipart_request(
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
-    (request, sender)
+    (with_test_upload_id(state, request), sender)
 }
 
 fn controlled_admin_multipart_request(
+    state: &AppState,
     uri: &str,
     path: &str,
     csrf: &str,
@@ -176,6 +219,7 @@ fn controlled_admin_multipart_request(
     tokio::sync::mpsc::Sender<std::result::Result<Bytes, io::Error>>,
 ) {
     controlled_admin_multipart_request_with_overwrite(
+        state,
         uri,
         path,
         csrf,
@@ -186,7 +230,9 @@ fn controlled_admin_multipart_request(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn controlled_admin_multipart_request_with_overwrite(
+    state: &AppState,
     uri: &str,
     path: &str,
     csrf: &str,
@@ -240,7 +286,7 @@ fn controlled_admin_multipart_request_with_overwrite(
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
-    (request, sender)
+    (with_test_upload_id(state, request), sender)
 }
 
 async fn finish_controlled_multipart(
@@ -328,6 +374,7 @@ fn html_share_strategy_request(
 }
 
 fn public_multipart_request_with_csrf(
+    state: &AppState,
     uri: &str,
     name: &str,
     content: &[u8],
@@ -360,10 +407,11 @@ fn public_multipart_request_with_csrf(
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
-    request
+    with_test_upload_id(state, request)
 }
 
 fn admin_multipart_request(
+    state: &AppState,
     uri: &str,
     path: &str,
     csrf: &str,
@@ -410,10 +458,11 @@ fn admin_multipart_request(
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
-    request
+    with_test_upload_id(state, request)
 }
 
 fn admin_folder_upload_request(
+    state: &AppState,
     uri: &str,
     path: &str,
     csrf: &str,
@@ -421,10 +470,11 @@ fn admin_folder_upload_request(
     name: &str,
     content: &[u8],
 ) -> Request {
-    folder_upload_request(uri, path, Some(csrf), folder_path, name, content)
+    folder_upload_request(state, uri, path, Some(csrf), folder_path, name, content)
 }
 
 fn folder_upload_request(
+    state: &AppState,
     uri: &str,
     path: &str,
     csrf: Option<&str>,
@@ -469,7 +519,7 @@ fn folder_upload_request(
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
-    request
+    with_test_upload_id(state, request)
 }
 
 async fn response_text(response: Response) -> String {

@@ -58,7 +58,8 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     let upload_csrf = page[csrf_start..csrf_end].to_string();
     assert!(!upload_csrf.is_empty());
 
-    let mut missing_csrf = multipart_request("/v/protected-upload/upload", "missing.txt", b"x");
+    let mut missing_csrf =
+        multipart_request(&state, "/v/protected-upload/upload", "missing.txt", b"x");
     missing_csrf.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&unlock_cookie).unwrap(),
@@ -69,6 +70,7 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     );
 
     let mut wrong_csrf = public_multipart_request_with_csrf(
+        &state,
         "/v/protected-upload/upload",
         "wrong.txt",
         b"x",
@@ -84,6 +86,7 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     );
 
     let mut duplicate_cookie = public_multipart_request_with_csrf(
+        &state,
         "/v/protected-upload/upload",
         "duplicate.txt",
         b"x",
@@ -108,6 +111,7 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
 
     let reserved_name = format!(".vaultlink-delete-{}.tombstone", "A".repeat(24));
     let mut reserved = public_multipart_request_with_csrf(
+        &state,
         "/v/protected-upload/upload",
         &reserved_name,
         b"x",
@@ -131,6 +135,7 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     assert_eq!((share.uploaded_bytes, share.uploaded_files), (0, 0));
 
     let mut accepted = public_multipart_request_with_csrf(
+        &state,
         "/v/protected-upload/upload",
         "first.txt",
         b"1234",
@@ -152,6 +157,7 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     assert_eq!((share.uploaded_bytes, share.uploaded_files), (4, 1));
 
     let mut conflict = public_multipart_request_with_csrf(
+        &state,
         "/v/protected-upload/upload",
         "first.txt",
         b"5",
@@ -168,6 +174,7 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     assert_eq!(state.db().active_upload_reservations(share_id).unwrap(), 0);
 
     let mut over_quota = folder_upload_request(
+        &state,
         "/v/protected-upload/upload",
         "",
         Some(&upload_csrf),
@@ -202,7 +209,7 @@ async fn protected_public_upload_binds_csrf_and_enforces_persistent_quota() {
     assert_eq!(state.db().active_upload_reservations(share_id).unwrap(), 0);
     assert!(!root.path().join("uploads/unaccounted").exists());
 
-    let mut exact_quota = multipart_request("/v/protected-upload/upload", "last.txt", b"5");
+    let mut exact_quota = multipart_request(&state, "/v/protected-upload/upload", "last.txt", b"5");
     exact_quota.headers_mut().insert(
         header::COOKIE,
         HeaderValue::from_str(&unlock_cookie).unwrap(),
@@ -260,7 +267,7 @@ async fn external_writers_disable_saved_public_overwrite_policy() {
     let mut config = state.config().clone();
     config.storage.external_writers = true;
     state.replace_config_for_test(config);
-    let app = router(state);
+    let app = router(state.clone());
 
     let page = response_text(
         app.clone()
@@ -283,6 +290,7 @@ async fn external_writers_disable_saved_public_overwrite_policy() {
 
     let response = app
         .oneshot(multipart_request_with_options(
+            &state,
             "/v/external-writers/upload",
             "report.txt",
             b"vaultlink",
@@ -339,7 +347,7 @@ async fn explicit_external_writer_replace_opt_in_enables_last_writer_wins() {
     config.storage.external_writers = true;
     config.storage.allow_external_writer_replace = true;
     state.replace_config_for_test(config);
-    let app = router(state);
+    let app = router(state.clone());
 
     let page = response_text(
         app.clone()
@@ -360,6 +368,7 @@ async fn explicit_external_writer_replace_opt_in_enables_last_writer_wins() {
 
     let response = app
         .oneshot(multipart_request_with_options(
+            &state,
             "/v/external-replace/upload",
             "report.txt",
             b"vaultlink",
@@ -398,10 +407,11 @@ async fn api_upload_route_can_stream_beyond_the_buffered_body_limit() {
             &UploadConflictStrategy::Reject,
         )
         .unwrap();
-    let app = router(state);
+    let app = router(state.clone());
     let content = vec![b'x'; DEFAULT_REQUEST_BODY_LIMIT + 64 * 1024];
     let response = app
         .oneshot(multipart_request(
+            &state,
             "/api/v2/public/shares/large-upload/upload",
             "large.bin",
             &content,

@@ -70,8 +70,8 @@ fn every_registered_method_has_one_complete_contract() {
         .map(|spec| (spec.surface, spec.method, spec.path))
         .collect::<HashSet<_>>();
     assert_eq!(unique.len(), specs.len(), "duplicate route method contract");
-    assert_eq!(crate::web::WEB_ROUTE_SPECS.len(), 69);
-    assert_eq!(crate::api::API_ROUTE_SPECS.len(), 45);
+    assert_eq!(crate::web::WEB_ROUTE_SPECS.len(), 73);
+    assert_eq!(crate::api::API_ROUTE_SPECS.len(), 47);
     assert_eq!(crate::setup::SETUP_ROUTE_SPECS.len(), 13);
 
     for spec in specs {
@@ -170,7 +170,8 @@ fn route_request_fixture(spec: &RouteSpec, csrf: &str) -> RouteRequestFixture {
         .externally_visible_path()
         .replace("{token}", "missing-token")
         .replace("{alias}", "missing-alias")
-        .replace("{id}", "999");
+        .replace("{id}", "999")
+        .replace("{upload_id}", "missing-upload-id");
     if matches!(
         uri.as_str(),
         "/admin/files/download" | "/admin/files/delete" | "/admin/preview" | "/admin/preview/raw"
@@ -488,7 +489,7 @@ async fn every_declared_csrf_contract_rejects_the_wrong_proof_before_mutation() 
     let data = tempfile::tempdir().unwrap();
     let state = test_state(root.path(), data.path());
     install_auth_contract_sessions(&state);
-    let app = crate::web::router(state);
+    let app = crate::web::router(state.clone());
 
     let cases = all_specs()
         .filter(|spec| {
@@ -516,6 +517,20 @@ async fn every_declared_csrf_contract_rejects_the_wrong_proof_before_mutation() 
         };
         let mut request = route_request(spec, "wrong");
         add_session_headers(&mut request, token, "wrong", spec);
+        if matches!(
+            spec.path,
+            "/admin/files/upload" | "/admin/files/upload/queue"
+        ) {
+            let admin_id = state.db().session("verified").unwrap().unwrap().admin_id;
+            let (id, _) = state
+                .db()
+                .create_upload_operation(crate::db::UploadOperationScope::Admin(admin_id))
+                .unwrap()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("idempotency-key", HeaderValue::from_str(&id).unwrap());
+        }
         let response = app.clone().oneshot(request).await.unwrap();
         if response.status() != StatusCode::FORBIDDEN {
             eprintln!(
@@ -786,12 +801,27 @@ async fn required_audit_failure_before_upload_publication_is_fail_closed() {
         "route_manifest_fail_upload_audit",
         "upload_quota_committed",
     );
+    let share_id = state
+        .db()
+        .share_by_token("audit-failure-upload")
+        .unwrap()
+        .unwrap()
+        .id;
+    let (id, _) = state
+        .db()
+        .create_upload_operation(crate::db::UploadOperationScope::Share(share_id))
+        .unwrap()
+        .unwrap();
+    let mut request = public_upload_request(
+        "/api/v2/public/shares/audit-failure-upload/upload",
+        "must-not-appear.txt",
+        b"payload",
+    );
+    request
+        .headers_mut()
+        .insert("idempotency-key", HeaderValue::from_str(&id).unwrap());
     let response = crate::web::router(state.clone())
-        .oneshot(public_upload_request(
-            "/api/v2/public/shares/audit-failure-upload/upload",
-            "must-not-appear.txt",
-            b"payload",
-        ))
+        .oneshot(request)
         .await
         .unwrap();
 

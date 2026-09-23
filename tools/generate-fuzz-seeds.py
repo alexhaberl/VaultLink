@@ -131,7 +131,7 @@ def seeds():
         "preamble_bytes": multipart(3, b"preamble"), "raw_eof": multipart(0, b"--a\r\nX:"),
         "header_exact": multipart(4), "header_over": multipart(4 | 8),
         "preamble_exact": multipart(5), "preamble_over": multipart(5 | 8),
-        "two_fields": multipart(6), "quoted_boundary": multipart(1 | 0x10, boundary=b"\0\0\1\0\1"),
+        "two_fields": multipart(6), "upload_id_before_file": multipart(6 | 8), "quoted_boundary": multipart(1 | 0x10, boundary=b"\0\0\1\0\1"),
         "long_boundary": multipart(1, boundary=b"\0" * 70),
         "late_eof": multipart(1 | 0x80, b"x" * 1024, eof=768),
         "content_type_duplicate": multipart(7, b"multipart/form-data; boundary=x; boundary=y"),

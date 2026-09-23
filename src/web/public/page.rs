@@ -69,12 +69,20 @@ pub(in crate::web) async fn public_page(
         None
     };
     let upload = if share.is_directory && share.permission.can_upload() {
+        let share_id = share.id;
+        let upload_id = crate::http_auth::database(state.db().clone(), move |db| {
+            db.create_upload_operation(crate::db::UploadOperationScope::Share(share_id))
+        })
+        .await?
+        .map(|ticket| ticket.0)
+        .unwrap_or_default();
         Some(build_upload_view(
             &state,
             &token,
             &share,
             &query,
             upload_csrf,
+            upload_id,
         )?)
     } else {
         None
@@ -547,6 +555,7 @@ fn build_upload_view(
     share: &Share,
     query: &BrowseQuery,
     csrf: Option<String>,
+    upload_id: String,
 ) -> Result<PublicUploadView> {
     let path = if share.permission.can_download() {
         path_security::validate_relative(query.path.as_deref().unwrap_or_default())
@@ -566,7 +575,9 @@ fn build_upload_view(
         path,
         action_url: format!("/v/{token}/upload"),
         queue_url: format!("/v/{token}/upload/queue"),
+        operation_url: format!("/v/{token}/upload/operations"),
         csrf: csrf.unwrap_or_default(),
+        upload_id,
         allow_overwrite: share.upload_conflict_strategy.can_overwrite()
             && state.config().storage.replacements_allowed(),
         upload_icon: TrustedMarkup::static_icon(crate::ui::Icon::Upload),
@@ -609,6 +620,19 @@ fn upload_notice(status: Option<&str>) -> Option<&'static str> {
             i18n::text(i18n::current_locale(), i18n::REPLACE_STORAGE_UNCONFIRMED)
         }
         "audit_uncertain" => i18n::text(i18n::current_locale(), i18n::UPLOAD_AUDIT_UNCERTAIN),
+        "audit_only_uncertain" => {
+            i18n::text(i18n::current_locale(), i18n::UPLOAD_AUDIT_ONLY_UNCERTAIN)
+        }
+        "storage_only_uncertain" => {
+            i18n::text(i18n::current_locale(), i18n::UPLOAD_STORAGE_UNCERTAIN)
+        }
+        "storage_audit_uncertain" => {
+            i18n::text(i18n::current_locale(), i18n::UPLOAD_AUDIT_UNCERTAIN)
+        }
+        "directory_uncertain" => {
+            i18n::text(i18n::current_locale(), i18n::UPLOAD_DIRECTORY_UNCERTAIN)
+        }
+        "id_conflict" => i18n::text(i18n::current_locale(), i18n::UPLOAD_ID_CONFLICT_NEW_FORM),
         _ => "",
     };
     (!message.is_empty()).then_some(message)

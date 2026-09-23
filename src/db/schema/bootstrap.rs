@@ -4,7 +4,7 @@ CREATE TABLE vaultlink_schema(
     fingerprint TEXT NOT NULL
 );
 INSERT INTO vaultlink_schema(singleton,fingerprint)
-VALUES(1,'vaultlink-schema-11-public-upload-directory-quota-2026-09-23');
+VALUES(1,'vaultlink-schema-12-idempotent-upload-operations-2026-09-23');
 
 CREATE TABLE vaultlink_schema_migrations(
     target_version INTEGER PRIMARY KEY CHECK(target_version > 0),
@@ -214,6 +214,22 @@ CREATE INDEX idx_upload_reservations_exp ON public_upload_reservations(expires_a
 CREATE INDEX idx_upload_reservations_share_epoch
     ON public_upload_reservations(share_id,upload_policy_epoch);
 
+CREATE TABLE upload_operations(
+    id_hash TEXT PRIMARY KEY,
+    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('admin','share')),
+    scope_id INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('ready','processing','retryable','committing','completed','rejected','outcome_unknown')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    fingerprint TEXT,
+    result_json TEXT,
+    fragment_name TEXT,
+    quota_charged INTEGER NOT NULL DEFAULT 0 CHECK(quota_charged IN (0,1)),
+    CHECK(scope_id > 0)
+);
+CREATE INDEX idx_upload_operations_scope ON upload_operations(scope_kind,scope_id,state);
+CREATE INDEX idx_upload_operations_exp ON upload_operations(expires_at);
+
 CREATE VIRTUAL TABLE share_search_fts USING fts5(
     alias_search_key,
     path_search_key,
@@ -302,8 +318,12 @@ fn initialize_empty_database(conn: &mut Connection) -> rusqlite::Result<()> {
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(11,?1)",
         [Utc::now().to_rfc3339()],
     )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(12,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    validate_schema_11(&tx)?;
+    validate_schema_12(&tx)?;
     validate_database(&tx)?;
     tx.commit()
 }

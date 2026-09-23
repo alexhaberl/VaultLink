@@ -39,6 +39,14 @@ async fn password_rotation_rejects_an_authorized_upload_before_its_file_field() 
     upload_request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
     ));
+    let (upload_id, _) = state
+        .db()
+        .create_upload_operation(crate::db::UploadOperationScope::Share(share_id))
+        .unwrap()
+        .unwrap();
+    upload_request
+        .headers_mut()
+        .insert("idempotency-key", upload_id.parse().unwrap());
 
     let app = router(state.clone());
     let upload = tokio::spawn(async move { app.oneshot(upload_request).await.unwrap() });
@@ -142,7 +150,12 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
 
     let uploaded = app
         .clone()
-        .oneshot(multipart_request("/v/upload/upload", "ok.txt", b"content"))
+        .oneshot(multipart_request(
+            &state,
+            "/v/upload/upload",
+            "ok.txt",
+            b"content",
+        ))
         .await
         .unwrap();
     assert_eq!(uploaded.status(), StatusCode::SEE_OTHER);
@@ -153,6 +166,7 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     let queued = app
         .clone()
         .oneshot(multipart_request(
+            &state,
             "/v/upload/upload/queue",
             "grüße.txt",
             b"queued",
@@ -170,7 +184,12 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     state.inject_upload_directory_sync_failure_for_test(std::io::ErrorKind::Other);
     let uncertain = app
         .clone()
-        .oneshot(multipart_request("/v/upload/upload", "uncertain.txt", b"x"))
+        .oneshot(multipart_request(
+            &state,
+            "/v/upload/upload",
+            "uncertain.txt",
+            b"x",
+        ))
         .await
         .unwrap();
     assert_eq!(uncertain.status(), StatusCode::SEE_OTHER);
@@ -184,7 +203,7 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
         .unwrap()
         .to_str()
         .unwrap()
-        .contains("upload=uncertain"));
+        .contains("upload=storage_only_uncertain"));
     assert_eq!(
         std::fs::read(root.path().join("uploads/uncertain.txt")).unwrap(),
         b"x"
@@ -198,6 +217,7 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     let response_loss = app
         .clone()
         .oneshot(multipart_request(
+            &state,
             "/v/upload/upload",
             "response-loss.txt",
             b"visible",
@@ -226,6 +246,7 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     let replace_response_loss = app
         .clone()
         .oneshot(multipart_request_with_options(
+            &state,
             "/v/replace/upload",
             "ok.txt",
             b"updated",
@@ -249,6 +270,7 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     let percent_name = app
         .clone()
         .oneshot(multipart_request(
+            &state,
             "/v/roundtrip/upload",
             "100%.txt",
             b"percent",
@@ -270,7 +292,12 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     for unsafe_name in ["C:escape.txt", "CON.txt"] {
         assert_eq!(
             app.clone()
-                .oneshot(multipart_request("/v/upload/upload", unsafe_name, b"x"))
+                .oneshot(multipart_request(
+                    &state,
+                    "/v/upload/upload",
+                    unsafe_name,
+                    b"x"
+                ))
                 .await
                 .unwrap()
                 .status(),
@@ -282,6 +309,7 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     assert_eq!(
         app.clone()
             .oneshot(multipart_request_with_path(
+                &state,
                 "/v/roundtrip/upload",
                 "never.txt",
                 b"x",
@@ -295,7 +323,12 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     assert!(!root.path().join("uploads/never.txt").exists());
     let conflict = app
         .clone()
-        .oneshot(multipart_request("/v/upload/upload", "ok.txt", b"new"))
+        .oneshot(multipart_request(
+            &state,
+            "/v/upload/upload",
+            "ok.txt",
+            b"new",
+        ))
         .await
         .unwrap();
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
@@ -305,7 +338,12 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     assert!(conflict_body.contains(r#"href="/v/upload""#));
     let replace_without_checkbox = app
         .clone()
-        .oneshot(multipart_request("/v/replace/upload", "ok.txt", b"new"))
+        .oneshot(multipart_request(
+            &state,
+            "/v/replace/upload",
+            "ok.txt",
+            b"new",
+        ))
         .await
         .unwrap();
     assert_eq!(replace_without_checkbox.status(), StatusCode::CONFLICT);
@@ -314,6 +352,7 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     let replaced = app
         .clone()
         .oneshot(multipart_request_with_options(
+            &state,
             "/v/replace/upload",
             "ok.txt",
             b"new",
@@ -347,7 +386,12 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     );
     let blocked = app
         .clone()
-        .oneshot(multipart_request("/v/upload/upload", "bad.exe", b"x"))
+        .oneshot(multipart_request(
+            &state,
+            "/v/upload/upload",
+            "bad.exe",
+            b"x",
+        ))
         .await
         .unwrap();
     assert_eq!(blocked.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -358,6 +402,7 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
     let blocked_with_overwrite = app
         .clone()
         .oneshot(multipart_request_with_options(
+            &state,
             "/v/replace/upload",
             "bad.exe",
             b"x",
@@ -376,6 +421,7 @@ async fn http_upload_enforces_limit_extension_conflict_and_cleanup() {
 
     let too_large = app
         .oneshot(multipart_request(
+            &state,
             "/v/upload/upload",
             "large.txt",
             b"123456789",
@@ -469,6 +515,7 @@ async fn public_upload_rejects_missing_duplicate_late_and_unknown_fields_without
         let response = app
             .clone()
             .oneshot(raw_multipart_request(
+                &state,
                 "/v/multipart-states/upload",
                 boundary,
                 body.into_bytes(),
@@ -519,6 +566,7 @@ async fn public_upload_binds_intent_after_the_complete_multipart_envelope() {
         .unwrap();
     let response = router(state.clone())
         .oneshot(multipart_request_with_late_overwrite(
+            &state,
             "/v/late-intent/upload",
             "existing.txt",
             b"new",
@@ -577,15 +625,13 @@ async fn public_upload_cancellation_during_staging_releases_the_typed_owner() {
     let hook = PublicUploadTestHook::blocking("cancel-staging", PublicUploadTestPhase::Staging);
     let hook_guard = install_public_upload_test_hook(hook.clone());
     let app = router(state.clone());
-    let request = tokio::spawn(async move {
-        app.oneshot(multipart_request(
-            "/v/cancel-staging/upload",
-            "cancelled.txt",
-            b"content",
-        ))
-        .await
-        .unwrap()
-    });
+    let upload_request = multipart_request(
+        &state,
+        "/v/cancel-staging/upload",
+        "cancelled.txt",
+        b"content",
+    );
+    let request = tokio::spawn(async move { app.oneshot(upload_request).await.unwrap() });
     hook.wait_until_entered().await;
 
     assert_eq!(state.upload_admission_available_for_test(), 0);
@@ -639,15 +685,13 @@ async fn public_upload_target_binding_is_detached_and_retains_admission_on_cance
         watchdog_hook.release();
     });
     let app = router(state.clone());
-    let request = tokio::spawn(async move {
-        app.oneshot(multipart_request(
-            "/v/cancel-target-binding/upload",
-            "cancelled.txt",
-            b"content",
-        ))
-        .await
-        .unwrap()
-    });
+    let upload_request = multipart_request(
+        &state,
+        "/v/cancel-target-binding/upload",
+        "cancelled.txt",
+        b"content",
+    );
+    let request = tokio::spawn(async move { app.oneshot(upload_request).await.unwrap() });
     let started = std::time::Instant::now();
     hook.wait_until_entered().await;
 
@@ -713,6 +757,7 @@ async fn public_upload_target_binding_failure_releases_admission_without_staging
     let hook_guard = install_public_upload_test_hook(hook.clone());
     let response = router(state.clone())
         .oneshot(multipart_request(
+            &state,
             "/v/failed-target-binding/upload",
             "never.txt",
             b"content",
@@ -756,15 +801,13 @@ async fn public_upload_cancellation_after_finalizer_handoff_does_not_abort_publi
     let hook = PublicUploadTestHook::blocking("cancel-finalizer", PublicUploadTestPhase::Finalizer);
     let hook_guard = install_public_upload_test_hook(hook.clone());
     let app = router(state.clone());
-    let request = tokio::spawn(async move {
-        app.oneshot(multipart_request(
-            "/v/cancel-finalizer/upload",
-            "published.txt",
-            b"content",
-        ))
-        .await
-        .unwrap()
-    });
+    let upload_request = multipart_request(
+        &state,
+        "/v/cancel-finalizer/upload",
+        "published.txt",
+        b"content",
+    );
+    let request = tokio::spawn(async move { app.oneshot(upload_request).await.unwrap() });
     hook.wait_until_entered().await;
 
     request.abort();
@@ -831,6 +874,7 @@ async fn public_upload_staging_io_failure_cleans_fragment_and_quota() {
     let hook_guard = install_public_upload_test_hook(hook.clone());
     let response = router(state.clone())
         .oneshot(multipart_request(
+            &state,
             "/v/staging-failure/upload",
             "never.txt",
             b"content",
@@ -887,8 +931,13 @@ async fn public_upload_uses_the_policy_that_wins_before_finalization() {
     let hook = PublicUploadTestHook::blocking("policy-first", PublicUploadTestPhase::Finalizer);
     let hook_guard = install_public_upload_test_hook(hook.clone());
     let app = router(state.clone());
-    let (upload, sender) =
-        controlled_multipart_request("/v/policy-first/upload", "existing.txt", b"new", true);
+    let (upload, sender) = controlled_multipart_request(
+        &state,
+        "/v/policy-first/upload",
+        "existing.txt",
+        b"new",
+        true,
+    );
     let upload_app = app.clone();
     let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
     wait_for_upload_fragment(root.path()).await;
@@ -962,8 +1011,13 @@ async fn public_upload_publish_wins_before_a_waiting_policy_change() {
     let hook = PublicUploadTestHook::blocking("upload-first", PublicUploadTestPhase::StorageLocked);
     let hook_guard = install_public_upload_test_hook(hook.clone());
     let app = router(state.clone());
-    let (upload, sender) =
-        controlled_multipart_request("/v/upload-first/upload", "existing.txt", b"new", true);
+    let (upload, sender) = controlled_multipart_request(
+        &state,
+        "/v/upload-first/upload",
+        "existing.txt",
+        b"new",
+        true,
+    );
     let upload_app = app.clone();
     let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
     wait_for_upload_fragment(root.path()).await;
@@ -1043,8 +1097,13 @@ async fn public_upload_uses_the_html_policy_that_wins_before_finalization() {
         PublicUploadTestHook::blocking("html-policy-first", PublicUploadTestPhase::Finalizer);
     let hook_guard = install_public_upload_test_hook(hook.clone());
     let app = router(state.clone());
-    let (upload, sender) =
-        controlled_multipart_request("/v/html-policy-first/upload", "existing.txt", b"new", true);
+    let (upload, sender) = controlled_multipart_request(
+        &state,
+        "/v/html-policy-first/upload",
+        "existing.txt",
+        b"new",
+        true,
+    );
     let upload_app = app.clone();
     let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
     wait_for_upload_fragment(root.path()).await;
@@ -1082,90 +1141,5 @@ async fn public_upload_uses_the_html_policy_that_wins_before_finalization() {
     );
     assert_eq!(share.uploaded_bytes, 0);
     assert_eq!(share.uploaded_files, 0);
-    drop(hook_guard);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn public_upload_publish_wins_before_a_waiting_html_policy_change() {
-    let root = tempfile::tempdir().unwrap();
-    let data = tempfile::tempdir().unwrap();
-    std::fs::create_dir(root.path().join("uploads")).unwrap();
-    std::fs::write(root.path().join("uploads/existing.txt"), b"old").unwrap();
-    let state = test_state(root.path(), data.path());
-    state.db().create_admin("admin", "hash", "secret").unwrap();
-    state
-        .db()
-        .create_session(
-            "html-upload-session",
-            1,
-            "html-upload-csrf",
-            Utc::now() + Duration::hours(1),
-        )
-        .unwrap();
-    state.db().verify_mfa("html-upload-session").unwrap();
-    let share_id = state
-        .db()
-        .create_share(
-            "html-upload-first",
-            None,
-            "uploads",
-            true,
-            &Permission::UploadOnly,
-            None,
-            None,
-            None,
-            1,
-            None,
-            &UploadConflictStrategy::OverwriteAllowed,
-        )
-        .unwrap();
-    let hook =
-        PublicUploadTestHook::blocking("html-upload-first", PublicUploadTestPhase::StorageLocked);
-    let hook_guard = install_public_upload_test_hook(hook.clone());
-    let app = router(state.clone());
-    let (upload, sender) =
-        controlled_multipart_request("/v/html-upload-first/upload", "existing.txt", b"new", true);
-    let upload_app = app.clone();
-    let upload = tokio::spawn(async move { upload_app.oneshot(upload).await.unwrap() });
-    wait_for_upload_fragment(root.path()).await;
-
-    finish_controlled_multipart(sender).await;
-    hook.wait_until_entered().await;
-    let policy_app = app.clone();
-    let policy = tokio::spawn(async move {
-        policy_app
-            .oneshot(html_share_strategy_request(
-                share_id,
-                "reject",
-                "html-upload-session",
-                "html-upload-csrf",
-            ))
-            .await
-            .unwrap()
-    });
-    tokio::task::yield_now().await;
-    assert!(!policy.is_finished());
-
-    hook.release();
-    let upload = upload.await.unwrap();
-    assert_eq!(upload.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        std::fs::read(root.path().join("uploads/existing.txt")).unwrap(),
-        b"new"
-    );
-    let policy = policy.await.unwrap();
-    assert_eq!(policy.status(), StatusCode::SEE_OTHER);
-    assert_eq!(state.db().active_upload_reservations(share_id).unwrap(), 0);
-    let share = state
-        .db()
-        .share_by_token("html-upload-first")
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        share.upload_conflict_strategy,
-        UploadConflictStrategy::Reject
-    );
-    assert_eq!(share.uploaded_bytes, 3);
-    assert_eq!(share.uploaded_files, 1);
     drop(hook_guard);
 }

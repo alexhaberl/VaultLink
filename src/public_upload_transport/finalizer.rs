@@ -1,12 +1,13 @@
 use super::*;
 
-type StorageMutationGuard = crate::storage_authority::StorageMutationGuard;
+type StorageMutationGuard = crate::upload_operation::UploadStorageGuard;
 
 pub(super) struct PublicUploadFinalizer {
     pub(super) state: AppState,
     pub(super) token: String,
     pub(super) upload: PreparedUpload,
     pub(super) audit_context: AuditContext,
+    pub(super) operation_hash: String,
 }
 
 enum FinalizerStep<T> {
@@ -48,13 +49,24 @@ struct PublicationReady {
 }
 
 impl PublicUploadFinalizer {
-    pub(super) async fn run(self) -> Result<PublicUploadOutcome> {
+    pub(super) async fn run(
+        self,
+        operation_guard: &StorageMutationGuard,
+    ) -> Result<PublicUploadOutcome> {
         let upload = apply_test_finalizer_hooks(&self.state, &self.token, self.upload).await?;
-        let preflight = match preflight_upload(&self.state, &self.token, upload).await? {
-            FinalizerStep::Continue(context) => context,
-            FinalizerStep::Complete(outcome) => return Ok(outcome),
-        };
-        let committed = match commit_upload(&self.state, self.audit_context, preflight).await? {
+        let preflight =
+            match preflight_upload(&self.state, &self.token, upload, operation_guard).await? {
+                FinalizerStep::Continue(context) => context,
+                FinalizerStep::Complete(outcome) => return Ok(outcome),
+            };
+        let committed = match commit_upload(
+            &self.state,
+            self.audit_context,
+            preflight,
+            self.operation_hash,
+        )
+        .await?
+        {
             FinalizerStep::Continue(context) => context,
             FinalizerStep::Complete(outcome) => return Ok(outcome),
         };
@@ -99,10 +111,13 @@ async fn preflight_upload(
     state: &AppState,
     token: &str,
     upload: PreparedUpload,
+    operation_guard: &StorageMutationGuard,
 ) -> Result<FinalizerStep<PreflightUpload>> {
-    let storage_guard = file_ops::acquire_storage_mutation(state)
+    let acquired_guard = file_ops::acquire_storage_mutation(state)
         .await
         .map_err(storage_recovery_app_error)?;
+    operation_guard.hold(acquired_guard);
+    let storage_guard = operation_guard.clone();
     storage_locked_test_checkpoint(token).await?;
     let upload_subdir = upload.upload_subdir().to_string();
     let current_share = match get_share(state, token).await {
@@ -297,12 +312,16 @@ async fn commit_upload(
     state: &AppState,
     audit_context: AuditContext,
     context: PreflightUpload,
+    operation_hash: String,
 ) -> Result<FinalizerStep<CommittedContext>> {
     let commit = context
         .upload
         .commit(
-            state.db().clone(),
-            audit_context.clone(),
+            UploadCommitRecord {
+                database: state.db().clone(),
+                audit_context: audit_context.clone(),
+                operation_hash,
+            },
             context.allow_replace,
             context.replaced,
             context.storage.directories_to_create,
@@ -654,14 +673,70 @@ async fn ensure_public_upload_directory(
 
 pub(super) async fn run_public_upload_finalizer(
     finalizer: PublicUploadFinalizer,
+    claim_guard: crate::upload_operation::UploadClaimGuard,
     audit_client_ip: Option<std::net::IpAddr>,
     locale: i18n::Locale,
     return_to: String,
+    operation_hash: String,
+    fragment_name: String,
 ) -> Result<PublicUploadOutcome> {
+    let operation_database = finalizer.state.db().clone();
+    let operation_cleanup = finalizer.state.storage_cleanup().clone();
+    let secure_root = finalizer.state.secure_root().clone();
     let task = tokio::spawn(
         with_audit_client_ip(
             audit_client_ip,
-            i18n::scope(locale, return_to, finalizer.run()),
+            i18n::scope(locale, return_to, async move {
+                let _claim_guard = claim_guard;
+                let operation_guard = StorageMutationGuard::default();
+                let result = finalizer.run(&operation_guard).await;
+                let (state, receipt) = match &result {
+                    Ok(PublicUploadOutcome::Success(success)) => {
+                        let mut receipt = serde_json::json!({
+                            "file": success.file(),
+                            "upload_subdir": success.upload_subdir(),
+                            "outcome": success.disposition().outcome(),
+                        });
+                        if success.warnings().any() {
+                            receipt["warning"] = serde_json::json!(success.warnings().legacy_code());
+                            receipt["warnings"] = serde_json::json!(success.warnings().codes());
+                        }
+                        ("completed", Some(receipt))
+                    }
+                    Ok(PublicUploadOutcome::Rejected(rejection)) => (
+                        "rejected",
+                        Some(serde_json::json!({
+                            "status": rejection.status().as_u16(),
+                            "reason": rejection.reason_code(),
+                        })),
+                    ),
+                    Err(_) => ("outcome_unknown", None),
+                };
+                let persisted = crate::http_auth::database(operation_database, move |db| {
+                    db.finish_upload_operation(&operation_hash, state, receipt.as_ref())
+                })
+                .await?;
+                if !persisted {
+                    return Err(AppError::new(
+                        StatusCode::CONFLICT,
+                        "Upload operation changed",
+                    ));
+                }
+                if matches!(&result, Ok(PublicUploadOutcome::Success(success)) if success.disposition() != UploadDisposition::DirectoryUncertain) {
+                    operation_guard.finish_clean();
+                }
+                if state != "outcome_unknown" {
+                    let removed = tokio::task::spawn_blocking(move || {
+                        secure_root.remove_finished_upload_fragment(&fragment_name)
+                    })
+                    .await;
+                    if !matches!(removed, Ok(Ok(()))) {
+                        operation_cleanup.request_cleanup();
+                    }
+                }
+                operation_cleanup.request_cleanup();
+                result
+            }),
         )
         .instrument(tracing::Span::current()),
     );

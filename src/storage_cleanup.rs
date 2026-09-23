@@ -54,6 +54,7 @@ enum CleanupPassError {
     Io(std::io::Error),
     Join(tokio::task::JoinError),
     Recovery(file_ops::FileOperationError),
+    Database(rusqlite::Error),
 }
 
 fn report_successful_cleanup(stats: &CleanupStats) {
@@ -83,8 +84,15 @@ fn report_cleanup_error(error: &CleanupPassError) {
                 "storage cleanup could not acquire a clean namespace; retrying"
             );
         }
+        CleanupPassError::Database(error) => {
+            report_cleanup_database_error(error);
+        }
         CleanupPassError::Cancelled => {}
     }
+}
+
+fn report_cleanup_database_error(error: &rusqlite::Error) {
+    tracing::warn!(error = %EscapedLogValue::new(error), "storage cleanup could not read upload operations; retrying");
 }
 
 impl StorageCleanupCoordinator {
@@ -243,10 +251,19 @@ impl StorageCleanupCoordinator {
             }
         };
         let secure_root = state.secure_root().clone();
+        let protected = state
+            .db()
+            .protected_upload_fragments()
+            .map_err(CleanupPassError::Database)?;
         let start_root = secure_root.clone();
         let (cleanup, mut cleanup_guard, mut authority_guard) =
             tokio::task::spawn_blocking(move || {
-                let cleanup = start_root.start_upload_fragment_cleanup();
+                let cleanup = start_root
+                    .start_upload_fragment_cleanup()
+                    .map(|mut cleanup| {
+                        cleanup.protect_upload_fragments(protected);
+                        cleanup
+                    });
                 (cleanup, cleanup_guard, authority_guard)
             })
             .await
