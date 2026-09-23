@@ -235,6 +235,44 @@ fn validate_pending_transfer_index(conn: &Connection) -> rusqlite::Result<()> {
 fn validate_schema_10(conn: &Connection) -> rusqlite::Result<()> {
     validate_fingerprint(conn, SCHEMA_10_FINGERPRINT)?;
     validate_pending_transfer_index(conn)?;
+    validate_share_filter_indexes(conn, 10)?;
+    validate_indexed_schema(conn, 10)
+}
+
+fn validate_schema_11(conn: &Connection) -> rusqlite::Result<()> {
+    validate_fingerprint(conn, SCHEMA_11_FINGERPRINT)?;
+    validate_pending_transfer_index(conn)?;
+    validate_share_filter_indexes(conn, 11)?;
+    let columns = conn
+        .prepare(
+            "SELECT name,\"notnull\",dflt_value FROM pragma_table_info('public_upload_usage')
+             WHERE name='created_directories'",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns != [("created_directories".to_owned(), 1, Some("0".to_owned()))] {
+        return Err(schema_error(
+            "schema 11 directory quota column is missing or invalid",
+        ));
+    }
+    let table_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='public_upload_usage'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !normalize_schema_sql(&table_sql).contains("check(created_directories >= 0)") {
+        return Err(schema_error("schema 11 directory quota check is missing"));
+    }
+    validate_indexed_schema(conn, 11)
+}
+
+fn validate_share_filter_indexes(conn: &Connection, version: i64) -> rusqlite::Result<()> {
     for (name, expected) in SHARE_FILTER_INDEXES {
         let actual: Option<String> = conn
             .query_row(
@@ -245,11 +283,11 @@ fn validate_schema_10(conn: &Connection) -> rusqlite::Result<()> {
             .optional()?;
         if actual.as_deref().map(normalize_schema_sql) != Some(normalize_schema_sql(expected)) {
             return Err(schema_error(format!(
-                "schema 10 index {name} is missing or invalid"
+                "schema {version} index {name} is missing or invalid"
             )));
         }
     }
-    validate_indexed_schema(conn, 10)
+    Ok(())
 }
 
 fn validate_indexed_schema(conn: &Connection, version: i64) -> rusqlite::Result<()> {

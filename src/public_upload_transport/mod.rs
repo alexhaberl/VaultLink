@@ -571,6 +571,7 @@ enum PublicUploadCommit {
     Committed(Box<CommittedUpload>),
     ReservationExpired,
     ShareUnavailable,
+    DirectoryQuotaReached,
 }
 
 struct CommittedUpload {
@@ -652,6 +653,7 @@ impl PreparedUpload {
         audit_context: AuditContext,
         replace: bool,
         replaced: bool,
+        directories_to_create: u64,
         storage_guard: crate::storage_authority::StorageMutationGuard,
     ) -> Result<PublicUploadCommit> {
         let reservation_token = self.reservation.token().to_string();
@@ -660,6 +662,7 @@ impl PreparedUpload {
             database.commit_upload_reservation_and_audit_audited(
                 &reservation_token,
                 total,
+                directories_to_create,
                 &audit_context,
             )
         })
@@ -696,6 +699,12 @@ impl PreparedUpload {
                 reservation.database_finalized();
                 storage_guard.finish_clean();
                 Ok(PublicUploadCommit::ShareUnavailable)
+            }
+            UploadReservationCommitOutcome::DirectoryQuotaReached => {
+                let Self { reservation, .. } = self;
+                reservation.database_finalized();
+                storage_guard.finish_clean();
+                Ok(PublicUploadCommit::DirectoryQuotaReached)
             }
         }
     }

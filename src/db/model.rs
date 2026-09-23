@@ -425,6 +425,7 @@ pub enum UploadReservationCommitOutcome {
     Committed,
     NotFound,
     ShareUnavailable,
+    DirectoryQuotaReached,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

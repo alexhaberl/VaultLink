@@ -378,3 +378,28 @@ fn migrate_schema_9_to_10(conn: &mut Connection) -> rusqlite::Result<()> {
     validate_database(&tx)?;
     tx.commit()
 }
+
+fn migrate_schema_10_to_11(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_schema_10(&tx)?;
+    tx.execute_batch(
+        "ALTER TABLE public_upload_usage ADD COLUMN created_directories INTEGER
+         NOT NULL DEFAULT 0 CHECK(created_directories >= 0);",
+    )?;
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(11,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+        [SCHEMA_11_FINGERPRINT],
+    )?;
+    #[cfg(test)]
+    if FAIL_NEXT_SCHEMA_10_TO_11_MIGRATION.with(|flag| flag.replace(false)) {
+        return Err(schema_error("injected schema 10 to 11 migration failure"));
+    }
+    tx.pragma_update(None, "user_version", 11)?;
+    validate_schema_11(&tx)?;
+    validate_database(&tx)?;
+    tx.commit()
+}

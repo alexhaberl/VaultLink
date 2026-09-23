@@ -1,4 +1,98 @@
 #[tokio::test]
+async fn public_upload_directory_quota_counts_across_zero_byte_uploads() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db().create_admin("admin", "hash", "secret").unwrap();
+    let share_id = state
+        .db()
+        .create_share(
+            "directory-quota-upload",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let app = router(state.clone());
+    for index in 0..16 {
+        let folder = (0..16)
+            .map(|depth| format!("group-{index}-{depth}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let response = app
+            .clone()
+            .oneshot(public_folder_upload_request(
+                "/v/directory-quota-upload/upload/queue",
+                "",
+                &folder,
+                "empty.txt",
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "upload {index}");
+        assert!(root
+            .path()
+            .join("uploads")
+            .join(folder)
+            .join("empty.txt")
+            .exists());
+    }
+    let denied_folder = "overflow/a";
+    let response = app
+        .clone()
+        .oneshot(public_folder_upload_request(
+            "/v/directory-quota-upload/upload/queue",
+            "",
+            denied_folder,
+            "empty.txt",
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+    assert!(!root.path().join("uploads/overflow").exists());
+    assert_eq!(upload_fragment_count(root.path()), 0);
+    let share = state
+        .db()
+        .share_by_token("directory-quota-upload")
+        .unwrap()
+        .unwrap();
+    assert_eq!((share.uploaded_bytes, share.uploaded_files), (0, 16));
+    let connection = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
+    let created_directories: u64 = connection
+        .query_row(
+            "SELECT created_directories FROM public_upload_usage WHERE share_id=?1",
+            [share_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(created_directories, 256);
+    assert_eq!(state.db().active_upload_reservations(share_id).unwrap(), 0);
+
+    // Existing directories remain usable when no new directory is needed.
+    let response = app
+        .oneshot(public_folder_upload_request(
+            "/v/directory-quota-upload/upload/queue",
+            "",
+            "group-0-0/group-0-1/group-0-2/group-0-3/group-0-4/group-0-5/group-0-6/group-0-7/group-0-8/group-0-9/group-0-10/group-0-11/group-0-12/group-0-13/group-0-14/group-0-15",
+            "another.txt",
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn public_upload_rejects_unreadable_or_excessively_deep_targets_before_staging() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();

@@ -477,6 +477,18 @@ async fn public_folder_partial_creation_after_quota_commit_is_audited_outcome_no
         .unwrap()
         .unwrap();
     assert_eq!((share.uploaded_bytes, share.uploaded_files), (7, 1));
+    let created_directories: u64 = rusqlite::Connection::open(data.path().join("data.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT created_directories FROM public_upload_usage WHERE share_id=?1",
+            [share.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        created_directories, 3,
+        "all planned directories remain charged"
+    );
     let events = state
         .db()
         .list_audit(Some("upload_directories_created"), 10, 0)

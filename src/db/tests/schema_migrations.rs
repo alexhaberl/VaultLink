@@ -5,10 +5,17 @@ fn schema_nine_upgrade_reopens_and_preserves_encrypted_share_data() {
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
+            "INSERT INTO public_upload_usage(share_id,uploaded_bytes,uploaded_files)
+             SELECT id,7,2 FROM shares;",
+        )
+        .unwrap();
+    connection
+        .execute_batch(
             "DROP INDEX idx_shares_protected_id;
+        ALTER TABLE public_upload_usage DROP COLUMN created_directories;
         DROP INDEX idx_shares_limit_id; DROP INDEX idx_shares_expires_id;
         DROP INDEX idx_shares_available_expires_id;
-        DELETE FROM vaultlink_schema_migrations WHERE target_version=10;
+        DELETE FROM vaultlink_schema_migrations WHERE target_version>=10;
         PRAGMA user_version=9;",
         )
         .unwrap();
@@ -35,12 +42,21 @@ fn schema_nine_upgrade_reopens_and_preserves_encrypted_share_data() {
             .query_row("SELECT token_ciphertext FROM shares", [], |r| r.get(0))
             .unwrap();
         assert_eq!(actual, ciphertext);
+        let usage: (u64, u64, u64) = database
+            .conn()
+            .query_row(
+                "SELECT uploaded_bytes,uploaded_files,created_directories FROM public_upload_usage",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(usage, (7, 2, 0));
         assert_eq!(
             database
                 .conn()
                 .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            10
+            11
         );
     }
 }
@@ -93,7 +109,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let applied_at: Vec<(i64, String)> = connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3,4,5,6,7,8,9,10) ORDER BY target_version",
+             WHERE target_version BETWEEN 2 AND 11 ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -108,7 +124,7 @@ fn schema_one_migrates_once_and_preserves_data_and_encrypted_secrets() {
     let reopened_applied_at: Vec<(i64, String)> = reopened_connection
         .prepare(
             "SELECT target_version,applied_at FROM vaultlink_schema_migrations
-             WHERE target_version IN (2,3,4,5,6,7,8,9,10) ORDER BY target_version",
+             WHERE target_version BETWEEN 2 AND 11 ORDER BY target_version",
         )
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))

@@ -96,6 +96,7 @@ pub(in crate::web) async fn public_page(
             i18n::text(i18n::current_locale(), i18n::LOCAL_HTTP)
         },
         upload_notice: upload_notice(query.upload.as_deref()),
+        upload_notice_uncertain: query.upload.as_deref() == Some("audit_uncertain"),
         split_layout: share.is_directory
             && share.permission.can_download()
             && share.permission.can_upload(),
@@ -607,7 +608,7 @@ fn upload_notice(status: Option<&str>) -> Option<&'static str> {
         "replaced_uncertain" => {
             i18n::text(i18n::current_locale(), i18n::REPLACE_STORAGE_UNCONFIRMED)
         }
-        "audit_uncertain" => i18n::text(i18n::current_locale(), i18n::AUDIT_DURABILITY_UNCERTAIN),
+        "audit_uncertain" => i18n::text(i18n::current_locale(), i18n::UPLOAD_AUDIT_UNCERTAIN),
         _ => "",
     };
     (!message.is_empty()).then_some(message)

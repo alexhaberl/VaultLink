@@ -1,4 +1,6 @@
 impl Database {
+    const MAX_PUBLIC_UPLOAD_CREATED_DIRECTORIES_PER_SHARE: u64 = 256;
+
     pub fn begin_upload_reservation(
         &self,
         token: &str,
@@ -209,7 +211,7 @@ impl Database {
         token: &str,
         uploaded_bytes: u64,
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
-        self.commit_upload_reservation_internal(token, uploaded_bytes, None)
+        self.commit_upload_reservation_internal(token, uploaded_bytes, 0, None)
     }
 
     pub fn commit_upload_reservation_and_audit(
@@ -218,23 +220,30 @@ impl Database {
         uploaded_bytes: u64,
         context: &AuditContext,
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
-        self.commit_upload_reservation_internal(token, uploaded_bytes, Some(context))
+        self.commit_upload_reservation_internal(token, uploaded_bytes, 0, Some(context))
     }
 
     pub(crate) fn commit_upload_reservation_and_audit_audited(
         &self,
         token: &str,
         uploaded_bytes: u64,
+        directories_to_create: u64,
         context: &AuditContext,
     ) -> rusqlite::Result<Audited<UploadReservationCommitOutcome>> {
-        self.commit_upload_reservation_internal(token, uploaded_bytes, Some(context))
-            .map(Audited::new)
+        self.commit_upload_reservation_internal(
+            token,
+            uploaded_bytes,
+            directories_to_create,
+            Some(context),
+        )
+        .map(Audited::new)
     }
 
     fn commit_upload_reservation_internal(
         &self,
         token: &str,
         uploaded_bytes: u64,
+        directories_to_create: u64,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
         let reservation_hash = token_hash(token);
@@ -286,13 +295,33 @@ impl Database {
         if uploaded_bytes > reserved_bytes {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        let created_directories: u64 = transaction
+            .query_row(
+                "SELECT created_directories FROM public_upload_usage WHERE share_id=?1",
+                [share_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if created_directories
+            .checked_add(directories_to_create)
+            .is_none_or(|total| total > Self::MAX_PUBLIC_UPLOAD_CREATED_DIRECTORIES_PER_SHARE)
+        {
+            transaction.execute(
+                "DELETE FROM public_upload_reservations WHERE token_hash=?1",
+                [&reservation_hash],
+            )?;
+            transaction.commit()?;
+            return Ok(UploadReservationCommitOutcome::DirectoryQuotaReached);
+        }
         transaction.execute(
-            "INSERT INTO public_upload_usage(share_id,uploaded_bytes,uploaded_files)
-             VALUES(?1,?2,1)
+            "INSERT INTO public_upload_usage(share_id,uploaded_bytes,uploaded_files,created_directories)
+             VALUES(?1,?2,1,?3)
              ON CONFLICT(share_id) DO UPDATE SET
                  uploaded_bytes=uploaded_bytes+excluded.uploaded_bytes,
-                 uploaded_files=uploaded_files+1",
-            params![share_id, uploaded_bytes],
+                 uploaded_files=uploaded_files+1,
+                 created_directories=created_directories+excluded.created_directories",
+            params![share_id, uploaded_bytes, directories_to_create],
         )?;
         transaction.execute(
             "DELETE FROM public_upload_reservations WHERE token_hash=?1",
@@ -301,7 +330,9 @@ impl Database {
         let audit_events = [RequiredAuditEvent::new(
             AuditAction::UploadQuotaCommitted,
             Some(share_id.to_string()),
-            Some(format!("bytes={uploaded_bytes};files=1")),
+            Some(format!(
+                "bytes={uploaded_bytes};files=1;directories={directories_to_create}"
+            )),
         )];
         if let Some(context) = required_audit {
             insert_required_audits(&transaction, context, &audit_events)?;
