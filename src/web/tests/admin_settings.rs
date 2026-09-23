@@ -1014,6 +1014,24 @@ async fn admin_upload_operation_replays_receipt_after_file_changes() {
     let conflict = app.clone().oneshot(conflict).await.unwrap();
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
     assert!(response_text(conflict).await.contains("upload_id_conflict"));
+    for (path, overwrite) in [("other", false), ("uploads", true)] {
+        let mut changed = admin_multipart_request(
+            &state,
+            "/admin/files/upload/queue",
+            path,
+            "admin-operation-csrf",
+            "once.txt",
+            b"first",
+            overwrite,
+        );
+        changed.headers_mut().insert(header::COOKIE, cookie.clone());
+        changed
+            .headers_mut()
+            .insert("idempotency-key", id.parse().unwrap());
+        let changed = app.clone().oneshot(changed).await.unwrap();
+        assert_eq!(changed.status(), StatusCode::CONFLICT);
+        assert!(response_text(changed).await.contains("upload_id_conflict"));
+    }
     let status = app
         .clone()
         .oneshot(

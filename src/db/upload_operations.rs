@@ -235,7 +235,8 @@ impl Database {
             .transpose()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         Ok(conn.execute(
-            "UPDATE upload_operations SET state=?2,result_json=?3,expires_at=?4,
+            "UPDATE upload_operations SET state=?2,result_json=?3,
+               expires_at=CASE WHEN ?2='retryable' THEN expires_at ELSE ?4 END,
                fingerprint=CASE WHEN ?2='retryable' THEN NULL ELSE fingerprint END,
                fragment_name=CASE WHEN ?2='outcome_unknown' THEN fragment_name ELSE NULL END
              WHERE id_hash=?1 AND state IN ('processing','committing')",
@@ -361,6 +362,23 @@ mod tests {
             UploadOperationClaim::Unavailable
         ));
         assert!(database.create_upload_operation(scope).unwrap().is_some());
+    }
+
+    #[test]
+    fn retryable_upload_does_not_extend_the_registration_deadline() {
+        let database = Database::open(":memory:").unwrap();
+        let scope = UploadOperationScope::Admin(1);
+        let (id, original_expiry) = database.create_upload_operation(scope).unwrap().unwrap();
+        assert!(matches!(
+            database.claim_upload_operation(scope, &id).unwrap(),
+            UploadOperationClaim::Started
+        ));
+        assert!(database
+            .finish_upload_operation(&token_hash(&id), "retryable", None)
+            .unwrap());
+        let view = database.upload_operation(scope, &id).unwrap().unwrap();
+        assert_eq!(view.state, "retryable");
+        assert_eq!(view.expires_at, original_expiry);
     }
 
     #[test]
