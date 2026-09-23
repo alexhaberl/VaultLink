@@ -110,7 +110,7 @@ impl<'a> PublicUploadParser<'a> {
 
     async fn run(mut self, mut multipart: Multipart) -> PublicUploadPhaseResult<PreparedUpload> {
         for field in std::mem::take(&mut self.prefix) {
-            self.handle_prefix(field)?;
+            self.handle_prefix(&field)?;
         }
         while let Some(field) = multipart.next_field().await.map_err(|error| {
             public_multipart_read_rejection(
@@ -128,7 +128,7 @@ impl<'a> PublicUploadParser<'a> {
 
     fn handle_prefix(
         &mut self,
-        field: crate::upload_operation::UploadPrefixField,
+        field: &crate::upload_operation::UploadPrefixField,
     ) -> PublicUploadPhaseResult<()> {
         use crate::upload_operation::UploadPrefixKind;
         let name = match field.kind {
@@ -146,10 +146,10 @@ impl<'a> PublicUploadParser<'a> {
                 }
                 Ok(())
             }
-            UploadPrefixKind::Path => self.set_path(field.value),
-            UploadPrefixKind::FolderPath => self.set_folder_path(field.value),
-            UploadPrefixKind::Overwrite => self.set_overwrite(field.value),
-            UploadPrefixKind::Csrf if field.value.len() <= 256 => self.set_csrf(field.value),
+            UploadPrefixKind::Path => self.set_path(&field.value),
+            UploadPrefixKind::FolderPath => self.set_folder_path(&field.value),
+            UploadPrefixKind::Overwrite => self.set_overwrite(&field.value),
+            UploadPrefixKind::Csrf if field.value.len() <= 256 => self.set_csrf(&field.value),
             UploadPrefixKind::Csrf => {
                 Err(self.rejection(StatusCode::FORBIDDEN, "Invalid CSRF token"))
             }
@@ -236,12 +236,13 @@ impl<'a> PublicUploadParser<'a> {
                 "Invalid upload path",
             )
             .await?;
-        self.set_path(value)
+        self.set_path(&value)
     }
 
-    fn set_path(&mut self, value: String) -> PublicUploadPhaseResult<()> {
-        self.upload_subdir = policy::normalize_public_upload_subdir(self.share.permission, &value)
-            .map_err(|_| self.rejection(StatusCode::BAD_REQUEST, "Invalid upload path"))?;
+    fn set_path(&mut self, value: &str) -> PublicUploadPhaseResult<()> {
+        self.upload_subdir =
+            policy::normalize_public_upload_subdir(self.share.permission, value)
+                .map_err(|_| self.rejection(StatusCode::BAD_REQUEST, "Invalid upload path"))?;
         Ok(())
     }
 
@@ -257,11 +258,11 @@ impl<'a> PublicUploadParser<'a> {
                 "Invalid folder path",
             )
             .await?;
-        self.set_folder_path(value)
+        self.set_folder_path(&value)
     }
 
-    fn set_folder_path(&mut self, value: String) -> PublicUploadPhaseResult<()> {
-        let folder_path = crate::path_security::validate_relative(&value)
+    fn set_folder_path(&mut self, value: &str) -> PublicUploadPhaseResult<()> {
+        let folder_path = crate::path_security::validate_relative(value)
             .map_err(|_| self.rejection(StatusCode::BAD_REQUEST, "Invalid folder path"))?
             .to_string_lossy()
             .replace('\\', "/");
@@ -292,10 +293,10 @@ impl<'a> PublicUploadParser<'a> {
                 "Invalid upload",
             )
             .await?;
-        self.set_overwrite(value)
+        self.set_overwrite(&value)
     }
 
-    fn set_overwrite(&mut self, value: String) -> PublicUploadPhaseResult<()> {
+    fn set_overwrite(&mut self, value: &str) -> PublicUploadPhaseResult<()> {
         self.overwrite_requested = value == "1";
         if self.overwrite_requested && !self.state.config().storage.replacements_allowed() {
             return Err(self.rejection(
@@ -313,13 +314,13 @@ impl<'a> PublicUploadParser<'a> {
         let value = self
             .read_text(field, 256, StatusCode::FORBIDDEN, "Invalid CSRF token")
             .await?;
-        self.set_csrf(value)
+        self.set_csrf(&value)
     }
 
-    fn set_csrf(&mut self, value: String) -> PublicUploadPhaseResult<()> {
+    fn set_csrf(&mut self, value: &str) -> PublicUploadPhaseResult<()> {
         self.csrf_validated = self
             .required_csrf
-            .is_none_or(|expected| auth::constant_time_eq(expected, &value));
+            .is_none_or(|expected| auth::constant_time_eq(expected, value));
         if !self.csrf_validated {
             return Err(self.rejection(StatusCode::FORBIDDEN, "Invalid CSRF token"));
         }

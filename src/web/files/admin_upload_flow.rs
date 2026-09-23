@@ -115,7 +115,7 @@ impl AdminUploadParser {
         &mut self,
         state: &FileRouteState,
         admin: &crate::db::Session,
-        field: crate::upload_operation::UploadPrefixField,
+        field: &crate::upload_operation::UploadPrefixField,
     ) -> Result<()> {
         use crate::upload_operation::UploadPrefixKind;
         match field.kind {
@@ -486,7 +486,7 @@ async fn parse_admin_upload(
     let mut parser = AdminUploadParser::new(authorization, upload_id);
     for field in prefix {
         parser.record_field()?;
-        parser.handle_prefix(state, admin, field)?;
+        parser.handle_prefix(state, admin, &field)?;
     }
     while let Some(field) = multipart
         .next_field()

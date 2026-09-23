@@ -204,7 +204,7 @@
         "src/web/files/admin_upload.rs",
         "src/web/files/admin_upload_flow.rs"
       ],
-      "sha256": "478d4cc448dec6a0ec22867ef39d95cc73520f5f66b071edd232b865990d8684"
+      "sha256": "22d25d89beab36c34c5885ef37ebfd3b4fb64843071a44d39ac097e07107a1e6"
     },
     {
       "name": "shared public upload transport and adapters",
@@ -216,7 +216,7 @@
         "src/web/public_upload/mod.rs",
         "src/web/public_upload/presenter.rs"
       ],
-      "sha256": "246503200d415d6120168a42da16c35d1249a9b79b0ffde5577ea93275f92413"
+      "sha256": "0733f2ad17f68d0ec897b6d864306d315dd13f240f7db63e25c03be627c2a3a5"
     }
   ]
 }
