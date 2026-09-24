@@ -28,9 +28,19 @@ STORAGE = f"{IDENT}-storage"
 CLONE = f"{IDENT}-clone"
 CONTAINER = IDENT
 PASSWORD = "Docker runtime smoke password 123!"
+HOST_NETWORK = os.environ.get("VAULTLINK_TEST_HOST_NETWORK") == "1"
 
 
 def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    if HOST_NETWORK and args and args[0] == "run":
+        run_args = list(args)
+        if "--publish" in run_args:
+            index = run_args.index("--publish")
+            del run_args[index:index + 2]
+        listener = ([] if any(value.startswith("VAULTLINK_CONTAINER_ADDR=")
+                              for value in run_args) else
+                    ["--env", "VAULTLINK_CONTAINER_ADDR=127.0.0.1:8081"])
+        args = ("run", "--network", "host", *listener, *run_args[1:])
     return subprocess.run(
         ["docker", *args], text=True, capture_output=True, check=check, timeout=90
     )
@@ -161,7 +171,8 @@ def main() -> None:
                "--publish", "127.0.0.1::8081",
                "--volume", f"{STATE}:/var/lib/vaultlink",
                "--volume", f"{STORAGE}:/mnt/storage", IMAGE)
-        published = docker("port", CONTAINER, "8081/tcp").stdout.strip()
+        published = ("127.0.0.1:8081" if HOST_NETWORK else
+                     docker("port", CONTAINER, "8081/tcp").stdout.strip())
         host_port = int(published.rsplit(":", 1)[1])
         url = f"http://127.0.0.1:{host_port}"
         assert docker("exec", CONTAINER, "id", "-u").stdout.strip() == "10001"
@@ -301,7 +312,8 @@ def main() -> None:
                    "--publish", "127.0.0.1::8081",
                    "--volume", f"{CLONE}:/var/lib/vaultlink",
                    "--volume", f"{STORAGE}:/mnt/storage", IMAGE)
-            recovered_port = int(docker("port", recovery, "8081/tcp").stdout.strip().rsplit(":", 1)[1])
+            recovered_port = (8081 if HOST_NETWORK else int(
+                docker("port", recovery, "8081/tcp").stdout.strip().rsplit(":", 1)[1]))
             recovered_url = f"http://127.0.0.1:{recovered_port}"
             wait_http(recovered_url + "/api/v2/health/ready", 200, container=recovery)
             status, recovered_file, _ = api(recovered_url + readback_path, "GET")
@@ -309,7 +321,8 @@ def main() -> None:
         finally:
             docker("rm", "--force", recovery, check=False)
         docker("start", CONTAINER)
-        published = docker("port", CONTAINER, "8081/tcp").stdout.strip()
+        published = ("127.0.0.1:8081" if HOST_NETWORK else
+                     docker("port", CONTAINER, "8081/tcp").stdout.strip())
         host_port = int(published.rsplit(":", 1)[1])
         url = f"http://127.0.0.1:{host_port}"
         wait_http(url + "/api/v2/health/ready", 200)
@@ -317,8 +330,16 @@ def main() -> None:
         assert status == 200 and hashlib.sha256(readback).hexdigest() == upload_hash
         second = f"{IDENT}-second-instance"
         try:
+            if HOST_NETWORK:
+                docker("run", "--rm", "--user", "0:0", "--entrypoint", "sed",
+                       "--volume", f"{CLONE}:/var/lib/vaultlink", IMAGE,
+                       "-i", "s/127\\.0\\.0\\.1:8080/127.0.0.1:18083/",
+                       "/var/lib/vaultlink/config.toml")
             docker("run", "--detach", "--name", second,
                    "--user", "10001:10001", "--read-only", "--cap-drop", "ALL",
+                   *(["--env", "VAULTLINK_CONTAINER_ADDR=127.0.0.1:18082",
+                      "--env", "VAULTLINK_SETUP_ADDR=127.0.0.1:18083"]
+                     if HOST_NETWORK else []),
                    "--volume", f"{CLONE}:/var/lib/vaultlink",
                    "--volume", f"{STORAGE}:/mnt/storage", IMAGE)
             for _ in range(50):
@@ -327,6 +348,10 @@ def main() -> None:
                 time.sleep(0.2)
             assert docker("inspect", second, "--format", "{{.State.ExitCode}}").stdout.strip() != "0", \
                 "second instance accepted the same storage root"
+            if HOST_NETWORK:
+                failure = docker("logs", second)
+                assert "storage instance lock" in (failure.stdout + failure.stderr).lower(), \
+                    "second instance failed for a reason other than the shared storage lock"
         finally:
             docker("rm", "--force", second, check=False)
         log_result = docker("logs", CONTAINER)

@@ -4,6 +4,7 @@ trap 'printf "rootless smoke failed at line %s\n" "$LINENO" >&2' ERR
 
 image=${VAULTLINK_TEST_IMAGE:?Set VAULTLINK_TEST_IMAGE}
 compose_project="vaultlink-rootless-ci-${GITHUB_RUN_ID:-local}"
+compose_files=(-f deploy/docker/compose.rootless.yaml -f tools/fixtures/compose.rootless-ci.yaml)
 command -v dockerd-rootless.sh >/dev/null || {
   sudo apt-get update
   sudo apt-get install -y uidmap slirp4netns fuse-overlayfs
@@ -21,9 +22,13 @@ command -v dockerd-rootless.sh >/dev/null || {
   mkdir -p "$RUNNER_TEMP/vaultlink-rootless-tools"
   (cd "$RUNNER_TEMP/vaultlink-rootless-tools" \
     && apt-get download 'docker-ce-rootless-extras=5:29.8.1-1~ubuntu.24.04~noble' \
-    && dpkg-deb -x docker-ce-rootless-extras_*.deb .)
+      'docker-ce=5:29.8.1-1~ubuntu.24.04~noble' \
+    && for package in docker-ce-rootless-extras_*.deb docker-ce_*.deb; do
+      dpkg-deb -x "$package" .
+    done)
   export PATH="$RUNNER_TEMP/vaultlink-rootless-tools/usr/bin:$PATH"
 }
+dockerd --version | grep -q '^Docker version 29\.8\.1,'
 command -v newuidmap >/dev/null
 command -v newgidmap >/dev/null
 next_subid_range() {
@@ -67,7 +72,7 @@ rootful_host=unix:///var/run/docker.sock
 
 cleanup() {
   VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
-    -f deploy/docker/compose.rootless.yaml down >/dev/null 2>&1 || true
+    "${compose_files[@]}" down >/dev/null 2>&1 || true
   if [[ -n ${daemon_pid:-} ]]; then
     kill "$daemon_pid" 2>/dev/null || true
     wait "$daemon_pid" 2>/dev/null || true
@@ -77,7 +82,7 @@ trap cleanup EXIT
 
 XDG_DATA_HOME="$rootless_data_dir" dockerd-rootless.sh \
   --host "$DOCKER_HOST" --storage-driver=fuse-overlayfs \
-  --iptables=false --ip6tables=false \
+  --bridge=none --iptables=false --ip6tables=false \
   >"$RUNNER_TEMP/vaultlink-rootless-daemon.log" 2>&1 &
 daemon_pid=$!
 for attempt in {1..90}; do
@@ -99,19 +104,20 @@ fi
 docker info --format '{{.DockerRootDir}} {{json .SecurityOptions}}'
 
 docker --host "$rootful_host" save "$image" | docker load
-VAULTLINK_TEST_EXPECT_ROOTLESS=1 python3 tools/docker-runtime-smoke.py
-VAULTLINK_IMAGE="$image" docker compose -f deploy/docker/compose.rootless.yaml config --quiet
+VAULTLINK_TEST_EXPECT_ROOTLESS=1 VAULTLINK_TEST_HOST_NETWORK=1 \
+  python3 tools/docker-runtime-smoke.py
+VAULTLINK_IMAGE="$image" docker compose "${compose_files[@]}" config --quiet
 VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
-  -f deploy/docker/compose.rootless.yaml run --rm --user 0 \
+  "${compose_files[@]}" run --rm --user 0 \
   --entrypoint bash vaultlink -ec \
   'install -d -o 10001 -g 10001 -m 0700 /var/lib/vaultlink \
    /mnt/storage/shared /mnt/storage/.vaultlink-internal \
    /mnt/storage/.vaultlink-internal/uploads \
    /mnt/storage/.vaultlink-internal/tombstones'
 VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
-  -f deploy/docker/compose.rootless.yaml up -d
+  "${compose_files[@]}" up -d
 service_container=$(VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
-  -f deploy/docker/compose.rootless.yaml ps -q vaultlink)
+  "${compose_files[@]}" ps -q vaultlink)
 test "$(docker exec "$service_container" id -u)" = 10001
 for ((attempt = 0; attempt < 30; attempt++)); do
   code=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/ || true)

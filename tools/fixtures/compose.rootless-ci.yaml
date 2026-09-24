@@ -1,0 +1,8 @@
+# GitHub-hosted runners deny bridge creation in an unprivileged user namespace.
+# This overlay is only for the rootless CI smoke on Docker Engine 29.5+.
+services:
+  vaultlink:
+    network_mode: host
+    ports: !reset []
+    environment:
+      VAULTLINK_CONTAINER_ADDR: "127.0.0.1:${VAULTLINK_HOST_PORT:-18080}"
