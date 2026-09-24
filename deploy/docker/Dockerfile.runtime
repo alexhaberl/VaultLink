@@ -1,0 +1,39 @@
+# syntax=docker.io/docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+ARG BUILDER_IMAGE=ghcr.io/alexhaberl/vaultlink-package-builder-debian13@sha256:3e8d5deac3091310a98ce33edfc0aecfc7eada6a9a4f560dc9a45a3cd0bddb14
+ARG RUNTIME_IMAGE=docker.io/library/debian@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
+
+FROM ${BUILDER_IMAGE} AS builder
+WORKDIR /work
+COPY . .
+RUN cargo build --release --locked \
+    && test -x target/release/vaultlink \
+    && test ! -e config.toml \
+    && test ! -e .env
+
+FROM ${RUNTIME_IMAGE} AS runtime
+ARG VERSION
+ARG VCS_REF
+LABEL org.opencontainers.image.title="VaultLink" \
+      org.opencontainers.image.source="https://github.com/alexhaberl/VaultLink" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.licenses="MIT"
+
+RUN printf 'vaultlink:x:10001:\n' >>/etc/group \
+    && printf 'vaultlink:x:10001:10001:VaultLink:/var/lib/vaultlink:/usr/sbin/nologin\n' >>/etc/passwd \
+    && install -d -o 10001 -g 10001 -m 0700 /var/lib/vaultlink \
+    && install -d -o 10001 -g 10001 -m 0755 /mnt/storage
+COPY --from=builder /work/target/release/vaultlink /usr/local/bin/vaultlink
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /work/LICENSE /usr/share/doc/vaultlink/LICENSE
+COPY --from=builder /work/config /usr/share/doc/vaultlink/config
+COPY deploy/docker/container-entrypoint.sh /usr/local/bin/container-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/container-entrypoint.sh
+
+ENV VAULTLINK_BIN=/usr/local/bin/vaultlink \
+    VAULTLINK_CONFIG_PATH=/var/lib/vaultlink/config.toml \
+    VAULTLINK_INSTALL_METHOD=container
+WORKDIR /var/lib/vaultlink
+EXPOSE 8081/tcp
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/container-entrypoint.sh"]

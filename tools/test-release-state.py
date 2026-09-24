@@ -159,6 +159,10 @@ def test_lifecycle() -> None:
         "context": f"vaultlink/nixos-{architecture}", "state": "success",
         "run_url": "https://github.com/example/VaultLink/actions/runs/1",
     } for architecture in ("amd64", "arm64"))
+    current["required_commit_gates"].extend({
+        "context": f"vaultlink/docker-{architecture}", "state": "success",
+        "run_url": "https://github.com/example/VaultLink/actions/runs/1",
+    } for architecture in ("amd64", "arm64"))
     patched["development_version"] = patched["supported_version"] = patched_version
     for item in patched["releases"]:
         if item.get("superseded_by") == previous:
@@ -170,6 +174,12 @@ def test_lifecycle() -> None:
         if gate["context"] != "vaultlink/nixos-arm64"
     ]
     assert any("gate set is incomplete" in error for error in errors(missing_nixos))
+    missing_docker = copy.deepcopy(patched)
+    entry(missing_docker)["required_commit_gates"] = [
+        gate for gate in entry(missing_docker)["required_commit_gates"]
+        if gate["context"] != "vaultlink/docker-arm64"
+    ]
+    assert any("gate set is incomplete" in error for error in errors(missing_docker))
     current["required_commit_gates"].append({
         "context": "vaultlink/performance", "state": "success",
         "run_url": "https://github.com/example/VaultLink/actions/runs/1",

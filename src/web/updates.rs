@@ -20,7 +20,7 @@ pub(super) async fn status(
     headers: HeaderMap,
 ) -> Result<Json<Status>> {
     session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    if updates::is_nixos_installation() {
+    if updates::external_install_method().is_some() {
         return Ok(Json(Status::disconnected()));
     }
     Ok(Json(
@@ -46,10 +46,14 @@ pub(super) async fn submit(
 ) -> Result<Json<Status>> {
     let authorization = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&authorization, &form.csrf)?;
-    if updates::is_nixos_installation() {
+    if let Some(method) = updates::external_install_method() {
         return Err(AppError(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Updates are managed by NixOS",
+            if method == "nixos" {
+                "Updates are managed by NixOS"
+            } else {
+                "Updates are managed by the container host"
+            },
         ));
     }
     let action = match (form.operation.as_str(), form.version, form.enabled) {

@@ -24,6 +24,7 @@ for fixture in \
     deploy/docker/Dockerfile.package-builder \
     deploy/docker/Dockerfile.qemu-runner \
     deploy/docker/Dockerfile.distro-vm-image \
+    deploy/docker/Dockerfile.runtime \
     README.md \
     docs/INSTALLATION.md \
     src/setup/routes.rs; do

@@ -69,6 +69,9 @@ supported in-place upgrade path; see the [release history](CHANGELOG.md).
 
 For a local development preview, follow the [container setup guide](docs/CONTAINER-SETUP.md).
 Its smoke image includes build tools and is intended for development and testing.
+The next release also plans an [official Docker Engine deployment](docs/DOCKER.md)
+using a GHCR image for Linux amd64 and arm64. Docker Desktop on Windows remains
+a development preview. The immutable 0.7.1 release has no runtime image.
 
 The development branch also contains a [NixOS 26.05 deployment guide](docs/NIXOS.md)
 and a repository flake for amd64 and arm64. NixOS is not part of the immutable
@@ -132,6 +135,7 @@ make run
 | [Updates and rollback](docs/UPGRADE-ROLLBACK.md) | Package-bound updates, backups, and recovery |
 | [Package contract](docs/PACKAGING.md) | Package contents, target matrix, and build/release requirements |
 | [NixOS deployment](docs/NIXOS.md) | Flake installation, local/SMB storage, updates and recovery |
+| [Docker Engine deployment](docs/DOCKER.md) | GHCR image, Compose, Linux storage, updates and recovery |
 | [Threat model](THREAT_MODEL.md) | Trust boundaries, security invariants, and accepted risks |
 
 The supported 0.7.1 release uses database schema 10; the superseded 0.6.0 release

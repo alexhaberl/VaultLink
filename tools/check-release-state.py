@@ -116,7 +116,10 @@ def validate_state(state: dict[str, Any], errors: list[str]) -> tuple[str, str, 
         # Historical immutable releases predate the NixOS target. The first
         # subsequent supported release must carry both new exact-commit gates.
         if tuple(map(int, supported.split("."))) > (0, 7, 1):
-            required_contexts.update({"vaultlink/nixos-amd64", "vaultlink/nixos-arm64"})
+            required_contexts.update({
+                "vaultlink/nixos-amd64", "vaultlink/nixos-arm64",
+                "vaultlink/docker-amd64", "vaultlink/docker-arm64",
+            })
         observed_contexts: set[str] = set()
         if isinstance(gates, list):
             for gate in gates:

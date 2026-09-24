@@ -19,7 +19,11 @@ mkdir -p "$(dirname -- "$CONFIG_PATH")"
     --config "$CONFIG_PATH" &
 PROXY_PID="$!"
 
-"$BIN" setup --config "$CONFIG_PATH" --listen "$SETUP_ADDR" &
+if [[ -e "$CONFIG_PATH" ]]; then
+    "$BIN" --config "$CONFIG_PATH" &
+else
+    "$BIN" setup --config "$CONFIG_PATH" --listen "$SETUP_ADDR" &
+fi
 VAULTLINK_PID="$!"
 
 # Invoked indirectly by the EXIT/INT/TERM traps.

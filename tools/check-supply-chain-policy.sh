@@ -117,9 +117,10 @@ check_audit_remediation_policy() {
     audit_package_builder="$audit_root/deploy/docker/Dockerfile.package-builder"
     audit_qemu_builder="$audit_root/deploy/docker/Dockerfile.qemu-runner"
     audit_vm_builder="$audit_root/deploy/docker/Dockerfile.distro-vm-image"
+    audit_runtime="$audit_root/deploy/docker/Dockerfile.runtime"
 
     for audit_dockerfile in \
-        "$audit_package_builder" "$audit_qemu_builder" "$audit_vm_builder"; do
+        "$audit_package_builder" "$audit_qemu_builder" "$audit_vm_builder" "$audit_runtime"; do
         if [ ! -f "$audit_dockerfile" ] || [ -L "$audit_dockerfile" ]; then
             report "release Dockerfile is missing or unsafe: $audit_dockerfile"
             continue
@@ -141,7 +142,7 @@ check_audit_remediation_policy() {
         if grep -E -i -q '^[[:space:]]*#[[:space:]]*syntax[[:space:]]*=' \
                 "$audit_dockerfile"; then
             case "$audit_dockerfile" in
-                "$audit_package_builder"|"$audit_qemu_builder"|"$audit_vm_builder") ;;
+                "$audit_package_builder"|"$audit_qemu_builder"|"$audit_vm_builder"|"$audit_runtime") ;;
                 *) report "unreviewed Dockerfile frontend directive in $audit_dockerfile" ;;
             esac
         fi
@@ -1354,6 +1355,12 @@ for architecture in amd64 arm64; do
         || ! grep -F -q "$context" .github/workflows/soak-start.yml; then
         report "candidate, soak, tag, and NixOS producer must share exact-commit gate $context"
     fi
+    context="vaultlink/docker-$architecture"
+    if ! grep -F -q 'context="vaultlink/docker-$architecture"' .github/workflows/docker-runtime.yml \
+        || ! grep -F -q "$context" .github/workflows/release.yml \
+        || ! grep -F -q "$context" .github/workflows/soak-start.yml; then
+        report "candidate, soak, tag, and Docker producer must share exact-commit gate $context"
+    fi
 done
 for workflow in \
     .github/workflows/packages.yml \
@@ -1385,6 +1392,8 @@ for gate_context in \
     vaultlink/native-arm64 \
     vaultlink/nixos-amd64 \
     vaultlink/nixos-arm64 \
+    vaultlink/docker-amd64 \
+    vaultlink/docker-arm64 \
     vaultlink/fuzz-600s-amd64 \
     vaultlink/fuzz-600s-arm64 \
     vaultlink/packages \

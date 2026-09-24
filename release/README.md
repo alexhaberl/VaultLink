@@ -50,6 +50,13 @@ contract. Both `vaultlink/nixos-amd64` and `vaultlink/nixos-arm64` must be
 successful for the exact frozen commit in release preflights and before the
 72-hour soak starts. Historical 0.7.1 evidence remains unchanged. See
 [the NixOS deployment guide](../docs/NIXOS.md).
+The next release also publishes a multiarch Docker runtime image to GHCR
+after the immutable signed native release succeeds. Its exact frozen commit
+must first pass `vaultlink/docker-amd64` and `vaultlink/docker-arm64` in the
+same preflights and before the soak. The image adds no GitHub release asset.
+Operators pin its top-level digest and keep the SQLite database, config and
+keyring with the matching image during recovery. See [the Docker deployment
+guide](../docs/DOCKER.md).
 
 ## Signing key
 

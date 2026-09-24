@@ -11,8 +11,12 @@ pub use host::run_host;
 pub(crate) const SOCKET: &str = "/run/vaultlink-update-control/control.sock";
 const MAX_MESSAGE: usize = 8192;
 
-pub(crate) fn is_nixos_installation() -> bool {
-    std::env::var("VAULTLINK_INSTALL_METHOD").ok().as_deref() == Some("nixos")
+pub(crate) fn external_install_method() -> Option<&'static str> {
+    match std::env::var("VAULTLINK_INSTALL_METHOD").ok().as_deref() {
+        Some("nixos") => Some("nixos"),
+        Some("container") => Some("container"),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -63,7 +67,7 @@ impl Status {
     pub(crate) fn disconnected() -> Self {
         Self {
             installed: env!("CARGO_PKG_VERSION").into(),
-            install_method: is_nixos_installation().then(|| "nixos".into()),
+            install_method: external_install_method().map(str::to_owned),
             phase: "unavailable".into(),
             ..Self::default()
         }

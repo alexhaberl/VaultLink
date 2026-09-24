@@ -5,6 +5,9 @@
 NixOS operators should also follow the [NixOS deployment guide](NIXOS.md).
 Its private TOML configuration uses the same mount-source, ownership and
 SQLite rules described here.
+Docker Engine operators should follow the [Docker deployment guide](DOCKER.md)
+and read mount identity from inside the running container. The state bind mount
+must remain on a supported local filesystem even when the file store uses SMB.
 
 Choose the storage layout and HTTPS mode before completing
 [installation](INSTALLATION.md). Examples in this checkout describe the supported
