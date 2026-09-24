@@ -20,6 +20,11 @@ published 0.7.1 release and its 21 assets remain unchanged.
    commit-bound `vaultlink/docker-amd64` and `vaultlink/docker-arm64` status
    contexts and inspect their workflow run, conclusion, branch, path, commit
    and artifacts. A failed or absent runner blocks the release.
+   GitHub-hosted runners deny Docker bridge creation in an unprivileged user
+   namespace. Their rootless smoke uses the CI-only host-network overlay with
+   a loopback listener; it does not qualify the production bridge-network
+   Compose file. The production rootless deployment must pass item 6 on real
+   Linux hosts before it is advertised.
 3. Require both Docker gates in release dry-run, candidate and evidence
    preflights, soak-start, tag checks, supply-chain policy and release-state
    validation. Run the existing native package, fuzz, reproducibility,

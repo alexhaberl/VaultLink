@@ -41,9 +41,14 @@ def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
                               for value in run_args) else
                     ["--env", "VAULTLINK_CONTAINER_ADDR=127.0.0.1:8081"])
         args = ("run", "--network", "host", *listener, *run_args[1:])
-    return subprocess.run(
-        ["docker", *args], text=True, capture_output=True, check=check, timeout=90
+    result = subprocess.run(
+        ["docker", *args], text=True, capture_output=True, check=False, timeout=90
     )
+    if check and result.returncode:
+        raise AssertionError(
+            f"Docker {args[0]} failed (exit {result.returncode}): {result.stderr[-3000:]}"
+        )
+    return result
 
 
 def request(url: str, method: str = "GET", data: dict[str, str] | None = None,

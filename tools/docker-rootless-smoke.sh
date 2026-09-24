@@ -2,7 +2,10 @@
 set -euo pipefail
 trap 'printf "rootless smoke failed at line %s\n" "$LINENO" >&2' ERR
 
-image=${VAULTLINK_TEST_IMAGE:?Set VAULTLINK_TEST_IMAGE}
+image=${VAULTLINK_TEST_IMAGE:-}
+if [[ ${VAULTLINK_PROBE_ONLY:-0} != 1 ]]; then
+  test -n "$image" || { echo 'Set VAULTLINK_TEST_IMAGE' >&2; exit 1; }
+fi
 compose_project="vaultlink-rootless-ci-${GITHUB_RUN_ID:-local}"
 compose_files=(-f deploy/docker/compose.rootless.yaml -f tools/fixtures/compose.rootless-ci.yaml)
 command -v dockerd-rootless.sh >/dev/null || {
@@ -71,8 +74,10 @@ install -d -m 0700 "$DOCKER_CONFIG"
 rootful_host=unix:///var/run/docker.sock
 
 cleanup() {
-  VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
-    "${compose_files[@]}" down >/dev/null 2>&1 || true
+  if [[ ${VAULTLINK_PROBE_ONLY:-0} != 1 ]]; then
+    VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
+      "${compose_files[@]}" down >/dev/null 2>&1 || true
+  fi
   if [[ -n ${daemon_pid:-} ]]; then
     kill "$daemon_pid" 2>/dev/null || true
     wait "$daemon_pid" 2>/dev/null || true
@@ -102,6 +107,14 @@ if ! grep -q 'rootless' "$RUNNER_TEMP/vaultlink-rootless-info.json"; then
   exit 1
 fi
 docker info --format '{{.DockerRootDir}} {{json .SecurityOptions}}'
+if [[ ${VAULTLINK_PROBE_ONLY:-0} == 1 ]]; then
+  probe_image=docker.io/library/debian@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
+  docker pull "$probe_image"
+  docker run --rm --network host --user 10001:10001 \
+    --entrypoint /bin/true "$probe_image"
+  printf 'Rootless Docker host-network runner probe passed\n'
+  exit 0
+fi
 
 docker --host "$rootful_host" save "$image" | docker load
 VAULTLINK_TEST_EXPECT_ROOTLESS=1 VAULTLINK_TEST_HOST_NETWORK=1 \

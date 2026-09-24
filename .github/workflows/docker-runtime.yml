@@ -13,8 +13,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rootless_probe:
+    name: Rootless runner probe (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify unprivileged daemon and container execution
+        shell: bash
+        env:
+          VAULTLINK_PROBE_ONLY: '1'
+        run: bash tools/docker-rootless-smoke.sh
+
   qualify:
     name: Docker runtime (${{ matrix.architecture }})
+    needs: rootless_probe
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     strategy:
