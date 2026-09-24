@@ -20,7 +20,7 @@ command -v dockerd-rootless.sh >/dev/null || {
   sudo apt-get update
   mkdir -p "$RUNNER_TEMP/vaultlink-rootless-tools"
   (cd "$RUNNER_TEMP/vaultlink-rootless-tools" \
-    && apt-get download docker-ce-rootless-extras \
+    && apt-get download 'docker-ce-rootless-extras=5:29.8.1-1~ubuntu.24.04~noble' \
     && dpkg-deb -x docker-ce-rootless-extras_*.deb .)
   export PATH="$RUNNER_TEMP/vaultlink-rootless-tools/usr/bin:$PATH"
 }
@@ -41,11 +41,25 @@ if ! grep -Eq "^$(id -un):[0-9]+:[0-9]{5,}$" /etc/subgid; then
   sudo usermod --add-subgids "$(next_subid_range /etc/subgid)" "$(id -un)"
 fi
 grep -E "^$(id -un):" /etc/subuid /etc/subgid
+if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
+  && [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) == 1 ]]; then
+  rootlesskit_bin=$(command -v rootlesskit)
+  test -n "$rootlesskit_bin"
+  sudo tee /etc/apparmor.d/vaultlink-ci-rootlesskit >/dev/null <<EOF
+abi <abi/4.0>,
+include <tunables/global>
+"$rootlesskit_bin" flags=(unconfined) {
+  userns,
+}
+EOF
+  sudo apparmor_parser -r /etc/apparmor.d/vaultlink-ci-rootlesskit
+fi
 
 rootless_run_dir="$RUNNER_TEMP/vaultlink-rootless-run"
 rootless_data_dir="$RUNNER_TEMP/vaultlink-rootless-data"
 install -d -m 0700 "$rootless_run_dir" "$rootless_data_dir"
 export XDG_RUNTIME_DIR="$rootless_run_dir"
+unset DOCKER_CONTEXT
 export DOCKER_HOST="unix://$rootless_run_dir/docker.sock"
 export DOCKER_CONFIG="$RUNNER_TEMP/vaultlink-rootless-cli"
 install -d -m 0700 "$DOCKER_CONFIG"
@@ -66,7 +80,8 @@ XDG_DATA_HOME="$rootless_data_dir" dockerd-rootless.sh \
   >"$RUNNER_TEMP/vaultlink-rootless-daemon.log" 2>&1 &
 daemon_pid=$!
 for attempt in {1..90}; do
-  if docker info --format '{{json .SecurityOptions}}' >"$RUNNER_TEMP/vaultlink-rootless-info.json" 2>/dev/null; then
+  if [[ -S "$rootless_run_dir/docker.sock" ]] \
+    && docker info --format '{{json .SecurityOptions}}' >"$RUNNER_TEMP/vaultlink-rootless-info.json" 2>/dev/null; then
     break
   fi
   if ! kill -0 "$daemon_pid" 2>/dev/null; then
@@ -75,7 +90,11 @@ for attempt in {1..90}; do
   fi
   sleep 1
 done
-grep -q 'rootless' "$RUNNER_TEMP/vaultlink-rootless-info.json"
+if ! grep -q 'rootless' "$RUNNER_TEMP/vaultlink-rootless-info.json"; then
+  cat "$RUNNER_TEMP/vaultlink-rootless-info.json"
+  cat "$RUNNER_TEMP/vaultlink-rootless-daemon.log"
+  exit 1
+fi
 docker info --format '{{.DockerRootDir}} {{json .SecurityOptions}}'
 
 docker --host "$rootful_host" save "$image" | docker load

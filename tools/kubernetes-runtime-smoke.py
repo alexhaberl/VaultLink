@@ -6,10 +6,8 @@ import hashlib
 import importlib.util
 import json
 import re
-import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -160,12 +158,7 @@ def main(mode: str) -> None:
                   payload) == 303
     status, readback, _ = api(URL + f"/v/{share_tokens['download_upload']}/download?path=upload.bin", "GET")
     assert status == 200 and hashlib.sha256(readback).digest() == hashlib.sha256(payload).digest()
-    with tempfile.TemporaryDirectory() as directory:
-        db = Path(directory) / "data.sqlite"
-        kubectl("cp", f"{name}:/var/lib/vaultlink/data.sqlite", str(db))
-        with sqlite3.connect(db) as connection:
-            assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-    print(f"Kubernetes setup, readiness, transfer hashes and SQLite passed: {filesystem} {source}")
+    print(f"Kubernetes setup, readiness and transfer hashes passed: {filesystem} {source}")
 
 
 if __name__ == "__main__":

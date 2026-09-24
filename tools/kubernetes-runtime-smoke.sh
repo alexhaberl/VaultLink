@@ -4,8 +4,12 @@ set -euo pipefail
 image=${VAULTLINK_TEST_IMAGE:?Set VAULTLINK_TEST_IMAGE}
 architecture=${VAULTLINK_TEST_ARCH:?Set VAULTLINK_TEST_ARCH}
 case "$architecture" in
-  amd64) kind_sha=aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d ;;
-  arm64) kind_sha=20022bee6cfcd5086cb7234d218e3454e6090022f2a8f55d1fa7fcf42c3867a2 ;;
+  amd64)
+    kind_sha=aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+    kubectl_sha=8b8f088da2dab964f853b38464033b1be15ede2839eca751482357c45abdd05a ;;
+  arm64)
+    kind_sha=20022bee6cfcd5086cb7234d218e3454e6090022f2a8f55d1fa7fcf42c3867a2
+    kubectl_sha=0ecf44450ee6063bf19dd166a103ee6df4a9034455c2abce626e6eea657d73fb ;;
   *) echo "Unsupported architecture: $architecture" >&2; exit 1 ;;
 esac
 
@@ -18,8 +22,7 @@ printf '%s  %s\n' "$kind_sha" "$bin_dir/kind" | sha256sum --check -
 chmod 0755 "$bin_dir/kind"
 kubectl_url="https://dl.k8s.io/release/v1.36.4/bin/linux/$architecture/kubectl"
 curl -fsSL "$kubectl_url" -o "$bin_dir/kubectl"
-curl -fsSL "$kubectl_url.sha256" -o "$bin_dir/kubectl.sha256"
-printf '%s  %s\n' "$(cat "$bin_dir/kubectl.sha256")" "$bin_dir/kubectl" | sha256sum --check -
+printf '%s  %s\n' "$kubectl_sha" "$bin_dir/kubectl" | sha256sum --check -
 chmod 0755 "$bin_dir/kubectl"
 
 cleanup() {
@@ -123,13 +126,22 @@ for ((attempt = 0; attempt < 60; attempt++)); do
   sleep 2
 done
 [[ $(kubectl get pods -l app=vaultlink -o name | wc -l) -eq 0 ]]
+sudo test -s "$test_root/state/config.toml"
+sudo test -s "$test_root/state/data.sqlite"
+sudo test -s "$test_root/state/secrets.keyring"
+sudo sha256sum \
+  "$test_root/state/config.toml" \
+  "$test_root/state/data.sqlite" \
+  "$test_root/state/secrets.keyring" \
+  "$test_root/storage/shared/readme.txt" \
+  "$test_root/storage/shared/uploads/upload.bin" \
+  | tee "$test_root/paired-hashes.txt" >/dev/null
 sudo tar -C "$test_root" -cf "$test_root/paired-backup.tar" state storage
 sudo rm "$test_root/state/data.sqlite"
+sudo truncate -s 0 "$test_root/storage/shared/readme.txt"
 sudo tar -C "$test_root" -xf "$test_root/paired-backup.tar"
-test -s "$test_root/state/data.sqlite" || sudo test -s "$test_root/state/data.sqlite"
-sudo cp "$test_root/state/data.sqlite" "$test_root/database-check.sqlite"
-sudo chown "$(id -u):$(id -g)" "$test_root/database-check.sqlite"
-python3 - "$test_root/database-check.sqlite" <<'PY'
+sudo sha256sum --check "$test_root/paired-hashes.txt"
+sudo python3 - "$test_root/state/data.sqlite" <<'PY'
 import sqlite3
 import sys
 with sqlite3.connect(sys.argv[1]) as db:
