@@ -55,8 +55,10 @@ jobs:
           printf 'system=%s\ncommit=%s\nkvm=yes\nfree_kib=%s\n' \
             "$NIX_SYSTEM" "$GITHUB_SHA" "$available_kib" >"evidence/$ARCHITECTURE.txt"
           for attempt in 1 2; do
+            rebuild=()
+            if [[ "$attempt" == 2 ]]; then rebuild=(--rebuild); fi
             output=$(nix build ".#packages.$NIX_SYSTEM.vaultlink" \
-              --rebuild --no-link --print-out-paths --no-write-lock-file)
+              "${rebuild[@]}" --no-link --print-out-paths --no-write-lock-file)
             test -x "$output/bin/vaultlink"
             "$output/bin/vaultlink" --version
             sha256sum "$output/bin/vaultlink" | awk '{print $1}' \
