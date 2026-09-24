@@ -5,10 +5,12 @@ It does not amend the immutable 0.7.1 release or its eleven-gate history.
 
 1. Freeze `flake.lock`, the Rust toolchain, package derivation, module,
    documentation and local/SMB VM tests before selecting the final commit.
-   Pin one reviewed Nixpkgs 26.05 revision. Check current NixOS support dates.
+   Pin one reviewed Nixpkgs 26.05 revision. Update the upgrade fixture's
+   source pin to the actual immediately preceding supported VaultLink release
+   before the candidate freeze. Check current NixOS support dates.
 2. Build the package twice, without reusing its output, on native GitHub
    amd64 and arm64 runners. Compare binary and Nix output hashes. Boot the
-   local-storage and SMB guests on both architectures and review evidence for
+   local-storage, SMB and old-version upgrade guests on both architectures and review evidence for
    mount identity, access control, readiness, transfer integrity, SQLite,
    restart and recovery behavior.
 3. Require `vaultlink/nixos-amd64` and `vaultlink/nixos-arm64` from successful

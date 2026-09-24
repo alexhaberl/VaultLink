@@ -1407,8 +1407,9 @@ for workflow in .github/workflows/release.yml .github/workflows/soak-start.yml; 
     fi
 done
 if ! grep -F -q -- '--name "vaultlink-release-unsigned-$APPROVED_COMMIT"' .github/workflows/soak-start.yml \
-    || ! grep -F -q 'tools/verify-package-release.sh "$candidate_artifact" 0.7.1' .github/workflows/soak-start.yml \
-    || ! grep -F -q 'package-targets.py asset debian13-amd64 0.7.1' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'tools/verify-package-release.sh "$candidate_artifact" "$package_version"' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'package-targets.py asset debian13-amd64 "$package_version"' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'package_version=$(sed -n' .github/workflows/soak-start.yml \
     || ! grep -F -q 'dpkg-deb -x "$candidate_artifact/$deb" "$extracted"' .github/workflows/soak-start.yml \
     || ! grep -F -q 'usr/lib/vaultlink/package/vaultlink' .github/workflows/soak-start.yml \
     || ! grep -F -q 'candidate_binary_sha256' .github/workflows/soak-start.yml \

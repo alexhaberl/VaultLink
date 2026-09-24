@@ -1,13 +1,16 @@
-{ lib, makeRustPlatform, rust-bin }:
+{ lib, makeRustPlatform, rust-bin
+, source ? lib.cleanSource ../.
+, packageVersion ? (builtins.fromTOML (builtins.readFile ../Cargo.toml)).package.version
+, cargoLockFile ? ../Cargo.lock
+}:
 let
   toolchain = rust-bin.fromRustupToolchainFile ../rust-toolchain.toml;
   rustPlatform = makeRustPlatform { cargo = toolchain; rustc = toolchain; };
-  manifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
 in rustPlatform.buildRustPackage {
   pname = "vaultlink";
-  version = manifest.package.version;
-  src = lib.cleanSource ../.;
-  cargoLock.lockFile = ../Cargo.lock;
+  version = packageVersion;
+  src = source;
+  cargoLock.lockFile = cargoLockFile;
   cargoBuildFlags = [ "--bin" "vaultlink" ];
   # Native CI runs the Rust suite on both architectures. The Nix derivation
   # builds the release payload; booted NixOS tests exercise that exact output.

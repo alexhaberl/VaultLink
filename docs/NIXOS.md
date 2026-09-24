@@ -41,6 +41,34 @@ remain unavailable; update the pinned flake and rebuild the host instead.
 Prepare an existing ext4, XFS, Btrfs or other audited local filesystem as a
 real mount at `storageMountPath`, or configure a CIFS mount in the host's
 `fileSystems` using the exact options in [the storage guide](CONFIGURATION.md).
+For an ext4 volume, first provision the filesystem and its UUID outside Nix,
+then declare the mount in the host module:
+
+```nix
+fileSystems."/mnt/storage" = {
+  device = "/dev/disk/by-uuid/REPLACE-WITH-REAL-UUID";
+  fsType = "ext4";
+  options = [ "nosuid" "nodev" "noexec" ];
+};
+```
+
+For a pre-provisioned SMB share, keep the credential file root-owned at
+`/etc/vaultlink/smb.credentials` with mode `0600`; put only its **path** in the
+Nix configuration:
+
+```nix
+fileSystems."/mnt/storage" = {
+  device = "//fileserver.example/vaultlink";
+  fsType = "cifs";
+  options = [
+    "credentials=/etc/vaultlink/smb.credentials" "_netdev"
+    "vers=3.1.1" "sec=ntlmsspi" "seal" "cache=strict" "serverino"
+    "nosuid" "nodev" "noexec"
+    "uid=vaultlink" "gid=vaultlink" "file_mode=0600" "dir_mode=0700"
+  ];
+};
+```
+
 For SMB, pre-provision `.vaultlink-internal/{uploads,tombstones}` server-side
 and enforce the documented server ACL. Mount with SMB 3.1.1, signing,
 encryption, strict cache, stable inode numbers, `nosuid,nodev,noexec`, and the
@@ -58,7 +86,12 @@ type and source it reports in the private TOML file:
 
 ```sh
 findmnt --target /mnt/storage --output TARGET,FSTYPE,SOURCE,OPTIONS
-cat /proc/self/mountinfo
+mount_id=$(findmnt --target /mnt/storage --noheadings --output ID)
+awk -v id="$mount_id" '$1 == id { for (i = 1; i <= NF; i++) if ($i == "-") {
+  print "expected_filesystem_type = \"" $(i+1) "\""
+  print "expected_mount_source = \"" $(i+2) "\""
+  exit
+}}' /proc/self/mountinfo
 ```
 
 An `UUID=` entry in `fileSystems` is not necessarily the mount source seen by
@@ -97,12 +130,31 @@ curl --fail http://127.0.0.1:8080/api/v2/health/ready
 Build the new pinned host generation **before** touching the live instance.
 Keep the old system generation and the old VaultLink flake lock. Schedule a
 maintenance window, close external ingress and stop `vaultlink.service`.
+After changing the host flake input to the reviewed new release tag and
+updating its committed lock, build without activation:
+
+```sh
+sudo nixos-rebuild build --flake /etc/nixos#my-host
+```
+
 With the process stopped, run a SQLite checkpoint and integrity check, then
 copy the current executable, `/etc/vaultlink/config.toml`,
 `/var/lib/vaultlink/data.sqlite` and `/var/lib/vaultlink/secrets.keyring` into
 one new root-owned mode-`0700` backup directory. Record SHA-256 hashes and
 owners/modes of every member. Protect the directory as credential material.
 Do not copy an active SQLite database or combine files from separate backups.
+
+```sh
+sudo systemctl stop vaultlink.service
+sudo sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA integrity_check;'
+sudo install -d -o root -g root -m 0700 /var/backups/vaultlink
+sudo install -d -o root -g root -m 0700 /var/backups/vaultlink/BEFORE-NEW-TAG
+sudo cp -L /run/current-system/sw/bin/vaultlink /var/backups/vaultlink/BEFORE-NEW-TAG/vaultlink
+sudo cp -a /etc/vaultlink/config.toml /var/lib/vaultlink/data.sqlite \
+  /var/lib/vaultlink/secrets.keyring /var/backups/vaultlink/BEFORE-NEW-TAG/
+sudo sh -c 'cd /var/backups/vaultlink/BEFORE-NEW-TAG && sha256sum vaultlink config.toml data.sqlite secrets.keyring > SHA256SUMS'
+sudo stat -c '%n %U:%G %a' /var/backups/vaultlink/BEFORE-NEW-TAG/*
+```
 
 Activate the already built generation with `nixos-rebuild switch --flake
 /etc/nixos#my-host`. Verify the running executable and health version, the
@@ -117,6 +169,22 @@ backup member is unavailable or fails validation, leave the service stopped
 for operator recovery. **Never use generation rollback alone after a schema
 migration.** An older manual database restore also requires revoking service
 tokens as described in [recovery rules](UPGRADE-ROLLBACK.md#recovery-rules).
+
+```sh
+sudo systemctl stop vaultlink.service
+sudo systemctl mask --runtime vaultlink.service
+sudo nixos-rebuild switch --rollback
+sudo sh -c 'cd /var/backups/vaultlink/BEFORE-NEW-TAG && sha256sum -c SHA256SUMS'
+sudo rm -f /var/lib/vaultlink/data.sqlite-wal /var/lib/vaultlink/data.sqlite-shm
+sudo cp -a /var/backups/vaultlink/BEFORE-NEW-TAG/config.toml /etc/vaultlink/config.toml
+sudo cp -a /var/backups/vaultlink/BEFORE-NEW-TAG/data.sqlite \
+  /var/backups/vaultlink/BEFORE-NEW-TAG/secrets.keyring /var/lib/vaultlink/
+sudo sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check;'
+# After checking the restored file hashes, owners and modes:
+sudo systemctl unmask --runtime vaultlink.service
+sudo systemctl start vaultlink.service
+curl --fail http://127.0.0.1:8080/api/v2/health/ready
+```
 
 The native DEB/RPM/Pacman updater, GUI host controller, installation marker and
 package-runtime guard do not apply to NixOS. NixOS package builds and local/SMB

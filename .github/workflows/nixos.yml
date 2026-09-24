@@ -48,10 +48,14 @@ jobs:
           mkdir -p evidence
           printf 'state=failure\n' >"evidence/$ARCHITECTURE.env"
           test "$(uname -m)" = "$EXPECTED_UNAME"
-          nix flake check --no-build --all-systems --no-write-lock-file
+          if [[ "${DETERMINATE_NIX_KVM:-0}" != 1 ]]; then
+            echo "KVM is unavailable on $RUNNER_NAME ($NIX_SYSTEM); NixOS VM qualification requires a KVM-capable GitHub runner" >&2
+            exit 1
+          fi
           test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
           available_kib=$(df -Pk / | awk 'NR==2 {print $4}')
           test "$available_kib" -ge 4194304
+          nix flake check --no-build --all-systems --no-write-lock-file
           printf 'system=%s\ncommit=%s\nkvm=yes\nfree_kib=%s\n' \
             "$NIX_SYSTEM" "$GITHUB_SHA" "$available_kib" >"evidence/$ARCHITECTURE.txt"
           for attempt in 1 2; do
@@ -70,6 +74,7 @@ jobs:
           cmp evidence/output-1.sha256 evidence/output-2.sha256
           nix build ".#checks.$NIX_SYSTEM.local" --no-link --no-write-lock-file
           nix build ".#checks.$NIX_SYSTEM.smb" --no-link --no-write-lock-file
+          nix build ".#checks.$NIX_SYSTEM.upgrade" --no-link --no-write-lock-file
           cat evidence/binary-1.sha256 evidence/output-1.sha256 \
             >>"evidence/$ARCHITECTURE.txt"
           printf 'state=success\n' >"evidence/$ARCHITECTURE.env"
