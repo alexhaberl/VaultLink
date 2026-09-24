@@ -16,7 +16,7 @@ jobs:
   qualify:
     name: Docker runtime (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +73,9 @@ jobs:
           VAULTLINK_STORAGE_DIR="$RUNNER_TEMP/vaultlink-storage" \
             docker compose -f deploy/docker/compose.yaml config --quiet
           VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 python3 tools/docker-runtime-smoke.py
+          VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 bash tools/docker-rootless-smoke.sh
+          VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 \
+          VAULTLINK_TEST_ARCH="$ARCHITECTURE" bash tools/kubernetes-runtime-smoke.sh
           cat "evidence/$ARCHITECTURE/binary-2.sha256" >>"evidence/$ARCHITECTURE/image.txt"
           printf 'state=success\n' >"evidence/$ARCHITECTURE.env"
       - name: Preserve Docker runtime evidence
@@ -115,6 +118,6 @@ jobs:
             gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
               -f state="$state" \
               -f context="vaultlink/docker-$architecture" \
-              -f description="Native Docker runtime build, binary reproducibility and production smoke: $state" \
+              -f description="Native image, rootless Docker and Kubernetes deployment: $state" \
               -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           done

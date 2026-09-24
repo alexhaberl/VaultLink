@@ -10,8 +10,11 @@ published 0.7.1 release and its 21 assets remain unchanged.
    toolchain change must follow the image-refresh order in
    [release/README.md](../release/README.md#refresh-procedure).
 2. On native `ubuntu-24.04` and `ubuntu-24.04-arm` runners, build the runtime
-   image twice, compare binary hashes, and run the production container smoke
-   with real audited local storage. Review setup, unprivileged UID, missing
+   image twice, compare binary hashes, and run the standard Docker smoke, the
+   rootless-daemon smoke and the Kubernetes 1.36 local-PV smoke with real
+   audited local storage. Rootless CI must confirm `docker info` reports a
+   rootless daemon; Kubernetes CI must exercise setup, readiness, transfer
+   hashes, restart and paired state/file restore. Review unprivileged UID, missing
    mount and unsafe-rights rejection, second-instance lockout, upload/download
    hashes, restart, stopped-state backup/recovery, readiness and SQLite integrity. Require the
    commit-bound `vaultlink/docker-amd64` and `vaultlink/docker-arm64` status
@@ -39,6 +42,10 @@ published 0.7.1 release and its 21 assets remain unchanged.
    Record the index digest and publish workflow URL in the new release notes.
 6. From the released digest, repeat installation, setup, transfer/readback,
    restart, backup and recovery checks on Linux amd64 and arm64 with local
-   storage and an audited SMB mount before marking Docker officially
-   supported. Restore image and matching config, SQLite and keyring together;
-   a bare image rollback after schema migration is invalid.
+   storage and an audited SMB mount for standard Docker, with Docker-managed
+   local volumes under a rootless daemon, and with Kubernetes 1.36 local ext4
+   PVs. Record each platform, image index digest, mount identity, test result
+   and restore evidence. Restore image and matching config, SQLite and keyring
+   together; a bare image rollback after schema migration is invalid. Do not
+   advertise the rootless or Kubernetes variant until its released-digest run
+   succeeds on both architectures.

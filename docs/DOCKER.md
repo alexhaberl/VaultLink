@@ -24,6 +24,16 @@ For an ext4 volume mounted at `/srv/vaultlink/storage`, prepare ownership on
 the host. The container runs as UID/GID `10001:10001` without capabilities.
 The state and storage paths must not overlap.
 
+The bind-mount commands below assume a standard Docker Engine without user
+namespace remapping. The VaultLink process is unprivileged inside the container;
+this alone does not make the Docker daemon rootless. For an unprivileged daemon,
+use the separate [rootless deployment](DOCKER-ROOTLESS.md), which uses
+Docker-managed local volumes and tests the daemon itself in CI. Container UID
+10001 maps to a different host UID in Rootless mode, so the host ownership and
+CIFS `uid`/`gid` values below must not be copied into that setup. The same OCI
+image also has a [Kubernetes deployment](KUBERNETES.md) with its own volume and
+restart checks.
+
 ```sh
 sudo install -d -o 10001 -g 10001 -m 0700 /srv/vaultlink/state
 sudo install -d -o 10001 -g 10001 -m 0700 \

@@ -142,6 +142,9 @@ def upload(url: str, upload_id: str, payload: bytes) -> int:
 
 def main() -> None:
     try:
+        if os.environ.get("VAULTLINK_TEST_EXPECT_ROOTLESS") == "1":
+            daemon = json.loads(docker("info", "--format", "{{json .SecurityOptions}}").stdout)
+            assert any("rootless" in option for option in daemon), daemon
         for volume in (STATE, STORAGE):
             docker("volume", "create", volume)
         docker("run", "--rm", "--user", "0:0", "--entrypoint", "bash",
