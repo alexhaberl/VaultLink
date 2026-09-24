@@ -73,11 +73,11 @@ jobs:
           VAULTLINK_STORAGE_DIR="$RUNNER_TEMP/vaultlink-storage" \
             docker compose -f deploy/docker/compose.yaml config --quiet
           VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 python3 tools/docker-runtime-smoke.py
-          VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 bash tools/docker-rootless-smoke.sh \
-            | tee "evidence/$ARCHITECTURE/rootless.txt"
           VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 \
           VAULTLINK_TEST_ARCH="$ARCHITECTURE" bash tools/kubernetes-runtime-smoke.sh \
             | tee "evidence/$ARCHITECTURE/kubernetes.txt"
+          VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 bash tools/docker-rootless-smoke.sh \
+            | tee "evidence/$ARCHITECTURE/rootless.txt"
           cat "evidence/$ARCHITECTURE/binary-2.sha256" >>"evidence/$ARCHITECTURE/image.txt"
           printf 'state=success\n' >"evidence/$ARCHITECTURE.env"
       - name: Preserve Docker runtime evidence

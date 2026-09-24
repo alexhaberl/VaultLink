@@ -258,7 +258,9 @@ def main() -> None:
         docker("stop", CONTAINER)
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "data.sqlite"
-            docker("cp", f"{CONTAINER}:/var/lib/vaultlink/data.sqlite", str(database))
+            # SQLite may leave committed pages in the WAL at shutdown. Copy the
+            # complete stopped state so the integrity check sees one snapshot.
+            docker("cp", f"{CONTAINER}:/var/lib/vaultlink/.", directory)
             with closing(sqlite3.connect(database)) as connection:
                 assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         missing_mount = f"{IDENT}-missing-mount"
