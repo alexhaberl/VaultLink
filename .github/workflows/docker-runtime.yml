@@ -68,6 +68,10 @@ jobs:
              test -s /etc/ssl/certs/ca-certificates.crt && \
              test -s /usr/share/doc/vaultlink/LICENSE && \
              test -s /usr/share/doc/vaultlink/config/production-reverse-proxy.toml'
+          VAULTLINK_IMAGE=vaultlink:runtime-2 \
+          VAULTLINK_STATE_DIR="$RUNNER_TEMP/vaultlink-state" \
+          VAULTLINK_STORAGE_DIR="$RUNNER_TEMP/vaultlink-storage" \
+            docker compose -f deploy/docker/compose.yaml config --quiet
           VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 python3 tools/docker-runtime-smoke.py
           cat "evidence/$ARCHITECTURE/binary-2.sha256" >>"evidence/$ARCHITECTURE/image.txt"
           printf 'state=success\n' >"evidence/$ARCHITECTURE.env"

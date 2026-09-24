@@ -15,6 +15,7 @@ concurrency:
 env:
   IMAGE: ghcr.io/alexhaberl/vaultlink
   BUILDKIT_IMAGE: docker.io/moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+  SBOM_SCANNER: docker.io/docker/buildkit-syft-scanner@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
 
 jobs:
   prepare:
@@ -44,7 +45,8 @@ jobs:
           version=${TAG#v}
           python3 - "$version" <<'PY'
           import sys
-          assert tuple(map(int, sys.argv[1].split("."))) > (0, 7, 1)
+          if tuple(map(int, sys.argv[1].split("."))) <= (0, 7, 1):
+              raise SystemExit("published v0.7.1 and earlier have no Docker image")
           PY
           test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.draft')" = false
           test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.immutable')" = true
@@ -107,7 +109,7 @@ jobs:
             --build-arg 'VERSION=${{ needs.prepare.outputs.version }}' \
             --build-arg 'VCS_REF=${{ needs.prepare.outputs.commit }}' \
             --metadata-file build-metadata.json \
-            --provenance=mode=max --sbom=true \
+            --provenance=mode=max --sbom="generator=$SBOM_SCANNER" \
             --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" .
           digest=$(jq -r '."containerimage.digest" // empty' build-metadata.json)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]

@@ -25,7 +25,8 @@ published 0.7.1 release and its 21 assets remain unchanged.
    The `docker-publish.yml` workflow must then verify the successful tag
    workflow, the GitHub-verified annotated tag, the immutable published
    release and exact commit. It builds each image child natively with pinned
-   BuildKit, pushes by digest, assembles the `vX.Y.Z` multiarch index and
+   BuildKit and a pinned Syft SBOM scanner, pushes by digest, assembles the
+   `vX.Y.Z` multiarch index and
    records the index and child digests as a workflow artifact.
 5. Confirm `linux/amd64` and `linux/arm64` on the **top-level** GHCR index,
    verify version and source revision labels on both platforms, and confirm

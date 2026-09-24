@@ -44,6 +44,20 @@ layout and ACL described in [configuration](CONFIGURATION.md). Keep SQLite in
 `VAULTLINK_STATE_DIR` on a **local** filesystem; never put it on SMB. A second
 VaultLink instance must not use the same storage root.
 
+On a dedicated Docker host, order `docker.service` after both mounted paths.
+This prevents Docker's restart policy from reusing a bind mount created before
+a remote SMB mount appears. Add the following systemd drop-in with
+`sudo systemctl edit docker.service`, then reload systemd and restart Docker in
+a maintenance window:
+
+```ini
+[Unit]
+RequiresMountsFor=/srv/vaultlink/state /srv/vaultlink/storage
+```
+
+VaultLink's mount audit remains the final startup check; a path that exists
+without the expected filesystem does not pass.
+
 ## Image and Compose
 
 After the release is published, inspect its multiarch index and record the

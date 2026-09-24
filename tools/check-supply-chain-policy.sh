@@ -1371,7 +1371,8 @@ for requirement in \
     'test "$verified" = true' \
     'test "$reason" = valid' \
     'test "$target" = "$COMMIT"' \
-    "--provenance=mode=max --sbom=true" \
+    'SBOM_SCANNER: docker.io/docker/buildkit-syft-scanner@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9' \
+    '--provenance=mode=max --sbom="generator=$SBOM_SCANNER"' \
     'push-by-digest=true,name-canonical=true,push=true' \
     'docker buildx imagetools create --tag "$tag"' \
     'cmp platforms.expected platforms.actual'; do
