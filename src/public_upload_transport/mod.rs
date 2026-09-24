@@ -30,7 +30,10 @@ pub(crate) use test_support::{
     install_public_upload_test_hook, PublicUploadTestHook, PublicUploadTestPhase,
 };
 #[cfg(test)]
-use test_support::{upload_blocking_phase_test_checkpoint, upload_phase_test_checkpoint};
+use test_support::{
+    upload_blocking_phase_test_checkpoint, upload_crash_test_checkpoint,
+    upload_phase_test_checkpoint,
+};
 
 use crate::{
     auth,

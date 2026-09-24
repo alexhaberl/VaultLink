@@ -164,6 +164,8 @@ async fn execute_claimed_public_upload(
             "Upload operation content differs",
         ));
     }
+    #[cfg(test)]
+    upload_crash_test_checkpoint(&token, "after_staging");
     let committing_hash = operation_hash.clone();
     let committing = database(state.db().clone(), move |db| {
         db.mark_upload_committing(&committing_hash)
@@ -176,6 +178,8 @@ async fn execute_claimed_public_upload(
         ));
     }
     upload.pending.retain_for_upload_operation();
+    #[cfg(test)]
+    upload_crash_test_checkpoint(&token, "before_quota");
 
     let audit_client_ip = current_audit_client_ip();
     let locale = i18n::current_locale();

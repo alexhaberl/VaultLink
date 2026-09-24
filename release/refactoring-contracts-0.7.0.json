@@ -216,7 +216,7 @@
         "src/web/public_upload/mod.rs",
         "src/web/public_upload/presenter.rs"
       ],
-      "sha256": "616c36c9e8bf13270ead786b2dac70daaa4a5a8698b611d935692e2b324d3472"
+      "sha256": "21d8ecf1af6dc448fd8ee8fec9cc198f32f301a81a8e506ffc13feba1b7f6325"
     }
   ]
 }

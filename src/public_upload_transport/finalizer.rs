@@ -70,11 +70,20 @@ impl PublicUploadFinalizer {
             FinalizerStep::Continue(context) => context,
             FinalizerStep::Complete(outcome) => return Ok(outcome),
         };
+        #[cfg(test)]
+        upload_crash_test_checkpoint(&self.token, "after_quota");
         let publication = match prepare_publication(&self.state, committed).await? {
             FinalizerStep::Continue(context) => context,
             FinalizerStep::Complete(outcome) => return Ok(outcome),
         };
-        publish_and_audit(&self.state, publication).await
+        #[cfg(test)]
+        upload_crash_test_checkpoint(&self.token, "after_directory");
+        let result = publish_and_audit(&self.state, &self.token, publication).await;
+        #[cfg(test)]
+        if result.is_ok() {
+            upload_crash_test_checkpoint(&self.token, "after_audit");
+        }
+        result
     }
 }
 
@@ -474,6 +483,7 @@ fn destination_is_absent(upload: &CommittedUpload, destination: &SecureDirectory
 
 async fn publish_and_audit(
     state: &AppState,
+    token: &str,
     context: PublicationReady,
 ) -> Result<PublicUploadOutcome> {
     let upload = context
@@ -494,6 +504,10 @@ async fn publish_and_audit(
         Ok(upload) => upload,
         Err(error) => return publish_error(&context.upload_subdir, error),
     };
+    #[cfg(test)]
+    upload_crash_test_checkpoint(token, "after_publication");
+    #[cfg(not(test))]
+    let _ = token;
     record_publication(
         state,
         published,
@@ -689,6 +703,8 @@ pub(super) async fn run_public_upload_finalizer(
             i18n::scope(locale, return_to, async move {
                 let _claim_guard = claim_guard;
                 let operation_guard = StorageMutationGuard::default();
+                #[cfg(test)]
+                let crash_token = finalizer.token.clone();
                 let result = finalizer.run(&operation_guard).await;
                 let (state, receipt) = match &result {
                     Ok(PublicUploadOutcome::Success(success)) => {
@@ -722,6 +738,8 @@ pub(super) async fn run_public_upload_finalizer(
                         "Upload operation changed",
                     ));
                 }
+                #[cfg(test)]
+                upload_crash_test_checkpoint(&crash_token, "after_result");
                 if matches!(&result, Ok(PublicUploadOutcome::Success(success)) if success.disposition() != UploadDisposition::DirectoryUncertain) {
                     operation_guard.finish_clean();
                 }

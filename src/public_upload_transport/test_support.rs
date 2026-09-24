@@ -159,3 +159,12 @@ pub(super) fn upload_blocking_phase_test_checkpoint(
     }
     Ok(())
 }
+
+pub(super) fn upload_crash_test_checkpoint(token: &str, phase: &str) {
+    if std::env::var("VAULTLINK_TEST_UPLOAD_CRASH_PHASE").as_deref() == Ok(phase)
+        && std::env::var("VAULTLINK_TEST_UPLOAD_CRASH_TOKEN").as_deref() == Ok(token)
+    {
+        // Exit without unwinding or running PendingUpload/guard destructors.
+        std::process::exit(137);
+    }
+}
