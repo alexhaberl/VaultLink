@@ -7,9 +7,13 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    previous = {
+      url = "github:alexhaberl/VaultLink/0af4612bd3c32a995b19de4cd19ca05ac4fd4855";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay }:
+  outputs = { self, nixpkgs, rust-overlay, previous }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forSystems = f: nixpkgs.lib.genAttrs systems
@@ -27,16 +31,10 @@
       checks = forSystems (system: pkgs:
         let
           vaultlink = self.packages.${system}.vaultlink;
-          oldSource = pkgs.fetchFromGitHub {
-            owner = "alexhaberl";
-            repo = "VaultLink";
-            rev = "0af4612bd3c32a995b19de4cd19ca05ac4fd4855"; # signed v0.7.0
-            hash = "sha256-sS+5c/I3RYI6r1p7vkGThO6MqJU98ROwLPbafo5EHIQ=";
-          };
           oldPackage = pkgs.callPackage ./nix/package.nix {
-            source = oldSource;
+            source = previous;
             packageVersion = "0.7.0";
-            cargoLockFile = "${oldSource}/Cargo.lock";
+            cargoLockFile = "${previous}/Cargo.lock";
           };
           mkTest = name: import (./nix/tests + "/${name}.nix") {
             inherit pkgs self system;

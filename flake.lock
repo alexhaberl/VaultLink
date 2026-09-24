@@ -16,9 +16,27 @@
         "type": "github"
       }
     },
+    "previous": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789252631,
+        "narHash": "sha256-sS+5c/I3RYI6r1p7vkGThO6MqJU98ROwLPbafo5EHIQ=",
+        "owner": "alexhaberl",
+        "repo": "VaultLink",
+        "rev": "0af4612bd3c32a995b19de4cd19ca05ac4fd4855",
+        "type": "github"
+      },
+      "original": {
+        "owner": "alexhaberl",
+        "repo": "VaultLink",
+        "rev": "0af4612bd3c32a995b19de4cd19ca05ac4fd4855",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
+        "previous": "previous",
         "rust-overlay": "rust-overlay"
       }
     },

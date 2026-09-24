@@ -16,7 +16,11 @@ It does not amend the immutable 0.7.1 release or its eleven-gate history.
 3. Require `vaultlink/nixos-amd64` and `vaultlink/nixos-arm64` from successful
    `.github/workflows/nixos.yml` runs for the exact candidate commit. Confirm
    workflow path, event, branch, conclusion, commit and artifact hashes. Missing
-   KVM, runner storage or one guest result blocks the gate.
+   KVM, runner storage or one guest result blocks the gate. The standard
+   `ubuntu-24.04-arm` runner lacked KVM in the 2026-09-24 qualification run.
+   Use `VAULTLINK_NIXOS_ARM_RUNNER` only for a reviewed GitHub-managed ARM64
+   runner that demonstrably exposes KVM; do not attach a persistent private
+   self-hosted runner to public pull requests.
 4. Preserve the existing nine native packages and exactly 21 release assets.
    Run native, package, fuzz, reproducibility and distro VM gates in their
    existing dependency order. Include both NixOS gates in dry-run,
