@@ -14,7 +14,7 @@ fn rejects_unknown_newer_schema() {
 }
 
 #[test]
-fn fresh_database_is_exactly_schema_eleven_without_plaintext_secret_columns() {
+fn fresh_database_is_exactly_schema_twelve_without_plaintext_secret_columns() {
     let database = Database::open(":memory:").unwrap();
     let connection = database.conn();
     assert_eq!(
@@ -25,12 +25,12 @@ fn fresh_database_is_exactly_schema_eleven_without_plaintext_secret_columns() {
     );
     let migration_records: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version BETWEEN 2 AND 11 AND length(applied_at)>0",
+            "SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version BETWEEN 2 AND 12 AND length(applied_at)>0",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migration_records, 10);
+    assert_eq!(migration_records, 11);
     let directory_quota_columns: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('public_upload_usage') WHERE name='created_directories' AND \"notnull\"=1 AND dflt_value='0'",
@@ -145,7 +145,8 @@ fn fresh_database_is_exactly_schema_eleven_without_plaintext_secret_columns() {
 fn downgrade_schema_eight_to_seven(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP INDEX idx_shares_protected_id;
+            "DROP TABLE upload_operations;
+             DROP INDEX idx_shares_protected_id;
              ALTER TABLE public_upload_usage DROP COLUMN created_directories;
              DROP INDEX idx_shares_limit_id;
              DROP INDEX idx_shares_expires_id;

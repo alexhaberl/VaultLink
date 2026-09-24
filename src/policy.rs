@@ -42,6 +42,7 @@ pub fn share_upload_conflict_strategy(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UploadFormField {
+    UploadId,
     Path,
     FolderPath,
     Overwrite,
@@ -57,6 +58,7 @@ pub enum UploadFormStateError {
     DuplicateOrLateFolderPath,
     DuplicateOverwrite,
     DuplicateOrLateCsrf,
+    DuplicateOrLateUploadId,
     MultipleFiles,
     UnknownField,
 }
@@ -71,6 +73,7 @@ pub struct UploadFormState {
     saw_overwrite: bool,
     saw_csrf: bool,
     saw_file: bool,
+    saw_upload_id: bool,
 }
 
 impl UploadFormState {
@@ -84,6 +87,13 @@ impl UploadFormState {
             return Err(UploadFormStateError::TooManyFields);
         }
         match field {
+            UploadFormField::UploadId => {
+                if std::mem::replace(&mut self.saw_upload_id, true) || self.saw_file {
+                    Err(UploadFormStateError::DuplicateOrLateUploadId)
+                } else {
+                    Ok(())
+                }
+            }
             UploadFormField::Path => {
                 if std::mem::replace(&mut self.saw_path, true) || self.saw_file {
                     Err(UploadFormStateError::DuplicateOrLatePath)

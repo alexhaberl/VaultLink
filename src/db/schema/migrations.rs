@@ -403,3 +403,41 @@ fn migrate_schema_10_to_11(conn: &mut Connection) -> rusqlite::Result<()> {
     validate_database(&tx)?;
     tx.commit()
 }
+
+fn migrate_schema_11_to_12(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_schema_11(&tx)?;
+    tx.execute_batch(
+        "CREATE TABLE upload_operations(
+            id_hash TEXT PRIMARY KEY,
+            scope_kind TEXT NOT NULL CHECK(scope_kind IN ('admin','share')),
+            scope_id INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('ready','processing','retryable','committing','completed','rejected','outcome_unknown')),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            fingerprint TEXT,
+            result_json TEXT,
+            fragment_name TEXT,
+            quota_charged INTEGER NOT NULL DEFAULT 0 CHECK(quota_charged IN (0,1)),
+            CHECK(scope_id > 0)
+         );
+         CREATE INDEX idx_upload_operations_scope ON upload_operations(scope_kind,scope_id,state);
+         CREATE INDEX idx_upload_operations_exp ON upload_operations(expires_at);",
+    )?;
+    #[cfg(test)]
+    if FAIL_NEXT_SCHEMA_11_TO_12_MIGRATION.with(|flag| flag.replace(false)) {
+        return Err(schema_error("injected schema 11 to 12 migration failure"));
+    }
+    tx.execute(
+        "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(12,?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.execute(
+        "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
+        [SCHEMA_12_FINGERPRINT],
+    )?;
+    tx.pragma_update(None, "user_version", 12)?;
+    validate_schema_12(&tx)?;
+    validate_database(&tx)?;
+    tx.commit()
+}

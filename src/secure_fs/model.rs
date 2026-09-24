@@ -264,6 +264,7 @@ pub struct UploadFragmentCleanupBatch {
 /// first entry on every pass.
 pub struct UploadFragmentCleanup {
     directories: Vec<CleanupDirectory>,
+    protected_fragments: HashSet<String>,
     visited: HashSet<(u64, u64)>,
     max_directory_stack: usize,
     max_visited_directories: usize,

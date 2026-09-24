@@ -748,6 +748,7 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
     let folder_upload = app
         .clone()
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/du/upload/queue",
             "",
             "Fotos/2026/Sommer",
@@ -771,6 +772,7 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
     let traversal = app
         .clone()
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/du/upload/queue",
             "",
             "../escape",
@@ -975,6 +977,7 @@ async fn public_folder_preview_zip_search_and_subfolder_upload() {
     let uploaded = app
         .clone()
         .oneshot(multipart_request_with_path(
+            &state,
             "/v/du/upload",
             "new.txt",
             b"new",

@@ -582,11 +582,12 @@ database=/var/lib/vaultlink/data.sqlite
 # Downgrade the live database metadata to the valid schema-7 shape while the
 # idle service still owns its connection. The immediately following upgrade
 # stops the service before copying it, then the packaged binary must perform
-# the real 7->8->9->10->11 migrations during readiness startup.
+# the real 7->8->9->10->11->12 migrations during readiness startup.
 sqlite3 "$database" <<'SQL'
 BEGIN IMMEDIATE;
 INSERT INTO audit(occurred_at,actor,action,object_id,detail,priority)
 VALUES('2026-08-30T00:00:00Z','vm-gate','upload','migration-probe','preserve',100);
+DROP TABLE upload_operations;
 ALTER TABLE public_upload_usage DROP COLUMN created_directories;
 DROP INDEX idx_shares_protected_id;
 DROP INDEX idx_shares_limit_id;
@@ -621,10 +622,10 @@ backup=$(/usr/lib/vaultlink/package/deploy/vaultlink-upgrade.sh \
 [ -d "$backup" ]
 printf '%s\n' "$backup" >"$evidence/upgrade-backup.txt"
 [ "$(sqlite3 "$backup/data.sqlite" 'PRAGMA user_version;')" = 7 ]
-[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 11 ]
+[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 12 ]
 [ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM service_tokens;')" = 0 ]
 [ "$(sqlite3 "$database" \
-    'SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (8,9,10,11);')" = 4 ]
+    'SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (8,9,10,11,12);')" = 5 ]
 [ "$(sqlite3 "$database" \
     "SELECT priority FROM audit WHERE object_id='migration-probe';")" = 100 ]
 systemctl stop vaultlink.service
@@ -634,7 +635,7 @@ systemctl stop vaultlink.service
 systemctl --quiet is-active vaultlink.service
 curl --fail --silent --show-error \
     http://127.0.0.1:18081/api/v2/health/ready >"$evidence/post-rollback-readiness.json"
-[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 11 ]
+[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 12 ]
 [ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM service_tokens;')" = 0 ]
 [ "$(sqlite3 "$database" \
     "SELECT priority FROM audit WHERE object_id='migration-probe';")" = 100 ]

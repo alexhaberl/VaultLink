@@ -382,6 +382,11 @@ catalog! {
     REMOVED_FROM_QUEUE, "upload.removed_queue", "Datei aus der Warteschlange entfernt.", "File removed from the queue.";
     READY, "upload.ready", "Bereit", "Ready";
     RETRY, "upload.retry", "Erneut versuchen", "Retry";
+    CHECK_UPLOAD_STATUS, "upload.check_status", "Status prüfen", "Check status";
+    CHECKING_UPLOAD_STATUS, "upload.checking_status", "Status wird geprüft …", "Checking status…";
+    UPLOAD_IN_PROGRESS, "upload.in_progress", "Der Upload läuft noch. Status erneut prüfen.", "The upload is still in progress. Check its status again.";
+    UPLOAD_OUTCOME_UNKNOWN, "upload.outcome_unknown", "Der Ausgang dieses Uploads ist unklar. Nicht erneut hochladen; den Zustand manuell prüfen.", "The outcome of this upload is unknown. Do not retry; check the result manually.";
+    UPLOAD_ID_EXPIRED, "upload.id_expired", "Die Upload-ID ist abgelaufen. Diesen Eintrag nicht erneut senden.", "The upload ID has expired. Do not resend this item.";
     REMOVE_FROM_LIST, "upload.remove_list", "Aus Liste entfernen", "Remove from list";
     UPLOADING, "upload.uploading", "Wird hochgeladen …", "Uploading…";
     UPLOADED, "upload.uploaded", "Hochgeladen", "Uploaded";
@@ -389,6 +394,12 @@ catalog! {
     UPLOAD_PERSIST_PENDING, "upload.persist_pending", "Hochgeladen – Persistenzbestätigung ausstehend", "Uploaded – persistence confirmation pending";
     REPLACE_PERSIST_PENDING, "upload.replace_pending", "Ersetzt – Persistenzbestätigung ausstehend", "Replaced – persistence confirmation pending";
     UPLOAD_AUDIT_UNCERTAIN, "upload.audit_uncertain", "Die Datei wurde hochgeladen, aber die Dauerhaftigkeit ihrer Speicherung oder ihrer Audit-Aufzeichnung ist unklar. Nicht erneut hochladen; den Zustand manuell prüfen.", "The file was uploaded, but the durability of its storage or audit record is uncertain. Do not retry; check the result manually.";
+    UPLOAD_STORAGE_UNCERTAIN, "upload.storage_uncertain", "Die Datei wurde hochgeladen, aber die Dauerhaftigkeit ihrer Speicherung ist unklar. Nicht erneut hochladen; den Zustand manuell prüfen.", "The file was uploaded, but the durability of its storage is uncertain. Do not retry; check the result manually.";
+    UPLOAD_AUDIT_ONLY_UNCERTAIN, "upload.audit_only_uncertain", "Die Datei wurde hochgeladen, aber die Dauerhaftigkeit ihrer Audit-Aufzeichnung ist unklar. Nicht erneut hochladen; den Zustand manuell prüfen.", "The file was uploaded, but the durability of its audit record is uncertain. Do not retry; check the result manually.";
+    UPLOAD_DIRECTORY_UNCERTAIN, "upload.directory_uncertain", "Der Upload-Ordner wurde möglicherweise nur teilweise erstellt. Die Datei wurde nicht hochgeladen. Den Zustand manuell prüfen.", "The upload folder may have been created only partially. The file was not uploaded. Check the result manually.";
+    UPLOAD_DIRECTORY_AUDIT_UNCERTAIN, "upload.directory_audit_uncertain", "Der Upload-Ordner wurde möglicherweise nur teilweise erstellt, und seine Audit-Aufzeichnung ist unklar. Die Datei wurde nicht hochgeladen. Den Zustand manuell prüfen.", "The upload folder may have been created only partially, and its audit record is uncertain. The file was not uploaded. Check the result manually.";
+    UPLOAD_ID_CONFLICT_NEW_FORM, "upload.id_conflict_new_form", "Diese Upload-ID gehört zu einer anderen Datei oder einem anderen Ziel. Für einen neuen Upload dieses Formular verwenden.", "This upload ID belongs to a different file or destination. Use this form for a new upload.";
+    UPLOAD_OPERATION_LIMIT, "upload.operation_limit", "Derzeit sind zu viele Upload-Vorgänge offen. Bitte später erneut laden.", "Too many upload operations are open. Reload this page later.";
     UPLOAD_RESPONSE_UNCERTAIN, "upload.response_uncertain", "Die Serverantwort war unvollständig. Die Datei kann bereits hochgeladen sein. Nicht erneut hochladen; den Zustand manuell prüfen.", "The server response was incomplete. The file may already have been uploaded. Do not retry; check the result manually.";
     INVALID_SERVER_RESPONSE, "upload.invalid_response", "Ungültige Serverantwort", "Invalid server response";
     UPLOAD_FAILED, "upload.failed", "Upload fehlgeschlagen", "Upload failed";

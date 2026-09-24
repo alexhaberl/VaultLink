@@ -169,6 +169,7 @@ pub(super) fn start_cleanup_from_directory(
     let directory = cleanup_directory_from_file(&root, policy)?;
     Ok(UploadFragmentCleanup {
         directories: vec![directory],
+        protected_fragments: HashSet::new(),
         visited: HashSet::from([(metadata.dev(), metadata.ino())]),
         max_directory_stack: MAX_CLEANUP_DIRECTORY_STACK,
         max_visited_directories: MAX_CLEANUP_VISITED_DIRECTORIES,

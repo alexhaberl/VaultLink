@@ -783,8 +783,8 @@ async fn service_tokens_are_isolated_from_other_api_html_and_public_authority() 
     let upload_route = format!("/api/v2/public/shares/{missing_public_token}/upload");
     assert_service_token_is_neutral_on_public_route(
         &app,
-        multipart_request(&upload_route, "neutral.txt", b"public baseline"),
-        multipart_request(&upload_route, "neutral.txt", b"public baseline"),
+        multipart_request(&state, &upload_route, "neutral.txt", b"public baseline"),
+        multipart_request(&state, &upload_route, "neutral.txt", b"public baseline"),
         &token,
         &upload_route,
     )

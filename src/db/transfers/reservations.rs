@@ -211,7 +211,7 @@ impl Database {
         token: &str,
         uploaded_bytes: u64,
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
-        self.commit_upload_reservation_internal(token, uploaded_bytes, 0, None)
+        self.commit_upload_reservation_internal(token, uploaded_bytes, 0, None, None)
     }
 
     pub fn commit_upload_reservation_and_audit(
@@ -220,7 +220,7 @@ impl Database {
         uploaded_bytes: u64,
         context: &AuditContext,
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
-        self.commit_upload_reservation_internal(token, uploaded_bytes, 0, Some(context))
+        self.commit_upload_reservation_internal(token, uploaded_bytes, 0, Some(context), None)
     }
 
     pub(crate) fn commit_upload_reservation_and_audit_audited(
@@ -229,12 +229,14 @@ impl Database {
         uploaded_bytes: u64,
         directories_to_create: u64,
         context: &AuditContext,
+        operation_hash: &str,
     ) -> rusqlite::Result<Audited<UploadReservationCommitOutcome>> {
         self.commit_upload_reservation_internal(
             token,
             uploaded_bytes,
             directories_to_create,
             Some(context),
+            Some(operation_hash),
         )
         .map(Audited::new)
     }
@@ -245,6 +247,7 @@ impl Database {
         uploaded_bytes: u64,
         directories_to_create: u64,
         required_audit: Option<&AuditContext>,
+        operation_hash: Option<&str>,
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
         let reservation_hash = token_hash(token);
         let now_text = Utc::now().to_rfc3339();
@@ -313,6 +316,17 @@ impl Database {
             )?;
             transaction.commit()?;
             return Ok(UploadReservationCommitOutcome::DirectoryQuotaReached);
+        }
+        if let Some(operation_hash) = operation_hash {
+            let claimed = transaction.execute(
+                "UPDATE upload_operations SET quota_charged=1
+                 WHERE id_hash=?1 AND scope_kind='share' AND scope_id=?2
+                   AND state='committing' AND quota_charged=0",
+                params![operation_hash, share_id],
+            )?;
+            if claimed != 1 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
         }
         transaction.execute(
             "INSERT INTO public_upload_usage(share_id,uploaded_bytes,uploaded_files,created_directories)

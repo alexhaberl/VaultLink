@@ -7,8 +7,8 @@ use crate::{
 
 use super::identity::entry_identity_state;
 use super::private_entries::{
-    active_upload_fragment_guard, unregister_upload_fragment, upload_fragment_name,
-    ActiveUploadFragmentKey,
+    active_upload_fragment_guard, is_upload_fragment_name, unregister_upload_fragment,
+    upload_fragment_name, ActiveUploadFragmentKey,
 };
 use super::{linux, validated, EntryIdentityState, EntryKind, SecureDirectory, SecureRoot};
 
@@ -47,6 +47,22 @@ impl SecureRoot {
 
     pub fn begin_staged_upload(&self) -> io::Result<PendingUpload> {
         self.root.begin_staged_upload()
+    }
+
+    /// Remove a fragment only after its operation result is durably recorded.
+    /// A crash between recording and removal is handled by ordinary cleanup.
+    pub(crate) fn remove_finished_upload_fragment(&self, name: &str) -> io::Result<()> {
+        if !is_upload_fragment_name(std::ffi::OsStr::new(name)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid upload fragment",
+            ));
+        }
+        match linux::unlink(self.root.staging.as_ref(), name) {
+            Ok(()) => self.root.staging.sync_all(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -123,6 +139,7 @@ pub struct PendingUpload {
     expected_identity: (u64, u64),
     allow_replace: bool,
     published: bool,
+    retain_on_drop: bool,
     _storage_instance_lock: Option<Arc<crate::StorageInstanceLock>>,
     #[cfg(test)]
     next_directory_sync_error: Option<io::ErrorKind>,
@@ -171,6 +188,7 @@ impl PendingUpload {
                         expected_identity,
                         allow_replace,
                         published: false,
+                        retain_on_drop: false,
                         _storage_instance_lock: storage_instance_lock,
                         #[cfg(test)]
                         next_directory_sync_error: None,
@@ -200,6 +218,16 @@ impl PendingUpload {
         self.file
             .take()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "upload file already taken"))
+    }
+
+    /// Keep a durably registered operation's fragment available for crash
+    /// reconciliation even if its finalizer returns before a terminal receipt.
+    pub(crate) fn retain_for_upload_operation(&mut self) {
+        self.retain_on_drop = true;
+    }
+
+    pub(crate) fn fragment_name(&self) -> &str {
+        &self.temporary_name
     }
 
     /// Binds the already-staged fragment to its final directory capability.
@@ -489,7 +517,7 @@ fn ambiguous_publication_error(
 
 impl Drop for PendingUpload {
     fn drop(&mut self) {
-        if !self.published {
+        if !self.published && !self.retain_on_drop {
             let _ = linux::unlink(&self.staging, &self.temporary_name);
         }
         if let Some(active_key) = self.active_key.take() {

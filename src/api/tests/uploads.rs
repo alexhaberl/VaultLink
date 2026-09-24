@@ -25,9 +25,10 @@ async fn api_delegated_public_upload_errors_are_json() {
             &UploadConflictStrategy::Reject,
         )
         .unwrap();
-    let app = crate::web::router(state);
+    let app = crate::web::router(state.clone());
     let response = app
         .oneshot(multipart_request(
+            &state,
             "/api/v2/public/shares/upload-token/upload",
             "blocked.exe",
             b"blocked",
@@ -86,6 +87,7 @@ async fn api_upload_reports_required_audit_failure_and_never_publishes_the_file(
 
     let response = app
         .oneshot(multipart_request(
+            &state,
             "/api/v2/public/shares/audit-failure-upload/upload",
             "must-not-appear.txt",
             b"payload",
@@ -156,6 +158,7 @@ async fn api_upload_reports_post_publication_audit_uncertainty_without_retry_sig
 
     let response = app
         .oneshot(multipart_request(
+            &state,
             "/api/v2/public/shares/post-publish-audit-failure/upload",
             "already-visible.txt",
             b"payload",
@@ -172,6 +175,7 @@ async fn api_upload_reports_post_publication_audit_uncertainty_without_retry_sig
         .starts_with("application/json"));
     let body = response_text(response).await;
     assert!(body.contains(r#""warning":"audit_durability_uncertain""#));
+    assert!(body.contains(r#""warnings":["audit_durability_uncertain"]"#));
     assert!(body.contains(r#""file":"already-visible.txt""#));
     assert!(root.path().join("uploads/already-visible.txt").exists());
     let share = state
@@ -367,5 +371,81 @@ async fn api_share_creation_preserves_audit_unavailable_from_real_pending_recove
             .unwrap()
             .relative_path,
         "old.txt"
+    );
+}
+#[tokio::test]
+async fn api_upload_requires_preissued_id_and_exposes_durable_result() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db().create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db()
+        .create_share(
+            "api-operation",
+            None,
+            "uploads",
+            true,
+            &Permission::UploadOnly,
+            None,
+            None,
+            None,
+            1,
+            None,
+            &UploadConflictStrategy::Reject,
+        )
+        .unwrap();
+    let app = crate::web::router(state.clone());
+    let endpoint = "/api/v2/public/shares/api-operation/upload";
+    let creation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("{endpoint}/operations"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(creation.status(), StatusCode::CREATED);
+    let ticket: serde_json::Value = serde_json::from_str(&response_text(creation).await).unwrap();
+    let id = ticket["upload_id"].as_str().unwrap();
+    let mut missing = multipart_request(&state, endpoint, "missing.txt", b"x");
+    missing.headers_mut().remove("idempotency-key");
+    let missing_response = app.clone().oneshot(missing).await.unwrap();
+    assert_eq!(missing_response.status(), StatusCode::BAD_REQUEST);
+    let mut request = multipart_request(&state, endpoint, "once.txt", b"payload");
+    request
+        .headers_mut()
+        .insert("idempotency-key", id.parse().unwrap());
+    let result = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(result.status(), StatusCode::SEE_OTHER);
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(ticket["status_url"].as_str().unwrap())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert!(response_text(status)
+        .await
+        .contains("\"state\":\"completed\""));
+    let mut replay = multipart_request(&state, endpoint, "once.txt", b"payload");
+    replay
+        .headers_mut()
+        .insert("idempotency-key", id.parse().unwrap());
+    assert_eq!(
+        app.oneshot(replay).await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/once.txt")).unwrap(),
+        b"payload"
     );
 }

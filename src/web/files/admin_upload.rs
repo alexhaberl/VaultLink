@@ -3,6 +3,58 @@ pub(super) struct AdminUploadSuccess {
     disposition: UploadDisposition,
     directory: String,
     audit_durability_uncertain: bool,
+    warnings: crate::services::upload::UploadWarnings,
+}
+
+#[derive(Serialize)]
+struct AdminUploadOperationTicket {
+    upload_id: String,
+    expires_at: String,
+    status_url: String,
+}
+
+pub(super) async fn create_admin_upload_operation(
+    State(state): State<FileRouteState>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let authorization = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    let (admin, _) = authorization.into_parts();
+    crate::http_auth::csrf_header(&admin, &headers)?;
+    let admin_id = admin.admin_id;
+    let issued = crate::http_auth::database(state.db().clone(), move |db| {
+        db.create_upload_operation(crate::db::UploadOperationScope::Admin(admin_id))
+    })
+    .await?
+    .ok_or(AppError(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many upload operations",
+    ))?;
+    let (upload_id, expires_at) = issued;
+    Ok((
+        StatusCode::CREATED,
+        Json(AdminUploadOperationTicket {
+            status_url: format!("/admin/files/upload/operations/{upload_id}"),
+            upload_id,
+            expires_at,
+        }),
+    )
+        .into_response())
+}
+
+pub(super) async fn admin_upload_operation_status(
+    State(state): State<FileRouteState>,
+    headers: HeaderMap,
+    AxPath(upload_id): AxPath<String>,
+) -> Result<Response> {
+    let authorization = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    let (admin, _) = authorization.into_parts();
+    let admin_id = admin.admin_id;
+    let view = crate::http_auth::database(state.db().clone(), move |db| {
+        db.upload_operation(crate::db::UploadOperationScope::Admin(admin_id), &upload_id)
+    })
+    .await?
+    .ok_or(AppError(StatusCode::GONE, "Upload operation unavailable"))?;
+    Ok(Json(view).into_response())
 }
 
 const ADMIN_UPLOAD_SESSION_REVOKED: &str = "session_revoked";
@@ -18,11 +70,15 @@ struct AdminUploadQueueSuccess {
     outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
 struct AdminUploadQueueErrorEnvelope {
     error: AdminUploadQueueError,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -33,11 +89,11 @@ struct AdminUploadQueueError {
 
 pub(super) async fn stage_admin_upload(
     state: &FileRouteState,
-    directory: &str,
+    _directory: &str,
     field: axum::extract::multipart::Field<'_>,
     maximum: u64,
     blocked_extensions: &[String],
-) -> Result<(PendingUpload, String, u64)> {
+) -> Result<(PendingUpload, String, u64, String)> {
     let file_name = field
         .file_name()
         .ok_or(AppError(StatusCode::BAD_REQUEST, "File name missing"))?;
@@ -55,11 +111,10 @@ pub(super) async fn stage_admin_upload(
         .await
         .map_err(storage_recovery_app_error)?;
     let secure_root = state.secure_root().clone();
-    let upload_directory = directory.to_string();
     let pending_file = tokio::task::spawn_blocking(move || {
         let _storage_guard = storage_guard;
         let mut pending = secure_root
-            .begin_upload(&upload_directory)
+            .begin_staged_upload()
             .map_err(|_| PendingUploadFileError::Begin)?;
         let file = pending.take_file().map_err(PendingUploadFileError::Take)?;
         Ok::<_, PendingUploadFileError>((pending, file))
@@ -80,6 +135,8 @@ pub(super) async fn stage_admin_upload(
     };
 
     let mut staged = StagedUploadFile::new(pending, file);
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
     let stream = field;
     tokio::pin!(stream);
     while let Some(chunk) = stream.next().await {
@@ -88,10 +145,16 @@ pub(super) async fn stage_admin_upload(
             .write_chunk(state, maximum, &chunk)
             .await
             .map_err(admin_staged_file_error)?;
+        digest.update(&chunk);
     }
     staged.finish().await.map_err(admin_staged_file_error)?;
     let (pending, total) = staged.into_parts();
-    Ok((pending, name, total))
+    Ok((
+        pending,
+        name,
+        total,
+        data_encoding::HEXLOWER.encode(digest.finalize().as_ref()),
+    ))
 }
 
 fn admin_staged_file_error(error: StagedFileError) -> AppError {
@@ -113,7 +176,7 @@ struct AdminUploadPermits {
     peer: ClientActivityPermit,
     proof: MfaSessionProof,
 }
-type AdminDirectoryStatus = (Vec<String>, bool, bool);
+type AdminDirectoryStatus = (Vec<String>, bool, bool, bool);
 type AdminDirectoryOutcome = SessionBound<AdminDirectoryStatus>;
 type AdminDirectoryAudit = (AdminDirectoryStatus, Vec<RequiredAuditEvent>);
 type AdminDirectoryResult<T> = std::result::Result<T, file_ops::FileOperationError>;
@@ -129,29 +192,31 @@ struct AdminDirectoryCreation {
 
 async fn ensure_admin_upload_directory(
     state: &FileRouteState,
-    proof: MfaSessionProof,
     base: &str,
     relative: &str,
     actor: &str,
-    upload_permit: tokio::sync::OwnedSemaphorePermit,
-    upload_peer_permit: ClientActivityPermit,
-) -> Result<(String, bool, AdminUploadPermits)> {
+    permits: AdminUploadPermits,
+    operation_guard: &crate::upload_operation::UploadStorageGuard,
+) -> Result<(
+    String,
+    crate::services::upload::UploadWarnings,
+    AdminUploadPermits,
+    bool,
+    bool,
+)> {
     let tree = path_security::validate_relative(relative)
         .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid folder path"))?
         .to_string_lossy()
         .replace('\\', "/");
-    let permits = AdminUploadPermits {
-        global: upload_permit,
-        peer: upload_peer_permit,
-        proof,
-    };
     if tree.is_empty() {
-        return Ok((base.to_string(), false, permits));
+        return Ok((base.to_string(), Default::default(), permits, true, false));
     }
     let target = join_display(base, &tree);
     let guard = file_ops::acquire_storage_mutation(state)
         .await
         .map_err(storage_recovery_app_error)?;
+    operation_guard.hold(guard);
+    let guard = operation_guard.clone();
     let database_permit = file_ops::acquire_database_permit(state.db())
         .await
         .map_err(file_operation_app_error)?;
@@ -174,7 +239,7 @@ async fn ensure_admin_upload_directory(
         ))
     })?
     .map_err(upload_directory_error)?;
-    let (_created, durability_uncertain, complete) = match outcome {
+    let (created, storage_uncertain, audit_uncertain, complete) = match outcome {
         SessionBound::Authorized(outcome) => outcome,
         SessionBound::SessionUnavailable => {
             return Err(AppError(
@@ -183,18 +248,21 @@ async fn ensure_admin_upload_directory(
             ));
         }
     };
-    if !complete {
-        return Err(AppError(
-            StatusCode::ACCEPTED,
-            "Upload directory creation is uncertain",
-        ));
-    }
-    Ok((target, durability_uncertain, permits))
+    Ok((
+        target,
+        crate::services::upload::UploadWarnings {
+            storage: storage_uncertain,
+            audit: audit_uncertain,
+        },
+        permits,
+        complete,
+        !created.is_empty(),
+    ))
 }
 
 fn create_admin_upload_directory_blocking(
     creation: AdminDirectoryCreation,
-    guard: crate::storage_authority::StorageMutationGuard,
+    guard: crate::upload_operation::UploadStorageGuard,
     database_permit: crate::db::RuntimeDatabasePermit,
 ) -> AdminDirectoryResult<(AdminDirectoryOutcome, AdminUploadPermits)> {
     let _database_permit = database_permit;
@@ -212,9 +280,9 @@ fn create_admin_upload_directory_blocking(
         Err(file_ops::FileOperationError::Database(error))
             if created_snapshot
                 .as_ref()
-                .is_some_and(|(created, _)| !created.is_empty()) =>
+                .is_some_and(|(created, _, _)| !created.is_empty()) =>
         {
-            let (created, complete) =
+            let (created, storage_uncertain, complete) =
                 created_snapshot.expect("created upload directories recorded");
             tracing::error!(
                 error = %EscapedLogValue::new(&error),
@@ -222,17 +290,22 @@ fn create_admin_upload_directory_blocking(
                 path = %EscapedLogPath::new(&creation.target),
                 "upload directories are visible but required audit durability is uncertain"
             );
-            Ok(SessionBound::Authorized((created, true, complete)))
+            Ok(SessionBound::Authorized((
+                created,
+                storage_uncertain,
+                true,
+                complete,
+            )))
         }
         Err(error) => Err(error),
     }?;
-    guard.finish_clean();
+    let _guard = guard;
     Ok((outcome, creation.permits))
 }
 
 fn create_admin_directory_tree(
     creation: &AdminDirectoryCreation,
-    created_snapshot: &mut Option<(Vec<String>, bool)>,
+    created_snapshot: &mut Option<(Vec<String>, bool, bool)>,
 ) -> AdminDirectoryResult<AdminDirectoryAudit> {
     RequiredAuditEvent::new(
         AuditAction::UploadDirectoriesCreated,
@@ -249,8 +322,8 @@ fn create_admin_directory_tree(
         .map_err(file_ops::FileOperationError::Io)?;
     let created = tree_outcome.created;
     let complete = tree_outcome.terminal_error.is_none();
-    *created_snapshot = Some((created.clone(), complete));
     let durability_uncertain = tree_outcome.sync_error.is_some() || !complete;
+    *created_snapshot = Some((created.clone(), durability_uncertain, complete));
     if let Some(error) = tree_outcome.sync_error {
         tracing::error!(
             error = %EscapedLogValue::new(&error),
@@ -277,7 +350,7 @@ fn create_admin_directory_tree(
         })
         .into_iter()
         .collect();
-    Ok(((created, durability_uncertain, complete), events))
+    Ok(((created, durability_uncertain, false, complete), events))
 }
 
 #[cfg(test)]
@@ -312,8 +385,11 @@ pub(super) async fn admin_upload(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Response> {
-    let success = match process_admin_upload(&state, &headers, multipart).await {
+    let success = match process_admin_upload(&state, &headers, multipart, None).await {
         Ok(success) => success,
+        Err(AppError(StatusCode::CONFLICT, "Upload ID conflicts with request")) => {
+            return Ok(Redirect::to(&browser_redirect("", "upload_id_conflict")).into_response());
+        }
         Err(AppError(StatusCode::UNAUTHORIZED, ADMIN_UPLOAD_SESSION_REVOKED)) => {
             return Err(AppError(StatusCode::UNAUTHORIZED, SESSION_REVOKED_MESSAGE));
         }
@@ -321,8 +397,16 @@ pub(super) async fn admin_upload(
     };
     let mut response = Redirect::to(&browser_redirect(
         &success.directory,
-        if success.audit_durability_uncertain {
-            "upload_audit_uncertain"
+        if success.disposition == UploadDisposition::DirectoryUncertain && success.warnings.audit {
+            "upload_directory_audit_uncertain"
+        } else if success.disposition == UploadDisposition::DirectoryUncertain {
+            "upload_directory_uncertain"
+        } else if success.warnings.storage && success.warnings.audit {
+            "upload_storage_audit_uncertain"
+        } else if success.warnings.storage {
+            "upload_storage_uncertain"
+        } else if success.warnings.audit {
+            "upload_audit_only_uncertain"
         } else {
             "upload_ok"
         },
@@ -347,17 +431,46 @@ pub(super) async fn admin_upload(
             HeaderValue::from_static("uncertain"),
         );
     }
+    if success.warnings.any() {
+        response.headers_mut().insert(
+            "x-vaultlink-upload-warnings",
+            HeaderValue::from_static(success.warnings.header()),
+        );
+    }
     Ok(response)
 }
 
 pub(super) async fn admin_upload_queue(
     State(state): State<FileRouteState>,
     headers: HeaderMap,
-    multipart: Multipart,
+    mut multipart: Multipart,
 ) -> Response {
-    match process_admin_upload(&state, &headers, multipart).await {
+    if let Err(error) = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await {
+        let error = AppError::from(error);
+        if matches!(
+            error,
+            AppError(StatusCode::UNAUTHORIZED, SESSION_REVOKED_MESSAGE)
+        ) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(AdminUploadSessionRevoked {
+                    error: ADMIN_UPLOAD_SESSION_REVOKED,
+                }),
+            )
+                .into_response();
+        }
+        return error.into_response();
+    }
+    let upload_id = match crate::upload_operation::take_upload_id(&mut multipart, &headers).await {
+        Ok(id) => id,
+        Err(message) => {
+            return admin_upload_queue_error_response(StatusCode::BAD_REQUEST, message, None)
+        }
+    };
+    let status_url = Some(format!("/admin/files/upload/operations/{}", upload_id.id));
+    match process_admin_upload(&state, &headers, multipart, Some(upload_id)).await {
         Ok(success) => {
-            let status = if success.audit_durability_uncertain {
+            let status = if success.warnings.any() {
                 StatusCode::ACCEPTED
             } else {
                 StatusCode::OK
@@ -367,9 +480,8 @@ pub(super) async fn admin_upload_queue(
                 Json(AdminUploadQueueSuccess {
                     file: success.file,
                     outcome: success.disposition.outcome().to_string(),
-                    warning: success
-                        .audit_durability_uncertain
-                        .then_some("audit_durability_uncertain"),
+                    warning: success.warnings.legacy_code(),
+                    warnings: success.warnings.codes(),
                 }),
             )
                 .into_response()
@@ -384,11 +496,17 @@ pub(super) async fn admin_upload_queue(
             }),
         )
             .into_response(),
-        Err(AppError(status, message)) => admin_upload_queue_error_response(status, message),
+        Err(AppError(status, message)) => {
+            admin_upload_queue_error_response(status, message, status_url)
+        }
     }
 }
 
-fn admin_upload_queue_error_response(status: StatusCode, message: &str) -> Response {
+fn admin_upload_queue_error_response(
+    status: StatusCode,
+    message: &str,
+    status_url: Option<String>,
+) -> Response {
     let admission_rejected =
         status == StatusCode::SERVICE_UNAVAILABLE && message.starts_with("Too many concurrent ");
     let code = match status {
@@ -401,6 +519,20 @@ fn admin_upload_queue_error_response(status: StatusCode, message: &str) -> Respo
         StatusCode::UNAUTHORIZED => "share_locked",
         StatusCode::FORBIDDEN => "upload_forbidden",
         StatusCode::NOT_FOUND => "target_not_found",
+        StatusCode::CONFLICT if message == "Upload ID conflicts with request" => {
+            "upload_id_conflict"
+        }
+        StatusCode::CONFLICT if message == "Upload operation already started; check its status" => {
+            "upload_in_progress"
+        }
+        StatusCode::CONFLICT if message == "Upload outcome is unknown; check its status" => {
+            "outcome_unknown"
+        }
+        StatusCode::CONFLICT
+            if message == "Upload operation was rejected; create a new operation" =>
+        {
+            "upload_rejected"
+        }
         StatusCode::CONFLICT => "file_exists",
         StatusCode::REQUEST_TIMEOUT => "upload_timeout",
         StatusCode::PAYLOAD_TOO_LARGE => "upload_too_large",
@@ -423,10 +555,15 @@ fn admin_upload_queue_error_response(status: StatusCode, message: &str) -> Respo
                 code: code.to_string(),
                 message: message.into_owned(),
             },
+            status_url: if code == "upload_in_progress" {
+                status_url
+            } else {
+                None
+            },
         }),
     )
         .into_response();
-    if admission_rejected {
+    if admission_rejected || code == "upload_in_progress" {
         response
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));

@@ -60,6 +60,7 @@ sqlite3 "$database" <<'SQL'
 BEGIN IMMEDIATE;
 INSERT INTO audit(occurred_at,actor,action,object_id,detail,priority)
 VALUES('2026-08-30T00:00:00Z','container-gate','upload','migration-probe','preserve',100);
+DROP TABLE upload_operations;
 ALTER TABLE public_upload_usage DROP COLUMN created_directories;
 DROP INDEX idx_shares_protected_id;
 DROP INDEX idx_shares_limit_id;
@@ -102,11 +103,11 @@ done
 kill "$migration_pid"
 wait "$migration_pid" || true
 migration_pid=
-[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 11 ]
+[ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 12 ]
 [ "$(sqlite3 "$database" \
     'SELECT COUNT(*) FROM service_tokens;')" = 0 ]
 [ "$(sqlite3 "$database" \
-    'SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (8,9,10,11);')" = 4 ]
+    'SELECT COUNT(*) FROM vaultlink_schema_migrations WHERE target_version IN (8,9,10,11,12);')" = 5 ]
 [ "$(sqlite3 "$database" \
     "SELECT priority FROM audit WHERE object_id='migration-probe';")" = 100 ]
 [ "$(sqlite3 "$database" 'PRAGMA integrity_check;')" = ok ]

@@ -14,6 +14,7 @@ mod slow_diagnostics;
 mod transfer_handoff;
 mod transfer_progress;
 mod transfers;
+mod upload_operations;
 
 pub(crate) use dispatch::{dispatch_database_work, dispatch_transfer_database_work};
 pub(crate) use executor::{
@@ -29,6 +30,9 @@ pub(crate) use required_audit::{
 pub(crate) use service_tokens::{SERVICE_TOKEN_PREFIX, SERVICE_TOKEN_RANDOM_BYTES};
 #[cfg(any(test, feature = "fuzzing"))]
 pub use shares::rewrite_share_path;
+pub(crate) use upload_operations::{
+    UploadOperationClaim, UploadOperationScope, UploadOperationView,
+};
 
 #[cfg(test)]
 use audit::enforce_audit_retention;

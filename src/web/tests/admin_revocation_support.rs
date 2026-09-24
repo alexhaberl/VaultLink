@@ -25,6 +25,7 @@ async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_adm
         .unwrap();
     state.db().verify_mfa("password-session").unwrap();
     let (upload, sender) = controlled_admin_multipart_request_with_overwrite(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "csrf-token",
@@ -69,6 +70,7 @@ async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_adm
         .unwrap();
     state.db().verify_mfa("mfa-session").unwrap();
     let (upload, sender) = controlled_admin_multipart_request_with_overwrite(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "csrf-token",
@@ -111,6 +113,7 @@ async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_adm
         .unwrap();
     state.db().verify_mfa("expiry-session").unwrap();
     let (upload, sender) = controlled_admin_multipart_request_with_overwrite(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "csrf-token",

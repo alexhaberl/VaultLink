@@ -283,7 +283,7 @@ async fn upload_only_never_exposes_target_paths_or_existing_content() {
             &UploadConflictStrategy::Reject,
         )
         .unwrap();
-    let app = router(state);
+    let app = router(state.clone());
 
     let html = response_text(
         app.clone()
@@ -305,6 +305,7 @@ async fn upload_only_never_exposes_target_paths_or_existing_content() {
     let folder_upload = app
         .clone()
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/drop-token/upload/queue",
             "",
             "Eingang/Projekt",
@@ -364,6 +365,7 @@ async fn public_folder_upload_propagates_first_and_later_mkdir_uncertainty() {
     let first = app
         .clone()
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/mkdir-response-loss/upload/queue",
             "",
             "first/nested",
@@ -372,10 +374,10 @@ async fn public_folder_upload_propagates_first_and_later_mkdir_uncertainty() {
         ))
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-    assert!(response_text(first)
-        .await
-        .contains(r#""outcome":"created_uncertain""#));
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first_body = response_text(first).await;
+    assert!(first_body.contains(r#""outcome":"created_uncertain""#));
+    assert!(first_body.contains(r#""warnings":["storage_durability_uncertain"]"#));
     assert_eq!(
         std::fs::read(root.path().join("uploads/first/nested/one.txt")).unwrap(),
         b"one"
@@ -392,6 +394,7 @@ async fn public_folder_upload_propagates_first_and_later_mkdir_uncertainty() {
         });
     let later = app
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/mkdir-response-loss/upload/queue",
             "",
             "later/nested",
@@ -400,10 +403,10 @@ async fn public_folder_upload_propagates_first_and_later_mkdir_uncertainty() {
         ))
         .await
         .unwrap();
-    assert_eq!(later.status(), StatusCode::OK);
-    assert!(response_text(later)
-        .await
-        .contains(r#""outcome":"created_uncertain""#));
+    assert_eq!(later.status(), StatusCode::ACCEPTED);
+    let later_body = response_text(later).await;
+    assert!(later_body.contains(r#""outcome":"created_uncertain""#));
+    assert!(later_body.contains(r#""warnings":["storage_durability_uncertain"]"#));
     assert_eq!(
         std::fs::read(root.path().join("uploads/later/nested/two.txt")).unwrap(),
         b"two"
@@ -452,6 +455,7 @@ async fn public_folder_partial_creation_after_quota_commit_is_audited_outcome_no
 
     let response = app
         .oneshot(public_folder_upload_request(
+            &state,
             "/v/partial-folder/upload/queue",
             "",
             "partial/blocker/child",
@@ -461,10 +465,10 @@ async fn public_folder_partial_creation_after_quota_commit_is_audited_outcome_no
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(response_text(response)
-        .await
-        .contains(r#""outcome":"directory_uncertain""#));
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let response_body = response_text(response).await;
+    assert!(response_body.contains(r#""outcome":"directory_uncertain""#));
+    assert!(response_body.contains(r#""warnings":["storage_durability_uncertain"]"#));
     assert!(root.path().join("uploads/partial").is_dir());
     assert!(root.path().join("uploads/partial/blocker").is_file());
     assert!(!root
@@ -522,6 +526,7 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
     let cookie = HeaderValue::from_static("vaultlink_session=session-token");
 
     let mut wrong_csrf = admin_multipart_request(
+        &state,
         "/admin/files/upload",
         "uploads",
         "wrong",
@@ -539,6 +544,7 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
     assert!(!root.path().join("uploads/blocked.txt").exists());
 
     let mut first = admin_multipart_request(
+        &state,
         "/admin/files/upload",
         "uploads",
         "csrf-token",
@@ -557,6 +563,7 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
     );
 
     let mut conflict = admin_multipart_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "csrf-token",
@@ -572,6 +579,7 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
     assert!(response_text(conflict).await.contains("file_exists"));
 
     let mut replace = admin_multipart_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "csrf-token",
@@ -591,6 +599,7 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
     );
 
     let mut folder_upload = admin_folder_upload_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "csrf-token",
@@ -635,6 +644,7 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
     );
 
     let mut blocked = admin_multipart_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "csrf-token",
@@ -683,6 +693,7 @@ async fn admin_upload_rechecks_the_exact_mfa_session_before_publish() {
     let app = router(state.clone());
 
     let (queued, sender) = controlled_admin_multipart_request(
+        &state,
         "/admin/files/upload/queue",
         "uploads",
         "csrf-token",
@@ -707,6 +718,7 @@ async fn admin_upload_rechecks_the_exact_mfa_session_before_publish() {
     assert!(!root.path().join("uploads/queue-revoked.txt").exists());
 
     let (browser, sender) = controlled_admin_multipart_request(
+        &state,
         "/admin/files/upload",
         "uploads",
         "csrf-token",
@@ -777,7 +789,7 @@ async fn text_preview_reserves_transfer_and_render_capacity_before_reading() {
     assert!(hook_slot.lock().unwrap().replace(hook.clone()).is_none());
     let hook_guard = TextPreviewReadTestGuard(hook.clone());
 
-    let app = router(state);
+    let app = router(state.clone());
     let first_app = app.clone();
     let first = tokio::spawn(async move {
         first_app
@@ -910,4 +922,182 @@ async fn text_preview_reserves_transfer_and_render_capacity_before_reading() {
     render_hook.release();
     assert_eq!(first_render.await.unwrap().status(), StatusCode::OK);
     drop(render_hook_guard);
+}
+#[tokio::test]
+async fn admin_upload_operation_replays_receipt_after_file_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("uploads")).unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db().create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db()
+        .create_session(
+            "admin-operation-session",
+            1,
+            "admin-operation-csrf",
+            Utc::now() + Duration::hours(1),
+        )
+        .unwrap();
+    state.db().verify_mfa("admin-operation-session").unwrap();
+    let app = router(state.clone());
+    let cookie = HeaderValue::from_static("vaultlink_session=admin-operation-session");
+    let ticket_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/admin/files/upload/operations")
+                .header(header::COOKIE, cookie.clone())
+                .header("x-csrf-token", "admin-operation-csrf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ticket_response.status(), StatusCode::CREATED);
+    let ticket: serde_json::Value =
+        serde_json::from_str(&response_text(ticket_response).await).unwrap();
+    let id = ticket["upload_id"].as_str().unwrap();
+    let mut first = admin_multipart_request(
+        &state,
+        "/admin/files/upload/queue",
+        "uploads",
+        "admin-operation-csrf",
+        "once.txt",
+        b"first",
+        false,
+    );
+    first.headers_mut().insert(header::COOKIE, cookie.clone());
+    first
+        .headers_mut()
+        .insert("idempotency-key", id.parse().unwrap());
+    assert_eq!(
+        app.clone().oneshot(first).await.unwrap().status(),
+        StatusCode::OK
+    );
+    std::fs::write(root.path().join("uploads/once.txt"), b"external").unwrap();
+    let replay = || {
+        let mut request = admin_multipart_request(
+            &state,
+            "/admin/files/upload/queue",
+            "uploads",
+            "admin-operation-csrf",
+            "once.txt",
+            b"first",
+            false,
+        );
+        request.headers_mut().insert(header::COOKIE, cookie.clone());
+        request
+            .headers_mut()
+            .insert("idempotency-key", id.parse().unwrap());
+        request
+    };
+    let mut held_uploads = Vec::new();
+    while let Ok(permit) = state.try_acquire_upload() {
+        held_uploads.push(permit);
+    }
+    assert!(!held_uploads.is_empty());
+    assert_eq!(
+        app.clone().oneshot(replay()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    drop(held_uploads);
+    let repeated = app.clone().oneshot(replay()).await.unwrap();
+    assert_eq!(repeated.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/once.txt")).unwrap(),
+        b"external"
+    );
+    let mut conflict = admin_multipart_request(
+        &state,
+        "/admin/files/upload/queue",
+        "uploads",
+        "admin-operation-csrf",
+        "once.txt",
+        b"other",
+        false,
+    );
+    conflict
+        .headers_mut()
+        .insert(header::COOKIE, cookie.clone());
+    conflict
+        .headers_mut()
+        .insert("idempotency-key", id.parse().unwrap());
+    let conflict = app.clone().oneshot(conflict).await.unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(response_text(conflict).await.contains("upload_id_conflict"));
+    for (path, overwrite) in [("other", false), ("uploads", true)] {
+        let mut changed = admin_multipart_request(
+            &state,
+            "/admin/files/upload/queue",
+            path,
+            "admin-operation-csrf",
+            "once.txt",
+            b"first",
+            overwrite,
+        );
+        changed.headers_mut().insert(header::COOKIE, cookie.clone());
+        changed
+            .headers_mut()
+            .insert("idempotency-key", id.parse().unwrap());
+        let changed = app.clone().oneshot(changed).await.unwrap();
+        assert_eq!(changed.status(), StatusCode::CONFLICT);
+        assert!(response_text(changed).await.contains("upload_id_conflict"));
+    }
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(ticket["status_url"].as_str().unwrap())
+                .header(header::COOKIE, cookie.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_str(&response_text(status).await).unwrap();
+    assert_eq!(status["state"], "completed");
+    assert!(status["result"].get("warnings").is_none());
+    assert_eq!(state.db().count_audit(Some("admin_upload")).unwrap(), 1);
+
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/admin/files/upload/operations")
+                .header(header::COOKIE, cookie.clone())
+                .header("x-csrf-token", "admin-operation-csrf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let ticket: serde_json::Value = serde_json::from_str(&response_text(second).await).unwrap();
+    let id = ticket["upload_id"].as_str().unwrap();
+    let boundary = "admin-prefixed-upload-id";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\nuploads\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\nadmin-operation-csrf\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"upload_id\"\r\n\r\n{id}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"prefixed.txt\"\r\n\r\nbytes\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/admin/files/upload/queue")
+                .header(header::COOKIE, cookie)
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read(root.path().join("uploads/prefixed.txt")).unwrap(),
+        b"bytes"
+    );
 }

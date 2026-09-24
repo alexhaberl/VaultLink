@@ -234,6 +234,7 @@ impl SecureRoot {
                 cleanup_directory_from_file(&tombstones, CleanupPolicy::TombstoneRoot)?,
                 cleanup_directory_from_file(&uploads, CleanupPolicy::UploadFragments)?,
             ],
+            protected_fragments: HashSet::new(),
             visited: HashSet::from([
                 (upload_identity.dev(), upload_identity.ino()),
                 (tombstone_identity.dev(), tombstone_identity.ino()),
@@ -297,6 +298,7 @@ impl SecureRoot {
         cleanup.deletion_root = Some(deletion_root);
         Ok(UploadFragmentCleanup {
             directories: vec![cleanup],
+            protected_fragments: HashSet::new(),
             visited: HashSet::from([(metadata.dev(), metadata.ino())]),
             max_directory_stack: MAX_CLEANUP_DIRECTORY_STACK,
             max_visited_directories: MAX_CLEANUP_VISITED_DIRECTORIES,

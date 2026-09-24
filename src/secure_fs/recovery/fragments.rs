@@ -1,4 +1,11 @@
 impl UploadFragmentCleanup {
+    pub(crate) fn protect_upload_fragments(
+        &mut self,
+        fragments: std::collections::HashSet<String>,
+    ) {
+        self.protected_fragments = fragments;
+    }
+
     pub fn run_batch(&mut self, max_entries: usize) -> io::Result<UploadFragmentCleanupBatch> {
         if max_entries == 0 {
             return Err(io::Error::new(
@@ -62,10 +69,10 @@ impl UploadFragmentCleanup {
                     }
                 }
             }
-            if name
-                .to_str()
-                .is_some_and(|name| active_upload_fragment_guard().contains(name))
-            {
+            if name.to_str().is_some_and(|name| {
+                self.protected_fragments.contains(name)
+                    || active_upload_fragment_guard().contains(name)
+            }) {
                 continue;
             }
             let child = match linux::openat2_scoped(

@@ -5,6 +5,63 @@ use axum::{
 };
 use serde::Serialize;
 
+#[derive(Serialize)]
+struct UploadOperationTicket {
+    upload_id: String,
+    expires_at: String,
+    status_url: String,
+}
+
+pub(crate) async fn create_operation(
+    State(state): State<PublicUploadRouteState>,
+    headers: HeaderMap,
+    AxPath(token): AxPath<String>,
+) -> ApiResult<Response> {
+    let issued = crate::public_upload_transport::create_public_upload_operation(
+        &state.into_upload_context(),
+        &headers,
+        &token,
+    )
+    .await
+    .map_err(|error| transport_error(&error))?
+    .ok_or(ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "upload_operation_limit",
+        "Too many upload operations",
+    ))?;
+    let (upload_id, expires_at) = issued;
+    Ok((
+        StatusCode::CREATED,
+        Json(UploadOperationTicket {
+            status_url: format!("/api/v2/public/shares/{token}/upload/operations/{upload_id}"),
+            upload_id,
+            expires_at,
+        }),
+    )
+        .into_response())
+}
+
+pub(crate) async fn operation_status(
+    State(state): State<PublicUploadRouteState>,
+    headers: HeaderMap,
+    AxPath((token, upload_id)): AxPath<(String, String)>,
+) -> ApiResult<Response> {
+    let view = crate::public_upload_transport::public_upload_operation(
+        &state.into_upload_context(),
+        &headers,
+        &token,
+        &upload_id,
+    )
+    .await
+    .map_err(|error| transport_error(&error))?
+    .ok_or(ApiError::new(
+        StatusCode::GONE,
+        "upload_id_unavailable",
+        "Upload operation unavailable",
+    ))?;
+    Ok(Json(view).into_response())
+}
+
 use crate::{
     internal_reporting::{report_internal, InternalOperation},
     public_upload_transport::{
@@ -23,6 +80,8 @@ struct UploadSuccess {
     outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<&'static str>,
 }
 
 pub(crate) async fn upload(
@@ -30,17 +89,43 @@ pub(crate) async fn upload(
     OriginalUri(_uri): OriginalUri,
     headers: HeaderMap,
     AxPath(token): AxPath<String>,
-    multipart: Multipart,
+    mut multipart: Multipart,
 ) -> ApiResult<Response> {
+    crate::public_upload_transport::preflight_upload_authorization(
+        &state.clone().into_upload_context(),
+        &headers,
+        &token,
+    )
+    .await
+    .map_err(|error| transport_error(&error))?;
+    let upload_id = crate::upload_operation::take_upload_id(&mut multipart, &headers)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_upload",
+                "Invalid upload ID",
+            )
+        })?;
+    let status_url = Some(format!(
+        "/api/v2/public/shares/{token}/upload/operations/{}",
+        upload_id.id
+    ));
     match execute_public_upload(
         state.into_upload_context(),
         &headers,
         token.clone(),
         multipart,
+        Some(upload_id),
     )
     .await
-    .map_err(|error| transport_error(&error))?
-    {
+    .map_err(|error| {
+        let mut response = transport_error(&error);
+        if response.code == "upload_in_progress" {
+            response.status_url = status_url;
+        }
+        response
+    })? {
         PublicUploadOutcome::Rejected(rejection) => Err(rejection_error(&rejection)),
         PublicUploadOutcome::Success(success) if !success.audit_durability_uncertain() => {
             success_redirect(&token, &success)
@@ -51,6 +136,7 @@ pub(crate) async fn upload(
                 file: success.file().to_string(),
                 outcome: success.disposition().outcome().to_string(),
                 warning: Some("audit_durability_uncertain"),
+                warnings: success.warnings().codes(),
             }),
         )
             .into_response()),
@@ -59,7 +145,15 @@ pub(crate) async fn upload(
 
 fn transport_error(error: &PublicUploadTransportError) -> ApiError {
     let status = error.status();
-    let code = if error.message() == crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE {
+    let code = if error.message() == "Upload ID conflicts with request" {
+        "upload_id_conflict"
+    } else if error.message() == "Upload operation already started; check its status" {
+        "upload_in_progress"
+    } else if error.message() == "Upload outcome is unknown; check its status" {
+        "outcome_unknown"
+    } else if error.message() == "Upload operation was rejected; create a new operation" {
+        "upload_rejected"
+    } else if error.message() == crate::http_auth::AUDIT_UNAVAILABLE_MESSAGE {
         "audit_unavailable"
     } else {
         status_code_name(status)
@@ -69,6 +163,9 @@ fn transport_error(error: &PublicUploadTransportError) -> ApiError {
         code,
         status.canonical_reason().unwrap_or("Request failed"),
     );
+    if code == "upload_in_progress" {
+        api_error.retry_after_seconds = Some(1);
+    }
     if status == StatusCode::SERVICE_UNAVAILABLE
         && (error.message() == crate::http_auth::ARGON2_BUSY_MESSAGE
             || error.message() == crate::http_auth::DATABASE_BUSY_MESSAGE
@@ -117,6 +214,12 @@ fn success_redirect(token: &str, success: &PublicUploadSuccess) -> ApiResult<Res
         response.headers_mut().insert(
             "x-vaultlink-durability",
             HeaderValue::from_static("uncertain"),
+        );
+    }
+    if success.warnings().any() {
+        response.headers_mut().insert(
+            "x-vaultlink-upload-warnings",
+            HeaderValue::from_static(success.warnings().header()),
         );
     }
     Ok(response)

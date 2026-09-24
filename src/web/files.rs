@@ -1,7 +1,7 @@
 use askama::Template;
 use axum::{
     body::Body,
-    extract::{Form, Json, Multipart, Query, State},
+    extract::{Form, Json, Multipart, Path as AxPath, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
@@ -65,6 +65,7 @@ use crate::{
 include!("files/mutations.rs");
 include!("files/admin_upload.rs");
 include!("files/admin_upload_flow.rs");
+include!("files/admin_upload_operation.rs");
 include!("files/browser.rs");
 include!("files/download.rs");
 include!("files/preview.rs");
