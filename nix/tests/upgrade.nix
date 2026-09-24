@@ -19,6 +19,7 @@ let
   '';
 in pkgs.testers.runNixOSTest {
   name = "vaultlink-upgrade-${system}";
+  requiredFeatures.kvm = system != "aarch64-linux";
   nodes.machine = { pkgs, lib, ... }: {
     imports = [ self.nixosModules.default ];
     boot.loader.grub.enable = lib.mkForce false;

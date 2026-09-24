@@ -19,6 +19,7 @@ let
   '';
 in pkgs.testers.runNixOSTest {
   name = "vaultlink-local-${system}";
+  requiredFeatures.kvm = system != "aarch64-linux";
   nodes.machine = { pkgs, ... }: {
     imports = [ self.nixosModules.default ];
     virtualisation.emptyDiskImages = [ 1024 ];

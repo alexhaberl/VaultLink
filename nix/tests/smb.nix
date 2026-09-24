@@ -19,6 +19,7 @@ let
   '';
 in pkgs.testers.runNixOSTest {
   name = "vaultlink-smb-${system}";
+  requiredFeatures.kvm = system != "aarch64-linux";
   nodes = {
     server = { pkgs, ... }: {
       environment.systemPackages = with pkgs; [ samba ];

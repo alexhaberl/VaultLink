@@ -27,7 +27,7 @@ jobs:
             system: aarch64-linux
             runner: ubuntu-24.04-arm
             uname: aarch64
-    runs-on: ${{ matrix.architecture == 'arm64' && vars.VAULTLINK_NIXOS_ARM_RUNNER || matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
       - uses: DeterminateSystems/determinate-nix-action@8d87e8d5e5b8a8309d4281094560f127d9a265f1 # v3.22.5
         with:
-          kvm: true
+          kvm: ${{ matrix.architecture == 'amd64' }}
       - name: Build twice and boot local and SMB NixOS guests
         id: qualification
         shell: bash
@@ -48,16 +48,21 @@ jobs:
           mkdir -p evidence
           printf 'state=failure\n' >"evidence/$ARCHITECTURE.env"
           test "$(uname -m)" = "$EXPECTED_UNAME"
-          if [[ "${DETERMINATE_NIX_KVM:-0}" != 1 ]]; then
-            echo "KVM is unavailable on $RUNNER_NAME ($NIX_SYSTEM); NixOS VM qualification requires a KVM-capable GitHub runner" >&2
-            exit 1
+          if [[ "$ARCHITECTURE" == amd64 ]]; then
+            test "${DETERMINATE_NIX_KVM:-0}" = 1
+            test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
+            acceleration=kvm
+          else
+            # Nixpkgs uses kvm:tcg; absent KVM makes TCG the only accelerator.
+            test "${DETERMINATE_NIX_KVM:-0}" != 1
+            test ! -e /dev/kvm
+            acceleration=tcg
           fi
-          test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
           available_kib=$(df -Pk / | awk 'NR==2 {print $4}')
           test "$available_kib" -ge 4194304
           nix flake check --no-build --all-systems --no-write-lock-file
-          printf 'system=%s\ncommit=%s\nkvm=yes\nfree_kib=%s\n' \
-            "$NIX_SYSTEM" "$GITHUB_SHA" "$available_kib" >"evidence/$ARCHITECTURE.txt"
+          printf 'system=%s\ncommit=%s\nacceleration=%s\nfree_kib=%s\n' \
+            "$NIX_SYSTEM" "$GITHUB_SHA" "$acceleration" "$available_kib" >"evidence/$ARCHITECTURE.txt"
           for attempt in 1 2; do
             rebuild=()
             if [[ "$attempt" == 2 ]]; then rebuild=(--rebuild); fi

@@ -228,6 +228,10 @@ SH
 ```
 
 The native DEB/RPM/Pacman updater, GUI host controller, installation marker and
-package-runtime guard do not apply to NixOS. NixOS package builds and local/SMB
-VM tests are performed on both architectures by the repository's GitHub
-workflow before a release can claim support.
+package-runtime guard do not apply to NixOS. The repository's GitHub workflow
+builds and runs local-storage, SMB and upgrade/recovery NixOS VM tests natively
+on both architectures before a release can claim support. The amd64 runner uses
+KVM. The GitHub-hosted arm64 runner runs QEMU with TCG software emulation; its
+tests do not require `/dev/kvm` and still must pass. The workflow records the
+accelerator and fails when the arm64 runner unexpectedly exposes KVM, so the
+ARM test evidence cannot silently change from TCG to KVM.
