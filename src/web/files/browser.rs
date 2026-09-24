@@ -349,6 +349,9 @@ fn admin_browser_notice(notice: Option<&str>) -> (Option<&'static str>, bool) {
         Some("upload_audit_only_uncertain") => (Some("upload.audit_only_uncertain"), false),
         Some("upload_storage_audit_uncertain") => (Some("upload.audit_uncertain"), false),
         Some("upload_directory_uncertain") => (Some("upload.directory_uncertain"), false),
+        Some("upload_directory_audit_uncertain") => {
+            (Some("upload.directory_audit_uncertain"), false)
+        }
         Some("upload_id_conflict") => (Some("upload.id_conflict_new_form"), false),
         Some("upload_ok") => (Some("files.uploaded"), true),
         _ => (None, false),

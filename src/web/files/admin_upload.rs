@@ -397,7 +397,9 @@ pub(super) async fn admin_upload(
     };
     let mut response = Redirect::to(&browser_redirect(
         &success.directory,
-        if success.disposition == UploadDisposition::DirectoryUncertain {
+        if success.disposition == UploadDisposition::DirectoryUncertain && success.warnings.audit {
+            "upload_directory_audit_uncertain"
+        } else if success.disposition == UploadDisposition::DirectoryUncertain {
             "upload_directory_uncertain"
         } else if success.warnings.storage && success.warnings.audit {
             "upload_storage_audit_uncertain"

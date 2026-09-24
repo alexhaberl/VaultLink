@@ -155,16 +155,29 @@ async fn public_upload_operation_replays_receipt_without_republishing() {
     assert_eq!(status["state"], "completed");
     assert!(status["result"].get("warnings").is_none());
     std::fs::remove_file(root.path().join("uploads/once.txt")).unwrap();
-    let mut replay = multipart_request(
-        &state,
-        "/v/idempotent-upload/upload/queue",
-        "once.txt",
-        b"first",
+    let replay = || {
+        let mut request = multipart_request(
+            &state,
+            "/v/idempotent-upload/upload/queue",
+            "once.txt",
+            b"first",
+        );
+        request
+            .headers_mut()
+            .insert("idempotency-key", id.parse().unwrap());
+        request
+    };
+    let mut held_uploads = Vec::new();
+    while let Ok(permit) = state.try_acquire_upload() {
+        held_uploads.push(permit);
+    }
+    assert!(!held_uploads.is_empty());
+    assert_eq!(
+        app.clone().oneshot(replay()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
-    replay
-        .headers_mut()
-        .insert("idempotency-key", id.parse().unwrap());
-    let replay_result = app.clone().oneshot(replay).await.unwrap();
+    drop(held_uploads);
+    let replay_result = app.clone().oneshot(replay()).await.unwrap();
     assert_eq!(replay_result.status(), StatusCode::OK);
     assert!(!root.path().join("uploads/once.txt").exists());
     let mut conflict = multipart_request(

@@ -101,7 +101,7 @@
         "src/i18n/messages.rs",
         "src/i18n/render.rs"
       ],
-      "sha256": "a51fdd944b9f3954997321f4961c72f6091fd31b368ef7fa53548f71824f47b3"
+      "sha256": "1d9f912d552201d267be2100c344a01d9d2d4c17740b185d84ccbd3cb1a6caeb"
     },
     {
       "name": "service domain source bundle",
@@ -204,7 +204,7 @@
         "src/web/files/admin_upload.rs",
         "src/web/files/admin_upload_flow.rs"
       ],
-      "sha256": "22d25d89beab36c34c5885ef37ebfd3b4fb64843071a44d39ac097e07107a1e6"
+      "sha256": "2c54ae040b43a98b348d2b23146058b205d5c8d802b7e4e9fd7635972fbe4750"
     },
     {
       "name": "shared public upload transport and adapters",
@@ -216,7 +216,7 @@
         "src/web/public_upload/mod.rs",
         "src/web/public_upload/presenter.rs"
       ],
-      "sha256": "0733f2ad17f68d0ec897b6d864306d315dd13f240f7db63e25c03be627c2a3a5"
+      "sha256": "616c36c9e8bf13270ead786b2dac70daaa4a5a8698b611d935692e2b324d3472"
     }
   ]
 }

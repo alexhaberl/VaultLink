@@ -27,6 +27,7 @@ pub(super) async fn process_admin_upload(
         }
         crate::db::UploadOperationClaim::Existing(view) => {
             if view.state == "completed" {
+                let _admission = acquire_admin_upload_concurrency_permits(state)?;
                 return replay_admin_upload(view, multipart, &upload_id, prefix, &admin).await;
             }
             if view.state == "outcome_unknown" {

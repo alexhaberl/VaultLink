@@ -38,6 +38,8 @@
       "The file was uploaded, but the durability of its audit record is uncertain. Do not retry; check the result manually.";
     const directoryWarningText = form.querySelector("[data-upload-directory-warning]")?.textContent?.trim() ||
       "The upload folder may have been created only partially. The file was not uploaded. Check the result manually.";
+    const directoryAuditWarningText = form.querySelector("[data-upload-directory-audit-warning]")?.textContent?.trim() ||
+      "The upload folder may have been created only partially, and its audit record is uncertain. The file was not uploaded. Check the result manually.";
     const responseWarningText = form.querySelector("[data-upload-response-warning]")?.textContent?.trim() ||
       "The server response was incomplete. The file may already have been uploaded. Do not retry; check the result manually.";
     if (!(input instanceof HTMLInputElement) || input.type !== "file" || !input.name ||
@@ -226,7 +228,7 @@
       item.serverFile = payload.file;
       item.outcome = payload.outcome;
       item.message = payload.outcome === "directory_uncertain"
-        ? directoryWarningText
+        ? auditUncertain ? directoryAuditWarningText : directoryWarningText
         : storageUncertain && auditUncertain ? auditWarningText
         : storageUncertain ? storageWarningText
         : auditUncertain ? auditOnlyWarningText

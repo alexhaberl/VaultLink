@@ -22,17 +22,20 @@ pub(super) fn success_response(
     token: &str,
     success: &PublicUploadSuccess,
 ) -> Result<Response> {
-    let upload_status = if success.disposition().outcome() == "directory_uncertain" {
-        "directory_uncertain"
-    } else if success.warnings().storage && success.warnings().audit {
-        "storage_audit_uncertain"
-    } else if success.warnings().audit {
-        "audit_only_uncertain"
-    } else if success.warnings().storage {
-        "storage_only_uncertain"
-    } else {
-        success.disposition().redirect_notice()
-    };
+    let upload_status =
+        if success.disposition().outcome() == "directory_uncertain" && success.warnings().audit {
+            "directory_audit_uncertain"
+        } else if success.disposition().outcome() == "directory_uncertain" {
+            "directory_uncertain"
+        } else if success.warnings().storage && success.warnings().audit {
+            "storage_audit_uncertain"
+        } else if success.warnings().audit {
+            "audit_only_uncertain"
+        } else if success.warnings().storage {
+            "storage_only_uncertain"
+        } else {
+            success.disposition().redirect_notice()
+        };
     let public_route = public_share_route(uri, token);
     let redirect_target = if success.upload_subdir().is_empty() {
         format!("{public_route}?upload={upload_status}")
@@ -239,5 +242,28 @@ mod tests {
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    }
+
+    #[test]
+    fn partial_directory_with_audit_uncertainty_names_both_causes() {
+        let success = PublicUploadSuccess::new(
+            "file.txt".to_string(),
+            "new".to_string(),
+            UploadDisposition::DirectoryUncertain,
+            true,
+        );
+        let response =
+            success_response(&"/v/share/upload".parse().unwrap(), "share", &success).unwrap();
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/v/share?path=new&upload=directory_audit_uncertain"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-vaultlink-upload-warnings")
+                .unwrap(),
+            "storage_durability_uncertain,audit_durability_uncertain"
+        );
     }
 }

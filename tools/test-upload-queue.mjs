@@ -60,6 +60,7 @@ const responseWarningText = "The server response was incomplete. The file may al
 const storageWarningText = "The file was uploaded, but the durability of its storage is uncertain. Do not retry; check the result manually.";
 const auditOnlyWarningText = "The file was uploaded, but the durability of its audit record is uncertain. Do not retry; check the result manually.";
 const directoryWarningText = "The upload folder may have been created only partially. The file was not uploaded. Check the result manually.";
+const directoryAuditWarningText = "The upload folder may have been created only partially, and its audit record is uncertain. The file was not uploaded. Check the result manually.";
 assert.match(auditWarningText, /storage or audit record/);
 const source = readFileSync("assets/web/upload-queue.js", "utf8");
 
@@ -76,6 +77,8 @@ async function runScenario(name, status, json, expectedMessage, statusResult = n
   auditOnlyWarning.textContent = auditOnlyWarningText;
   const directoryWarning = new Element("span");
   directoryWarning.textContent = directoryWarningText;
+  const directoryAuditWarning = new Element("span");
+  directoryAuditWarning.textContent = directoryAuditWarningText;
   const responseWarning = new Element("span");
   responseWarning.textContent = responseWarningText;
   form.elementsBySelector.set("[data-upload-input]", input);
@@ -85,6 +88,7 @@ async function runScenario(name, status, json, expectedMessage, statusResult = n
   form.elementsBySelector.set("[data-upload-storage-warning]", storageWarning);
   form.elementsBySelector.set("[data-upload-audit-only-warning]", auditOnlyWarning);
   form.elementsBySelector.set("[data-upload-directory-warning]", directoryWarning);
+  form.elementsBySelector.set("[data-upload-directory-audit-warning]", directoryAuditWarning);
   form.elementsBySelector.set("[data-upload-response-warning]", responseWarning);
 
   const document = {
@@ -153,6 +157,9 @@ await runScenario("combined warning", 202, async () => ({
 await runScenario("partial directory", 202, async () => ({
   file: "empty.txt", outcome: "directory_uncertain", warning: "audit_durability_uncertain", warnings: ["storage_durability_uncertain"]
 }), directoryWarningText);
+await runScenario("partial directory with uncertain audit", 202, async () => ({
+  file: "empty.txt", outcome: "directory_uncertain", warning: "audit_durability_uncertain", warnings: ["storage_durability_uncertain", "audit_durability_uncertain"]
+}), directoryAuditWarningText);
 const storedAudit = { file: "empty.txt", outcome: "created", warning: "audit_durability_uncertain", warnings: ["audit_durability_uncertain"] };
 await runScenario("lost response", 200, null, auditOnlyWarningText, storedAudit);
 await runScenario("malformed success JSON at 200", 200, async () => { throw new SyntaxError("Invalid JSON"); }, auditOnlyWarningText, storedAudit);

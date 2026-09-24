@@ -433,6 +433,18 @@ async fn acquire_admin_upload_permits(
     headers: &HeaderMap,
     proof: MfaSessionProof,
 ) -> Result<AdminUploadPermits> {
+    let (upload_permit, peer_permit) = acquire_admin_upload_concurrency_permits(state)?;
+    verify_admin_upload_capacity(state, headers).await?;
+    Ok(AdminUploadPermits {
+        global: upload_permit,
+        peer: peer_permit,
+        proof,
+    })
+}
+
+fn acquire_admin_upload_concurrency_permits(
+    state: &FileRouteState,
+) -> Result<(tokio::sync::OwnedSemaphorePermit, ClientActivityPermit)> {
     let upload_permit = state.try_acquire_upload().map_err(|_| {
         AppError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -445,12 +457,7 @@ async fn acquire_admin_upload_permits(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many concurrent uploads from this client",
         ))?;
-    verify_admin_upload_capacity(state, headers).await?;
-    Ok(AdminUploadPermits {
-        global: upload_permit,
-        peer: peer_permit,
-        proof,
-    })
+    Ok((upload_permit, peer_permit))
 }
 
 async fn verify_admin_upload_capacity(state: &FileRouteState, headers: &HeaderMap) -> Result<()> {

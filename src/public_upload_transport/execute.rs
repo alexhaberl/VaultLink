@@ -41,6 +41,7 @@ pub(crate) async fn execute_public_upload(
         }
         UploadOperationClaim::Existing(view) => {
             if view.state == "completed" {
+                let _admission = acquire_public_upload_admission(&state, share.id)?;
                 return replay_public_upload(
                     view,
                     multipart,
@@ -229,36 +230,8 @@ async fn reauthorize_claimed_public_upload(
             .is_some_and(|value| auth::constant_time_eq(expected, value))
     });
 
-    let public_upload_permit = state.try_acquire_public_upload().map_err(|_| {
-        AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent public uploads",
-        )
-    })?;
-    let upload_permit = state.try_acquire_upload().map_err(|_| {
-        AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent uploads",
-        )
-    })?;
-    let upload_peer_permit = state
-        .try_acquire_upload_peer(current_client_limit_key())
-        .ok_or(AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent uploads from this client",
-        ))?;
-    let upload_share_permit = state
-        .try_acquire_upload_share(share.id)
-        .ok_or(AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent uploads for this share",
-        ))?;
-    let authorized_upload = AuthorizedUpload::new(PublicUploadAdmission {
-        _public: public_upload_permit,
-        _upload: upload_permit,
-        _peer: upload_peer_permit,
-        _share: upload_share_permit,
-    });
+    let authorized_upload =
+        AuthorizedUpload::new(acquire_public_upload_admission(state, share.id)?);
     let secure_root = state.secure_root().clone();
     let share_path = share.relative_path.clone();
     let share_scope = tokio::task::spawn_blocking(move || {
@@ -286,6 +259,42 @@ async fn reauthorize_claimed_public_upload(
         csrf_header_valid,
         authorized_upload,
     ))
+}
+
+fn acquire_public_upload_admission(
+    state: &AppState,
+    share_id: i64,
+) -> Result<PublicUploadAdmission> {
+    let public_upload_permit = state.try_acquire_public_upload().map_err(|_| {
+        AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many concurrent public uploads",
+        )
+    })?;
+    let upload_permit = state.try_acquire_upload().map_err(|_| {
+        AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many concurrent uploads",
+        )
+    })?;
+    let upload_peer_permit = state
+        .try_acquire_upload_peer(current_client_limit_key())
+        .ok_or(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many concurrent uploads from this client",
+        ))?;
+    let upload_share_permit = state
+        .try_acquire_upload_share(share_id)
+        .ok_or(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many concurrent uploads for this share",
+        ))?;
+    Ok(PublicUploadAdmission {
+        _public: public_upload_permit,
+        _upload: upload_permit,
+        _peer: upload_peer_permit,
+        _share: upload_share_permit,
+    })
 }
 
 async fn replay_public_upload(

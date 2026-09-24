@@ -977,20 +977,33 @@ async fn admin_upload_operation_replays_receipt_after_file_changes() {
         StatusCode::OK
     );
     std::fs::write(root.path().join("uploads/once.txt"), b"external").unwrap();
-    let mut replay = admin_multipart_request(
-        &state,
-        "/admin/files/upload/queue",
-        "uploads",
-        "admin-operation-csrf",
-        "once.txt",
-        b"first",
-        false,
+    let replay = || {
+        let mut request = admin_multipart_request(
+            &state,
+            "/admin/files/upload/queue",
+            "uploads",
+            "admin-operation-csrf",
+            "once.txt",
+            b"first",
+            false,
+        );
+        request.headers_mut().insert(header::COOKIE, cookie.clone());
+        request
+            .headers_mut()
+            .insert("idempotency-key", id.parse().unwrap());
+        request
+    };
+    let mut held_uploads = Vec::new();
+    while let Ok(permit) = state.try_acquire_upload() {
+        held_uploads.push(permit);
+    }
+    assert!(!held_uploads.is_empty());
+    assert_eq!(
+        app.clone().oneshot(replay()).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
-    replay.headers_mut().insert(header::COOKIE, cookie.clone());
-    replay
-        .headers_mut()
-        .insert("idempotency-key", id.parse().unwrap());
-    let repeated = app.clone().oneshot(replay).await.unwrap();
+    drop(held_uploads);
+    let repeated = app.clone().oneshot(replay()).await.unwrap();
     assert_eq!(repeated.status(), StatusCode::OK);
     assert_eq!(
         std::fs::read(root.path().join("uploads/once.txt")).unwrap(),

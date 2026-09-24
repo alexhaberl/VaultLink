@@ -632,6 +632,10 @@ fn upload_notice(status: Option<&str>) -> Option<&'static str> {
         "directory_uncertain" => {
             i18n::text(i18n::current_locale(), i18n::UPLOAD_DIRECTORY_UNCERTAIN)
         }
+        "directory_audit_uncertain" => i18n::text(
+            i18n::current_locale(),
+            i18n::UPLOAD_DIRECTORY_AUDIT_UNCERTAIN,
+        ),
         "id_conflict" => i18n::text(i18n::current_locale(), i18n::UPLOAD_ID_CONFLICT_NEW_FORM),
         _ => "",
     };
