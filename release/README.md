@@ -44,6 +44,13 @@ The VaultLink release workflow publishes only the nine native packages declared 
 archives or standalone binaries. GitHub's automatic source archives are
 unsupported source material.
 
+The next release's NixOS 26.05 support is distributed through the signed tag
+and committed `flake.lock`; it does not alter the nine-package, 21-asset
+contract. Both `vaultlink/nixos-amd64` and `vaultlink/nixos-arm64` must be
+successful for the exact frozen commit in release preflights and before the
+72-hour soak starts. Historical 0.7.1 evidence remains unchanged. See
+[the NixOS deployment guide](../docs/NIXOS.md).
+
 ## Signing key
 
 Generate the project key once on an offline trusted system:

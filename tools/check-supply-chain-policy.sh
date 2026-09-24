@@ -1347,6 +1347,14 @@ for aggregate_context in \
         report "candidate, soak, tag, and producer must share aggregate gate $aggregate_context"
     fi
 done
+for architecture in amd64 arm64; do
+    context="vaultlink/nixos-$architecture"
+    if ! grep -F -q 'context="vaultlink/nixos-$architecture"' .github/workflows/nixos.yml \
+        || ! grep -F -q "$context" .github/workflows/release.yml \
+        || ! grep -F -q "$context" .github/workflows/soak-start.yml; then
+        report "candidate, soak, tag, and NixOS producer must share exact-commit gate $context"
+    fi
+done
 for workflow in \
     .github/workflows/packages.yml \
     .github/workflows/reproducibility.yml \
@@ -1375,6 +1383,8 @@ fi
 for gate_context in \
     vaultlink/native-amd64 \
     vaultlink/native-arm64 \
+    vaultlink/nixos-amd64 \
+    vaultlink/nixos-arm64 \
     vaultlink/fuzz-600s-amd64 \
     vaultlink/fuzz-600s-arm64 \
     vaultlink/packages \

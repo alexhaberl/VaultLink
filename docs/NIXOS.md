@@ -1,0 +1,124 @@
+# NixOS 26.05 deployment
+
+The repository flake provides VaultLink for `x86_64-linux` and `aarch64-linux`.
+Use a reviewed, signed VaultLink release tag and retain the exact revision in
+your host's `flake.lock`. The currently published 0.7.1 release predates this
+target; do not treat a checkout of `main` as a supported release.
+
+## Host configuration
+
+Import `vaultlink.nixosModules.default` in the host flake and pin its input to
+the supported tag. For example, replace `vX.Y.Z` with that tag:
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs.vaultlink.url = "github:alexhaberl/VaultLink/vX.Y.Z";
+  outputs = { nixpkgs, vaultlink, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux"; # or aarch64-linux
+      modules = [
+        vaultlink.nixosModules.default
+        ({ ... }: {
+          services.vaultlink = {
+            enable = true;
+            storageMountPath = "/mnt/storage";
+            configFile = "/etc/vaultlink/config.toml";
+          };
+        })
+      ];
+    };
+  };
+}
+```
+
+The module creates a static `vaultlink` user and private state directories. It
+does not put the TOML configuration, SMB credentials, SQLite database or
+`secrets.keyring` in the Nix store. It skips startup until the configuration
+exists. Once installed, package updates and automatic updates in the web UI
+remain unavailable; update the pinned flake and rebuild the host instead.
+
+Prepare an existing ext4, XFS, Btrfs or other audited local filesystem as a
+real mount at `storageMountPath`, or configure a CIFS mount in the host's
+`fileSystems` using the exact options in [the storage guide](CONFIGURATION.md).
+For SMB, pre-provision `.vaultlink-internal/{uploads,tombstones}` server-side
+and enforce the documented server ACL. Mount with SMB 3.1.1, signing,
+encryption, strict cache, stable inode numbers, `nosuid,nodev,noexec`, and the
+dedicated VaultLink account. For local storage mounted at `/mnt/storage`, use
+`root_mount_path = "/mnt/storage/shared"` and
+`internal_directory = "/mnt/storage/.vaultlink-internal"`; the latter is the
+required private sibling lock domain. For SMB, the share root can be
+`root_mount_path = "/mnt/storage"` with its reserved internal child. Put
+`/var/lib/vaultlink`, SQLite and the keyring
+on a separate supported local filesystem. Never run two instances on one
+storage root.
+
+Inspect the active kernel mount record, then set the **literal** filesystem
+type and source it reports in the private TOML file:
+
+```sh
+findmnt --target /mnt/storage --output TARGET,FSTYPE,SOURCE,OPTIONS
+cat /proc/self/mountinfo
+```
+
+An `UUID=` entry in `fileSystems` is not necessarily the mount source seen by
+VaultLink. The service refuses a missing mount, wrong source, wrong type,
+unsafe ownership or remote SQLite filesystem. Make the shared root and reserved
+internal directory owned by `vaultlink:vaultlink` and inaccessible for
+group/other writes. Use a reverse proxy with HTTPS or VaultLink's standalone
+TLS mode as described in [configuration](CONFIGURATION.md).
+
+## Initial browser setup
+
+After activating the host configuration, run setup as `vaultlink` into its
+private staging directory. Expose the setup listener only through an SSH
+tunnel; save the displayed TOTP secret. The commands mirror the native
+[installation guide](INSTALLATION.md#initial-browser-setup-through-an-ssh-tunnel):
+
+```sh
+sudo -u vaultlink /run/current-system/sw/bin/vaultlink setup \
+  --config /var/lib/vaultlink/setup/config.toml --listen 127.0.0.1:8090
+# In another terminal: ssh -4 -N -L 127.0.0.1:8090:127.0.0.1:8090 host
+```
+
+After stopping setup with Ctrl+C, install the generated configuration and
+start the service:
+
+```sh
+sudo install -o root -g vaultlink -m 0640 \
+  /var/lib/vaultlink/setup/config.toml /etc/vaultlink/config.toml
+sudo -u vaultlink rm /var/lib/vaultlink/setup/config.toml
+sudo systemctl start vaultlink.service
+curl --fail http://127.0.0.1:8080/api/v2/health/ready
+```
+
+## Guided upgrade and recovery
+
+Build the new pinned host generation **before** touching the live instance.
+Keep the old system generation and the old VaultLink flake lock. Schedule a
+maintenance window, close external ingress and stop `vaultlink.service`.
+With the process stopped, run a SQLite checkpoint and integrity check, then
+copy the current executable, `/etc/vaultlink/config.toml`,
+`/var/lib/vaultlink/data.sqlite` and `/var/lib/vaultlink/secrets.keyring` into
+one new root-owned mode-`0700` backup directory. Record SHA-256 hashes and
+owners/modes of every member. Protect the directory as credential material.
+Do not copy an active SQLite database or combine files from separate backups.
+
+Activate the already built generation with `nixos-rebuild switch --flake
+/etc/nixos#my-host`. Verify the running executable and health version, the
+readiness endpoint, and `PRAGMA integrity_check` before reopening ingress.
+If any check fails, stop and runtime-mask the service before switching to the
+previous system generation with `nixos-rebuild switch --rollback`. Restore the
+matching old configuration, database and keyring while it is still stopped;
+remove stale SQLite WAL sidecars only as part of that stopped, verified
+restore. Check hashes, ownership and modes, unmask and start the service, then
+verify the old version and readiness. If either generation or any matching
+backup member is unavailable or fails validation, leave the service stopped
+for operator recovery. **Never use generation rollback alone after a schema
+migration.** An older manual database restore also requires revoking service
+tokens as described in [recovery rules](UPGRADE-ROLLBACK.md#recovery-rules).
+
+The native DEB/RPM/Pacman updater, GUI host controller, installation marker and
+package-runtime guard do not apply to NixOS. NixOS package builds and local/SMB
+VM tests are performed on both architectures by the repository's GitHub
+workflow before a release can claim support.

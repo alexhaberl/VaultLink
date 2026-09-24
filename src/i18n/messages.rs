@@ -17,6 +17,8 @@ catalog! {
     UPDATES_NEVER_CHECKED, "updates.never_checked", "Noch nicht geprüft", "Not checked yet";
     UPDATES_UNAVAILABLE, "updates.unavailable", "Host-Updater nicht verbunden", "Host updater not connected";
     UPDATES_UNAVAILABLE_HELP, "updates.unavailable_help", "Paketupdates über die Oberfläche sind für diese Installation noch nicht eingerichtet.", "Package updates through the interface are not configured for this installation yet.";
+    UPDATES_NIXOS, "updates.nixos", "Updates werden von NixOS verwaltet", "Updates are managed by NixOS";
+    UPDATES_NIXOS_HELP, "updates.nixos_help", "Baue eine neue gepinnte VaultLink-Flake und aktiviere sie mit nixos-rebuild. Sichere Konfiguration, Datenbank und Keyring vor dem Versionswechsel.", "Build a newly pinned VaultLink flake and activate it with nixos-rebuild. Back up the configuration, database, and keyring before changing versions.";
     UPDATES_CHECK, "updates.check", "Auf Updates prüfen", "Check for updates";
     UPDATES_INSTALL, "updates.install", "Update installieren", "Install update";
     UPDATES_RELEASE_NOTES, "updates.release_notes", "Release-Notes auf GitHub", "Release notes on GitHub";

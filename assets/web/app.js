@@ -26,6 +26,7 @@ function initUpdateSettings() {
     automatic_on: '<vl-i18n key="updates.automatic_on"/>', automatic_off: '<vl-i18n key="updates.automatic_off"/>',
     saving: '<vl-i18n key="updates.saving"/>', save_failed: '<vl-i18n key="updates.save_failed"/>',
     unavailable: '<vl-i18n key="updates.unavailable"/>', unavailable_help: '<vl-i18n key="updates.unavailable_help"/>',
+    nixos: '<vl-i18n key="updates.nixos"/>', nixos_help: '<vl-i18n key="updates.nixos_help"/>',
     reconnecting: '<vl-i18n key="updates.reconnecting"/>', reconnecting_help: '<vl-i18n key="updates.reconnecting_help"/>',
     check_required: '<vl-i18n key="updates.check_required"/>'
   };
@@ -60,7 +61,8 @@ function initUpdateSettings() {
     q('[data-update-auto-status]').textContent = labels[state.automatic ? 'automatic_on' : 'automatic_off'];
     if (state.checked_at) q('[data-update-checked]').textContent = labels.checked + ' ' + new Intl.DateTimeFormat(document.documentElement.lang, {dateStyle:'short',timeStyle:'short'}).format(new Date(state.checked_at * 1000));
     const operation = state.operation?.operation;
-    if (!state.available) status('unavailable', 'unavailable_help', 'neutral');
+    if (!state.available && state.install_method === 'nixos') status('nixos', 'nixos_help', 'neutral');
+    else if (!state.available) status('unavailable', 'unavailable_help', 'neutral');
     else if (['queued', 'running'].includes(state.phase)) {
       if (operation === 'automatic') {
         status('saving', 'installing_help', 'active');

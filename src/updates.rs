@@ -42,6 +42,8 @@ pub(crate) enum Request {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Status {
     pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_method: Option<String>,
     pub installed: String,
     pub latest: Option<String>,
     pub update_available: bool,
@@ -57,6 +59,9 @@ impl Status {
     pub(crate) fn disconnected() -> Self {
         Self {
             installed: env!("CARGO_PKG_VERSION").into(),
+            install_method: (std::env::var("VAULTLINK_INSTALL_METHOD").ok().as_deref()
+                == Some("nixos"))
+            .then(|| "nixos".into()),
             phase: "unavailable".into(),
             ..Self::default()
         }

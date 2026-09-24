@@ -2,6 +2,10 @@
 
 [Back to README](../README.md)
 
+For the upcoming repository-flake installation on NixOS 26.05, see the
+[NixOS guide](NIXOS.md). The signed 0.7.1 release described below contains
+only native distribution packages.
+
 This guide installs the supported **VaultLink 0.7.1** native packages,
 including the TLS handshake-validation fix described in the
 [security notice](../SECURITY.md#tls-security-update-in-071).

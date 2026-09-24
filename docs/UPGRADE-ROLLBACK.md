@@ -1,5 +1,9 @@
 # Upgrade, backup, and rollback
 
+The upcoming NixOS 26.05 flake uses a separate, guided upgrade and recovery
+procedure in the [NixOS guide](NIXOS.md#guided-upgrade-and-recovery). The
+native package updater below does not manage NixOS installations.
+
 VaultLink 0.7.1 supports upgrades only between native packages for the exact
 same distribution, release, and architecture. There is no supported adoption,
 upgrade, or migration path from the withdrawn 0.5.0 archive installation. A
