@@ -353,12 +353,11 @@ def main() -> None:
                 time.sleep(0.2)
             assert docker("inspect", second, "--format", "{{.State.ExitCode}}").stdout.strip() != "0", \
                 "second instance accepted the same storage root"
-            if HOST_NETWORK:
-                failure = docker("logs", second)
-                failure_log = failure.stdout + failure.stderr
-                assert "storage instance lock" in failure_log.lower(), \
-                    "second instance failed for a reason other than the shared storage lock: " \
-                    + failure_log[-2000:]
+            failure = docker("logs", second)
+            failure_log = failure.stdout + failure.stderr
+            assert ".vaultlink-instance.lock" in failure_log and "contended" in failure_log.lower(), \
+                "second instance failed for a reason other than the shared storage lock: " \
+                + failure_log[-2000:]
         finally:
             docker("rm", "--force", second, check=False)
         log_result = docker("logs", CONTAINER)
