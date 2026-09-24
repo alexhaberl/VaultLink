@@ -38,9 +38,9 @@ EOF
 chmod 0600 "$HOME/vaultlink-docker.env"
 docker info --format '{{json .SecurityOptions}}'
 docker compose -p vaultlink --env-file "$HOME/vaultlink-docker.env" \
-  -f deploy/docker/compose.rootless.yaml run --rm --user 0 \
+  -f deploy/docker/compose.rootless.yaml run --rm --user 10001:10001 \
   --entrypoint bash vaultlink -ec \
-  'install -d -o 10001 -g 10001 -m 0700 \
+  'install -d -m 0700 \
    /var/lib/vaultlink /mnt/storage/shared \
    /mnt/storage/.vaultlink-internal \
    /mnt/storage/.vaultlink-internal/uploads \
@@ -49,9 +49,10 @@ docker compose -p vaultlink --env-file "$HOME/vaultlink-docker.env" \
   -f deploy/docker/compose.rootless.yaml up -d
 ```
 
-The bootstrap helper runs as UID 0 **inside the rootless user namespace** to
-prepare Docker-managed volumes. The VaultLink service still runs as UID 10001
-with all capabilities dropped and a read-only root filesystem.
+The bootstrap helper and VaultLink service both run as UID 10001. The image
+already owns the two volume roots as UID/GID 10001, so the helper only creates
+private subdirectories. The service has all capabilities dropped and a
+read-only root filesystem.
 
 Inspect the container's `/proc/self/mountinfo` for `/mnt/storage` and enter its
 literal filesystem type and source in setup. Set

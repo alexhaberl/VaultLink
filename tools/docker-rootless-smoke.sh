@@ -128,9 +128,9 @@ VAULTLINK_TEST_EXPECT_ROOTLESS=1 VAULTLINK_TEST_HOST_NETWORK=1 \
   python3 tools/docker-runtime-smoke.py
 VAULTLINK_IMAGE="$image" docker compose "${compose_files[@]}" config --quiet
 VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
-  "${compose_files[@]}" run --rm --user 0 \
+  "${compose_files[@]}" run --rm --user 10001:10001 \
   --entrypoint bash vaultlink -ec \
-  'install -d -o 10001 -g 10001 -m 0700 /var/lib/vaultlink \
+  'install -d -m 0700 /var/lib/vaultlink \
    /mnt/storage/shared /mnt/storage/.vaultlink-internal \
    /mnt/storage/.vaultlink-internal/uploads \
    /mnt/storage/.vaultlink-internal/tombstones'
