@@ -6,8 +6,13 @@ import json
 import os
 from pathlib import Path
 from contextlib import closing
+import base64
+import hashlib
+import hmac
+from http.cookies import SimpleCookie
 import re
 import sqlite3
+import struct
 import subprocess
 import tempfile
 import time
@@ -20,6 +25,7 @@ IMAGE = os.environ.get("VAULTLINK_TEST_IMAGE", "vaultlink:runtime-dev")
 IDENT = f"vaultlink-runtime-{uuid.uuid4().hex[:12]}"
 STATE = f"{IDENT}-state"
 STORAGE = f"{IDENT}-storage"
+CLONE = f"{IDENT}-clone"
 CONTAINER = IDENT
 PASSWORD = "Docker runtime smoke password 123!"
 
@@ -73,6 +79,65 @@ def mount_identity() -> tuple[str, str]:
             separator = fields.index("-")
             return fields[separator + 1], fields[separator + 2]
     raise AssertionError("storage bind mount absent from container mountinfo")
+
+
+def totp(secret: str) -> str:
+    key = base64.b32decode(secret)
+    digest = hmac.new(key, struct.pack(">Q", int(time.time() // 30)), hashlib.sha1).digest()
+    offset = digest[-1] & 15
+    return f"{(struct.unpack('>I', digest[offset:offset + 4])[0] & 0x7fffffff) % 1000000:06d}"
+
+
+def api(url: str, method: str, payload: dict[str, object] | None = None,
+        cookie: str = "", csrf: str = "") -> tuple[int, bytes, list[str]]:
+    headers = {}
+    if cookie:
+        headers["Cookie"] = cookie
+    if csrf:
+        headers["x-csrf-token"] = csrf
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, method=method, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status, response.read(), response.headers.get_all("Set-Cookie", [])
+    except urllib.error.HTTPError as error:
+        return error.code, error.read(), error.headers.get_all("Set-Cookie", [])
+
+
+def merge_cookies(previous: str, set_cookie: list[str]) -> str:
+    values = dict(part.split("=", 1) for part in previous.split("; ") if part)
+    for header in set_cookie:
+        parsed = SimpleCookie()
+        parsed.load(header)
+        for key, morsel in parsed.items():
+            values[key] = morsel.value
+    return "; ".join(f"{key}={value}" for key, value in values.items())
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def upload(url: str, upload_id: str, payload: bytes) -> int:
+    boundary = "vaultlink-runtime-smoke-boundary"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="upload.bin"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode() + payload + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(url, method="POST", data=body, headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Idempotency-Key": upload_id,
+    })
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(req, timeout=10) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
 
 
 def main() -> None:
@@ -132,12 +197,59 @@ def main() -> None:
         }
         status, body = request(url + "/", "POST", fields, token)
         assert status == 200 and "Setup complete" in body, (status, body[:500])
+        totp_secrets = re.findall(r"[A-Z2-7]{32}", body)
+        assert totp_secrets, "setup response did not contain the initial TOTP secret"
+        totp_secret = totp_secrets[0]
         status, body = request(url + "/complete", "POST", token=token)
         assert status == 200 and "Setup confirmed" in body, (status, body[:500])
         status, body = request(url + "/start", "POST", token=token)
         assert status == 200 and "VaultLink is starting" in body, (status, body[:500])
         ready = wait_http(url + "/api/v2/health/ready", 200)
         assert json.loads(ready)["ok"] is True
+        docker("exec", CONTAINER, "bash", "-ec",
+               "printf 'VaultLink container transfer smoke\\n' > /mnt/storage/shared/readme.txt")
+        status, body, cookies = api(url + "/api/v2/session/login", "POST", {
+            "username": "admin", "password": PASSWORD,
+        })
+        assert status == 200, (status, body[:300])
+        cookie = merge_cookies("", cookies)
+        csrf = json.loads(body)["csrf_token"]
+        status, body, cookies = api(url + "/api/v2/session/mfa", "POST", {
+            "code": totp(totp_secret),
+        }, cookie, csrf)
+        assert status == 200, (status, body[:300])
+        cookie = merge_cookies(cookie, cookies)
+        csrf = json.loads(body)["csrf_token"]
+        status, body, _ = api(url + "/api/v2/shares", "POST", {
+            "path": "readme.txt", "permission": "download_only", "overwrite_allowed": False,
+        }, cookie, csrf)
+        assert status == 200, (status, body[:300])
+        download_token = json.loads(body)["token"]
+        status, downloaded, _ = api(url + f"/v/{download_token}/download", "GET")
+        assert status == 200, (status, downloaded[:100])
+        expected_hash = hashlib.sha256(b"VaultLink container transfer smoke\n").hexdigest()
+        assert hashlib.sha256(downloaded).hexdigest() == expected_hash
+        docker("exec", CONTAINER, "install", "-d", "-m", "0700", "/mnt/storage/shared/uploads")
+        share_tokens = {}
+        for permission in ("upload_only", "download_upload"):
+            status, body, _ = api(url + "/api/v2/shares", "POST", {
+                "path": "uploads", "permission": permission, "overwrite_allowed": False,
+            }, cookie, csrf)
+            assert status == 200, (status, body[:300])
+            share_tokens[permission] = json.loads(body)["token"]
+        status, body, _ = api(
+            url + f"/v/{share_tokens['upload_only']}/upload/operations", "POST"
+        )
+        assert status == 201, (status, body[:300])
+        upload_id = json.loads(body)["upload_id"]
+        upload_payload = b"VaultLink container upload and readback smoke\n"
+        status = upload(url + f"/v/{share_tokens['upload_only']}/upload", upload_id, upload_payload)
+        assert status == 303, status
+        readback_path = f"/v/{share_tokens['download_upload']}/download?path=upload.bin"
+        status, readback, _ = api(url + readback_path, "GET")
+        assert status == 200, (status, readback[:100])
+        upload_hash = hashlib.sha256(upload_payload).hexdigest()
+        assert hashlib.sha256(readback).hexdigest() == upload_hash
         assert docker("exec", CONTAINER, "test", "-s", "/var/lib/vaultlink/data.sqlite").returncode == 0
         assert docker("exec", CONTAINER, "test", "-s", "/var/lib/vaultlink/secrets.keyring").returncode == 0
         docker("stop", CONTAINER)
@@ -157,17 +269,51 @@ def main() -> None:
             assert "mount" in (failure.stdout + failure.stderr).lower()
         finally:
             docker("rm", "--force", missing_mount, check=False)
+        docker("run", "--rm", "--user", "0:0", "--entrypoint", "chmod",
+               "--volume", f"{STORAGE}:/mnt/storage", IMAGE, "0777", "/mnt/storage/shared")
+        unsafe_permissions = f"{IDENT}-unsafe-permissions"
+        try:
+            docker("run", "--detach", "--name", unsafe_permissions,
+                   "--user", "10001:10001", "--read-only", "--cap-drop", "ALL",
+                   "--volume", f"{STATE}:/var/lib/vaultlink",
+                   "--volume", f"{STORAGE}:/mnt/storage", IMAGE)
+            exit_code = docker("wait", unsafe_permissions).stdout.strip()
+            assert exit_code != "0", "service accepted a group/world-writable storage root"
+        finally:
+            docker("rm", "--force", unsafe_permissions, check=False)
+            docker("run", "--rm", "--user", "0:0", "--entrypoint", "chmod",
+                   "--volume", f"{STORAGE}:/mnt/storage", IMAGE, "0700", "/mnt/storage/shared")
+        docker("volume", "create", CLONE)
+        docker("run", "--rm", "--user", "0:0", "--entrypoint", "bash",
+               "--volume", f"{STATE}:/source:ro", "--volume", f"{CLONE}:/target",
+               IMAGE, "-ec", "cp -a /source/. /target/ && chown -R 10001:10001 /target")
         docker("start", CONTAINER)
         published = docker("port", CONTAINER, "8081/tcp").stdout.strip()
         host_port = int(published.rsplit(":", 1)[1])
         url = f"http://127.0.0.1:{host_port}"
         wait_http(url + "/api/v2/health/ready", 200)
+        status, readback, _ = api(url + readback_path, "GET")
+        assert status == 200 and hashlib.sha256(readback).hexdigest() == upload_hash
+        second = f"{IDENT}-second-instance"
+        try:
+            docker("run", "--detach", "--name", second,
+                   "--user", "10001:10001", "--read-only", "--cap-drop", "ALL",
+                   "--volume", f"{CLONE}:/var/lib/vaultlink",
+                   "--volume", f"{STORAGE}:/mnt/storage", IMAGE)
+            for _ in range(50):
+                if docker("inspect", second, "--format", "{{.State.Running}}").stdout.strip() == "false":
+                    break
+                time.sleep(0.2)
+            assert docker("inspect", second, "--format", "{{.State.ExitCode}}").stdout.strip() != "0", \
+                "second instance accepted the same storage root"
+        finally:
+            docker("rm", "--force", second, check=False)
         log_result = docker("logs", CONTAINER)
         assert PASSWORD not in log_result.stdout + log_result.stderr
-        print(f"Docker runtime smoke passed: {filesystem} {source}, setup, missing mount, restart, SQLite")
+        print(f"Docker runtime smoke passed: {filesystem} {source}, setup, transfer hashes, mount and rights guards, second instance, restart, SQLite")
     finally:
         docker("rm", "--force", CONTAINER, check=False)
-        for volume in (STATE, STORAGE):
+        for volume in (STATE, STORAGE, CLONE):
             docker("volume", "rm", "--force", volume, check=False)
 
 

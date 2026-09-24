@@ -50,6 +50,8 @@ After the release is published, inspect its multiarch index and record the
 immutable digest. Replace `vX.Y.Z` with the actual supported signed tag:
 
 ```sh
+git fetch origin --tags
+git checkout --detach vX.Y.Z
 docker buildx imagetools inspect ghcr.io/alexhaberl/vaultlink:vX.Y.Z
 # Confirm both linux/amd64 and linux/arm64, then copy the top-level Digest.
 ```
@@ -150,29 +152,57 @@ container before backing up data:
 docker pull ghcr.io/alexhaberl/vaultlink@sha256:NEW_RELEASE_INDEX_DIGEST
 docker compose --env-file /etc/vaultlink/docker.env \
   -f deploy/docker/compose.yaml stop vaultlink
-sudo sqlite3 /srv/vaultlink/state/data.sqlite \
-  'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA integrity_check;'
-sudo install -d -o root -g root -m 0700 /var/backups/vaultlink/BEFORE-NEW-TAG
-sudo cp -a /srv/vaultlink/state/. /var/backups/vaultlink/BEFORE-NEW-TAG/
-sudo cp /etc/vaultlink/docker.env /var/backups/vaultlink/BEFORE-NEW-TAG/docker.env
+sudo sqlite3 /srv/vaultlink/state/data.sqlite 'PRAGMA wal_checkpoint(TRUNCATE);'
+test "$(sudo sqlite3 /srv/vaultlink/state/data.sqlite 'PRAGMA integrity_check;')" = ok
+sudo install -d -o root -g root -m 0700 /var/backups/vaultlink/BEFORE-NEW-TAG/state
+sudo cp -a /srv/vaultlink/state/. /var/backups/vaultlink/BEFORE-NEW-TAG/state/
+sudo cp -a /etc/vaultlink/docker.env /var/backups/vaultlink/BEFORE-NEW-TAG/docker.env
 sudo sh -c 'cd /var/backups/vaultlink/BEFORE-NEW-TAG && \
-  sha256sum config.toml data.sqlite secrets.keyring docker.env > SHA256SUMS'
+  sha256sum state/config.toml state/data.sqlite state/secrets.keyring docker.env > SHA256SUMS'
 ```
 
 The state backup contains the matching configuration, SQLite database and
 keyring. Protect it as credential material and back up the mounted file store
 consistently as well. Replace the image digest in `/etc/vaultlink/docker.env`,
 start Compose, and verify the binary version, readiness, and SQLite integrity
-before reopening ingress. Check hashes and ownership of the backup.
+before reopening ingress:
 
-If an upgrade fails, keep ingress closed and stop the container. Restore the
-**previous image digest and its matching entire stopped state backup**
-including config, database and keyring; remove the failed SQLite WAL sidecars
-only during this stopped restore. Start the old image and confirm readiness,
-version, file access and `PRAGMA integrity_check` before reopening ingress.
-Keep the service stopped if any restore or check fails. Rolling back only the
-image after a database migration is unsafe. A database rollback may require
-revoking service tokens as described in
+```sh
+docker compose --env-file /etc/vaultlink/docker.env \
+  -f deploy/docker/compose.yaml up -d
+docker compose --env-file /etc/vaultlink/docker.env \
+  -f deploy/docker/compose.yaml exec vaultlink /usr/local/bin/vaultlink --version
+curl --fail http://127.0.0.1:18080/api/v2/health/ready
+test "$(sudo sqlite3 /srv/vaultlink/state/data.sqlite 'PRAGMA integrity_check;')" = ok
+```
+
+If an upgrade fails, keep ingress closed and stop the container. Check the
+backup hashes and restore the **previous image digest and its matching entire
+stopped state backup**. Move the failed state aside as one directory, including
+any SQLite WAL sidecars, before copying back the matching config, database and
+keyring. Use a fresh failed-state path and keep it private:
+
+```sh
+docker compose --env-file /etc/vaultlink/docker.env \
+  -f deploy/docker/compose.yaml stop vaultlink
+sudo sh -eu <<'SH'
+backup=/var/backups/vaultlink/BEFORE-NEW-TAG
+cd "$backup"
+sha256sum -c SHA256SUMS
+test ! -e /srv/vaultlink/state.failed-NEW-TAG
+mv /srv/vaultlink/state /srv/vaultlink/state.failed-NEW-TAG
+install -d -o 10001 -g 10001 -m 0700 /srv/vaultlink/state
+cp -a "$backup/state/." /srv/vaultlink/state/
+cp -a "$backup/docker.env" /etc/vaultlink/docker.env
+SH
+docker compose --env-file /etc/vaultlink/docker.env \
+  -f deploy/docker/compose.yaml up -d
+```
+
+Confirm the previous version, readiness, file access and `PRAGMA
+integrity_check` before reopening ingress. Keep the service stopped if any
+restore or check fails. Rolling back only the image after a database migration
+is unsafe. A database rollback may require revoking service tokens as described in
 [recovery rules](UPGRADE-ROLLBACK.md#recovery-rules).
 
 ## Docker Desktop development preview

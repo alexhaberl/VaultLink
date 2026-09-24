@@ -1362,6 +1362,23 @@ for architecture in amd64 arm64; do
         report "candidate, soak, tag, and Docker producer must share exact-commit gate $context"
     fi
 done
+docker_publish=.github/workflows/docker-publish.yml
+for requirement in \
+    'workflow_run:' \
+    'github.event.workflow_run.conclusion == '\''success'\''' \
+    'github.event.workflow_run.event == '\''push'\''' \
+    'github.event.workflow_run.head_repository.full_name == github.repository' \
+    'test "$verified" = true' \
+    'test "$reason" = valid' \
+    'test "$target" = "$COMMIT"' \
+    "--provenance=mode=max --sbom=true" \
+    'push-by-digest=true,name-canonical=true,push=true' \
+    'docker buildx imagetools create --tag "$tag"' \
+    'cmp platforms.expected platforms.actual'; do
+    if ! grep -F -q -- "$requirement" "$docker_publish"; then
+        report "Docker publication must retain reviewed release and multiarch evidence: $requirement"
+    fi
+done
 for workflow in \
     .github/workflows/packages.yml \
     .github/workflows/reproducibility.yml \

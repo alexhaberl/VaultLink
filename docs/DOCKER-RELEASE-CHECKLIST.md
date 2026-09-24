@@ -12,7 +12,8 @@ published 0.7.1 release and its 21 assets remain unchanged.
 2. On native `ubuntu-24.04` and `ubuntu-24.04-arm` runners, build the runtime
    image twice, compare binary hashes, and run the production container smoke
    with real audited local storage. Review setup, unprivileged UID, missing
-   mount rejection, restart, readiness and SQLite integrity. Require the
+   mount and unsafe-rights rejection, second-instance lockout, upload/download
+   hashes, restart, readiness and SQLite integrity. Require the
    commit-bound `vaultlink/docker-amd64` and `vaultlink/docker-arm64` status
    contexts and inspect their workflow run, conclusion, branch, path, commit
    and artifacts. A failed or absent runner blocks the release.

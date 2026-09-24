@@ -143,6 +143,10 @@ jobs:
           [[ "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           tag="$IMAGE:${{ needs.prepare.outputs.tag }}"
+          if docker buildx imagetools inspect "$tag" >/dev/null 2>&1; then
+            echo "Versioned GHCR image already exists; refusing to replace $tag" >&2
+            exit 1
+          fi
           docker buildx imagetools create --tag "$tag" "$IMAGE@$amd64" "$IMAGE@$arm64"
           docker buildx imagetools inspect "$tag" --raw \
             | jq -r '.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"' \
