@@ -452,9 +452,21 @@ curl -sS -f "http://$APP_ADDR/api/v2/public/shares/$SHARE_TOKEN" | grep -q '"per
     || fail "public share API did not return upload_only"
 
 printf 'blocked' > "$WORK_DIR/blocked.exe"
+UPLOAD_OPERATION_RESULT="$(
+    curl -sS -w $'\n%{http_code}' \
+        -X POST "http://$APP_ADDR/api/v2/public/shares/$SHARE_TOKEN/upload/operations"
+)"
+UPLOAD_OPERATION_STATUS="${UPLOAD_OPERATION_RESULT##*$'\n'}"
+UPLOAD_OPERATION_JSON="${UPLOAD_OPERATION_RESULT%$'\n'*}"
+[[ "$UPLOAD_OPERATION_STATUS" == "201" ]] \
+    || fail "upload operation create returned $UPLOAD_OPERATION_STATUS instead of 201"
+UPLOAD_ID="$(printf '%s' "$UPLOAD_OPERATION_JSON" | json_get upload_id)"
+[[ "$UPLOAD_ID" =~ ^[A-Za-z0-9_-]{43}$ ]] \
+    || fail "upload operation create did not return a valid upload ID"
 UPLOAD_STATUS="$(
     curl -sS -o "$WORK_DIR/upload-error.json" -w '%{http_code}' \
         -X POST "http://$APP_ADDR/api/v2/public/shares/$SHARE_TOKEN/upload" \
+        -H "Idempotency-Key: $UPLOAD_ID" \
         -F "file=@$WORK_DIR/blocked.exe;filename=blocked.exe"
 )"
 [[ "$UPLOAD_STATUS" == "415" ]] || fail "blocked upload returned $UPLOAD_STATUS instead of 415"

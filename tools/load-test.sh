@@ -306,7 +306,7 @@ profile_curl() {
     diagnostic_http=${diagnostic_metrics%%,*}
     diagnostic_expected=false
     case "$diagnostic_operation:$diagnostic_http" in
-        metadata:2??|metadata:503|range:206|upload:303|readback:200)
+        metadata:2??|metadata:503|range:206|registration:201|upload:303|readback:200)
             diagnostic_expected=true ;;
     esac
     if [ "$diagnostic_exit" -ne 0 ] || [ "$diagnostic_expected" = false ]; then
@@ -746,9 +746,32 @@ upload_profile() {
             wait_for_profile_go
             headers="$work/upload-$upload.headers"
             filename="load-$SOAK_NAMESPACE-$run_id-$upload.bin"
+            registration_status=$(profile_curl "$identity" registration "$upload" 1 '%{http_code}' \
+                --connect-timeout "$connect_timeout" \
+                --max-time "$transfer_max_time" \
+                --request POST \
+                --output "$work/upload-$upload.operation.json" \
+                "$VAULTLINK_BASE_URL/v/$upload_token/upload/operations")
+            [ "$registration_status" = 201 ] || {
+                echo "upload client $upload: operation registration returned HTTP $registration_status" >&2
+                exit 1
+            }
+            upload_id=$(python3 - "$work/upload-$upload.operation.json" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response:
+    upload_id = json.load(response)["upload_id"]
+if not isinstance(upload_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", upload_id):
+    raise SystemExit("operation registration did not return a valid upload ID")
+print(upload_id)
+PY
+            )
             status=$(profile_curl "$identity" upload "$upload" 1 '%{http_code}' \
                 --connect-timeout "$connect_timeout" \
                 --max-time "$transfer_max_time" \
+                --header "Idempotency-Key: $upload_id" \
                 --form "file=@$work/upload.bin;filename=$filename" \
                 --dump-header "$headers" \
                 --output /dev/null \
