@@ -115,10 +115,10 @@ Every image reference ends in an OCI `sha256` digest. `UNPROVISIONED`, a
 mutable tag, a repository mismatch, an unavailable platform, or an unselected
 Arch snapshot stops package and release work before compilation.
 
-The package-builder, QEMU-runner, and guest-image Dockerfiles also use one
+The package-builder, QEMU-runner, guest-image and runtime Dockerfiles use one
 reviewed `docker.io/docker/dockerfile` patch release pinned to its multiarch
 index digest. The supply-chain policy requires that exact first-line directive
-in all three recipes, rejects any additional frontend directive, and forbids
+in all four recipes, rejects any additional frontend directive, and forbids
 `BUILDKIT_SYNTAX` overrides in every workflow. Each protected refresh workflow
 is also bound to exactly its reviewed recipe and build-argument allowlist, so a
 different `--file`, an extra argument, Bake, or direct `buildctl` cannot bypass
@@ -138,7 +138,7 @@ imagetools inspect docker.io/docker/dockerfile:<patch> --raw | jq
 '.manifests[].platform'` to confirm both `linux/amd64` and `linux/arm64`.
 Cross-check the index digest against the verified
 [`docker/dockerfile` publisher and exact tag in Docker Hub](https://hub.docker.com/r/docker/dockerfile/tags?name=1.27.0).
-Update the patch version, digest, all three first-line directives, and the
+Update the patch version, digest, all four first-line directives, and the
 policy constant in one change.
 
 Builder and guest images are source-independent: their Dockerfiles and locked
@@ -155,7 +155,7 @@ Before changing the Dockerfile frontend, select an exact stable patch tag and
 use normal `docker buildx imagetools inspect` output to verify the displayed
 top-level index digest. Inspect the raw manifest list separately to confirm the
 `linux/amd64` and `linux/arm64` entries, and cross-check that index on Docker
-Hub before updating the three Dockerfile directives and the policy's reviewed
+Hub before updating the four Dockerfile directives and the policy's reviewed
 frontend reference atomically. Never substitute a platform-specific child
 manifest digest. A real frontend digest change requires fresh builder,
 QEMU-runner, and all nine guest-image candidates and invalidates any active
