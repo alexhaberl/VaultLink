@@ -94,6 +94,18 @@ include!("schema/validation.rs");
 mod pending_index_tests {
     use super::*;
     #[test]
+    fn schema_twelve_rejects_a_missing_upload_operation_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch("DROP TABLE upload_operations").unwrap();
+
+        let error = validate_current(&conn).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("schema 12 upload operation table is missing"));
+    }
+
+    #[test]
     fn schema_twelve_migration_rolls_back_atomically_and_validates_shape() {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();

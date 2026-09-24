@@ -33,7 +33,7 @@
   "locked_files": [
     {
       "path": "src/db/schema.rs",
-      "sha256": "1166e99051e150aeeaf13739d8ec660f2b3b01a892a8efec9b0dbd4022c4f642",
+      "sha256": "b67c6fe48cee7ab13343ceea1fdad41195bcf32e8367049d52d099dc6ac419f7",
       "contract": "schema version and fingerprints"
     },
     {
