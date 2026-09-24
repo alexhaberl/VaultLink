@@ -1375,7 +1375,10 @@ for requirement in \
     '--provenance=mode=max --sbom="generator=$SBOM_SCANNER"' \
     'push-by-digest=true,name-canonical=true,push=true' \
     'docker buildx imagetools create --tag "$tag"' \
-    'cmp platforms.expected platforms.actual'; do
+    'cmp platforms.expected platforms.actual' \
+    '  verify_public:' \
+    'export DOCKER_CONFIG="$docker_config"' \
+    "docker pull --platform"; do
     if ! grep -F -q -- "$requirement" "$docker_publish"; then
         report "Docker publication must retain reviewed release and multiarch evidence: $requirement"
     fi

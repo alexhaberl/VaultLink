@@ -57,7 +57,7 @@ def request(url: str, method: str = "GET", data: dict[str, str] | None = None,
 
 
 def wait_http(url: str, expected: int, timeout: float = 35,
-              token: str | None = None) -> str:
+              token: str | None = None, container: str = CONTAINER) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -67,7 +67,7 @@ def wait_http(url: str, expected: int, timeout: float = 35,
         except OSError:
             pass
         time.sleep(0.2)
-    log_result = docker("logs", CONTAINER, check=False)
+    log_result = docker("logs", container, check=False)
     raise AssertionError(f"{url} did not return HTTP {expected}: {log_result.stdout + log_result.stderr}")
 
 
@@ -287,6 +287,22 @@ def main() -> None:
         docker("run", "--rm", "--user", "0:0", "--entrypoint", "bash",
                "--volume", f"{STATE}:/source:ro", "--volume", f"{CLONE}:/target",
                IMAGE, "-ec", "cp -a /source/. /target/ && chown -R 10001:10001 /target")
+        recovery = f"{IDENT}-recovery"
+        try:
+            docker("run", "--detach", "--name", recovery,
+                   "--user", "10001:10001", "--read-only", "--cap-drop", "ALL",
+                   "--security-opt", "no-new-privileges", "--init",
+                   "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700",
+                   "--publish", "127.0.0.1::8081",
+                   "--volume", f"{CLONE}:/var/lib/vaultlink",
+                   "--volume", f"{STORAGE}:/mnt/storage", IMAGE)
+            recovered_port = int(docker("port", recovery, "8081/tcp").stdout.strip().rsplit(":", 1)[1])
+            recovered_url = f"http://127.0.0.1:{recovered_port}"
+            wait_http(recovered_url + "/api/v2/health/ready", 200, container=recovery)
+            status, recovered_file, _ = api(recovered_url + readback_path, "GET")
+            assert status == 200 and hashlib.sha256(recovered_file).hexdigest() == upload_hash
+        finally:
+            docker("rm", "--force", recovery, check=False)
         docker("start", CONTAINER)
         published = docker("port", CONTAINER, "8081/tcp").stdout.strip()
         host_port = int(published.rsplit(":", 1)[1])
@@ -310,7 +326,7 @@ def main() -> None:
             docker("rm", "--force", second, check=False)
         log_result = docker("logs", CONTAINER)
         assert PASSWORD not in log_result.stdout + log_result.stderr
-        print(f"Docker runtime smoke passed: {filesystem} {source}, setup, transfer hashes, mount and rights guards, second instance, restart, SQLite")
+        print(f"Docker runtime smoke passed: {filesystem} {source}, setup, transfer hashes, mount and rights guards, backup recovery, second instance, restart, SQLite")
     finally:
         docker("rm", "--force", CONTAINER, check=False)
         for volume in (STATE, STORAGE, CLONE):
