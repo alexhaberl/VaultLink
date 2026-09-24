@@ -11,6 +11,8 @@ Install Docker Engine Rootless mode for a dedicated service account following
 the [Docker Rootless guide](https://docs.docker.com/engine/security/rootless/).
 Ensure `newuidmap`, `newgidmap`, and at least 65,536 subordinate UIDs and GIDs
 are configured. Enable the per-user systemd service and lingering for startup.
+Use cgroup v2 with a delegated user service so limits such as `pids_limit` are
+enforced; check the daemon's Cgroup Driver and Version in `docker info`.
 Confirm that `docker info` lists `rootless` under Server Security Options and
 that `docker context show` selects that daemon. Being in the `docker` group or
 setting `user: 10001:10001` alone does not make the daemon rootless.
@@ -35,7 +37,7 @@ VAULTLINK_HOST_PORT=18080
 EOF
 chmod 0600 "$HOME/vaultlink-docker.env"
 docker info --format '{{json .SecurityOptions}}'
-docker compose --env-file "$HOME/vaultlink-docker.env" \
+docker compose -p vaultlink --env-file "$HOME/vaultlink-docker.env" \
   -f deploy/docker/compose.rootless.yaml run --rm --user 0 \
   --entrypoint bash vaultlink -ec \
   'install -d -o 10001 -g 10001 -m 0700 \
@@ -43,7 +45,7 @@ docker compose --env-file "$HOME/vaultlink-docker.env" \
    /mnt/storage/.vaultlink-internal \
    /mnt/storage/.vaultlink-internal/uploads \
    /mnt/storage/.vaultlink-internal/tombstones'
-docker compose --env-file "$HOME/vaultlink-docker.env" \
+docker compose -p vaultlink --env-file "$HOME/vaultlink-docker.env" \
   -f deploy/docker/compose.rootless.yaml up -d
 ```
 
@@ -65,8 +67,31 @@ proxy. Keep one service instance per storage volume pair.
 Pin the new release digest and Compose file from the same signed tag. Before
 activating it, stop external ingress and the container, then back up the
 **entire** stopped `vaultlink-state` and `vaultlink-storage` volumes together
-with the previous digest and Compose file. A temporary helper container on the
-same rootless daemon can archive each volume to a protected local directory.
+with the previous digest and Compose file. With the fixed `-p vaultlink`
+project name, the volume names are `vaultlink_vaultlink-state` and
+`vaultlink_vaultlink-storage`. Archive them through the rootless daemon into a
+private local directory with enough capacity:
+
+```sh
+backup_dir="$HOME/vaultlink-backups/BEFORE-NEW-TAG"
+install -d -m 0700 "$backup_dir"
+docker compose -p vaultlink --env-file "$HOME/vaultlink-docker.env" \
+  -f deploy/docker/compose.rootless.yaml stop vaultlink
+for volume in state storage; do
+  docker run --rm --user 0 --entrypoint tar \
+    --volume "vaultlink_vaultlink-$volume:/source:ro" \
+    --volume "$backup_dir:/backup" \
+    "$(sed -n 's/^VAULTLINK_IMAGE=//p' "$HOME/vaultlink-docker.env")" \
+    -C /source -cf "/backup/$volume.tar" .
+done
+cp deploy/docker/compose.rootless.yaml "$backup_dir/compose.rootless.yaml"
+cp "$HOME/vaultlink-docker.env" "$backup_dir/docker.env"
+sha256sum "$backup_dir"/* >"$backup_dir/SHA256SUMS"
+```
+
+Keep this backup private: it contains configuration secrets and keyring
+material. Check the backed-up SQLite database with `PRAGMA integrity_check`
+using a local extracted copy before changing the image digest.
 Verify the database with `PRAGMA integrity_check`, the new binary version,
 readiness and file hashes before opening ingress. On failure, stop the service,
 restore both previous volumes and the previous digest from the paired backup,

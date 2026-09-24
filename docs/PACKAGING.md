@@ -16,9 +16,11 @@ This describes the immutable 0.7.1 release. The next release also plans a
 signed release tag. NixOS does not add a GitHub release asset, native package
 target, package marker or native updater. Its own amd64 and arm64 build and
 booted local/SMB tests must pass before that target is marked supported.
-The next release also plans a [Docker Engine deployment](DOCKER.md) as a
-digest-addressed GHCR multiarch image. Its native amd64 and arm64 runtime gates
-must pass on the exact frozen commit. The image is published after the signed,
+The next release also plans [Docker Engine](DOCKER.md),
+[rootless Docker](DOCKER-ROOTLESS.md) and [Kubernetes](KUBERNETES.md)
+deployments using one digest-addressed GHCR multiarch image. Its native amd64
+and arm64 runtime gates include all three deployment modes and must pass on
+the exact frozen commit. The image is published after the signed,
 immutable release and does not change the nine native package targets or 21
 GitHub release assets. Container updates use a new image digest and a paired
 state backup rather than the native updater.

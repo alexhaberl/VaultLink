@@ -66,7 +66,7 @@ cat >"$test_root/pv.yaml" <<'EOF'
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: vaultlink-ci-state
+  name: vaultlink-state
 spec:
   capacity:
     storage: 1Gi
@@ -86,7 +86,7 @@ spec:
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: vaultlink-ci-storage
+  name: vaultlink-storage
 spec:
   capacity:
     storage: 10Gi
