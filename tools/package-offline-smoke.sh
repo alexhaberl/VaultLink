@@ -60,6 +60,7 @@ sqlite3 "$database" <<'SQL'
 BEGIN IMMEDIATE;
 INSERT INTO audit(occurred_at,actor,action,object_id,detail,priority)
 VALUES('2026-08-30T00:00:00Z','container-gate','upload','migration-probe','preserve',100);
+DROP TABLE upload_operations;
 ALTER TABLE public_upload_usage DROP COLUMN created_directories;
 DROP INDEX idx_shares_protected_id;
 DROP INDEX idx_shares_limit_id;
