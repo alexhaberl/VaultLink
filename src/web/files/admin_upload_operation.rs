@@ -156,9 +156,7 @@ async fn replay_admin_upload(
     .await
     .map_err(|message| match message {
         "Upload IDs disagree" => AppError(StatusCode::BAD_REQUEST, message),
-        "Invalid CSRF proof" | "CSRF proof missing" => {
-            AppError(StatusCode::FORBIDDEN, message)
-        }
+        "Invalid CSRF proof" | "CSRF proof missing" => AppError(StatusCode::FORBIDDEN, message),
         _ => AppError(StatusCode::CONFLICT, "Upload ID conflicts with request"),
     })?;
     if view.fingerprint.as_deref() != Some(&fingerprint) {
