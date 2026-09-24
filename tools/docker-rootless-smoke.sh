@@ -41,6 +41,14 @@ if ! grep -Eq "^$(id -un):[0-9]+:[0-9]{5,}$" /etc/subgid; then
   sudo usermod --add-subgids "$(next_subid_range /etc/subgid)" "$(id -un)"
 fi
 grep -E "^$(id -un):" /etc/subuid /etc/subgid
+legacy_bin_dir="$RUNNER_TEMP/vaultlink-iptables-legacy"
+install -d -m 0700 "$legacy_bin_dir"
+for command in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do
+  legacy_command=${command/tables/tables-legacy}
+  ln -s "$(command -v "$legacy_command")" "$legacy_bin_dir/$command"
+done
+export PATH="$legacy_bin_dir:$PATH"
+iptables --version | grep -q legacy
 if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
   && [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) == 1 ]]; then
   rootlesskit_bin=$(command -v rootlesskit)
