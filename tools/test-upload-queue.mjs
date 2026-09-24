@@ -108,6 +108,7 @@ async function runScenario(name, status, json, expectedMessage, statusResult = n
       return { ok: true, status: 200, json: async () => ({ state: "completed", result: statusResult }) };
     }
     assert.equal(options.headers["Idempotency-Key"], "a".repeat(43), name);
+    if (json === null) throw new TypeError("Upload response lost");
     return { ok: true, status, json };
   };
 
@@ -153,6 +154,8 @@ await runScenario("partial directory", 202, async () => ({
   file: "empty.txt", outcome: "directory_uncertain", warning: "audit_durability_uncertain", warnings: ["storage_durability_uncertain"]
 }), directoryWarningText);
 const storedAudit = { file: "empty.txt", outcome: "created", warning: "audit_durability_uncertain", warnings: ["audit_durability_uncertain"] };
+await runScenario("lost response", 200, null, auditOnlyWarningText, storedAudit);
+await runScenario("malformed success JSON at 200", 200, async () => { throw new SyntaxError("Invalid JSON"); }, auditOnlyWarningText, storedAudit);
 await runScenario("truncated JSON", 202, async () => { throw new SyntaxError("Unexpected end of JSON input"); }, auditOnlyWarningText, storedAudit);
 await runScenario("incomplete JSON object", 202, async () => ({ file: "empty.txt" }), auditOnlyWarningText, storedAudit);
 await runScenario("error envelope with accepted status", 202, async () => ({ error: { code: "unknown" } }), auditOnlyWarningText, storedAudit);
