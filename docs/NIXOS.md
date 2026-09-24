@@ -57,6 +57,7 @@ For a pre-provisioned SMB share, keep the credential file root-owned at
 Nix configuration:
 
 ```nix
+boot.supportedFilesystems = [ "cifs" ];
 fileSystems."/mnt/storage" = {
   device = "//fileserver.example/vaultlink";
   fsType = "cifs";
