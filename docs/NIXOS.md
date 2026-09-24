@@ -76,7 +76,17 @@ encryption, strict cache, stable inode numbers, `nosuid,nodev,noexec`, and the
 dedicated VaultLink account. For local storage mounted at `/mnt/storage`, use
 `root_mount_path = "/mnt/storage/shared"` and
 `internal_directory = "/mnt/storage/.vaultlink-internal"`; the latter is the
-required private sibling lock domain. For SMB, the share root can be
+required private sibling lock domain. Create it with private
+`uploads` and `tombstones` subdirectories owned by `vaultlink:vaultlink`.
+
+```sh
+sudo install -d -o vaultlink -g vaultlink -m 0700 \
+  /mnt/storage/shared /mnt/storage/.vaultlink-internal \
+  /mnt/storage/.vaultlink-internal/uploads \
+  /mnt/storage/.vaultlink-internal/tombstones
+```
+
+For SMB, the share root can be
 `root_mount_path = "/mnt/storage"` with its reserved internal child. Put
 `/var/lib/vaultlink`, SQLite and the keyring
 on a separate supported local filesystem. Never run two instances on one
@@ -170,35 +180,51 @@ curl --fail http://127.0.0.1:8080/api/v2/health/ready
 sudo sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check;'
 ```
 
-If any check fails, stop and runtime-mask the service before switching to the
-previous system generation with `nixos-rebuild switch --rollback`. Restore the
-matching old configuration, database and keyring while it is still stopped;
-remove stale SQLite WAL sidecars only as part of that stopped, verified
-restore. Check hashes, ownership and modes, unmask and start the service, then
-verify the old version and readiness. If either generation or any matching
-backup member is unavailable or fails validation, leave the service stopped
-for operator recovery. **Never use generation rollback alone after a schema
-migration.** An older manual database restore also requires revoking service
-tokens as described in [recovery rules](UPGRADE-ROLLBACK.md#recovery-rules).
+If any check fails, close ingress and run the recovery commands below as one
+root shell operation. A NixOS generation switch can start an enabled unit even
+after a runtime mask, so move the active config file aside **before** switching
+back. The module's `ConditionPathExists` then keeps VaultLink stopped while the
+old generation is activated and its matching database and keyring are restored.
+Remove stale SQLite WAL sidecars only as part of that stopped, verified
+restore. The shell stops VaultLink on any failure; keep ingress closed and
+recover manually if a generation or backup member is missing. Check ownership
+and modes before reopening access. **Never use generation rollback alone after
+a schema migration.** An older manual database restore also requires revoking
+service tokens as described in [recovery rules](UPGRADE-ROLLBACK.md#recovery-rules).
+Before any later rebuild, restore the host flake input and lock to the previous
+VaultLink tag so the next generation does not reactivate the failed version.
 
 ```sh
-sudo systemctl stop vaultlink.service
-sudo systemctl mask --runtime vaultlink.service
-sudo nixos-rebuild switch --rollback
-sudo sh -c 'cd /var/backups/vaultlink/BEFORE-NEW-TAG && sha256sum -c SHA256SUMS'
-sudo rm -f /var/lib/vaultlink/data.sqlite-wal /var/lib/vaultlink/data.sqlite-shm
-sudo cp -a /var/backups/vaultlink/BEFORE-NEW-TAG/config.toml /etc/vaultlink/config.toml
-sudo cp -a /var/backups/vaultlink/BEFORE-NEW-TAG/data.sqlite \
-  /var/backups/vaultlink/BEFORE-NEW-TAG/secrets.keyring /var/lib/vaultlink/
-sudo cmp /etc/vaultlink/config.toml /var/backups/vaultlink/BEFORE-NEW-TAG/config.toml
-sudo cmp /var/lib/vaultlink/data.sqlite /var/backups/vaultlink/BEFORE-NEW-TAG/data.sqlite
-sudo cmp /var/lib/vaultlink/secrets.keyring /var/backups/vaultlink/BEFORE-NEW-TAG/secrets.keyring
-sudo sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check;'
-# After checking owners, modes and the previous generation's binary hash:
-sudo sha256sum /run/current-system/sw/bin/vaultlink /var/backups/vaultlink/BEFORE-NEW-TAG/vaultlink
-sudo systemctl unmask --runtime vaultlink.service
-sudo systemctl start vaultlink.service
+sudo sh -eu <<'SH'
+backup=/var/backups/vaultlink/BEFORE-NEW-TAG
+failed=/var/backups/vaultlink/FAILED-NEW-TAG
+trap 'systemctl stop vaultlink.service || true' 0
+systemctl stop vaultlink.service
+systemctl mask --runtime vaultlink.service
+install -d -o root -g root -m 0700 "$failed"
+test ! -e "$failed/config.toml"
+mv /etc/vaultlink/config.toml "$failed/config.toml"
+test ! -e /etc/vaultlink/config.toml
+nixos-rebuild switch --rollback
+test ! -e /etc/vaultlink/config.toml
+if systemctl is-active --quiet vaultlink.service; then exit 1; fi
+(cd "$backup" && sha256sum -c SHA256SUMS)
+cmp "$backup/vaultlink" /run/current-system/sw/bin/vaultlink
+rm -f /var/lib/vaultlink/data.sqlite-wal /var/lib/vaultlink/data.sqlite-shm
+cp -a "$backup/data.sqlite" "$backup/secrets.keyring" /var/lib/vaultlink/
+cp -a "$backup/config.toml" /etc/vaultlink/config.toml
+cmp /etc/vaultlink/config.toml "$backup/config.toml"
+cmp /var/lib/vaultlink/data.sqlite "$backup/data.sqlite"
+cmp /var/lib/vaultlink/secrets.keyring "$backup/secrets.keyring"
+test "$(sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check')" = ok
+stat -c '%n %U:%G %a' /etc/vaultlink/config.toml \
+  /var/lib/vaultlink/data.sqlite /var/lib/vaultlink/secrets.keyring
+systemctl unmask --runtime vaultlink.service
+systemctl reset-failed vaultlink.service
+systemctl start vaultlink.service
 curl --fail http://127.0.0.1:8080/api/v2/health/ready
+trap - 0
+SH
 ```
 
 The native DEB/RPM/Pacman updater, GUI host controller, installation marker and
