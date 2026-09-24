@@ -63,47 +63,54 @@ EOF
   sudo apparmor_parser -r /etc/apparmor.d/vaultlink-ci-rootlesskit
 fi
 
-rootless_run_dir="$RUNNER_TEMP/vaultlink-rootless-run"
+sudo loginctl enable-linger "$(id -un)"
+sudo systemctl start "user@$(id -u).service"
+rootless_run_dir="/run/user/$(id -u)"
 rootless_data_dir="$RUNNER_TEMP/vaultlink-rootless-data"
-install -d -m 0700 "$rootless_run_dir" "$rootless_data_dir"
+test -d "$rootless_run_dir"
+install -d -m 0700 "$rootless_data_dir"
 export XDG_RUNTIME_DIR="$rootless_run_dir"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$rootless_run_dir/bus"
+systemctl --user is-active --quiet default.target
 unset DOCKER_CONTEXT
 export DOCKER_HOST="unix://$rootless_run_dir/docker.sock"
 export DOCKER_CONFIG="$RUNNER_TEMP/vaultlink-rootless-cli"
 install -d -m 0700 "$DOCKER_CONFIG"
 rootful_host=unix:///var/run/docker.sock
+service_name=vaultlink-ci-rootless
 
 cleanup() {
   if [[ ${VAULTLINK_PROBE_ONLY:-0} != 1 ]]; then
     VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
       "${compose_files[@]}" down >/dev/null 2>&1 || true
   fi
-  if [[ -n ${daemon_pid:-} ]]; then
-    kill "$daemon_pid" 2>/dev/null || true
-    wait "$daemon_pid" 2>/dev/null || true
+  if [[ -n ${service_started:-} ]]; then
+    systemctl --user stop "$service_name.service" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-XDG_DATA_HOME="$rootless_data_dir" dockerd-rootless.sh \
+systemd-run --user --unit="$service_name" --property=Delegate=yes \
+  /usr/bin/env "PATH=$PATH" "XDG_RUNTIME_DIR=$rootless_run_dir" \
+  "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" \
+  "XDG_DATA_HOME=$rootless_data_dir" dockerd-rootless.sh \
   --host "$DOCKER_HOST" --storage-driver=fuse-overlayfs \
-  --bridge=none --iptables=false --ip6tables=false \
-  >"$RUNNER_TEMP/vaultlink-rootless-daemon.log" 2>&1 &
-daemon_pid=$!
+  --bridge=none --iptables=false --ip6tables=false
+service_started=1
 for attempt in {1..90}; do
   if [[ -S "$rootless_run_dir/docker.sock" ]] \
     && docker info --format '{{json .SecurityOptions}}' >"$RUNNER_TEMP/vaultlink-rootless-info.json" 2>/dev/null; then
     break
   fi
-  if ! kill -0 "$daemon_pid" 2>/dev/null; then
-    cat "$RUNNER_TEMP/vaultlink-rootless-daemon.log"
+  if ! systemctl --user is-active --quiet "$service_name.service"; then
+    journalctl --user -u "$service_name.service" --no-pager -n 80
     exit 1
   fi
   sleep 1
 done
 if ! grep -q 'rootless' "$RUNNER_TEMP/vaultlink-rootless-info.json"; then
   cat "$RUNNER_TEMP/vaultlink-rootless-info.json"
-  cat "$RUNNER_TEMP/vaultlink-rootless-daemon.log"
+  journalctl --user -u "$service_name.service" --no-pager -n 80
   exit 1
 fi
 docker info --format '{{.DockerRootDir}} {{json .SecurityOptions}}'
