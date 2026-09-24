@@ -2,6 +2,12 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.vaultlink;
+  validAbsolutePath = path:
+    lib.hasPrefix "/" path
+    && lib.all (segment:
+      segment != "" && segment != "." && segment != ".."
+      && builtins.match "^[^[:space:]]+$" segment != null
+    ) (lib.tail (lib.splitString "/" path));
 in {
   options.services.vaultlink = {
     enable = lib.mkEnableOption "VaultLink file sharing";
@@ -30,12 +36,12 @@ in {
       }
       {
         assertion = cfg.storageMountPath != null
-          && builtins.match "^/[^[:space:]]*" cfg.storageMountPath != null
-          && cfg.storageMountPath != "/";
+          && validAbsolutePath cfg.storageMountPath;
         message = "services.vaultlink.storageMountPath must be an absolute mount path.";
       }
       {
-        assertion = builtins.match "^/[^[:space:]]*" cfg.configFile != null
+        assertion = validAbsolutePath cfg.configFile
+          && cfg.configFile != "/nix/store"
           && !(lib.hasPrefix "/nix/store/" cfg.configFile);
         message = "services.vaultlink.configFile must be an absolute path outside the Nix store.";
       }

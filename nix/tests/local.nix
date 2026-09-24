@@ -49,6 +49,7 @@ in pkgs.testers.runNixOSTest {
     machine.succeed("install -d -o vaultlink -g vaultlink -m 0700 /var/lib/vaultlink/second")
     machine.succeed("sed -e 's/127.0.0.1:8080/127.0.0.1:8081/g' -e 's@data_directory = \"/var/lib/vaultlink\"@data_directory = \"/var/lib/vaultlink/second\"@' /etc/vaultlink/config.toml > /etc/vaultlink/second.toml; chgrp vaultlink /etc/vaultlink/second.toml; chmod 0640 /etc/vaultlink/second.toml")
     machine.fail("runuser -u vaultlink -- ${vaultlink}/bin/vaultlink --config /etc/vaultlink/second.toml > /tmp/vaultlink-second.log 2>&1")
+    machine.succeed("cat /tmp/vaultlink-second.log")
     machine.succeed("grep -q 'already held' /tmp/vaultlink-second.log")
     machine.succeed("systemctl restart vaultlink.service")
     machine.wait_until_succeeds("curl --fail --silent http://127.0.0.1:8080/api/v2/health/ready | grep -q '\"ok\":true'")

@@ -110,7 +110,8 @@ jobs:
 
           validate_gate vaultlink/native-amd64 .github/workflows/ci.yml
           validate_gate vaultlink/native-arm64 .github/workflows/ci.yml
-          if [[ "$package_version" != 0.7.1 ]]; then
+          nixos_required=$(python3 -c 'import sys; print(tuple(map(int, sys.argv[1].split("."))) > (0, 7, 1))' "$package_version")
+          if [[ "$nixos_required" == True ]]; then
             validate_gate vaultlink/nixos-amd64 .github/workflows/nixos.yml
             validate_gate vaultlink/nixos-arm64 .github/workflows/nixos.yml
           fi

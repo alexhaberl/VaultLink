@@ -6,22 +6,22 @@
     </div>
     <div class="vl-update-version-grid">
       <div><span class="vl-update-label"><vl-i18n key="updates.installed"/></span><strong class="vl-update-version" data-update-installed>{{ installed_version }}</strong><span class="vl-muted"><vl-i18n key="updates.current_installation"/></span></div>
-      <div><span class="vl-update-label"><vl-i18n key="updates.latest"/></span><strong class="vl-update-version" data-update-latest>—</strong><span class="vl-muted" data-update-checked><vl-i18n key="updates.never_checked"/></span></div>
+      <div data-update-latest-block><span class="vl-update-label"><vl-i18n key="updates.latest"/></span><strong class="vl-update-version" data-update-latest>—</strong><span class="vl-muted" data-update-checked><vl-i18n key="updates.never_checked"/></span></div>
     </div>
     <div class="vl-update-status" data-update-status data-tone="neutral" role="status" aria-live="polite" aria-atomic="true">
       <span class="vl-update-dot" aria-hidden="true"></span>
       <div><strong data-update-heading><vl-i18n key="updates.unavailable"/></strong><p data-update-detail><vl-i18n key="updates.unavailable_help"/></p></div>
     </div>
-    <div class="vl-update-actions">
+    <div class="vl-update-actions" data-update-native-actions>
       <div class="vl-button-group">
         <button type="button" class="vl-button vl-button--secondary" data-update-check disabled><vl-i18n key="updates.check"/></button>
         <button type="button" class="vl-button" data-update-install hidden><vl-i18n key="updates.install"/></button>
       </div>
       <a href="https://github.com/alexhaberl/VaultLink/releases" target="_blank" rel="noopener noreferrer"><vl-i18n key="updates.release_notes"/> ↗</a>
     </div>
-    <p class="vl-update-trust vl-muted"><vl-i18n key="updates.trust"/></p>
+    <p class="vl-update-trust vl-muted" data-update-native-trust><vl-i18n key="updates.trust"/></p>
   </div>
-  <div class="vl-panel vl-update-panel">
+  <div class="vl-panel vl-update-panel" data-update-auto-panel>
     <h2><vl-i18n key="updates.automatic_title"/></h2>
     <p class="vl-muted"><vl-i18n key="updates.automatic_help"/></p>
     <label class="vl-toggle vl-update-auto">

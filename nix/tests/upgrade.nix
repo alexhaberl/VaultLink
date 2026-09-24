@@ -57,7 +57,7 @@ in pkgs.testers.runNixOSTest {
     machine.succeed("cd /var/backups/vaultlink-upgrade-test && sha256sum -c SHA256SUMS")
     machine.succeed("rm -f /var/lib/vaultlink/data.sqlite-wal /var/lib/vaultlink/data.sqlite-shm")
     machine.succeed("cp -a /var/backups/vaultlink-upgrade-test/config.toml /etc/vaultlink/config.toml; cp -a /var/backups/vaultlink-upgrade-test/data.sqlite /var/backups/vaultlink-upgrade-test/secrets.keyring /var/lib/vaultlink/")
-    machine.succeed("cd /var/lib/vaultlink && sha256sum data.sqlite secrets.keyring | cmp - <(cd /var/backups/vaultlink-upgrade-test && sha256sum data.sqlite secrets.keyring)")
+    machine.succeed("cmp /var/lib/vaultlink/data.sqlite /var/backups/vaultlink-upgrade-test/data.sqlite; cmp /var/lib/vaultlink/secrets.keyring /var/backups/vaultlink-upgrade-test/secrets.keyring")
     machine.succeed("test \"$(sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check')\" = ok")
     machine.succeed("systemctl unmask --runtime vaultlink.service; systemctl start vaultlink.service")
     machine.wait_until_succeeds("curl --fail --silent http://127.0.0.1:8080/api/v2/health/ready | grep -q '0.7.0'")

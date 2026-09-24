@@ -20,6 +20,9 @@ pub(super) async fn status(
     headers: HeaderMap,
 ) -> Result<Json<Status>> {
     session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
+    if updates::is_nixos_installation() {
+        return Ok(Json(Status::disconnected()));
+    }
     Ok(Json(
         updates::exchange(&Request::Status {})
             .await
@@ -43,6 +46,12 @@ pub(super) async fn submit(
 ) -> Result<Json<Status>> {
     let authorization = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
     csrf(&authorization, &form.csrf)?;
+    if updates::is_nixos_installation() {
+        return Err(AppError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Updates are managed by NixOS",
+        ));
+    }
     let action = match (form.operation.as_str(), form.version, form.enabled) {
         ("check", None, None) => Operation::Check {},
         ("install", Some(version), None) => Operation::Install { version },

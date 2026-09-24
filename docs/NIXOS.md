@@ -159,6 +159,16 @@ sudo stat -c '%n %U:%G %a' /var/backups/vaultlink/BEFORE-NEW-TAG/*
 Activate the already built generation with `nixos-rebuild switch --flake
 /etc/nixos#my-host`. Verify the running executable and health version, the
 readiness endpoint, and `PRAGMA integrity_check` before reopening ingress.
+For example:
+
+```sh
+sudo nixos-rebuild switch --flake /etc/nixos#my-host
+/run/current-system/sw/bin/vaultlink --version
+systemctl show -p ExecStart --value vaultlink.service
+curl --fail http://127.0.0.1:8080/api/v2/health/ready
+sudo sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check;'
+```
+
 If any check fails, stop and runtime-mask the service before switching to the
 previous system generation with `nixos-rebuild switch --rollback`. Restore the
 matching old configuration, database and keyring while it is still stopped;
@@ -179,8 +189,12 @@ sudo rm -f /var/lib/vaultlink/data.sqlite-wal /var/lib/vaultlink/data.sqlite-shm
 sudo cp -a /var/backups/vaultlink/BEFORE-NEW-TAG/config.toml /etc/vaultlink/config.toml
 sudo cp -a /var/backups/vaultlink/BEFORE-NEW-TAG/data.sqlite \
   /var/backups/vaultlink/BEFORE-NEW-TAG/secrets.keyring /var/lib/vaultlink/
+sudo cmp /etc/vaultlink/config.toml /var/backups/vaultlink/BEFORE-NEW-TAG/config.toml
+sudo cmp /var/lib/vaultlink/data.sqlite /var/backups/vaultlink/BEFORE-NEW-TAG/data.sqlite
+sudo cmp /var/lib/vaultlink/secrets.keyring /var/backups/vaultlink/BEFORE-NEW-TAG/secrets.keyring
 sudo sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check;'
-# After checking the restored file hashes, owners and modes:
+# After checking owners, modes and the previous generation's binary hash:
+sudo sha256sum /run/current-system/sw/bin/vaultlink /var/backups/vaultlink/BEFORE-NEW-TAG/vaultlink
 sudo systemctl unmask --runtime vaultlink.service
 sudo systemctl start vaultlink.service
 curl --fail http://127.0.0.1:8080/api/v2/health/ready
