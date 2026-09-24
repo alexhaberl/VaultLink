@@ -247,6 +247,23 @@ async fn public_upload_operation_replays_receipt_without_republishing() {
         b"bytes"
     );
 
+    let mismatch_boundary = "mismatched-upload-id";
+    let mismatch_body = format!(
+        "--{mismatch_boundary}\r\nContent-Disposition: form-data; name=\"upload_id\"\r\n\r\n{second_id}\r\n--{mismatch_boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"once.txt\"\r\n\r\nfirst\r\n--{mismatch_boundary}--\r\n"
+    );
+    let mismatch = Request::builder()
+        .method(Method::POST)
+        .uri("/v/idempotent-upload/upload/queue")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={mismatch_boundary}"),
+        )
+        .header("idempotency-key", id)
+        .body(Body::from(mismatch_body))
+        .unwrap();
+    let mismatch_result = app.clone().oneshot(mismatch).await.unwrap();
+    assert_eq!(mismatch_result.status(), StatusCode::BAD_REQUEST);
+
     let creation = app
         .clone()
         .oneshot(

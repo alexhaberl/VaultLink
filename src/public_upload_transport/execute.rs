@@ -314,7 +314,13 @@ async fn replay_public_upload(
         },
     )
     .await
-    .map_err(|_| AppError::new(StatusCode::CONFLICT, "Upload ID conflicts with request"))?;
+    .map_err(|message| match message {
+        "Upload IDs disagree" => AppError::new(StatusCode::BAD_REQUEST, message),
+        "Invalid CSRF proof" | "CSRF proof missing" => {
+            AppError::new(StatusCode::FORBIDDEN, message)
+        }
+        _ => AppError::new(StatusCode::CONFLICT, "Upload ID conflicts with request"),
+    })?;
     if view.fingerprint.as_deref() != Some(&fingerprint) {
         return Err(AppError::new(
             StatusCode::CONFLICT,
