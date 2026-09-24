@@ -11,6 +11,12 @@ packages. GitHub's automatically generated source archives are source material,
 not supported installation artifacts. VaultLink does not publish a package
 repository, a standalone binary, or a project tar archive.
 
+This describes the immutable 0.7.1 release. The next release also plans a
+[NixOS 26.05 repository-flake deployment](NIXOS.md), built by users from the
+signed release tag. NixOS does not add a GitHub release asset, native package
+target, package marker or native updater. Its own amd64 and arm64 build and
+booted local/SMB tests must pass before that target is marked supported.
+
 ## Supported targets
 
 The checked-in `release/package-targets.json` manifest is the sole source of

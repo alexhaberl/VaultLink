@@ -2,6 +2,10 @@
 
 [Back to README](../README.md)
 
+NixOS operators should also follow the [NixOS deployment guide](NIXOS.md).
+Its private TOML configuration uses the same mount-source, ownership and
+SQLite rules described here.
+
 Choose the storage layout and HTTPS mode before completing
 [installation](INSTALLATION.md). Examples in this checkout describe the supported
 0.7.0 release; the configurable `[admission]` section is new in 0.7.0.

@@ -1,0 +1,128 @@
+name: NixOS package and VM gates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nixos-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    name: NixOS 26.05 (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            system: x86_64-linux
+            runner: ubuntu-24.04
+            uname: x86_64
+          - architecture: arm64
+            system: aarch64-linux
+            runner: ubuntu-24.04-arm
+            uname: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/determinate-nix-action@8d87e8d5e5b8a8309d4281094560f127d9a265f1 # v3.22.5
+        with:
+          kvm: ${{ matrix.architecture == 'amd64' }}
+      - name: Build twice and boot local and SMB NixOS guests
+        id: qualification
+        shell: bash
+        env:
+          NIX_SYSTEM: ${{ matrix.system }}
+          EXPECTED_UNAME: ${{ matrix.uname }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          printf 'state=failure\n' >"evidence/$ARCHITECTURE.env"
+          test "$(uname -m)" = "$EXPECTED_UNAME"
+          if [[ "$ARCHITECTURE" == amd64 ]]; then
+            test "${DETERMINATE_NIX_KVM:-0}" = 1
+            test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
+            acceleration=kvm
+          else
+            # Nixpkgs uses kvm:tcg; absent KVM makes TCG the only accelerator.
+            test "${DETERMINATE_NIX_KVM:-0}" != 1
+            test ! -e /dev/kvm
+            acceleration=tcg
+          fi
+          available_kib=$(df -Pk / | awk 'NR==2 {print $4}')
+          test "$available_kib" -ge 4194304
+          nix flake check --no-build --all-systems --no-write-lock-file
+          printf 'system=%s\ncommit=%s\nacceleration=%s\nfree_kib=%s\n' \
+            "$NIX_SYSTEM" "$GITHUB_SHA" "$acceleration" "$available_kib" >"evidence/$ARCHITECTURE.txt"
+          for attempt in 1 2; do
+            rebuild=()
+            if [[ "$attempt" == 2 ]]; then rebuild=(--rebuild); fi
+            output=$(nix build ".#packages.$NIX_SYSTEM.vaultlink" \
+              "${rebuild[@]}" --no-link --print-out-paths --no-write-lock-file)
+            test -x "$output/bin/vaultlink"
+            "$output/bin/vaultlink" --version
+            sha256sum "$output/bin/vaultlink" | awk '{print $1}' \
+              >"evidence/binary-$attempt.sha256"
+            nix hash path --type sha256 "$output" \
+              >"evidence/output-$attempt.sha256"
+          done
+          cmp evidence/binary-1.sha256 evidence/binary-2.sha256
+          cmp evidence/output-1.sha256 evidence/output-2.sha256
+          nix build ".#checks.$NIX_SYSTEM.local" --no-link --no-write-lock-file
+          nix build ".#checks.$NIX_SYSTEM.smb" --no-link --no-write-lock-file
+          nix build ".#checks.$NIX_SYSTEM.upgrade" --no-link --no-write-lock-file
+          cat evidence/binary-1.sha256 evidence/output-1.sha256 \
+            >>"evidence/$ARCHITECTURE.txt"
+          printf 'state=success\n' >"evidence/$ARCHITECTURE.env"
+      - name: Preserve NixOS qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nixos-${{ matrix.architecture }}-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  publish_gate:
+    name: Publish exact-commit NixOS gates
+    if: ${{ always() && github.event_name == 'push' }}
+    needs: [qualify]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: nixos-*-${{ github.sha }}
+          path: evidence
+          merge-multiple: true
+      - name: Publish independent architecture results
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for architecture in amd64 arm64; do
+            state=failure
+            if [[ -f "evidence/$architecture.env" ]] \
+              && grep -Fxq 'state=success' "evidence/$architecture.env"; then
+              state=success
+            fi
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+              -f state="$state" \
+              -f context="vaultlink/nixos-$architecture" \
+              -f description="NixOS 26.05 package, reproducibility, local and SMB VM tests: $state" \
+              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done

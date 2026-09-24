@@ -11,6 +11,10 @@ pub use host::run_host;
 pub(crate) const SOCKET: &str = "/run/vaultlink-update-control/control.sock";
 const MAX_MESSAGE: usize = 8192;
 
+pub(crate) fn is_nixos_installation() -> bool {
+    std::env::var("VAULTLINK_INSTALL_METHOD").ok().as_deref() == Some("nixos")
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Operation {
@@ -42,6 +46,8 @@ pub(crate) enum Request {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Status {
     pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_method: Option<String>,
     pub installed: String,
     pub latest: Option<String>,
     pub update_available: bool,
@@ -57,6 +63,7 @@ impl Status {
     pub(crate) fn disconnected() -> Self {
         Self {
             installed: env!("CARGO_PKG_VERSION").into(),
+            install_method: is_nixos_installation().then(|| "nixos".into()),
             phase: "unavailable".into(),
             ..Self::default()
         }

@@ -26,6 +26,8 @@ function initUpdateSettings() {
     automatic_on: '<vl-i18n key="updates.automatic_on"/>', automatic_off: '<vl-i18n key="updates.automatic_off"/>',
     saving: '<vl-i18n key="updates.saving"/>', save_failed: '<vl-i18n key="updates.save_failed"/>',
     unavailable: '<vl-i18n key="updates.unavailable"/>', unavailable_help: '<vl-i18n key="updates.unavailable_help"/>',
+    nixos: document.documentElement.lang.startsWith('de') ? 'Updates werden von NixOS verwaltet' : 'Updates are managed by NixOS',
+    nixos_help: document.documentElement.lang.startsWith('de') ? 'Baue eine neue gepinnte VaultLink-Flake und aktiviere sie mit nixos-rebuild. Sichere Konfiguration, Datenbank und Keyring vor dem Versionswechsel.' : 'Build a newly pinned VaultLink flake and activate it with nixos-rebuild. Back up the configuration, database, and keyring before changing versions.',
     reconnecting: '<vl-i18n key="updates.reconnecting"/>', reconnecting_help: '<vl-i18n key="updates.reconnecting_help"/>',
     check_required: '<vl-i18n key="updates.check_required"/>'
   };
@@ -46,6 +48,11 @@ function initUpdateSettings() {
     q('[data-update-status]').dataset.tone = tone;
   };
   const render = () => {
+    const isNixos = !state.available && state.install_method === 'nixos';
+    q('[data-update-native-actions]').hidden = isNixos;
+    q('[data-update-auto-panel]').hidden = isNixos;
+    q('[data-update-latest-block]').hidden = isNixos;
+    q('[data-update-native-trust]').hidden = isNixos;
     check.disabled = isBusy();
     automatic.disabled = isBusy();
     install.disabled = isBusy();
@@ -60,7 +67,8 @@ function initUpdateSettings() {
     q('[data-update-auto-status]').textContent = labels[state.automatic ? 'automatic_on' : 'automatic_off'];
     if (state.checked_at) q('[data-update-checked]').textContent = labels.checked + ' ' + new Intl.DateTimeFormat(document.documentElement.lang, {dateStyle:'short',timeStyle:'short'}).format(new Date(state.checked_at * 1000));
     const operation = state.operation?.operation;
-    if (!state.available) status('unavailable', 'unavailable_help', 'neutral');
+    if (isNixos) status('nixos', 'nixos_help', 'neutral');
+    else if (!state.available) status('unavailable', 'unavailable_help', 'neutral');
     else if (['queued', 'running'].includes(state.phase)) {
       if (operation === 'automatic') {
         status('saving', 'installing_help', 'active');

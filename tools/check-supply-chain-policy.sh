@@ -1347,6 +1347,14 @@ for aggregate_context in \
         report "candidate, soak, tag, and producer must share aggregate gate $aggregate_context"
     fi
 done
+for architecture in amd64 arm64; do
+    context="vaultlink/nixos-$architecture"
+    if ! grep -F -q 'context="vaultlink/nixos-$architecture"' .github/workflows/nixos.yml \
+        || ! grep -F -q "$context" .github/workflows/release.yml \
+        || ! grep -F -q "$context" .github/workflows/soak-start.yml; then
+        report "candidate, soak, tag, and NixOS producer must share exact-commit gate $context"
+    fi
+done
 for workflow in \
     .github/workflows/packages.yml \
     .github/workflows/reproducibility.yml \
@@ -1375,6 +1383,8 @@ fi
 for gate_context in \
     vaultlink/native-amd64 \
     vaultlink/native-arm64 \
+    vaultlink/nixos-amd64 \
+    vaultlink/nixos-arm64 \
     vaultlink/fuzz-600s-amd64 \
     vaultlink/fuzz-600s-arm64 \
     vaultlink/packages \
@@ -1397,8 +1407,9 @@ for workflow in .github/workflows/release.yml .github/workflows/soak-start.yml; 
     fi
 done
 if ! grep -F -q -- '--name "vaultlink-release-unsigned-$APPROVED_COMMIT"' .github/workflows/soak-start.yml \
-    || ! grep -F -q 'tools/verify-package-release.sh "$candidate_artifact" 0.7.1' .github/workflows/soak-start.yml \
-    || ! grep -F -q 'package-targets.py asset debian13-amd64 0.7.1' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'tools/verify-package-release.sh "$candidate_artifact" "$package_version"' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'package-targets.py asset debian13-amd64 "$package_version"' .github/workflows/soak-start.yml \
+    || ! grep -F -q 'package_version=$(sed -n' .github/workflows/soak-start.yml \
     || ! grep -F -q 'dpkg-deb -x "$candidate_artifact/$deb" "$extracted"' .github/workflows/soak-start.yml \
     || ! grep -F -q 'usr/lib/vaultlink/package/vaultlink' .github/workflows/soak-start.yml \
     || ! grep -F -q 'candidate_binary_sha256' .github/workflows/soak-start.yml \
