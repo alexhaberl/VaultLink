@@ -35,8 +35,10 @@ published 0.7.1 release and its 21 assets remain unchanged.
    records the index and child digests as a workflow artifact.
 5. Confirm `linux/amd64` and `linux/arm64` on the **top-level** GHCR index.
    The `verify_public` jobs on native amd64 and arm64 runners must pull the
-   digest without Registry credentials and verify version and source revision
-   labels. The first GHCR package may need its visibility set to public by the
+   digest without Registry credentials, verify version and source revision
+   labels, then repeat standard Docker, rootless Docker and Kubernetes local-PV
+   smokes with the actual published image. The first GHCR package may need its
+   visibility set to public by the
    repository owner; rerun the failed public verification after that change.
    Keep ingress closed until both platform checks pass.
    Record the index digest and publish workflow URL in the new release notes.

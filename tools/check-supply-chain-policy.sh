@@ -1383,6 +1383,19 @@ for requirement in \
         report "Docker publication must retain reviewed release and multiarch evidence: $requirement"
     fi
 done
+for smoke in \
+    tools/docker-runtime-smoke.py \
+    tools/docker-rootless-smoke.sh \
+    tools/kubernetes-runtime-smoke.sh; do
+    if ! grep -F -q "$smoke" .github/workflows/docker-runtime.yml \
+        || ! grep -F -q "$smoke" "$docker_publish"; then
+        report "Docker qualification and published-digest verification must run $smoke"
+    fi
+done
+if ! grep -F -q 'VAULTLINK_TEST_EXPECT_ROOTLESS=1' tools/docker-rootless-smoke.sh \
+    || ! grep -F -q '"rootless" in option' tools/docker-runtime-smoke.py; then
+    report 'rootless Docker gate must verify the daemon, not only the container UID'
+fi
 for workflow in \
     .github/workflows/packages.yml \
     .github/workflows/reproducibility.yml \

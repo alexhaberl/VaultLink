@@ -176,6 +176,7 @@ jobs:
   verify_public:
     needs: [prepare, publish]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     permissions:
       contents: read
       actions: read
@@ -190,6 +191,10 @@ jobs:
             runner: ubuntu-24.04-arm
             uname: aarch64
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: docker-release-index-${{ needs.prepare.outputs.tag }}
@@ -198,6 +203,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = '${{ matrix.uname }}'
+          test "$(git rev-parse HEAD)" = '${{ needs.prepare.outputs.commit }}'
           reference=$(head -n 1 image-reference.txt)
           [[ "$reference" =~ ^ghcr\.io/alexhaberl/vaultlink@sha256:[0-9a-f]{64}$ ]]
           docker_config=$(mktemp -d)
@@ -210,3 +216,8 @@ jobs:
           docker image inspect "$reference" \
             --format '{{.Architecture}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
             | grep -Fxq '${{ matrix.architecture }} ${{ needs.prepare.outputs.commit }}'
+          docker tag "$reference" vaultlink:release-test
+          VAULTLINK_TEST_IMAGE=vaultlink:release-test python3 tools/docker-runtime-smoke.py
+          VAULTLINK_TEST_IMAGE=vaultlink:release-test bash tools/docker-rootless-smoke.sh
+          VAULTLINK_TEST_IMAGE=vaultlink:release-test \
+          VAULTLINK_TEST_ARCH='${{ matrix.architecture }}' bash tools/kubernetes-runtime-smoke.sh

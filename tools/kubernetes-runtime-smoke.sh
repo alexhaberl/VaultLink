@@ -118,7 +118,7 @@ wait "$forward_pid" 2>/dev/null || true
 unset forward_pid
 
 kubectl scale deployment/vaultlink --replicas=0
-for attempt in {1..60}; do
+for ((attempt = 0; attempt < 60; attempt++)); do
   [[ $(kubectl get pods -l app=vaultlink -o name | wc -l) -eq 0 ]] && break
   sleep 2
 done

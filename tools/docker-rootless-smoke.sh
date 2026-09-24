@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'printf "rootless smoke failed at line %s\n" "$LINENO" >&2' ERR
 
 image=${VAULTLINK_TEST_IMAGE:?Set VAULTLINK_TEST_IMAGE}
 compose_project="vaultlink-rootless-ci-${GITHUB_RUN_ID:-local}"
@@ -25,8 +26,21 @@ command -v dockerd-rootless.sh >/dev/null || {
 }
 command -v newuidmap >/dev/null
 command -v newgidmap >/dev/null
-grep -Eq "^$(id -un):[0-9]+:[0-9]{5,}$" /etc/subuid
-grep -Eq "^$(id -un):[0-9]+:[0-9]{5,}$" /etc/subgid
+next_subid_range() {
+  awk -F: 'BEGIN { next_id = 100000 }
+    $2 + $3 > next_id { next_id = $2 + $3 }
+    END {
+      start = int((next_id + 65535) / 65536) * 65536
+      printf "%d-%d\n", start, start + 65535
+    }' "$1"
+}
+if ! grep -Eq "^$(id -un):[0-9]+:[0-9]{5,}$" /etc/subuid; then
+  sudo usermod --add-subuids "$(next_subid_range /etc/subuid)" "$(id -un)"
+fi
+if ! grep -Eq "^$(id -un):[0-9]+:[0-9]{5,}$" /etc/subgid; then
+  sudo usermod --add-subgids "$(next_subid_range /etc/subgid)" "$(id -un)"
+fi
+grep -E "^$(id -un):" /etc/subuid /etc/subgid
 
 rootless_run_dir="$RUNNER_TEMP/vaultlink-rootless-run"
 rootless_data_dir="$RUNNER_TEMP/vaultlink-rootless-data"
@@ -79,7 +93,7 @@ VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
 service_container=$(VAULTLINK_IMAGE="$image" docker compose -p "$compose_project" \
   -f deploy/docker/compose.rootless.yaml ps -q vaultlink)
 test "$(docker exec "$service_container" id -u)" = 10001
-for attempt in {1..30}; do
+for ((attempt = 0; attempt < 30; attempt++)); do
   code=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/ || true)
   [[ $code == 401 ]] && break
   sleep 1
