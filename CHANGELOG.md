@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.2 — Unreleased
+
+- Add NixOS 26.05 deployment support and a multiarch OCI runtime image for the
+  next release, subject to exact-commit qualification and publication checks.
+- Add schema 11 and 12 migrations, including per-share upload-directory counts
+  and hash-only upload operation receipts with preissued upload IDs.
+- Continue the nine signed native packages and the 72-hour soak requirements.
+  Release qualification and publication remain pending.
+
 ## 0.7.1 — 2026-09-22
 
 [Published release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1),

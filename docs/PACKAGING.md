@@ -55,6 +55,22 @@ For the published 0.7.1 release, the manifest defines these packages:
 | Fedora 44 aarch64 | `vaultlink-0.7.1-1.fc44.aarch64.rpm` |
 | Arch Linux x86_64 | `vaultlink-0.7.1-1-x86_64.pkg.tar.zst` |
 
+The unreleased 0.7.2 checkout renders these **candidate asset names** from the
+same nine-target manifest. They are not published packages; keep using 0.7.1
+for installation until 0.7.2 completes qualification and publication.
+
+| Target | Candidate asset |
+| --- | --- |
+| Debian 13 amd64 | `vaultlink_0.7.2-1+deb13_amd64.deb` |
+| Debian 13 arm64 | `vaultlink_0.7.2-1+deb13_arm64.deb` |
+| Ubuntu 24.04 amd64 | `vaultlink_0.7.2-1+ubuntu24.04_amd64.deb` |
+| Ubuntu 24.04 arm64 | `vaultlink_0.7.2-1+ubuntu24.04_arm64.deb` |
+| Ubuntu 26.04 amd64 | `vaultlink_0.7.2-1+ubuntu26.04_amd64.deb` |
+| Ubuntu 26.04 arm64 | `vaultlink_0.7.2-1+ubuntu26.04_arm64.deb` |
+| Fedora 44 x86_64 | `vaultlink-0.7.2-1.fc44.x86_64.rpm` |
+| Fedora 44 aarch64 | `vaultlink-0.7.2-1.fc44.aarch64.rpm` |
+| Arch Linux x86_64 | `vaultlink-0.7.2-1-x86_64.pkg.tar.zst` |
+
 Each binary is compiled inside its target distribution on a native runner of
 the same CPU architecture. Arch Linux ARM, distributions derived from the
 listed targets, later rolling Arch snapshots, and every unlisted OS/version
