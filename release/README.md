@@ -50,6 +50,20 @@ contract. Both `vaultlink/nixos-amd64` and `vaultlink/nixos-arm64` must be
 successful for the exact frozen commit in release preflights and before the
 72-hour soak starts. Historical 0.7.1 evidence remains unchanged. See
 [the NixOS deployment guide](../docs/NIXOS.md).
+The next release also publishes a multiarch OCI runtime image to GHCR
+after the immutable signed native release succeeds. Its exact frozen commit
+must first pass `vaultlink/docker-amd64` and `vaultlink/docker-arm64` in the
+same preflights and before the soak. Its BuildKit image and Syft SBOM scanner
+are pinned by digest. The image adds no GitHub release asset.
+Keep the exact release commit at the tip of `main` until the follow-on GHCR
+publication and unauthenticated amd64/arm64 pull checks succeed.
+Operators pin its top-level digest and keep the SQLite database, config and
+keyring with the matching image during recovery. The two Docker status contexts
+cover standard Docker Engine, a rootless Docker daemon and Kubernetes 1.36 on
+native amd64 and arm64; a green container-UID check alone is insufficient.
+See the [standard Docker](../docs/DOCKER.md),
+[rootless Docker](../docs/DOCKER-ROOTLESS.md) and
+[Kubernetes](../docs/KUBERNETES.md) deployment guides.
 
 ## Signing key
 
@@ -108,10 +122,10 @@ Every image reference ends in an OCI `sha256` digest. `UNPROVISIONED`, a
 mutable tag, a repository mismatch, an unavailable platform, or an unselected
 Arch snapshot stops package and release work before compilation.
 
-The package-builder, QEMU-runner, and guest-image Dockerfiles also use one
+The package-builder, QEMU-runner, guest-image and runtime Dockerfiles use one
 reviewed `docker.io/docker/dockerfile` patch release pinned to its multiarch
 index digest. The supply-chain policy requires that exact first-line directive
-in all three recipes, rejects any additional frontend directive, and forbids
+in all four recipes, rejects any additional frontend directive, and forbids
 `BUILDKIT_SYNTAX` overrides in every workflow. Each protected refresh workflow
 is also bound to exactly its reviewed recipe and build-argument allowlist, so a
 different `--file`, an extra argument, Bake, or direct `buildctl` cannot bypass
@@ -131,7 +145,7 @@ imagetools inspect docker.io/docker/dockerfile:<patch> --raw | jq
 '.manifests[].platform'` to confirm both `linux/amd64` and `linux/arm64`.
 Cross-check the index digest against the verified
 [`docker/dockerfile` publisher and exact tag in Docker Hub](https://hub.docker.com/r/docker/dockerfile/tags?name=1.27.0).
-Update the patch version, digest, all three first-line directives, and the
+Update the patch version, digest, all four first-line directives, and the
 policy constant in one change.
 
 Builder and guest images are source-independent: their Dockerfiles and locked
@@ -148,7 +162,7 @@ Before changing the Dockerfile frontend, select an exact stable patch tag and
 use normal `docker buildx imagetools inspect` output to verify the displayed
 top-level index digest. Inspect the raw manifest list separately to confirm the
 `linux/amd64` and `linux/arm64` entries, and cross-check that index on Docker
-Hub before updating the three Dockerfile directives and the policy's reviewed
+Hub before updating the four Dockerfile directives and the policy's reviewed
 frontend reference atomically. Never substitute a platform-specific child
 manifest digest. A real frontend digest change requires fresh builder,
 QEMU-runner, and all nine guest-image candidates and invalidates any active

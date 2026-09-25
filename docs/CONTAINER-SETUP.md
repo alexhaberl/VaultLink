@@ -1,5 +1,9 @@
 # Container setup entrypoint
 
+For an official Linux server deployment with the GHCR runtime image, Compose,
+audited local or SMB mount, and backup procedure, use the [Docker Engine
+guide](DOCKER.md). This page explains the proxy and local smoke image.
+
 VaultLink intentionally binds its bootstrap setup UI and development server to
 loopback. Docker port publishing cannot reach a listener on the container's
 loopback interface directly. The container entrypoint keeps that boundary and
@@ -39,7 +43,7 @@ the gateway is the trust boundary and must be allowlisted explicitly only when
 the published port remains host-local.
 
 The repository's digest-pinned smoke image can exercise this flow locally. It
-is a test image with build tools, not the final minimal runtime image:
+is a test image with build tools:
 
 ```sh
 docker build -f deploy/docker/Dockerfile.setup-smoke -t vaultlink:smoke .

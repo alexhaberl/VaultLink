@@ -1,0 +1,26 @@
+services:
+  vaultlink:
+    image: ${VAULTLINK_IMAGE:?Set VAULTLINK_IMAGE to the reviewed GHCR release digest}
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    stop_grace_period: 30s
+    ports:
+      - "127.0.0.1:${VAULTLINK_HOST_PORT:-18080}:8081"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700
+    volumes:
+      - type: volume
+        source: vaultlink-state
+        target: /var/lib/vaultlink
+      - type: volume
+        source: vaultlink-storage
+        target: /mnt/storage
+
+volumes:
+  vaultlink-state:
+  vaultlink-storage:

@@ -1,0 +1,148 @@
+name: Docker runtime image gates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-runtime-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rootless_probe:
+    name: Rootless runner probe (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify unprivileged daemon and container execution
+        shell: bash
+        env:
+          VAULTLINK_PROBE_ONLY: '1'
+        run: bash tools/docker-rootless-smoke.sh
+
+  qualify:
+    name: Docker runtime (${{ matrix.architecture }})
+    needs: rootless_probe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            uname: x86_64
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            uname: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and test the native production image
+        shell: bash
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          PLATFORM: ${{ matrix.platform }}
+          EXPECTED_UNAME: ${{ matrix.uname }}
+        run: |
+          set -euo pipefail
+          mkdir -p "evidence/$ARCHITECTURE"
+          printf 'state=failure\n' >"evidence/$ARCHITECTURE.env"
+          test "$(uname -m)" = "$EXPECTED_UNAME"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          for attempt in 1 2; do
+            docker build --no-cache --pull=false \
+              --platform "$PLATFORM" \
+              --file deploy/docker/Dockerfile.runtime \
+              --tag "vaultlink:runtime-$attempt" \
+              --build-arg "VERSION=$version" \
+              --build-arg "VCS_REF=$GITHUB_SHA" .
+            container=$(docker create "vaultlink:runtime-$attempt")
+            docker cp "$container:/usr/local/bin/vaultlink" "evidence/$ARCHITECTURE/vaultlink-$attempt"
+            docker rm "$container"
+            sha256sum "evidence/$ARCHITECTURE/vaultlink-$attempt" | cut -d ' ' -f 1 \
+              >"evidence/$ARCHITECTURE/binary-$attempt.sha256"
+          done
+          cmp "evidence/$ARCHITECTURE/binary-1.sha256" "evidence/$ARCHITECTURE/binary-2.sha256"
+          docker image inspect vaultlink:runtime-2 \
+            --format '{{.Architecture}} {{.Config.User}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
+            >"evidence/$ARCHITECTURE/image.txt"
+          grep -Fxq "$ARCHITECTURE 10001:10001 $GITHUB_SHA" "evidence/$ARCHITECTURE/image.txt"
+          docker run --rm --entrypoint sh vaultlink:runtime-2 -ec \
+            '! command -v cargo && ! command -v rustc && \
+             test -s /etc/ssl/certs/ca-certificates.crt && \
+             test -s /usr/share/doc/vaultlink/LICENSE && \
+             test -s /usr/share/doc/vaultlink/config/production-reverse-proxy.toml'
+          VAULTLINK_IMAGE=vaultlink:runtime-2 \
+          VAULTLINK_STATE_DIR="$RUNNER_TEMP/vaultlink-state" \
+          VAULTLINK_STORAGE_DIR="$RUNNER_TEMP/vaultlink-storage" \
+            docker compose -f deploy/docker/compose.yaml config --quiet
+          VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 python3 tools/docker-runtime-smoke.py
+          VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 \
+          VAULTLINK_TEST_ARCH="$ARCHITECTURE" bash tools/kubernetes-runtime-smoke.sh \
+            | tee "evidence/$ARCHITECTURE/kubernetes.txt"
+          VAULTLINK_TEST_IMAGE=vaultlink:runtime-2 bash tools/docker-rootless-smoke.sh \
+            | tee "evidence/$ARCHITECTURE/rootless.txt"
+          cat "evidence/$ARCHITECTURE/binary-2.sha256" >>"evidence/$ARCHITECTURE/image.txt"
+          printf 'state=success\n' >"evidence/$ARCHITECTURE.env"
+      - name: Preserve Docker runtime evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-${{ matrix.architecture }}-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  publish_gate:
+    name: Publish exact-commit Docker gates
+    if: ${{ always() && github.event_name == 'push' }}
+    needs: [qualify]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: docker-*-${{ github.sha }}
+          path: evidence
+          merge-multiple: true
+      - name: Publish independent architecture results
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for architecture in amd64 arm64; do
+            state=failure
+            if [[ -f "evidence/$architecture.env" ]] \
+              && grep -Fxq 'state=success' "evidence/$architecture.env"; then
+              state=success
+            fi
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+              -f state="$state" \
+              -f context="vaultlink/docker-$architecture" \
+              -f description="Native image, rootless Docker and Kubernetes deployment: $state" \
+              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done

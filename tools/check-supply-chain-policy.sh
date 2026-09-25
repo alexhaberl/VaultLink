@@ -117,9 +117,10 @@ check_audit_remediation_policy() {
     audit_package_builder="$audit_root/deploy/docker/Dockerfile.package-builder"
     audit_qemu_builder="$audit_root/deploy/docker/Dockerfile.qemu-runner"
     audit_vm_builder="$audit_root/deploy/docker/Dockerfile.distro-vm-image"
+    audit_runtime="$audit_root/deploy/docker/Dockerfile.runtime"
 
     for audit_dockerfile in \
-        "$audit_package_builder" "$audit_qemu_builder" "$audit_vm_builder"; do
+        "$audit_package_builder" "$audit_qemu_builder" "$audit_vm_builder" "$audit_runtime"; do
         if [ ! -f "$audit_dockerfile" ] || [ -L "$audit_dockerfile" ]; then
             report "release Dockerfile is missing or unsafe: $audit_dockerfile"
             continue
@@ -141,7 +142,7 @@ check_audit_remediation_policy() {
         if grep -E -i -q '^[[:space:]]*#[[:space:]]*syntax[[:space:]]*=' \
                 "$audit_dockerfile"; then
             case "$audit_dockerfile" in
-                "$audit_package_builder"|"$audit_qemu_builder"|"$audit_vm_builder") ;;
+                "$audit_package_builder"|"$audit_qemu_builder"|"$audit_vm_builder"|"$audit_runtime") ;;
                 *) report "unreviewed Dockerfile frontend directive in $audit_dockerfile" ;;
             esac
         fi
@@ -1354,7 +1355,47 @@ for architecture in amd64 arm64; do
         || ! grep -F -q "$context" .github/workflows/soak-start.yml; then
         report "candidate, soak, tag, and NixOS producer must share exact-commit gate $context"
     fi
+    context="vaultlink/docker-$architecture"
+    if ! grep -F -q 'context="vaultlink/docker-$architecture"' .github/workflows/docker-runtime.yml \
+        || ! grep -F -q "$context" .github/workflows/release.yml \
+        || ! grep -F -q "$context" .github/workflows/soak-start.yml; then
+        report "candidate, soak, tag, and Docker producer must share exact-commit gate $context"
+    fi
 done
+docker_publish=.github/workflows/docker-publish.yml
+for requirement in \
+    'workflow_run:' \
+    'github.event.workflow_run.conclusion == '\''success'\''' \
+    'github.event.workflow_run.event == '\''push'\''' \
+    'github.event.workflow_run.head_repository.full_name == github.repository' \
+    'test "$verified" = true' \
+    'test "$reason" = valid' \
+    'test "$target" = "$COMMIT"' \
+    'SBOM_SCANNER: docker.io/docker/buildkit-syft-scanner@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9' \
+    '--provenance=mode=max --sbom="generator=$SBOM_SCANNER"' \
+    'push-by-digest=true,name-canonical=true,push=true' \
+    'docker buildx imagetools create --tag "$tag"' \
+    'cmp platforms.expected platforms.actual' \
+    '  verify_public:' \
+    'export DOCKER_CONFIG="$docker_config"' \
+    "docker pull --platform"; do
+    if ! grep -F -q -- "$requirement" "$docker_publish"; then
+        report "Docker publication must retain reviewed release and multiarch evidence: $requirement"
+    fi
+done
+for smoke in \
+    tools/docker-runtime-smoke.py \
+    tools/docker-rootless-smoke.sh \
+    tools/kubernetes-runtime-smoke.sh; do
+    if ! grep -F -q "$smoke" .github/workflows/docker-runtime.yml \
+        || ! grep -F -q "$smoke" "$docker_publish"; then
+        report "Docker qualification and published-digest verification must run $smoke"
+    fi
+done
+if ! grep -F -q 'VAULTLINK_TEST_EXPECT_ROOTLESS=1' tools/docker-rootless-smoke.sh \
+    || ! grep -F -q '"rootless" in option' tools/docker-runtime-smoke.py; then
+    report 'rootless Docker gate must verify the daemon, not only the container UID'
+fi
 for workflow in \
     .github/workflows/packages.yml \
     .github/workflows/reproducibility.yml \
@@ -1385,6 +1426,8 @@ for gate_context in \
     vaultlink/native-arm64 \
     vaultlink/nixos-amd64 \
     vaultlink/nixos-arm64 \
+    vaultlink/docker-amd64 \
+    vaultlink/docker-arm64 \
     vaultlink/fuzz-600s-amd64 \
     vaultlink/fuzz-600s-arm64 \
     vaultlink/packages \

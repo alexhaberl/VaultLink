@@ -24,9 +24,9 @@ It does not amend the immutable 0.7.1 release or its eleven-gate history.
    requests.
 4. Preserve the existing nine native packages and exactly 21 release assets.
    Run native, package, fuzz, reproducibility and distro VM gates in their
-   existing dependency order. Include both NixOS gates in dry-run,
-   candidate/evidence preflights and soak-start checks. Run the existing full
-   72-hour Debian soak before publication.
+   existing dependency order. Include both NixOS and both Docker gates in
+   dry-run, candidate/evidence preflights and soak-start checks. Run the
+   existing full 72-hour Debian soak before publication.
 5. Sign only the reviewed, frozen commit. Check the published tag's signature
    and immutability, then document how users pin the tag and their host lock.
    Record both NixOS gate URLs in the new release-state entry. Keep earlier

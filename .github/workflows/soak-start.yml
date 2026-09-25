@@ -104,6 +104,8 @@ jobs:
           if [[ "$nixos_required" == True ]]; then
             validate_gate vaultlink/nixos-amd64 .github/workflows/nixos.yml
             validate_gate vaultlink/nixos-arm64 .github/workflows/nixos.yml
+            validate_gate vaultlink/docker-amd64 .github/workflows/docker-runtime.yml
+            validate_gate vaultlink/docker-arm64 .github/workflows/docker-runtime.yml
           fi
           validate_gate vaultlink/fuzz-600s-amd64 .github/workflows/fuzz.yml
           validate_gate vaultlink/fuzz-600s-arm64 .github/workflows/fuzz.yml
