@@ -11,6 +11,13 @@ evidence and signed packages retained for authenticated rollback.
 `development_version` identifies the checkout; `supported_version` changes only
 after verification of the newly published immutable release.
 
+The current checkout is unreleased 0.7.2 development. Its
+[checklist](../docs/RELEASE-CHECKLIST-0.7.2.md),
+[qualification ledger](qualification-0.7.2.json), and
+[finding inventory](qualification-findings-0.7.2.json) track the next candidate.
+Build-input and image-pin review precedes final qualification. No 0.7.2 gate or
+72-hour soak result is claimed by the published 0.7.1 evidence.
+
 The [0.7.1 checklist](../docs/RELEASE-CHECKLIST-0.7.1.md),
 [`qualification-0.7.1.json`](qualification-0.7.1.json), and independent
 [`qualification-findings-0.7.1.json`](qualification-findings-0.7.1.json) track

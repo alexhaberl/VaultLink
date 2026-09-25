@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.2 — Unreleased
+
+- Prepare [NixOS 26.05 deployment](docs/NIXOS.md) through the repository flake
+  on x86_64 and aarch64, with exact-commit build and boot checks before release.
+- Prepare the first multiarch OCI runtime image for [Docker Engine](docs/DOCKER.md)
+  and [rootless Docker](docs/DOCKER-ROOTLESS.md) on Linux amd64/arm64. Publish
+  its digest-pinned GHCR image only after the signed native release, subject to
+  both Docker architecture gates.
+- Prepare [Kubernetes 1.36 deployment](docs/KUBERNETES.md) using that image and
+  a single pod with separate persistent state and storage volumes. Qualify the
+  manifest on both architectures before marking it supported.
+- Bound per-share public upload directories and add durable, idempotent upload
+  retries with preissued operation IDs. Schema 11 and 12 add directory counts
+  and hash-only upload operation receipts.
+- Continue the nine signed native packages and the 72-hour soak requirements.
+  Release qualification and publication remain pending.
+
 ## 0.7.1 — 2026-09-22
 
 [Published release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1),

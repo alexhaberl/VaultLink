@@ -245,7 +245,7 @@ already-public releases and mismatched drafts are rejected without alteration.
    amd64 DEB. A status from another commit, an expired/missing artifact, or any
    package/payload/live hash mismatch blocks release.
 
-The monitor rejects restarts, inactive health, non-0.7.1 health responses,
+The monitor rejects restarts, inactive health, non-0.7.2 health responses,
 SQLite integrity failures, error-priority service journal entries, RSS over
 256 MiB, failed load profiles, and a changed executable hash. RSS retention must
 also pass both independent growth checks: the final-hour median may grow from
@@ -281,16 +281,16 @@ Never remove or replace active evidence while the systemd unit is running.
 
 
 The comparative 19-metric performance test is retired for every release from
-0.7.0 onward. The v0.7.1 candidate needs no baseline lock or
+0.7.0 onward. The v0.7.2 candidate needs no baseline lock or
 `vaultlink/performance` receipt. Complete the exact-commit candidate preflight
 and fresh security audit before starting the full 72 hours. Final evidence/tag
 phases independently verify the actual package binary and complete soak artifact;
 all load, latency, RSS, integrity, and transfer checks remain mandatory.
 See the [performance policy](../release/performance/README.md) and the
-[0.7.1 release checklist](RELEASE-CHECKLIST-0.7.1.md), targeted for 2026-09-22.
+[0.7.2 release checklist](RELEASE-CHECKLIST-0.7.2.md). No release date is set.
 
 Before starting this candidate, re-provision all seven orchestration files
 from its frozen commit using the installation steps above. The controller,
-monitor, collector and verifier now expect version 0.7.1; old installed helpers
-will fail the orchestration hash check. Reuse no 0.7.0 result or active run.
+monitor, collector and verifier now expect version 0.7.2; old installed helpers
+will fail the orchestration hash check. Reuse no 0.7.1 result or active run.
 Archive previous evidence through the documented maintenance procedure first.

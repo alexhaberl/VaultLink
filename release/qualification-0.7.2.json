@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "release_version": "0.7.2",
+  "release_status": "unreleased",
+  "updated_at": "2026-09-25",
+  "allowed_statuses": [
+    "open",
+    "closed",
+    "accepted"
+  ],
+  "findings": [
+    {
+      "id": "QUAL-001",
+      "title": "Comparative performance test retirement",
+      "status": "accepted",
+      "decision": "Maintainer decision on 2026-09-17: retire the comparative 19-metric performance test for every release from 0.7.0 onward. Full-load and 72-hour soak checks remain mandatory.",
+      "evidence": [
+        "release/performance/policy.json",
+        "release/performance/README.md"
+      ]
+    },
+    {
+      "id": "REL-001",
+      "title": "0.7.2 development version and release preparation",
+      "status": "closed",
+      "evidence": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "release/release-state.json",
+        "docs/RELEASE-CHECKLIST-0.7.2.md",
+        "CHANGELOG.md"
+      ]
+    },
+    {
+      "id": "CI-001",
+      "title": "Reviewed build inputs and complete image pins",
+      "status": "open",
+      "evidence": []
+    },
+    {
+      "id": "SEC-001",
+      "title": "Fresh candidate security audit and schema migration review",
+      "status": "open",
+      "evidence": []
+    },
+    {
+      "id": "PERF-001",
+      "title": "Full-load latency, memory, transfer, and integrity evidence",
+      "status": "open",
+      "evidence": []
+    },
+    {
+      "id": "QUAL-006",
+      "title": "Exact-commit gates and complete 72-hour soak",
+      "status": "open",
+      "evidence": []
+    }
+  ]
+}

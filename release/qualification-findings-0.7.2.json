@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "release_version": "0.7.2",
+  "findings": [
+    {
+      "id": "QUAL-001",
+      "title": "Comparative performance test retirement"
+    },
+    {
+      "id": "REL-001",
+      "title": "0.7.2 development version and release preparation"
+    },
+    {
+      "id": "CI-001",
+      "title": "Reviewed build inputs and complete image pins"
+    },
+    {
+      "id": "SEC-001",
+      "title": "Fresh candidate security audit and schema migration review"
+    },
+    {
+      "id": "PERF-001",
+      "title": "Full-load latency, memory, transfer, and integrity evidence"
+    },
+    {
+      "id": "QUAL-006",
+      "title": "Exact-commit gates and complete 72-hour soak"
+    }
+  ]
+}

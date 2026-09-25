@@ -7,7 +7,7 @@ operational requirements, advisory exceptions, and vulnerability reporting.
 
 ## Supported versions
 
-Release line: The currently supported release is `0.7.1`. Its native packages cover Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Versions `0.7.0` and `0.6.0` are superseded and no longer supported. The withdrawn `v0.5.0` archive remains unsupported; unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported. [`release/release-state.json`](release/release-state.json) is authoritative for lifecycle state and immutable release evidence.
+Release line: `0.7.2` is unreleased development. The currently supported release is `0.7.1`. Its native packages cover Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Versions `0.7.0` and `0.6.0` are superseded and no longer supported. The withdrawn `v0.5.0` archive remains unsupported; unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported. [`release/release-state.json`](release/release-state.json) is authoritative for lifecycle state and immutable release evidence.
 
 ## TLS security update in 0.7.1
 

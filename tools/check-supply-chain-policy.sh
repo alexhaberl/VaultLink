@@ -475,8 +475,8 @@ if ! python3 tools/check-package-target-lock-policy.py; then
     report "package target bootstrap lock truth table failed"
 fi
 if [ "$(python3 tools/package-targets.py ids --allow-unprovisioned 2>/dev/null | wc -l)" -ne 9 ] \
-    || [ "$(python3 tools/package-targets.py assets 0.7.1 --allow-unprovisioned 2>/dev/null | wc -l)" -ne 9 ]; then
-    report "the package manifest must render exactly nine target IDs and nine unique 0.7.1 assets"
+    || [ "$(python3 tools/package-targets.py assets 0.7.2 --allow-unprovisioned 2>/dev/null | wc -l)" -ne 9 ]; then
+    report "the package manifest must render exactly nine target IDs and nine unique 0.7.2 assets"
 fi
 if ! grep -F -q '"builder_image": "UNPROVISIONED"' "$target_manifest" \
     && ! grep -F -q '"vm_image": "UNPROVISIONED"' "$target_manifest"; then
@@ -2445,8 +2445,8 @@ if ! grep -F -q 'value < 2.000' "$package_native_load_smoke" \
     || ! grep -F -q 'sqlite_integrity=ok' "$package_native_load_smoke"; then
     report "native exact-package evidence must independently enforce p95, status/hash, RSS, PID, readiness, SQLite, and 50/20/5 CI smoke completeness"
 fi
-if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.7.2' "$package_workflow" \
-    || ! grep -F -x -q 'REAL_PACKAGE_NEW_VERSION ?= 0.7.2' Makefile \
+if ! grep -F -q 'REAL_UPDATE_NEW_VERSION: 0.7.3' "$package_workflow" \
+    || ! grep -F -x -q 'REAL_PACKAGE_NEW_VERSION ?= 0.7.3' Makefile \
     || ! printf '%s\n' "$package_build_job" \
         | grep -F -q 'git archive "$GITHUB_SHA" | tar -x -C "$fixture_source"' \
     || ! printf '%s\n' "$package_build_job" \

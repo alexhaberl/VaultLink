@@ -4,7 +4,7 @@ VaultLink shares files from an existing Linux storage mount through download and
 upload links. Manage files in the web interface and let recipients open their
 links in a browser. Storage can be local or an existing SMB share.
 
-Status: The currently supported release is `v0.7.1`.
+Status: `0.7.2` is unreleased development. The currently supported release is `v0.7.1`.
 See the [changelog](CHANGELOG.md) and [release status](release/release-state.json).
 Published on **2026-09-22** after package and VM qualification and the full
 72-hour soak. Versions 0.7.0 and 0.6.0 are superseded and unsupported.
