@@ -43,7 +43,7 @@ if [ ! -d "$api_work" ] || [ -L "$api_work" ]; then
     fail "API smoke fixture is unavailable"
 fi
 
-for command_name in awk cmp curl date df find findmnt grep install kill nproc \
+for command_name in awk cmp curl date df find findmnt grep install kill nproc openssl \
     python3 readlink sed seq setpriv sha256sum sleep sort sqlite3 stat taskset \
     truncate; do
     command -v "$command_name" >/dev/null \
@@ -442,9 +442,44 @@ esac
     || fail "runtime data and payload are not on the same audited local filesystem"
 
 runtime_config=$runtime_base/config.toml
+certificate_dir=$runtime_base/proxy-certs
+install -d -o root -g vaultlink -m 0750 "$certificate_dir"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -subj '/CN=VaultLink Native Load CA' -addext 'basicConstraints=critical,CA:TRUE' \
+    -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+    -keyout "$certificate_dir/ca.key" -out "$certificate_dir/ca.crt" >/dev/null 2>&1
+for certificate_name in server client; do
+    openssl req -newkey rsa:2048 -nodes -subj "/CN=$certificate_name" \
+        -keyout "$certificate_dir/$certificate_name.key" \
+        -out "$certificate_dir/$certificate_name.csr" >/dev/null 2>&1
+done
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n' \
+    >"$certificate_dir/server.ext"
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n' \
+    >"$certificate_dir/client.ext"
+for certificate_name in server client; do
+    openssl x509 -req -in "$certificate_dir/$certificate_name.csr" \
+        -CA "$certificate_dir/ca.crt" -CAkey "$certificate_dir/ca.key" \
+        -CAcreateserial -days 2 -extfile "$certificate_dir/$certificate_name.ext" \
+        -out "$certificate_dir/$certificate_name.crt" >/dev/null 2>&1
+done
+chown root:vaultlink "$certificate_dir/ca.crt" "$certificate_dir/server.crt"
+chmod 0640 "$certificate_dir/ca.crt" "$certificate_dir/server.crt"
+chown vaultlink:vaultlink "$certificate_dir/server.key"
+chmod 0600 "$certificate_dir/server.key"
+chmod 0600 "$certificate_dir/client.key"
+client_fingerprint=$(openssl x509 -in "$certificate_dir/client.crt" -outform DER | sha256sum | awk '{ print $1 }')
+export VAULTLINK_TLS_CLIENT_CERT="$certificate_dir/client.crt"
+export VAULTLINK_TLS_CLIENT_KEY="$certificate_dir/client.key"
+export VAULTLINK_TLS_SERVER_CA="$certificate_dir/ca.crt"
+curl() {
+    command curl --cert "$VAULTLINK_TLS_CLIENT_CERT" \
+        --key "$VAULTLINK_TLS_CLIENT_KEY" --cacert "$VAULTLINK_TLS_SERVER_CA" \
+        --header 'X-Forwarded-For: 198.51.100.10' "$@"
+}
 awk -v root="$runtime_root" -v data="$runtime_data" \
     -v internal="$runtime_internal" -v fstype="$mount_fstype" \
-    -v source="$mount_source" '
+    -v source="$mount_source" -v certdir="$certificate_dir" '
     function finish_storage() {
         if (!storage_fstype) {
             print "expected_filesystem_type = \"" fstype "\""
@@ -506,6 +541,15 @@ awk -v root="$runtime_root" -v data="$runtime_data" \
     section == "[reverse_proxy]" && /^trust_x_forwarded_headers[[:space:]]*=/ {
         print "trust_x_forwarded_headers = true"; forwarded++; next
     }
+    section == "[tls]" && /^enabled[[:space:]]*=/ {
+        print "enabled = true"; tls_enabled++; next
+    }
+    section == "[tls]" && /^cert_file[[:space:]]*=/ {
+        print "cert_file = \"" certdir "/server.crt\""; tls_cert++; next
+    }
+    section == "[tls]" && /^key_file[[:space:]]*=/ {
+        print "key_file = \"" certdir "/server.key\""; tls_key++; next
+    }
     { print }
     END {
         if (section == "[storage]") finish_storage()
@@ -514,10 +558,13 @@ awk -v root="$runtime_root" -v data="$runtime_data" \
             || storage_internal != 1 || storage_mount != 1 \
             || storage_fstype != 1 || storage_source != 1 \
             || secure_cookie != 1 || proxy_enabled != 1 \
-            || trusted_proxies != 1 || forwarded != 1) exit 1
+            || trusted_proxies != 1 || forwarded != 1 \
+            || tls_enabled != 1 || tls_cert != 1 || tls_key != 1) exit 1
     }
 ' "$api_work/config.toml" >"$runtime_config" \
     || fail "could not create the native reverse-proxy runtime configuration"
+printf '\n[reverse_proxy.transport]\nkind = "mtls"\nclient_ca_file = "%s/ca.crt"\nclient_fingerprints = ["%s"]\n' \
+    "$certificate_dir" "$client_fingerprint" >>"$runtime_config"
 chown root:vaultlink "$runtime_config"
 chmod 0640 "$runtime_config"
 printf '%s\n' \
@@ -525,7 +572,7 @@ printf '%s\n' \
     'production_mode=true' \
     'secure_cookie=true' \
     'reverse_proxy_enabled=true' \
-    'trusted_proxy=127.0.0.1' \
+    'proxy_transport=mtls' \
     'require_mount=true' \
     "storage_filesystem=$mount_fstype" \
     >"$evidence/runtime-policy.env"
@@ -556,7 +603,7 @@ case "$service_starttime" in *[!0-9]*|'') fail "service start time is unavailabl
 for attempt in $(seq 1 120); do
     kill -0 "$service_pid" 2>/dev/null || fail "package service exited during readiness"
     if curl --fail --silent --show-error \
-        http://127.0.0.1:18081/api/v2/health/ready \
+        https://127.0.0.1:18081/api/v2/health/ready \
         >"$runtime_base/readiness.json" 2>/dev/null; then
         break
     fi
@@ -618,13 +665,13 @@ PY
 )
 login=$(curl --fail --silent --show-error -c "$cookie" \
     -H 'content-type: application/json' -X POST \
-    http://127.0.0.1:18081/api/v2/session/login \
+    https://127.0.0.1:18081/api/v2/session/login \
     -d "{\"username\":\"admin\",\"password\":\"$password\"}")
 csrf=$(printf '%s' "$login" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])')
 mfa=$(curl --fail --silent --show-error -b "$cookie" -c "$cookie" \
     -H 'content-type: application/json' -H "x-csrf-token: $csrf" -X POST \
-    http://127.0.0.1:18081/api/v2/session/mfa -d "{\"code\":\"$totp_code\"}")
+    https://127.0.0.1:18081/api/v2/session/mfa -d "{\"code\":\"$totp_code\"}")
 csrf=$(printf '%s' "$mfa" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])')
 
@@ -637,7 +684,7 @@ create_share() {
     share_permission=$2
     curl --fail --silent --show-error -b "$cookie" \
         -H 'content-type: application/json' -H "x-csrf-token: $csrf" -X POST \
-        http://127.0.0.1:18081/api/v2/shares \
+        https://127.0.0.1:18081/api/v2/shares \
         -d "{\"path\":\"$share_path\",\"permission\":\"$share_permission\",\"overwrite_allowed\":false}" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 }
@@ -661,8 +708,8 @@ native_stage=ci_smoke_load
 load_tmp=$load_client_mount/tmp
 install -d -o root -g root -m 0700 "$load_tmp"
 load_status=0
-VAULTLINK_BASE_URL=http://127.0.0.1:18081 \
-VAULTLINK_HEALTH_URL=http://127.0.0.1:18081/api/v2/health/ready \
+VAULTLINK_BASE_URL=https://127.0.0.1:18081 \
+VAULTLINK_HEALTH_URL=http://127.0.0.1:8082/api/v2/health/ready \
 DOWNLOAD_TOKEN=$download_token \
 ADMISSION_DOWNLOAD_TOKEN=$admission_download_token \
 RANGE_DOWNLOAD_TOKEN=$range_download_token \

@@ -254,6 +254,40 @@ chmod 0750 \
 chmod 0700 "$runtime_internal"
 
 runtime_stage=production-config
+certificate_dir=/etc/vaultlink/proxy-smoke-certs
+install -d -o root -g vaultlink -m 0750 "$certificate_dir"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -subj '/CN=VaultLink VM Smoke CA' -addext 'basicConstraints=critical,CA:TRUE' \
+    -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+    -keyout "$certificate_dir/ca.key" -out "$certificate_dir/ca.crt" >/dev/null 2>&1
+for certificate_name in server client; do
+    openssl req -newkey rsa:2048 -nodes -subj "/CN=$certificate_name" \
+        -keyout "$certificate_dir/$certificate_name.key" \
+        -out "$certificate_dir/$certificate_name.csr" >/dev/null 2>&1
+done
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n' \
+    >"$certificate_dir/server.ext"
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n' \
+    >"$certificate_dir/client.ext"
+for certificate_name in server client; do
+    openssl x509 -req -in "$certificate_dir/$certificate_name.csr" \
+        -CA "$certificate_dir/ca.crt" -CAkey "$certificate_dir/ca.key" \
+        -CAcreateserial -days 2 -extfile "$certificate_dir/$certificate_name.ext" \
+        -out "$certificate_dir/$certificate_name.crt" >/dev/null 2>&1
+done
+chown root:vaultlink "$certificate_dir/ca.crt" "$certificate_dir/server.crt"
+chmod 0640 "$certificate_dir/ca.crt" "$certificate_dir/server.crt"
+chown vaultlink:vaultlink "$certificate_dir/server.key"
+chmod 0600 "$certificate_dir/server.key" "$certificate_dir/client.key"
+client_fingerprint=$(openssl x509 -in "$certificate_dir/client.crt" -outform DER | sha256sum | awk '{ print $1 }')
+export VAULTLINK_TLS_CLIENT_CERT="$certificate_dir/client.crt"
+export VAULTLINK_TLS_CLIENT_KEY="$certificate_dir/client.key"
+export VAULTLINK_TLS_SERVER_CA="$certificate_dir/ca.crt"
+curl() {
+    command curl --cert "$VAULTLINK_TLS_CLIENT_CERT" \
+        --key "$VAULTLINK_TLS_CLIENT_KEY" --cacert "$VAULTLINK_TLS_SERVER_CA" \
+        --header 'X-Forwarded-For: 198.51.100.10' "$@"
+}
 runtime_config_work=$(mktemp)
 sed \
     -e 's/^mode = "development"$/mode = "reverse_proxy"/' \
@@ -265,7 +299,7 @@ sed \
     -e "s|$api_work/root|$runtime_root|g" \
     -e "s|$api_work/data|/var/lib/vaultlink|g" \
     "$api_work/config.toml" >"$runtime_config_work"
-awk '
+awk -v certdir="$certificate_dir" '
     function finish_storage() {
         if (storage_filesystem == 0) {
             print "expected_filesystem_type = \"ext4\""
@@ -312,14 +346,32 @@ awk '
         rewritten_forwarded++
         next
     }
+    section == "[tls]" && /^enabled = / {
+        print "enabled = true"
+        rewritten_tls++
+        next
+    }
+    section == "[tls]" && /^cert_file = / {
+        print "cert_file = \"" certdir "/server.crt\""
+        rewritten_cert++
+        next
+    }
+    section == "[tls]" && /^key_file = / {
+        print "key_file = \"" certdir "/server.key\""
+        rewritten_key++
+        next
+    }
     { print }
     END {
         if (section == "[storage]") finish_storage()
         if (skipping_proxies || rewritten_enabled != 1 \
             || rewritten_proxies != 1 || rewritten_forwarded != 1 \
+            || rewritten_tls != 1 || rewritten_cert != 1 || rewritten_key != 1 \
             || storage_filesystem != 1 || storage_source != 1) exit 1
     }
 ' "$runtime_config_work" >"$evidence/config.toml"
+printf '\n[reverse_proxy.transport]\nkind = "mtls"\nclient_ca_file = "%s/ca.crt"\nclient_fingerprints = ["%s"]\n' \
+    "$certificate_dir" "$client_fingerprint" >>"$evidence/config.toml"
 rm -f "$runtime_config_work"
 runtime_config_work=
 grep -F -x -q 'mode = "reverse_proxy"' "$evidence/config.toml"
@@ -339,7 +391,7 @@ if ! awk '
     }
     section == "[tls]" && /^enabled[[:space:]]*=/ {
         tls++
-        tls_ok += ($0 == "enabled = false")
+        tls_ok += ($0 == "enabled = true")
     }
     END {
         exit !(enabled == 1 && enabled_ok == 1 \
@@ -352,6 +404,7 @@ if ! awk '
     exit 77
 fi
 grep -F -x -q 'require_mount = true' "$evidence/config.toml"
+grep -F -x -q 'kind = "mtls"' "$evidence/config.toml"
 grep -F -x -q 'expected_filesystem_type = "ext4"' "$evidence/config.toml"
 grep -F -x -q 'root_mount_path = "/mnt/storage/shared"' "$evidence/config.toml"
 grep -F -x -q 'internal_directory = "/mnt/storage/.vaultlink-internal"' "$evidence/config.toml"
@@ -380,7 +433,7 @@ systemctl daemon-reload
 systemctl start vaultlink.service
 for attempt in $(seq 1 120); do
     if curl --fail --silent --show-error \
-        http://127.0.0.1:18081/api/v2/health/ready \
+        http://127.0.0.1:8082/api/v2/health/ready \
         >"$evidence/readiness.json" 2>"$evidence/readiness-last.stderr"; then
         break
     fi
@@ -416,12 +469,12 @@ PY
 )
 login=$(curl --fail --silent --show-error -c "$cookie" \
     -H 'content-type: application/json' -X POST \
-    http://127.0.0.1:18081/api/v2/session/login \
+    https://127.0.0.1:18081/api/v2/session/login \
     -d "{\"username\":\"admin\",\"password\":\"$password\"}")
 csrf=$(printf '%s' "$login" | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])')
 mfa=$(curl --fail --silent --show-error -b "$cookie" -c "$cookie" \
     -H 'content-type: application/json' -H "x-csrf-token: $csrf" -X POST \
-    http://127.0.0.1:18081/api/v2/session/mfa -d "{\"code\":\"$totp_code\"}")
+    https://127.0.0.1:18081/api/v2/session/mfa -d "{\"code\":\"$totp_code\"}")
 csrf=$(printf '%s' "$mfa" | python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])')
 
 install -d -o vaultlink -g vaultlink -m 0750 \
@@ -432,7 +485,7 @@ create_share() {
     permission=$2
     curl --fail --silent --show-error -b "$cookie" \
         -H 'content-type: application/json' -H "x-csrf-token: $csrf" -X POST \
-        http://127.0.0.1:18081/api/v2/shares \
+        https://127.0.0.1:18081/api/v2/shares \
         -d "{\"path\":\"$path\",\"permission\":\"$permission\",\"overwrite_allowed\":false}" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 }
@@ -475,8 +528,8 @@ printf 'guest_cpu_set=0-3\n' >"$evidence/resource-isolation.env"
 record_service_cpu_affinity before >>"$evidence/resource-isolation.env"
 # The single-quoted wrapper expands variables in the pinned child shell.
 # shellcheck disable=SC2016
-VAULTLINK_BASE_URL=http://127.0.0.1:18081 \
-VAULTLINK_HEALTH_URL=http://127.0.0.1:18081/api/v2/health/ready \
+VAULTLINK_BASE_URL=https://127.0.0.1:18081 \
+VAULTLINK_HEALTH_URL=http://127.0.0.1:8082/api/v2/health/ready \
 DOWNLOAD_TOKEN=$download_token \
 ADMISSION_DOWNLOAD_TOKEN=$admission_download_token \
 RANGE_DOWNLOAD_TOKEN=$range_download_token \
@@ -634,7 +687,7 @@ systemctl stop vaultlink.service
     >"$evidence/rollback.txt"
 systemctl --quiet is-active vaultlink.service
 curl --fail --silent --show-error \
-    http://127.0.0.1:18081/api/v2/health/ready >"$evidence/post-rollback-readiness.json"
+    http://127.0.0.1:8082/api/v2/health/ready >"$evidence/post-rollback-readiness.json"
 [ "$(sqlite3 "$database" 'PRAGMA user_version;')" = 12 ]
 [ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM service_tokens;')" = 0 ]
 [ "$(sqlite3 "$database" \

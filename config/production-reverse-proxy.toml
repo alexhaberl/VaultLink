@@ -1,6 +1,6 @@
 [server]
 mode = "reverse_proxy"
-listen_address = "127.0.0.1:8080"
+listen_address = "unix:/run/vaultlink-proxy/http.sock"
 public_base_url = "https://files.example.com"
 production_mode = true
 
@@ -57,13 +57,16 @@ stream_max_duration_seconds = 21600
 [reverse_proxy]
 enabled = true
 allow_non_loopback = false
-# This is both the exact TCP-peer allowlist and the trust boundary for
-# forwarded headers. The local listener/readiness peers are listed explicitly.
-# For an external proxy with listen_address = "0.0.0.0:8080", use for example:
-# allow_non_loopback = true
-# trusted_proxies = ["192.0.2.10", "127.0.0.1"]
-trusted_proxies = ["127.0.0.1", "::1"]
+# Only list authenticated intermediate proxies in a forwarding chain. This
+# list does not grant access to the application listener.
+trusted_proxies = []
 trust_x_forwarded_headers = true
+
+[reverse_proxy.transport]
+kind = "unix"
+socket_path = "/run/vaultlink-proxy/http.sock"
+# Replace with the actual, dedicated unprivileged Caddy service UID.
+proxy_uids = [10002]
 
 [tls]
 enabled = false

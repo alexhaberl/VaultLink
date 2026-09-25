@@ -2,6 +2,7 @@
 enum CommandMode {
     Serve,
     Setup,
+    SetupOnce,
     InitAdmin,
     ReadinessTarget,
 }
@@ -16,6 +17,10 @@ fn command_mode(args: &[String]) -> Result<CommandMode, String> {
         Some("setup") => {
             validate_value_options(args, 2, &["--config", "--listen"])?;
             Ok(CommandMode::Setup)
+        }
+        Some("setup-once") => {
+            validate_value_options(args, 2, &["--config", "--listen"])?;
+            Ok(CommandMode::SetupOnce)
         }
         Some("init-admin") => {
             validate_value_options(args, 2, &["--config", "--username"])?;

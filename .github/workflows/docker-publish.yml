@@ -26,12 +26,24 @@ jobs:
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
+      statuses: read
     outputs:
       tag: ${{ steps.verify.outputs.tag }}
       commit: ${{ steps.verify.outputs.commit }}
       version: ${{ steps.verify.outputs.version }}
+      amd64_hash: ${{ steps.verify.outputs.amd64_hash }}
+      arm64_hash: ${{ steps.verify.outputs.arm64_hash }}
+      qualification_run: ${{ steps.verify.outputs.qualification_run }}
+      qualification_attempt: ${{ steps.verify.outputs.qualification_attempt }}
+      amd64_artifact_sha: ${{ steps.verify.outputs.amd64_artifact_sha }}
+      arm64_artifact_sha: ${{ steps.verify.outputs.arm64_artifact_sha }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
       - name: Check published immutable release and verified tag
         id: verify
         shell: bash
@@ -60,7 +72,19 @@ jobs:
           test "$verified" = true
           test "$reason" = valid
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$COMMIT"
-          printf 'tag=%s\ncommit=%s\nversion=%s\n' "$TAG" "$COMMIT" "$version" >>"$GITHUB_OUTPUT"
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+          python3 tools/release-evidence.py docker --commit "$COMMIT" \
+            --version "$version" --output docker-qualification.json
+          amd64_hash=$(jq -r '.architectures.amd64.binary_sha256' docker-qualification.json)
+          arm64_hash=$(jq -r '.architectures.arm64.binary_sha256' docker-qualification.json)
+          qualification_run=$(jq -r '.run_id' docker-qualification.json)
+          qualification_attempt=$(jq -r '.run_attempt' docker-qualification.json)
+          amd64_artifact_sha=$(jq -r '.architectures.amd64.artifact_sha256' docker-qualification.json)
+          arm64_artifact_sha=$(jq -r '.architectures.arm64.artifact_sha256' docker-qualification.json)
+          printf 'tag=%s\ncommit=%s\nversion=%s\namd64_hash=%s\narm64_hash=%s\nqualification_run=%s\nqualification_attempt=%s\namd64_artifact_sha=%s\narm64_artifact_sha=%s\n' \
+            "$TAG" "$COMMIT" "$version" "$amd64_hash" "$arm64_hash" \
+            "$qualification_run" "$qualification_attempt" \
+            "$amd64_artifact_sha" "$arm64_artifact_sha" >>"$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -113,11 +137,22 @@ jobs:
             --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" .
           digest=$(jq -r '."containerimage.digest" // empty' build-metadata.json)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          expected='${{ matrix.architecture == 'amd64' && needs.prepare.outputs.amd64_hash || needs.prepare.outputs.arm64_hash }}'
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          docker pull "$IMAGE@$digest"
+          container=$(docker create "$IMAGE@$digest")
+          docker cp "$container:/usr/local/bin/vaultlink" published-vaultlink
+          docker rm "$container"
+          measured=$(sha256sum published-vaultlink | cut -d ' ' -f 1)
+          test "$measured" = "$expected"
           printf '%s\n' "$digest" >'digest-${{ matrix.architecture }}'
+          printf '%s\n' "$measured" >'binary-${{ matrix.architecture }}.sha256'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: docker-release-digest-${{ matrix.architecture }}
-          path: digest-${{ matrix.architecture }}
+          path: |
+            digest-${{ matrix.architecture }}
+            binary-${{ matrix.architecture }}.sha256
           if-no-files-found: error
           retention-days: 90
 
@@ -143,18 +178,37 @@ jobs:
           arm64=$(cat digests/digest-arm64)
           [[ "$amd64" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(cat digests/binary-amd64.sha256)" = '${{ needs.prepare.outputs.amd64_hash }}'
+          test "$(cat digests/binary-arm64.sha256)" = '${{ needs.prepare.outputs.arm64_hash }}'
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           tag="$IMAGE:${{ needs.prepare.outputs.tag }}"
-          if docker buildx imagetools inspect "$tag" >/dev/null 2>&1; then
-            echo "Versioned GHCR image already exists; refusing to replace $tag" >&2
-            exit 1
+          existing_tag=false
+          if docker buildx imagetools inspect "$tag" >tag-inspection.txt 2>tag-inspection.err; then
+            existing_tag=true
+            echo "Versioned GHCR image exists; verifying its immutable digest without replacing it"
+          else
+            grep -Eiq 'manifest unknown|not found|name unknown' tag-inspection.err || {
+              cat tag-inspection.err >&2
+              echo "Could not prove the versioned tag is absent" >&2
+              exit 1
+            }
+            docker buildx imagetools create --tag "$tag" "$IMAGE@$amd64" "$IMAGE@$arm64"
           fi
-          docker buildx imagetools create --tag "$tag" "$IMAGE@$amd64" "$IMAGE@$arm64"
-          docker buildx imagetools inspect "$tag" --raw \
-            | jq -r '.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"' \
+          docker buildx imagetools inspect "$tag" --raw >index.json
+          jq -r '.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"' index.json \
             | sort -u >platforms.actual
           printf '%s\n' linux/amd64 linux/arm64 >platforms.expected
           cmp platforms.expected platforms.actual
+          index_amd64=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' index.json)
+          index_arm64=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' index.json)
+          [[ "$index_amd64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$index_arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [ "$existing_tag" = false ]; then
+            test "$index_amd64" = "$amd64"
+            test "$index_arm64" = "$arm64"
+          fi
+          amd64=$index_amd64
+          arm64=$index_arm64
           inspection=$(docker buildx imagetools inspect "$tag")
           printf '%s\n' "$inspection"
           index_digest=$(printf '%s\n' "$inspection" \
@@ -164,6 +218,13 @@ jobs:
           printf 'tag=%s\ncommit=%s\namd64=%s\narm64=%s\n' \
             '${{ needs.prepare.outputs.tag }}' '${{ needs.prepare.outputs.commit }}' \
             "$amd64" "$arm64" >>image-reference.txt
+          printf 'qualified_amd64_sha256=%s\nqualified_arm64_sha256=%s\nqualification_run=%s\nqualification_attempt=%s\nqualified_amd64_artifact_sha256=%s\nqualified_arm64_artifact_sha256=%s\n' \
+            '${{ needs.prepare.outputs.amd64_hash }}' \
+            '${{ needs.prepare.outputs.arm64_hash }}' \
+            '${{ needs.prepare.outputs.qualification_run }}' \
+            '${{ needs.prepare.outputs.qualification_attempt }}' \
+            '${{ needs.prepare.outputs.amd64_artifact_sha }}' \
+            '${{ needs.prepare.outputs.arm64_artifact_sha }}' >>image-reference.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: docker-release-index-${{ needs.prepare.outputs.tag }}
@@ -210,6 +271,19 @@ jobs:
           trap 'rm -rf -- "$docker_config"' EXIT
           export DOCKER_CONFIG="$docker_config"
           docker pull --platform 'linux/${{ matrix.architecture }}' "$reference"
+          expected='${{ matrix.architecture == 'amd64' && needs.prepare.outputs.amd64_hash || needs.prepare.outputs.arm64_hash }}'
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          grep -Fxq "qualified_${{ matrix.architecture }}_sha256=$expected" image-reference.txt
+          container=$(docker create --platform 'linux/${{ matrix.architecture }}' "$reference")
+          docker cp "$container:/usr/local/bin/vaultlink" verified-public-vaultlink
+          docker rm "$container"
+          measured=$(sha256sum verified-public-vaultlink | cut -d ' ' -f 1)
+          test "$measured" = "$expected"
+          child=$(sed -n 's/^${{ matrix.architecture }}=//p' image-reference.txt)
+          [[ "$child" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'reference=%s\narchitecture=%s\nchild_digest=%s\nqualified_sha256=%s\npublic_sha256=%s\n' \
+            "$reference" '${{ matrix.architecture }}' "$child" "$expected" "$measured" \
+            >'public-binary-${{ matrix.architecture }}.txt'
           version=$(docker run --rm --network none \
             --entrypoint /usr/local/bin/vaultlink "$reference" --version)
           [[ "$version" == *'${{ needs.prepare.outputs.version }}'* ]]
@@ -221,3 +295,58 @@ jobs:
           VAULTLINK_TEST_IMAGE=vaultlink:release-test bash tools/docker-rootless-smoke.sh
           VAULTLINK_TEST_IMAGE=vaultlink:release-test \
           VAULTLINK_TEST_ARCH='${{ matrix.architecture }}' bash tools/kubernetes-runtime-smoke.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-public-binary-${{ matrix.architecture }}-${{ needs.prepare.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: public-binary-${{ matrix.architecture }}.txt
+          if-no-files-found: error
+          retention-days: 90
+
+  complete_evidence:
+    needs: [prepare, publish, verify_public]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docker-release-index-${{ needs.prepare.outputs.tag }}
+          path: evidence
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: docker-public-binary-*-${{ needs.prepare.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+          merge-multiple: true
+      - name: Bind qualification, child digests and public binaries
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.prepare.outputs.commit }}
+          EXPECTED_TAG: ${{ needs.prepare.outputs.tag }}
+          QUALIFICATION_RUN: ${{ needs.prepare.outputs.qualification_run }}
+          QUALIFICATION_ATTEMPT: ${{ needs.prepare.outputs.qualification_attempt }}
+          AMD64_HASH: ${{ needs.prepare.outputs.amd64_hash }}
+          ARM64_HASH: ${{ needs.prepare.outputs.arm64_hash }}
+          AMD64_ARTIFACT_SHA: ${{ needs.prepare.outputs.amd64_artifact_sha }}
+          ARM64_ARTIFACT_SHA: ${{ needs.prepare.outputs.arm64_artifact_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          python3 tools/docker-release-proof.py \
+            --evidence evidence --repository "$GITHUB_REPOSITORY" \
+            --commit "$EXPECTED_COMMIT" --tag "$EXPECTED_TAG" \
+            --qualification-run "$QUALIFICATION_RUN" \
+            --qualification-attempt "$QUALIFICATION_ATTEMPT" \
+            --amd64-hash "$AMD64_HASH" --arm64-hash "$ARM64_HASH" \
+            --amd64-artifact-sha "$AMD64_ARTIFACT_SHA" \
+            --arm64-artifact-sha "$ARM64_ARTIFACT_SHA"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-release-proof-${{ needs.prepare.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/docker-release-proof.json
+          if-no-files-found: error
+          retention-days: 90

@@ -15,6 +15,42 @@ fn validate_tls_files(tls: &Tls) -> Result<(), ConfigError> {
         .map_err(|error| ConfigError::Invalid(error.to_string()))
 }
 
+fn validate_proxy_mtls_files(tls: &Tls, ca_file: &Path) -> Result<(), ConfigError> {
+    use rustls_pki_types::pem::PemObject;
+    let material = crate::tls_files::read_validated_tls_pem(&tls.cert_file, &tls.key_file)
+        .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+    let ca = crate::tls_files::read_validated_ca_pem(ca_file)
+        .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+    let certificates =
+        rustls_pki_types::CertificateDer::pem_slice_iter(&material.certificate_chain)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+    let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(&material.private_key)
+        .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+    let mut roots = rustls::RootCertStore::empty();
+    let ca_certificates = rustls_pki_types::CertificateDer::pem_slice_iter(&ca)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+    if certificates.is_empty() || ca_certificates.is_empty() || ca_certificates.len() > 8 {
+        return Err(ConfigError::Invalid(
+            "mTLS certificate chain or proxy CA is empty or oversized".into(),
+        ));
+    }
+    for certificate in ca_certificates {
+        roots
+            .add(certificate)
+            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+    }
+    rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
+        .build()
+        .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+    Ok(())
+}
+
 pub fn letsencrypt_cache_dir(storage: &Storage, tls: &Tls) -> Result<PathBuf, ConfigError> {
     validate_acme_cache_path(&storage.data_directory, &tls.letsencrypt_cache_dir)?;
     if tls.letsencrypt_cache_dir.is_absolute() {

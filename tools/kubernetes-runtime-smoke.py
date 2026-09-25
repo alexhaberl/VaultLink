@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -24,6 +26,7 @@ upload = common.upload
 
 URL = "http://127.0.0.1:18081"
 PASSWORD = "Docker runtime smoke password 123!"
+forward: subprocess.Popen[str] | None = None
 
 
 def kubectl(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -42,21 +45,62 @@ def pod() -> str:
     raise AssertionError("VaultLink Kubernetes pod did not reach Running")
 
 
+def start_forward() -> None:
+    global forward
+    if forward is None or forward.poll() is not None:
+        forward = subprocess.Popen(
+            ["kubectl", "port-forward", "deployment/vaultlink", "18081:8081"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+
+
+def stop_forward() -> None:
+    global forward
+    if forward is not None:
+        if forward.poll() is None:
+            forward.terminate()
+        try:
+            forward.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            forward.kill()
+            forward.wait(timeout=5)
+        forward = None
+
+
 def wait_http(path: str, status: int, timeout: float = 50) -> str:
     deadline = time.monotonic() + timeout
+    last_response = "no response"
     while time.monotonic() < deadline:
+        start_forward()
         try:
             actual, body = request(URL + path)
             if actual == status:
                 return body
-        except OSError:
-            pass
+            last_response = f"HTTP {actual}"
+        except OSError as error:
+            last_response = type(error).__name__
         time.sleep(0.25)
-    raise AssertionError(f"{path} did not return {status}: {kubectl('logs', pod(), check=False).stdout}")
+    name = pod()
+    item = json.loads(kubectl("get", "pod", name, "-o", "json").stdout)
+    containers = item["status"].get("containerStatuses", [])
+    states = [(entry.get("restartCount"), list(entry.get("state", {}))) for entry in containers]
+    forward_exit = None if forward is None else forward.poll()
+    raise AssertionError(
+        f"{path} did not return {status}: last={last_response}, "
+        f"port_forward_exit={forward_exit}, pod_phase={item['status'].get('phase')}, "
+        f"container_restart_and_state={states}")
 
 
 def main(mode: str) -> None:
+    global URL
+    certificate_directory = Path(os.environ["VAULTLINK_KUBE_CERT_DIR"])
+    fingerprint = hashlib.sha256(subprocess.run(
+        ["openssl", "x509", "-in", str(certificate_directory / "client.crt"),
+         "-outform", "DER"], capture_output=True, check=True).stdout).hexdigest()
+    context = ssl.create_default_context(cafile=str(certificate_directory / "ca.crt"))
+    context.load_cert_chain(str(certificate_directory / "client.crt"),
+                            str(certificate_directory / "client.key"))
     name = pod()
+    start_forward()
     uid = kubectl("exec", name, "--", "id", "-u").stdout.strip()
     assert uid == "10001", uid
     mountinfo = kubectl("exec", name, "--", "cat", "/proc/self/mountinfo").stdout
@@ -68,12 +112,17 @@ def main(mode: str) -> None:
     filesystem, source = fields[separator + 1:separator + 3]
     assert filesystem == "ext4", (filesystem, source)
     if mode == "verify":
+        common.TLS_CONTEXT = context
+        URL = "https://127.0.0.1:18081"
         ready = json.loads(wait_http("/api/v2/health/ready", 200))
         assert ready["ok"] is True
         print(f"Kubernetes restart and readiness passed: {filesystem} {source}")
         return
 
     wait_http("/", 401)
+    kubectl("exec", name, "--", "/usr/local/bin/vaultlink", "health-check", "--live")
+    assert kubectl("exec", name, "--", "/usr/local/bin/vaultlink", "health-check",
+                   "--ready", check=False).returncode != 0
     logs = kubectl("logs", name).stdout
     tokens = re.findall(r"#token=([^\s]+)", logs)
     assert tokens, logs
@@ -88,7 +137,7 @@ def main(mode: str) -> None:
         time.sleep(0.2)
     assert status == 200, status
     fields = {
-        "server_mode": "reverse_proxy", "listen_address": "127.0.0.1:8080",
+        "server_mode": "reverse_proxy", "listen_address": "0.0.0.0:8081",
         "public_base_url": "https://vaultlink.example.test",
         "root_mount_path": "/mnt/storage/shared",
         "data_directory": "/var/lib/vaultlink",
@@ -102,8 +151,12 @@ def main(mode: str) -> None:
         "preview_extensions": "txt,log,md,csv,json,toml,yaml,yml,ini,conf",
         "image_preview_extensions": "jpg,jpeg,png,gif,webp,bmp,avif",
         "max_media_preview_size_mb": "100",
-        "trusted_proxies": "127.0.0.1,::1",
-        "certificate_source": "files", "tls_cert_file": "", "tls_key_file": "",
+        "trusted_proxies": "", "proxy_transport": "mtls",
+        "client_ca_file": "/var/lib/vaultlink/certs/ca.crt",
+        "client_fingerprints": fingerprint,
+        "certificate_source": "files",
+        "tls_cert_file": "/var/lib/vaultlink/certs/server.crt",
+        "tls_key_file": "/var/lib/vaultlink/certs/server.key",
         "letsencrypt_contact_email": "", "letsencrypt_cache_dir": "acme",
         "log_level": "info", "admin_username": "admin",
         "admin_password": PASSWORD, "admin_password_confirm": PASSWORD,
@@ -115,6 +168,13 @@ def main(mode: str) -> None:
     for path in ("/complete", "/start"):
         status, body = request(URL + path, "POST", token=token)
         assert status == 200, (path, status, body[:300])
+    assert "VaultLink is starting" in body, "setup did not request the production listener"
+    # Port forwarding is tied to the bootstrap listener. Open a fresh stream
+    # after the entrypoint replaces it with the production mTLS listener.
+    stop_forward()
+    start_forward()
+    common.TLS_CONTEXT = context
+    URL = "https://127.0.0.1:18081"
     ready = json.loads(wait_http("/api/v2/health/ready", 200))
     assert ready["ok"] is True
     kubectl("exec", name, "--", "bash", "-ec",
@@ -162,4 +222,7 @@ def main(mode: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "setup")
+    try:
+        main(sys.argv[1] if len(sys.argv) > 1 else "setup")
+    finally:
+        stop_forward()

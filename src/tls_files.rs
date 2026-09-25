@@ -151,6 +151,13 @@ pub fn read_validated_tls_pem(cert_file: &Path, key_file: &Path) -> io::Result<V
     })
 }
 
+/// Read a proxy client CA through the same protected path and descriptor checks
+/// used for a TLS certificate chain.
+pub fn read_validated_ca_pem(path: &Path) -> io::Result<Vec<u8>> {
+    let service_uid = rustix::process::geteuid().as_raw();
+    open_validated_file(path, TlsFileKind::CertificateChain, service_uid)?.read(service_uid)
+}
+
 fn open_validated_file(
     path: &Path,
     kind: TlsFileKind,

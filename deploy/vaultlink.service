@@ -10,7 +10,10 @@ StartLimitBurst=3
 # enforces this with its private lifetime lock and fails startup on contention.
 Type=simple
 User=vaultlink
-Group=vaultlink
+Group=vaultlink-proxy
+SupplementaryGroups=vaultlink
+RuntimeDirectory=vaultlink-proxy
+RuntimeDirectoryMode=0750
 # Bound glibc arena retention after concurrent transfer and database bursts.
 Environment=MALLOC_ARENA_MAX=4
 ExecStartPre=+/usr/lib/vaultlink/package/deploy/vaultlink-runtime-guard.sh --start-update-control

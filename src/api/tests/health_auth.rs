@@ -46,6 +46,49 @@ async fn health_reports_the_exact_package_version() {
 }
 
 #[tokio::test]
+async fn loopback_health_listener_has_no_application_routes_and_needs_main_listener() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let listening = std::sync::Arc::new(AtomicBool::new(false));
+    let app = local_health_router(&test_state(root.path(), data.path()), listening.clone());
+    for path in ["/login", "/api/v2/session/login", "/v/token/download"] {
+        assert_eq!(
+            app.clone()
+                .oneshot(json_request(Method::GET, path, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(json_request(Method::GET, "/api/v2/health/live", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(json_request(Method::GET, "/api/v2/health/ready", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    listening.store(true, Ordering::Release);
+    assert_eq!(
+        app.oneshot(json_request(Method::GET, "/api/v2/health/ready", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn liveness_stays_up_when_readiness_dependencies_fail() {
     for component in ["database", "storage"] {
         let root = tempfile::tempdir().unwrap();

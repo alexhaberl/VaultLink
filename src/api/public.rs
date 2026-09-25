@@ -1,7 +1,5 @@
-use std::net::SocketAddr;
-
 use axum::{
-    extract::{ConnectInfo, Path as AxPath, State},
+    extract::{Path as AxPath, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -116,7 +114,6 @@ struct UnlockResponse {
 
 pub(super) async fn unlock_share(
     State(state): State<PublicRouteState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     AxPath(token): AxPath<String>,
     Json(request): Json<UnlockRequest>,

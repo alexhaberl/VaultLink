@@ -6,6 +6,8 @@ fn local_readiness_peer_ip(listen_ip: IpAddr) -> IpAddr {
     }
 }
 
+pub const PROXY_HEALTH_ADDRESS: &str = "127.0.0.1:8082";
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let value = fs::read_to_string(path)?;
@@ -15,6 +17,14 @@ impl Config {
     }
 
     pub fn local_readiness_target(&self) -> Result<LocalReadinessTarget, ConfigError> {
+        if self.server.mode == ServerMode::ReverseProxy {
+            self.validate()?;
+            return Ok(LocalReadinessTarget {
+                url: format!("http://{PROXY_HEALTH_ADDRESS}/api/v2/health/ready"),
+                connect_to: None,
+                insecure: false,
+            });
+        }
         let listen: SocketAddr = self.server.listen_address.parse().map_err(|_| {
             ConfigError::Invalid("listen_address must be an IP socket address".into())
         })?;
@@ -102,12 +112,13 @@ fn validate_public_base_url(config: &Config) -> Result<Url, ConfigError> {
 }
 
 fn validate_server_mode(config: &Config, url: &Url) -> Result<(), ConfigError> {
-    let listen: std::net::SocketAddr =
-        config.server.listen_address.parse().map_err(|_| {
-            ConfigError::Invalid("listen_address must be an IP socket address".into())
-        })?;
     match config.server.mode {
         ServerMode::Development => {
+            let listen: SocketAddr = config.server.listen_address.parse().map_err(|_| {
+                ConfigError::Invalid(
+                    "development listen_address must be an IP socket address".into(),
+                )
+            })?;
             if config.server.production_mode {
                 return Err(ConfigError::Invalid(
                     "development mode cannot be production_mode".into(),
@@ -135,9 +146,9 @@ fn validate_server_mode(config: &Config, url: &Url) -> Result<(), ConfigError> {
                     "reverse_proxy mode requires production_mode and HTTPS public_base_url".into(),
                 ));
             }
-            if !config.reverse_proxy.enabled || config.reverse_proxy.trusted_proxies.is_empty() {
+            if !config.reverse_proxy.enabled {
                 return Err(ConfigError::Invalid(
-                    "reverse_proxy mode requires enabled=true and trusted_proxies".into(),
+                    "reverse_proxy mode requires enabled=true".into(),
                 ));
             }
             if !config.reverse_proxy.trust_x_forwarded_headers {
@@ -145,45 +156,58 @@ fn validate_server_mode(config: &Config, url: &Url) -> Result<(), ConfigError> {
                     "reverse_proxy mode requires trust_x_forwarded_headers=true".into(),
                 ));
             }
-            if !listen.ip().is_loopback() && !config.reverse_proxy.allow_non_loopback {
-                return Err(ConfigError::Invalid(
-                    "non-loopback reverse proxy binding requires allow_non_loopback=true".into(),
-                ));
-            }
-            if !listen.ip().is_loopback()
-                && !config
-                    .reverse_proxy
-                    .trusted_proxies
-                    .iter()
-                    .copied()
-                    .map(crate::proxy::canonical_peer_ip)
-                    .any(|proxy| !proxy.is_loopback())
-            {
-                return Err(ConfigError::Invalid(
-                    "non-loopback binding requires a non-loopback trusted proxy".into(),
-                ));
-            }
-            let readiness_peer = local_readiness_peer_ip(listen.ip());
-            if !crate::proxy::is_trusted_proxy_peer(
-                readiness_peer,
-                &config.reverse_proxy.trusted_proxies,
-            ) {
-                return Err(ConfigError::Invalid(format!(
-                    "reverse_proxy trusted_proxies must include the local readiness peer {readiness_peer}"
-                )));
-            }
-            if config.tls.enabled {
-                return Err(ConfigError::Invalid(
-                    "reverse_proxy mode must not enable application TLS".into(),
-                ));
-            }
-            if config.tls.certificate_source == CertificateSource::LetsEncrypt {
-                return Err(ConfigError::Invalid(
-                    "letsencrypt certificate_source is valid only in standalone_tls mode".into(),
-                ));
+            match config.reverse_proxy.transport.as_ref() {
+                Some(ProxyTransport::Unix { socket_path, proxy_uids }) => {
+                    if config.server.listen_address != format!("unix:{}", socket_path.display())
+                        || !socket_path.is_absolute()
+                        || socket_path.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+                        || socket_path == Path::new("/")
+                        || proxy_uids.is_empty()
+                        || proxy_uids.len() > 16
+                        || proxy_uids.contains(&0)
+                        || proxy_uids.iter().collect::<std::collections::HashSet<_>>().len() != proxy_uids.len()
+                        || config.tls.enabled
+                        || config.reverse_proxy.allow_non_loopback
+                    {
+                        return Err(ConfigError::Invalid(
+                            "unix reverse proxy requires a matching absolute socket path, a non-root proxy UID allowlist, and no application TLS".into(),
+                        ));
+                    }
+                }
+                Some(ProxyTransport::Mtls { client_ca_file, client_fingerprints }) => {
+                    let listen: SocketAddr = config.server.listen_address.parse().map_err(|_| {
+                        ConfigError::Invalid("mTLS listen_address must be an IP socket address".into())
+                    })?;
+                    if (listen.ip().is_unspecified() || !listen.ip().is_loopback())
+                        && !config.reverse_proxy.allow_non_loopback
+                    {
+                        return Err(ConfigError::Invalid("non-loopback mTLS binding requires allow_non_loopback=true".into()));
+                    }
+                    if listen.port() == 8082 && (listen.ip().is_unspecified() || listen.ip().is_loopback())
+                        || !config.tls.enabled
+                        || config.tls.certificate_source != CertificateSource::Files
+                        || !client_ca_file.is_absolute()
+                        || client_fingerprints.is_empty()
+                        || client_fingerprints.len() > 16
+                        || client_fingerprints.iter().any(|v| v.len() != 64 || !v.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+                    {
+                        return Err(ConfigError::Invalid("mTLS reverse proxy requires dedicated CA, server TLS files, and lowercase client certificate SHA-256 allowlist".into()));
+                    }
+                    validate_tls_files(&config.tls)?;
+                    validate_proxy_mtls_files(&config.tls, client_ca_file)?;
+                }
+                None => return Err(ConfigError::Invalid(
+                    "reverse_proxy.transport is required; migrate the old IP-only proxy configuration before upgrade".into(),
+                )),
             }
         }
         ServerMode::StandaloneTls => {
+            let listen: SocketAddr = config.server.listen_address.parse().map_err(|_| {
+                ConfigError::Invalid(
+                    "standalone_tls listen_address must be an IP socket address".into(),
+                )
+            })?;
+            let _ = listen;
             if !config.server.production_mode || url.scheme() != "https" || !config.tls.enabled {
                 return Err(ConfigError::Invalid(
                     "standalone_tls requires production_mode, HTTPS URL and TLS enabled".into(),

@@ -110,7 +110,10 @@ VaultLink. The service refuses a missing mount, wrong source, wrong type,
 unsafe ownership or remote SQLite filesystem. Make the shared root and reserved
 internal directory owned by `vaultlink:vaultlink` and inaccessible for
 group/other writes. Use a reverse proxy with HTTPS or VaultLink's standalone
-TLS mode as described in [configuration](CONFIGURATION.md).
+TLS mode as described in [configuration](CONFIGURATION.md). For a local proxy,
+assign its dedicated account to the `vaultlink-proxy` group, use the protected
+Unix socket and list that account's numeric UID in
+`reverse_proxy.transport.proxy_uids`. A network proxy requires mTLS.
 
 ## Initial browser setup
 
@@ -133,8 +136,12 @@ sudo install -o root -g vaultlink -m 0640 \
   /var/lib/vaultlink/setup/config.toml /etc/vaultlink/config.toml
 sudo -u vaultlink rm /var/lib/vaultlink/setup/config.toml
 sudo systemctl start vaultlink.service
-curl --fail http://127.0.0.1:8080/api/v2/health/ready
+sudo -u vaultlink /run/current-system/sw/bin/vaultlink health-check --ready
 ```
+
+The local `health-check` commands in this guide assume reverse-proxy mode. In
+`standalone_tls` mode, check the configured HTTPS health URL with normal server
+certificate validation instead.
 
 ## Guided upgrade and recovery
 
@@ -176,7 +183,7 @@ For example:
 sudo nixos-rebuild switch --flake /etc/nixos#my-host
 /run/current-system/sw/bin/vaultlink --version
 systemctl show -p ExecStart --value vaultlink.service
-curl --fail http://127.0.0.1:8080/api/v2/health/ready
+sudo -u vaultlink /run/current-system/sw/bin/vaultlink health-check --ready
 sudo sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check;'
 ```
 
@@ -222,7 +229,7 @@ stat -c '%n %U:%G %a' /etc/vaultlink/config.toml \
 systemctl unmask --runtime vaultlink.service
 systemctl reset-failed vaultlink.service
 systemctl start vaultlink.service
-curl --fail http://127.0.0.1:8080/api/v2/health/ready
+sudo -u vaultlink /run/current-system/sw/bin/vaultlink health-check --ready
 trap - 0
 SH
 ```

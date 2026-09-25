@@ -31,7 +31,7 @@ use tokio::{
 };
 use vaultlink::{
     auth,
-    config::{self, CertificateSource, Config, ServerMode},
+    config::{self, CertificateSource, Config, ProxyTransport, ServerMode},
     db::{
         AdminRecoveryOutcome, AuditContext, AuditRetentionOutcome, Database, InitialAdminOutcome,
     },
@@ -44,6 +44,7 @@ use transport_diagnostics::TransportDiagnostics;
 
 include!("server/acceptor.rs");
 include!("server/runtime.rs");
+include!("server/proxy_runtime.rs");
 include!("server/audit_worker.rs");
 include!("cli/parse.rs");
 include!("cli/recovery.rs");

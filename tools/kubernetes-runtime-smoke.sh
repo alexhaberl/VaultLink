@@ -26,7 +26,6 @@ printf '%s  %s\n' "$kubectl_sha" "$bin_dir/kubectl" | sha256sum --check -
 chmod 0755 "$bin_dir/kubectl"
 
 cleanup() {
-  if [[ -n ${forward_pid:-} ]]; then kill "$forward_pid" 2>/dev/null || true; fi
   if [[ -n ${cluster_created:-} ]]; then kind delete cluster --name vaultlink-ci || true; fi
   for name in storage state; do
     if mountpoint -q "$test_root/$name"; then sudo umount "$test_root/$name" || true; fi
@@ -48,6 +47,21 @@ sudo install -d -o 10001 -g 10001 -m 0700 \
   "$test_root/storage/.vaultlink-internal" \
   "$test_root/storage/.vaultlink-internal/uploads" \
   "$test_root/storage/.vaultlink-internal/tombstones"
+mkdir -p "$test_root/client-certs"
+python3 - "$test_root/client-certs" <<'PY'
+import importlib.util, pathlib, sys
+path = pathlib.Path('tools/docker-runtime-smoke.py')
+spec = importlib.util.spec_from_file_location('vaultlink_smoke', path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.make_test_certificates(pathlib.Path(sys.argv[1]))
+PY
+sudo install -d -o 10001 -g 10001 -m 0700 "$test_root/state/certs"
+for name in ca.crt server.crt server.key client.crt client.key; do
+  sudo install -o 10001 -g 10001 -m 0600 \
+    "$test_root/client-certs/$name" "$test_root/state/certs/$name"
+done
+export VAULTLINK_KUBE_CERT_DIR="$test_root/client-certs"
 
 cat >"$test_root/kind.yaml" <<EOF
 kind: Cluster
@@ -112,13 +126,7 @@ sed "s@ghcr.io/alexhaberl/vaultlink:vX.Y.Z@$image@" \
 kubectl apply -f "$test_root/vaultlink.yaml"
 kubectl wait --for=jsonpath='{.status.phase}'=Running pod -l app=vaultlink --timeout=180s
 
-kubectl port-forward deployment/vaultlink 18081:8081 \
-  >"$test_root/port-forward.log" 2>&1 &
-forward_pid=$!
 python3 tools/kubernetes-runtime-smoke.py setup
-kill "$forward_pid" 2>/dev/null || true
-wait "$forward_pid" 2>/dev/null || true
-unset forward_pid
 
 kubectl scale deployment/vaultlink --replicas=0
 for ((attempt = 0; attempt < 60; attempt++)); do
@@ -149,9 +157,6 @@ with sqlite3.connect(sys.argv[1]) as db:
 PY
 kubectl scale deployment/vaultlink --replicas=1
 kubectl wait --for=jsonpath='{.status.phase}'=Running pod -l app=vaultlink --timeout=180s
-kubectl port-forward deployment/vaultlink 18081:8081 \
-  >"$test_root/port-forward-restart.log" 2>&1 &
-forward_pid=$!
 python3 tools/kubernetes-runtime-smoke.py verify
 kubectl rollout status deployment/vaultlink --timeout=120s
 printf 'Kubernetes local-PV setup, transfers, paired restore and restart passed\n'

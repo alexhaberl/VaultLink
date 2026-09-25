@@ -548,6 +548,45 @@ async fn readiness(State(state): State<ReadinessState>) -> impl IntoResponse {
     )
 }
 
+#[derive(Clone)]
+struct LocalHealthState {
+    readiness: ReadinessState,
+    application_listening: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Only these two routes are exposed by the separate loopback health port.
+pub fn local_health_router(
+    state: &AppState,
+    application_listening: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Router {
+    use axum::extract::FromRef;
+    let local = LocalHealthState {
+        readiness: ReadinessState::from_ref(state),
+        application_listening,
+    };
+    Router::new()
+        .route("/api/v2/health/live", axum::routing::get(health))
+        .route("/api/v2/health/ready", axum::routing::get(local_readiness))
+        .with_state(local)
+}
+
+async fn local_readiness(State(state): State<LocalHealthState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+    let ready =
+        state.application_listening.load(Ordering::Acquire) && state.readiness.check().await;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(HealthResponse {
+            ok: ready,
+            version: env!("CARGO_PKG_VERSION"),
+        }),
+    )
+}
+
 #[derive(Serialize)]
 struct SimpleResponse {
     ok: bool,

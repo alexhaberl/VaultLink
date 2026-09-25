@@ -140,6 +140,18 @@ sudo vaultlink-update install
 sudo vaultlink-update auto
 ```
 
+An upgrade that changes the proxy transport supplies a root-owned,
+`root:vaultlink` mode `0640` candidate in `/etc/vaultlink` through
+`install --candidate-config /etc/vaultlink/proxy-next.toml`. The updater checks
+the old binary with the live configuration and the signed new binary with the
+candidate **before** package installation. Recovery restores the old binary,
+configuration, database, keyring and native package together. Automatic
+installation with a legacy proxy configuration aborts with migration guidance.
+The published 0.7.1 updater cannot take this argument; follow the
+[one-time signed migration procedure](PROXY-MIGRATION-071.md) for its first
+transition. Keep the external proxy closed until both its transport and the
+new application's readiness have been tested.
+
 `check` compares the installed package with the latest stable strict
 `vMAJOR.MINOR.PATCH` release without executing downloaded content.
 `install` installs only a newer release for the exact package target.

@@ -47,21 +47,60 @@ fn validate_setup_credentials(form: &SetupForm) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_proxy_transport(
+    form: &SetupForm,
+    reverse_proxy_mode: bool,
+) -> Result<Option<ProxyTransport>, String> {
+    if !reverse_proxy_mode {
+        return Ok(None);
+    }
+    let transport = match form.proxy_transport.as_str() {
+        "unix" => ProxyTransport::Unix {
+            socket_path: form
+                .listen_address
+                .strip_prefix("unix:")
+                .map(PathBuf::from)
+                .ok_or("Unix listener must use unix:/absolute/path")?,
+            proxy_uids: form
+                .proxy_uid
+                .split(',')
+                .map(|uid| {
+                    uid.trim()
+                        .parse()
+                        .map_err(|_| "Invalid proxy UID allowlist")
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        "mtls" => ProxyTransport::Mtls {
+            client_ca_file: PathBuf::from(form.client_ca_file.trim()),
+            client_fingerprints: form
+                .client_fingerprints
+                .split([',', '\n', '\r', ' ', '\t'])
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect(),
+        },
+        _ => return Err("Select Unix socket or mTLS as the reverse-proxy transport".into()),
+    };
+    Ok(Some(transport))
+}
+
 fn parse_setup_form(form: SetupForm) -> Result<PreparedSetup, String> {
     validate_setup_credentials(&form)?;
-    // Confirmation is needed only for the comparison above. Drop it before
-    // parsing configuration and performing storage I/O.
-    drop(form.admin_password_confirm);
     let mode = match form.server_mode.as_str() {
         "development" => ServerMode::Development,
         "reverse_proxy" => ServerMode::ReverseProxy,
         "standalone_tls" => ServerMode::StandaloneTls,
         _ => {
-            return Err(i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_SERVER_MODE).into())
+            return Err(i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_SERVER_MODE).into());
         }
     };
     let standalone_tls = matches!(mode, ServerMode::StandaloneTls);
     let reverse_proxy_mode = matches!(mode, ServerMode::ReverseProxy);
+    let transport = parse_proxy_transport(&form, reverse_proxy_mode)?;
+    // Confirmation is needed only for the comparison above. Drop it before
+    // parsing the rest of the configuration and performing storage I/O.
+    drop(form.admin_password_confirm);
     let production_mode = !matches!(mode, ServerMode::Development);
     let external_writers = form.external_writers.is_some();
     let allow_external_writer_replace = form.allow_external_writer_replace.is_some();
@@ -81,7 +120,7 @@ fn parse_setup_form(form: SetupForm) -> Result<PreparedSetup, String> {
                 i18n::current_locale(),
                 i18n::SETUP_INVALID_CERTIFICATE_SOURCE,
             )
-            .into())
+            .into());
         }
     };
     let invalid_extensions =
@@ -103,6 +142,11 @@ fn parse_setup_form(form: SetupForm) -> Result<PreparedSetup, String> {
         .map_err(|_| {
             i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_TRUSTED_PROXIES).to_string()
         })?;
+    let allow_non_loopback = matches!(transport.as_ref(), Some(ProxyTransport::Mtls { .. }))
+        && form
+            .listen_address
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|address| !address.ip().is_loopback());
     let config = Config {
         server: Server {
             mode,
@@ -145,12 +189,13 @@ fn parse_setup_form(form: SetupForm) -> Result<PreparedSetup, String> {
         },
         reverse_proxy: ReverseProxy {
             enabled: reverse_proxy_mode,
-            allow_non_loopback: false,
+            allow_non_loopback,
             trusted_proxies,
             trust_x_forwarded_headers: reverse_proxy_mode,
+            transport,
         },
         tls: Tls {
-            enabled: standalone_tls,
+            enabled: standalone_tls || (reverse_proxy_mode && form.proxy_transport == "mtls"),
             certificate_source,
             cert_file: form.tls_cert_file.into(),
             key_file: form.tls_key_file.into(),

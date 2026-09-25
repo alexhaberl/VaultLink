@@ -1190,6 +1190,27 @@ EOF
     "$runtime_guard" || fail "Arch removal fault probes did not restore runtime parity"
 fi
 
+# The previously published updater cannot provide a candidate configuration.
+# Its attempt to install this package must be rejected by the new preinstall
+# script before package or service mutation when the live proxy is IP-only.
+[ ! -e "$config" ] && [ ! -L "$config" ] \
+    || fail "legacy migration probe expected no live configuration"
+printf '[server]\nmode = "reverse_proxy"\n[reverse_proxy]\nenabled = true\ntrust_x_forwarded_headers = true\ntrusted_proxies = ["127.0.0.1"]\n' \
+    >"$config"
+# A transport-looking field in another table must not bypass the guard.
+printf '[unrelated]\nkind = "unix"\n' >>"$config"
+chown root:vaultlink "$config"
+chmod 0640 "$config"
+legacy_preinstall_log=$(mktemp "${TMPDIR:-/tmp}/vaultlink-legacy-preinstall.XXXXXXXX")
+if /usr/lib/vaultlink/package/deploy/vaultlink-package-lifecycle.sh \
+    preinstall "$package_format" "$os_id" "$os_version" "$package_arch" \
+    vaultlink upgrade >"$legacy_preinstall_log" 2>&1; then
+    fail "package preinstall accepted a legacy IP-only proxy without migration"
+fi
+grep -F -q 'legacy IP-only proxy configuration' "$legacy_preinstall_log" \
+    || fail "legacy proxy rejection lacked migration guidance"
+rm -f "$legacy_preinstall_log" "$config"
+
 # A postinstall failure during any upgrade must preserve the pre-existing
 # trusted host marker. A hostile updater-config symlink injects that failure
 # after the package payload and marker have been examined.

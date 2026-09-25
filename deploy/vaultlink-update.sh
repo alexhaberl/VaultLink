@@ -11,6 +11,7 @@ export LC_ALL LANG PATH
 # The verified old-package branch sets it only inside a short-lived subshell
 # after FD9 and FD8 are both already locked by this updater.
 unset VAULTLINK_PACKAGE_RECOVERY
+unset VAULTLINK_PROXY_MIGRATION_CONFIG
 
 repository=alexhaberl/VaultLink
 github_origin=https://github.com
@@ -113,13 +114,18 @@ validate_open_lock() {
 }
 
 usage() {
-    echo "usage (as root): vaultlink-update [check|install|auto]" >&2
+    echo "usage (as root): vaultlink-update [check|install|auto] [--candidate-config /etc/vaultlink/NAME.toml]" >&2
     exit 64
 }
 
 [ "$(id -u)" -eq 0 ] || usage
-[ "$#" -eq 1 ] || usage
+[ "$#" -eq 1 ] || [ "$#" -eq 3 ] || usage
 action=$1
+candidate_config=
+if [ "$#" -eq 3 ]; then
+    [ "$action" = install ] && [ "$2" = --candidate-config ] || usage
+    candidate_config=$3
+fi
 case "$action" in
     check|install|auto) ;;
     *) usage ;;
@@ -154,6 +160,24 @@ validate_root_file() {
         echo "$checked_label must not be group- or world-writable" >&2
         return 1
     }
+}
+
+validate_migration_config() {
+    [ -n "$candidate_config" ] || return 0
+    case "$candidate_config" in
+        /etc/vaultlink/*.toml) ;;
+        *) echo "candidate configuration must be an explicit file in /etc/vaultlink" >&2; return 1 ;;
+    esac
+    candidate_name=${candidate_config#/etc/vaultlink/}
+    case "$candidate_name" in
+        ''|*/*|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    [ "$candidate_config" != "$live_config" ] || return 1
+    [ -d /etc/vaultlink ] && [ ! -L /etc/vaultlink ] \
+        && [ "$(stat -c '%u:%g:%a' /etc/vaultlink)" = "0:$service_gid:750" ] || return 1
+    [ -f "$candidate_config" ] && [ ! -L "$candidate_config" ] \
+        && [ "$(stat -c '%u:%g:%a' "$candidate_config")" = "0:$service_gid:640" ] || return 1
+    [ "$(stat -c %h "$candidate_config")" -eq 1 ] || return 1
 }
 
 validate_candidate_checksum_root() {
@@ -1784,14 +1808,23 @@ restore_runtime_backup() {
     restore_binary=/opt/vaultlink/.vaultlink.package-restore
     restore_data=/var/lib/vaultlink/.data.sqlite.package-restore
     restore_keyring=/var/lib/vaultlink/.secrets.keyring.package-restore
-    rm -f "$restore_binary" "$restore_data" "$restore_keyring"
+    restore_config=/etc/vaultlink/.config.toml.package-restore
+    rm -f "$restore_binary" "$restore_data" "$restore_keyring" "$restore_config"
     install -o root -g root -m 0755 "$recovery_backup/vaultlink" "$restore_binary" || return 1
     install -o vaultlink -g vaultlink -m 0600 "$recovery_backup/data.sqlite" "$restore_data" || return 1
     install -o vaultlink -g vaultlink -m 0600 "$recovery_backup/secrets.keyring" "$restore_keyring" || return 1
     sqlite3 "$restore_data" 'PRAGMA integrity_check' | grep -q -x ok || return 1
-    validate_file_unchanged_from_backup "$live_config" \
-        "$recovery_backup/config.toml" "$recovery_backup/config.metadata" || return 1
+    if [ -n "$candidate_config" ]; then
+        install -o root -g vaultlink -m 0640 \
+            "$recovery_backup/config.toml" "$restore_config" || return 1
+    else
+        validate_file_unchanged_from_backup "$live_config" \
+            "$recovery_backup/config.toml" "$recovery_backup/config.metadata" || return 1
+    fi
     mv -f "$restore_binary" "$live_binary" || return 1
+    if [ -n "$candidate_config" ]; then
+        mv -f "$restore_config" "$live_config" || return 1
+    fi
     rm -f "$data-wal" "$data-shm"
     mv -f "$restore_data" "$data" || return 1
     mv -f "$restore_keyring" "$keyring" || return 1
@@ -2127,6 +2160,32 @@ validate_installed_payload "$installed_version" "$old_extract_root" \
     || fail "installed package payload differs from its verified release package"
 candidate_binary="$new_extract_root${package_binary}"
 candidate_upgrade="$new_extract_root${package_upgrade}"
+validate_migration_config || fail "candidate configuration path or permissions are unsafe"
+activation_config=${candidate_config:-$live_config}
+proxy_group=$(getent group vaultlink-proxy || true)
+case "$proxy_group" in
+    vaultlink-proxy:x:*:*) ;;
+    *) fail "vaultlink-proxy group is absent; complete the documented migration before package installation" ;;
+esac
+# The old binary must continue to accept its live configuration. The candidate
+# must accept its separate configuration before any package or service mutation.
+timeout --kill-after=2 5 runuser -u vaultlink -- \
+    "$live_binary" readiness-target --config "$live_config" >/dev/null \
+    || fail "installed binary rejects its live configuration"
+exec 7<"$candidate_binary" || fail "cannot open signed candidate for config preflight"
+candidate_preflight_status=0
+timeout --kill-after=2 5 runuser -u vaultlink -- \
+    /proc/self/fd/7 readiness-target --config "$activation_config" >/dev/null \
+    || candidate_preflight_status=$?
+exec 7<&-
+[ "$candidate_preflight_status" -eq 0 ] \
+    || fail "candidate rejects configuration; prepare --candidate-config before updating"
+candidate_config_sha=$(sha256sum "$activation_config" | awk '{ print $1 }')
+if [ -z "$candidate_config" ] && [ "$installed_version" = 0.7.1 ]; then
+    # The published 0.7.1 updater has no candidate-configuration argument.
+    # Its signed package preinstall also rejects the legacy proxy layout.
+    echo "0.7.1 migration: use the separately verified new updater with --candidate-config" >&2
+fi
 
 package_dry_run "$new_package_file" 0 "$new_extract_root" \
     || fail "new package dependencies are unavailable; update the host packages manually"
@@ -2142,13 +2201,16 @@ validate_open_lock 8 "$maintenance_lock" \
 maintenance_lock_held=1
 validate_installed_payload "$installed_version" "$old_extract_root" \
     || fail "installed package state changed before the maintenance window"
+test "$(sha256sum "$activation_config" | awk '{ print $1 }')" = "$candidate_config_sha" \
+    || fail "candidate configuration changed after preflight"
 cmp -s "$live_binary" "$old_extract_root$package_binary" \
     || fail "live runtime changed before the maintenance window"
 create_recovery_backup || fail "could not create the pre-update runtime recovery unit"
 validate_persistent_install_method \
     || fail "installation binding changed before native package installation"
 package_mutation_started=1
-package_install "$new_package_file" 0 || fail "native package installation failed"
+VAULTLINK_PROXY_MIGRATION_CONFIG="$candidate_config" \
+    package_install "$new_package_file" 0 || fail "native package installation failed"
 systemctl daemon-reload \
     || fail "systemd could not reload the newly installed package units"
 validate_installed_payload "$latest_version" "$new_extract_root" \
@@ -2167,7 +2229,7 @@ validate_installed_payload "$latest_version" "$new_extract_root" \
 cmp -s "$live_binary" "$recovery_backup/vaultlink" \
     || fail "live runtime changed before the maintenance-lock handoff"
 backup_directory=$(VAULTLINK_MAINTENANCE_LOCK_FD=8 \
-    "$candidate_upgrade" "$candidate_binary" "$live_config") \
+    "$candidate_upgrade" "$candidate_binary" "$activation_config") \
     || fail "verified package activation or migration failed"
 case "$backup_directory" in
     "$backup_root"/*)
@@ -2199,9 +2261,14 @@ if [ "$service_was_active" -eq 0 ]; then
     systemctl --quiet is-active vaultlink.service \
         && fail "manual package update unexpectedly left the service active"
 fi
-validate_file_unchanged_from_backup "$live_config" \
-    "$recovery_backup/config.toml" "$recovery_backup/config.metadata" \
-    || fail "package update changed configuration bytes or filesystem identity"
+if [ -n "$candidate_config" ]; then
+    cmp -s "$live_config" "$candidate_config" \
+        || fail "activated configuration differs from the validated candidate"
+else
+    validate_file_unchanged_from_backup "$live_config" \
+        "$recovery_backup/config.toml" "$recovery_backup/config.metadata" \
+        || fail "package update changed configuration bytes or filesystem identity"
+fi
 if [ -f "$recovery_backup/update.conf" ]; then
     validate_file_unchanged_from_backup "$update_config" \
         "$recovery_backup/update.conf" "$recovery_backup/update-config.metadata" \

@@ -1,77 +1,36 @@
-# Container setup entrypoint
+# Container setup and production listener
 
-For an official Linux server deployment with the GHCR runtime image, Compose,
-audited local or SMB mount, and backup procedure, use the [Docker Engine
-guide](DOCKER.md). This page explains the proxy and local smoke image.
+The official container exposes port `8081`. With no configuration, the
+entrypoint starts a temporary HTTP bootstrap proxy on that port, the setup UI
+on container loopback `127.0.0.1:8080`, and a separate loopback health listener
+on `127.0.0.1:8082`. The health CLI reports live during setup and not ready.
+Keep the published bootstrap port bound to host loopback and use an SSH tunnel
+for the one-time setup token.
 
-VaultLink intentionally binds its bootstrap setup UI and development server to
-loopback. Docker port publishing cannot reach a listener on the container's
-loopback interface directly. The container entrypoint keeps that boundary and
-starts VaultLink's Rust/Hyper `container-proxy` subcommand on a separate port
-instead of changing the application listener to a wildcard address. The same
-VaultLink binary provides both processes; there is no second HTTP runtime.
+The setup form must select **reverse proxy**, `mtls`, a production listener of
+`0.0.0.0:8081`, an HTTPS public URL, a server certificate and key, a dedicated
+proxy-client CA, and the SHA-256 fingerprints of authorized client certificate
+DER files. Store certificate material in a protected container volume owned by
+the container UID `10001`; private keys must never be copied to the image.
+The upstream proxy verifies the server certificate and server name and presents
+its allowed client certificate. VaultLink validates both the CA chain and the
+leaf fingerprint before serving HTTP.
 
-The default topology is:
+After the operator confirms setup and selects Start, the entrypoint stops the
+bootstrap proxy and its setup process completely before starting the production
+mTLS listener. A pre-existing configuration is loaded directly: invalid or
+legacy IP-only configuration terminates the container instead of reopening
+bootstrap HTTP. The only production health endpoint is the container-local
+`127.0.0.1:8082`; use `vaultlink health-check --live` or `--ready` through
+Docker/Kubernetes exec. That listener has no application routes and ignores
+forwarding headers. The CLI uses bounded local HTTP requests.
 
-- container proxy: `0.0.0.0:8081`
-- setup and default development listener: `127.0.0.1:8080`
-- host example: `127.0.0.1:18080` published to container port `8081`
+`VAULTLINK_BIN`, `VAULTLINK_CONFIG_PATH`, `VAULTLINK_SETUP_ADDR`, and
+`VAULTLINK_CONTAINER_ADDR` customize the bootstrap process. The container proxy
+only serves bootstrap and local development; it is absent from production.
 
-The proxy first connects to the setup listener. It refreshes a fail-closed
-configuration snapshot every 250 ms on a blocking worker. After setup has
-committed the configuration and transitioned in the same process, new
-connections therefore use `server.listen_address` from that snapshot and are
-forwarded to the configured loopback listener. Non-loopback configured targets
-are never proxied.
-
-The proxy is HTTP-aware at the container boundary and applies one of two trust
-paths to each connection. A direct or otherwise untrusted peer cannot supply
-its own identity: the proxy removes client-supplied `Forwarded` and
-`X-Forwarded-For` headers and sets `X-Forwarded-For` to the TCP peer address.
-This is the fail-closed default before setup and whenever the runtime
-configuration is missing or invalid.
-
-In production behind Caddy, Nginx, or another trusted proxy, configure that
-proxy's exact container-facing TCP address in `reverse_proxy.trusted_proxies`
-alongside the loopback peer used by VaultLink. When reverse-proxy header trust
-is enabled, the container proxy accepts a forwarding chain only from an exact
-allowlist match, validates every address, normalizes the chain, and appends the
-immediate peer. Malformed trusted chains are rejected; an unlisted peer still
-uses the direct-peer path. Docker NAT can make the observed peer a bridge or
-host-gateway address instead of the proxy's service address. In that topology,
-the gateway is the trust boundary and must be allowlisted explicitly only when
-the published port remains host-local.
-
-The repository's digest-pinned smoke image can exercise this flow locally. It
-is a test image with build tools:
-
-```sh
-docker build -f deploy/docker/Dockerfile.setup-smoke -t vaultlink:smoke .
-docker volume create vaultlink-state
-docker volume create vaultlink-storage
-docker run --rm --name vaultlink-preview \
-  --publish 127.0.0.1:18080:8081 \
-  --volume vaultlink-state:/var/lib/vaultlink \
-  --volume vaultlink-storage:/mnt/storage \
-  --env VAULTLINK_BIN=/work/target/release/vaultlink \
-  vaultlink:smoke bash deploy/docker/container-entrypoint.sh
-```
-
-Open the tokenized URL printed by the container. For a persistent local
-development preview, choose `/mnt/storage` as the root and keep
-`/var/lib/vaultlink` as the data directory. Do not expose host port `18080`
-beyond loopback: the setup token grants bootstrap access. A production reverse
-proxy may connect to this host-local port after setup; publishing the port on a
-public host address is not a replacement for an authenticated TLS proxy.
-
-The entrypoint accepts these overrides:
-
-- `VAULTLINK_BIN` (default `/opt/vaultlink/vaultlink`)
-- `VAULTLINK_CONFIG_PATH` (default `/var/lib/vaultlink/config.toml`)
-- `VAULTLINK_SETUP_ADDR` (default `127.0.0.1:8080`)
-- `VAULTLINK_CONTAINER_ADDR` (default `0.0.0.0:8081`)
-
-Production CIFS deployments still require their server-side ACL and reserved
-`.vaultlink-internal` layout to be provisioned before VaultLink starts. A
-standalone-TLS service with a non-loopback configured listener must publish its
-service port directly; the loopback proxy deliberately refuses that target.
+The local runtime smoke generates short-lived test certificates, verifies
+no-certificate and unpinned-certificate rejection, verifies the server name,
+then exercises authenticated transfer and restart through the published port.
+The [Docker Engine guide](DOCKER.md) covers volumes, host proxy, and recovery;
+the [configuration guide](CONFIGURATION.md) covers Unix sockets and mTLS.

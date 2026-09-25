@@ -241,6 +241,11 @@ mod tests {
         config.reverse_proxy.enabled = true;
         config.reverse_proxy.trust_x_forwarded_headers = true;
         config.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+        config.server.listen_address = "unix:/run/vaultlink-proxy/http.sock".into();
+        config.reverse_proxy.transport = Some(ProxyTransport::Unix {
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![10002],
+        });
 
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("production_mode=true requires require_mount=true"));
@@ -405,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_reverse_proxy_requires_explicit_opt_in() {
+    fn legacy_ip_only_reverse_proxy_is_rejected_before_activation() {
         let mut c = base();
         c.server.mode = ServerMode::ReverseProxy;
         c.server.production_mode = true;
@@ -419,15 +424,11 @@ mod tests {
         assert!(c.validate().is_err());
         c.reverse_proxy.allow_non_loopback = true;
         let error = c.validate().unwrap_err().to_string();
-        assert!(error.contains("local readiness peer 127.0.0.1"));
-        c.reverse_proxy
-            .trusted_proxies
-            .push("127.0.0.1".parse().unwrap());
-        assert!(c.validate().is_ok());
+        assert!(error.contains("reverse_proxy.transport is required"));
     }
 
     #[test]
-    fn reverse_proxy_readiness_accepts_mapped_ipv4_allowlist_entry() {
+    fn unix_reverse_proxy_rejects_network_listener_and_root_proxy_uid() {
         let mut c = base();
         c.server.mode = ServerMode::ReverseProxy;
         c.server.production_mode = true;
@@ -442,7 +443,24 @@ mod tests {
             "192.0.2.10".parse().unwrap(),
             "::ffff:127.0.0.1".parse().unwrap(),
         ];
+        c.reverse_proxy.transport = Some(ProxyTransport::Unix {
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![0],
+        });
+        assert!(c.validate().is_err());
+        c.server.listen_address = "unix:/run/vaultlink-proxy/http.sock".into();
+        c.reverse_proxy.allow_non_loopback = false;
+        assert!(c.validate().is_err());
+        c.reverse_proxy.transport = Some(ProxyTransport::Unix {
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![10002],
+        });
         c.validate().unwrap();
+        c.reverse_proxy.transport = Some(ProxyTransport::Unix {
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![10002, 10002],
+        });
+        assert!(c.validate().is_err());
     }
     #[test]
     fn hsts_rejected_in_development() {
@@ -581,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_target_uses_loopback_for_wildcard_reverse_proxy_bind() {
+    fn readiness_target_uses_separate_loopback_health_listener() {
         let mut c = base();
         c.server.mode = ServerMode::ReverseProxy;
         c.server.production_mode = true;
@@ -594,12 +612,18 @@ mod tests {
         c.reverse_proxy.allow_non_loopback = true;
         c.reverse_proxy.trusted_proxies =
             vec!["192.0.2.10".parse().unwrap(), "127.0.0.1".parse().unwrap()];
+        c.server.listen_address = "unix:/run/vaultlink-proxy/http.sock".into();
+        c.reverse_proxy.allow_non_loopback = false;
+        c.reverse_proxy.transport = Some(ProxyTransport::Unix {
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![10002],
+        });
         assert!(c.validate().is_ok());
 
         assert_eq!(
             c.local_readiness_target().unwrap(),
             LocalReadinessTarget {
-                url: "http://127.0.0.1:8080/api/v2/health/ready".into(),
+                url: "http://127.0.0.1:8082/api/v2/health/ready".into(),
                 connect_to: None,
                 insecure: false,
             }

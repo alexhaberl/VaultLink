@@ -199,6 +199,10 @@ mod tests {
             blocked_extensions: "exe".into(),
             audit_client_ip_enabled: None,
             trusted_proxies: "127.0.0.1".into(),
+            proxy_transport: String::new(),
+            proxy_uid: String::new(),
+            client_ca_file: String::new(),
+            client_fingerprints: String::new(),
             certificate_source: "files".into(),
             tls_cert_file: "".into(),
             tls_key_file: "".into(),
@@ -211,6 +215,12 @@ mod tests {
             admin_password: "a very long password".into(),
             admin_password_confirm: "a very long password".into(),
         }
+    }
+
+    fn use_unix_proxy(form: &mut SetupForm, data: &Path) {
+        form.proxy_transport = "unix".into();
+        form.proxy_uid = "10002".into();
+        form.listen_address = format!("unix:{}", data.join("proxy.sock").display());
     }
 
     fn configure_production_mount_policy(form: &mut SetupForm, root: &Path) {
@@ -958,6 +968,7 @@ mod tests {
         let mut form = form(root.path(), data.path());
         form.server_mode = "reverse_proxy".into();
         form.public_base_url = "https://files.example.test".into();
+        use_unix_proxy(&mut form, data.path());
         configure_production_mount_policy(&mut form, root.path());
         build_and_store_with_mount_validator(&config_path, form, |_| {
             Ok(SetupStorageValidation::TestBypass)
@@ -1001,6 +1012,7 @@ mod tests {
         let mut form = form(root.path(), data.path());
         form.server_mode = "reverse_proxy".into();
         form.public_base_url = "https://files.example.test".into();
+        use_unix_proxy(&mut form, data.path());
 
         let error = match build_and_store(&config_dir.path().join("config.toml"), form).await {
             Ok(_) => panic!("production setup without mount policy unexpectedly succeeded"),
@@ -1028,6 +1040,7 @@ mod tests {
         let mut form = form(&shared, &data_alias);
         form.server_mode = "reverse_proxy".into();
         form.public_base_url = "https://files.example.test".into();
+        use_unix_proxy(&mut form, &data_alias);
         form.internal_directory = internal.display().to_string();
         form.require_mount = Some("on".into());
         form.expected_filesystem_type = "ext4".into();

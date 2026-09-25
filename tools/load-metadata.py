@@ -102,6 +102,9 @@ class Client:
                 (20011, self.body_callback), (20079, self.header_callback),
                 (10062, b"127.0.0.1"), (78, connect_timeout), (13, request_timeout),
                 (99, 1), (74, 1), (75, 1),
+                (10025, os.environ["VAULTLINK_TLS_CLIENT_CERT"].encode()),
+                (10087, os.environ["VAULTLINK_TLS_CLIENT_KEY"].encode()),
+                (10065, os.environ["VAULTLINK_TLS_SERVER_CA"].encode()),
             ):
                 curl.option(self.easy, option, value)
         except BaseException:
@@ -304,9 +307,9 @@ def main():
         raise CurlFailure("invalid metadata generator configuration")
     if values[0] > 100 or values[1] > 300 or values[2] > 3600 or values[3] > 900:
         raise CurlFailure("metadata generator configuration exceeds profile bounds")
-    base = re.fullmatch(r"http://127\.0\.0\.1:([0-9]+)", os.environ["VAULTLINK_BASE_URL"])
+    base = re.fullmatch(r"https://127\.0\.0\.1:([0-9]+)", os.environ["VAULTLINK_BASE_URL"])
     if not base or not 1 <= int(base[1]) <= 65535:
-        raise CurlFailure("metadata generator requires the local HTTP listener")
+        raise CurlFailure("metadata generator requires the local mTLS listener")
     if not re.fullmatch(r"[A-Za-z0-9._~-]+", os.environ["DOWNLOAD_TOKEN"]):
         raise CurlFailure("metadata share token is invalid")
     return run(work, *values)

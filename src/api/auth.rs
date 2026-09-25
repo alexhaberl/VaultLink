@@ -1,7 +1,5 @@
-use std::net::SocketAddr;
-
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::State,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -44,7 +42,6 @@ struct LoginResponse {
 
 pub(super) async fn login(
     State(state): State<AuthRouteState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     Json(form): Json<LoginRequest>,
 ) -> ApiResult<Response> {

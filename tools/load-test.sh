@@ -18,6 +18,19 @@ export LC_ALL LANG
 : "${VAULTLINK_CONFIG:?set VAULTLINK_CONFIG}"
 command -v curl >/dev/null
 command -v python3 >/dev/null
+: "${VAULTLINK_TLS_CLIENT_CERT:?set an mTLS client certificate for the load proxy}"
+: "${VAULTLINK_TLS_CLIENT_KEY:?set its private key path}"
+: "${VAULTLINK_TLS_SERVER_CA:?set the backend server CA path}"
+for tls_input in "$VAULTLINK_TLS_CLIENT_CERT" "$VAULTLINK_TLS_CLIENT_KEY" "$VAULTLINK_TLS_SERVER_CA"; do
+    if [ ! -f "$tls_input" ] || [ -L "$tls_input" ] || [ ! -r "$tls_input" ]; then
+        echo "load mTLS input is missing or unsafe" >&2
+        exit 66
+    fi
+done
+curl() {
+    command curl --cert "$VAULTLINK_TLS_CLIENT_CERT" \
+        --key "$VAULTLINK_TLS_CLIENT_KEY" --cacert "$VAULTLINK_TLS_SERVER_CA" "$@"
+}
 metadata_script=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/load-metadata.py
 if [ ! -f "$metadata_script" ] || [ -L "$metadata_script" ]; then
     echo "metadata generator helper is missing or unsafe" >&2
@@ -127,10 +140,10 @@ case "$SOAK_NAMESPACE" in
 esac
 [ "${#SOAK_NAMESPACE}" -le 128 ] || { echo "SOAK_NAMESPACE is too long" >&2; exit 64; }
 case "$VAULTLINK_BASE_URL" in
-    http://127.0.0.1:[0-9]*) ;;
-    *) echo "VAULTLINK_BASE_URL must be the direct local HTTP listener" >&2; exit 64 ;;
+    https://127.0.0.1:[0-9]*) ;;
+    *) echo "VAULTLINK_BASE_URL must be the direct local mTLS listener" >&2; exit 64 ;;
 esac
-base_port=${VAULTLINK_BASE_URL#http://127.0.0.1:}
+base_port=${VAULTLINK_BASE_URL#https://127.0.0.1:}
 case "$base_port" in *[!0-9]*|'') echo "VAULTLINK_BASE_URL must contain only a loopback port" >&2; exit 64 ;; esac
 [ "$base_port" -le 65535 ] || { echo "VAULTLINK_BASE_URL port is invalid" >&2; exit 64; }
 [ -r "$VAULTLINK_CONFIG" ] || { echo "VaultLink config is not readable" >&2; exit 66; }
@@ -161,11 +174,8 @@ toml_value() {
     || { echo "soak requires reverse_proxy.enabled=true" >&2; exit 77; }
 [ "$(toml_value reverse_proxy trust_x_forwarded_headers)" = true ] \
     || { echo "soak requires trusted forwarded client identities" >&2; exit 77; }
-trusted_proxies=$(toml_value reverse_proxy trusted_proxies)
-case "$trusted_proxies" in
-    *'"127.0.0.1"'*) ;;
-    *) echo "soak local peer is not an explicit trusted proxy" >&2; exit 77 ;;
-esac
+[ "$(toml_value reverse_proxy.transport kind)" = '"mtls"' ] \
+    || { echo "soak requires authenticated mTLS proxy transport" >&2; exit 77; }
 
 supervision_mode=systemd
 pid=
@@ -543,7 +553,7 @@ load_snapshot() {
     fi
     health_body="$work/snapshot-health.json"
     curl --fail --silent --show-error \
-        "${VAULTLINK_HEALTH_URL:-http://127.0.0.1:8080/api/v2/health/ready}" \
+        "${VAULTLINK_HEALTH_URL:-http://127.0.0.1:8082/api/v2/health/ready}" \
         -o "$health_body"
     expected_health="{\"ok\":true,\"version\":\"${SOAK_EXPECTED_VERSION:-0.7.2}\"}"
     [ "$(cat "$health_body")" = "$expected_health" ] || return 1

@@ -250,7 +250,12 @@ chmod 0755 "$mock_dir/id"
 cat >"$mock_dir/getent" <<'EOF'
 #!/bin/sh
 set -eu
-[ "$#" -eq 2 ] && [ "$2" = vaultlink ] || exit 64
+[ "$#" -eq 2 ] || exit 64
+if [ "$1" = group ] && [ "$2" = vaultlink-proxy ]; then
+    printf '%s\n' 'vaultlink-proxy:x:998:'
+    exit 0
+fi
+[ "$2" = vaultlink ] || exit 64
 case "$1" in
     passwd)
         home=/var/lib/vaultlink

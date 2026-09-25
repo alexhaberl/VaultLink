@@ -145,6 +145,21 @@ pub struct ReverseProxy {
     pub trusted_proxies: Vec<IpAddr>,
     #[serde(default)]
     pub trust_x_forwarded_headers: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<ProxyTransport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProxyTransport {
+    Unix {
+        socket_path: PathBuf,
+        proxy_uids: Vec<u32>,
+    },
+    Mtls {
+        client_ca_file: PathBuf,
+        client_fingerprints: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

@@ -123,7 +123,7 @@ cargo run -- init-admin --config config/development.toml --username admin
 make run
 ```
 
-`make sample-data` creates `dev/mount` and `dev/data`. With Docker available, `make docker-smoke` builds the digest-pinned Debian-13/Rust image and runs setup, API, load-fixture, soak-evidence, upgrade, and rollback tests without external container networking. Individual Docker targets remain available. The [container setup entrypoint](docs/CONTAINER-SETUP.md) keeps VaultLink on loopback and publishes a separate proxy port. `make policy-check` validates project supply-chain rules.
+`make sample-data` creates `dev/mount` and `dev/data`. With Docker available, `make docker-smoke` builds the digest-pinned Debian-13/Rust image and runs setup, API, load-fixture, soak-evidence, upgrade, and rollback tests without external container networking. Individual Docker targets remain available. The [container setup entrypoint](docs/CONTAINER-SETUP.md) exposes a temporary bootstrap proxy and then serves production mTLS directly. `make policy-check` validates project supply-chain rules.
 
 ## Documentation
 

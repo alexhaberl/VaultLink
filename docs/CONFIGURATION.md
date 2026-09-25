@@ -32,7 +32,7 @@ Examples:
 Startup rules:
 
 - `development`: loopback only, HTTP, no HSTS.
-- `reverse_proxy`: production, HTTPS `public_base_url`, `reverse_proxy.enabled = true`, at least one trusted proxy, no application TLS.
+- `reverse_proxy`: production, HTTPS `public_base_url`, `reverse_proxy.enabled = true`, and a mandatory authenticated `unix` or `mtls` transport. Legacy IP-only proxy configurations fail validation.
 - `standalone_tls` with `certificate_source = "files"`: production HTTPS, TLS enabled, certificate and key present; optional SIGHUP reload.
 - `standalone_tls` with `certificate_source = "letsencrypt"`: production HTTPS, TLS enabled, reverse proxy disabled, DNS host in `public_base_url`, contact email, and a secure ACME cache below `data_directory`.
 
@@ -110,21 +110,31 @@ See the kernel's [CIFS security option reporting](https://github.com/torvalds/li
 
 ### Reverse proxy (recommended)
 
-VaultLink listens locally, for example on `127.0.0.1:8080`, while Caddy or Nginx terminates HTTPS. `trusted_proxies` is both the exact direct-peer allowlist and the Forwarded-header trust boundary. For an external proxy, explicitly enable non-loopback binding and include the real proxy IP plus the local readiness peer:
+For a local proxy, VaultLink listens on a protected Unix socket. Its directory must be owned by the service UID and dedicated `vaultlink-proxy` GID with mode `0750`; the socket is `0660`. Grant socket access to the proxy through that group, without adding it to the `vaultlink` data group. Set `proxy_uids` to the proxy process's actual non-root UID(s). VaultLink checks each connection with `SO_PEERCRED` and rejects symlinked or unsafe socket paths. The packaged systemd unit creates `/run/vaultlink-proxy` with the correct ownership. A typical local configuration is:
 
 ```toml
 [server]
 mode = "reverse_proxy"
-listen_address = "0.0.0.0:8080"
+listen_address = "unix:/run/vaultlink-proxy/http.sock"
+public_base_url = "https://files.example.com"
+production_mode = true
 
 [reverse_proxy]
 enabled = true
-allow_non_loopback = true
-trusted_proxies = ["192.0.2.10", "127.0.0.1"]
+allow_non_loopback = false
+trusted_proxies = []
 trust_x_forwarded_headers = true
+
+[reverse_proxy.transport]
+kind = "unix"
+socket_path = "/run/vaultlink-proxy/http.sock"
+proxy_uids = [10002]
+
+[tls]
+enabled = false
 ```
 
-Replace `192.0.2.10` with the real proxy IP. See [deploy/vaultlink-external-proxy-network.conf](../deploy/vaultlink-external-proxy-network.conf). For large uploads through Nginx/Nginx Proxy Manager:
+For a network proxy, select `kind = "mtls"`, bind `listen_address = "0.0.0.0:8081"`, set `allow_non_loopback = true`, configure `[tls]` with validated server `cert_file` and `key_file`, and provide an absolute `client_ca_file` plus lowercase SHA-256 fingerprints of allowed client certificate DER encodings. The proxy must verify VaultLink's server certificate and DNS name; VaultLink verifies the client's CA chain, validity and pinned leaf fingerprint during the handshake. Prepare overlapping fingerprints before rotation, then restart both sides in a controlled sequence. `trusted_proxies` only lists authenticated intermediate hops in a forwarding chain; it does not authenticate TCP peers. The separate health listener is bound only to `127.0.0.1:8082` and serves liveness/readiness, never application routes. The [external proxy network example](../deploy/vaultlink-external-proxy-network.conf) restricts routing but does not replace mTLS. For large uploads through Nginx/Nginx Proxy Manager:
 
 ```nginx
 client_max_body_size 1g;

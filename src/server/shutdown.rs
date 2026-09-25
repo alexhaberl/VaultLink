@@ -1,5 +1,5 @@
-fn install_server_shutdown(
-    handle: axum_server::Handle<std::net::SocketAddr>,
+fn install_server_shutdown<A: axum_server::Address + Send + 'static>(
+    handle: axum_server::Handle<A>,
     cleanup: vaultlink::storage_cleanup::StorageCleanupCoordinator,
 ) {
     tokio::spawn(async move {

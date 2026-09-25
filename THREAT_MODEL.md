@@ -130,7 +130,7 @@ flowchart LR
 | Boundary | Security decision |
 | --- | --- |
 | TB-01 Internet to TLS endpoint | The proxy/network layer handles volumetric defense and transport security; VaultLink still validates every application request |
-| TB-02 Reverse proxy to VaultLink | Forwarding headers are trusted only from exact configured TCP peers and only after full chain validation |
+| TB-02 Reverse proxy to VaultLink | Forwarding headers are accepted only after Unix peer-UID verification or a CA-validated and fingerprint-pinned client-certificate handshake; the chain is then validated right to left |
 | TB-03 Bearer or administrator state to an operation | Session, Share, service-token scope, CSRF, MFA, expiry, permission, quota, mixed-auth, and route-isolation checks are performed before protected work |
 | TB-04 VaultLink to SQLite/keyring | Local permissions, schema checks, keyring pairing, transactions, and required audit protect application state |
 | TB-05 VaultLink to mounted storage | Descriptor-relative capabilities, mount identity, internal namespaces, and atomic publication confine filesystem effects |
@@ -155,7 +155,7 @@ A change that weakens one requires an explicit threat-model review.
 | INV-06 | A filesystem operation already made visible is never falsely reported as safely retryable after later audit uncertainty | `202 audit_durability_uncertain`, persistent file-operation journal, recovery tests |
 | INV-07 | Stored application secrets require the matching protected keyring and are validated before service operation | `src/db/keyring.rs`, startup decryption probes, rotation and restart tests |
 | INV-08 | Unknown and known administrator usernames consume the same admitted Argon2 resource class | shared Argon2 semaphore and dummy hashing path in `src/http_auth.rs` and `src/services/auth/mod.rs` |
-| INV-09 | An untrusted network peer cannot assert another client identity through forwarding headers | exact trusted-proxy allowlist and right-to-left chain validation |
+| INV-09 | An untrusted network or local peer cannot assert another client identity through forwarding headers | Unix `SO_PEERCRED` UID allowlist or mTLS client CA and fingerprint check, then right-to-left chain validation |
 | INV-10 | RSA WebAuthn credentials remain unreachable while `RUSTSEC-2023-0071` is excepted | no RS256 advertising, centralized runtime rejection, persistence/authentication regression tests |
 | INV-11 | Every release builder and guest is the exact reviewed digest declared for that target or the workflow fails before protected work | `release/package-targets.json`, image-refresh workflow, manifest validation, and supply-chain policy |
 | INV-12 | Pull-request and non-publish jobs never receive signing secrets or release write authority, and cannot choose the environment that does | public-and-tag-only GitHub-hosted `publish` job, protected `release-signing` environment, direct GitHub variable lookup, job-scoped permissions |
@@ -183,7 +183,7 @@ test evidence against which each case is reviewed.
 | TM-AUTH-04 | Username enumeration or overload differences reveal valid administrators | Equal admission class for known/unknown users, dummy Argon2, bounded limiter state, normalized errors | Network timing cannot be made perfectly identical. Reassess after authentication-flow or Argon2 changes. |
 | TM-AUTH-05 | An RSA WebAuthn path reaches the affected `rsa` implementation | RS256 is not advertised; persisted and runtime credential state is centrally rejected before use | The exception is valid only for the current relying-party behavior. Apply the mandatory triggers in `SECURITY.md`. |
 | TM-AUTH-06 | A monitoring token reaches a privileged route or redacted monitoring data leaks Share capabilities | Exactly two mixed-auth routes, fixed scope bit, strict Authorization grammar, dedicated SQL projections and DTOs that omit token/ciphertext/path/alias/URL/password fields, complete negative route matrix | Monitoring still reveals operational counts and selected non-secret Share metadata. Reassess every new field, scope, route, or CORS behavior. |
-| TM-NET-01 | Spoofed `Forwarded` or `X-Forwarded-For` changes rate-limit or audit identity | Exact trusted-peer allowlist, right-to-left validation, malformed-chain rejection, direct-peer fallback | A compromised allowlisted proxy can assert the identity it is trusted to provide. Reassess proxy topology and Docker NAT boundaries. |
+| TM-NET-01 | Spoofed `Forwarded` or `X-Forwarded-For` changes rate-limit or audit identity | Authenticated Unix UID or mTLS client certificate, one validated client IP shared by limits and audit, right-to-left chain validation, malformed-chain rejection | An authorized but compromised proxy can assert client identity. Reassess proxy service integrity, certificate custody and forwarding topology. |
 | TM-NET-02 | Cleartext traffic, TLS downgrade, or unsafe public binding exposes credentials | Production HTTPS validation, secure cookies, HSTS option, loopback defaults, documented proxy/standalone modes | TLS endpoint operation is outside VaultLink when a proxy terminates TLS. Reassess certificate source, bind mode, or proxy ownership. |
 
 ### Filesystem, uploads, and external writers

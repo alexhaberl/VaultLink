@@ -902,7 +902,7 @@ assert_mutables_unchanged() {
 assert_parity "$old_version"
 
 run_production_updater() {
-    sh "$repo_root/deploy/vaultlink-update.sh" install
+    sh "$repo_root/deploy/vaultlink-update.sh" install "$@"
 }
 
 archive_parser_result=not-applicable
@@ -1058,9 +1058,69 @@ printf '%s\n' "$second_mutation" | grep -F -q "$old_asset" \
 assert_parity "$old_version"
 assert_mutables_unchanged
 
+# Exercise a separately prepared configuration through both the pre-mutation
+# guard and the real package/recovery transaction. The fixture differs only by
+# a TOML comment, so the transport and mock service remain deterministic.
+migration_candidate=/etc/vaultlink/proxy-next.toml
+install -o root -g vaultlink -m 0640 /etc/vaultlink/config.toml "$migration_candidate"
+sed -i 's/^mode = "development"$/mode = "reverse_proxy"/' "$migration_candidate"
+: >"$work/package-manager.log"
+if run_production_updater --candidate-config "$migration_candidate" \
+    >"$work/invalid-candidate.stdout" 2>"$work/invalid-candidate.stderr"; then
+    fail "updater accepted an invalid migration candidate"
+fi
+grep -F -q 'candidate rejects configuration' "$work/invalid-candidate.stderr" \
+    || fail "invalid migration candidate was not rejected at preflight"
+! grep -q '^MUTATE ' "$work/package-manager.log" \
+    || fail "invalid migration candidate reached package mutation"
+assert_parity "$old_version"
+assert_mutables_unchanged
+
+install -o root -g vaultlink -m 0640 /etc/vaultlink/config.toml "$migration_candidate"
+printf '\n# separately prepared migration candidate\n' >>"$migration_candidate"
+migration_hash=$(sha256sum "$migration_candidate" | awk '{ print $1 }')
+: >"$work/package-manager.log"
+: >"$service_state/fail-new-start"
+if run_production_updater --candidate-config "$migration_candidate" \
+    >"$work/migration-recovery.stdout" 2>"$work/migration-recovery.stderr"; then
+    fail "updater ignored candidate activation failure"
+fi
+rm -f "$service_state/fail-new-start"
+[ "$(grep -c '^MUTATE ' "$work/package-manager.log")" -eq 2 ] \
+    || fail "candidate recovery did not reinstall the old package"
+assert_parity "$old_version"
+assert_mutable_bytes_unchanged
+config_identity=$(stat -c '%d:%i:%u:%g:%a:%y' /etc/vaultlink/config.toml)
+assert_mutables_unchanged
+
+: >"$work/package-manager.log"
+if ! run_production_updater --candidate-config "$migration_candidate" \
+    >"$work/migration-success.stdout" 2>"$work/migration-success.stderr"; then
+    tail -n 100 "$work/migration-success.stderr" >&2
+    fail "valid prepared configuration failed to activate"
+fi
+assert_parity "$new_version"
+[ "$(sha256sum /etc/vaultlink/config.toml | awk '{ print $1 }')" = "$migration_hash" ] \
+    || fail "activated configuration differs from prepared candidate"
+migration_backup=$(sed -n 's/^backup_directory=//p' "$work/migration-success.stdout")
+[ -f "$migration_backup/config.toml" ] \
+    && [ "$(sha256sum "$migration_backup/config.toml" | awk '{ print $1 }')" = "$config_hash" ] \
+    || fail "migration backup did not retain the old configuration"
+systemctl stop vaultlink.service
+case "$package_format" in
+    deb) dpkg --install "$normal_old/$old_asset" >/dev/null ;;
+    rpm) rpm --upgrade --oldpackage --replacepkgs "$normal_old/$old_asset" >/dev/null ;;
+    pkg.tar.zst) pacman --upgrade --noconfirm "$normal_old/$old_asset" >/dev/null ;;
+esac
+/usr/lib/vaultlink/package/deploy/vaultlink-rollback.sh "$migration_backup" >/dev/null
+assert_parity "$old_version"
+assert_mutable_bytes_unchanged
+rm -f "$migration_candidate"
+
 printf 'target=%s\nold_version=%s\nnew_version=%s\n' \
     "$target_id" "$old_version" "$new_version"
 printf 'native_package_manager=%s\ntransport_fixture=local-trusted-url-adapter\n' \
     "$native_manager"
 printf 'archive_parser_negative_fixtures=%s\n' "$archive_parser_result"
 printf 'missing_dependency_zero_mutation=ok\nsuccess_parity=ok\nactivation_old_package_reinstall=ok\n'
+printf 'candidate_config_preflight=ok\ncandidate_config_recovery=ok\ncandidate_config_activation_rollback=ok\n'
