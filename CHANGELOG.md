@@ -2,10 +2,18 @@
 
 ## 0.7.2 — Unreleased
 
-- Add NixOS 26.05 deployment support and a multiarch OCI runtime image for the
-  next release, subject to exact-commit qualification and publication checks.
-- Add schema 11 and 12 migrations, including per-share upload-directory counts
-  and hash-only upload operation receipts with preissued upload IDs.
+- Prepare [NixOS 26.05 deployment](docs/NIXOS.md) through the repository flake
+  on x86_64 and aarch64, with exact-commit build and boot checks before release.
+- Prepare the first multiarch OCI runtime image for [Docker Engine](docs/DOCKER.md)
+  and [rootless Docker](docs/DOCKER-ROOTLESS.md) on Linux amd64/arm64. Publish
+  its digest-pinned GHCR image only after the signed native release, subject to
+  both Docker architecture gates.
+- Prepare [Kubernetes 1.36 deployment](docs/KUBERNETES.md) using that image and
+  a single pod with separate persistent state and storage volumes. Qualify the
+  manifest on both architectures before marking it supported.
+- Bound per-share public upload directories and add durable, idempotent upload
+  retries with preissued operation IDs. Schema 11 and 12 add directory counts
+  and hash-only upload operation receipts.
 - Continue the nine signed native packages and the 72-hour soak requirements.
   Release qualification and publication remain pending.
 
