@@ -149,7 +149,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             cleanup_coordinator,
             None,
             app,
-        ).await
+        )
+        .await
     };
     wait_for_cleanup_shutdown(cleanup_worker.shutdown(), CLEANUP_JOIN_TIMEOUT).await?;
     server_result

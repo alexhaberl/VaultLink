@@ -53,16 +53,39 @@ async fn loopback_health_listener_has_no_application_routes_and_needs_main_liste
     let listening = std::sync::Arc::new(AtomicBool::new(false));
     let app = local_health_router(test_state(root.path(), data.path()), listening.clone());
     for path in ["/login", "/api/v2/session/login", "/v/token/download"] {
-        assert_eq!(app.clone().oneshot(json_request(Method::GET, path, ""))
-            .await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            app.clone()
+                .oneshot(json_request(Method::GET, path, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
-    assert_eq!(app.clone().oneshot(json_request(Method::GET,
-        "/api/v2/health/live", "")).await.unwrap().status(), StatusCode::OK);
-    assert_eq!(app.clone().oneshot(json_request(Method::GET,
-        "/api/v2/health/ready", "")).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        app.clone()
+            .oneshot(json_request(Method::GET, "/api/v2/health/live", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(json_request(Method::GET, "/api/v2/health/ready", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     listening.store(true, Ordering::Release);
-    assert_eq!(app.oneshot(json_request(Method::GET,
-        "/api/v2/health/ready", "")).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.oneshot(json_request(Method::GET, "/api/v2/health/ready", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]

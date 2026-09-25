@@ -243,7 +243,8 @@ mod tests {
         config.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
         config.server.listen_address = "unix:/run/vaultlink-proxy/http.sock".into();
         config.reverse_proxy.transport = Some(ProxyTransport::Unix {
-            socket_path: "/run/vaultlink-proxy/http.sock".into(), proxy_uids: vec![10002],
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![10002],
         });
 
         let error = config.validate().unwrap_err().to_string();
@@ -443,18 +444,21 @@ mod tests {
             "::ffff:127.0.0.1".parse().unwrap(),
         ];
         c.reverse_proxy.transport = Some(ProxyTransport::Unix {
-            socket_path: "/run/vaultlink-proxy/http.sock".into(), proxy_uids: vec![0],
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![0],
         });
         assert!(c.validate().is_err());
         c.server.listen_address = "unix:/run/vaultlink-proxy/http.sock".into();
         c.reverse_proxy.allow_non_loopback = false;
         assert!(c.validate().is_err());
         c.reverse_proxy.transport = Some(ProxyTransport::Unix {
-            socket_path: "/run/vaultlink-proxy/http.sock".into(), proxy_uids: vec![10002],
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![10002],
         });
         c.validate().unwrap();
         c.reverse_proxy.transport = Some(ProxyTransport::Unix {
-            socket_path: "/run/vaultlink-proxy/http.sock".into(), proxy_uids: vec![10002, 10002],
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![10002, 10002],
         });
         assert!(c.validate().is_err());
     }
@@ -611,7 +615,8 @@ mod tests {
         c.server.listen_address = "unix:/run/vaultlink-proxy/http.sock".into();
         c.reverse_proxy.allow_non_loopback = false;
         c.reverse_proxy.transport = Some(ProxyTransport::Unix {
-            socket_path: "/run/vaultlink-proxy/http.sock".into(), proxy_uids: vec![10002],
+            socket_path: "/run/vaultlink-proxy/http.sock".into(),
+            proxy_uids: vec![10002],
         });
         assert!(c.validate().is_ok());
 

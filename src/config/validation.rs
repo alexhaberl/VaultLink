@@ -115,7 +115,9 @@ fn validate_server_mode(config: &Config, url: &Url) -> Result<(), ConfigError> {
     match config.server.mode {
         ServerMode::Development => {
             let listen: SocketAddr = config.server.listen_address.parse().map_err(|_| {
-                ConfigError::Invalid("development listen_address must be an IP socket address".into())
+                ConfigError::Invalid(
+                    "development listen_address must be an IP socket address".into(),
+                )
             })?;
             if config.server.production_mode {
                 return Err(ConfigError::Invalid(
@@ -201,7 +203,9 @@ fn validate_server_mode(config: &Config, url: &Url) -> Result<(), ConfigError> {
         }
         ServerMode::StandaloneTls => {
             let listen: SocketAddr = config.server.listen_address.parse().map_err(|_| {
-                ConfigError::Invalid("standalone_tls listen_address must be an IP socket address".into())
+                ConfigError::Invalid(
+                    "standalone_tls listen_address must be an IP socket address".into(),
+                )
             })?;
             let _ = listen;
             if !config.server.production_mode || url.scheme() != "https" || !config.tls.enabled {

@@ -82,11 +82,16 @@ impl rustls::server::danger::ClientCertVerifier for PinnedProxyClientVerifier {
         now: rustls_pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         use sha2::Digest;
-        self.inner.verify_client_cert(certificate, intermediates, now)?;
+        self.inner
+            .verify_client_cert(certificate, intermediates, now)?;
         let fingerprint = sha2::Sha256::digest(certificate.as_ref())
-            .iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         if !self.fingerprints.contains(&fingerprint) {
-            return Err(rustls::Error::General("client certificate is not an allowed proxy".into()));
+            return Err(rustls::Error::General(
+                "client certificate is not an allowed proxy".into(),
+            ));
         }
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
@@ -97,7 +102,8 @@ impl rustls::server::danger::ClientCertVerifier for PinnedProxyClientVerifier {
         certificate: &rustls_pki_types::CertificateDer<'_>,
         signature: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, certificate, signature)
+        self.inner
+            .verify_tls12_signature(message, certificate, signature)
     }
 
     fn verify_tls13_signature(
@@ -106,7 +112,8 @@ impl rustls::server::danger::ClientCertVerifier for PinnedProxyClientVerifier {
         certificate: &rustls_pki_types::CertificateDer<'_>,
         signature: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, certificate, signature)
+        self.inner
+            .verify_tls13_signature(message, certificate, signature)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -131,7 +138,10 @@ async fn load_proxy_mtls_config(
             .collect::<Result<Vec<_>, _>>()
             .map_err(io::Error::other)?;
         if certificates.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty server certificate chain"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty server certificate chain",
+            ));
         }
         let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(&pem.private_key)
             .map_err(io::Error::other)?;
@@ -139,14 +149,18 @@ async fn load_proxy_mtls_config(
             .collect::<Result<Vec<_>, _>>()
             .map_err(io::Error::other)?;
         if ca_certificates.is_empty() || ca_certificates.len() > 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid proxy client CA chain"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid proxy client CA chain",
+            ));
         }
         let mut roots = rustls::RootCertStore::empty();
         for certificate in ca_certificates {
             roots.add(certificate).map_err(io::Error::other)?;
         }
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-            .build().map_err(io::Error::other)?;
+            .build()
+            .map_err(io::Error::other)?;
         let config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(Arc::new(PinnedProxyClientVerifier {
                 inner: verifier,
@@ -156,7 +170,9 @@ async fn load_proxy_mtls_config(
             .map_err(io::Error::other)?;
         let mut config = config;
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config)))
+        Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+            Arc::new(config),
+        ))
     })
     .await
     .map_err(|error| io::Error::other(format!("mTLS loading task failed: {error}")))?

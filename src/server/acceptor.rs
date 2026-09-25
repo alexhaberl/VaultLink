@@ -74,7 +74,10 @@ impl<A> MtlsProxyAcceptor<A> {
     fn new(inner: A) -> Self {
         // Bound unauthenticated handshakes below the authenticated connection
         // budget while allowing the documented 50/20/5 parallel load profile.
-        Self { inner, pending_handshakes: Arc::new(Semaphore::new(MAX_PENDING_MTLS_HANDSHAKES)) }
+        Self {
+            inner,
+            pending_handshakes: Arc::new(Semaphore::new(MAX_PENDING_MTLS_HANDSHAKES)),
+        }
     }
 }
 
@@ -87,23 +90,32 @@ where
 {
     type Stream = A::Stream;
     type Service = VerifiedProxyService<A::Service>;
-    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send + 'static>>;
+    type Future =
+        Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send + 'static>>;
 
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
         let permit = match self.pending_handshakes.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return Box::pin(async {
-                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "mTLS handshake budget exhausted"))
-            }),
+            Err(_) => {
+                return Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "mTLS handshake budget exhausted",
+                    ))
+                })
+            }
         };
         let future = self.inner.accept(stream, service);
         Box::pin(async move {
             let (stream, service) = future.await?;
             drop(permit);
-            Ok((stream, VerifiedProxyService {
-                inner: service,
-                peer: vaultlink::proxy::VerifiedProxyPeer::Mtls,
-            }))
+            Ok((
+                stream,
+                VerifiedProxyService {
+                    inner: service,
+                    peer: vaultlink::proxy::VerifiedProxyPeer::Mtls,
+                },
+            ))
         })
     }
 }
@@ -131,20 +143,31 @@ where
 {
     type Stream = ConnectionLimitedIo<tokio::net::UnixStream>;
     type Service = VerifiedProxyService<S>;
-    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send + 'static>>;
+    type Future =
+        Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send + 'static>>;
 
     fn accept(&self, stream: tokio::net::UnixStream, service: S) -> Self::Future {
         let credential = match stream.peer_cred() {
             Ok(credential) if self.proxy_uids.contains(&credential.uid()) => credential,
-            _ => return Box::pin(async {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "Unix proxy UID is not allowed"))
-            }),
+            _ => {
+                return Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Unix proxy UID is not allowed",
+                    ))
+                })
+            }
         };
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return Box::pin(async {
-                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "Unix proxy connection budget exhausted"))
-            }),
+            Err(_) => {
+                return Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "Unix proxy connection budget exhausted",
+                    ))
+                })
+            }
         };
         // The accounting key is internal; it is never a client IP or request identity.
         let accounting_peer = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
@@ -158,19 +181,28 @@ where
             peer: accounting_peer,
             maximum: MAX_ACTIVE_CONNECTIONS,
         };
-        let diagnostics = TransportDiagnostics::new(0, 0, MAX_ACTIVE_CONNECTIONS - self.permits.available_permits());
+        let diagnostics = TransportDiagnostics::new(
+            0,
+            0,
+            MAX_ACTIVE_CONNECTIONS - self.permits.available_permits(),
+        );
         Box::pin(async move {
-            Ok((ConnectionLimitedIo {
-                inner: stream,
-                diagnostics,
-                _permit: lease,
-                write_timeout: None,
-                write_idle_timeout: RESPONSE_WRITE_IDLE_TIMEOUT,
-                connection_deadline: Box::pin(tokio::time::sleep(MAX_CONNECTION_LIFETIME)),
-            }, VerifiedProxyService {
-                inner: service,
-                peer: vaultlink::proxy::VerifiedProxyPeer::Unix { uid: credential.uid() },
-            }))
+            Ok((
+                ConnectionLimitedIo {
+                    inner: stream,
+                    diagnostics,
+                    _permit: lease,
+                    write_timeout: None,
+                    write_idle_timeout: RESPONSE_WRITE_IDLE_TIMEOUT,
+                    connection_deadline: Box::pin(tokio::time::sleep(MAX_CONNECTION_LIFETIME)),
+                },
+                VerifiedProxyService {
+                    inner: service,
+                    peer: vaultlink::proxy::VerifiedProxyPeer::Unix {
+                        uid: credential.uid(),
+                    },
+                },
+            ))
         })
     }
 }
@@ -598,13 +630,18 @@ mod proxy_acceptor_tests {
             .accept(allowed_stream, ())
             .await
             .unwrap();
-        assert_eq!(verified.peer, vaultlink::proxy::VerifiedProxyPeer::Unix { uid });
+        assert_eq!(
+            verified.peer,
+            vaultlink::proxy::VerifiedProxyPeer::Unix { uid }
+        );
 
         let (rejected_stream, _peer) = tokio::net::UnixStream::pair().unwrap();
         let foreign_uid = if uid == 0 { 1 } else { 0 };
         let result = UnixProxyAcceptor::new(vec![foreign_uid])
             .accept(rejected_stream, ())
             .await;
-        assert!(matches!(result, Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied));
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
     }
 }
