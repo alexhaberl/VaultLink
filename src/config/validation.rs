@@ -162,7 +162,7 @@ fn validate_server_mode(config: &Config, url: &Url) -> Result<(), ConfigError> {
                         || socket_path == Path::new("/")
                         || proxy_uids.is_empty()
                         || proxy_uids.len() > 16
-                        || proxy_uids.iter().any(|uid| *uid == 0)
+                        || proxy_uids.contains(&0)
                         || proxy_uids.iter().collect::<std::collections::HashSet<_>>().len() != proxy_uids.len()
                         || config.tls.enabled
                         || config.reverse_proxy.allow_non_loopback
