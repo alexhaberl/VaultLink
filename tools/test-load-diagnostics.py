@@ -9,6 +9,8 @@ import tempfile
 import threading
 import time
 
+from test_mtls_fixture import LocalMtlsFixture
+
 SOURCE = Path(__file__).with_name("load-test.sh").read_text()
 
 
@@ -45,20 +47,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
 
 
+tls = LocalMtlsFixture()
+tls_environment = tls.environment()
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+tls.wrap_server(server)
 thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
-base = f"http://127.0.0.1:{server.server_port}"
-functions = "\n".join(function(name) for name in ("soak_curl", "profile_curl", "persist_load_evidence"))
+base = f"https://127.0.0.1:{server.server_port}"
+functions = "\n".join(function(name) for name in ("curl", "soak_curl", "profile_curl", "persist_load_evidence"))
 
 try:
     with tempfile.TemporaryDirectory(prefix="vaultlink-load-diagnostics-") as temporary:
         root = Path(temporary)
         for operation, path, code, should_log in [
-            ("metadata", "empty", 52, True),
-            ("range", "partial", 18, True),
-            ("upload", "empty", 52, True),
-            ("readback", "partial", 18, True),
+            ("metadata", "empty", (52, 56), True),
+            ("range", "partial", (18, 56), True),
+            ("upload", "empty", (52, 56), True),
+            ("readback", "partial", (18, 56), True),
             ("metadata", "missing", 0, True),
             ("metadata", "healthy", 0, False),
         ]:
@@ -73,18 +78,18 @@ profile_curl 198.18.1.3 "$TEST_OPERATION" 2 10 "$TEST_FORMAT" \
             expected_fields = 4 if operation == "range" else 2 if operation == "metadata" else 1
             output_format = ("%{http_code},%{time_starttransfer},%{speed_download},%{time_total}" if operation == "range"
                              else "%{http_code},%{time_total}" if operation == "metadata" else "%{http_code}")
-            result = subprocess.run(["sh", "-c", script], env={**os.environ,
+            result = subprocess.run(["sh", "-c", script], env={**os.environ, **tls_environment,
                 "TEST_WORK": str(work), "TEST_OPERATION": operation, "TEST_URL": f"{base}/{path}",
                 "TEST_FORMAT": output_format},
                 capture_output=True, text=True, timeout=15)
-            assert result.returncode == code, (operation, result)
+            assert result.returncode in (code if isinstance(code, tuple) else (code,)), (operation, result)
             assert len(result.stdout.split(",")) == expected_fields, result.stdout
             assert "|" not in result.stdout
             records = list(work.glob("transport-*.failure"))
             assert bool(records) == should_log, (operation, records)
             if should_log:
                 record = records[0].read_text()
-                assert f"curl_exit={code}" in record and "client=2 request=10" in record
+                assert f"curl_exit={result.returncode}" in record and "client=2 request=10" in record
                 metrics = dict(field.split("=", 1) for field in record.split())
                 assert int(metrics["local_port"]) > 0
                 assert metrics["remote_port"] == str(server.server_port)
@@ -114,7 +119,7 @@ wait_for_profile_go() { :; }
 trap 'code=$?; persist_load_evidence "$code"; exit "$code"' EXIT
 metadata_profile
 '''
-        result = subprocess.run(["sh", "-c", script], env={**os.environ,
+        result = subprocess.run(["sh", "-c", script], env={**os.environ, **tls_environment,
             "TEST_WORK": str(work), "LOAD_TEST_EVIDENCE_DIR": str(evidence),
             "TEST_METADATA_SCRIPT": str(Path(__file__).with_name("load-metadata.py").resolve()),
             "VAULTLINK_BASE_URL": base, "DOWNLOAD_TOKEN": "SECRET_TOKEN"},
@@ -126,7 +131,7 @@ metadata_profile
         assert len(successes) == 29
         assert (evidence / "load-command.env").read_text() == "stage=parallel-profiles\nexit_status=1\n"
         diagnostics = (evidence / "transport-failures.log").read_text()
-        assert "curl_exit=52" in diagnostics and "request=10" in diagnostics
+        assert any(f"curl_exit={code}" in diagnostics for code in (52, 56)) and "request=10" in diagnostics
         assert "SECRET" not in diagnostics + result.stderr
 
         # SIGTERM interrupts the shell's wait before the Python worker has
@@ -135,7 +140,7 @@ metadata_profile
         work.mkdir()
         evidence = root / "cancel-evidence"
         process = subprocess.Popen(["sh", "-c", script.replace(': >"$work/profile-go"', ":")],
-            env={**os.environ, "TEST_WORK": str(work), "LOAD_TEST_EVIDENCE_DIR": str(evidence),
+            env={**os.environ, **tls_environment, "TEST_WORK": str(work), "LOAD_TEST_EVIDENCE_DIR": str(evidence),
                  "TEST_METADATA_SCRIPT": str(Path(__file__).with_name("load-metadata.py").resolve()),
                  "VAULTLINK_BASE_URL": base, "DOWNLOAD_TOKEN": "SECRET_TOKEN"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -160,5 +165,6 @@ finally:
     server.shutdown()
     server.server_close()
     thread.join()
+    tls.close()
 
-print("Load transport diagnostics: real curl52/18, HTTP errors, redaction and partial request counts passed")
+print("Load transport diagnostics: real TLS disconnect/partial response, HTTP errors, redaction and partial request counts passed")

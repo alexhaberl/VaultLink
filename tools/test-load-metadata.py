@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real HTTP regression checks for concurrent metadata load and fail-closed results."""
+"""Real mTLS regression checks for concurrent metadata load and fail-closed results."""
 import collections
 import csv
 import http.server
@@ -12,6 +12,8 @@ import tempfile
 import threading
 import time
 import unittest
+
+from test_mtls_fixture import LocalMtlsFixture
 
 
 SCRIPT = Path(os.environ.get("TEST_METADATA_SCRIPT", Path(__file__).with_name("load-metadata.py"))).resolve()
@@ -90,13 +92,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class MetadataTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tls = LocalMtlsFixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tls.close()
+
     def test_workers_inherit_affinity_and_stop_at_barrier_without_attempts(self):
         with tempfile.TemporaryDirectory(prefix="vaultlink-metadata-stop-") as temporary:
             work = Path(temporary)
             cpu = str(min(os.sched_getaffinity(0)))
             process = subprocess.Popen(["taskset", "--cpu-list", cpu, sys.executable,
                                         str(SCRIPT), temporary, "2", "5", "15", "10"],
-                env={**os.environ, "VAULTLINK_BASE_URL": "http://127.0.0.1:1", "DOWNLOAD_TOKEN": "SECRET_TOKEN"},
+                env={**os.environ, **self.tls.environment(),
+                     "VAULTLINK_BASE_URL": "https://127.0.0.1:1", "DOWNLOAD_TOKEN": "SECRET_TOKEN"},
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 deadline = time.monotonic() + 5
@@ -127,6 +138,7 @@ class MetadataTests(unittest.TestCase):
 
     def test_termination_aborts_inflight_requests_and_retains_attempts(self):
         server = Server("blocked", 2)
+        self.tls.wrap_server(server)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -134,7 +146,8 @@ class MetadataTests(unittest.TestCase):
                 work = Path(temporary)
                 (work / "profile-go").touch()
                 process = subprocess.Popen([sys.executable, str(SCRIPT), temporary, "2", "5", "300", "10"],
-                    env={**os.environ, "VAULTLINK_BASE_URL": f"http://127.0.0.1:{server.server_port}",
+                    env={**os.environ, **self.tls.environment(),
+                         "VAULTLINK_BASE_URL": f"https://127.0.0.1:{server.server_port}",
                          "DOWNLOAD_TOKEN": "SECRET_TOKEN", "NO_PROXY": "127.0.0.1"},
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
@@ -160,6 +173,7 @@ class MetadataTests(unittest.TestCase):
 
     def exercise(self, mode, clients):
         server = Server(mode, clients)
+        self.tls.wrap_server(server)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -168,7 +182,8 @@ class MetadataTests(unittest.TestCase):
                 (work / "profile-go").touch()
                 result = subprocess.run(
                     [sys.executable, str(SCRIPT), str(work), str(clients), "5", "15", "5"],
-                    env={**os.environ, "VAULTLINK_BASE_URL": f"http://127.0.0.1:{server.server_port}",
+                    env={**os.environ, **self.tls.environment(),
+                         "VAULTLINK_BASE_URL": f"https://127.0.0.1:{server.server_port}",
                          "DOWNLOAD_TOKEN": "SECRET_TOKEN", "NO_PROXY": "127.0.0.1"},
                     capture_output=True, text=True, timeout=45)
                 files = {path.name: path.read_text() for path in work.iterdir()}
@@ -197,6 +212,7 @@ class MetadataTests(unittest.TestCase):
         # Client1 must finish all requests before we release that callback. The
         # old shared-interpreter threads deterministically fail this handshake.
         server = Server("callback", 2)
+        self.tls.wrap_server(server)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         notify_read, notify_write = os.pipe()
@@ -224,7 +240,8 @@ class MetadataTests(unittest.TestCase):
                     "sys.exit(module.main())\n", encoding="ascii")
                 process = subprocess.Popen(
                     [sys.executable, str(wrapper), str(SCRIPT), temporary, "2", "5", "30", "10"],
-                    env={**os.environ, "VAULTLINK_BASE_URL": f"http://127.0.0.1:{server.server_port}",
+                    env={**os.environ, **self.tls.environment(),
+                         "VAULTLINK_BASE_URL": f"https://127.0.0.1:{server.server_port}",
                          "DOWNLOAD_TOKEN": "SECRET_TOKEN", "NO_PROXY": "127.0.0.1",
                          "NOTIFY_FD": str(notify_write), "RELEASE_FD": str(release_read)},
                     pass_fds=(notify_write, release_read), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -277,7 +294,7 @@ class MetadataTests(unittest.TestCase):
                     self.assertGreater(float(metrics["total_seconds"]), 1.1)
 
     def test_transport_and_http_errors_are_never_retried(self):
-        for mode, curl_code, http_status in (("empty", 52, "000"), ("partial", 18, "200"), ("error", 0, "500")):
+        for mode, curl_codes, http_status in (("empty", (52, 56), "000"), ("partial", (18, 56), "200"), ("error", (0,), "500")):
             with self.subTest(mode=mode):
                 result, files, server = self.exercise(mode, 1)
                 self.assertEqual(result.returncode, 1)
@@ -285,7 +302,7 @@ class MetadataTests(unittest.TestCase):
                 self.assertEqual(files["metadata-client-0.counts"], "0,1,1,0\n")
                 record = files["transport-metadata-0-1.failure"]
                 metrics = dict(field.split("=", 1) for field in record.split())
-                self.assertEqual(metrics["curl_exit"], str(curl_code))
+                self.assertIn(int(metrics["curl_exit"]), curl_codes)
                 self.assertEqual(metrics["http_status"], http_status)
                 self.assertGreater(int(metrics["local_port"]), 0)
                 self.assertEqual(metrics["remote_port"], str(server.server_port))
