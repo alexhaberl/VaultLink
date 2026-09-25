@@ -136,8 +136,12 @@ curl -sS -f -X POST "http://$PROXY_ADDR/start" \
     -H "x-vaultlink-setup-token: $TOKEN" \
     | grep -q "VaultLink is starting"
 
-wait_http "http://$PROXY_ADDR/login" "200"
-wait_http "http://$PROXY_ADDR/api/v2/health/ready" "200"
+wait_http "http://$INTERNAL_ADDR/login" "200"
+wait_http "http://$INTERNAL_ADDR/api/v2/health/ready" "200"
+if curl -sS --connect-timeout 1 "http://$PROXY_ADDR/login" >/dev/null 2>&1; then
+    echo "Bootstrap proxy remained reachable after setup" >&2
+    exit 1
+fi
 kill -0 "$CONTAINER_PID"
 
 if grep -Fq "$ADMIN_PASSWORD" "$CONTAINER_LOG"; then

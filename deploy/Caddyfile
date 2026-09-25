@@ -1,5 +1,5 @@
 files.example.com {
-    reverse_proxy 127.0.0.1:8080
+    reverse_proxy unix//run/vaultlink-proxy/http.sock
     request_body {
         # The 1 GB file payload needs room for multipart boundaries and fields.
         max_size 1002MB

@@ -27,6 +27,7 @@ PERF = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PERF)
 EvidenceError = PERF.EvidenceError
 PERFORMANCE_WORKFLOW = ".github/workflows/performance-evidence.yml"
+DOCKER_WORKFLOW = ".github/workflows/docker-runtime.yml"
 PRODUCER_FILES = ("tools/load-test.sh", "tools/load-metadata.py", "tools/collect-performance-evidence.py",
                   "tools/check-performance-evidence.py")
 
@@ -148,6 +149,43 @@ class GitHub:
                 "artifact_sha256": digest.removeprefix("sha256:")}
 
 
+def docker_qualification(api: GitHub, commit: str, version: str, destination: Path) -> dict:
+    """Bind both qualified binaries to one completed main run and attempt."""
+    PERF._commit(commit, "Docker candidate commit")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise EvidenceError("invalid Docker candidate version")
+    runs = [api.gate(commit, f"vaultlink/docker-{arch}", DOCKER_WORKFLOW)
+            for arch in ("amd64", "arm64")]
+    if (runs[0]["id"] != runs[1]["id"]
+            or runs[0]["run_attempt"] != runs[1]["run_attempt"]):
+        raise EvidenceError("Docker architecture gates belong to different run attempts")
+    run = runs[0]
+    if run["event"] not in ("push", "workflow_dispatch"):
+        raise EvidenceError("Docker qualification was not a main push or manual main rerun")
+    result = {"schema_version": 1, "repository": api.repository,
+              "commit": commit, "version": version, "workflow": DOCKER_WORKFLOW,
+              "run_id": run["id"], "run_attempt": run["run_attempt"], "architectures": {}}
+    for architecture in ("amd64", "arm64"):
+        name = (f"docker-qualification-{architecture}-{commit}-"
+                f"{run['id']}-{run['run_attempt']}")
+        target = destination / architecture
+        artifact = api.artifact(run, name, target)
+        path = target / "qualification.json"
+        document, _ = PERF._read_json(path)
+        expected = {"schema_version": 1, "repository": api.repository,
+                    "commit": commit, "version": version, "workflow": DOCKER_WORKFLOW,
+                    "event": run["event"], "architecture": architecture,
+                    "run_id": run["id"], "run_attempt": run["run_attempt"]}
+        if not isinstance(document, dict) or set(document) != set(expected) | {"binary_sha256"} or any(
+                document[key] != value or type(document[key]) is not type(value)
+                for key, value in expected.items()):
+            raise EvidenceError("Docker qualification receipt has wrong identity or schema")
+        PERF._sha256(document["binary_sha256"], "qualified Docker binary")
+        result["architectures"][architecture] = {
+            "binary_sha256": document["binary_sha256"], **artifact}
+    return result
+
+
 def package_version_at(api: GitHub, commit: str) -> str:
     """Read the package version from the verified measurement commit, not the producer."""
     PERF._commit(commit, "measurement commit")
@@ -259,6 +297,10 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("producer-digest")
     commands.add_parser("performance-required")
+    docker = commands.add_parser("docker")
+    docker.add_argument("--commit", required=True)
+    docker.add_argument("--version", required=True)
+    docker.add_argument("--output", required=True, type=Path)
     verify = commands.add_parser("performance")
     verify.add_argument("--commit", required=True)
     verify.add_argument("--binary-sha256", required=True)
@@ -279,7 +321,9 @@ def main() -> int:
         api = GitHub(os.environ.get("GITHUB_REPOSITORY", ""))
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "evidence"
-            if args.command == "performance":
+            if args.command == "docker":
+                result = docker_qualification(api, args.commit, args.version, destination)
+            elif args.command == "performance":
                 PERF._commit(args.commit, "expected commit")
                 PERF._sha256(args.binary_sha256, "expected binary")
                 packages = api.gate(args.commit, "vaultlink/packages", ".github/workflows/packages.yml")

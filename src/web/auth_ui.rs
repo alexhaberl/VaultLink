@@ -1,8 +1,6 @@
-use std::net::SocketAddr;
-
 use askama::Template;
 use axum::{
-    extract::{ConnectInfo, Form, Json, State},
+    extract::{Form, Json, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
 };
@@ -55,7 +53,6 @@ pub(super) struct LoginForm {
 
 pub(super) async fn login(
     State(state): State<AuthRouteState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Result<Response> {

@@ -68,6 +68,17 @@ Operators pin its top-level digest and keep the SQLite database, config and
 keyring with the matching image during recovery. The two Docker status contexts
 cover standard Docker Engine, a rootless Docker daemon and Kubernetes 1.36 on
 native amd64 and arm64; a green container-UID check alone is insufficient.
+The status contexts are only selectors. `tools/release-evidence.py docker`
+downloads digest-checked, attempt-bound qualification receipts for both
+architectures from the same successful run and verifies their commit, workflow,
+event, repository, version and binary SHA-256. Both release and soak preflights
+use that verifier. The publication workflow uses the same pinned BuildKit
+engine, hashes each newly pushed child image by digest before creating the
+version tag, and hashes each anonymous public pull again. Its final proof joins
+the qualification artifact digests, binary hashes, child digests and index
+digest. A missing or expired receipt requires full requalification of the
+frozen commit. This proves the binary identity and inspected image properties,
+not byte-identical OCI images.
 See the [standard Docker](../docs/DOCKER.md),
 [rootless Docker](../docs/DOCKER-ROOTLESS.md) and
 [Kubernetes](../docs/KUBERNETES.md) deployment guides.

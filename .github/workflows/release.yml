@@ -116,6 +116,8 @@ jobs:
             validate_gate vaultlink/nixos-arm64 .github/workflows/nixos.yml
             validate_gate vaultlink/docker-amd64 .github/workflows/docker-runtime.yml
             validate_gate vaultlink/docker-arm64 .github/workflows/docker-runtime.yml
+            python3 tools/release-evidence.py docker --commit "$candidate_commit" \
+              --version "$package_version" --output "$RUNNER_TEMP/docker-qualification.json"
           fi
           validate_gate vaultlink/fuzz-600s-amd64 .github/workflows/fuzz.yml
           validate_gate vaultlink/fuzz-600s-arm64 .github/workflows/fuzz.yml
@@ -272,6 +274,15 @@ jobs:
             sh tools/check-version-consistency.sh --release-evidence --binary "$binary" \
               --packages-run-id "$PACKAGES_RUN" "${performance_args[@]}"
           fi
+          python3 tools/release-evidence.py docker --commit "$CANDIDATE_COMMIT" \
+            --version '${{ needs.prepare.outputs.package_version }}' \
+            --output "$RUNNER_TEMP/docker-qualification.json"
+          jq --slurpfile docker "$RUNNER_TEMP/docker-qualification.json" \
+            '. + {docker_qualification: $docker[0]}' \
+            "$RUNNER_TEMP/effective-qualification.json" \
+            >"$RUNNER_TEMP/effective-qualification-with-docker.json"
+          mv "$RUNNER_TEMP/effective-qualification-with-docker.json" \
+            "$RUNNER_TEMP/effective-qualification.json"
       - name: Archive effective qualification without changing the candidate commit
         if: needs.prepare.outputs.release_stage == 'evidence' || needs.prepare.outputs.release_stage == 'tag'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -106,6 +106,8 @@ jobs:
             validate_gate vaultlink/nixos-arm64 .github/workflows/nixos.yml
             validate_gate vaultlink/docker-amd64 .github/workflows/docker-runtime.yml
             validate_gate vaultlink/docker-arm64 .github/workflows/docker-runtime.yml
+            python3 tools/release-evidence.py docker --commit "$APPROVED_COMMIT" \
+              --version "$package_version" --output "$RUNNER_TEMP/docker-qualification.json"
           fi
           validate_gate vaultlink/fuzz-600s-amd64 .github/workflows/fuzz.yml
           validate_gate vaultlink/fuzz-600s-arm64 .github/workflows/fuzz.yml

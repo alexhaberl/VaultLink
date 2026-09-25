@@ -121,6 +121,14 @@ struct SetupForm {
     blocked_extensions: String,
     audit_client_ip_enabled: Option<String>,
     trusted_proxies: String,
+    #[serde(default)]
+    proxy_transport: String,
+    #[serde(default)]
+    proxy_uid: String,
+    #[serde(default)]
+    client_ca_file: String,
+    #[serde(default)]
+    client_fingerprints: String,
     certificate_source: String,
     tls_cert_file: String,
     tls_key_file: String,

@@ -61,7 +61,7 @@ Do not open a public issue. Use GitHub's private vulnerability reporting for thi
 ## Operational assumptions
 
 - VaultLink runs as the dedicated `vaultlink` user on one exact package target documented above. A package built on that distribution and architecture is not claimed compatible with a derivative or another release.
-- Production traffic is HTTPS, preferably terminated by a trusted reverse proxy.
+- Production traffic is HTTPS. A local reverse proxy connects through a protected Unix socket and an allowed peer UID; a network proxy uses mTLS with a dedicated client CA and pinned leaf fingerprint. Authorized proxy processes and their certificate custody remain inside the identity trust boundary.
 - Every production configuration uses `require_mount=true` with a pre-provisioned service-owned root, private internal directory and data directory plus an exact filesystem type and active `/proc/self/mountinfo` source. CIFS may place the reserved internal directory directly below the share root; other required mounts use a private sibling. This remains fail-closed when a remote mount disappears and exposes its local fallback directory.
 - Without `external_writers`, the visible root, private sibling and data directory are owned by the VaultLink service uid and are not writable through group/other mode bits or a POSIX ACL mask. Other local writers are unsupported in this mode.
 - An external-writer deployment uses the audited CIFS policy only: SMB 3.1.1 with encryption, strict caching, a dedicated VaultLink SMB identity, verified mount source/type/options and no nested mounts or symlink traversal.

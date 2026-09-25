@@ -103,6 +103,30 @@ fn parse_setup_form(form: SetupForm) -> Result<PreparedSetup, String> {
         .map_err(|_| {
             i18n::text(i18n::current_locale(), i18n::SETUP_INVALID_TRUSTED_PROXIES).to_string()
         })?;
+    let transport = if reverse_proxy_mode {
+        match form.proxy_transport.as_str() {
+            "unix" => Some(ProxyTransport::Unix {
+                socket_path: form.listen_address.strip_prefix("unix:")
+                    .map(PathBuf::from)
+                    .ok_or("Unix listener must use unix:/absolute/path")?,
+                proxy_uids: form.proxy_uid.split(',').map(|uid| uid.trim().parse()
+                    .map_err(|_| "Invalid proxy UID allowlist")).collect::<Result<Vec<_>, _>>()?,
+            }),
+            "mtls" => Some(ProxyTransport::Mtls {
+                client_ca_file: PathBuf::from(form.client_ca_file.trim()),
+                client_fingerprints: form.client_fingerprints
+                    .split([',', '\n', '\r', ' ', '\t'])
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string).collect(),
+            }),
+            _ => return Err("Select Unix socket or mTLS as the reverse-proxy transport".into()),
+        }
+    } else {
+        None
+    };
+    let allow_non_loopback = matches!(transport.as_ref(), Some(ProxyTransport::Mtls { .. }))
+        && form.listen_address.parse::<std::net::SocketAddr>()
+            .is_ok_and(|address| !address.ip().is_loopback());
     let config = Config {
         server: Server {
             mode,
@@ -145,12 +169,13 @@ fn parse_setup_form(form: SetupForm) -> Result<PreparedSetup, String> {
         },
         reverse_proxy: ReverseProxy {
             enabled: reverse_proxy_mode,
-            allow_non_loopback: false,
+            allow_non_loopback,
             trusted_proxies,
             trust_x_forwarded_headers: reverse_proxy_mode,
+            transport,
         },
         tls: Tls {
-            enabled: standalone_tls,
+            enabled: standalone_tls || (reverse_proxy_mode && form.proxy_transport == "mtls"),
             certificate_source,
             cert_file: form.tls_cert_file.into(),
             key_file: form.tls_key_file.into(),

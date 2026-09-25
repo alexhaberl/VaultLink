@@ -235,6 +235,8 @@ Alternatively, use the command line:
 sudo vaultlink-update check
 sudo vaultlink-update install
 
+# For a 0.7.1 IP-only reverse proxy, first follow docs/PROXY-MIGRATION-071.md.
+
 # Optional unattended updates: bootstrap the packaged example once, then review it.
 if sudo test ! -e /etc/vaultlink/update.conf && \
    sudo test ! -L /etc/vaultlink/update.conf; then
@@ -328,7 +330,7 @@ Never expose setup with `--listen 0.0.0.0:8090`; no non-loopback exception exist
 ### Configuration without browser setup
 
 Adapt the matching release's configuration example to your storage mount, public
-HTTPS URL, and trusted proxy before starting VaultLink. Use the example
+HTTPS URL, and authenticated proxy transport before starting VaultLink. Use the example
 included in the installed package; no source checkout is needed.
 
 ```sh

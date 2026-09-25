@@ -48,6 +48,21 @@ sudo install -d -o 10001 -g 10001 -m 0700 \
   "$test_root/storage/.vaultlink-internal" \
   "$test_root/storage/.vaultlink-internal/uploads" \
   "$test_root/storage/.vaultlink-internal/tombstones"
+mkdir -p "$test_root/client-certs"
+python3 - "$test_root/client-certs" <<'PY'
+import importlib.util, pathlib, sys
+path = pathlib.Path('tools/docker-runtime-smoke.py')
+spec = importlib.util.spec_from_file_location('vaultlink_smoke', path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.make_test_certificates(pathlib.Path(sys.argv[1]))
+PY
+sudo install -d -o 10001 -g 10001 -m 0700 "$test_root/state/certs"
+for name in ca.crt server.crt server.key client.crt client.key; do
+  sudo install -o 10001 -g 10001 -m 0600 \
+    "$test_root/client-certs/$name" "$test_root/state/certs/$name"
+done
+export VAULTLINK_KUBE_CERT_DIR="$test_root/client-certs"
 
 cat >"$test_root/kind.yaml" <<EOF
 kind: Cluster

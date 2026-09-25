@@ -4,9 +4,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  BUILDKIT_IMAGE: docker.io/moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
 
 concurrency:
   group: docker-runtime-${{ github.event.pull_request.number || github.ref }}
@@ -68,8 +72,13 @@ jobs:
           printf 'state=failure\n' >"evidence/$ARCHITECTURE.env"
           test "$(uname -m)" = "$EXPECTED_UNAME"
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          builder="vaultlink-qualification-$ARCHITECTURE"
+          docker buildx create --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE" --name "$builder" --use
+          trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
+          docker buildx inspect --bootstrap
           for attempt in 1 2; do
-            docker build --no-cache --pull=false \
+            docker buildx build --no-cache --load \
               --platform "$PLATFORM" \
               --file deploy/docker/Dockerfile.runtime \
               --tag "vaultlink:runtime-$attempt" \
@@ -103,18 +112,39 @@ jobs:
             | tee "evidence/$ARCHITECTURE/rootless.txt"
           cat "evidence/$ARCHITECTURE/binary-2.sha256" >>"evidence/$ARCHITECTURE/image.txt"
           printf 'state=success\n' >"evidence/$ARCHITECTURE.env"
+          python3 - "$ARCHITECTURE" "$version" <<'PY' >qualification.json
+          import json, os, pathlib, sys
+          architecture, version = sys.argv[1:]
+          digest = pathlib.Path(f"evidence/{architecture}/binary-1.sha256").read_text().strip()
+          if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+              raise SystemExit("invalid qualified binary SHA-256")
+          json.dump({"schema_version": 1, "repository": os.environ["GITHUB_REPOSITORY"],
+                     "commit": os.environ["GITHUB_SHA"], "version": version,
+                     "workflow": ".github/workflows/docker-runtime.yml",
+                     "event": os.environ["GITHUB_EVENT_NAME"],
+                     "architecture": architecture, "run_id": int(os.environ["GITHUB_RUN_ID"]),
+                     "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+                     "binary_sha256": digest}, sys.stdout, sort_keys=True)
+          PY
+      - name: Preserve successful qualification receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-qualification-${{ matrix.architecture }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: qualification.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Preserve Docker runtime evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: docker-${{ matrix.architecture }}-${{ github.sha }}
+          name: docker-${{ matrix.architecture }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence/
           if-no-files-found: warn
           retention-days: 90
 
   publish_gate:
     name: Publish exact-commit Docker gates
-    if: ${{ always() && github.event_name == 'push' }}
+    if: ${{ always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     needs: [qualify]
     runs-on: ubuntu-24.04
     permissions:
@@ -122,12 +152,14 @@ jobs:
       contents: read
       statuses: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
         with:
-          pattern: docker-*-${{ github.sha }}
+          pattern: docker-qualification-*-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence
-          merge-multiple: true
       - name: Publish independent architecture results
         shell: bash
         env:
@@ -136,8 +168,17 @@ jobs:
           set -euo pipefail
           for architecture in amd64 arm64; do
             state=failure
-            if [[ -f "evidence/$architecture.env" ]] \
-              && grep -Fxq 'state=success' "evidence/$architecture.env"; then
+            receipt="evidence/docker-qualification-$architecture-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/qualification.json"
+            if [[ '${{ needs.qualify.result }}' == success && -f "$receipt" ]] && jq -e \
+              --arg arch "$architecture" --arg sha "$GITHUB_SHA" \
+              --arg repo "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" \
+              --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+              --arg version "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" \
+              '.schema_version == 1 and .architecture == $arch and .commit == $sha and
+               .repository == $repo and .run_id == $run and .run_attempt == $attempt and
+               .version == $version and .workflow == ".github/workflows/docker-runtime.yml" and
+               (.event == "push" or .event == "workflow_dispatch") and
+               (.binary_sha256 | test("^[0-9a-f]{64}$"))' "$receipt" >/dev/null; then
               state=success
             fi
             gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \

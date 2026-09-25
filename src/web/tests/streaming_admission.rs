@@ -160,6 +160,7 @@ async fn trusted_forwarded_clients_receive_independent_stream_limits() {
         request.extensions_mut().insert(ConnectInfo(
             "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
         ));
+        request.extensions_mut().insert(crate::proxy::VerifiedProxyPeer::Unix { uid: 10002 });
         request
     };
 
@@ -203,6 +204,31 @@ async fn trusted_forwarded_clients_receive_independent_stream_limits() {
 }
 
 #[tokio::test]
+async fn direct_local_peer_cannot_spoof_forwarding_into_stream_or_audit_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut state = test_state(root.path(), data.path());
+    let mut config = state.config().clone();
+    config.server.mode = ServerMode::ReverseProxy;
+    config.reverse_proxy.enabled = true;
+    config.reverse_proxy.trust_x_forwarded_headers = true;
+    config.reverse_proxy.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    state.replace_config_for_test(config);
+    let app = Router::new()
+        .route("/download", get(|| async { "would consume a stream" }))
+        .layer(middleware::from_fn_with_state(state.clone(), response_admission))
+        .layer(middleware::from_fn_with_state(state, audit_client_ip_context));
+    for spoofed in ["198.18.1.1", "198.18.1.2", "198.18.1.3"] {
+        let mut request = Request::builder().uri("/download")
+            .header("x-forwarded-for", spoofed).body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
 async fn malformed_trusted_forwarding_is_rejected_before_admission_with_security_headers() {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -218,6 +244,7 @@ async fn malformed_trusted_forwarding_is_rejected_before_admission_with_security
     forwarded
         .headers_mut()
         .insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+    forwarded.extensions_mut().insert(crate::proxy::VerifiedProxyPeer::Unix { uid: 10002 });
 
     let response = router(state).oneshot(forwarded).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -826,6 +853,7 @@ async fn public_transfer_completion_uses_the_validated_audit_ip_snapshot() {
     download
         .headers_mut()
         .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+    download.extensions_mut().insert(crate::proxy::VerifiedProxyPeer::Unix { uid: 10002 });
     let response = router(state.clone()).oneshot(download).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(state.stream_peer_admission_contains_for_test("203.0.113.10".parse().unwrap()));

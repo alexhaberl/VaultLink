@@ -1,1 +1,2 @@
 u vaultlink - "VaultLink service account" /var/lib/vaultlink -
+g vaultlink-proxy -

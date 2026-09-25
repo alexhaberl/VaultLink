@@ -328,6 +328,31 @@ package_preinstall() {
         package_validate_marker
         package_validate_service_identity
         if [ "$mode" = upgrade ]; then
+            proxy_group=$(getent group vaultlink-proxy 2>/dev/null || true)
+            case "$proxy_group" in
+                vaultlink-proxy:x:*:*) ;;
+                *) package_fail "vaultlink-proxy group is missing or invalid; perform the documented signed migration before package upgrade" ;;
+            esac
+            if [ -f /etc/vaultlink/config.toml ] \
+                && grep -Eq '^[[:space:]]*mode[[:space:]]*=[[:space:]]*"reverse_proxy"' /etc/vaultlink/config.toml \
+                && ! awk '
+                    /^[[:space:]]*\[/ {
+                        section = $0
+                        sub(/[[:space:]]*#.*/, "", section)
+                        gsub(/[[:space:]]/, "", section)
+                    }
+                    section == "[reverse_proxy.transport]" \
+                        && /^[[:space:]]*kind[[:space:]]*=[[:space:]]*"(unix|mtls)"[[:space:]]*(#.*)?$/ {
+                        found = 1
+                    }
+                    END { exit !found }
+                ' /etc/vaultlink/config.toml; then
+                [ -n "${VAULTLINK_PROXY_MIGRATION_CONFIG:-}" ] \
+                    || package_fail "legacy IP-only proxy configuration: use the signed migration updater with --candidate-config before installing"
+                [ -f "$VAULTLINK_PROXY_MIGRATION_CONFIG" ] \
+                    && [ ! -L "$VAULTLINK_PROXY_MIGRATION_CONFIG" ] \
+                    || package_fail "migration candidate configuration is unavailable"
+            fi
             package_validate_regular_file "$candidate" 755
             package_validate_regular_file "$live_binary" 755
             if [ "${VAULTLINK_PACKAGE_RECOVERY:-0}" = 1 ]; then

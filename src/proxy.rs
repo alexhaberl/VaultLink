@@ -5,6 +5,35 @@ use std::net::{IpAddr, Ipv6Addr};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidForwardedFor;
 
+/// The listener creates this extension only after a Unix credential check or
+/// a successful, pinned client-certificate TLS handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifiedProxyPeer {
+    Unix { uid: u32 },
+    Mtls,
+}
+
+pub fn validated_proxy_client_ip(
+    headers: &HeaderMap,
+    trusted_hops: &[IpAddr],
+) -> Result<IpAddr, InvalidForwardedFor> {
+    let mut current = None;
+    for value in headers.get_all("x-forwarded-for").iter().rev() {
+        let text = value.to_str().map_err(|_| InvalidForwardedFor)?;
+        for candidate in text.rsplit(',') {
+            if let Some(ip) = current {
+                if !is_trusted_proxy_peer(ip, trusted_hops) {
+                    return Ok(ip);
+                }
+            }
+            current = Some(canonical_peer_ip(
+                candidate.trim().parse().map_err(|_| InvalidForwardedFor)?,
+            ));
+        }
+    }
+    current.ok_or(InvalidForwardedFor)
+}
+
 /// Canonicalizes a TCP peer without widening the configured trust boundary.
 ///
 /// Dual-stack listeners can report an IPv4 peer as an IPv4-mapped IPv6
@@ -114,6 +143,7 @@ mod tests {
                 allow_non_loopback: false,
                 trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
                 trust_x_forwarded_headers: true,
+                transport: None,
             },
             tls: Tls::default(),
             security: Security {

@@ -1,8 +1,6 @@
-use std::net::SocketAddr;
-
 use askama::Template;
 use axum::{
-    extract::{ConnectInfo, Form, Path as AxPath, Query, State},
+    extract::{Form, Path as AxPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
@@ -261,7 +259,6 @@ pub(super) struct UnlockForm {
 
 pub(super) async fn unlock_share(
     State(state): State<PublicRouteState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     AxPath(token): AxPath<String>,
     Form(form): Form<UnlockForm>,
@@ -369,7 +366,6 @@ fn joined_relative(base: &str, child: &str) -> Result<String> {
 
 pub(super) async fn short_redirect(
     State(state): State<PublicRouteState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     AxPath(alias): AxPath<String>,
 ) -> Result<Redirect> {

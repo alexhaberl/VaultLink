@@ -11,6 +11,7 @@ import hashlib
 import hmac
 from http.cookies import SimpleCookie
 import re
+import ssl
 import sqlite3
 import struct
 import subprocess
@@ -29,6 +30,63 @@ CLONE = f"{IDENT}-clone"
 CONTAINER = IDENT
 PASSWORD = "Docker runtime smoke password 123!"
 HOST_NETWORK = os.environ.get("VAULTLINK_TEST_HOST_NETWORK") == "1"
+TLS_CONTEXT: ssl.SSLContext | None = None
+
+
+def make_test_certificates(directory: Path) -> tuple[str, str]:
+    def openssl(*args: str, binary: bool = False) -> bytes:
+        result = subprocess.run(["openssl", *args], cwd=directory, capture_output=True,
+                                check=True, timeout=20)
+        return result.stdout
+
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+            "-subj", "/CN=VaultLink Test Proxy CA",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            "-keyout", "ca.key", "-out", "ca.crt")
+    for name in ("server", "client", "other"):
+        openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", f"/CN={name}",
+                "-keyout", f"{name}.key", "-out", f"{name}.csr")
+        extension = ("basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\n"
+                     + ("extendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n"
+                        if name == "server" else "extendedKeyUsage=clientAuth\n"))
+        (directory / f"{name}.ext").write_text(extension)
+        openssl("x509", "-req", "-in", f"{name}.csr", "-CA", "ca.crt",
+                "-CAkey", "ca.key", "-CAcreateserial", "-out", f"{name}.crt",
+                "-days", "2", "-extfile", f"{name}.ext")
+    openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=expired",
+            "-keyout", "expired.key", "-out", "expired.csr")
+    (directory / "index.txt").write_text("")
+    (directory / "serial").write_text("1000\n")
+    (directory / "expired-ca.cnf").write_text(
+        "[ca]\ndefault_ca=local\n[local]\ndatabase=index.txt\n"
+        "new_certs_dir=.\nserial=serial\nprivate_key=ca.key\n"
+        "certificate=ca.crt\ndefault_md=sha256\npolicy=names\n"
+        "[names]\ncommonName=supplied\n"
+    )
+    (directory / "expired.ext").write_text(
+        "[client]\nbasicConstraints=CA:FALSE\n"
+        "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n"
+    )
+    openssl("ca", "-batch", "-notext", "-config", "expired-ca.cnf",
+            "-extfile", "expired.ext", "-extensions", "client", "-in", "expired.csr",
+            "-out", "expired.crt", "-startdate", "20200101000000Z",
+            "-enddate", "20200102000000Z")
+    fingerprint = lambda name: hashlib.sha256(
+        openssl("x509", "-in", f"{name}.crt", "-outform", "DER")
+    ).hexdigest()
+    return fingerprint("client"), fingerprint("expired")
+
+
+def open_request(req: urllib.request.Request, timeout: int = 10, no_redirect: bool = False):
+    if TLS_CONTEXT is None or not req.full_url.startswith("https://"):
+        if no_redirect:
+            return urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout)
+    if no_redirect:
+        return urllib.request.build_opener(NoRedirect(),
+            urllib.request.HTTPSHandler(context=TLS_CONTEXT)).open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout, context=TLS_CONTEXT)
 
 
 def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -54,6 +112,8 @@ def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 def request(url: str, method: str = "GET", data: dict[str, str] | None = None,
             token: str | None = None, json_body: dict[str, str] | None = None) -> tuple[int, str]:
     headers = {}
+    if url.startswith("https://"):
+        headers["X-Forwarded-For"] = "198.51.100.10"
     if token:
         headers["x-vaultlink-setup-token"] = token
     body = None
@@ -65,7 +125,7 @@ def request(url: str, method: str = "GET", data: dict[str, str] | None = None,
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, method=method, data=body, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=3) as response:
+        with open_request(req, timeout=3) as response:
             return response.status, response.read().decode()
     except urllib.error.HTTPError as error:
         return error.code, error.read().decode()
@@ -74,16 +134,24 @@ def request(url: str, method: str = "GET", data: dict[str, str] | None = None,
 def wait_http(url: str, expected: int, timeout: float = 35,
               token: str | None = None, container: str = CONTAINER) -> str:
     deadline = time.monotonic() + timeout
+    last_error = "no response"
     while time.monotonic() < deadline:
         try:
             status, body = request(url, token=token)
             if status == expected:
                 return body
-        except OSError:
-            pass
+            last_error = f"HTTP {status}"
+        except OSError as error:
+            last_error = f"{type(error).__name__}: {error}"
         time.sleep(0.2)
     log_result = docker("logs", container, check=False)
-    raise AssertionError(f"{url} did not return HTTP {expected}: {log_result.stdout + log_result.stderr}")
+    logs = re.sub(r"#token=\S+", "#token=[REDACTED]",
+                  log_result.stdout + log_result.stderr)
+    errors = [line for line in logs.splitlines()
+              if ("error" in line.lower() or "failed" in line.lower())
+              and "vaultlink::transport" not in line]
+    raise AssertionError(f"{url} did not return HTTP {expected}; "
+                         f"last client error: {last_error}; service errors: {errors[-5:]}")
 
 
 def mount_identity() -> tuple[str, str]:
@@ -106,6 +174,8 @@ def totp(secret: str) -> str:
 def api(url: str, method: str, payload: dict[str, object] | None = None,
         cookie: str = "", csrf: str = "") -> tuple[int, bytes, list[str]]:
     headers = {}
+    if url.startswith("https://"):
+        headers["X-Forwarded-For"] = "198.51.100.10"
     if cookie:
         headers["Cookie"] = cookie
     if csrf:
@@ -116,7 +186,7 @@ def api(url: str, method: str, payload: dict[str, object] | None = None,
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, method=method, data=body, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with open_request(req, timeout=10) as response:
             return response.status, response.read(), response.headers.get_all("Set-Cookie", [])
     except urllib.error.HTTPError as error:
         return error.code, error.read(), error.headers.get_all("Set-Cookie", [])
@@ -147,16 +217,21 @@ def upload(url: str, upload_id: str, payload: bytes) -> int:
     req = urllib.request.Request(url, method="POST", data=body, headers={
         "Content-Type": f"multipart/form-data; boundary={boundary}",
         "Idempotency-Key": upload_id,
+        "X-Forwarded-For": "198.51.100.10",
     })
     try:
-        with urllib.request.build_opener(NoRedirect()).open(req, timeout=10) as response:
+        with open_request(req, timeout=10, no_redirect=True) as response:
             return response.status
     except urllib.error.HTTPError as error:
         return error.code
 
 
 def main() -> None:
+    global TLS_CONTEXT
+    certificates = tempfile.TemporaryDirectory(prefix="vaultlink-proxy-smoke-")
     try:
+        certificate_directory = Path(certificates.name)
+        fingerprint, expired_fingerprint = make_test_certificates(certificate_directory)
         if os.environ.get("VAULTLINK_TEST_EXPECT_ROOTLESS") == "1":
             daemon = json.loads(docker("info", "--format", "{{json .SecurityOptions}}").stdout)
             assert any("rootless" in option for option in daemon), daemon
@@ -169,6 +244,12 @@ def main() -> None:
                "/var/lib/vaultlink /mnt/storage/shared /mnt/storage/.vaultlink-internal "
                "/mnt/storage/.vaultlink-internal/uploads "
                "/mnt/storage/.vaultlink-internal/tombstones")
+        docker("run", "--rm", "--user", "0:0", "--entrypoint", "bash",
+               "--volume", f"{STATE}:/var/lib/vaultlink",
+               "--volume", f"{certificate_directory}:/cert-source:ro", IMAGE, "-ec",
+               "install -d -o 10001 -g 10001 -m 0700 /var/lib/vaultlink/certs; "
+               "for name in ca.crt server.crt server.key client.crt client.key; do "
+               "install -o 10001 -g 10001 -m 0600 /cert-source/$name /var/lib/vaultlink/certs/$name; done")
         docker("run", "--detach", "--name", CONTAINER,
                "--user", "10001:10001", "--read-only", "--cap-drop", "ALL",
                "--security-opt", "no-new-privileges", "--init",
@@ -194,7 +275,7 @@ def main() -> None:
         wait_http(url + "/", 200, token=token)
         fields = {
             "server_mode": "reverse_proxy",
-            "listen_address": "127.0.0.1:8080",
+            "listen_address": "0.0.0.0:8081",
             "public_base_url": "https://vaultlink.example.test",
             "root_mount_path": "/mnt/storage/shared",
             "data_directory": "/var/lib/vaultlink",
@@ -208,8 +289,12 @@ def main() -> None:
             "preview_extensions": "txt,log,md,csv,json,toml,yaml,yml,ini,conf",
             "image_preview_extensions": "jpg,jpeg,png,gif,webp,bmp,avif",
             "max_media_preview_size_mb": "100",
-            "trusted_proxies": "127.0.0.1,::1",
-            "certificate_source": "files", "tls_cert_file": "", "tls_key_file": "",
+            "trusted_proxies": "", "proxy_transport": "mtls",
+            "client_ca_file": "/var/lib/vaultlink/certs/ca.crt",
+            "client_fingerprints": f"{fingerprint},{expired_fingerprint}",
+            "certificate_source": "files",
+            "tls_cert_file": "/var/lib/vaultlink/certs/server.crt",
+            "tls_key_file": "/var/lib/vaultlink/certs/server.key",
             "letsencrypt_contact_email": "", "letsencrypt_cache_dir": "acme",
             "log_level": "info", "admin_username": "admin",
             "admin_password": PASSWORD, "admin_password_confirm": PASSWORD,
@@ -223,8 +308,44 @@ def main() -> None:
         assert status == 200 and "Setup confirmed" in body, (status, body[:500])
         status, body = request(url + "/start", "POST", token=token)
         assert status == 200 and "VaultLink is starting" in body, (status, body[:500])
+        TLS_CONTEXT = ssl.create_default_context(cafile=str(certificate_directory / "ca.crt"))
+        TLS_CONTEXT.load_cert_chain(str(certificate_directory / "client.crt"),
+                                    str(certificate_directory / "client.key"))
+        url = f"https://127.0.0.1:{host_port}"
         ready = wait_http(url + "/api/v2/health/ready", 200)
         assert json.loads(ready)["ok"] is True
+        assert docker("exec", CONTAINER, "/usr/local/bin/vaultlink", "health-check", "--ready").returncode == 0
+        no_client = ssl.create_default_context(cafile=str(certificate_directory / "ca.crt"))
+        def expect_tls_rejection(context: ssl.SSLContext, identity: str) -> None:
+            forged = urllib.request.Request(url + "/login", headers={
+                "X-Forwarded-For": identity,
+            })
+            try:
+                urllib.request.urlopen(forged, timeout=3, context=context)
+            except urllib.error.HTTPError as error:
+                raise AssertionError("unauthenticated proxy reached HTTP") from error
+            except urllib.error.URLError as error:
+                assert isinstance(error.reason, ssl.SSLError), error
+            except ssl.SSLError:
+                pass
+            else:
+                raise AssertionError("unauthenticated proxy reached HTTP")
+        expect_tls_rejection(no_client, "198.51.100.1")
+        expect_tls_rejection(no_client, "198.51.100.2")
+        wrong_client = ssl.create_default_context(cafile=str(certificate_directory / "ca.crt"))
+        wrong_client.load_cert_chain(str(certificate_directory / "other.crt"),
+                                     str(certificate_directory / "other.key"))
+        expect_tls_rejection(wrong_client, "198.51.100.3")
+        expired_client = ssl.create_default_context(cafile=str(certificate_directory / "ca.crt"))
+        expired_client.load_cert_chain(str(certificate_directory / "expired.crt"),
+                                       str(certificate_directory / "expired.key"))
+        expect_tls_rejection(expired_client, "198.51.100.4")
+        with __import__("socket").create_connection(("127.0.0.1", host_port), timeout=3) as raw:
+            try:
+                TLS_CONTEXT.wrap_socket(raw, server_hostname="wrong.example.test")
+                raise AssertionError("proxy accepted the wrong server identity")
+            except ssl.SSLError:
+                pass
         docker("exec", CONTAINER, "bash", "-ec",
                "printf 'VaultLink container transfer smoke\\n' > /mnt/storage/shared/readme.txt")
         status, body, cookies = api(url + "/api/v2/session/login", "POST", {
@@ -319,7 +440,7 @@ def main() -> None:
                    "--volume", f"{STORAGE}:/mnt/storage", IMAGE)
             recovered_port = (8081 if HOST_NETWORK else int(
                 docker("port", recovery, "8081/tcp").stdout.strip().rsplit(":", 1)[1]))
-            recovered_url = f"http://127.0.0.1:{recovered_port}"
+            recovered_url = f"https://127.0.0.1:{recovered_port}"
             wait_http(recovered_url + "/api/v2/health/ready", 200, container=recovery)
             status, recovered_file, _ = api(recovered_url + readback_path, "GET")
             assert status == 200 and hashlib.sha256(recovered_file).hexdigest() == upload_hash
@@ -329,7 +450,7 @@ def main() -> None:
         published = ("127.0.0.1:8081" if HOST_NETWORK else
                      docker("port", CONTAINER, "8081/tcp").stdout.strip())
         host_port = int(published.rsplit(":", 1)[1])
-        url = f"http://127.0.0.1:{host_port}"
+        url = f"https://127.0.0.1:{host_port}"
         wait_http(url + "/api/v2/health/ready", 200)
         status, readback, _ = api(url + readback_path, "GET")
         assert status == 200 and hashlib.sha256(readback).hexdigest() == upload_hash
@@ -338,7 +459,7 @@ def main() -> None:
             if HOST_NETWORK:
                 docker("run", "--rm", "--user", "0:0", "--entrypoint", "sed",
                        "--volume", f"{CLONE}:/var/lib/vaultlink", IMAGE,
-                       "-i", "s/127\\.0\\.0\\.1:8080/127.0.0.1:18083/",
+                       "-i", "s/0\\.0\\.0\\.0:8081/127.0.0.1:18083/",
                        "/var/lib/vaultlink/config.toml")
             docker("run", "--detach", "--name", second,
                    "--user", "10001:10001", "--read-only", "--cap-drop", "ALL",
@@ -364,6 +485,7 @@ def main() -> None:
         assert PASSWORD not in log_result.stdout + log_result.stderr
         print(f"Docker runtime smoke passed: {filesystem} {source}, setup, transfer hashes, mount and rights guards, backup recovery, second instance, restart, SQLite")
     finally:
+        certificates.cleanup()
         docker("rm", "--force", CONTAINER, check=False)
         for volume in (STATE, STORAGE, CLONE):
             docker("volume", "rm", "--force", volume, check=False)

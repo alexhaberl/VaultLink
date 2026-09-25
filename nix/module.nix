@@ -48,6 +48,7 @@ in {
     ];
 
     users.groups.vaultlink = { };
+    users.groups.vaultlink-proxy = { };
     environment.systemPackages = [ cfg.package ];
     users.users.vaultlink = {
       isSystemUser = true;
@@ -76,7 +77,10 @@ in {
       serviceConfig = {
         Type = "simple";
         User = "vaultlink";
-        Group = "vaultlink";
+        Group = "vaultlink-proxy";
+        SupplementaryGroups = [ "vaultlink" ];
+        RuntimeDirectory = "vaultlink-proxy";
+        RuntimeDirectoryMode = "0750";
         Environment = [ "MALLOC_ARENA_MAX=4" "VAULTLINK_INSTALL_METHOD=nixos" ];
         ExecStart = "${cfg.package}/bin/vaultlink --config ${lib.escapeShellArg cfg.configFile}";
         ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";

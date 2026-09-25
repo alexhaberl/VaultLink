@@ -29,8 +29,8 @@ use tower_http::{
 use crate::{
     auth,
     config::{
-        Admission, CertificateSource, Config, Logging, ReverseProxy, Security, Server, ServerMode,
-        Storage, Tls, MAX_TEXT_PREVIEW_SIZE,
+        Admission, CertificateSource, Config, Logging, ProxyTransport, ReverseProxy, Security,
+        Server, ServerMode, Storage, Tls, MAX_TEXT_PREVIEW_SIZE,
     },
     db::{AuditContext, Database, InitialAdminOutcome},
     i18n::{self, Locale},

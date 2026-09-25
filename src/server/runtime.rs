@@ -27,6 +27,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).is_some_and(|value| value == "health-check") {
+        return local_health_check(&args).await.map_err(Into::into);
+    }
+    if args.get(1).is_some_and(|value| value == "health-bootstrap") {
+        if args.len() != 2 {
+            return Err("health-bootstrap takes no options".into());
+        }
+        return run_bootstrap_health().await.map_err(Into::into);
+    }
     if args
         .get(1)
         .is_some_and(|value| matches!(value.as_str(), "update-control" | "update-job"))
@@ -97,10 +106,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = arg(&args, "--config")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
-    if mode == CommandMode::Setup {
+    if matches!(mode, CommandMode::Setup | CommandMode::SetupOnce) {
         let listen = arg(&args, "--listen").unwrap_or("127.0.0.1:8090");
         let listen: std::net::SocketAddr = listen.parse()?;
         if !vaultlink::setup::run(config_path.clone(), listen).await? {
+            return Ok(());
+        }
+        if mode == CommandMode::SetupOnce {
             return Ok(());
         }
     }
@@ -124,31 +136,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let effective_public_base_url = vaultlink::http_auth::runtime_settings(&state).public_base_url;
     let cleanup_coordinator = state.storage_cleanup_coordinator();
     let cleanup_worker = state.start_storage_cleanup_worker()?;
-    let addr: std::net::SocketAddr = config.server.listen_address.parse()?;
-    let trusted_proxy_peers = if config.server.mode == ServerMode::ReverseProxy {
-        Some(Arc::new(
-            config
-                .reverse_proxy
-                .trusted_proxies
-                .iter()
-                .copied()
-                .map(vaultlink::proxy::canonical_peer_ip)
-                .collect::<HashSet<_>>(),
-        ))
+    let app = web::router(state.clone());
+    let server_result = if config.server.mode == ServerMode::ReverseProxy {
+        serve_proxy_application(&config, state, cleanup_coordinator, app).await
     } else {
-        None
+        let addr: std::net::SocketAddr = config.server.listen_address.parse()?;
+        tracing::info!(%addr,mode=?config.server.mode,"VaultLink starting");
+        serve_application(
+            &config,
+            addr,
+            &effective_public_base_url,
+            cleanup_coordinator,
+            None,
+            app,
+        ).await
     };
-    let app = web::router(state);
-    tracing::info!(%addr,mode=?config.server.mode,"VaultLink starting");
-    let server_result = serve_application(
-        &config,
-        addr,
-        &effective_public_base_url,
-        cleanup_coordinator,
-        trusted_proxy_peers,
-        app,
-    )
-    .await;
     wait_for_cleanup_shutdown(cleanup_worker.shutdown(), CLEANUP_JOIN_TIMEOUT).await?;
     server_result
 }

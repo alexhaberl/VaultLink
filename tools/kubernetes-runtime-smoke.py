@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -56,6 +58,14 @@ def wait_http(path: str, status: int, timeout: float = 50) -> str:
 
 
 def main(mode: str) -> None:
+    global URL
+    certificate_directory = Path(os.environ["VAULTLINK_KUBE_CERT_DIR"])
+    fingerprint = hashlib.sha256(subprocess.run(
+        ["openssl", "x509", "-in", str(certificate_directory / "client.crt"),
+         "-outform", "DER"], capture_output=True, check=True).stdout).hexdigest()
+    context = ssl.create_default_context(cafile=str(certificate_directory / "ca.crt"))
+    context.load_cert_chain(str(certificate_directory / "client.crt"),
+                            str(certificate_directory / "client.key"))
     name = pod()
     uid = kubectl("exec", name, "--", "id", "-u").stdout.strip()
     assert uid == "10001", uid
@@ -68,12 +78,17 @@ def main(mode: str) -> None:
     filesystem, source = fields[separator + 1:separator + 3]
     assert filesystem == "ext4", (filesystem, source)
     if mode == "verify":
+        common.TLS_CONTEXT = context
+        URL = "https://127.0.0.1:18081"
         ready = json.loads(wait_http("/api/v2/health/ready", 200))
         assert ready["ok"] is True
         print(f"Kubernetes restart and readiness passed: {filesystem} {source}")
         return
 
     wait_http("/", 401)
+    kubectl("exec", name, "--", "/usr/local/bin/vaultlink", "health-check", "--live")
+    assert kubectl("exec", name, "--", "/usr/local/bin/vaultlink", "health-check",
+                   "--ready", check=False).returncode != 0
     logs = kubectl("logs", name).stdout
     tokens = re.findall(r"#token=([^\s]+)", logs)
     assert tokens, logs
@@ -88,7 +103,7 @@ def main(mode: str) -> None:
         time.sleep(0.2)
     assert status == 200, status
     fields = {
-        "server_mode": "reverse_proxy", "listen_address": "127.0.0.1:8080",
+        "server_mode": "reverse_proxy", "listen_address": "0.0.0.0:8081",
         "public_base_url": "https://vaultlink.example.test",
         "root_mount_path": "/mnt/storage/shared",
         "data_directory": "/var/lib/vaultlink",
@@ -102,8 +117,12 @@ def main(mode: str) -> None:
         "preview_extensions": "txt,log,md,csv,json,toml,yaml,yml,ini,conf",
         "image_preview_extensions": "jpg,jpeg,png,gif,webp,bmp,avif",
         "max_media_preview_size_mb": "100",
-        "trusted_proxies": "127.0.0.1,::1",
-        "certificate_source": "files", "tls_cert_file": "", "tls_key_file": "",
+        "trusted_proxies": "", "proxy_transport": "mtls",
+        "client_ca_file": "/var/lib/vaultlink/certs/ca.crt",
+        "client_fingerprints": fingerprint,
+        "certificate_source": "files",
+        "tls_cert_file": "/var/lib/vaultlink/certs/server.crt",
+        "tls_key_file": "/var/lib/vaultlink/certs/server.key",
         "letsencrypt_contact_email": "", "letsencrypt_cache_dir": "acme",
         "log_level": "info", "admin_username": "admin",
         "admin_password": PASSWORD, "admin_password_confirm": PASSWORD,
@@ -115,6 +134,8 @@ def main(mode: str) -> None:
     for path in ("/complete", "/start"):
         status, body = request(URL + path, "POST", token=token)
         assert status == 200, (path, status, body[:300])
+    common.TLS_CONTEXT = context
+    URL = "https://127.0.0.1:18081"
     ready = json.loads(wait_http("/api/v2/health/ready", 200))
     assert ready["ok"] is True
     kubectl("exec", name, "--", "bash", "-ec",

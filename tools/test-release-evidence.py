@@ -79,7 +79,58 @@ class FakeGitHub(EVIDENCE.GitHub):
         raise AssertionError(f"unexpected GitHub request: {suffix}")
 
 
+class FakeDockerGitHub(FakeGitHub):
+    def __init__(self):
+        super().__init__()
+        self.run_data.update(path=EVIDENCE.DOCKER_WORKFLOW, event="push")
+        self.statuses = [{"context": f"vaultlink/docker-{arch}", "state": "success",
+                          "target_url": f"https://github.com/{REPO}/actions/runs/789"}
+                         for arch in ("amd64", "arm64")]
+        self.archives = {}
+        self.artifacts = []
+        for number, arch in enumerate(("amd64", "arm64"), start=900):
+            receipt = {"schema_version": 1, "repository": REPO, "commit": COMMIT,
+                       "version": "0.7.2", "workflow": EVIDENCE.DOCKER_WORKFLOW,
+                       "event": "push", "architecture": arch, "run_id": 789,
+                       "run_attempt": 2, "binary_sha256": format(number, "064x")}
+            raw = archive_bytes({"qualification.json": json.dumps(receipt)})
+            self.archives[number] = raw
+            self.artifacts.append({"id": number,
+                                   "name": f"docker-qualification-{arch}-{COMMIT}-789-2",
+                                   "expired": False,
+                                   "digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                                   "created_at": "2026-09-05T12:01:00Z",
+                                   "workflow_run": {"id": 789, "head_sha": COMMIT}})
+
+    def request(self, suffix, *, raw=False):
+        if raw and suffix.startswith("actions/artifacts/") and suffix.endswith("/zip"):
+            return self.archives[int(suffix.split("/")[2])]
+        return super().request(suffix, raw=raw)
+
+
 class ReleaseEvidenceTests(unittest.TestCase):
+    def test_docker_qualification_binds_both_architectures_and_attempt(self):
+        api = FakeDockerGitHub()
+        def verify():
+            with tempfile.TemporaryDirectory() as tmp:
+                return EVIDENCE.docker_qualification(api, COMMIT, "0.7.2", Path(tmp) / "receipt")
+        proof = verify()
+        self.assertEqual(set(proof["architectures"]), {"amd64", "arm64"})
+        self.assertEqual(proof["run_attempt"], 2)
+        for field, bad in (("head_sha", "a" * 40), ("event", "pull_request"),
+                           ("run_attempt", 3), ("conclusion", "failure")):
+            with self.subTest(field=field), patch.dict(api.run_data, {field: bad}):
+                self.assertRaises(EVIDENCE.EvidenceError, verify)
+        api.statuses.insert(0, {**api.statuses[0], "state": "failure"})
+        self.assertRaises(EVIDENCE.EvidenceError, verify)
+        api.statuses.pop(0)
+        for field, bad in (("expired", True), ("digest", "sha256:" + "0" * 64),
+                           ("name", "docker-qualification-arm64-old-run")):
+            with self.subTest(field=field), patch.dict(api.artifacts[1], {field: bad}):
+                self.assertRaises(EVIDENCE.EvidenceError, verify)
+        api.artifacts.append(copy.deepcopy(api.artifacts[1]))
+        self.assertRaises(EVIDENCE.EvidenceError, verify)
+
     def test_gate_binds_repository_workflow_commit_event_and_latest_status(self):
         api = FakeGitHub()
         def gate():

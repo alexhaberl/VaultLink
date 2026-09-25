@@ -106,8 +106,11 @@ staging-only public share tokens and local paths without placing secrets in
 Actions logs:
 
 ```text
-VAULTLINK_BASE_URL=http://127.0.0.1:8080
-VAULTLINK_HEALTH_URL=http://127.0.0.1:8080/api/v2/health/ready
+VAULTLINK_BASE_URL=https://127.0.0.1:8081
+VAULTLINK_HEALTH_URL=http://127.0.0.1:8082/api/v2/health/ready
+VAULTLINK_TLS_CLIENT_CERT=/etc/vaultlink/soak-client.crt
+VAULTLINK_TLS_CLIENT_KEY=/etc/vaultlink/soak-client.key
+VAULTLINK_TLS_SERVER_CA=/etc/vaultlink/soak-server-ca.crt
 VAULTLINK_DATABASE=/var/lib/vaultlink/data.sqlite
 VAULTLINK_CONFIG=/etc/vaultlink/config.toml
 DOWNLOAD_TOKEN=REPLACE_WITH_STAGING_DOWNLOAD_TOKEN
@@ -122,8 +125,12 @@ UPLOAD_VERIFY_TOKEN=REPLACE_WITH_STAGING_READBACK_TOKEN
 ```
 
 The soak listener must run in `reverse_proxy` mode with `enabled=true`,
-`trust_x_forwarded_headers=true`, and the direct peer `127.0.0.1` explicitly in
-`trusted_proxies`. The load script refuses a public base URL. Before applying
+`trust_x_forwarded_headers=true` and `reverse_proxy.transport.kind="mtls"`.
+Its dedicated CA validates the local test client's certificate and its
+fingerprint is explicitly allowlisted. The client verifies the backend's
+server name `127.0.0.1` and certificate through the configured CA; protect
+the client key as root-only soak material. The load script refuses a public
+base URL or an unauthenticated listener. Before applying
 load it saturates one forwarded stream key and proves that a different
 forwarded identity still receives an independent admission slot. The benchmark
 then assigns separate RFC 2544 identities to all 100 metadata clients, 40 range

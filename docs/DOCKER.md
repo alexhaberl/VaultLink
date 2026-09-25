@@ -110,11 +110,13 @@ The Compose file binds port 8081 to host loopback only, keeps the root
 filesystem read-only, drops capabilities, and allows writes only in the two
 explicit bind mounts and a small private `/tmp`. Do not publish port 8081 on a
 public address. Place a TLS reverse proxy in front of the host-local port.
-The container proxy routes setup and service traffic to VaultLink's loopback
-listener. In the browser setup select **reverse proxy**, use an `https://`
-public URL, set the service listener to `127.0.0.1:8080`, and configure the
-exact trusted proxy peer addresses. See the
-[container proxy guide](CONTAINER-SETUP.md) for forwarded-header behavior.
+The temporary HTTP proxy serves setup only. In the browser choose **reverse
+proxy** with **mTLS**, an `https://` public URL, and service listener
+`0.0.0.0:8081`. Pre-provision the server certificate/key, dedicated proxy CA
+and allowed client-certificate fingerprints in the private state volume. The
+host proxy must present that client certificate and verify VaultLink's server
+certificate and name. The bootstrap proxy exits before production starts; see
+the [container setup guide](CONTAINER-SETUP.md).
 
 Before committing setup, inspect the **container's** mount record and put its
 literal filesystem type and source into `expected_filesystem_type` and
@@ -155,14 +157,15 @@ container. After a container restart, the entrypoint sees the existing private
 `config.toml` and starts the service directly. Check readiness:
 
 ```sh
-curl --fail http://127.0.0.1:18080/api/v2/health/ready
+docker compose --env-file /etc/vaultlink/docker.env \
+  -f deploy/docker/compose.yaml exec vaultlink \
+  /usr/local/bin/vaultlink health-check --ready
 ```
 
-Terminate TLS at a reverse proxy that reaches only the host-local port. Keep
-its proxy IP allowlist narrow; Docker NAT can make the observed TCP peer a
-bridge or host-gateway address. Add that exact address only when the published
-port remains host-local. Follow the [HTTPS configuration guide](CONFIGURATION.md)
-for secure cookies and trusted headers.
+Connect the host reverse proxy to the host-local port with mTLS. Its client
+certificate, rather than its Docker NAT address, grants forwarding authority.
+Keep the port host-local and follow the [HTTPS configuration guide](CONFIGURATION.md)
+for certificate rotation and secure cookies.
 
 ## Backup, upgrade and recovery
 
@@ -196,7 +199,9 @@ docker compose --env-file /etc/vaultlink/docker.env \
   -f deploy/docker/compose.yaml up -d
 docker compose --env-file /etc/vaultlink/docker.env \
   -f deploy/docker/compose.yaml exec vaultlink /usr/local/bin/vaultlink --version
-curl --fail http://127.0.0.1:18080/api/v2/health/ready
+docker compose --env-file /etc/vaultlink/docker.env \
+  -f deploy/docker/compose.yaml exec vaultlink \
+  /usr/local/bin/vaultlink health-check --ready
 test "$(sudo sqlite3 /srv/vaultlink/state/data.sqlite 'PRAGMA integrity_check;')" = ok
 ```
 

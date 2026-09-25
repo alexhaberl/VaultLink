@@ -1693,7 +1693,10 @@ if ! grep -F -q 'section == "[reverse_proxy]" && $0 == "enabled = false"' "$vm_r
     || ! grep -F -q 'proxies_ok += ($0 == "trusted_proxies = [\"127.0.0.1\"]")' "$vm_runtime_smoke" \
     || ! grep -F -q 'forwarded_ok += ($0 == "trust_x_forwarded_headers = true")' "$vm_runtime_smoke" \
     || ! grep -F -q 'section == "[tls]" && /^enabled[[:space:]]*=/' "$vm_runtime_smoke" \
-    || ! grep -F -q 'tls_ok += ($0 == "enabled = false")' "$vm_runtime_smoke"; then
+    || ! grep -F -q 'tls_ok += ($0 == "enabled = true")' "$vm_runtime_smoke" \
+    || ! grep -F -q 'rewritten_tls != 1 || rewritten_cert != 1 || rewritten_key != 1' "$vm_runtime_smoke" \
+    || ! grep -F -q 'kind = "mtls"' "$vm_runtime_smoke" \
+    || ! grep -F -q 'client_fingerprints = ["%s"]' "$vm_runtime_smoke"; then
     report "the distro VM runtime gate must build and verify minimal storage and section-scoped reverse-proxy configuration"
 fi
 vm_evidence_upload=$(awk '
@@ -1710,7 +1713,8 @@ if ! grep -F -q 'runtime_status=$?' "$vm_runtime_smoke" \
     || ! grep -F -q '2>"$evidence/readiness-last.stderr"' "$vm_runtime_smoke" \
     || ! grep -F -q 'totp_wait_seconds=$((31 - totp_epoch % 30))' "$vm_runtime_smoke" \
     || ! grep -F -q 'sleep "$totp_wait_seconds"' "$vm_runtime_smoke" \
-    || ! grep -F -q 'VAULTLINK_HEALTH_URL=http://127.0.0.1:18081/api/v2/health/ready' "$vm_runtime_smoke" \
+    || ! grep -F -q 'VAULTLINK_HEALTH_URL=http://127.0.0.1:8082/api/v2/health/ready' "$vm_runtime_smoke" \
+    || ! grep -F -q 'VAULTLINK_BASE_URL=https://127.0.0.1:18081' "$vm_runtime_smoke" \
     || ! grep -F -q 'load_tmp="$runtime_mount_base/.distro-vm-load-work"' "$vm_runtime_smoke" \
     || ! grep -F -q 'install -d -o root -g root -m 0700 "$load_tmp"' "$vm_runtime_smoke" \
     || ! grep -F -q 'TMPDIR="$load_tmp"' "$vm_runtime_smoke" \

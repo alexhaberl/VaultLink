@@ -94,8 +94,10 @@ kubectl port-forward "pod/$pod" 18081:8081
 
 Open the printed token URL through that local port. If `kubectl` runs on a
 remote administration host, use an SSH tunnel to its loopback port. In browser
-setup select reverse-proxy mode, `listen_address=127.0.0.1:8080`, the public
-`https://` URL, and the exact trusted proxy peer addresses. Set
+setup select reverse-proxy mode with `mtls`, `listen_address=0.0.0.0:8081`,
+the public `https://` URL, a private server key, a dedicated proxy-client CA,
+and allowlisted client-certificate fingerprints. Provision the certificate
+files on the state volume before setup. Set
 `root_mount_path=/mnt/storage/shared`,
 `internal_directory=/mnt/storage/.vaultlink-internal`, and
 `data_directory=/var/lib/vaultlink`. Read the pod's mount record and enter the
@@ -111,8 +113,8 @@ kubectl exec "$pod" -- cat /proc/self/mountinfo | awk \
 kubectl rollout status deployment/vaultlink
 ```
 
-Expose the `vaultlink` Service only through a TLS ingress or reverse proxy
-that preserves the required forwarded headers; see the
+Expose the `vaultlink` Service only through an ingress or reverse proxy that
+authenticates to the backend with mTLS and verifies its server identity; see the
 [container proxy guide](CONTAINER-SETUP.md). Keep the setup port-forward private.
 Before opening public access, check `/api/v2/health/ready`, the image digest,
 unprivileged UID, transfer hashes and SQLite integrity. The container update

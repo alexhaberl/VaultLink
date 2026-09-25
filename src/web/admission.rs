@@ -644,14 +644,21 @@ pub(super) async fn audit_client_ip_context(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let client_ip = match req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        Some(ConnectInfo(peer)) => {
-            match proxy::validated_effective_client_ip(peer.ip(), req.headers(), state.config()) {
-                Ok(client_ip) => Some(client_ip),
-                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-            }
+    let client_ip = if state.config().server.mode == crate::config::ServerMode::ReverseProxy {
+        if req.extensions().get::<proxy::VerifiedProxyPeer>().is_none() {
+            return StatusCode::FORBIDDEN.into_response();
         }
-        None => None,
+        match proxy::validated_proxy_client_ip(
+            req.headers(),
+            &state.config().reverse_proxy.trusted_proxies,
+        ) {
+            Ok(client_ip) => Some(client_ip),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        }
+    } else {
+        req.extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(peer)| peer.ip())
     };
     req.extensions_mut().insert(ValidatedClientIp(client_ip));
     with_audit_client_ip(client_ip, next.run(req)).await
