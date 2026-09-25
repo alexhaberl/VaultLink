@@ -26,7 +26,6 @@ printf '%s  %s\n' "$kubectl_sha" "$bin_dir/kubectl" | sha256sum --check -
 chmod 0755 "$bin_dir/kubectl"
 
 cleanup() {
-  if [[ -n ${forward_pid:-} ]]; then kill "$forward_pid" 2>/dev/null || true; fi
   if [[ -n ${cluster_created:-} ]]; then kind delete cluster --name vaultlink-ci || true; fi
   for name in storage state; do
     if mountpoint -q "$test_root/$name"; then sudo umount "$test_root/$name" || true; fi
@@ -127,13 +126,7 @@ sed "s@ghcr.io/alexhaberl/vaultlink:vX.Y.Z@$image@" \
 kubectl apply -f "$test_root/vaultlink.yaml"
 kubectl wait --for=jsonpath='{.status.phase}'=Running pod -l app=vaultlink --timeout=180s
 
-kubectl port-forward deployment/vaultlink 18081:8081 \
-  >"$test_root/port-forward.log" 2>&1 &
-forward_pid=$!
 python3 tools/kubernetes-runtime-smoke.py setup
-kill "$forward_pid" 2>/dev/null || true
-wait "$forward_pid" 2>/dev/null || true
-unset forward_pid
 
 kubectl scale deployment/vaultlink --replicas=0
 for ((attempt = 0; attempt < 60; attempt++)); do
@@ -164,9 +157,6 @@ with sqlite3.connect(sys.argv[1]) as db:
 PY
 kubectl scale deployment/vaultlink --replicas=1
 kubectl wait --for=jsonpath='{.status.phase}'=Running pod -l app=vaultlink --timeout=180s
-kubectl port-forward deployment/vaultlink 18081:8081 \
-  >"$test_root/port-forward-restart.log" 2>&1 &
-forward_pid=$!
 python3 tools/kubernetes-runtime-smoke.py verify
 kubectl rollout status deployment/vaultlink --timeout=120s
 printf 'Kubernetes local-PV setup, transfers, paired restore and restart passed\n'

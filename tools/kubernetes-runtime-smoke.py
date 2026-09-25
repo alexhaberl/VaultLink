@@ -26,6 +26,7 @@ upload = common.upload
 
 URL = "http://127.0.0.1:18081"
 PASSWORD = "Docker runtime smoke password 123!"
+forward: subprocess.Popen[str] | None = None
 
 
 def kubectl(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -44,17 +45,49 @@ def pod() -> str:
     raise AssertionError("VaultLink Kubernetes pod did not reach Running")
 
 
+def start_forward() -> None:
+    global forward
+    if forward is None or forward.poll() is not None:
+        forward = subprocess.Popen(
+            ["kubectl", "port-forward", "deployment/vaultlink", "18081:8081"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+
+
+def stop_forward() -> None:
+    global forward
+    if forward is not None:
+        if forward.poll() is None:
+            forward.terminate()
+        try:
+            forward.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            forward.kill()
+            forward.wait(timeout=5)
+        forward = None
+
+
 def wait_http(path: str, status: int, timeout: float = 50) -> str:
     deadline = time.monotonic() + timeout
+    last_response = "no response"
     while time.monotonic() < deadline:
+        start_forward()
         try:
             actual, body = request(URL + path)
             if actual == status:
                 return body
-        except OSError:
-            pass
+            last_response = f"HTTP {actual}"
+        except OSError as error:
+            last_response = type(error).__name__
         time.sleep(0.25)
-    raise AssertionError(f"{path} did not return {status}: {kubectl('logs', pod(), check=False).stdout}")
+    name = pod()
+    item = json.loads(kubectl("get", "pod", name, "-o", "json").stdout)
+    containers = item["status"].get("containerStatuses", [])
+    states = [(entry.get("restartCount"), list(entry.get("state", {}))) for entry in containers]
+    forward_exit = None if forward is None else forward.poll()
+    raise AssertionError(
+        f"{path} did not return {status}: last={last_response}, "
+        f"port_forward_exit={forward_exit}, pod_phase={item['status'].get('phase')}, "
+        f"container_restart_and_state={states}")
 
 
 def main(mode: str) -> None:
@@ -67,6 +100,7 @@ def main(mode: str) -> None:
     context.load_cert_chain(str(certificate_directory / "client.crt"),
                             str(certificate_directory / "client.key"))
     name = pod()
+    start_forward()
     uid = kubectl("exec", name, "--", "id", "-u").stdout.strip()
     assert uid == "10001", uid
     mountinfo = kubectl("exec", name, "--", "cat", "/proc/self/mountinfo").stdout
@@ -134,6 +168,11 @@ def main(mode: str) -> None:
     for path in ("/complete", "/start"):
         status, body = request(URL + path, "POST", token=token)
         assert status == 200, (path, status, body[:300])
+    assert "VaultLink is starting" in body, "setup did not request the production listener"
+    # Port forwarding is tied to the bootstrap listener. Open a fresh stream
+    # after the entrypoint replaces it with the production mTLS listener.
+    stop_forward()
+    start_forward()
     common.TLS_CONTEXT = context
     URL = "https://127.0.0.1:18081"
     ready = json.loads(wait_http("/api/v2/health/ready", 200))
@@ -183,4 +222,7 @@ def main(mode: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "setup")
+    try:
+        main(sys.argv[1] if len(sys.argv) > 1 else "setup")
+    finally:
+        stop_forward()
