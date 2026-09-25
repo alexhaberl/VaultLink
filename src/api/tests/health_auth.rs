@@ -51,7 +51,7 @@ async fn loopback_health_listener_has_no_application_routes_and_needs_main_liste
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let listening = std::sync::Arc::new(AtomicBool::new(false));
-    let app = local_health_router(test_state(root.path(), data.path()), listening.clone());
+    let app = local_health_router(&test_state(root.path(), data.path()), listening.clone());
     for path in ["/login", "/api/v2/session/login", "/v/token/download"] {
         assert_eq!(
             app.clone()

@@ -556,12 +556,12 @@ struct LocalHealthState {
 
 /// Only these two routes are exposed by the separate loopback health port.
 pub fn local_health_router(
-    state: AppState,
+    state: &AppState,
     application_listening: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Router {
     use axum::extract::FromRef;
     let local = LocalHealthState {
-        readiness: ReadinessState::from_ref(&state),
+        readiness: ReadinessState::from_ref(state),
         application_listening,
     };
     Router::new()

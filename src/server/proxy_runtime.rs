@@ -197,7 +197,7 @@ async fn serve_proxy_application(
     let health_addr: std::net::SocketAddr = config::PROXY_HEALTH_ADDRESS.parse()?;
     let health_handle = axum_server::Handle::new();
     install_server_shutdown(health_handle.clone(), cleanup.clone());
-    let health_router = vaultlink::api::local_health_router(state, listening);
+    let health_router = vaultlink::api::local_health_router(&state, listening);
     let health = axum_server::bind(health_addr)
         .map(|acceptor| ConnectionLimitAcceptor::new(acceptor, None))
         .http1_only();
