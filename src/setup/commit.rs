@@ -79,6 +79,7 @@ fn parse_proxy_transport(
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .collect(),
+            handshake_timeout_seconds: None,
         },
         _ => return Err("Select Unix socket or mTLS as the reverse-proxy transport".into()),
     };

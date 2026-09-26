@@ -162,14 +162,21 @@ async fn serve_proxy_application(
         ProxyTransport::Mtls {
             client_ca_file,
             client_fingerprints,
+            handshake_timeout_seconds,
         } => {
             install_noop_sighup_handler("mTLS trust configuration requires a coordinated restart");
             let addr: std::net::SocketAddr = config.server.listen_address.parse()?;
             let tls = load_proxy_mtls_config(config, client_ca_file, client_fingerprints).await?;
+            let handshake_timeout = Duration::from_secs(handshake_timeout_seconds.unwrap_or(10));
             let handle = axum_server::Handle::new();
             install_server_shutdown(handle.clone(), cleanup.clone());
             let mut server = axum_server::bind_rustls(addr, tls)
-                .map(|acceptor| MtlsProxyAcceptor::new(ConnectionLimitAcceptor::new_mtls(acceptor)))
+                .map(|acceptor| {
+                    MtlsProxyAcceptor::new(ConnectionLimitAcceptor::new_mtls(
+                        acceptor.handshake_timeout(handshake_timeout),
+                        handshake_timeout,
+                    ))
+                })
                 .http1_only();
             harden_http_server(&mut server);
             let start_handle = handle.clone();

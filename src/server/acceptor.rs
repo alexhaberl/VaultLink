@@ -34,11 +34,12 @@ impl<A> ConnectionLimitAcceptor<A> {
         }
     }
 
-    fn new_mtls(inner: A) -> Self {
+    fn new_mtls(inner: A, handshake_timeout: Duration) -> Self {
         let mut acceptor = Self::new(inner, None);
         // A separate pre-handshake semaphore limits unauthenticated work.
         // Connections that have completed mTLS may share a proxy's TCP IP.
         acceptor.max_connections_per_peer = MAX_ACTIVE_CONNECTIONS;
+        acceptor.accept_timeout = handshake_timeout + Duration::from_secs(5);
         acceptor
     }
 }

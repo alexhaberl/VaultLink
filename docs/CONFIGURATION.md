@@ -145,6 +145,13 @@ proxy_request_buffering off;
 proxy_buffering off;
 ```
 
+The mTLS handshake deadline defaults to 10 seconds. The optional
+`reverse_proxy.transport.handshake_timeout_seconds` accepts 10–60 seconds;
+values above 10 require a loopback listener. The offline QEMU full-load gate
+uses 60 seconds on its isolated loopback listener because TCG can delay 150
+simultaneous handshakes. Native package tests and the dedicated 72-hour soak
+retain the 10-second default.
+
 ### Standalone TLS with PEM files
 
 `certificate_source = "files"` reads `cert_file` and `key_file`. The private key must use mode `0400`, `0440`, `0600`, or `0640`. `root:vaultlink` with group-read-only access is supported; other members of that dedicated group are inside the administrative trust boundary. With `reload_on_cert_change = true`, `systemctl reload vaultlink` reloads PEM files through SIGHUP and keeps the previous TLS configuration if the replacement is invalid.

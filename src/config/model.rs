@@ -159,6 +159,8 @@ pub enum ProxyTransport {
     Mtls {
         client_ca_file: PathBuf,
         client_fingerprints: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handshake_timeout_seconds: Option<u64>,
     },
 }
 

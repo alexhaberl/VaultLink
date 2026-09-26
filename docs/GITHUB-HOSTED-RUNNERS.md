@@ -176,10 +176,12 @@ Every one of the nine targets performs:
   counts and statuses, transfer and upload hashes, absence of corruption,
   process and RSS limits, and all other functional and security assertions;
   only its recorded p95 and threshold comparison are diagnostic. The forced-TCG
-  guest uses short-lived P-256 mTLS certificates so emulated RSA signing does
-  not exhaust the application's fixed 10-second handshake deadline during the
-  full burst. The native package smoke still tests RSA mTLS. This changes no
-  client or request count, deadline, status, hash, or integrity assertion.
+  guest uses short-lived P-256 mTLS certificates and a bounded 60-second
+  handshake deadline on its isolated loopback listener. P-256 alone did not
+  prevent the library's default 10-second handshake timeout during the 150-client
+  burst under TCG. Native package smoke and the dedicated 72-hour soak retain
+  RSA mTLS and the 10-second default. The guest retains the exact client and
+  request counts, statuses, hashes, and integrity assertions.
   Forced-TCG transfers have a bounded 60-minute request deadline without changing any
   concurrency, byte-count, status, or integrity assertion. The
   commit-bound workflow explicitly records `acceleration_policy=force-tcg` and

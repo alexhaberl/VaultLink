@@ -174,10 +174,15 @@ fn validate_server_mode(config: &Config, url: &Url) -> Result<(), ConfigError> {
                         ));
                     }
                 }
-                Some(ProxyTransport::Mtls { client_ca_file, client_fingerprints }) => {
+                Some(ProxyTransport::Mtls {
+                    client_ca_file,
+                    client_fingerprints,
+                    handshake_timeout_seconds,
+                }) => {
                     let listen: SocketAddr = config.server.listen_address.parse().map_err(|_| {
                         ConfigError::Invalid("mTLS listen_address must be an IP socket address".into())
                     })?;
+                    validate_mtls_handshake_timeout(listen, *handshake_timeout_seconds)?;
                     if (listen.ip().is_unspecified() || !listen.ip().is_loopback())
                         && !config.reverse_proxy.allow_non_loopback
                     {
@@ -232,6 +237,21 @@ fn validate_server_mode(config: &Config, url: &Url) -> Result<(), ConfigError> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_mtls_handshake_timeout(
+    listen: SocketAddr,
+    configured_seconds: Option<u64>,
+) -> Result<(), ConfigError> {
+    let Some(seconds) = configured_seconds else {
+        return Ok(());
+    };
+    if !(10..=60).contains(&seconds) || (seconds > 10 && !listen.ip().is_loopback()) {
+        return Err(ConfigError::Invalid(
+            "extended mTLS handshake timeout requires a loopback listener and a value from 10 to 60 seconds".into(),
+        ));
     }
     Ok(())
 }
