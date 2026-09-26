@@ -1,7 +1,10 @@
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ACTIVE_CONNECTIONS: usize = 256;
 const MAX_ACTIVE_CONNECTIONS_PER_PEER: usize = 32;
-const MAX_PENDING_MTLS_HANDSHAKES: usize = 96;
+const MAX_PENDING_MTLS_HANDSHAKES: usize = 192;
+// All 100 metadata, 40 range, and 10 upload clients may connect at once.
+const _: () = assert!(MAX_PENDING_MTLS_HANDSHAKES >= 100 + 40 + 10);
+const _: () = assert!(MAX_PENDING_MTLS_HANDSHAKES < MAX_ACTIVE_CONNECTIONS);
 const CONNECTION_ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
 const RESPONSE_WRITE_IDLE_TIMEOUT: Duration = vaultlink::transport::RESPONSE_WRITE_IDLE_TIMEOUT;
 const MAX_CONNECTION_LIFETIME: Duration = vaultlink::transport::MAX_CONNECTION_LIFETIME;
@@ -73,7 +76,7 @@ struct MtlsProxyAcceptor<A> {
 impl<A> MtlsProxyAcceptor<A> {
     fn new(inner: A) -> Self {
         // Bound unauthenticated handshakes below the authenticated connection
-        // budget while allowing the documented 50/20/5 parallel load profile.
+        // budget while allowing the required 100/40/10 full-load profile.
         Self {
             inner,
             pending_handshakes: Arc::new(Semaphore::new(MAX_PENDING_MTLS_HANDSHAKES)),
