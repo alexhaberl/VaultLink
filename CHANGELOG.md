@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.2 — Unreleased
+## 0.7.2 — 2026-09-30
 
 - Prepare [NixOS 26.05 deployment](docs/NIXOS.md) through the repository flake
   on x86_64 and aarch64, with exact-commit build and boot checks before release.

@@ -19,17 +19,17 @@
     "previous": {
       "flake": false,
       "locked": {
-        "lastModified": 1789252631,
-        "narHash": "sha256-sS+5c/I3RYI6r1p7vkGThO6MqJU98ROwLPbafo5EHIQ=",
+        "lastModified": 1789731181,
+        "narHash": "sha256-xYyOP4RiATbr1F5VUEGGME70/5itBrSInkdXlYX3phw=",
         "owner": "alexhaberl",
         "repo": "VaultLink",
-        "rev": "0af4612bd3c32a995b19de4cd19ca05ac4fd4855",
+        "rev": "efdbea07d0e77f9bd89cbde7fd1a706055739e36",
         "type": "github"
       },
       "original": {
         "owner": "alexhaberl",
         "repo": "VaultLink",
-        "rev": "0af4612bd3c32a995b19de4cd19ca05ac4fd4855",
+        "rev": "efdbea07d0e77f9bd89cbde7fd1a706055739e36",
         "type": "github"
       }
     },

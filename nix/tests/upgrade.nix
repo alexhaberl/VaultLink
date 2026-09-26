@@ -41,7 +41,7 @@ in pkgs.testers.runNixOSTest {
     machine.succeed("printf 'persistent upgrade payload\n' > /mnt/storage/shared/payload.txt; chown vaultlink:vaultlink /mnt/storage/shared/payload.txt")
     machine.succeed("install -o root -g vaultlink -m 0640 ${configFile} /etc/vaultlink/config.toml")
     machine.succeed("systemctl reset-failed vaultlink.service; systemctl restart vaultlink.service")
-    machine.wait_until_succeeds("curl --fail --silent http://127.0.0.1:8080/api/v2/health/ready | grep -q '0.7.0'")
+    machine.wait_until_succeeds("curl --fail --silent http://127.0.0.1:8080/api/v2/health/ready | grep -q '0.7.1'")
     machine.succeed("test -s /var/lib/vaultlink/data.sqlite && test -s /var/lib/vaultlink/secrets.keyring")
     old_system = machine.succeed("readlink -f /run/current-system").strip()
     machine.succeed("systemctl stop vaultlink.service")
@@ -63,7 +63,7 @@ in pkgs.testers.runNixOSTest {
     machine.succeed("cmp /var/lib/vaultlink/data.sqlite /var/backups/vaultlink-upgrade-test/data.sqlite; cmp /var/lib/vaultlink/secrets.keyring /var/backups/vaultlink-upgrade-test/secrets.keyring")
     machine.succeed("test \"$(sqlite3 /var/lib/vaultlink/data.sqlite 'PRAGMA integrity_check')\" = ok")
     machine.succeed("systemctl unmask --runtime vaultlink.service; systemctl reset-failed vaultlink.service; systemctl start vaultlink.service")
-    machine.wait_until_succeeds("curl --fail --silent http://127.0.0.1:8080/api/v2/health/ready | grep -q '0.7.0'")
+    machine.wait_until_succeeds("curl --fail --silent http://127.0.0.1:8080/api/v2/health/ready | grep -q '0.7.1'")
     machine.succeed("test \"$(sha256sum /proc/$(systemctl show -p MainPID --value vaultlink.service)/exe | cut -d' ' -f1)\" = \"$(sha256sum /var/backups/vaultlink-upgrade-test/vaultlink | cut -d' ' -f1)\"")
     machine.succeed("test \"$(sha256sum /mnt/storage/shared/payload.txt | cut -d' ' -f1)\" = \"$(printf 'persistent upgrade payload\n' | sha256sum | cut -d' ' -f1)\"")
   '';

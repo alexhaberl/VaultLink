@@ -8,7 +8,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     previous = {
-      url = "github:alexhaberl/VaultLink/0af4612bd3c32a995b19de4cd19ca05ac4fd4855";
+      url = "github:alexhaberl/VaultLink/efdbea07d0e77f9bd89cbde7fd1a706055739e36";
       flake = false;
     };
   };
@@ -33,7 +33,7 @@
           vaultlink = self.packages.${system}.vaultlink;
           oldPackage = pkgs.callPackage ./nix/package.nix {
             source = previous;
-            packageVersion = "0.7.0";
+            packageVersion = "0.7.1";
             cargoLockFile = "${previous}/Cargo.lock";
           };
           mkTest = name: import (./nix/tests + "/${name}.nix") {

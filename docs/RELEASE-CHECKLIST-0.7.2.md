@@ -4,7 +4,8 @@ Status: **unreleased development**. VaultLink 0.7.1 remains the supported,
 immutable release. [`release/release-state.json`](../release/release-state.json)
 is authoritative for lifecycle state. This checklist and the
 [qualification ledger](../release/qualification-0.7.2.json) track work for the
-next candidate; no final candidate or release date has been selected.
+next candidate. The planned UTC release date is 2026-09-30; the final candidate
+has not yet been frozen.
 
 The [0.7.1 checklist](RELEASE-CHECKLIST-0.7.1.md) and its publication evidence
 remain historical records. The comparative 19-metric performance test is retired

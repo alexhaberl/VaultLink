@@ -294,7 +294,8 @@ and fresh security audit before starting the full 72 hours. Final evidence/tag
 phases independently verify the actual package binary and complete soak artifact;
 all load, latency, RSS, integrity, and transfer checks remain mandatory.
 See the [performance policy](../release/performance/README.md) and the
-[0.7.2 release checklist](RELEASE-CHECKLIST-0.7.2.md). No release date is set.
+[0.7.2 release checklist](RELEASE-CHECKLIST-0.7.2.md). The planned UTC release
+date is 2026-09-30.
 
 Before starting this candidate, re-provision all seven orchestration files
 from its frozen commit using the installation steps above. The controller,
