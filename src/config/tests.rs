@@ -428,6 +428,18 @@ mod tests {
     }
 
     #[test]
+    fn extended_mtls_handshake_timeout_is_bounded_to_loopback() {
+        let loopback = "127.0.0.1:18081".parse().unwrap();
+        let public = "192.0.2.10:18081".parse().unwrap();
+        assert!(validate_mtls_handshake_timeout(public, None).is_ok());
+        assert!(validate_mtls_handshake_timeout(public, Some(10)).is_ok());
+        assert!(validate_mtls_handshake_timeout(loopback, Some(60)).is_ok());
+        for (listen, seconds) in [(loopback, 9), (loopback, 61), (public, 11)] {
+            assert!(validate_mtls_handshake_timeout(listen, Some(seconds)).is_err());
+        }
+    }
+
+    #[test]
     fn unix_reverse_proxy_rejects_network_listener_and_root_proxy_uid() {
         let mut c = base();
         c.server.mode = ServerMode::ReverseProxy;

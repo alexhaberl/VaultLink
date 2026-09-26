@@ -1696,7 +1696,8 @@ if ! grep -F -q 'section == "[reverse_proxy]" && $0 == "enabled = false"' "$vm_r
     || ! grep -F -q 'tls_ok += ($0 == "enabled = true")' "$vm_runtime_smoke" \
     || ! grep -F -q 'rewritten_tls != 1 || rewritten_cert != 1 || rewritten_key != 1' "$vm_runtime_smoke" \
     || ! grep -F -q 'kind = "mtls"' "$vm_runtime_smoke" \
-    || ! grep -F -q 'client_fingerprints = ["%s"]' "$vm_runtime_smoke"; then
+    || ! grep -F -q 'client_fingerprints = ["%s"]' "$vm_runtime_smoke" \
+    || ! grep -F -q 'handshake_timeout_seconds = 60' "$vm_runtime_smoke"; then
     report "the distro VM runtime gate must build and verify minimal storage and section-scoped reverse-proxy configuration"
 fi
 vm_evidence_upload=$(awk '

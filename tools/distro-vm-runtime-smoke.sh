@@ -256,9 +256,9 @@ chmod 0700 "$runtime_internal"
 runtime_stage=production-config
 certificate_dir=/etc/vaultlink/proxy-smoke-certs
 install -d -o root -g vaultlink -m 0750 "$certificate_dir"
-# Forced TCG must authenticate all 150 clients without spending the fixed
-# 10-second TLS handshake deadline on emulated RSA private-key operations.
-# Native package smoke still exercises RSA; this guest uses ephemeral P-256.
+# Forced TCG authenticates all 150 clients with ephemeral P-256 certificates.
+# Its isolated loopback listener receives a bounded handshake allowance below;
+# native package smoke and the soak retain RSA and the 10-second default.
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 \
     -out "$certificate_dir/ca.key" >/dev/null 2>&1
 openssl req -x509 -new -key "$certificate_dir/ca.key" -days 2 \
@@ -383,6 +383,9 @@ awk -v certdir="$certificate_dir" '
 ' "$runtime_config_work" >"$evidence/config.toml"
 printf '\n[reverse_proxy.transport]\nkind = "mtls"\nclient_ca_file = "%s/ca.crt"\nclient_fingerprints = ["%s"]\n' \
     "$certificate_dir" "$client_fingerprint" >>"$evidence/config.toml"
+if [ "$acceleration" = tcg ]; then
+    printf 'handshake_timeout_seconds = 60\n' >>"$evidence/config.toml"
+fi
 rm -f "$runtime_config_work"
 runtime_config_work=
 grep -F -x -q 'mode = "reverse_proxy"' "$evidence/config.toml"
