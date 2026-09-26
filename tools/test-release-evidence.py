@@ -249,7 +249,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
                         patch.object(EVIDENCE, "verify_receipt") as performance, \
                         patch.object(EVIDENCE, "verify_soak") as soak, \
                         patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO}):
-                    self.assertEqual(STATE.validate_phase(args, errors), {"QUAL-001", "QUAL-006"})
+                    self.assertEqual(STATE.validate_phase(args, "0.7.1", errors), {"QUAL-001", "QUAL-006"})
                     self.assertEqual(errors, [])
                     self.assertEqual(performance.call_count, int(phase != "candidate"))
                     self.assertEqual(soak.call_count, int(phase in {"evidence", "tag"}))
@@ -263,12 +263,12 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 with patch.object(STATE, "load_release_evidence", return_value=EVIDENCE), \
                         patch.object(EVIDENCE, "performance_required", return_value=True), \
                         patch.object(EVIDENCE, "verify_receipt", side_effect=EVIDENCE.EvidenceError("stale")):
-                    self.assertFalse(STATE.validate_phase(args, errors))
+                    self.assertFalse(STATE.validate_phase(args, "0.7.1", errors))
                     self.assertTrue(errors)
                     self.assertIsNone(args.effective_qualification)
             args.phase, args.require_ready, args.expected_commit = "development", True, None
             errors = []
-            self.assertFalse(STATE.validate_phase(args, errors))
+            self.assertFalse(STATE.validate_phase(args, "0.7.1", errors))
             self.assertTrue(errors, "legacy require-ready must remain strict")
 
     def test_performance_retirement_covers_every_release_from_070(self):
@@ -328,7 +328,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
                         patch.object(EVIDENCE, "verify_receipt") as performance, \
                         patch.object(EVIDENCE, "verify_soak") as soak, \
                         patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO}):
-                    self.assertEqual(STATE.validate_phase(args, errors), {"QUAL-006"})
+                    self.assertEqual(STATE.validate_phase(args, "0.7.1", errors), {"QUAL-006"})
                     self.assertEqual(errors, [])
                     self.assertEqual(candidate.call_count, int(phase != "candidate"))
                     performance.assert_not_called()
@@ -351,7 +351,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
                         patch.object(EVIDENCE, "verify_candidate"), \
                         patch.object(EVIDENCE, verifier, side_effect=EVIDENCE.EvidenceError("missing proof")), \
                         patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO}):
-                    self.assertFalse(STATE.validate_phase(args, errors))
+                    self.assertFalse(STATE.validate_phase(args, "0.7.1", errors))
                     self.assertTrue(errors)
                     self.assertIsNone(args.effective_qualification)
             for required, supplied in [(True, None), (False, Path(temporary) / "pretend.json")]:
@@ -359,8 +359,46 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 errors = []
                 with patch.object(STATE, "load_release_evidence", return_value=EVIDENCE), \
                         patch.object(EVIDENCE, "performance_required", return_value=required):
-                    self.assertFalse(STATE.validate_phase(args, errors))
+                    self.assertFalse(STATE.validate_phase(args, "0.7.1", errors))
                     self.assertTrue(errors)
+
+    def test_072_soak_metrics_remain_open_until_verified_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = argparse.Namespace(phase="candidate", require_ready=False, expected_commit=COMMIT,
+                expected_binary_sha256=EXPECTED["binary_sha256"], expected_packages_run_id=123,
+                performance_receipt=None, output=Path(temporary) / "effective.json")
+            for phase in ("candidate", "soak", "evidence", "tag"):
+                args.phase = phase
+                errors = []
+                with patch.object(STATE, "load_release_evidence", return_value=EVIDENCE), \
+                        patch.object(EVIDENCE, "performance_required", return_value=False), \
+                        patch.object(EVIDENCE, "verify_candidate"), \
+                        patch.object(EVIDENCE, "verify_soak", return_value={"verified": True}) as soak, \
+                        patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO}):
+                    self.assertEqual(STATE.validate_phase(args, "0.7.2", errors),
+                                     {"QUAL-006", "PERF-001"})
+                    self.assertEqual(errors, [])
+                    self.assertEqual(soak.call_count, int(phase in {"evidence", "tag"}))
+                    if phase == "candidate":
+                        self.assertIsNone(args.effective_qualification)
+                    else:
+                        effective = args.effective_qualification
+                        self.assertEqual(effective["deferred_findings"],
+                                         ["PERF-001", "QUAL-006"] if phase == "soak" else [])
+                        self.assertEqual(effective["resolved_findings"],
+                                         [] if phase == "soak" else ["QUAL-006", "PERF-001"])
+                    self.assertFalse(args.output.exists())
+            for phase in ("evidence", "tag"):
+                args.phase = phase
+                errors = []
+                with patch.object(STATE, "load_release_evidence", return_value=EVIDENCE), \
+                        patch.object(EVIDENCE, "performance_required", return_value=False), \
+                        patch.object(EVIDENCE, "verify_candidate"), \
+                        patch.object(EVIDENCE, "verify_soak", side_effect=EVIDENCE.EvidenceError("missing soak")), \
+                        patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO}):
+                    self.assertFalse(STATE.validate_phase(args, "0.7.2", errors))
+                    self.assertTrue(errors)
+                    self.assertIsNone(args.effective_qualification)
 
     def test_candidate_verification_rejects_a_different_packages_run(self):
         from unittest.mock import Mock

@@ -31,6 +31,9 @@ The full-load and soak requirements still apply.
 - [ ] Review and resolve open findings in the
   [0.7.2 ledger](../release/qualification-0.7.2.json), with a fresh audit of the
   committed Cargo.lock. Keep final qualification evidence tied to one commit.
+  PERF-001 and QUAL-006 remain open through the candidate and soak-start phases.
+  The evidence preflight resolves them only after verifying the complete,
+  binary-bound 72-hour soak; no ledger edit is needed after the freeze.
 
 ## Qualify the exact candidate
 
