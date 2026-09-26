@@ -142,6 +142,11 @@ make run
 | [Kubernetes deployment](docs/KUBERNETES.md) | Single pod, local persistent volumes, probes and recovery |
 | [Threat model](THREAT_MODEL.md) | Trust boundaries, security invariants, and accepted risks |
 
+The API, internals, and configuration references in this `main` checkout also
+describe unreleased 0.7.2 changes. For a 0.7.1 installation, use the matching
+[v0.7.1 documentation](https://github.com/alexhaberl/VaultLink/tree/v0.7.1/docs)
+and the configuration examples included in its signed package.
+
 The supported 0.7.1 release uses database schema 10; the superseded 0.6.0 release
 used schema 6. See [data and persistence](docs/INTERNALS.md#data-and-persistence)
 for migration details. Release evidence is linked from

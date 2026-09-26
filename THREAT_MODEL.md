@@ -2,11 +2,16 @@
 
 | Field | Value |
 | --- | --- |
-| Last reviewed | 2026-09-17 (0.7.1 release preparation) |
-| Baseline commit | Published 0.7.1 package commit `efdbea07d0e77f9bd89cbde7fd1a706055739e36`; later `main` changes require separate qualification |
-| Applies to | VaultLink 0.7.1 native packages listed in [PACKAGING.md](docs/PACKAGING.md) |
-| Companion documents | [Security policy](SECURITY.md), [0.7.1 release checklist](docs/RELEASE-CHECKLIST-0.7.1.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
+| Last reviewed | 2026-09-26 (0.7.2 development source review) |
+| Review baseline | Source at `e71a9bb4fd58d5fbddbda06d115ed4865d59b81a` on `main`; later source changes need review |
+| Applies to | Supported 0.7.1 native packages and the reviewed, unreleased 0.7.2 development design; 0.7.2 release qualification is pending |
+| Companion documents | [Security policy](SECURITY.md), [0.7.2 release checklist](docs/RELEASE-CHECKLIST-0.7.2.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
 | Release state | [`release/release-state.json`](release/release-state.json): 0.7.1 supported (published 2026-09-22), 0.7.0 and 0.6.0 superseded, 0.5.0 withdrawn |
+
+This review covers the 0.7.2 changes to uploads, proxy transport, NixOS,
+Docker, Kubernetes, and OCI publication. It records design and source controls;
+the fresh dependency audit, architecture gates, package/VM evidence, and 72-hour
+soak in the [0.7.2 checklist](docs/RELEASE-CHECKLIST-0.7.2.md) remain open.
 
 ## Purpose
 
@@ -66,9 +71,11 @@ The supported deployment trusts the exact Debian, Ubuntu, Fedora, or Arch
 package target named in `docs/PACKAGING.md`, the Linux security primitives used
 by VaultLink, the native package database, the configured TLS endpoint, the
 audited local filesystem, and the operator-managed identities and ACLs
-described in `SECURITY.md`. Required kernel primitives include `openat2(2)`,
-`renameat2(2)`, and statx mount IDs. A derivative or different OS release is
-not assumed equivalent.
+described in `SECURITY.md`. The proposed 0.7.2 deployments additionally trust
+the reviewed NixOS flake and host module or the OCI runtime, container engine,
+or Kubernetes node and volume administrator. Required kernel primitives include
+`openat2(2)`, `renameat2(2)`, and statx mount IDs. A derivative or different OS
+release, storage driver, or container runtime is not assumed equivalent.
 
 ## Protected assets
 
@@ -77,6 +84,7 @@ not assumed equivalent.
 | Visible storage content and names | Access only through the configured root, Share capability, and mutation policy |
 | Administrator credentials and MFA state | Confidentiality, replay resistance, and authenticated lifecycle changes |
 | Sessions, CSRF values, Share tokens, service tokens, and preview/unlock state | Unpredictability, correct binding, least privilege, protected transport, and revocation |
+| Upload operation IDs and receipts | Unpredictability, owner binding, hash-only persistence, bounded lifetime, single-commit semantics, and honest unknown-outcome reporting |
 | SQLite policy and accounting state | Transactional integrity, schema authenticity, and bounded resource use |
 | `secrets.keyring` and encrypted database fields | Confidentiality, exact database/keyring pairing, and atomic rotation |
 | Configuration, mount identity, and internal storage | Fail-closed validation and service-only modification |
@@ -85,6 +93,7 @@ not assumed equivalent.
 | Source, dependencies, target manifest, builder/guest images, and workflow definitions | Reviewed immutable inputs and reproducible provenance |
 | Minisign private key and publication token | Exposure only to the isolated tag-only publish job |
 | Release artifacts, SBOMs, checksums, and evidence | Exact-commit integrity, architecture identity, and verified signatures |
+| OCI image manifest and child digests | Binding to the signed release, both qualified architecture binaries, and the public pulled image |
 
 ## Threat actors and capabilities
 
@@ -93,12 +102,13 @@ not assumed equivalent.
 | Unauthenticated network client | Send malformed, slow, parallel, and spoofed requests; guess credentials and bearer links | Host, proxy, or database access |
 | Public Share holder | Exercise every operation permitted by a leaked or intentionally shared bearer link | Administrator privileges or access outside that Share |
 | Monitoring service-token holder | Read the two redacted instance-monitoring resources at the fixed `monitoring:read` scope | Existing Share/file/admin/session/public/HTML routes, mutations, paths, capability tokens, URLs, aliases, or password hashes |
-| Malicious uploader | Choose filenames, metadata, multipart framing, sizes, timing, and cancellation behavior | Direct access to protected internal staging |
+| Malicious uploader | Choose filenames, directories, metadata, multipart framing, upload IDs, sizes, timing, retry patterns, and cancellation behavior | Direct access to protected internal staging or another owner's operation |
 | Authenticated administrator | Use all documented administrator operations and see all visible storage | Host root, keyring plaintext, arbitrary audit deletion, or release authority |
 | Compromised administrator browser | Reuse browser-visible responses and submit requests within cookie and CSP constraints | Reading `HttpOnly` cookies without another browser compromise |
 | External SMB writer | Modify visible content with the server-side rights explicitly granted to its SMB identity | Access to `.vaultlink-internal`, local SQLite/keyring, or VaultLink process memory |
 | Reverse proxy | Terminate TLS and, when allowlisted, assert a validated forwarding chain | Application, database, storage, or signing authority |
 | Local unprivileged user | Interact with host resources allowed by Linux permissions | `vaultlink` uid, root, protected files, or Docker-group authority |
+| Container or cluster operator | Control image references, mounts, runtime settings, traffic routing, or pod scheduling within assigned infrastructure permissions | Independent integrity of a deployment they administer |
 | Host or storage administrator | Control the system or service inside the documented trust boundary | Independence for tamper-resistant audit evidence |
 | Repository contributor or dependency author | Propose source, workflow, lockfile, action, or container changes for review | Release tag authorization or repository-secret access by default |
 | Compromised GitHub-hosted CI job | Control its ephemeral workspace, job-scoped token, and produced artifacts | Persistence into another job or access to signing secrets and write authority not assigned to that job |
@@ -125,6 +135,13 @@ flowchart LR
     Artifacts --> Publish["Separate GitHub-hosted publish job"]
     GitHub["Protected environment, vars, tag authorization, and secrets"] --> Publish
     Publish --> Release["Signed public GitHub release"]
+    Source --> Nix["Pinned NixOS flake + host build"]
+    Release --> DockerPublish["Separate qualified OCI publish workflow"]
+    Runners --> DockerPublish
+    DockerPublish --> GHCR["GHCR multiarch index digest"]
+    GHCR --> Runtime["Docker / Kubernetes runtime"]
+    Nix --> Runtime
+    Runtime --> App
 ```
 
 | Boundary | Security decision |
@@ -139,11 +156,15 @@ flowchart LR
 | TB-08 Reviewed source to GitHub-hosted CI | Full-SHA and digest pins, one declarative target manifest, ephemeral native jobs, target builders/guests, package allowlists, and reproducibility evidence constrain build inputs; GitHub's runner, registry, and artifact isolation remain trusted |
 | TB-09 Public repository activity to secret-bearing publication | Public visibility grants read, fork, and pull-request access, not tag creation, environment approval, signing/policy secrets, or publication authority; publication additionally requires public visibility, an authorized version tag, the protected `release-signing` environment, and an admin-read proof that Immutable Releases is enabled |
 | TB-10 Maintainer authorization to release | An annotated version tag must equal the approved `main` commit, the repository must be public, environment approval must succeed, and all exact-commit evidence must pass |
+| TB-11 Upload client to durable operation | A random preissued ID is scoped to one administrator or Share, stored only by hash, and checked with current authorization; the durable commit phase prevents an uncertain response from being treated as a safe retry |
+| TB-12 Signed source or release to new runtime | NixOS builds from a pinned signed tag; OCI publication follows an immutable signed native release and binds each architecture's public image binary to exact-commit qualification. Operators pin the resulting GHCR index digest and use matching deployment files |
+| TB-13 Runtime to host state and storage | NixOS, Docker, and Kubernetes depend on private local SQLite/keyring state, an independently mounted storage root, one live instance, and a trusted host or node administrator; container isolation does not make writable volumes or the daemon an independent security boundary |
 
 ## Security invariants
 
-These properties are intended to remain true across all supported deployments.
-A change that weakens one requires an explicit threat-model review.
+These properties are intended to remain true across supported deployments and
+the reviewed 0.7.2 development design where applicable. A change that weakens one
+requires an explicit threat-model review.
 
 | ID | Invariant | Primary enforcement and evidence |
 | --- | --- | --- |
@@ -152,7 +173,7 @@ A change that weakens one requires an explicit threat-model review.
 | INV-03 | Public upload staging is never writable through the visible namespace or an external SMB identity | protected `.vaultlink-internal`, server-side ACL requirements, upload and CIFS gates |
 | INV-04 | Visible publication is atomic and never silently clobbers unless the explicit external-writer replacement risk is enabled | `renameat2` no-replace publication, overwrite policy tests, documented last-writer-wins exception |
 | INV-05 | A required-audit database mutation cannot commit without its audit row | `src/db/required_audit.rs`, transaction rollback tests |
-| INV-06 | A filesystem operation already made visible is never falsely reported as safely retryable after later audit uncertainty | `202 audit_durability_uncertain`, persistent file-operation journal, recovery tests |
+| INV-06 | A filesystem operation already made visible is never falsely reported as safely retryable after later audit or storage uncertainty | upload warning fields, terminal `outcome_unknown` for uncertain commits, persistent file-operation journal, recovery tests |
 | INV-07 | Stored application secrets require the matching protected keyring and are validated before service operation | `src/db/keyring.rs`, startup decryption probes, rotation and restart tests |
 | INV-08 | Unknown and known administrator usernames consume the same admitted Argon2 resource class | shared Argon2 semaphore and dummy hashing path in `src/http_auth.rs` and `src/services/auth/mod.rs` |
 | INV-09 | An untrusted network or local peer cannot assert another client identity through forwarding headers | Unix `SO_PEERCRED` UID allowlist or mTLS client CA and fingerprint check, then right-to-left chain validation |
@@ -163,6 +184,11 @@ A change that weakens one requires an explicit threat-model review.
 | INV-14 | Missing Minisign material, target image provisioning, matrix evidence, release evidence, or immutable-release policy proof blocks publication | fail-closed aggregate gates, admin-read pre-publication checks, and unchecked release checklist gates |
 | INV-15 | A package update cannot silently mix package database, candidate, active binary, or runtime state versions | root-only staged inputs and pinned Minisign key, exact install marker, signed new and old packages, offline dependency preflight and transaction, canonical frozen backup sources, authenticated package reinstall, preserved updater-config identity, post-recovery parity checks, and a root package/runtime `ExecStartPre` guard with bounded restart attempts before every service start |
 | INV-16 | A service token authorizes only redacted monitoring reads and no credential-bearing or mutating route | strict single-header/mixed-auth parser, fixed `monitoring:read` scope, dedicated redacted SQL/DTOs, negative route inventory, response/log/diagnostics redaction tests |
+| INV-17 | An upload ID cannot publish twice, cross owners, or turn an uncertain commit into an automatic resend | `src/upload_operation.rs`, `src/db/upload_operations.rs`, scoped hash-only records, request fingerprints, durable `committing` state, terminal `outcome_unknown`, and upload crash/retry tests |
+| INV-18 | Public uploads cannot create unbounded new directories or publish after Share revocation | schema-11 per-Share directory accounting, storage mutation guard, authority recheck before publication, quota and revocation tests |
+| INV-19 | Reverse-proxy application traffic cannot bypass authenticated peer transport | protected Unix socket with `SO_PEERCRED` UID allowlist or server/client mTLS with client-CA and leaf-fingerprint checks; loopback-only separate health listener and negative transport tests |
+| INV-20 | A 0.7.2 deployment cannot claim supported provenance from a development build or mismatched runtime | exact signed tag, pinned Nix flake revision or GHCR index digest, same-tag deployment files, native NixOS/Docker architecture gates, and public OCI binary rechecks |
+| INV-21 | A second workload cannot silently share VaultLink's state/storage pair | service-owned lock domain and mount checks, NixOS mount dependency, distinct Docker volumes or mounts, Kubernetes single replica with `Recreate`, and restart/recovery smokes |
 
 ## Threat register
 
@@ -185,6 +211,8 @@ test evidence against which each case is reviewed.
 | TM-AUTH-06 | A monitoring token reaches a privileged route or redacted monitoring data leaks Share capabilities | Exactly two mixed-auth routes, fixed scope bit, strict Authorization grammar, dedicated SQL projections and DTOs that omit token/ciphertext/path/alias/URL/password fields, complete negative route matrix | Monitoring still reveals operational counts and selected non-secret Share metadata. Reassess every new field, scope, route, or CORS behavior. |
 | TM-NET-01 | Spoofed `Forwarded` or `X-Forwarded-For` changes rate-limit or audit identity | Authenticated Unix UID or mTLS client certificate, one validated client IP shared by limits and audit, right-to-left chain validation, malformed-chain rejection | An authorized but compromised proxy can assert client identity. Reassess proxy service integrity, certificate custody and forwarding topology. |
 | TM-NET-02 | Cleartext traffic, TLS downgrade, or unsafe public binding exposes credentials | Production HTTPS validation, secure cookies, HSTS option, loopback defaults, documented proxy/standalone modes | TLS endpoint operation is outside VaultLink when a proxy terminates TLS. Reassess certificate source, bind mode, or proxy ownership. |
+| TM-NET-03 | A local user connects to a proxy socket, or a remote peer forges forwarding headers before proxy authentication | Private socket directory and mode, kernel `SO_PEERCRED` UID allowlist, or mTLS CA and leaf-fingerprint validation before HTTP; separate loopback-only health listener | An authorized proxy process or stolen client certificate remains trusted. Rotations, UID/group changes, and proxy compromise require review. Network filtering alone cannot substitute for peer authentication. |
+| TM-NET-04 | The temporary container setup HTTP endpoint or setup token becomes publicly reachable before production mTLS is active | Docker host-loopback port binding and SSH tunnel procedure; Kubernetes direct pod port-forward with unready Service, private setup token, and no external ingress until readiness and certificate checks | A cluster administrator or a user with pod-network access may reach the bootstrap listener. Operators must restrict pod networking and keep port-forwards private; setup is not a production authentication mode. |
 
 ### Filesystem, uploads, and external writers
 
@@ -196,6 +224,8 @@ test evidence against which each case is reviewed.
 | TM-FS-04 | An external SMB writer modifies content outside VaultLink policy or races publication | Dedicated SMB identity, SMB 3.1.1 signing/encryption requirement, strict mount policy, protected internal ACL, no symlink traversal, no-replace default | Direct writer changes intentionally bypass VaultLink audit/quotas. Explicit replacement mode accepts undetectable last-writer-wins loss. Reassess any new external-writer mode. |
 | TM-FS-05 | Recursive delete, crash, or rollback leaves partial or ambiguous filesystem state | Staged tombstones, durable manifests, bounded restartable cleanup, identity checks, forward recovery | Operators may need to resolve fail-closed recovery entries. Reassess journal format or mutation sequencing. |
 | TM-FS-06 | ZIP, search, preview, range, or streaming endpoints exhaust CPU, memory, descriptors, or storage | Global/per-peer semaphores, size/count/depth limits, constant-memory streaming, idle/deadline limits, bounded result sets | Limits protect the application, not upstream bandwidth. Reassess defaults with measured load and new content processors. |
+| TM-FS-07 | A public uploader creates arbitrarily deep or numerous directories to exhaust inode, listing, or cleanup capacity | Path and multipart bounds, per-Share cap of 256 newly created directories, serialized missing-component count and quota booking before creation, fail-closed accounting | Direct external SMB writers bypass this quota; directories present at migration are not backfilled. A failed creation may consume quota to avoid undercounting visible state. Reassess cap and cleanup behavior after load evidence. |
+| TM-FS-08 | Cancellation or a lost upload response leads to duplicate publication, overwrite, or an incorrect success/failure claim | Preissued owner-scoped operation ID, request fingerprint, durable `committing` transition, status lookup, terminal `outcome_unknown`, protected fragments, and browser queue that does not resend automatically | An unknown outcome may require manual inspection; the service cannot promise exactly-once filesystem effects across every crash boundary. Retained fragments and 24-hour receipts consume bounded space. |
 
 ### Database, secrets, audit, and recovery
 
@@ -206,6 +236,8 @@ test evidence against which each case is reviewed.
 | TM-DATA-03 | An administrator suppresses or rewrites evidence | Required audit is atomic with protected mutations; events mirror to journald; local retention is bounded and priority-aware | Host/root/log administrators can tamper with local evidence. Independently administered append-only or WORM forwarding is required for stronger assurance. |
 | TM-DATA-04 | An old binary, mismatched configuration, swapped rollback input, or partial backup is activated after migration, or an older restore revives a revoked service token | Forward-only schema validation, inseparable four-file backup unit, canonical symlink-free `root:root` mode-`0700` backup subtree, exact `0700`/`0600` source modes, identity-and-hash freezing before use, maintenance lock, transactional upgrade/rollback, exact health/version checks; manual-restore runbook requires stopped-service revoke-all and reissue before traffic | Manual recovery by a trusted host administrator remains possible and powerful. Skipping the token step can restore bearer access. Reassess schema, backup layout, or deployment tooling changes. |
 | TM-DATA-05 | Unbounded database, token, or audit growth causes denial of service | Bounded audit rows and retention, 64-entry service-token cap including expired rows, upload/transfer accounting, connection pool, busy timeout, bounded limiter state | Storage capacity still requires monitoring. Reassess after load tests or schema growth. |
+| TM-DATA-06 | An upload ID is guessed, replayed by another owner, leaked in a URL, or retained indefinitely | 32-byte random IDs, hash-only storage, administrator/Share scope, current session or Share authorization on status and claim, no ID in prepared-form URLs, 24-hour result expiry, per-owner and global registration caps | A stolen ID plus current owner authority can inspect or retry within its lifetime. Database and protected logs remain sensitive even without plaintext IDs; recheck new clients and status fields. |
+| TM-DATA-07 | A schema-11/12 migration, rollback, or partial restore loses upload accounting or operation state | Atomic forward migrations and schema-shape validation, paired binary/config/database/keyring backup, version checks, fail-closed unknown schema and recovery | The 0.7.1 binary cannot open schema 12; rollback needs its matching pre-migration backup. A restored old database can revive older policy state, so stop ingress and follow the recovery procedure. |
 
 ### Build, dependency, and release supply chain
 
@@ -220,6 +252,8 @@ test evidence against which each case is reviewed.
 | TM-SC-07 | Missing builder, public key, private key, password, or immutable-release policy proof causes an unsafe fallback | `UNPROVISIONED`, empty/mismatched variables, missing `release/minisign.pub`, absent signing/policy secrets, a disabled immutable-release setting, or invalid evidence all fail closed before publication | The Administration token is repository-scoped and read-only; this intentionally blocks release readiness until explicit provisioning, with no fallback. |
 | TM-SC-08 | A forged, redirected, downgraded, cross-distro, wrong-architecture, malformed, or power-interrupted package update gains root execution, serves mixed code, or prevents recovery | Fixed official GitHub path, HTTPS-only redirects, stable strict SemVer, root-only `mktemp` staging, pinned root-owned Minisign key, direct package signatures, signed global checksums, exact marker/OS/package-database binding, bounded safe package inspection, exact DEB dependency preflight and fail-closed configure-only continuation, signed Arch install/remove wrappers, exact payload version, verified old-package download, offline package-manager transaction, preserved `update.conf` presence and inode, complete restore, final version parity, and a fail-closed package/runtime guard with bounded restarts before every service start | GitHub availability and retention, the release signing key, host root, CA trust, native package manager, and installed updater remain trusted. A power loss is fail-closed but may require operator recovery from retained evidence. Key rotation is manual. Reassess repository ownership, asset retention/naming, package formats, signing, updater privileges, or release hosting. |
 | TM-SC-09 | A maintainer script, unexpected package path, dependency, mode, package-manager hook, or systemd unit expands host authority | Format-specific linter, common positive allowlist, offline lifecycle smokes, no-autostart assertion, exact file inventory, signed Arch transaction wrappers, real update-unit/package-manager VM probes, exact bounded/ambient transaction capabilities with `NoNewPrivileges=true`, an inspected zero-capability `vaultlink` child, and an SELinux-enforcing Fedora guest | The root updater intentionally needs `ProtectSystem=false` and six capabilities across native package-manager execs; all usable capabilities are dropped at the candidate UID boundary, unrelated sandboxing remains enabled, transactions have 90-minute start and 30-minute stop ceilings, and signed allowlists plus parity checks are the write boundary. Native package-manager behavior and distribution policy remain trusted. Reassess every package layout, scriptlet, dependency, service unit, capability, hook, or sandbox change. |
+| TM-SC-10 | A NixOS flake or module embeds secrets in the public store, builds from an unreviewed revision, or enables the native updater outside its package boundary | Signed tag and pinned flake lock, private config/SMB credentials outside the Nix store, static service user, mount dependency and systemd sandbox, disabled package updater, native amd64/arm64 build and booted local/SMB/upgrade guests | Nixpkgs cache, substituter trust, host configuration, and root remain trusted. The first NixOS release needs exact-commit gates and a matching tagged flake; a development checkout is not supported. |
+| TM-SC-11 | A mutable OCI tag, altered child manifest, or mismatched deployment file serves a binary different from the signed release | Separate post-release publish workflow checks immutable release and exact tag/commit, consumes both architecture qualification receipts, compares public child binaries, verifies public multiarch pulls, and records an index digest; deployment guides pin that digest and same-tag Compose/manifest files | GHCR and its availability, container registry credentials, host/container runtime, and operator-selected digest remain trusted. The 0.7.1 release has no official image; 0.7.2 publication must pass its own gates. |
 
 ### Operations and availability
 
@@ -229,12 +263,14 @@ test evidence against which each case is reviewed.
 | TM-OPS-02 | Repeated process or package/runtime parity failure resets local defenses or makes the service unavailable | systemd hardening/restart policy, root package/runtime start guard, `StartLimitIntervalSec=1h`, `StartLimitBurst=3`, fail-closed startup, soak restart gate, upstream rate limits | VaultLink is single-process and its rate-limit counters are not persistent. A remotely triggerable restart is a security defect requiring immediate review. Mixed package state remains unavailable until trusted operator recovery. |
 | TM-OPS-03 | Host service privileges are used to attack the system | Dedicated user, empty capability set by default, restrictive systemd sandbox, narrow standalone capability override | Host root is privileged by design; GitHub-hosted CI isolation and the GitHub control plane remain trusted separately. Reassess service-unit overrides. |
 | TM-OPS-04 | Operational privacy settings create misleading forensic expectations | Client-IP audit is opt-in, purge is constrained and audited, client IPs never mirror to journald | Privacy-preserving defaults reduce correlation. Operators must choose and document their lawful forensic requirements. |
+| TM-OPS-05 | A container or pod starts against an absent mount, exposes setup or health to the network, or shares writable state with another instance | Distinct private state/storage mounts, mount identity checks, loopback-only setup exposure in Docker, separate local health listener, unprivileged UID, no capabilities and read-only root; Kubernetes uses one replica, `Recreate`, local PVs and explicit readiness | Docker daemon and Kubernetes node administrators can read or replace mounted state. `ReadWriteOnce` is not a single-process lock; pod scheduling, ingress, PV source and backup pairing require operator checks. |
+| TM-OPS-06 | Rootless mode is mistaken for an unprivileged daemon, or an unsupported storage driver weakens mount/permission guarantees | Rootless-daemon check in smoke and operator procedure, Docker-managed separate local volumes, cgroup-v2 delegation check, same in-process mount and permissions audit | The dedicated rootless account, subordinate-ID configuration, volume backing filesystem, and host kernel remain trusted. Rootless CIFS bind mounts are not qualified by this variant. |
 
 ## Accepted residual risks
 
 The following are explicit design decisions, not undisclosed guarantees.
 Reconfirmed for 0.7.0 on 2026-09-04; each remains subject to its stated
-condition and review trigger:
+condition and review trigger. The 0.7.2 candidate must retain those conditions:
 
 | ID | Accepted risk | Required condition |
 | --- | --- | --- |
@@ -249,6 +285,17 @@ condition and review trigger:
 | RA-09 | Host root, storage administrators, GitHub administrators, and the GitHub control plane retain powerful trusted roles | Access is restricted, reviewed, and separated where the supported deployment requires it |
 | RA-11 | The supported source repository and release are public | Public users may read, fork, and propose changes but receive no implicit write, tag, environment-approval, signing-secret, or release authority; branch, tag, and environment protections remain mandatory |
 | RA-12 | VaultLink does not operate APT, DNF, or Pacman repositories and depends on GitHub retaining old package assets | Repository-level immutable releases protect future published assets; whole package releases are never deleted, and updates fail closed when the authenticated old package cannot be obtained |
+
+### 0.7.2 candidate residual conditions
+
+These are identified for release review, not evidence that 0.7.2 has passed
+qualification or that a new deployment target is already supported.
+
+| ID | Residual condition | Release review requirement |
+| --- | --- | --- |
+| CR-01 | An interrupted upload after entering `committing` may have changed storage or quota while the client sees `outcome_unknown` | Retain the terminal status, protected fragment and manual inspection path; verify crash, retry, quota and hash behavior before release. Do not advertise automatic exactly-once retry. |
+| CR-02 | The host, Docker daemon, Kubernetes node/PV administrator, or NixOS substituter can replace runtime or state inside its assigned trust boundary | Verify pinned tag or digest, filesystem sources, service identity, private credentials, single-instance operation, paired backups and platform-specific gates. Do not infer support for other runtimes or storage drivers. |
+| CR-03 | The GHCR image is published after the native release and has a separate availability and provenance path | Require the post-release public index/binary proof and document the digest actually pulled on both architectures before claiming official container support. |
 
 ### Closed historical risks
 
@@ -270,12 +317,18 @@ this document alone:
 - security-focused unit and integration tests for authentication, CSRF,
   WebAuthn, path handling, mount identity, upload publication, required audit,
   key rotation, and concurrency;
+- schema-11/12 migration, upload-ID scope/replay/crash recovery, directory quota,
+  proxy peer/mTLS, forwarded-header, and lost-response queue tests;
+- NixOS native amd64/arm64 build and booted local/SMB/upgrade guests, Docker
+  native architecture/rootless/Kubernetes smokes, and the separate public OCI
+  digest/binary proof when those workflows succeed for the exact candidate;
 - exact-commit nine-target package reproducibility, full-system VM, per-target
   load, staging, hardware-FIDO2, SMB, and Debian 72-hour soak gates in
-  `docs/RELEASE-CHECKLIST-0.7.1.md`.
+  `docs/RELEASE-CHECKLIST-0.7.2.md`.
 
-Passing CI validates tested controls but does not close unchecked release
-checklist items or change an accepted residual risk.
+The 0.7.2 gates and fresh Cargo.lock audit are still open. Passing individual
+CI jobs validates tested controls but does not close unchecked release
+checklist items or accept a candidate residual condition.
 
 ## Review record
 
@@ -287,6 +340,7 @@ checklist items or change an accepted residual risk.
 | 2026-08-30 | Unreleased 0.7.0 monitoring implementation | Instance-wide `monitoring:read` tokens, redacted monitoring routes, schema 7, administrator lifecycle, local revoke-all recovery, and Home Assistant trust boundary | Bearer authentication is confined to two read-only projections; token plaintext and privileged Share fields remain excluded, and older manual restores require global token revocation/reissue before traffic |
 | 2026-09-04 | Unreleased 0.7.0 review-findings implementation | Release-state truth, qualification ledger, workflow linting, security/performance findings, schema 8, and architecture gates | RA-01 through RA-09 and RA-11 through RA-12 reconfirmed for 0.7.0; release remains fail closed until the qualification ledger has no open entry |
 | 2026-09-17 | Unreleased 0.7.1 preparation | TLS dependency fix, published-artifact gap, fresh security audits and release qualification | Schema and feature trust boundaries remain unchanged; the source fix does not repair immutable 0.7.0 packages. Performance and final soak qualification remain open; the existing residual-risk conditions still apply. |
+| 2026-09-26 | `e71a9bb4fd58d5fbddbda06d115ed4865d59b81a` (unreleased 0.7.2 `main`) | Schema-11/12 directory quotas and upload IDs; authenticated Unix/mTLS proxy transport; NixOS, Docker/rootless, Kubernetes, and post-release OCI provenance | Updated TB-11 through TB-13, INV-17 through INV-21, TM-FS-07/08, TM-DATA-06/07, TM-NET-03/04, TM-SC-10/11, TM-OPS-05/06 and CR-01 through CR-03 against source, deployment files, docs, and workflow definitions. Fresh audit and release gates remain open; this source review does not qualify a release. |
 
 ## Review triggers
 
@@ -300,12 +354,14 @@ Review and update this model when any of the following changes:
 - cryptography, keyring format, encrypted fields, secret lifecycle, or the
   compensated RSA advisory conditions;
 - storage capability, mount validation, upload publication, external-writer,
-  overwrite, delete, backup, migration, or rollback semantics;
+  overwrite, upload-operation state, directory quota, delete, backup,
+  migration, or rollback semantics;
 - audit atomicity, event retention, privacy settings, journald forwarding, or
   regulatory evidence requirements;
 - repository visibility, runner trust, workflow permissions, artifact flow,
   builder image selection, repository variables, signing keys, branch/tag rules,
-  environment protection, or release evidence;
+  environment protection, Nix flake lock, OCI image/index digest, GHCR
+  publication, runtime privilege, persistent-volume layout, or release evidence;
 - a new advisory, security incident, remotely triggerable restart, failed
   invariant, or material load/soak result.
 

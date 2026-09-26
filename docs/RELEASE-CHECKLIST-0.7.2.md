@@ -15,6 +15,10 @@ The full-load and soak requirements still apply.
 
 - [ ] Review changes since v0.7.1, including schema 11 and 12 migrations,
   NixOS 26.05 support, the OCI runtime image, Cargo.lock, and all build inputs.
+- [ ] Reconfirm the [threat model](../THREAT_MODEL.md) against the final candidate,
+  including upload operation IDs, directory quotas, authenticated proxy
+  transport, and new deployment paths. Resolve its candidate residual conditions
+  before qualification.
 - [ ] Complete any required builder, QEMU, and nine-guest image refreshes before
   qualification. A Dockerfile frontend change requires all eleven images.
   Verify provenance, architectures, package inventories, generated manifest,

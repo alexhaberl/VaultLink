@@ -2,9 +2,10 @@
 
 [Back to README](../README.md)
 
-This reference covers the supported **0.7.1** release. Monitoring and
-service-token routes are new in **0.7.0** and are unavailable in the
-superseded **0.6.0** release. The Share-search change is marked separately.
+This reference describes the unreleased **0.7.2 development checkout**.
+The supported **0.7.1** release does not have the upload preparation and
+operation-ID routes or require preissued upload IDs. Monitoring and
+service-token routes are available since **0.7.0**, but not in **0.6.0**.
 Health probes and the `/api/v2` prefix are already available in 0.6.0.
 
 ## Browser routes and authentication
@@ -29,8 +30,8 @@ Health probes and the `/api/v2` prefix are already available in 0.6.0.
 | `/v/:token/unlock` | POST | unlock a password-protected Share |
 | `/v/:token/download`, `/v/:token/download.zip` | GET/HEAD | streamed file or ZIP transfer |
 | `/v/:token/upload` | POST | streamed public upload |
-| `/admin/files/upload/prepare`, `/v/:token/upload/prepare` | POST | prepare an HTML upload without JavaScript |
-| `/admin/files/upload/operations`, `/v/:token/upload/operations` | POST/GET `/:upload_id` | create and inspect an upload operation |
+| `/admin/files/upload/prepare`, `/v/:token/upload/prepare` | POST | **0.7.2 development.** Prepare an HTML upload without JavaScript |
+| `/admin/files/upload/operations`, `/v/:token/upload/operations` | POST/GET `/:upload_id` | **0.7.2 development.** Create and inspect an upload operation |
 
 `max_downloads` counts content transfers (download, ZIP, counted preview) before the first nonempty chunk is released; an empty transfer is counted at completion. An interrupted transfer may therefore already count. Public metadata/landing requests and uploads do not count. `HEAD` returns metadata only when the equivalent `GET` could begin under the current transfer session and does not itself consume quota.
 
@@ -63,7 +64,7 @@ After `/api/v2/session/mfa`, clients must retain both the rotated `Set-Cookie` v
 | `/api/v2/public/shares/:token/unlock` | POST | unlock protected Share |
 | `/api/v2/public/shares/:token/download` | GET/HEAD | safe streamed download |
 | `/api/v2/public/shares/:token/upload` | POST | safe streamed upload |
-| `/api/v2/public/shares/:token/upload/operations` | POST/GET `/:upload_id` | create and inspect an upload operation |
+| `/api/v2/public/shares/:token/upload/operations` | POST/GET `/:upload_id` | **0.7.2 development.** Create and inspect an upload operation |
 | `/api/v2/public/shares/:token/preview` | GET | safe preview |
 | `/api/v2/public/shares/:token/download.zip` | GET | safe ZIP transfer |
 
@@ -84,7 +85,7 @@ JSON errors have this envelope:
 { "error": { "code": "forbidden", "message": "..." } }
 ```
 
-### Upload operation IDs (breaking change)
+### Upload operation IDs (unreleased 0.7.2 breaking change)
 
 Opening the file browser or an upload Share does not create an upload operation. The JavaScript queue requests one ID per file when sending starts. With JavaScript disabled or unavailable, **Prepare upload** posts the current `path` and `csrf` to `/admin/files/upload/prepare` or `/v/:token/upload/prepare`. The response contains an ordinary multipart form with `upload_id` before the file input; the ID is never put in the URL. Administrator authorization and protected-Share unlock/CSRF checks still apply. The prepared form remains a single-file HTML upload and is not enhanced by the queue.
 

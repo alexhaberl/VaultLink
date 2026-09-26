@@ -1,6 +1,7 @@
 # v0.6.0 native-package release checklist
 
-Status: superseded and unsupported since 2026-09-16; upgrade to 0.7.0.
+Status: superseded and unsupported since 2026-09-16; upgrade to the currently
+supported 0.7.1 release.
 Originally published on 2026-09-01. The authoritative
 lifecycle and immutable evidence record is
 [`release/release-state.json`](../release/release-state.json).

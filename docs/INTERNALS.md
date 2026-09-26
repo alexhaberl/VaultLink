@@ -2,8 +2,9 @@
 
 [Back to README](../README.md)
 
-This reference describes the supported **0.7.1 release**. Schema and feature
-differences from the superseded **0.6.0** release are called out below.
+This reference describes the unreleased **0.7.2 development checkout** and
+identifies differences from the supported **0.7.1 release** and superseded
+**0.6.0** release where relevant.
 For supported versions and vulnerability reporting, see
 [Security Policy](../SECURITY.md).
 
