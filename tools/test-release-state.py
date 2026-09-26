@@ -45,10 +45,11 @@ def qualification() -> dict[str, object]:
     }
 
 
-def validate(root: Path, value: dict[str, object]) -> list[str]:
+def validate(root: Path, value: dict[str, object], require_ready: bool = False,
+             allowed_open: frozenset[str] = frozenset()) -> list[str]:
     write_json(root / "release/qualification-0.7.0.json", value)
     errors: list[str] = []
-    MODULE.validate_qualification("0.7.0", False, errors)
+    MODULE.validate_qualification("0.7.0", require_ready, errors, allowed_open)
     return errors
 
 
@@ -249,6 +250,16 @@ def main() -> None:
         try:
             valid = qualification()
             assert validate(root, valid) == []
+
+            pending_soak = copy.deepcopy(valid)
+            for finding in pending_soak["findings"]:  # type: ignore[union-attr]
+                finding["status"] = "closed"
+                if finding["id"] in {"PERF-001", "QUAL-006"}:
+                    finding["status"] = "open"
+            assert any("PERF-001" in error for error in validate(
+                root, pending_soak, True, frozenset({"QUAL-006"})))
+            assert validate(root, pending_soak, True,
+                            frozenset({"PERF-001", "QUAL-006"})) == []
 
             missing = copy.deepcopy(valid)
             missing["findings"].pop()  # type: ignore[union-attr]

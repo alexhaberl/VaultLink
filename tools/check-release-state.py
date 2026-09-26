@@ -246,7 +246,7 @@ def validate_evidence(value: Any, finding_id: str, errors: list[str]) -> None:
             f"evidence path is not a file or directory for {finding_id}: {value}", errors)
 
 
-def validate_qualification(development: str, require_ready: bool, errors: list[str], resolved: frozenset[str] = frozenset()) -> None:
+def validate_qualification(development: str, require_ready: bool, errors: list[str], allowed_open: frozenset[str] = frozenset()) -> None:
     path = ROOT / f"release/qualification-{development}.json"
     qualification = load_json(path)
     require(isinstance(qualification, dict), "qualification root must be an object", errors)
@@ -295,7 +295,7 @@ def validate_qualification(development: str, require_ready: bool, errors: list[s
             if status in {"closed", "accepted"}:
                 require(isinstance(evidence, list) and bool(evidence),
                         f"{status} finding lacks evidence: {finding_id}", errors)
-            if status == "open" and finding_id not in resolved:
+            if status == "open" and finding_id not in allowed_open:
                 open_findings.append(finding_id)
     require(categories == {"CI", "PERF", "QUAL", "REL", "SEC"},
             "qualification must cover CI, PERF, QUAL, REL, and SEC findings", errors)
@@ -364,7 +364,7 @@ def load_release_evidence():
     return evidence
 
 
-def validate_phase(args, errors: list[str]) -> frozenset[str]:
+def validate_phase(args, development: str, errors: list[str]) -> frozenset[str]:
     args.effective_qualification = None
     phase = args.phase
     if args.require_ready and phase == "development":
@@ -380,8 +380,14 @@ def validate_phase(args, errors: list[str]) -> frozenset[str]:
         performance_required = evidence.performance_required()
         retirement = None if performance_required else evidence.performance_policy()
         resolved = frozenset({"QUAL-001", "QUAL-006"} if performance_required else {"QUAL-006"})
+        # 0.7.2 PERF-001 describes measured soak results, which cannot exist
+        # before the soak. Keep it open in the source ledger and defer it only
+        # while starting the exact candidate. The evidence and tag phases still
+        # have to verify the complete, binary-bound soak before resolving it.
+        soak_metrics_finding = development == "0.7.2"
+        deferred = frozenset({"PERF-001"}) if soak_metrics_finding else frozenset()
         if phase == "candidate":
-            return resolved
+            return resolved | deferred
         evidence.PERF._sha256(args.expected_binary_sha256, "expected binary")
         evidence.positive(args.expected_packages_run_id, "expected packages run")
         receipt = None
@@ -402,6 +408,8 @@ def validate_phase(args, errors: list[str]) -> frozenset[str]:
             with tempfile.TemporaryDirectory() as temporary:
                 soak_receipt = evidence.verify_soak(api, args.expected_commit, args.expected_binary_sha256,
                                      Path(temporary) / "soak")
+            if soak_metrics_finding:
+                resolved |= frozenset({"PERF-001"})
         if args.output:
             args.effective_qualification = {
                 "schema_version": 2, "phase": phase, "commit": args.expected_commit,
@@ -411,10 +419,13 @@ def validate_phase(args, errors: list[str]) -> frozenset[str]:
                 "performance_retirement": retirement,
                 "soak_receipt": soak_receipt,
                 "resolved_findings": (["QUAL-001"] if performance_required else [])
-                    + (["QUAL-006"] if phase != "soak" else []),
+                    + (["QUAL-006"] if phase != "soak" else [])
+                    + (["PERF-001"] if soak_metrics_finding and phase in {"evidence", "tag"} else []),
+                "deferred_findings": (["PERF-001", "QUAL-006"] if soak_metrics_finding else ["QUAL-006"])
+                    if phase == "soak" else [],
                 "accepted_findings": [] if performance_required else ["QUAL-001"],
             }
-        return resolved
+        return resolved | (deferred if phase == "soak" else frozenset())
     except (OSError, ValueError, KeyError) as error:
         errors.append(f"release evidence: {error}")
         return frozenset()
@@ -440,8 +451,8 @@ def main() -> int:
     errors: list[str] = []
     development, supported, releases = validate_state(state, errors)
     validate_targets(state, errors)
-    resolved = validate_phase(args, errors)
-    validate_qualification(development, args.require_ready or args.phase != "development", errors, resolved)
+    allowed_open = validate_phase(args, development, errors)
+    validate_qualification(development, args.require_ready or args.phase != "development", errors, allowed_open)
     validate_docs(development, supported, releases, errors)
     if errors:
         for error in errors:

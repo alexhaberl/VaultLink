@@ -16,7 +16,7 @@
     },
     {
       "id": "SEC-001",
-      "title": "Fresh candidate security audit and schema migration review"
+      "title": "Pre-freeze lockfile audit and schema migration review"
     },
     {
       "id": "PERF-001",

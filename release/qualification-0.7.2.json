@@ -2,7 +2,7 @@
   "schema_version": 1,
   "release_version": "0.7.2",
   "release_status": "unreleased",
-  "updated_at": "2026-09-25",
+  "updated_at": "2026-09-26",
   "allowed_statuses": [
     "open",
     "closed",
@@ -34,14 +34,24 @@
     {
       "id": "CI-001",
       "title": "Reviewed build inputs and complete image pins",
-      "status": "open",
-      "evidence": []
+      "status": "closed",
+      "evidence": [
+        "release/preparation-0.7.2.md",
+        "release/package-targets.json",
+        "deploy/docker/qemu-runner-image.lock"
+      ]
     },
     {
       "id": "SEC-001",
-      "title": "Fresh candidate security audit and schema migration review",
-      "status": "open",
-      "evidence": []
+      "title": "Pre-freeze lockfile audit and schema migration review",
+      "status": "closed",
+      "evidence": [
+        "release/preparation-0.7.2.md",
+        "Cargo.lock",
+        "THREAT_MODEL.md",
+        "src/db/schema/migrations.rs",
+        "src/db/schema.rs"
+      ]
     },
     {
       "id": "PERF-001",

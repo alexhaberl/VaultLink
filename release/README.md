@@ -17,6 +17,10 @@ The current checkout is unreleased 0.7.2 development. Its
 [finding inventory](qualification-findings-0.7.2.json) track the next candidate.
 Build-input and image-pin review precedes final qualification. No 0.7.2 gate or
 72-hour soak result is claimed by the published 0.7.1 evidence.
+The [pre-freeze review](preparation-0.7.2.md) records the completed image-pin
+and source security checks. PERF-001 stays open in the committed ledger while
+the candidate and soak-start phases run. Only a verified 72-hour soak resolves
+it in the evidence and tag phases, without changing the frozen commit.
 
 The [0.7.1 checklist](../docs/RELEASE-CHECKLIST-0.7.1.md),
 [`qualification-0.7.1.json`](qualification-0.7.1.json), and independent

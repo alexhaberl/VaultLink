@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.2 — Unreleased
+## 0.7.2 — 2026-09-30
 
 - Prepare [NixOS 26.05 deployment](docs/NIXOS.md) through the repository flake
   on x86_64 and aarch64, with exact-commit build and boot checks before release.
@@ -11,9 +11,14 @@
 - Prepare [Kubernetes 1.36 deployment](docs/KUBERNETES.md) using that image and
   a single pod with separate persistent state and storage volumes. Qualify the
   manifest on both architectures before marking it supported.
-- Bound per-share public upload directories and add durable, idempotent upload
-  retries with preissued operation IDs. Schema 11 and 12 add directory counts
-  and hash-only upload operation receipts.
+- Bound per-share public upload directories and add owner-scoped operation IDs
+  for safe upload retries before commit. An interrupted commit reports an
+  explicit unknown outcome for manual inspection instead of resending the file.
+  Schema 11 and 12 add directory counts and hash-only operation receipts.
+- Authenticate reverse-proxy traffic through a private Unix peer-UID boundary
+  or mutual TLS, and accept forwarding headers only from a verified proxy.
+- Tighten transfer authorization, upload and setup recovery, and container
+  startup checks before the new deployment targets become supported.
 - Continue the nine signed native packages and the 72-hour soak requirements.
   Release qualification and publication remain pending.
 
