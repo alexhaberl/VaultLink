@@ -256,18 +256,25 @@ chmod 0700 "$runtime_internal"
 runtime_stage=production-config
 certificate_dir=/etc/vaultlink/proxy-smoke-certs
 install -d -o root -g vaultlink -m 0750 "$certificate_dir"
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+# Forced TCG must authenticate all 150 clients without spending the fixed
+# 10-second TLS handshake deadline on emulated RSA private-key operations.
+# Native package smoke still exercises RSA; this guest uses ephemeral P-256.
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 \
+    -out "$certificate_dir/ca.key" >/dev/null 2>&1
+openssl req -x509 -new -key "$certificate_dir/ca.key" -days 2 \
     -subj '/CN=VaultLink VM Smoke CA' -addext 'basicConstraints=critical,CA:TRUE' \
     -addext 'keyUsage=critical,keyCertSign,cRLSign' \
-    -keyout "$certificate_dir/ca.key" -out "$certificate_dir/ca.crt" >/dev/null 2>&1
+    -out "$certificate_dir/ca.crt" >/dev/null 2>&1
 for certificate_name in server client; do
-    openssl req -newkey rsa:2048 -nodes -subj "/CN=$certificate_name" \
-        -keyout "$certificate_dir/$certificate_name.key" \
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 \
+        -out "$certificate_dir/$certificate_name.key" >/dev/null 2>&1
+    openssl req -new -key "$certificate_dir/$certificate_name.key" \
+        -subj "/CN=$certificate_name" \
         -out "$certificate_dir/$certificate_name.csr" >/dev/null 2>&1
 done
-printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n' \
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n' \
     >"$certificate_dir/server.ext"
-printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n' \
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n' \
     >"$certificate_dir/client.ext"
 for certificate_name in server client; do
     openssl x509 -req -in "$certificate_dir/$certificate_name.csr" \
@@ -275,6 +282,10 @@ for certificate_name in server client; do
         -CAcreateserial -days 2 -extfile "$certificate_dir/$certificate_name.ext" \
         -out "$certificate_dir/$certificate_name.crt" >/dev/null 2>&1
 done
+openssl verify -verify_ip 127.0.0.1 -purpose sslserver \
+    -CAfile "$certificate_dir/ca.crt" "$certificate_dir/server.crt" >/dev/null
+openssl verify -purpose sslclient -CAfile "$certificate_dir/ca.crt" \
+    "$certificate_dir/client.crt" >/dev/null
 chown root:vaultlink "$certificate_dir/ca.crt" "$certificate_dir/server.crt"
 chmod 0640 "$certificate_dir/ca.crt" "$certificate_dir/server.crt"
 chown vaultlink:vaultlink "$certificate_dir/server.key"
