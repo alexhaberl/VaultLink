@@ -175,8 +175,12 @@ Every one of the nine targets performs:
   100/40/10 `full` load-workload evidence. The QEMU gate remains authoritative for request
   counts and statuses, transfer and upload hashes, absence of corruption,
   process and RSS limits, and all other functional and security assertions;
-  only its recorded p95 and threshold comparison are diagnostic. Forced-TCG
-  transfers have a bounded 60-minute request deadline without changing any
+  only its recorded p95 and threshold comparison are diagnostic. The forced-TCG
+  guest uses short-lived P-256 mTLS certificates so emulated RSA signing does
+  not exhaust the application's fixed 10-second handshake deadline during the
+  full burst. The native package smoke still tests RSA mTLS. This changes no
+  client or request count, deadline, status, hash, or integrity assertion.
+  Forced-TCG transfers have a bounded 60-minute request deadline without changing any
   concurrency, byte-count, status, or integrity assertion. The
   commit-bound workflow explicitly records `acceleration_policy=force-tcg` and
   `acceleration=tcg` for every target. Debian and Ubuntu test guests runtime-
