@@ -122,7 +122,7 @@
         "src/config/validation.rs",
         "src/config/tls.rs"
       ],
-      "sha256": "f3be2c4801483a1eaf1672c64ee9066d6ad9bf372e46cb28e53bfbc416fb01d4"
+      "sha256": "b95a05ef0766dd4faf865f03935afa931201e30fd0f374548bb497c13dccbff8"
     },
     {
       "name": "setup state-routes-handlers-commit-discovery-views",
@@ -134,7 +134,7 @@
         "src/setup/discovery.rs",
         "src/setup/views.rs"
       ],
-      "sha256": "33e8b8fdc0f7877dc26d62e70bf587e41eac5fa7e348df7c604e8582af35b7e5"
+      "sha256": "693668076794de1b12635639291932caebb639b7e8bd8852eb8addab930e61c0"
     },
     {
       "name": "database auth common-admins-mfa-webauthn-sessions",
