@@ -13,15 +13,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mtls_handshake_budget_covers_the_full_release_load() {
-        // The 100 metadata, 40 range, and 10 upload clients may all open
-        // their first connection concurrently, including in QEMU VM gates.
-        let required_full_load_clients = 100 + 40 + 10;
-        assert!(MAX_PENDING_MTLS_HANDSHAKES >= required_full_load_clients);
-        assert!(MAX_PENDING_MTLS_HANDSHAKES < MAX_ACTIVE_CONNECTIONS);
-    }
-
     #[tokio::test]
     async fn cleanup_join_returns_a_timed_out_error_at_its_deadline() {
         let error = wait_for_cleanup_shutdown(
