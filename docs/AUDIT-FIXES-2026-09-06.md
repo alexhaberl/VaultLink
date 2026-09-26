@@ -1,12 +1,13 @@
 # Audit fixes — 2026-09-06
 
-Subsequent maintainer decision on 2026-09-06: the comparative performance
-baseline requirement described below is deferred for 0.7.0 only. The current
-policy is recorded in [performance requirements](../release/performance/README.md).
-QUAL-001 now records that accepted deferral; the 72-hour soak remains mandatory.
-The following sections describe the earlier audit implementation and checks.
+The comparative performance baseline requirement described below was deferred
+on 2026-09-06 and retired for every release from 0.7.0 onward on 2026-09-17.
+The current policy is recorded in
+[performance requirements](../release/performance/README.md). QUAL-001 records
+that accepted retirement; the 72-hour soak remains mandatory. The following
+sections preserve the earlier audit implementation and checks.
 
-Implemented on `vaultlink/audit-fixes`, based on current main
+Implemented on `vaultlink/audit-fixes`, based on then-current main
 `440346dc41c21811393029a180e29f713efe5193` (PR #160). Main was fetched again
 before final validation and still identified this commit. The original main
 checkout and operational instances were left untouched. Docker containers used

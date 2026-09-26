@@ -10,7 +10,7 @@ transfer-admission and hosted-runner load-profile corrections.
 | [Debian 13 amd64 package smoke](https://github.com/alexhaberl/VaultLink/actions/runs/33931364844/job/101211999504) | Metadata requests received HTTP 503 during the old 100/40/10 load profile. | Serialize transfer writers before general database admission, leaving capacity for reads (`675ab3d`, already on main). |
 | [Ubuntu 24.04 amd64 package smoke](https://github.com/alexhaberl/VaultLink/actions/runs/33934131261/job/101219987611) | Metadata requests and two upload readbacks received HTTP 503; the upload POSTs themselves succeeded with HTTP 303. | The same transfer-admission correction, plus the explicit hosted-runner smoke profile (`a709438`, already on main). |
 
-The current [package workflow on main](https://github.com/alexhaberl/VaultLink/actions/runs/33996609499)
+The [package workflow on main at the time](https://github.com/alexhaberl/VaultLink/actions/runs/33996609499)
 passed all nine distribution/architecture targets. Hosted package CI uses
 50 metadata clients, 20 range downloads and five uploads. The full 100/40/10
 profile remains required for VM/soak validation, with strict performance

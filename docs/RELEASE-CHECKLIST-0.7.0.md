@@ -1,13 +1,16 @@
 # v0.7.0 native-package release checklist
 
-Status: supported package release, published on 2026-09-16. This checklist is
-separate from the withdrawn 0.5.0 and superseded 0.6.0 historical records.
+Status: published on 2026-09-16; superseded and unsupported since 2026-09-22.
+Upgrade to the supported 0.7.1 release. This checklist is a historical record,
+separate from the withdrawn 0.5.0 and superseded 0.6.0 records.
 [`release/release-state.json`](../release/release-state.json) is authoritative
 for lifecycle state, and
 [`release/qualification-0.7.0.json`](../release/qualification-0.7.0.json) is
 the frozen pre-publication review-finding record. Its open soak finding was
 resolved in effective qualification by the successful commit-bound evidence
 gates; the candidate ledger is not rewritten after publication.
+The comparative-performance deferral below records the decision at the time;
+the test was later [retired for every release from 0.7.0 onward](../release/performance/README.md).
 
 The public release was verified read-only on 2026-09-16: GitHub validates the
 signed annotated `v0.7.0` tag object
