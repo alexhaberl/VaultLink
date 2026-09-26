@@ -56,6 +56,11 @@ struct ExpectedEntry {
     is_directory: bool,
 }
 
+enum ExpectedZipError {
+    SourceChanged,
+    SizeLimit,
+}
+
 fn check_zip(payload: &[u8], control: [u8; 4]) {
     let temporary = tempfile::tempdir().unwrap();
     let directory = FixtureDirectory(temporary.path().to_owned());
@@ -92,7 +97,7 @@ fn check_zip(payload: &[u8], control: [u8; 4]) {
             bytes: if is_directory {
                 Vec::new()
             } else {
-                bytes[..bytes.len().min(scanned_len)].to_vec()
+                bytes.to_vec()
             },
             is_directory,
         });
@@ -107,19 +112,39 @@ fn check_zip(payload: &[u8], control: [u8; 4]) {
         .iter()
         .map(|entry| entry.bytes.len() as u64)
         .sum::<u64>();
-    let maximum = match control[3] % 3 {
+    let maximum = match control[3] % 4 {
         0 => 0,
         1 => actual_bytes,
-        _ => actual_bytes.saturating_sub(1),
+        2 => actual_bytes.saturating_sub(1),
+        _ => 1 + u64::from(control[3] / 4),
     };
     let plan = zip::ZipPlan {
         estimated_archive_size: zip::estimate_zip_archive_size(&files).unwrap(),
         files,
         max_data_size: maximum,
     };
+    // A source mismatch wins before reading that file; an aggregate limit can
+    // win while reading an earlier unchanged file. Successful archives must
+    // contain the complete source bytes, never a prefix of a changed source.
+    let mut preceding_bytes = 0;
+    let expected_error = expected.iter().zip(&plan.files).find_map(|(entry, file)| {
+        if entry.bytes.len() as u64 != file.scanned_len {
+            return Some(ExpectedZipError::SourceChanged);
+        }
+        preceding_bytes += entry.bytes.len() as u64;
+        (maximum != 0 && preceding_bytes > maximum).then_some(ExpectedZipError::SizeLimit)
+    });
     let archive = zip::write_zip_archive(&directory, &plan, Vec::new());
-    if maximum != 0 && actual_bytes > maximum {
-        assert!(matches!(archive, Err(zip::ZipBuildError::Limit(_))));
+    if let Some(expected_error) = expected_error {
+        match expected_error {
+            ExpectedZipError::SourceChanged => {
+                assert!(matches!(archive, Err(zip::ZipBuildError::Source(error))
+                    if error.kind() == io::ErrorKind::InvalidData))
+            }
+            ExpectedZipError::SizeLimit => {
+                assert!(matches!(archive, Err(zip::ZipBuildError::Limit(_))));
+            }
+        }
         return;
     }
     let archive = archive.unwrap();
@@ -352,6 +377,22 @@ fn check_preview_stream(payload: &[u8], repetition_control: u8) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_changes_and_size_limits_keep_the_first_failure() {
+        for payload in [b"a".as_slice(), b"abc", b"unchanged source bytes"] {
+            for controls in [
+                [2, 0, 2 << 2, 3], // Earlier size limit wins for larger payloads.
+                [2, 0, 2 << 2, 2], // Second source changed before exceeding the limit.
+                [2, 0, 2, 2],      // First source changed before any read.
+                [2, 0, 1 << 2, 2], // Second source grew beyond its plan.
+                [2, 0, 0, 2],      // Unchanged sources exceed the aggregate limit.
+                [2, 2, 0, 1],      // Directory plus exact-limit complete content.
+            ] {
+                super::check_zip(payload, controls);
+            }
+        }
+    }
+
     #[test]
     fn curated_zip_preview_seeds() {
         for seed in [
