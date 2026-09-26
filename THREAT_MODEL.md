@@ -269,8 +269,8 @@ test evidence against which each case is reviewed.
 ## Accepted residual risks
 
 The following are explicit design decisions, not undisclosed guarantees.
-They were accepted for earlier releases and remain subject to their conditions
-and review triggers. The 0.7.2 candidate must retain those conditions:
+Reconfirmed for 0.7.0 on 2026-09-04; each remains subject to its stated
+condition and review trigger. The 0.7.2 candidate must retain those conditions:
 
 | ID | Accepted risk | Required condition |
 | --- | --- | --- |
