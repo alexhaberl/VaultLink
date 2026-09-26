@@ -78,7 +78,7 @@
     },
     {
       "path": "src/route-manifest.snapshot",
-      "sha256": "d0767c6a16704ddaf70554df037fb201d316147af72bf4c21436e5a59bb36b0e",
+      "sha256": "12ea441ac7931599da50ee9d39385e4180d9957a8f904c33fe0c4be06a374c3d",
       "contract": "route, auth, MFA, CSRF, audit, body and mutation inventory"
     },
     {
@@ -88,7 +88,7 @@
     },
     {
       "path": "src/db/transfers.rs",
-      "sha256": "ed0cd9fa579ede8f3823d5005ccebad5772352d37b3639e7c0a0e9cb4b7e545c",
+      "sha256": "6d7c5e22e51aadac3c6aa2cf11d99eb46d168839c95ebaa8cdb4ebb8c3b13c0e",
       "contract": "transfer split order and common SQL helpers"
     }
   ],
@@ -101,7 +101,7 @@
         "src/i18n/messages.rs",
         "src/i18n/render.rs"
       ],
-      "sha256": "1d9f912d552201d267be2100c344a01d9d2d4c17740b185d84ccbd3cb1a6caeb"
+      "sha256": "fe4e2c143e06a18c798e8047b29d752ee3aec055ff8ddce5defda2efd0ff7953"
     },
     {
       "name": "service domain source bundle",
@@ -134,7 +134,7 @@
         "src/setup/discovery.rs",
         "src/setup/views.rs"
       ],
-      "sha256": "9718e0ec6920b6251a090e65b5febce099bcac2970c9d8f2b667cbf7e7c18cd6"
+      "sha256": "33e8b8fdc0f7877dc26d62e70bf587e41eac5fa7e348df7c604e8582af35b7e5"
     },
     {
       "name": "database auth common-admins-mfa-webauthn-sessions",
@@ -175,7 +175,7 @@
           "strip_suffix": "}\n"
         }
       ],
-      "sha256": "f27d169b1dd13326f0f8220bc435a42306f0c8588753ea39f5a688d96d5df251"
+      "sha256": "d1c81cb94b42b7c324d4e8118351f81afa67b2d7d2382ee53bd5af7818f62922"
     },
     {
       "name": "secure filesystem model-root-directory-staging-recovery",
@@ -191,7 +191,7 @@
         "src/secure_fs/recovery/delete.rs",
         "src/secure_fs/recovery/cleanup.rs"
       ],
-      "sha256": "3eda0256bc03b6b48fdc175e79572bc598c4a57ee1c4ef1af699002b00828779"
+      "sha256": "13bace8ba54683200972c3fbdb2b686ce2bed34e01e3a67e120f9b912c19fefa"
     },
     {
       "name": "web file views-mutations-browser-download-preview-upload",
@@ -204,7 +204,7 @@
         "src/web/files/admin_upload.rs",
         "src/web/files/admin_upload_flow.rs"
       ],
-      "sha256": "2c54ae040b43a98b348d2b23146058b205d5c8d802b7e4e9fd7635972fbe4750"
+      "sha256": "0371f444038940bc52e747a00872d67c7515d757f9a999e4ce0b4b13fdac6d7b"
     },
     {
       "name": "shared public upload transport and adapters",
@@ -216,7 +216,7 @@
         "src/web/public_upload/mod.rs",
         "src/web/public_upload/presenter.rs"
       ],
-      "sha256": "21d8ecf1af6dc448fd8ee8fec9cc198f32f301a81a8e506ffc13feba1b7f6325"
+      "sha256": "825a713e9bfc88803bf865ef655569d7e6ab4e1b579c6888556282e17f894b34"
     }
   ]
 }

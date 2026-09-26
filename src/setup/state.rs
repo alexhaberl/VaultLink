@@ -3,6 +3,7 @@ struct SetupState {
     config_path: Arc<PathBuf>,
     token: Arc<String>,
     commit: Arc<tokio::sync::Mutex<bool>>,
+    prepared: Arc<AtomicBool>,
     start_sender: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     start_requested: Arc<AtomicBool>,
 }

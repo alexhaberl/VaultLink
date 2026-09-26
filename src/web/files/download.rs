@@ -17,7 +17,7 @@ pub(super) async fn admin_download(
     let storage_guard = file_ops::acquire_storage_read(&state)
         .await
         .map_err(storage_recovery_app_error)?;
-    let (file, length) = tokio::task::spawn_blocking(move || {
+    let (file, length) = crate::response_work::spawn_blocking(move || {
         let _storage_guard = storage_guard;
         let file = secure_root.open_file(&open_path)?;
         let metadata = file.metadata()?;
@@ -59,7 +59,7 @@ pub(super) async fn admin_download(
         Body::empty()
     } else {
         Body::from_stream(ReaderStream::with_capacity(
-            tokio::fs::File::from_std(file),
+            crate::admitted_file::AdmittedFile::from_std(file),
             super::BUFFERED_RESPONSE_CHUNK_BYTES,
         ))
     };

@@ -78,10 +78,13 @@
     {% endfor %}
   {% endif %}
 
-  <form class="vl-stack" data-security-key-register data-csrf="{{ csrf }}">
+  <form method="post" action="/admin/account/security-keys/register/start" class="vl-stack" data-security-key-register data-csrf="{{ csrf }}">
+    <p class="vl-muted" data-security-key-script-required><vl-i18n key="account.security_key_script_required"/></p>
+    <fieldset class="vl-stack" disabled data-security-key-fields>
     <label class="vl-field"><vl-i18n key="account.security_key_label"/><input name="label" maxlength="80" required></label>
     <label class="vl-field"><vl-i18n key="account.current_password"/><input name="current_password" type="password" maxlength="1024" autocomplete="current-password" required></label>
     <button class="vl-button" type="submit"><vl-i18n key="account.security_key_add"/></button>
+    </fieldset>
     <p class="vl-muted" data-security-key-status role="status" aria-live="polite"></p>
   </form>
 </section>

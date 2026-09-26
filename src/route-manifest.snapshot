@@ -19,6 +19,7 @@ web|POST|/admin/account/security-keys/{id}/delete|AdminSession|MutationContext|F
 web|POST|/admin/files/directories|AdminSession|MutationContext|FormField|Required|Form|Storage
 web|POST|/admin/files/upload|AdminSession|MutationContext|FormField|Required|Multipart|Upload
 web|POST|/admin/files/upload/queue|AdminSession|MutationContext|FormField|Required|Multipart|Upload
+web|POST|/admin/files/upload/prepare|AdminSession|MutationContext|FormField|Required|Form|Upload
 web|POST|/admin/files/upload/operations|AdminSession|MutationContext|Header|Required|None|Upload
 web|GET|/admin/files/upload/operations/{upload_id}|AdminSession|None|None|Observation|None|ReadOnly
 web|POST|/admin/files/rename|AdminSession|MutationContext|FormField|Required|Form|Storage
@@ -62,6 +63,7 @@ web|HEAD|/v/{token}/download|ShareCapability|None|None|Required|None|ReadOnly
 web|GET|/v/{token}/download.zip|ShareCapability|None|None|Required|None|ReadOnly
 web|POST|/v/{token}/upload|ShareCapability|None|None|Required|Multipart|Upload
 web|POST|/v/{token}/upload/queue|ShareCapability|None|None|Required|Multipart|Upload
+web|POST|/v/{token}/upload/prepare|ShareCapability|None|FormField|Required|Form|Upload
 web|POST|/v/{token}/upload/operations|ShareCapability|None|Header|Required|None|Upload
 web|GET|/v/{token}/upload/operations/{upload_id}|ShareCapability|None|None|Observation|None|ReadOnly
 web|GET|/s/{alias}|Public|None|None|Observation|None|ReadOnly

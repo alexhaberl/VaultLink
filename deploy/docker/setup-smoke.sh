@@ -49,6 +49,8 @@ rm -rf "$WORK_DIR"
 mkdir -p "$ROOT_DIR/uploads" "$DATA_DIR"
 printf '%s\n' 'VaultLink setup smoke test file' > "$ROOT_DIR/readme.txt"
 
+start_container() {
+    TOKEN=""
 VAULTLINK_BIN="$BIN" \
 VAULTLINK_CONFIG_PATH="$CONFIG_PATH" \
 VAULTLINK_SETUP_ADDR="$INTERNAL_ADDR" \
@@ -63,12 +65,17 @@ if [[ -z "$TOKEN" ]]; then
     cat "$CONTAINER_LOG" >&2
     exit 1
 fi
+}
+
+start_container
+
 curl -sS -o /dev/null -w '%{http_code}' \
     -H 'Content-Type: application/json' \
     --data-binary "{\"token\":\"$TOKEN\"}" \
     "http://$PROXY_ADDR/bootstrap" | grep -qx 204
 wait_http "http://$PROXY_ADDR/" "200"
 
+submit_setup() {
 curl -sS -f -X POST "http://$PROXY_ADDR/" \
     -H "x-vaultlink-setup-token: $TOKEN" \
     --data-urlencode "server_mode=development" \
@@ -102,6 +109,26 @@ curl -sS -f -X POST "http://$PROXY_ADDR/" \
     --data-urlencode "admin_password=$ADMIN_PASSWORD" \
     --data-urlencode "admin_password_confirm=$ADMIN_PASSWORD" \
     | grep -q "Setup complete"
+
+}
+
+submit_setup
+
+# Simulate the two durable crash windows, then recover with the same inputs.
+for setup_window in pending no_admin; do
+    cleanup
+    config_before="$(sha256sum "$CONFIG_PATH")"
+    if [[ "$setup_window" == "no_admin" ]]; then
+        sqlite3 "$DATA_DIR/data.sqlite" 'DELETE FROM admins;'
+        rm -f "$DATA_DIR/.vaultlink-initial-setup.pending"
+    fi
+    start_container
+    curl -sS -X POST -H "x-vaultlink-setup-token: $TOKEN" \
+        -o /dev/null -w '%{http_code}' "http://$PROXY_ADDR/complete" | grep -qx 409
+    submit_setup
+    test "$(sha256sum "$CONFIG_PATH")" = "$config_before"
+    test -s "$DATA_DIR/.vaultlink-initial-setup.pending"
+done
 
 curl -sS -f -X POST "http://$PROXY_ADDR/complete" \
     -H "x-vaultlink-setup-token: $TOKEN" \
@@ -143,6 +170,20 @@ if curl -sS --connect-timeout 1 "http://$PROXY_ADDR/login" >/dev/null 2>&1; then
     exit 1
 fi
 kill -0 "$CONTAINER_PID"
+
+# A confirmed installation must restart as the ordinary service.
+cleanup
+TOKEN=""
+VAULTLINK_BIN="$BIN" VAULTLINK_CONFIG_PATH="$CONFIG_PATH" \
+VAULTLINK_SETUP_ADDR="$INTERNAL_ADDR" VAULTLINK_CONTAINER_ADDR="$PROXY_ADDR" \
+    "$ENTRYPOINT" >>"$CONTAINER_LOG" 2>&1 &
+CONTAINER_PID="$!"
+wait_http "http://$INTERNAL_ADDR/login" "200"
+wait_http "http://$INTERNAL_ADDR/api/v2/health/ready" "200"
+if curl -sS --connect-timeout 1 "http://$PROXY_ADDR/login" >/dev/null 2>&1; then
+    echo "Bootstrap proxy started for a confirmed installation" >&2
+    exit 1
+fi
 
 if grep -Fq "$ADMIN_PASSWORD" "$CONTAINER_LOG"; then
     echo "Smoke logs contain sensitive setup data" >&2

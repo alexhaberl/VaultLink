@@ -70,7 +70,7 @@ fn every_registered_method_has_one_complete_contract() {
         .map(|spec| (spec.surface, spec.method, spec.path))
         .collect::<HashSet<_>>();
     assert_eq!(unique.len(), specs.len(), "duplicate route method contract");
-    assert_eq!(crate::web::WEB_ROUTE_SPECS.len(), 73);
+    assert_eq!(crate::web::WEB_ROUTE_SPECS.len(), 75);
     assert_eq!(crate::api::API_ROUTE_SPECS.len(), 47);
     assert_eq!(crate::setup::SETUP_ROUTE_SPECS.len(), 13);
 
@@ -436,7 +436,14 @@ fn install_auth_contract_sessions(state: &AppState) {
     assert!(state.db().verify_mfa("verified").unwrap());
 }
 
+fn is_upload_json_route(path: &str) -> bool {
+    path == "/admin/files/upload/queue" || path.starts_with("/admin/files/upload/operations")
+}
+
 fn expected_anonymous_auth_status(spec: &RouteSpec) -> Option<StatusCode> {
+    if spec.surface == RouteSurface::Web && is_upload_json_route(spec.path) {
+        return Some(StatusCode::UNAUTHORIZED);
+    }
     match (spec.surface, spec.auth) {
         (RouteSurface::Web, AuthContract::Session | AuthContract::AdminSession) => {
             Some(StatusCode::SEE_OTHER)
@@ -609,7 +616,7 @@ async fn every_session_protected_route_rejects_an_exactly_revoked_session() {
         let expected = match (spec.surface, spec.path) {
             // The queue endpoint is a fetch/JSON transport under the web URL
             // space and intentionally preserves its stable 401 response.
-            (RouteSurface::Web, "/admin/files/upload/queue") => StatusCode::UNAUTHORIZED,
+            (RouteSurface::Web, path) if is_upload_json_route(path) => StatusCode::UNAUTHORIZED,
             (RouteSurface::Web, _) => StatusCode::SEE_OTHER,
             (RouteSurface::ApiV2, _) => StatusCode::UNAUTHORIZED,
             (RouteSurface::Setup, _) => unreachable!(),

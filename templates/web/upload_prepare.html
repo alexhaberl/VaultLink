@@ -1,0 +1,12 @@
+<section class="vl-panel vl-stack">
+  <h1><vl-i18n key="upload.files"/></h1>
+  <form method="post" enctype="multipart/form-data" action="{{ action }}" class="vl-stack">
+    <input type="hidden" name="upload_id" value="{{ upload_id }}">
+    <input type="hidden" name="path" value="{{ path }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    {% if allow_overwrite %}<label class="vl-switch"><input type="checkbox" name="overwrite_existing" value="1"><span><vl-i18n key="share.replace_existing_file"/></span></label>{% endif %}
+    <input type="file" name="file" required>
+    <button class="vl-button"><vl-i18n key="upload.securely"/></button>
+  </form>
+  <a href="{{ back_link }}"><vl-i18n key="common.back"/></a>
+</section>

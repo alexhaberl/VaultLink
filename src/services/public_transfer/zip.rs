@@ -652,6 +652,15 @@ fn write_zip_file<'a, D: DirectoryAccess, W: Write>(
     let mut source = directory
         .open_regular_file(&planned.source_path)
         .map_err(ZipBuildError::Source)?;
+    let source_changed = || {
+        ZipBuildError::Source(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zip source size changed after planning",
+        ))
+    };
+    if source.metadata().map_err(ZipBuildError::Source)?.len() != planned.scanned_len {
+        return Err(source_changed());
+    }
     let mut remaining = planned.scanned_len;
     let mut size = 0u64;
     let mut crc = crc32fast::Hasher::new();
@@ -661,8 +670,10 @@ fn write_zip_file<'a, D: DirectoryAccess, W: Write>(
             .read(&mut buffer[..wanted])
             .map_err(ZipBuildError::Source)?;
         if read == 0 {
-            break;
+            return Err(source_changed());
         }
+        #[cfg(test)]
+        crate::test_checkpoint::hit(&format!("zip-read:{}", planned.archive_name));
         remaining -= read as u64;
         size = checked_zip_data(size, read as u64, 0)?;
         *total_data = checked_zip_data(*total_data, read as u64, plan.max_data_size)?;
@@ -670,6 +681,14 @@ fn write_zip_file<'a, D: DirectoryAccess, W: Write>(
         writer
             .write_all(&buffer[..read])
             .map_err(ZipBuildError::Output)?;
+    }
+    if source
+        .read(&mut buffer[..1])
+        .map_err(ZipBuildError::Source)?
+        != 0
+        || source.metadata().map_err(ZipBuildError::Source)?.len() != planned.scanned_len
+    {
+        return Err(source_changed());
     }
     let crc = crc.finalize();
     write_streaming_descriptor(writer, crc, size).map_err(ZipBuildError::Output)?;
@@ -786,7 +805,7 @@ where
 {
     let (sender, receiver) = tokio::sync::mpsc::channel(ZIP_CHANNEL_CHUNKS);
     let error_sender = sender.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::response_work::spawn_blocking(move || {
         let _resources = resources;
         on_start();
         if let Err(error) = write_zip_archive(&directory, &plan, ZipChannelWriter::new(sender)) {
@@ -810,7 +829,7 @@ where
 }
 
 pub(crate) struct ReservedZipStream {
-    pub(crate) inner: ReaderStream<tokio::fs::File>,
+    pub(crate) inner: ReaderStream<crate::admitted_file::AdmittedFile>,
     pub(crate) _reservation: ZipTempReservation,
 }
 

@@ -389,6 +389,31 @@ fn finish_replay_fingerprint(
     Ok(data_encoding::HEXLOWER.encode(Sha256::digest(metadata).as_ref()))
 }
 
+pub(crate) enum GuardedUploadClaim {
+    Started(UploadClaimGuard),
+    Existing(crate::db::UploadOperationView),
+    Unavailable,
+}
+
+// Runs entirely inside the admitted DB worker. Dropping an unobserved result
+// releases its claim just like dropping a request that already owns it.
+pub(crate) fn claim_upload_operation(
+    database: Database,
+    scope: crate::db::UploadOperationScope,
+    id: &str,
+) -> rusqlite::Result<GuardedUploadClaim> {
+    Ok(match database.claim_upload_operation(scope, id)? {
+        crate::db::UploadOperationClaim::Started => {
+            let guard = UploadClaimGuard::new(database, id);
+            #[cfg(test)]
+            crate::test_checkpoint::hit(&format!("upload-claimed:{id}"));
+            GuardedUploadClaim::Started(guard)
+        }
+        crate::db::UploadOperationClaim::Existing(view) => GuardedUploadClaim::Existing(view),
+        crate::db::UploadOperationClaim::Unavailable => GuardedUploadClaim::Unavailable,
+    })
+}
+
 pub(crate) struct UploadClaimGuard {
     database: Database,
     id_hash: String,

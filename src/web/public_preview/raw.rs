@@ -62,6 +62,7 @@ pub(crate) async fn public_preview_raw(
         .check_availability(
             &prepared.share,
             session_token.clone(),
+            crate::http_auth::share_unlock_token(&headers, prepared.share.id),
             resource_key.clone(),
             "preview",
         )
@@ -78,6 +79,7 @@ pub(crate) async fn public_preview_raw(
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
+    let unlock_token = crate::http_auth::share_unlock_token(&headers, prepared.share.id);
     let selection = match prepared
         .select_raw(settings.max_media_preview_size, range)
         .await
@@ -91,7 +93,7 @@ pub(crate) async fn public_preview_raw(
             service
                 .begin(
                     &share,
-                    transfer_client(&state, session_token),
+                    transfer_client(&state, session_token, unlock_token),
                     resource_key,
                     "preview",
                 )
@@ -157,8 +159,10 @@ async fn validate_preview_token(
 fn transfer_client(
     state: &PublicTransferRouteState,
     session_token: Option<String>,
+    unlock_token: Option<String>,
 ) -> PublicTransferClient {
     PublicTransferClient {
+        unlock_token,
         client_key: current_client_limit_key().to_string(),
         session_token,
         audit_client_ip: runtime_settings(state)

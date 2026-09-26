@@ -364,7 +364,6 @@ fn admin_browser_template(
     summary: AdminStorageSummary,
     listing: AdminBrowserListing,
     csrf_token: String,
-    upload_id: String,
 ) -> AdminBrowserTemplate {
     let encoded_path = encoded(&request.relative);
     let current_folder_target = if request.raw.is_empty() {
@@ -394,7 +393,6 @@ fn admin_browser_template(
         up_url: parent_path(&request.relative)
             .map(|parent| format!("/admin?path={}", encoded(&parent))),
         csrf_token,
-        upload_id,
         replacements_allowed: state.config().storage.replacements_allowed(),
         upload_icon: super::templates::TrustedMarkup::static_icon(crate::ui::Icon::Upload),
         folder_icon: super::templates::TrustedMarkup::static_icon(crate::ui::Icon::Folder),
@@ -419,13 +417,6 @@ pub(super) async fn admin_browser(
     Query(query): Query<BrowseQuery>,
 ) -> Result<Html<String>> {
     let (_, session) = session(&state, &headers, true, MissingSession::RedirectToLogin).await?;
-    let admin_id = session.admin_id;
-    let upload_id = crate::http_auth::database(state.db().clone(), move |db| {
-        db.create_upload_operation(crate::db::UploadOperationScope::Admin(admin_id))
-    })
-    .await?
-    .map(|ticket| ticket.0)
-    .unwrap_or_default();
     let settings = runtime_settings(&state);
     let summary = load_admin_storage_summary(&state).await?;
     let request = AdminBrowseRequest::from_query(query)?;
@@ -436,7 +427,6 @@ pub(super) async fn admin_browser(
         summary,
         listing,
         session.csrf_token.clone(),
-        upload_id,
     );
     Ok(Html(super::templates::admin_page(
         &state,

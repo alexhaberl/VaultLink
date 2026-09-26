@@ -166,9 +166,7 @@ pub(super) struct PermitBody {
 
 pub(super) struct StreamAdmissionBody {
     pub(super) inner: Body,
-    pub(super) _permit: OwnedSemaphorePermit,
-    pub(super) _peer_permit: ClientActivityPermit,
-    pub(super) _public_permit: Option<OwnedSemaphorePermit>,
+    pub(super) _admission: crate::response_work::ResponseWorkAdmission,
     pub(super) deadline: Pin<Box<tokio::time::Sleep>>,
     pub(super) minimum_progress: MinimumProgress,
     pub(super) transferred_data_bytes: u64,
@@ -179,8 +177,7 @@ pub(super) struct StreamAdmissionBody {
 
 pub(super) struct BufferedAdmissionBody {
     pub(super) inner: Body,
-    pub(super) _permit: OwnedSemaphorePermit,
-    pub(super) _peer_permit: ClientActivityPermit,
+    pub(super) _admission: crate::response_work::ResponseWorkAdmission,
     pub(super) pending: Option<Bytes>,
     pub(super) complete: bool,
     pub(super) deadline: Pin<Box<tokio::time::Sleep>>,
@@ -419,19 +416,16 @@ fn try_buffered_permits(
 fn wrap_streaming_response(
     state: &AdmissionRouteState,
     response: Response,
-    permits: ResponseBodyPermits,
+    admission: crate::response_work::ResponseWorkAdmission,
     operation: &'static str,
     public: bool,
 ) -> Response {
-    let (body_permit, body_peer_permit, public_body_permit) = permits;
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
         Body::new(StreamAdmissionBody {
             inner: body,
-            _permit: body_permit,
-            _peer_permit: body_peer_permit,
-            _public_permit: public_body_permit,
+            _admission: admission,
             deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(
                 state.config().admission.stream_max_duration_seconds,
             ))),
@@ -448,20 +442,18 @@ fn wrap_streaming_response(
 
 fn wrap_buffered_response(
     mut response: Response,
-    permits: ResponseBodyPermits,
+    admission: crate::response_work::ResponseWorkAdmission,
     head_request: bool,
 ) -> Response {
     if !head_request {
         response.headers_mut().remove(header::CONTENT_LENGTH);
     }
-    let (body_permit, body_peer_permit, _) = permits;
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
         Body::new(BufferedAdmissionBody {
             inner: body,
-            _permit: body_permit,
-            _peer_permit: body_peer_permit,
+            _admission: admission,
             pending: None,
             complete: false,
             deadline: Box::pin(tokio::time::sleep(BUFFERED_RESPONSE_MAX_LIFETIME)),
@@ -471,7 +463,7 @@ fn wrap_buffered_response(
 
 pub(super) async fn response_admission(
     State(state): State<AdmissionRouteState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let permit = match state.try_acquire_response() {
@@ -494,18 +486,20 @@ pub(super) async fn response_admission(
         Err(rejection) => return rejection.into_response(),
     };
 
-    let response = next.run(request).await;
+    let admission = crate::response_work::ResponseWorkAdmission::new(body_permits);
+    request.extensions_mut().insert(admission.clone());
+    let response = admission.clone().scope(next.run(request)).await;
     drop(permit);
     if streaming {
         wrap_streaming_response(
             &state,
             response,
-            body_permits,
+            admission,
             stream_operation,
             public_streaming,
         )
     } else {
-        wrap_buffered_response(response, body_permits, head_request)
+        wrap_buffered_response(response, admission, head_request)
     }
 }
 

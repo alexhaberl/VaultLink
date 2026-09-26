@@ -121,7 +121,6 @@ struct PublicUploadView {
     queue_url: String,
     operation_url: String,
     csrf: String,
-    upload_id: String,
     allow_overwrite: bool,
     upload_icon: TrustedMarkup,
     folder_icon: TrustedMarkup,

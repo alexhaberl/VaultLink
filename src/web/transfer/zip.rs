@@ -119,6 +119,7 @@ async fn begin_zip_resources(
     };
     let session_token = transfer_cookie(headers, prepared.share.id).map(str::to_owned);
     let client = PublicTransferClient {
+        unlock_token: crate::http_auth::share_unlock_token(headers, prepared.share.id),
         client_key: current_client_limit_key().to_string(),
         session_token,
         audit_client_ip: runtime_settings(state)
@@ -284,7 +285,7 @@ fn materialized_body(
         Body::from_stream(transfer_stream(
             ReservedZipStream {
                 inner: ReaderStream::with_capacity(
-                    tokio::fs::File::from_std(file),
+                    crate::admitted_file::AdmittedFile::from_std(file),
                     BUFFERED_RESPONSE_CHUNK_BYTES,
                 ),
                 _reservation: reservation,

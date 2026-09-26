@@ -69,20 +69,12 @@ pub(in crate::web) async fn public_page(
         None
     };
     let upload = if share.is_directory && share.permission.can_upload() {
-        let share_id = share.id;
-        let upload_id = crate::http_auth::database(state.db().clone(), move |db| {
-            db.create_upload_operation(crate::db::UploadOperationScope::Share(share_id))
-        })
-        .await?
-        .map(|ticket| ticket.0)
-        .unwrap_or_default();
         Some(build_upload_view(
             &state,
             &token,
             &share,
             &query,
             upload_csrf,
-            upload_id,
         )?)
     } else {
         None
@@ -555,7 +547,6 @@ fn build_upload_view(
     share: &Share,
     query: &BrowseQuery,
     csrf: Option<String>,
-    upload_id: String,
 ) -> Result<PublicUploadView> {
     let path = if share.permission.can_download() {
         path_security::validate_relative(query.path.as_deref().unwrap_or_default())
@@ -577,7 +568,6 @@ fn build_upload_view(
         queue_url: format!("/v/{token}/upload/queue"),
         operation_url: format!("/v/{token}/upload/operations"),
         csrf: csrf.unwrap_or_default(),
-        upload_id,
         allow_overwrite: share.upload_conflict_strategy.can_overwrite()
             && state.config().storage.replacements_allowed(),
         upload_icon: TrustedMarkup::static_icon(crate::ui::Icon::Upload),

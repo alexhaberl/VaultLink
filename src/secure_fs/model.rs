@@ -239,6 +239,8 @@ pub enum DirectoryScanItem {
 /// A continuation-preserving directory iterator. Unlike offset pagination, it
 /// never rescans entries that were already consumed.
 pub struct DirectoryScan {
+    #[cfg(test)]
+    injected_error: Option<io::ErrorKind>,
     entries: std::fs::ReadDir,
     directory: File,
     strict_mount_boundary: bool,

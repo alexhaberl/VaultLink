@@ -13,23 +13,47 @@ impl Database {
         resource_key: &str,
         action: &str,
     ) -> rusqlite::Result<TransferLeaseBeginOutcome> {
-        let (now, expires) = transfer_deadlines();
+        self.begin_authorized_transfer_lease(
+            session_token,
+            lease_token,
+            TransferAuthorization {
+                share_id,
+                unlock_token: None,
+            },
+            resource_key,
+            action,
+        )
+    }
+
+    pub fn begin_authorized_transfer_lease(
+        &self,
+        session_token: &str,
+        lease_token: &str,
+        authorization: TransferAuthorization<'_>,
+        resource_key: &str,
+        action: &str,
+    ) -> rusqlite::Result<TransferLeaseBeginOutcome> {
+        let share_id = authorization.share_id;
         let session_token_hash = token_hash(session_token);
         let lease_token_hash = token_hash(lease_token);
         let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (now, expires) = transfer_deadlines();
         cleanup_transfer_state(&transaction, &now)?;
         let access = transfer_access_state(
             &transaction,
             &session_token_hash,
-            share_id,
+            authorization,
             resource_key,
             action,
             &now,
         )?;
 
         match access {
+            TransferAccessState::Unauthorized => {
+                return Ok(TransferLeaseBeginOutcome::Unauthorized)
+            }
             TransferAccessState::ExistingGrant { grant_id, counted } => {
                 if !counted {
                     transaction.execute(
@@ -92,21 +116,40 @@ impl Database {
         resource_key: &str,
         action: &str,
     ) -> rusqlite::Result<TransferAvailabilityOutcome> {
-        let (now, _) = transfer_deadlines();
+        self.check_authorized_transfer_availability(
+            session_token,
+            TransferAuthorization {
+                share_id,
+                unlock_token: None,
+            },
+            resource_key,
+            action,
+        )
+    }
+
+    pub fn check_authorized_transfer_availability(
+        &self,
+        session_token: &str,
+        authorization: TransferAuthorization<'_>,
+        resource_key: &str,
+        action: &str,
+    ) -> rusqlite::Result<TransferAvailabilityOutcome> {
         let session_token_hash = token_hash(session_token);
         let mut connection = self.try_conn()?;
         // A preflight must not compete with lease creation/heartbeats for the
         // writer. One read snapshot keeps share limits and grants consistent;
         // begin_transfer_lease still reserves quota in an immediate transaction.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let (now, _) = transfer_deadlines();
         let outcome = match transfer_access_state(
             &transaction,
             &session_token_hash,
-            share_id,
+            authorization,
             resource_key,
             action,
             &now,
         )? {
+            TransferAccessState::Unauthorized => TransferAvailabilityOutcome::Unauthorized,
             TransferAccessState::Available => TransferAvailabilityOutcome::Available,
             TransferAccessState::ExistingGrant { counted: true, .. } => {
                 TransferAvailabilityOutcome::AlreadyCounted

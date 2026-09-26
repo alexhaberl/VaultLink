@@ -16,6 +16,7 @@ mod tests {
             config_path: Arc::new(config_path),
             token: Arc::new("token".into()),
             commit: Arc::new(tokio::sync::Mutex::new(false)),
+            prepared: Arc::new(AtomicBool::new(false)),
             start_sender: Arc::new(tokio::sync::Mutex::new(Some(start_sender))),
             start_requested: Arc::new(AtomicBool::new(false)),
         }
@@ -908,6 +909,7 @@ mod tests {
             config_path: Arc::new(config_path),
             token: Arc::new("token".into()),
             commit: Arc::new(tokio::sync::Mutex::new(true)),
+            prepared: Arc::new(AtomicBool::new(true)),
             start_sender: Arc::new(tokio::sync::Mutex::new(Some(start_sender))),
             start_requested: requested.clone(),
         };
@@ -1078,10 +1080,13 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         let config_path = config_dir.path().join("config.toml");
+        assert!(needs_setup(&config_path).unwrap());
         build_and_store(&config_path, form(root.path(), data.path()))
             .await
             .unwrap();
         std::fs::remove_file(data.path().join("data.sqlite")).unwrap();
+        clear_initial_setup_pending(data.path()).unwrap();
+        assert!(needs_setup(&config_path).unwrap());
 
         build_and_store(&config_path, form(root.path(), data.path()))
             .await
@@ -1101,6 +1106,17 @@ mod tests {
             .await
             .unwrap();
         assert!(initial_setup_pending_path(data.path()).is_file());
+        assert!(needs_setup(&config_path).unwrap());
+        let state = test_setup_state(config_path.clone());
+        assert_eq!(
+            complete_setup(State(state), setup_headers()).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert!(initial_setup_pending_path(data.path()).is_file());
+        let mut wrong = form(root.path(), data.path());
+        wrong.admin_password = SecretString::new("different-long-password".into());
+        wrong.admin_password_confirm = SecretString::new("different-long-password".into());
+        assert!(build_and_store(&config_path, wrong).await.is_err());
         let recovered = build_and_store(&config_path, form(root.path(), data.path()))
             .await
             .unwrap();
@@ -1111,10 +1127,33 @@ mod tests {
 
         clear_initial_setup_pending(data.path()).unwrap();
         assert!(!initial_setup_pending_path(data.path()).exists());
+        assert!(!needs_setup(&config_path).unwrap());
         assert!(
             build_and_store(&config_path, form(root.path(), data.path()))
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn container_start_rejects_corrupt_database_and_pending_marker() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.toml");
+        build_and_store(&config_path, form(root.path(), data.path()))
+            .await
+            .unwrap();
+        let marker = initial_setup_pending_path(data.path());
+        for invalid in ["", "wrong admin", "different-admin"] {
+            std::fs::write(&marker, invalid).unwrap();
+            assert!(needs_setup(&config_path).is_err());
+        }
+        std::fs::remove_file(&marker).unwrap();
+        symlink(data.path().join("missing"), &marker).unwrap();
+        assert!(needs_setup(&config_path).is_err());
+        std::fs::remove_file(marker).unwrap();
+        std::fs::write(data.path().join("data.sqlite"), b"not a database").unwrap();
+        assert!(needs_setup(&config_path).is_err());
     }
 }

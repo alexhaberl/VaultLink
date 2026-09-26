@@ -346,7 +346,7 @@ async fn serve_connection(
     peer: IpAddr,
     setup_upstream: SocketAddr,
     policy: ProxyPolicy,
-    _lease: ConnectionLease,
+    lease: ConnectionLease,
     header_timeout: Duration,
 ) {
     let service =
@@ -358,7 +358,10 @@ async fn serve_connection(
         .max_headers(64)
         .max_buf_size(64 * 1024);
     if let Err(error) = builder
-        .serve_connection(TokioIo::new(stream), service)
+        .serve_connection(
+            TokioIo::new(crate::transport::ConnectionLimitedIo::new(stream, lease)),
+            service,
+        )
         .await
     {
         tracing::debug!(%peer, %error, "container proxy connection closed");
@@ -797,5 +800,52 @@ GET /second HTTP/1.1\r\nHost: vaultlink\r\nX-Forwarded-For: 203.0.113.77\r\n\r\n
         assert!(admission
             .try_acquire("198.51.100.42".parse().unwrap(), false)
             .is_some());
+    }
+    #[tokio::test]
+    async fn stalled_response_write_releases_global_and_peer_connection_slots() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let service = service_fn(|_: Request<Incoming>| async {
+                Ok::<_, Infallible>(Response::new(Full::new(axum::body::Bytes::from(
+                    vec![b'x'; 16 * 1024 * 1024],
+                ))))
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let upstream_guard = AbortTaskOnDrop(upstream_task);
+        let (mut client, stream) = tcp_pair().await;
+        let admission = ConnectionAdmission::new(1, 1);
+        let peer = "198.51.100.43".parse().unwrap();
+        let lease = admission.try_acquire(peer, false).unwrap();
+        client
+            .write_all(b"GET /large HTTP/1.1\r\nHost: vaultlink\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(admission.try_acquire(peer, false).is_none());
+        // Keep the downstream socket open without reading its response. This
+        // exercises the real proxy, its TCP writer and the production 30s limit.
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            serve_connection(
+                stream,
+                peer,
+                upstream_address,
+                ProxyPolicy::default(),
+                lease,
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(admission.state().active, 0);
+        assert!(!admission.state().peers.contains_key(&peer));
+        assert!(admission.try_acquire(peer, false).is_some());
+        drop(client);
+        drop(upstream_guard);
     }
 }

@@ -2,7 +2,7 @@ use askama::Template;
 use axum::{
     extract::{Form, Json, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use chrono::{Duration, Utc};
 use serde::Deserialize;
@@ -101,9 +101,12 @@ pub(super) async fn login(
 pub(super) async fn mfa_page(
     State(state): State<AuthRouteState>,
     headers: HeaderMap,
-) -> Result<Html<String>> {
+) -> Result<Response> {
     let (_, current_session) =
         session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
+    if current_session.mfa_verified {
+        return Ok(Redirect::to("/admin").into_response());
+    }
     let admin_id = current_session.admin_id;
     let username = current_session.username.clone();
     let (security_key_count, totp_enabled) = database(state.db().clone(), move |db| {
@@ -121,7 +124,8 @@ pub(super) async fn mfa_page(
             security_key_enabled: security_key_count >= 2,
             totp_enabled,
         },
-    )?))
+    )?)
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -137,6 +141,9 @@ pub(super) async fn mfa(
 ) -> Result<Response> {
     let (token, s) = session(&state, &headers, false, MissingSession::RedirectToLogin).await?;
     csrf(&s, &form.csrf)?;
+    if s.mfa_verified {
+        return Ok(Redirect::to("/admin").into_response());
+    }
     let key = format!("mfa:{}", s.username.to_lowercase());
     if !state.login_limiter().check_and_record_attempt(&key) {
         return Err(AppError(

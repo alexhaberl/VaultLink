@@ -29,9 +29,10 @@ Health probes and the `/api/v2` prefix are already available in 0.6.0.
 | `/v/:token/unlock` | POST | unlock a password-protected Share |
 | `/v/:token/download`, `/v/:token/download.zip` | GET/HEAD | streamed file or ZIP transfer |
 | `/v/:token/upload` | POST | streamed public upload |
+| `/admin/files/upload/prepare`, `/v/:token/upload/prepare` | POST | prepare an HTML upload without JavaScript |
 | `/admin/files/upload/operations`, `/v/:token/upload/operations` | POST/GET `/:upload_id` | create and inspect an upload operation |
 
-`max_downloads` counts completed content transfers (download, ZIP, counted preview), not public metadata/landing requests or uploads. `HEAD` returns metadata only when the equivalent `GET` could begin under the current transfer session and does not itself consume quota.
+`max_downloads` counts content transfers (download, ZIP, counted preview) before the first nonempty chunk is released; an empty transfer is counted at completion. An interrupted transfer may therefore already count. Public metadata/landing requests and uploads do not count. `HEAD` returns metadata only when the equivalent `GET` could begin under the current transfer session and does not itself consume quota.
 
 The JSON API under `/api/v2` normally uses the same secure cookies, MFA sessions, CSRF rules, SecureFS access, SQLite operations, and audit events as the HTML UI. Mutating administrator API routes require `X-CSRF-Token`. Since 0.7.0, the only bearer-token exception is read-only access to `/api/v2/monitoring/summary` and `/api/v2/monitoring/shares` with an instance-wide `monitoring:read` token. Every `/api/v2` error message is English regardless of locale cookie or `Accept-Language`.
 
@@ -84,6 +85,10 @@ JSON errors have this envelope:
 ```
 
 ### Upload operation IDs (breaking change)
+
+Opening the file browser or an upload Share does not create an upload operation. The JavaScript queue requests one ID per file when sending starts. With JavaScript disabled or unavailable, **Prepare upload** posts the current `path` and `csrf` to `/admin/files/upload/prepare` or `/v/:token/upload/prepare`. The response contains an ordinary multipart form with `upload_id` before the file input; the ID is never put in the URL. Administrator authorization and protected-Share unlock/CSRF checks still apply. The prepared form remains a single-file HTML upload and is not enhanced by the queue.
+
+Administrator ticket, queue and status endpoints return JSON `401` on session loss. The queue stops, retains existing IDs and offers sign-in followed by an explicit status check. It does not send another file, replace an ID or reuse stale CSRF after authentication is lost. If the stored operation is safely retryable after signing in, reload the page and select the file again.
 
 Every new logical upload, including API uploads, must first create an operation with `POST` to the corresponding `/upload/operations` route. The response is HTTP `201` with `upload_id`, `expires_at`, and `status_url`. Administrator creation requires an MFA session and `X-CSRF-Token`; a password-protected public Share requires its unlock session and `X-VaultLink-Upload-CSRF`. Each status `GET` rechecks the current session or Share permission and unlock state.
 

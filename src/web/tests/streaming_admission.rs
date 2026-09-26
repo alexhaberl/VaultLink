@@ -955,8 +955,11 @@ async fn response_body_wrappers_chunk_buffered_data_and_deadline_streams() {
     let input = vec![7u8; BUFFERED_RESPONSE_CHUNK_BYTES * 2 + 17];
     let body = Body::new(BufferedAdmissionBody {
         inner: Body::from(input.clone()),
-        _permit: buffered_permit,
-        _peer_permit: buffered_peer,
+        _admission: crate::response_work::ResponseWorkAdmission::new((
+            buffered_permit,
+            buffered_peer,
+            None,
+        )),
         pending: None,
         complete: false,
         deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(1))),
@@ -978,9 +981,11 @@ async fn response_body_wrappers_chunk_buffered_data_and_deadline_streams() {
     let stream_peer = try_acquire_client_activity(counts.clone(), peer, 1).unwrap();
     let body = Body::new(StreamAdmissionBody {
         inner: Body::from_stream(futures_util::stream::pending::<io::Result<Bytes>>()),
-        _permit: stream_permit,
-        _peer_permit: stream_peer,
-        _public_permit: None,
+        _admission: crate::response_work::ResponseWorkAdmission::new((
+            stream_permit,
+            stream_peer,
+            None,
+        )),
         deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))),
         minimum_progress: MinimumProgress::with_intervals(
             1,
@@ -1027,9 +1032,7 @@ async fn timed_out_started_stream_drops_its_producer_immediately() {
     let peer_permit = try_acquire_client_activity(counts, peer, 1).unwrap();
     let body = Body::new(StreamAdmissionBody {
         inner: Body::from_stream(producer),
-        _permit: permit,
-        _peer_permit: peer_permit,
-        _public_permit: None,
+        _admission: crate::response_work::ResponseWorkAdmission::new((permit, peer_permit, None)),
         deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_millis(10))),
         minimum_progress: MinimumProgress::with_intervals(
             1,

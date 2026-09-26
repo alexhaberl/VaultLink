@@ -77,12 +77,15 @@ async fn submit_setup(
     }
     match build_and_store(&state.config_path, form).await {
         Ok(result) => match TrustedMarkup::generated_qr(result.otpauth.expose_secret()) {
-            Ok(qr) => Html(page_without_locale_switcher(&SetupCompletedTemplate {
-                qr: &qr,
-                secret: result.totp_secret.expose_secret(),
-                otpauth: result.otpauth.expose_secret(),
-            }))
-            .into_response(),
+            Ok(qr) => {
+                state.prepared.store(true, Ordering::Release);
+                Html(page_without_locale_switcher(&SetupCompletedTemplate {
+                    qr: &qr,
+                    secret: result.totp_secret.expose_secret(),
+                    otpauth: result.otpauth.expose_secret(),
+                }))
+                .into_response()
+            }
             Err(error) => setup_internal(InternalOperation::SetupQrRender, error),
         },
         Err(error) => (
@@ -116,6 +119,9 @@ async fn complete_setup(State(state): State<SetupState>, headers: HeaderMap) -> 
             .into_response(),
             Err(error) => setup_internal(InternalOperation::SetupConfigLoad, error),
         };
+    }
+    if !state.prepared.load(Ordering::Acquire) {
+        return StatusCode::CONFLICT.into_response();
     }
     let config = match Config::load(state.config_path.as_ref()) {
         Ok(config) => config,

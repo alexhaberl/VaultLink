@@ -183,3 +183,31 @@ pub(super) async fn upload_queue(
         )),
     }
 }
+
+pub(super) async fn prepare_upload(
+    State(state): State<PublicUploadRouteState>,
+    mut headers: HeaderMap,
+    AxPath(token): AxPath<String>,
+    axum::extract::Form(form): axum::extract::Form<super::upload_prepare::UploadPrepareForm>,
+) -> Result<axum::response::Html<String>> {
+    let state = state.into_upload_context();
+    let (upload_id, path, allow_overwrite) =
+        crate::public_upload_transport::prepare_public_upload_operation(
+            &state,
+            &mut headers,
+            &token,
+            &form.path,
+            &form.csrf,
+        )
+        .await
+        .map_err(|error| transport_error(&error))?;
+    super::upload_prepare::PreparedUploadTemplate {
+        action: format!("/v/{token}/upload"),
+        back_link: format!("/v/{token}"),
+        path,
+        csrf: form.csrf,
+        upload_id,
+        allow_overwrite,
+    }
+    .render_page()
+}

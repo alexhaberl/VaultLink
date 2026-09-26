@@ -4,6 +4,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("VaultLink supports Linux only");
 
+mod admitted_file;
 pub mod api;
 pub mod auth;
 mod best_effort_telemetry;
@@ -30,6 +31,7 @@ pub mod proxy;
 pub(crate) mod public_upload_transport;
 pub mod range;
 mod readiness;
+mod response_work;
 #[cfg(test)]
 mod route_inventory_tests;
 pub mod routing;
@@ -50,6 +52,8 @@ mod template_policy_tests;
 #[cfg(test)]
 mod test_support;
 pub mod tls_files;
+#[doc(hidden)]
+pub mod transport;
 pub mod ui;
 pub mod updates;
 pub(crate) mod upload_operation;
@@ -792,3 +796,6 @@ mod tests {
         assert!(!root.join(DEFAULT_INTERNAL_DIRECTORY_NAME).exists());
     }
 }
+
+#[cfg(test)]
+mod test_checkpoint;

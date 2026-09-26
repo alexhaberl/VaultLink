@@ -1,6 +1,6 @@
 use super::{
     insert_required_audits, token_hash, trace_required_audits, AuditAction, AuditContext, Audited,
-    Database, Permission, RequiredAuditEvent, TransferAvailabilityOutcome,
+    Database, Permission, RequiredAuditEvent, TransferAuthorization, TransferAvailabilityOutcome,
     TransferLeaseBeginOutcome, TransferLeaseCancelOutcome, TransferLeaseCompleteOutcome,
     TransferLeaseHeartbeatOutcome, TransferMonthlyCounts, UploadReservationBeginOutcome,
     UploadReservationCommitOutcome, UploadReservationExtendOutcome, MAX_SQLITE_UNSIGNED,
@@ -13,6 +13,7 @@ const UPLOAD_RESERVATION_TTL_SECONDS: i64 = 15 * 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransferAccessState {
+    Unauthorized,
     Available,
     ExistingGrant { grant_id: i64, counted: bool },
     LimitReached,
@@ -144,23 +145,45 @@ fn available_upload_share_total_limit(
 fn transfer_access_state(
     connection: &Connection,
     session_token_hash: &str,
-    share_id: i64,
+    authorization: TransferAuthorization<'_>,
     resource_key: &str,
     action: &str,
     now: &str,
 ) -> rusqlite::Result<TransferAccessState> {
+    let share_id = authorization.share_id;
     let share = connection
         .query_row(
-            "SELECT max_downloads,download_count FROM shares
+            "SELECT max_downloads,download_count,password_hash IS NOT NULL FROM shares
              WHERE id=?1 AND active=1 AND (expires_at IS NULL OR expires_at>?2)
                AND permission IN ('download_only','download_upload')",
             params![share_id, now],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((max_downloads, download_count)) = share else {
+    let Some((max_downloads, download_count, protected)) = share else {
         return Ok(TransferAccessState::ShareUnavailable);
     };
+
+    if protected {
+        let authorized = if let Some(token) = authorization.unlock_token {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM public_unlock_sessions WHERE token_hash=?1 AND share_id=?2 AND expires_at>?3)",
+                params![token_hash(token), share_id, now],
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
+        if !authorized {
+            return Ok(TransferAccessState::Unauthorized);
+        }
+    }
 
     let existing_grant = connection
         .query_row(

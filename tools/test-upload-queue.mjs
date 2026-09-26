@@ -170,3 +170,80 @@ await runScenario("contradictory warning fields", 200, async () => ({
   file: "empty.txt", outcome: "created", warning: "audit_durability_uncertain", warnings: []
 }), auditOnlyWarningText, storedAudit);
 console.log("Upload queue issues one ID per file and resolves uncertain responses via status");
+
+async function authenticationScenario(phase, status, redirected = false, storedState = "completed") {
+  const form = new Form();
+  form.dataset.queueEndpoint = "/admin/files/upload/queue";
+  form.dataset.operationEndpoint = "/admin/files/upload/operations";
+  const input = new Input();
+  const list = new Element();
+  const submit = new Button();
+  form.elementsBySelector.set("[data-upload-input]", input);
+  form.elementsBySelector.set("[data-upload-list]", list);
+  form.elementsBySelector.set("[data-upload-submit]", submit);
+  const document = {
+    readyState: "complete", documentElement: { lang: "en" },
+    querySelectorAll: () => [form],
+    createElement: (tag) => tag === "button" ? new Button() : new Element(tag),
+    createDocumentFragment: () => new Element("fragment")
+  };
+  const calls = [];
+  let signedInAgain = false;
+  const id = "b".repeat(43);
+  const response = (status, payload, redirected = false) => ({
+    status, ok: status >= 200 && status < 300, redirected,
+    json: async () => payload, clone() { return this; }
+  });
+  const fetch = async (url, options) => {
+    calls.push([url, options.method]);
+    const endpoint = url === form.dataset.operationEndpoint ? "ticket"
+      : url === form.dataset.queueEndpoint ? "upload" : "status";
+    if (endpoint === phase && !signedInAgain) return response(status, { error: "mfa_required" }, redirected);
+    if (endpoint === "ticket") return response(201, { upload_id: id, status_url: `${url}/${id}` });
+    if (endpoint === "upload") {
+      assert.equal(options.headers["Idempotency-Key"], id);
+      throw new TypeError("lost response");
+    }
+    assert.equal(url, `${form.dataset.operationEndpoint}/${id}`, "the original ID survives session loss");
+    return response(200, { state: storedState, result: { file: "first.txt", outcome: "created" } });
+  };
+  runInNewContext(source, {
+    document, fetch, console, File, FormData, HTMLElement: Element,
+    HTMLFormElement: Form, HTMLInputElement: Input, HTMLButtonElement: Button
+  });
+  const idle = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (let i = 0; i < 30 && form.attributes.get("aria-busy") !== "false"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+  input.files = [new File("first.txt"), new File("second.txt")];
+  input.dispatch("change");
+  form.dispatch("submit", { preventDefault() {} });
+  await idle();
+  assert.equal(list.children[0].dataset.state, "authentication", `${phase}/${status}`);
+  assert.equal(list.children[1].dataset.state, "ready", "remaining files must stop");
+  assert.equal(submit.disabled, true);
+  const actions = list.children[0].children[1].children;
+  assert.equal(actions[0].href, "/login");
+  const before = calls.length;
+  form.dispatch("submit", { preventDefault() {} });
+  await idle();
+  assert.equal(calls.length, before, "never submit again with stale CSRF");
+  if (phase !== "ticket") {
+    signedInAgain = true;
+    actions[1].dispatch("click");
+    await idle();
+    assert.equal(list.children[0].dataset.state, storedState === "completed" ? "success" : "reselect");
+    assert.equal(calls.length, before + 1, "reauthentication permits only an explicit status GET");
+    assert.equal(calls.filter(([url]) => url === form.dataset.operationEndpoint).length, 1);
+  }
+}
+
+await authenticationScenario("ticket", 401);
+await authenticationScenario("ticket", 200, true);
+await authenticationScenario("upload", 401);
+await authenticationScenario("upload", 403);
+await authenticationScenario("status", 401);
+await authenticationScenario("upload", 401, false, "retryable");
+console.log("Upload queue stops on authentication loss, retains IDs and checks results after login");

@@ -1,6 +1,6 @@
 # Container setup and production listener
 
-The official container exposes port `8081`. With no configuration, the
+The official container exposes port `8081`. With incomplete setup, the
 entrypoint starts a temporary HTTP bootstrap proxy on that port, the setup UI
 on container loopback `127.0.0.1:8080`, and a separate loopback health listener
 on `127.0.0.1:8082`. The health CLI reports live during setup and not ready.
@@ -16,18 +16,36 @@ The upstream proxy verifies the server certificate and server name and presents
 its allowed client certificate. VaultLink validates both the CA chain and the
 leaf fingerprint before serving HTTP.
 
-After the operator confirms setup and selects Start, the entrypoint stops the
-bootstrap proxy and its setup process completely before starting the production
-mTLS listener. A pre-existing configuration is loaded directly: invalid or
-legacy IP-only configuration terminates the container instead of reopening
-bootstrap HTTP. The only production health endpoint is the container-local
-`127.0.0.1:8082`; use `vaultlink health-check --live` or `--ready` through
-Docker/Kubernetes exec. That listener has no application routes and ignores
-forwarding headers. The CLI uses bounded local HTTP requests.
+The entrypoint runs the internal `container-start --config PATH --listen LOOPBACK`
+mode. It checks the configuration, administrator database and pending setup
+marker. Missing configuration, zero administrators or a valid
+`.vaultlink-initial-setup.pending` marker reopen the token-protected setup.
+A damaged, inaccessible or legacy IP-only configuration stops startup. A
+confirmed installation with an administrator starts the normal service.
+
+After a restart during setup, submit the same configuration again. If the
+administrator was already stored, its password is required and the saved TOTP
+secret is shown again. The configuration and secret are preserved. Confirm
+that the secret has been saved before starting the service; this confirmation
+is not an additional TOTP-code challenge. Calling `/complete` before successful
+creation or recovery cannot remove the pending marker. The persisted state is
+checked again before the service starts.
+
+After the operator confirms setup and selects Start, `container-start` stops
+and joins all bootstrap processes before starting the production mTLS listener.
+The production health endpoint is the container-local `127.0.0.1:8082`; use
+`vaultlink health-check --live` or `--ready` through Docker/Kubernetes exec.
+That listener has no application routes and ignores forwarding headers. The
+CLI uses bounded local HTTP requests.
+
+The bootstrap proxy shares the main server's transport deadlines: 30 seconds
+without write progress and a maximum connection lifetime of 24 hours.
+Successful writes renew the idle allowance. Timeouts release both global and
+peer connection slots.
 
 `VAULTLINK_BIN`, `VAULTLINK_CONFIG_PATH`, `VAULTLINK_SETUP_ADDR`, and
 `VAULTLINK_CONTAINER_ADDR` customize the bootstrap process. The container proxy
-only serves bootstrap and local development; it is absent from production.
+only serves bootstrap; it is absent after normal service startup.
 
 The local runtime smoke generates short-lived test certificates, verifies
 no-certificate and unpinned-certificate rejection, verifies the server name,

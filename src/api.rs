@@ -211,6 +211,7 @@ impl From<crate::services::public_transfer::PublicTransferError> for ApiError {
     fn from(error: crate::services::public_transfer::PublicTransferError) -> Self {
         use crate::services::public_transfer::PublicTransferError as Error;
         let (status, code) = match error {
+            Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Error::StorageBusy => return Self::storage_busy(),
             Error::NotFound | Error::FileUnavailable | Error::ShareTargetUnavailable => {
                 (StatusCode::NOT_FOUND, "not_found")

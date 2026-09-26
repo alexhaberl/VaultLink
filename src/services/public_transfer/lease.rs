@@ -17,6 +17,7 @@ use super::{PublicTransferError, PublicTransferService};
 pub(crate) struct PublicTransferClient {
     pub(crate) client_key: String,
     pub(crate) session_token: Option<String>,
+    pub(crate) unlock_token: Option<String>,
     pub(crate) audit_client_ip: Option<String>,
 }
 
@@ -140,16 +141,20 @@ impl PublicTransferService {
             .session_token
             .unwrap_or_else(|| auth::random_token(32));
         let lease_token = auth::random_token(32);
+        #[cfg(test)]
+        crate::test_checkpoint::hit_async(format!("transfer-begin:{}", share.token)).await;
         let pending = begin_transfer_lease_cancellation_safe(
             self.state().db().clone(),
             session_token.clone(),
             lease_token.clone(),
             share.id,
+            client.unlock_token,
             resource_key,
             action,
         )
         .await?;
         match pending.outcome {
+            TransferLeaseBeginOutcome::Unauthorized => Err(PublicTransferError::Unauthorized),
             TransferLeaseBeginOutcome::NewLease | TransferLeaseBeginOutcome::AlreadyCounted => {
                 let heartbeat_stop = start_transfer_heartbeat(
                     self.state().db().clone(),
@@ -182,22 +187,29 @@ impl PublicTransferService {
         &self,
         share: &Share,
         session_token: Option<String>,
+        unlock_token: Option<String>,
         resource_key: String,
         action: &'static str,
     ) -> Result<(), PublicTransferError> {
         let session_token = session_token.unwrap_or_else(|| auth::random_token(32));
         let share_id = share.id;
+        #[cfg(test)]
+        crate::test_checkpoint::hit_async(format!("transfer-check:{}", share.token)).await;
         let outcome =
             super::prepare::run_database_read(self.state().db().clone(), move |database| {
-                database.check_transfer_availability(
+                database.check_authorized_transfer_availability(
                     &session_token,
-                    share_id,
+                    crate::db::TransferAuthorization {
+                        share_id,
+                        unlock_token: unlock_token.as_deref(),
+                    },
                     &resource_key,
                     action,
                 )
             })
             .await?;
         match outcome {
+            TransferAvailabilityOutcome::Unauthorized => Err(PublicTransferError::Unauthorized),
             TransferAvailabilityOutcome::Available
             | TransferAvailabilityOutcome::AlreadyCounted => Ok(()),
             TransferAvailabilityOutcome::LimitReached => {
@@ -215,6 +227,7 @@ async fn begin_transfer_lease_cancellation_safe(
     session_token: String,
     lease_token: String,
     share_id: i64,
+    unlock_token: Option<String>,
     resource_key: String,
     action: &'static str,
 ) -> Result<PendingLeaseOwnership, PublicTransferError> {
@@ -224,10 +237,13 @@ async fn begin_transfer_lease_cancellation_safe(
         database,
         "transfer_lease_begin",
         move |database, admission| {
-            let outcome = database.begin_transfer_lease(
+            let outcome = database.begin_authorized_transfer_lease(
                 &session_token,
                 &lease_token,
-                share_id,
+                crate::db::TransferAuthorization {
+                    share_id,
+                    unlock_token: unlock_token.as_deref(),
+                },
                 &resource_key,
                 action,
             );

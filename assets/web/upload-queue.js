@@ -57,6 +57,20 @@
 
     let sequence = 0;
     let running = false;
+    let authenticationLost = false;
+    class AuthenticationRequired extends Error {}
+    const requireAuthentication = async (response) => {
+      const denied = response.status === 403 ? await response.clone().json().catch(() => null) : null;
+      const mfaRequired = denied?.error === "mfa_required" || denied?.error?.code === "mfa_required";
+      if (response.status === 401 || mfaRequired || response.redirected) {
+        authenticationLost = true;
+        throw new AuthenticationRequired();
+      }
+    };
+    const showAuthenticationRequired = (item) => {
+      item.status = "authentication";
+      item.message = '<vl-i18n key="upload.auth_required"/>';
+    };
     let dragDepth = 0;
     const items = [];
 
@@ -68,7 +82,7 @@
       running = busy;
       form.setAttribute("aria-busy", busy ? "true" : "false");
       if (submit instanceof HTMLButtonElement || submit instanceof HTMLInputElement) {
-        submit.disabled = busy;
+        submit.disabled = busy || authenticationLost;
       }
     };
 
@@ -81,7 +95,7 @@
     };
 
     const retryItem = async (item) => {
-      if (running || !["ready", "retryable"].includes(item.status)) return;
+      if (running || authenticationLost || !["ready", "retryable"].includes(item.status)) return;
       item.status = "ready";
       item.message = '<vl-i18n key="upload.ready"/>';
       render();
@@ -123,6 +137,16 @@
         }
         if (item.status === "retryable") {
           actions.append(actionButton('<vl-i18n key="upload.retry"/>', () => { void retryItem(item); }, running));
+        }
+        if (item.status === "authentication") {
+          const login = document.createElement("a");
+          login.className = "vl-button vl-button--secondary";
+          login.href = endpoint.startsWith("/admin/") ? "/login" : form.action.replace(/\/upload$/, "");
+          login.target = "_blank";
+          login.rel = "noopener";
+          login.textContent = '<vl-i18n key="auth.sign_in"/>';
+          actions.append(login);
+          if (item.uploadId) actions.append(actionButton('<vl-i18n key="upload.check_status"/>', () => { void checkItemStatus(item); }, running));
         }
         if (item.status === "checking") {
           actions.append(actionButton('<vl-i18n key="upload.check_status"/>', () => { void checkItemStatus(item); }, running));
@@ -194,6 +218,7 @@
         credentials: "same-origin",
         headers: { "Accept": "application/json", ...csrfHeader() }
       });
+      await requireAuthentication(response);
       if (response.status !== 201) throw new Error(`<vl-i18n key="upload.failed"/> (${response.status})`);
       const ticket = await response.json();
       if (!ticket || typeof ticket.upload_id !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(ticket.upload_id) ||
@@ -246,6 +271,7 @@
         const response = await fetch(item.statusUrl, {
           method: "GET", credentials: "same-origin", headers: { "Accept": "application/json" }
         });
+        await requireAuthentication(response);
         if (response.status === 410) {
           item.status = "expired";
           item.message = '<vl-i18n key="upload.id_expired"/>';
@@ -259,8 +285,8 @@
             break;
           case "ready":
           case "retryable":
-            item.status = "retryable";
-            item.message = '<vl-i18n key="upload.retry"/>';
+            item.status = authenticationLost ? "reselect" : "retryable";
+            item.message = authenticationLost ? '<vl-i18n key="upload.reselect"/>' : '<vl-i18n key="upload.retry"/>';
             break;
           case "outcome_unknown":
             item.status = "unknown";
@@ -277,7 +303,8 @@
           default:
             throw new Error("Unknown upload state");
         }
-      } catch (_) {
+      } catch (error) {
+        if (error instanceof AuthenticationRequired) { showAuthenticationRequired(item); return; }
         item.status = "checking";
         item.message = responseWarningText;
       } finally {
@@ -299,6 +326,7 @@
           headers: { "Accept": "application/json", "Idempotency-Key": item.uploadId }
         });
 
+        await requireAuthentication(response);
         let payload;
         try {
           payload = await response.json();
@@ -325,6 +353,7 @@
           return;
         }
       } catch (error) {
+        if (error instanceof AuthenticationRequired) { showAuthenticationRequired(item); render(); return; }
         if (item.uploadId) {
           await checkItemStatus(item);
           return;
@@ -336,10 +365,11 @@
     };
 
     async function processItems(queue) {
-      if (running || queue.length === 0) return;
+      if (running || authenticationLost || queue.length === 0) return;
       setBusy(true);
       render();
       for (const item of queue) {
+        if (authenticationLost) break;
         if (item.status === "ready") {
           await uploadItem(item);
         }
@@ -354,7 +384,7 @@
       if (successful > 0) result.push(`${successful} <vl-i18n key="upload.successful"/>`);
       if (warned.length > 0) result.push(...new Set(warned.map((item) => item.message)));
       if (failed > 0) result.push(`${failed} <vl-i18n key="upload.failed_retry"/>`);
-      setFeedback(result.join(", "));
+      setFeedback(authenticationLost ? '<vl-i18n key="upload.auth_required"/>' : result.join(", "));
     }
 
     input.addEventListener("change", () => {
@@ -412,10 +442,12 @@
       });
     }
 
-    // Keep the SSR form a true single-file fallback until initialization is complete.
+    // Reveal the queue only after all handlers are installed.
     input.required = false;
     input.multiple = true;
     form.dataset.uploadQueueReady = "true";
+    form.hidden = false;
+    if (form.previousElementSibling?.matches("form[data-upload-prepare]")) form.previousElementSibling.hidden = true;
     setFeedback('<vl-i18n key="upload.none_selected"/>');
   };
 

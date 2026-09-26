@@ -31,6 +31,7 @@ async fn unclaimed_public_lease_does_not_hold_admission_and_still_cancels() {
         "session".into(),
         "lease".into(),
         share,
+        None,
         "file.txt".into(),
         "download",
     )

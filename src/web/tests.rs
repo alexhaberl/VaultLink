@@ -22,3 +22,5 @@ include!("tests/upload_crash.rs");
 include!("tests/public_upload_policy.rs");
 include!("tests/admin_revocation_support.rs");
 include!("tests/admin_mutations.rs");
+include!("tests/bug_regressions.rs");
+include!("tests/storage_regressions.rs");
