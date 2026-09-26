@@ -81,8 +81,9 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    let admission = crate::response_work::ResponseWorkAdmission::current();
     let supervisor = tokio::spawn(async move {
-        let output = tokio::task::spawn_blocking(operation).await?;
+        let output = admission.spawn_blocking(operation).await?;
         Ok::<_, tokio::task::JoinError>((resources, output))
     });
     supervisor.await?

@@ -307,6 +307,10 @@ pub fn unlock_cookie_name(share_id: i64) -> String {
     format!("vaultlink_unlock_{share_id}")
 }
 
+pub fn share_unlock_token(headers: &HeaderMap, share_id: i64) -> Option<String> {
+    named_cookie(headers, &unlock_cookie_name(share_id)).map(str::to_owned)
+}
+
 pub async fn share_is_unlocked(
     state: &(impl Borrow<AppState> + ?Sized),
     headers: &HeaderMap,

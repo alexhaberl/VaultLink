@@ -19,3 +19,4 @@ include!("tests/webauthn.rs");
 
 include!("tests/audit_bounds.rs");
 include!("tests/query_fixture.rs");
+include!("tests/transfer_authorization.rs");

@@ -11,6 +11,7 @@ pub async fn run(
         config_path: Arc::new(config_path),
         token: Arc::new(token),
         commit: Arc::new(tokio::sync::Mutex::new(false)),
+        prepared: Arc::new(AtomicBool::new(false)),
         start_sender: Arc::new(tokio::sync::Mutex::new(Some(start_sender))),
         start_requested: start_requested.clone(),
     };

@@ -402,11 +402,33 @@ fn initial_setup_pending_path(data_directory: &Path) -> PathBuf {
 
 fn read_initial_setup_pending(data_directory: &Path) -> Result<Option<String>, String> {
     let path = initial_setup_pending_path(data_directory);
-    match std::fs::read_to_string(path) {
-        Ok(username) => Ok(Some(username.trim().to_string())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.to_string()),
+    use std::{io::Read as _, os::unix::fs::OpenOptionsExt as _};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            rustix::fs::OFlags::NOFOLLOW.bits() as i32 | rustix::fs::OFlags::NONBLOCK.bits() as i32,
+        )
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("Invalid initial setup pending marker".into());
     }
+    let mut username = String::new();
+    file.take(67)
+        .read_to_string(&mut username)
+        .map_err(|error| error.to_string())?;
+    if username.len() > 65 || !auth::valid_admin_username(username.trim()) {
+        return Err("Invalid initial setup pending marker".into());
+    }
+    Ok(Some(username.trim().to_owned()))
 }
 
 fn ensure_initial_setup_pending(data_directory: &Path, username: &str) -> Result<(), String> {
@@ -489,3 +511,26 @@ fn parse_usize(name: &str, value: &str) -> Result<usize, String> {
 
 const MB: u64 = 1_000_000;
 const GB: u64 = 1_000_000_000;
+
+/// Decide container bootstrap from validated persisted state, not config existence.
+pub fn needs_setup(config_path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    match std::fs::symlink_metadata(config_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let config = Config::load(config_path)?;
+    let validated = storage_mount::validate_and_open(&config.storage)?;
+    validated.verify_path_bindings(&config.storage)?;
+    let data = validated.data_file()?;
+    let data_path = PathBuf::from(format!("/proc/self/fd/{}", data.as_raw_fd()));
+    let pending = read_initial_setup_pending(&data_path)?;
+    let database = Database::open_in_directory(data)?;
+    let admins = database.admin_count()?;
+    if let Some(username) = &pending {
+        if admins > 0 && database.admin(username)?.is_none() {
+            return Err("Initial setup pending marker references a missing administrator".into());
+        }
+    }
+    Ok(admins == 0 || pending.is_some())
+}

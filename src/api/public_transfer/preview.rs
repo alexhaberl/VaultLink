@@ -185,6 +185,7 @@ fn transfer_client(
     share: &Share,
 ) -> PublicTransferClient {
     PublicTransferClient {
+        unlock_token: crate::http_auth::share_unlock_token(headers, share.id),
         client_key: current_client_limit_key().to_string(),
         session_token: transfer_cookie(headers, share.id).map(str::to_owned),
         audit_client_ip: runtime_settings(state)

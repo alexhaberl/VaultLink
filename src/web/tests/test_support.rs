@@ -49,7 +49,7 @@ use chrono::{Duration, Utc};
 use futures_util::StreamExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
-    io::{self, Read},
+    io,
     net::SocketAddr,
     path::Path,
     sync::{atomic::Ordering, Arc},

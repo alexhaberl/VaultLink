@@ -1,4 +1,8 @@
 catalog! {
+    UPLOAD_PREPARE, "upload.prepare", "Upload vorbereiten", "Prepare upload";
+    UPLOAD_AUTH_REQUIRED, "upload.auth_required", "Bitte erneut anmelden und dann das Upload-Ergebnis prüfen. Es wird nichts automatisch erneut gesendet.", "Sign in again, then check the upload result. Nothing will be resent automatically.";
+    UPLOAD_RESELECT, "upload.reselect", "Upload nicht ausgeführt. Bitte die Seite neu laden und die Datei erneut auswählen.", "Upload was not performed. Reload the page and select the file again.";
+    SECURITY_KEY_SCRIPT_REQUIRED, "account.security_key_script_required", "Zum Registrieren eines Sicherheitsschlüssels muss JavaScript verfügbar sein.", "JavaScript must be available to register a security key.";
     UPDATES_RECONNECTING, "updates.reconnecting", "Verbindung wird wiederhergestellt …", "Reconnecting …";
     UPDATES_RECONNECTING_HELP, "updates.reconnecting_help", "Der Dienst ist vorübergehend nicht erreichbar. Ein bereits gestartetes Update läuft unabhängig weiter. Der Status wird erneut abgefragt.", "The service is temporarily unreachable. An update that has already started continues independently. The status will be checked again.";
     UPDATES_CHECK_REQUIRED, "updates.check_required", "Die Versionsauswahl ist nicht mehr aktuell. Bitte erneut auf Updates prüfen.", "The selected version is no longer current. Please check for updates again.";

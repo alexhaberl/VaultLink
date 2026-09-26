@@ -538,6 +538,18 @@ mod tests {
             .unwrap(),
             CommandMode::Setup
         );
+        assert_eq!(
+            command_mode(&arguments(&[
+                "vaultlink",
+                "container-start",
+                "--config",
+                "config.toml",
+                "--listen",
+                "127.0.0.1:8090"
+            ]))
+            .unwrap(),
+            CommandMode::ContainerStart
+        );
         assert!(command_mode(&arguments(&["vaultlink", "recover-adminn"])).is_err());
         assert!(command_mode(&arguments(&["vaultlink", "--unknown"])).is_err());
         assert!(command_mode(&arguments(&[

@@ -686,7 +686,7 @@ async fn ensure_public_upload_directory(
 }
 
 pub(super) async fn run_public_upload_finalizer(
-    finalizer: PublicUploadFinalizer,
+    mut finalizer: PublicUploadFinalizer,
     claim_guard: crate::upload_operation::UploadClaimGuard,
     audit_client_ip: Option<std::net::IpAddr>,
     locale: i18n::Locale,
@@ -702,6 +702,15 @@ pub(super) async fn run_public_upload_finalizer(
             audit_client_ip,
             i18n::scope(locale, return_to, async move {
                 let _claim_guard = claim_guard;
+                #[cfg(test)]
+                crate::test_checkpoint::hit_async(format!("upload-finalizing:{operation_hash}")).await;
+                let committing_hash = operation_hash.clone();
+                if !crate::http_auth::database(operation_database.clone(), move |db| db.mark_upload_committing(&committing_hash)).await? {
+                    return Err(AppError::new(StatusCode::CONFLICT, "Upload operation changed"));
+                }
+                finalizer.upload.pending.retain_for_upload_operation();
+                #[cfg(test)]
+                upload_crash_test_checkpoint(&finalizer.token, "before_quota");
                 let operation_guard = StorageMutationGuard::default();
                 #[cfg(test)]
                 let crash_token = finalizer.token.clone();

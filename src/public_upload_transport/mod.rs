@@ -38,8 +38,8 @@ use test_support::{
 use crate::{
     auth,
     db::{
-        AuditAction, AuditContext, Share, UploadOperationClaim, UploadOperationScope,
-        UploadOperationView, UploadReservationBeginOutcome, UploadReservationCommitOutcome,
+        AuditAction, AuditContext, Share, UploadOperationScope, UploadOperationView,
+        UploadReservationBeginOutcome, UploadReservationCommitOutcome,
         UploadReservationExtendOutcome,
     },
     file_ops,
@@ -886,3 +886,31 @@ struct PublicUploadAdmission {
 }
 
 include!("execute.rs");
+
+pub(crate) async fn prepare_public_upload_operation(
+    state: &AppState,
+    headers: &mut HeaderMap,
+    token: &str,
+    path: &str,
+    csrf: &str,
+) -> Result<(String, String, bool)> {
+    let share = authorized_upload_share(state, headers, token).await?;
+    let path = crate::policy::normalize_public_upload_subdir(share.permission, path)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "Invalid path"))?;
+    headers.insert(
+        "x-vaultlink-upload-csrf",
+        csrf.parse()
+            .map_err(|_| AppError::new(StatusCode::FORBIDDEN, "Invalid upload CSRF proof"))?,
+    );
+    let (upload_id, _) = create_public_upload_operation(state, headers, token)
+        .await?
+        .ok_or_else(|| {
+            AppError::new(StatusCode::TOO_MANY_REQUESTS, "Too many upload operations")
+        })?;
+    Ok((
+        upload_id,
+        path,
+        share.upload_conflict_strategy.can_overwrite()
+            && state.config().storage.replacements_allowed(),
+    ))
+}

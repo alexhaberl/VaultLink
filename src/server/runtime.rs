@@ -106,13 +106,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = arg(&args, "--config")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
-    if matches!(mode, CommandMode::Setup | CommandMode::SetupOnce) {
+    if mode == CommandMode::ContainerStart {
+        if vaultlink::setup::needs_setup(&config_path)? {
+            let listen = arg(&args, "--listen").unwrap_or("127.0.0.1:8080");
+            let listen = listen.parse()?;
+            if !run_container_setup(&config_path, listen).await? {
+                return Ok(());
+            }
+        }
+        if vaultlink::setup::needs_setup(&config_path)? {
+            return Err("Container setup is incomplete".into());
+        }
+    } else if matches!(mode, CommandMode::Setup | CommandMode::SetupOnce) {
         let listen = arg(&args, "--listen").unwrap_or("127.0.0.1:8090");
         let listen: std::net::SocketAddr = listen.parse()?;
-        if !vaultlink::setup::run(config_path.clone(), listen).await? {
-            return Ok(());
-        }
+        let start = vaultlink::setup::run(config_path.clone(), listen).await?;
         if mode == CommandMode::SetupOnce {
+            return if start {
+                Ok(())
+            } else {
+                Err("Container setup stopped before start was requested".into())
+            };
+        }
+        if !start {
             return Ok(());
         }
     }

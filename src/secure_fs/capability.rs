@@ -42,14 +42,27 @@ fn visible_entry(name: &OsString, metadata: &std::fs::Metadata) -> DirectoryScan
 }
 
 impl Iterator for DirectoryScan {
-    type Item = DirectoryScanItem;
+    type Item = io::Result<DirectoryScanItem>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(test)]
+        if let Some(kind) = self.injected_error.take() {
+            return Some(Err(io::Error::from(kind)));
+        }
         let item = match self.entries.next()? {
             Ok(item) => item,
-            Err(_) => return Some(DirectoryScanItem::Filtered),
+            Err(error) => return Some(Err(error)),
         };
         let name = item.file_name();
+        if path_security::is_internal_storage_name(&name)
+            || is_upload_fragment_name(&name)
+            || is_deletion_tombstone_name(&name)
+            || name
+                .to_str()
+                .is_none_or(|name| path_security::validate_relative(name).is_err())
+        {
+            return Some(Ok(DirectoryScanItem::Filtered));
+        }
         let child = match linux::openat2_scoped(
             &self.directory,
             &name,
@@ -57,17 +70,30 @@ impl Iterator for DirectoryScan {
             self.strict_mount_boundary,
         ) {
             Ok(child) => child,
-            Err(_) => return Some(DirectoryScanItem::Filtered),
+            // These errors are explicit confinement-policy rejections, not I/O failures.
+            Err(error)
+                if error.raw_os_error().is_some_and(|code| {
+                    code == rustix::io::Errno::XDEV.raw_os_error()
+                        || code == rustix::io::Errno::LOOP.raw_os_error()
+                }) =>
+            {
+                return Some(Ok(DirectoryScanItem::Filtered));
+            }
+            Err(error) => return Some(Err(error)),
         };
         let metadata = match child.metadata() {
             Ok(metadata) => metadata,
-            Err(_) => return Some(DirectoryScanItem::Filtered),
+            Err(error) => return Some(Err(error)),
         };
-        Some(visible_entry(&name, &metadata))
+        Some(Ok(visible_entry(&name, &metadata)))
     }
 }
 
 impl DirectoryScan {
+    #[cfg(test)]
+    pub(crate) fn inject_error(&mut self, kind: io::ErrorKind) {
+        self.injected_error = Some(kind);
+    }
     /// Consumes at most `max_entries` raw directory items and preserves the
     /// continuation for the next call. `entries.len()` can be smaller than
     /// `scanned` when private or unsafe items were filtered.
@@ -83,7 +109,7 @@ impl DirectoryScan {
             match self.next() {
                 Some(item) => {
                     batch.scanned += 1;
-                    if let Some(entry) = item.into_entry() {
+                    if let Some(entry) = item?.into_entry() {
                         batch.entries.push(entry);
                     }
                 }
@@ -262,12 +288,24 @@ impl SecureDirectory {
     }
 
     pub fn list(&self, relative: &str, offset: usize, limit: usize) -> io::Result<Vec<Entry>> {
-        Ok(self
-            .scan_directory(relative)?
-            .filter_map(DirectoryScanItem::into_entry)
-            .skip(offset)
-            .take(limit)
-            .collect())
+        let mut entries = Vec::new();
+        let mut skipped = 0;
+        if limit == 0 {
+            return Ok(entries);
+        }
+        for item in self.scan_directory(relative)? {
+            if let Some(entry) = item?.into_entry() {
+                if skipped < offset {
+                    skipped += 1;
+                } else {
+                    entries.push(entry);
+                    if entries.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(entries)
     }
 
     pub fn scan_directory(&self, relative: &str) -> io::Result<DirectoryScan> {
@@ -299,6 +337,8 @@ pub(super) fn directory_scan_from_file(
     let proc_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
     let entries = std::fs::read_dir(proc_path)?;
     Ok(DirectoryScan {
+        #[cfg(test)]
+        injected_error: None,
         entries,
         directory,
         strict_mount_boundary,

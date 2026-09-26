@@ -42,7 +42,7 @@ pub(crate) use zip::{
     write_streaming_zip64_locator, write_zip_archive, zip_requires_direct_stream,
     zip_temp_reserved_bytes_for_test, StreamingZipEntry, ZipFilePlan, ZIP64_CENTRAL_EXTRA_SIZE,
     ZIP64_EXTRA_PAYLOAD_SIZE, ZIP64_LOCAL_EXTRA_SIZE, ZIP64_SIZE_FIELDS_SIZE, ZIP64_VERSION,
-    ZIP_EOCD_SIZE, ZIP_PLAN_MAX_BYTES,
+    ZIP_PLAN_MAX_BYTES,
 };
 
 pub(crate) use crate::http_contract::STREAM_BUFFER_BYTES as BUFFERED_RESPONSE_CHUNK_BYTES;

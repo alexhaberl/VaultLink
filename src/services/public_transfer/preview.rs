@@ -42,7 +42,7 @@ where
     R: Send + 'static,
     F: FnOnce() -> io::Result<PreviewContent> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    crate::response_work::spawn_blocking(move || {
         let content = read();
         (resources, content)
     })

@@ -28,18 +28,22 @@ pub(crate) async fn execute_public_upload(
     let share_id = share.id;
     let claim_id = upload_id.clone();
     let claim = database(state.db().clone(), move |db| {
-        db.claim_upload_operation(UploadOperationScope::Share(share_id), &claim_id)
+        crate::upload_operation::claim_upload_operation(
+            db,
+            UploadOperationScope::Share(share_id),
+            &claim_id,
+        )
     })
     .await?;
-    match claim {
-        UploadOperationClaim::Started => {}
-        UploadOperationClaim::Unavailable => {
+    let claim_guard = match claim {
+        crate::upload_operation::GuardedUploadClaim::Started(guard) => guard,
+        crate::upload_operation::GuardedUploadClaim::Unavailable => {
             return Err(AppError::new(
                 StatusCode::GONE,
                 "Upload operation unavailable",
             ));
         }
-        UploadOperationClaim::Existing(view) => {
+        crate::upload_operation::GuardedUploadClaim::Existing(view) => {
             if view.state == "completed" {
                 let _admission = acquire_public_upload_admission(&state, share.id)?;
                 return replay_public_upload(
@@ -70,8 +74,17 @@ pub(crate) async fn execute_public_upload(
                 "Upload operation already started; check its status",
             ));
         }
-    }
-    execute_claimed_public_upload(state, headers, token, multipart, share, prefix, upload_id).await
+    };
+    execute_claimed_public_upload(
+        state,
+        headers,
+        token,
+        multipart,
+        share,
+        prefix,
+        (upload_id, claim_guard),
+    )
+    .await
 }
 
 async fn execute_claimed_public_upload(
@@ -81,10 +94,9 @@ async fn execute_claimed_public_upload(
     multipart: Multipart,
     share: Share,
     prefix: Vec<crate::upload_operation::UploadPrefixField>,
-    upload_id: String,
+    claim: (String, crate::upload_operation::UploadClaimGuard),
 ) -> Result<PublicUploadOutcome> {
-    let claim_guard =
-        crate::upload_operation::UploadClaimGuard::new(state.db().clone(), &upload_id);
+    let (upload_id, claim_guard) = claim;
 
     let (share, share_scope, required_csrf, csrf_header_valid, authorized_upload) =
         reauthorize_claimed_public_upload(&state, headers, &token, share.id).await?;
@@ -131,7 +143,7 @@ async fn execute_claimed_public_upload(
         upload_id: &upload_id,
         prefix,
     };
-    let mut upload = match form_phase.run(multipart).await {
+    let upload = match form_phase.run(multipart).await {
         Ok(upload) => upload,
         Err(PublicUploadPhaseError::Rejection(rejection)) => {
             let operation_hash = claim_guard.id_hash().to_owned();
@@ -166,21 +178,6 @@ async fn execute_claimed_public_upload(
     }
     #[cfg(test)]
     upload_crash_test_checkpoint(&token, "after_staging");
-    let committing_hash = operation_hash.clone();
-    let committing = database(state.db().clone(), move |db| {
-        db.mark_upload_committing(&committing_hash)
-    })
-    .await?;
-    if !committing {
-        return Err(AppError::new(
-            StatusCode::CONFLICT,
-            "Upload operation changed",
-        ));
-    }
-    upload.pending.retain_for_upload_operation();
-    #[cfg(test)]
-    upload_crash_test_checkpoint(&token, "before_quota");
-
     let audit_client_ip = current_audit_client_ip();
     let locale = i18n::current_locale();
     let return_to = i18n::current_return_to();

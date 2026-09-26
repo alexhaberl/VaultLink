@@ -3,6 +3,7 @@ enum CommandMode {
     Serve,
     Setup,
     SetupOnce,
+    ContainerStart,
     InitAdmin,
     ReadinessTarget,
 }
@@ -13,6 +14,10 @@ fn command_mode(args: &[String]) -> Result<CommandMode, String> {
         Some("--config") => {
             validate_value_options(args, 1, &["--config"])?;
             Ok(CommandMode::Serve)
+        }
+        Some("container-start") => {
+            validate_value_options(args, 2, &["--config", "--listen"])?;
+            Ok(CommandMode::ContainerStart)
         }
         Some("setup") => {
             validate_value_options(args, 2, &["--config", "--listen"])?;

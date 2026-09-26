@@ -59,7 +59,6 @@ struct AdminBrowserTemplate {
     path_encoded: String,
     up_url: Option<String>,
     csrf_token: String,
-    upload_id: String,
     replacements_allowed: bool,
     upload_icon: super::templates::TrustedMarkup,
     folder_icon: super::templates::TrustedMarkup,

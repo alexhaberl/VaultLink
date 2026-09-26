@@ -25,10 +25,9 @@ use std::{
 
 use axum_server::accept::Accept;
 use hyper_util::rt::TokioTimer;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{OwnedSemaphorePermit, Semaphore},
-};
+#[cfg(test)]
+use tokio::io::AsyncWrite;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vaultlink::{
     auth,
     config::{self, CertificateSource, Config, ProxyTransport, ServerMode},
@@ -44,6 +43,7 @@ use transport_diagnostics::TransportDiagnostics;
 
 include!("server/acceptor.rs");
 include!("server/runtime.rs");
+include!("server/container_start.rs");
 include!("server/proxy_runtime.rs");
 include!("server/audit_worker.rs");
 include!("cli/parse.rs");

@@ -51,6 +51,7 @@ pub(crate) async fn download(
         .check_availability(
             &share,
             session_token.clone(),
+            crate::http_auth::share_unlock_token(&headers, share.id),
             relative_file.clone(),
             "download",
         )
@@ -70,7 +71,11 @@ pub(crate) async fn download(
             service
                 .begin(
                     &share,
-                    transfer_client(&state, session_token),
+                    transfer_client(
+                        &state,
+                        session_token,
+                        crate::http_auth::share_unlock_token(&headers, share.id),
+                    ),
                     relative_file.clone(),
                     "download",
                 )
@@ -107,8 +112,10 @@ async fn authorize(
 fn transfer_client(
     state: &PublicTransferRouteState,
     session_token: Option<String>,
+    unlock_token: Option<String>,
 ) -> PublicTransferClient {
     PublicTransferClient {
+        unlock_token,
         client_key: current_client_limit_key().to_string(),
         session_token,
         audit_client_ip: runtime_settings(state)

@@ -20,6 +20,7 @@ pub(crate) struct PublicTransferService {
 }
 
 pub(crate) enum PublicTransferError {
+    Unauthorized,
     NotFound,
     Inactive,
     Expired,
@@ -61,7 +62,7 @@ pub(crate) struct PreparedDownload {
 }
 
 pub(crate) struct PreparedFileSelection {
-    pub(crate) file: tokio::fs::File,
+    pub(crate) file: crate::admitted_file::AdmittedFile,
     pub(crate) start: u64,
     pub(crate) end: u64,
     pub(crate) full_length: u64,
@@ -170,8 +171,10 @@ impl PublicTransferService {
         let share_path = share.relative_path.clone();
         let open_relative_file = relative_file.clone();
         let share_is_directory = share.is_directory;
-        let (file, metadata) = tokio::task::spawn_blocking(move || {
+        let (file, metadata) = crate::response_work::spawn_blocking(move || {
             let _storage_guard = storage_guard;
+            #[cfg(test)]
+            crate::test_checkpoint::hit(&format!("download-open:{share_path}"));
             let file = if share_is_directory {
                 open_root
                     .bind_directory(&share_path)
@@ -216,7 +219,7 @@ impl PublicTransferService {
             .replace('\\', "/");
         let root = self.state.secure_root().clone();
         let share_path = share.relative_path.clone();
-        let directory = tokio::task::spawn_blocking(move || {
+        let directory = crate::response_work::spawn_blocking(move || {
             let _storage_guard = storage_guard;
             root.bind_directory(&share_path)
         })
@@ -255,7 +258,7 @@ impl PublicTransferService {
         let root = self.state.secure_root().clone();
         let share_path = share.relative_path.clone();
         let is_directory = share.is_directory;
-        let target = tokio::task::spawn_blocking(move || {
+        let target = crate::response_work::spawn_blocking(move || {
             let _storage_guard = storage_guard;
             if is_directory {
                 root.bind_directory(&share_path)
@@ -307,7 +310,7 @@ impl PreparedPreview {
         requested_range: Option<&str>,
     ) -> Result<PreparedFileSelection, PublicTransferError> {
         let relative_file = self.relative_file;
-        let (file, metadata) = tokio::task::spawn_blocking(move || {
+        let (file, metadata) = crate::response_work::spawn_blocking(move || {
             let file = match self.target {
                 PreparedPreviewTarget::Directory(directory) => directory
                     .open_file(&relative_file)
@@ -359,7 +362,7 @@ async fn select_raw_file(
     };
     let (start, end) = range.unwrap_or((0, length.saturating_sub(1)));
     let response_length = if length == 0 { 0 } else { end - start + 1 };
-    let mut file = tokio::fs::File::from_std(file);
+    let mut file = crate::admitted_file::AdmittedFile::from_std(file);
     if start > 0 {
         file.seek(io::SeekFrom::Start(start))
             .await
@@ -395,7 +398,7 @@ pub(crate) async fn select_file(
     };
     let (start, end) = range.unwrap_or((0, length.saturating_sub(1)));
     let response_length = if length == 0 { 0 } else { end - start + 1 };
-    let mut file = tokio::fs::File::from_std(file);
+    let mut file = crate::admitted_file::AdmittedFile::from_std(file);
     if start > 0 {
         file.seek(io::SeekFrom::Start(start))
             .await

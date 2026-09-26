@@ -506,8 +506,16 @@ pub enum AdminDeactivationOutcome {
     NotFound,
 }
 
+/// Unlock proof checked in the same snapshot as transfer admission.
+#[derive(Clone, Copy)]
+pub struct TransferAuthorization<'a> {
+    pub share_id: i64,
+    pub unlock_token: Option<&'a str>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferLeaseBeginOutcome {
+    Unauthorized,
     AlreadyCounted,
     NewLease,
     LimitReached,
@@ -516,6 +524,7 @@ pub enum TransferLeaseBeginOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferAvailabilityOutcome {
+    Unauthorized,
     Available,
     AlreadyCounted,
     LimitReached,

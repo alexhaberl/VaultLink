@@ -204,3 +204,27 @@ impl Drop for TransportDiagnostics {
 #[cfg(test)]
 #[path = "tests/transport_diagnostics.rs"]
 mod tests;
+
+impl vaultlink::transport::TransportObserver for TransportDiagnostics {
+    fn failure(&mut self, reason: &'static str) {
+        self.failure(reason);
+    }
+    fn io_error(&mut self, error: &io::Error) {
+        self.io_error(error);
+    }
+    fn read(&mut self, bytes: usize) {
+        self.read(bytes);
+    }
+    fn wrote(&mut self, bytes: usize) {
+        self.wrote(bytes);
+    }
+    fn write_poll(
+        &mut self,
+        operation: &'static str,
+        result: &'static str,
+        requested: usize,
+        deadline: Option<Instant>,
+    ) {
+        self.write_poll(operation, result, requested, deadline);
+    }
+}

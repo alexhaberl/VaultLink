@@ -1,3 +1,35 @@
+pub(super) async fn prepare_admin_upload(
+    State(state): State<FileRouteState>,
+    headers: HeaderMap,
+    Form(form): Form<super::upload_prepare::UploadPrepareForm>,
+) -> Result<Html<String>> {
+    let authorization = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    let (admin, _) = authorization.into_parts();
+    csrf(&admin, &form.csrf)?;
+    let path = path_security::validate_relative(&form.path)
+        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid path"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let admin_id = admin.admin_id;
+    let (upload_id, _) = crate::http_auth::database(state.db().clone(), move |db| {
+        db.create_upload_operation(crate::db::UploadOperationScope::Admin(admin_id))
+    })
+    .await?
+    .ok_or(AppError(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many upload operations",
+    ))?;
+    super::upload_prepare::PreparedUploadTemplate {
+        action: "/admin/files/upload".into(),
+        back_link: format!("/admin?path={}", encoded(&path)),
+        path,
+        csrf: admin.csrf_token,
+        upload_id,
+        allow_overwrite: state.config().storage.replacements_allowed(),
+    }
+    .render_page()
+}
+
 pub(super) struct AdminUploadSuccess {
     file: String,
     disposition: UploadDisposition,
@@ -17,7 +49,10 @@ pub(super) async fn create_admin_upload_operation(
     State(state): State<FileRouteState>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    let authorization = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    let authorization = match mfa_session(&state, &headers, MissingSession::Unauthorized).await {
+        Ok(authorization) => authorization,
+        Err(error) => return Ok(admin_upload_json_auth_error(AppError::from(error))),
+    };
     let (admin, _) = authorization.into_parts();
     crate::http_auth::csrf_header(&admin, &headers)?;
     let admin_id = admin.admin_id;
@@ -46,7 +81,10 @@ pub(super) async fn admin_upload_operation_status(
     headers: HeaderMap,
     AxPath(upload_id): AxPath<String>,
 ) -> Result<Response> {
-    let authorization = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await?;
+    let authorization = match mfa_session(&state, &headers, MissingSession::Unauthorized).await {
+        Ok(authorization) => authorization,
+        Err(error) => return Ok(admin_upload_json_auth_error(AppError::from(error))),
+    };
     let (admin, _) = authorization.into_parts();
     let admin_id = admin.admin_id;
     let view = crate::http_auth::database(state.db().clone(), move |db| {
@@ -445,21 +483,8 @@ pub(super) async fn admin_upload_queue(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    if let Err(error) = mfa_session(&state, &headers, MissingSession::RedirectToLogin).await {
-        let error = AppError::from(error);
-        if matches!(
-            error,
-            AppError(StatusCode::UNAUTHORIZED, SESSION_REVOKED_MESSAGE)
-        ) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(AdminUploadSessionRevoked {
-                    error: ADMIN_UPLOAD_SESSION_REVOKED,
-                }),
-            )
-                .into_response();
-        }
-        return error.into_response();
+    if let Err(error) = mfa_session(&state, &headers, MissingSession::Unauthorized).await {
+        return admin_upload_json_auth_error(AppError::from(error));
     }
     let upload_id = match crate::upload_operation::take_upload_id(&mut multipart, &headers).await {
         Ok(id) => id,
@@ -496,6 +521,10 @@ pub(super) async fn admin_upload_queue(
             }),
         )
             .into_response(),
+        Err(error @ AppError(StatusCode::UNAUTHORIZED, _))
+        | Err(error @ AppError(StatusCode::FORBIDDEN, "MFA verification required")) => {
+            admin_upload_json_auth_error(error)
+        }
         Err(AppError(status, message)) => {
             admin_upload_queue_error_response(status, message, status_url)
         }
@@ -569,4 +598,17 @@ fn admin_upload_queue_error_response(
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     }
     response
+}
+
+fn admin_upload_json_auth_error(error: AppError) -> Response {
+    let code = match error {
+        AppError(
+            StatusCode::UNAUTHORIZED,
+            SESSION_REVOKED_MESSAGE | ADMIN_UPLOAD_SESSION_REVOKED,
+        ) => "session_revoked",
+        AppError(StatusCode::UNAUTHORIZED, _) => "unauthorized",
+        AppError(StatusCode::FORBIDDEN, "MFA verification required") => "mfa_required",
+        _ => return error.into_response(),
+    };
+    (error.0, Json(serde_json::json!({"error": code}))).into_response()
 }

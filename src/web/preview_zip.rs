@@ -21,8 +21,7 @@ pub(super) use crate::services::public_transfer::{
     zip_requires_direct_stream, zip_temp_reserved_bytes_for_test, StreamingZipEntry,
     TextPreviewReadTestGuard, TextPreviewReadTestHook, ZipBuildError, ZipFilePlan, ZipPlan,
     TEXT_PREVIEW_READ_TEST_HOOK, ZIP64_CENTRAL_EXTRA_SIZE, ZIP64_EXTRA_PAYLOAD_SIZE,
-    ZIP64_LOCAL_EXTRA_SIZE, ZIP64_SIZE_FIELDS_SIZE, ZIP64_VERSION, ZIP_EOCD_SIZE,
-    ZIP_PLAN_MAX_BYTES,
+    ZIP64_LOCAL_EXTRA_SIZE, ZIP64_SIZE_FIELDS_SIZE, ZIP64_VERSION, ZIP_PLAN_MAX_BYTES,
 };
 pub(super) use crate::services::public_transfer::{read_preview, PreviewContent};
 
@@ -38,7 +37,7 @@ pub(super) async fn raw_preview_response<D: DirectoryAccess, G: Send + 'static>(
     storage_guard: G,
 ) -> Result<Response> {
     let open_path = relative_file.clone();
-    let file = tokio::task::spawn_blocking(move || {
+    let file = crate::response_work::spawn_blocking(move || {
         // Capability acquisition must retain namespace authority even when the
         // awaiting HTTP future is cancelled. The descriptor remains safe after
         // this blocking task releases the guard and streaming begins.
@@ -68,7 +67,7 @@ async fn raw_preview_opened_response(
     kind: PreviewKind,
     max_size: u64,
 ) -> Result<Response> {
-    let (file, metadata) = tokio::task::spawn_blocking(move || {
+    let (file, metadata) = crate::response_work::spawn_blocking(move || {
         let metadata = file.metadata();
         (file, metadata)
     })
@@ -88,17 +87,8 @@ async fn raw_preview_opened_response(
     if !metadata.is_file() {
         return Err(AppError(StatusCode::BAD_REQUEST, "Not a file"));
     }
-    let mut file = tokio::fs::File::from_std(file);
-    let length = file
-        .metadata()
-        .await
-        .map_err(|error| {
-            AppError::from(report_internal(
-                InternalOperation::WebRawPreviewAsyncMetadata,
-                error,
-            ))
-        })?
-        .len();
+    let mut file = crate::admitted_file::AdmittedFile::from_std(file);
+    let length = metadata.len();
     if length > max_size {
         return Err(AppError(
             StatusCode::PAYLOAD_TOO_LARGE,

@@ -4,7 +4,12 @@ pub(super) async fn process_admin_upload(
     mut multipart: Multipart,
     prechecked_upload_id: Option<crate::upload_operation::UploadIdSelection>,
 ) -> Result<AdminUploadSuccess> {
-    let authorization = mfa_session(state, headers, MissingSession::RedirectToLogin).await?;
+    let missing = if prechecked_upload_id.is_some() {
+        MissingSession::Unauthorized
+    } else {
+        MissingSession::RedirectToLogin
+    };
+    let authorization = mfa_session(state, headers, missing).await?;
     let (admin, proof) = authorization.into_parts();
     let selection = match prechecked_upload_id {
         Some(selection) => selection,
@@ -17,15 +22,19 @@ pub(super) async fn process_admin_upload(
     let admin_id = admin.admin_id;
     let claim_id = upload_id.clone();
     let claim = crate::http_auth::database(state.db().clone(), move |db| {
-        db.claim_upload_operation(crate::db::UploadOperationScope::Admin(admin_id), &claim_id)
+        crate::upload_operation::claim_upload_operation(
+            db,
+            crate::db::UploadOperationScope::Admin(admin_id),
+            &claim_id,
+        )
     })
     .await?;
-    match claim {
-        crate::db::UploadOperationClaim::Started => {}
-        crate::db::UploadOperationClaim::Unavailable => {
+    let claim_guard = match claim {
+        crate::upload_operation::GuardedUploadClaim::Started(guard) => guard,
+        crate::upload_operation::GuardedUploadClaim::Unavailable => {
             return Err(AppError(StatusCode::GONE, "Upload operation unavailable"));
         }
-        crate::db::UploadOperationClaim::Existing(view) => {
+        crate::upload_operation::GuardedUploadClaim::Existing(view) => {
             if view.state == "completed" {
                 let _admission = acquire_admin_upload_concurrency_permits(state)?;
                 return replay_admin_upload(view, multipart, &upload_id, prefix, &admin).await;
@@ -47,9 +56,7 @@ pub(super) async fn process_admin_upload(
                 "Upload operation already started; check its status",
             ));
         }
-    }
-    let claim_guard =
-        crate::upload_operation::UploadClaimGuard::new(state.db().clone(), &upload_id);
+    };
     let authorization = AuthorizedAdminUpload {
         permits: acquire_admin_upload_permits(state, headers, proof).await?,
     };
@@ -70,15 +77,6 @@ pub(super) async fn process_admin_upload(
             "Upload operation content differs",
         ));
     }
-    let committing_hash = operation_hash.clone();
-    if !crate::http_auth::database(state.db().clone(), move |db| {
-        db.mark_upload_committing(&committing_hash)
-    })
-    .await?
-    {
-        return Err(AppError(StatusCode::CONFLICT, "Upload operation changed"));
-    }
-    upload.pending.retain_for_upload_operation();
     apply_admin_upload_test_fault(state, &mut upload);
     let audit_client_ip = current_audit_client_ip();
     let audit_context = AuditContext::new(admin.username, enabled_audit_client_ip(state));
@@ -88,6 +86,13 @@ pub(super) async fn process_admin_upload(
     let finalizer = tokio::spawn(
         with_audit_client_ip(audit_client_ip, async move {
             let _claim_guard = claim_guard;
+            #[cfg(test)]
+            crate::test_checkpoint::hit_async(format!("upload-finalizing:{operation_hash}")).await;
+            let committing_hash = operation_hash.clone();
+            if !crate::http_auth::database(task_state.db().clone(), move |db| db.mark_upload_committing(&committing_hash)).await? {
+                return Err(AppError(StatusCode::CONFLICT, "Upload operation changed"));
+            }
+            upload.pending.retain_for_upload_operation();
             let operation_guard = crate::upload_operation::UploadStorageGuard::default();
             let (result, safe_to_retry) =
                 finalize_admin_upload(&task_state, upload, audit_context, &operation_guard).await;

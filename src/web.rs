@@ -37,6 +37,7 @@ mod transfer_runtime;
 mod updates;
 #[path = "web/public_upload/mod.rs"]
 mod upload;
+mod upload_prepare;
 
 use crate::http_contract::{
     DEFAULT_REQUEST_BODY_LIMIT, MAX_SEARCH_QUERY_BYTES, MAX_UPLOAD_OPTION_FIELD_BYTES,
@@ -107,6 +108,7 @@ impl From<crate::services::public_transfer::PublicTransferError> for AppError {
     fn from(error: crate::services::public_transfer::PublicTransferError) -> Self {
         use crate::services::public_transfer::PublicTransferError as Error;
         match error {
+            Error::Unauthorized => Self(StatusCode::UNAUTHORIZED, "Share is locked"),
             Error::NotFound => Self(StatusCode::NOT_FOUND, "Link not found"),
             Error::Inactive | Error::Expired => {
                 Self(StatusCode::GONE, "This link is no longer active")
@@ -334,6 +336,9 @@ crate::declare_routes! {
         DefaultBodyLimit::max(HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize),
         middleware::from_fn(guard_multipart_upload),
     ];
+    "/admin/files/upload/prepare" {
+        POST => files::prepare_admin_upload, [AdminSession, MutationContext, FormField, Required, Form, Upload];
+    }
     "/admin/files/upload/operations" {
         POST => files::create_admin_upload_operation, [AdminSession, MutationContext, Header, Required, None, Upload];
     }
@@ -449,6 +454,9 @@ crate::declare_routes! {
         DefaultBodyLimit::max(HARD_MULTIPART_LIMIT.min(usize::MAX as u64) as usize),
         middleware::from_fn(guard_multipart_upload),
     ];
+    "/v/{token}/upload/prepare" {
+        POST => upload::prepare_upload, [ShareCapability, None, FormField, Required, Form, Upload];
+    }
     "/v/{token}/upload/operations" {
         POST => upload::create_operation, [ShareCapability, None, Header, Required, None, Upload];
     }
