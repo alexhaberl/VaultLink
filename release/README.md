@@ -307,7 +307,7 @@ authoritative for full-system functionality, security, integrity, RSS,
 package-manager operations, upgrade, backup, migration, rollback, and SELinux;
 its numeric p95 and `<2 s` comparison are diagnostic. The commit-bound
 nine-target workflow forces and records TCG for every target without a second
-matrix. Its isolated loopback mTLS fixture allows a bounded 60-second TLS
+matrix. Its isolated loopback mTLS fixture allows a bounded 180-second TLS
 handshake; native package tests and the dedicated soak retain the 10-second
 default. Guest-image refreshes may use KVM on amd64 only after a bounded QMP
 probe reports it present and enabled; otherwise they select TCG.

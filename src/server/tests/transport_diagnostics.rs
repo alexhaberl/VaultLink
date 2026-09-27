@@ -239,6 +239,7 @@ fn real_http_header_close_records_ports_and_received_bytes() {
         task.await.unwrap();
         let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
         assert!(output.contains("closed_without_response"), "{output}");
+        assert!(output.contains("accept_completed_ms=Some("), "{output}");
         assert!(output.contains(&format!("peer_port={port}")));
         assert!(output.contains(&format!("bytes_read={}", incomplete.len())));
         assert!(output.contains("bytes_written=0"));

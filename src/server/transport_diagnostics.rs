@@ -41,6 +41,7 @@ pub(crate) struct TransportDiagnostics {
     peer_port: u16,
     local_port: u16,
     active_at_accept: usize,
+    accept_completed_ms: Option<u128>,
     bytes_read: u64,
     bytes_written: u64,
     first_read_ms: Option<u128>,
@@ -66,6 +67,7 @@ impl TransportDiagnostics {
             peer_port,
             local_port,
             active_at_accept,
+            accept_completed_ms: None,
             bytes_read: 0,
             bytes_written: 0,
             first_read_ms: None,
@@ -87,6 +89,10 @@ impl TransportDiagnostics {
 
     pub(crate) fn failure(&mut self, reason: &'static str) {
         self.failure.get_or_insert(reason);
+    }
+
+    pub(crate) fn accept_completed(&mut self) {
+        self.accept_completed_ms = Some(self.started.elapsed().as_millis());
     }
 
     pub(crate) fn io_error(&mut self, error: &io::Error) {
@@ -178,6 +184,7 @@ impl Drop for TransportDiagnostics {
                 peer_port = self.peer_port,
                 local_port = self.local_port,
                 active_at_accept = self.active_at_accept,
+                accept_completed_ms = ?self.accept_completed_ms,
                 elapsed_ms = self.started.elapsed().as_millis(),
                 bytes_read = self.bytes_read,
                 bytes_written = self.bytes_written,

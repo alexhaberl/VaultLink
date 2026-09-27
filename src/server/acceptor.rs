@@ -347,6 +347,7 @@ where
                     ));
                 }
             };
+            diagnostics.accept_completed();
             Ok((
                 ConnectionLimitedIo {
                     inner,
