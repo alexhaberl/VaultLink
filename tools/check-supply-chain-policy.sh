@@ -1177,6 +1177,8 @@ if ! grep -F -q 'SOAK_ORCHESTRATION_SHA256' deploy/vaultlink-soak-control.sh \
     || ! grep -F -q 'load profiles do not cover all 12 six-hour soak buckets' tools/check-soak-evidence.sh \
     || ! grep -F -q 'upload_integrity=server_readback' tools/load-test.sh \
     || ! grep -F -q 'holder_token=$ADMISSION_DOWNLOAD_TOKEN' tools/load-test.sh \
+    || ! grep -F -q 'exec curl --cert "$VAULTLINK_TLS_CLIENT_CERT"' tools/load-test.sh \
+    || ! grep -F -q 'curl_exec --interface 127.0.0.1 --header "X-Forwarded-For: $identity"' tools/load-test.sh \
     || ! grep -F -q '"$VAULTLINK_BASE_URL/v/$holder_token/download" &' tools/load-test.sh \
     || ! grep -F -q 'validate_distinct_token_set "download token set"' tools/load-test.sh \
     || ! grep -F -q 'validate_distinct_token_set "upload token set"' tools/load-test.sh \

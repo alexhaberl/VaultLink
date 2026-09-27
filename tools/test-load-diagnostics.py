@@ -5,6 +5,7 @@ import http.server
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -22,11 +23,24 @@ def function(name):
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     requests_by_client = {}
+    hold_started = threading.Event()
+    hold_release = threading.Event()
 
     def log_message(self, *_args):
         pass
 
     def do_GET(self):
+        if self.path.startswith("/hold"):
+            self.send_response(206)
+            self.send_header("Content-Length", "1048576")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"x" * 8192)
+            self.wfile.flush()
+            self.hold_started.set()
+            self.hold_release.wait(timeout=10)
+            self.close_connection = True
+            return
         if self.path.startswith("/empty"):
             self.close_connection = True
             return
@@ -161,10 +175,49 @@ metadata_profile
             if process.poll() is None:
                 process.kill()
             process.communicate()
+
+        if sys.platform.startswith("linux"):
+            # An asynchronous shell function has a shell PID; terminating it
+            # leaves its real Curl child connected. The holder must exec Curl.
+            pid_file = root / "holder.pid"
+            stop_file = root / "stop-holder"
+            holder_functions = "\n".join(function(name) for name in
+                                         ("curl", "curl_exec", "stop_admission_holders"))
+            holder_script = "set -eu\n" + holder_functions + "\n" + r'''
+admission_holders=''
+trap 'stop_admission_holders' EXIT
+curl_exec --noproxy '*' --interface 127.0.0.1 --silent --show-error \
+    --max-time 10 --limit-rate 1024 --output /dev/null "$TEST_URL/hold" &
+admission_holders="$!"
+printf '%s\n' "$!" >"$TEST_PID_FILE"
+while [ ! -e "$TEST_STOP_FILE" ]; do sleep 0.02; done
+stop_admission_holders
+'''
+            holder = subprocess.Popen(["sh", "-c", holder_script],
+                env={**os.environ, **tls_environment, "TEST_URL": base,
+                     "TEST_PID_FILE": str(pid_file), "TEST_STOP_FILE": str(stop_file)},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                assert Handler.hold_started.wait(timeout=5), "holder did not start"
+                pid = int(pid_file.read_text())
+                assert Path(f"/proc/{pid}/comm").read_text().strip() == "curl", pid
+                stop_file.touch()
+                started = time.monotonic()
+                stdout, stderr = holder.communicate(timeout=3)
+                assert holder.returncode == 0 and stdout == "" and stderr == "", stderr
+                assert time.monotonic() - started < 2
+                assert not Path(f"/proc/{pid}").exists(), "holder Curl survived cleanup"
+            finally:
+                stop_file.touch()
+                Handler.hold_release.set()
+                if holder.poll() is None:
+                    holder.kill()
+                holder.communicate(timeout=12)
 finally:
+    Handler.hold_release.set()
     server.shutdown()
     server.server_close()
     thread.join()
     tls.close()
 
-print("Load transport diagnostics: real TLS disconnect/partial response, HTTP errors, redaction and partial request counts passed")
+print("Load transport diagnostics: TLS errors, redaction, partial counts and admission holder cleanup passed")
