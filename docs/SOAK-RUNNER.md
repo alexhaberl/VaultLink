@@ -158,7 +158,9 @@ The admission probe spreads one forwarded client's streams evenly across the
 first two shares, so it exercises the per-client limit without also exhausting
 the per-share limit. The 40 parallel benchmark ranges are distributed across
 all three shares as 14/13/13 streams; no share can reach the hard 16-stream
-ceiling merely because the benchmark is running.
+ceiling merely because the benchmark is running. The admission probe terminates
+and joins its actual Curl processes before this workload starts; leftover probe
+streams would consume the same share slots and invalidate the result.
 
 `UPLOAD_TOKEN` and `UPLOAD_TOKEN_2` through `UPLOAD_TOKEN_5` must be five
 distinct, independent upload shares rooted at the same staging-only upload
@@ -295,7 +297,7 @@ phases independently verify the actual package binary and complete soak artifact
 all load, latency, RSS, integrity, and transfer checks remain mandatory.
 See the [performance policy](../release/performance/README.md) and the
 [0.7.2 release checklist](RELEASE-CHECKLIST-0.7.2.md). The planned UTC release
-date is 2026-09-30.
+date is 2026-10-01.
 
 Before starting this candidate, re-provision all seven orchestration files
 from its frozen commit using the installation steps above. The controller,

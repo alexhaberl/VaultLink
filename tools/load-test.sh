@@ -31,6 +31,14 @@ curl() {
     command curl --cert "$VAULTLINK_TLS_CLIENT_CERT" \
         --key "$VAULTLINK_TLS_CLIENT_KEY" --cacert "$VAULTLINK_TLS_SERVER_CA" "$@"
 }
+
+# Background admission holders must replace their shell process with curl.
+# Otherwise $! names the shell running this function and killing it leaves
+# the real curl process (and its share admission slot) alive until timeout.
+curl_exec() {
+    exec curl --cert "$VAULTLINK_TLS_CLIENT_CERT" \
+        --key "$VAULTLINK_TLS_CLIENT_KEY" --cacert "$VAULTLINK_TLS_SERVER_CA" "$@"
+}
 metadata_script=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/load-metadata.py
 if [ ! -f "$metadata_script" ] || [ -L "$metadata_script" ]; then
     echo "metadata generator helper is missing or unsafe" >&2
@@ -454,7 +462,7 @@ verify_forwarded_admission_identity() {
         else
             holder_token=$ADMISSION_DOWNLOAD_TOKEN
         fi
-        curl --interface 127.0.0.1 --header "X-Forwarded-For: $identity" \
+        curl_exec --interface 127.0.0.1 --header "X-Forwarded-For: $identity" \
             --silent --show-error --max-time "$admission_holder_max_time" \
             --limit-rate 1024 --range "0-$admission_range_end" \
             --dump-header "$work/admission-$holder.headers" --output /dev/null \
