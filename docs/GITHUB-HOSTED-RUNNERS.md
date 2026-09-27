@@ -176,11 +176,13 @@ Every one of the nine targets performs:
   counts and statuses, transfer and upload hashes, absence of corruption,
   process and RSS limits, and all other functional and security assertions;
   only its recorded p95 and threshold comparison are diagnostic. The forced-TCG
-  guest uses short-lived P-256 mTLS certificates and a bounded 60-second
-  handshake deadline on its isolated loopback listener. P-256 alone did not
-  prevent the library's default 10-second handshake timeout during the 150-client
-  burst under TCG. Native package smoke and the dedicated 72-hour soak retain
-  RSA mTLS and the 10-second default. The guest retains the exact client and
+  guest uses short-lived P-256 mTLS certificates and a bounded 180-second
+  handshake deadline on its isolated loopback listener, with a 210-second
+  client connect deadline. P-256 alone did not prevent the default 10-second
+  handshake timeout during the 150-client burst under TCG, and two full
+  qualification attempts also exceeded 60 seconds on multiple ARM guests.
+  Native package smoke and the dedicated 72-hour soak retain RSA mTLS and the
+  10-second default. The guest retains the exact client and
   request counts, statuses, hashes, and integrity assertions.
   Forced-TCG transfers have a bounded 60-minute request deadline without changing any
   concurrency, byte-count, status, or integrity assertion. The
@@ -309,9 +311,12 @@ ports, the active connection count at admission, elapsed time, read/write byte
 counts and first-read/last-write timing. Correlate the server's `peer_port` with
 curl's local port and the timestamp. `closed_without_response` describes an
 observed connection close; it does **not** prove a header timeout. The HTTP
-library does not expose every close reason. No request bytes or peer addresses
-are retained. Warnings are capped at 60 per 60-second window per process; the
-next emitted warning reports how many events were suppressed.
+library does not expose every close reason. `accept_completed_ms` records when
+the transport handshake ended, relative to connection admission, so a later
+close can be compared with the 15-second HTTP header deadline. No request
+bytes or peer addresses are retained. Warnings are capped at 60 per 60-second
+window per process; the next emitted warning reports how many events were
+suppressed.
 
 Write-idle timeouts are checked after an attempted I/O operation still returns
 `Pending`; restored progress wins over an elapsed idle timer. The absolute

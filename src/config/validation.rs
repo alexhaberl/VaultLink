@@ -248,9 +248,9 @@ fn validate_mtls_handshake_timeout(
     let Some(seconds) = configured_seconds else {
         return Ok(());
     };
-    if !(10..=60).contains(&seconds) || (seconds > 10 && !listen.ip().is_loopback()) {
+    if !(10..=180).contains(&seconds) || (seconds > 10 && !listen.ip().is_loopback()) {
         return Err(ConfigError::Invalid(
-            "extended mTLS handshake timeout requires a loopback listener and a value from 10 to 60 seconds".into(),
+            "extended mTLS handshake timeout requires a loopback listener and a value from 10 to 180 seconds".into(),
         ));
     }
     Ok(())

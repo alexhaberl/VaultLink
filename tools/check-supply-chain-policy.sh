@@ -1597,7 +1597,7 @@ if [ "$(grep -F -c 'LOAD_P95_POLICY=diagnostic' "$vm_runtime_smoke" || true)" -n
         'LOAD_P95_POLICY=diagnostic' .github deploy tools \
     || ! grep -F -q 'case "$acceleration" in kvm|tcg)' "$vm_runtime_smoke" \
     || ! grep -F -q 'if [ "$acceleration" = tcg ]; then' "$vm_runtime_smoke" \
-    || ! grep -F -q 'load_connect_timeout_seconds=60' "$vm_runtime_smoke" \
+    || ! grep -F -q 'load_connect_timeout_seconds=210' "$vm_runtime_smoke" \
     || ! grep -F -q 'load_metadata_max_time_seconds=300' "$vm_runtime_smoke" \
     || ! grep -F -q 'load_transfer_max_time_seconds=3600' "$vm_runtime_smoke" \
     || ! grep -F -q 'load_admission_ready_timeout_seconds=600' "$vm_runtime_smoke" \
@@ -1697,7 +1697,7 @@ if ! grep -F -q 'section == "[reverse_proxy]" && $0 == "enabled = false"' "$vm_r
     || ! grep -F -q 'rewritten_tls != 1 || rewritten_cert != 1 || rewritten_key != 1' "$vm_runtime_smoke" \
     || ! grep -F -q 'kind = "mtls"' "$vm_runtime_smoke" \
     || ! grep -F -q 'client_fingerprints = ["%s"]' "$vm_runtime_smoke" \
-    || ! grep -F -q 'handshake_timeout_seconds = 60' "$vm_runtime_smoke"; then
+    || ! grep -F -q 'handshake_timeout_seconds = 180' "$vm_runtime_smoke"; then
     report "the distro VM runtime gate must build and verify minimal storage and section-scoped reverse-proxy configuration"
 fi
 vm_evidence_upload=$(awk '

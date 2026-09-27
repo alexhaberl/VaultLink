@@ -146,11 +146,13 @@ proxy_buffering off;
 ```
 
 The mTLS handshake deadline defaults to 10 seconds. The optional
-`reverse_proxy.transport.handshake_timeout_seconds` accepts 10–60 seconds;
+`reverse_proxy.transport.handshake_timeout_seconds` accepts 10–180 seconds;
 values above 10 require a loopback listener. The offline QEMU full-load gate
-uses 60 seconds on its isolated loopback listener because TCG can delay 150
-simultaneous handshakes. Native package tests and the dedicated 72-hour soak
-retain the 10-second default.
+uses 180 seconds on its isolated loopback listener because TCG can delay 150
+simultaneous handshakes; its clients allow 210 seconds to connect. This
+exception lengthens the time a local unauthenticated peer can occupy a
+handshake slot. Native package tests and the dedicated 72-hour soak retain
+the 10-second default.
 
 ### Standalone TLS with PEM files
 

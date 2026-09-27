@@ -122,7 +122,7 @@
         "src/config/validation.rs",
         "src/config/tls.rs"
       ],
-      "sha256": "b95a05ef0766dd4faf865f03935afa931201e30fd0f374548bb497c13dccbff8"
+      "sha256": "c9bb6d51060a723e92696f1c946a7ed7da4197e85bdd5b97534d832a821cef97"
     },
     {
       "name": "setup state-routes-handlers-commit-discovery-views",

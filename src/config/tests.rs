@@ -433,8 +433,8 @@ mod tests {
         let public = "192.0.2.10:18081".parse().unwrap();
         assert!(validate_mtls_handshake_timeout(public, None).is_ok());
         assert!(validate_mtls_handshake_timeout(public, Some(10)).is_ok());
-        assert!(validate_mtls_handshake_timeout(loopback, Some(60)).is_ok());
-        for (listen, seconds) in [(loopback, 9), (loopback, 61), (public, 11)] {
+        assert!(validate_mtls_handshake_timeout(loopback, Some(180)).is_ok());
+        for (listen, seconds) in [(loopback, 9), (loopback, 181), (public, 11)] {
             assert!(validate_mtls_handshake_timeout(listen, Some(seconds)).is_err());
         }
     }

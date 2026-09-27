@@ -384,7 +384,7 @@ awk -v certdir="$certificate_dir" '
 printf '\n[reverse_proxy.transport]\nkind = "mtls"\nclient_ca_file = "%s/ca.crt"\nclient_fingerprints = ["%s"]\n' \
     "$certificate_dir" "$client_fingerprint" >>"$evidence/config.toml"
 if [ "$acceleration" = tcg ]; then
-    printf 'handshake_timeout_seconds = 60\n' >>"$evidence/config.toml"
+    printf 'handshake_timeout_seconds = 180\n' >>"$evidence/config.toml"
 fi
 rm -f "$runtime_config_work"
 runtime_config_work=
@@ -530,7 +530,7 @@ load_admission_holder_max_time_seconds=30
 load_admission_probe_max_time_seconds=5
 load_profile_ready_timeout_seconds=10
 if [ "$acceleration" = tcg ]; then
-    load_connect_timeout_seconds=60
+    load_connect_timeout_seconds=210
     load_metadata_max_time_seconds=300
     load_transfer_max_time_seconds=3600
     load_admission_ready_timeout_seconds=600
