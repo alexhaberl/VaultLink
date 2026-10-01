@@ -326,9 +326,11 @@ this document alone:
   load, staging, hardware-FIDO2, SMB, and Debian 72-hour soak gates in
   `docs/RELEASE-CHECKLIST-0.7.2.md`.
 
-The 0.7.2 gates and fresh Cargo.lock audit are still open. Passing individual
-CI jobs validates tested controls but does not close unchecked release
-checklist items or accept a candidate residual condition.
+The preparatory 2026-10-01 Cargo.lock audit is recorded in
+`release/preparation-0.7.2.md`. Exact-commit release gates and the separate
+pre-soak, collection, and pre-publication audits remain open. Passing individual
+CI jobs does not close unchecked release checklist items or accept a candidate
+residual condition.
 
 ## Review record
 
@@ -341,6 +343,7 @@ checklist items or accept a candidate residual condition.
 | 2026-09-04 | Unreleased 0.7.0 review-findings implementation | Release-state truth, qualification ledger, workflow linting, security/performance findings, schema 8, and architecture gates | RA-01 through RA-09 and RA-11 through RA-12 reconfirmed for 0.7.0; release remains fail closed until the qualification ledger has no open entry |
 | 2026-09-17 | Unreleased 0.7.1 preparation | TLS dependency fix, published-artifact gap, fresh security audits and release qualification | Schema and feature trust boundaries remain unchanged; the source fix does not repair immutable 0.7.0 packages. Performance and final soak qualification remain open; the existing residual-risk conditions still apply. |
 | 2026-09-26 | `e71a9bb4fd58d5fbddbda06d115ed4865d59b81a` (unreleased 0.7.2 `main`) | Schema-11/12 directory quotas and upload IDs; authenticated Unix/mTLS proxy transport; NixOS, Docker/rootless, Kubernetes, and post-release OCI provenance | Updated TB-11 through TB-13, INV-17 through INV-21, TM-FS-07/08, TM-DATA-06/07, TM-NET-03/04, TM-SC-10/11, TM-OPS-05/06 and CR-01 through CR-03 against source, deployment files, docs, and workflow definitions. Fresh audit and release gates remain open; this source review does not qualify a release. |
+| 2026-10-01 | `8354dcbe1abaf758ffb621dda6f43b8a49b991cf` (unreleased 0.7.2 pre-freeze) | Recheck source and build inputs after the mTLS load-budget and loopback timeout changes, soak admission-holder cleanup, Cargo/Debian dependency refresh, builder pins, and NixOS/Docker documentation updates | Rechecked TB-02 and TB-11 through TB-13, INV-17 through INV-21, TM-OPS-01, TM-SC-04/10/11 and CR-01 through CR-03. The 192 pending-handshake cap remains below the 256 active-connection cap; the 10-second default and loopback-only 180-second maximum bound the TCG exception. The Curl-holder regression test, preliminary PR architecture/package checks, fresh lockfile audit, and reviewed builder artifacts are recorded in `release/preparation-0.7.2.md`. No new residual risk is accepted; exact-commit gates, VM binding, 72-hour soak, and post-release public OCI proof remain required. |
 
 ## Review triggers
 
