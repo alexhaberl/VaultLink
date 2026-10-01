@@ -55,6 +55,16 @@ expected_mount_source = "/dev/mapper/vaultlink"
 
 `expected_mount_source` must exactly match the source field in the active `/proc/self/mountinfo` row; a `UUID=` entry in `/etc/fstab` is not automatically the same value. Supported audited local filesystems are ext2/3/4, XFS, Btrfs, F2FS, Bcachefs, and ZFS. The root, internal directory, and data directory belong to the `vaultlink` service user and must not be writable through group/other mode bits or the POSIX ACL mask. SQLite may share that local mount only outside the visible tree. With CIFS/SMB, SQLite must be on a separate local filesystem.
 
+### Access to files below the storage root
+
+The VaultLink application runs as the unprivileged `vaultlink` user, not as root. A VaultLink administrator does not bypass filesystem permissions. For user data below `root_mount_path`, the service user needs:
+
+- Search (`x`) permission on every directory in the path to a file, and read (`r`) permission on the file to download it.
+- Read and search (`r+x`) permission on a directory to list its contents.
+- Write and search (`w+x`) permission on the relevant parent directories to create, upload, rename, or delete entries.
+
+A root-owned file with mode `0600` is therefore inaccessible to VaultLink. Grant only the required access through ownership, group permissions, or ACLs; do not run the application as root to bypass missing permissions. The file browser and shares remain confined to the configured storage root. For CIFS/SMB, the server ACL must also grant the VaultLink SMB service account the required access. When using another mount base, also adjust the packaged service's `ReadWritePaths` as described in the [installation guide](INSTALLATION.md#native-package-deployment).
+
 `public_base_url` uses canonical `http://` or `https://` authority syntax without a trailing slash. Base paths, credentials, query strings, and fragments are unsupported.
 
 **Since 0.7.0:** the optional `[admission]` section protects the reserved administrator capacity and slow-client boundaries. Omitted sections use the shown defaults. Operators may only tighten them: reduce parallelism/duration or increase minimum DATA-byte throughput. The global ceilings remain 32 uploads and 128 streams, leaving at least four upload and 32 stream slots outside the public pools.
