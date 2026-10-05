@@ -2,8 +2,9 @@
 
 The repository flake provides VaultLink for `x86_64-linux` and `aarch64-linux`.
 Use a reviewed, signed VaultLink release tag and retain the exact revision in
-your host's `flake.lock`. The currently published 0.7.1 release predates this
-target; do not treat a checkout of `main` as a supported release.
+your host's `flake.lock`. The signed `v0.7.2` release includes this target
+and passed both native architecture build and VM gates. Use that tag rather
+than an unqualified later checkout of `main`.
 
 ## Host configuration
 

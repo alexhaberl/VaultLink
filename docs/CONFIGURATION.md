@@ -10,9 +10,8 @@ and read mount identity from inside the running container. The state bind mount
 must remain on a supported local filesystem even when the file store uses SMB.
 
 Choose the storage layout and HTTPS mode before completing
-[installation](INSTALLATION.md). The examples in this checkout follow unreleased
-0.7.2 development. For the supported 0.7.1 release, use the examples shipped
-with its signed package. The configurable `[admission]` section exists since
+[installation](INSTALLATION.md). The examples in this checkout follow the supported
+0.7.2 release. Use the examples shipped with its signed package. The configurable `[admission]` section exists since
 0.7.0.
 
 Known 0.6.0 limitation: CIFS startup can fail with `missing required security
@@ -20,8 +19,8 @@ option "sign"` even when the SMB session is signed and encrypted. That release
 checks for a standalone mountinfo entry that Linux does not emit. Changing only
 the mount command cannot fix the application check. Local ext4 installations
 are unaffected by this defect. The correction was introduced in 0.7.0 and is
-included in the supported 0.7.1 release. Version 0.6.0 is superseded; upgrade
-to 0.7.1.
+included in the supported 0.7.2 release. Version 0.6.0 is superseded; upgrade
+to 0.7.2.
 
 ## Configuration model
 
@@ -35,7 +34,7 @@ Examples:
 Startup rules:
 
 - `development`: loopback only, HTTP, no HSTS.
-- `reverse_proxy`: production, HTTPS `public_base_url`, `reverse_proxy.enabled = true`, and a mandatory authenticated `unix` or `mtls` transport in the 0.7.2 development build. The published 0.7.1 release still accepts IP-only proxy configurations; follow the [migration guide](PROXY-MIGRATION-071.md) before upgrading from one.
+- `reverse_proxy`: production, HTTPS `public_base_url`, `reverse_proxy.enabled = true`, and a mandatory authenticated `unix` or `mtls` transport in 0.7.2. The superseded 0.7.1 release accepts IP-only proxy configurations; follow the [migration guide](PROXY-MIGRATION-071.md) before upgrading from one.
 - `standalone_tls` with `certificate_source = "files"`: production HTTPS, TLS enabled, certificate and key present; optional SIGHUP reload.
 - `standalone_tls` with `certificate_source = "letsencrypt"`: production HTTPS, TLS enabled, reverse proxy disabled, DNS host in `public_base_url`, contact email, and a secure ACME cache below `data_directory`.
 
