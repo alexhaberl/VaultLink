@@ -2,9 +2,8 @@
 
 [Back to README](../README.md)
 
-This reference describes the unreleased **0.7.2 development checkout** and
-identifies differences from the supported **0.7.1 release** and superseded
-**0.6.0** release where relevant.
+This reference describes the supported **0.7.2 release** and identifies
+differences from superseded **0.7.1** and **0.6.0** releases where relevant.
 For supported versions and vulnerability reporting, see
 [Security Policy](../SECURITY.md).
 
@@ -100,7 +99,7 @@ reserved bytes. Authority and policy epoch are checked on extension and again
 before publication, including when an upload finishes inside its existing
 reservation. Ahead reservation never authorizes publication after revocation.
 
-The superseded 0.6.0 release uses schema 6. Fresh installations of the supported 0.7.1 release create schema 10 and version-2 through version-10 migration records. This development version creates schema 12 and migrates valid schema-1 through schema-11 databases through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, schema 8 adds normalized trigram Share search plus composite audit-pagination indexes, schema 9 adds an index for pending transfer cleanup, schema 10 adds partial indexes for protected and exhausted Shares plus expiry indexes, schema 11 adds the per-share upload-directory counter, and schema 12 adds hash-only upload operation receipts. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup from before the schema-12 migration. Schema 12 and mandatory preissued upload IDs ship together.
+The superseded 0.6.0 release uses schema 6. Fresh installations of the superseded 0.7.1 release create schema 10 and version-2 through version-10 migration records. The supported 0.7.2 release creates schema 12 and migrates valid schema-1 through schema-11 databases through atomic `IMMEDIATE` transactions; schema 3 adds the bounded share-listing indexes, schema 4 adds administrator-session activity tracking while revoking pre-migration sessions, schema 5 adds audit-retention priority, schema 6 applies the centralized audit policy to existing upload-related records, schema 7 adds hash-only monitoring service tokens, schema 8 adds normalized trigram Share search plus composite audit-pagination indexes, schema 9 adds an index for pending transfer cleanup, schema 10 adds partial indexes for protected and exhausted Shares plus expiry indexes, schema 11 adds the per-share upload-directory counter, and schema 12 adds hash-only upload operation receipts. Future, unknown, corrupt, and non-empty unversioned schemas are rejected. Migrations are forward-only; rollback restores a matching old binary/config/database/keyring backup from before the schema-12 migration. Schema 12 and mandatory preissued upload IDs ship together.
 
 An upload operation is scoped to an administrator or Share ID. Its `processing` phase can be retried after an interrupted receive; entering `committing` is durable before visible changes. Startup recovery turns an unfinished commit into terminal `outcome_unknown` instead of blindly republishing. Results expire after 24 hours; in-progress finalizers are retained. Registration is bounded to 64 unused IDs and 4,096 total operations per owner, with global limits of 4,096 unused and 65,536 total. The upload queue lives only in browser memory and requests an ID for each file when its first send begins.
 

@@ -1,12 +1,20 @@
 # Docker Engine deployment (Linux amd64 and arm64)
 
-The first official container image is planned for the next release. The
-published 0.7.1 release has no VaultLink runtime image. Use the signed release
+The first official container image is published for `v0.7.2`. Use the signed release
 tag, its matching immutable GHCR image digest, and the Compose file from that
 same tag. The image is built natively for `linux/amd64` and `linux/arm64`; the
 release workflow publishes its multiarch index only after the signed, immutable
 native release is published. Do not deploy an image built from a development
 branch as a production release.
+
+Verified `v0.7.2` multiarch index (Linux amd64 and arm64):
+
+```text
+ghcr.io/alexhaberl/vaultlink@sha256:05dec2be0c87d06a4a5e3df5d157f0d7ac6a1a4e6e6e85bcfa17b12f25cca54f
+```
+
+Public pulls, binary identities and runtime tests for both architectures are
+recorded in [the publication receipt](../release/publication-0.7.2.json).
 
 ## Host storage
 

@@ -181,6 +181,20 @@ jobs:
           test "$(cat digests/binary-amd64.sha256)" = '${{ needs.prepare.outputs.amd64_hash }}'
           test "$(cat digests/binary-arm64.sha256)" = '${{ needs.prepare.outputs.arm64_hash }}'
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # Native BuildKit outputs are attested indices. Imagetools flattens
+          # their platform manifests when composing the multiarch index.
+          source_platform_digest() {
+            source_index=$1
+            architecture=$2
+            docker buildx imagetools inspect "$IMAGE@$source_index" --raw \
+              | jq -er --arg arch "$architecture" \
+                '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest]
+                 | if length == 1 then .[0] else error("expected one native platform manifest") end'
+          }
+          source_amd64=$(source_platform_digest "$amd64" amd64)
+          source_arm64=$(source_platform_digest "$arm64" arm64)
+          [[ "$source_amd64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$source_arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
           tag="$IMAGE:${{ needs.prepare.outputs.tag }}"
           existing_tag=false
           if docker buildx imagetools inspect "$tag" >tag-inspection.txt 2>tag-inspection.err; then
@@ -204,8 +218,8 @@ jobs:
           [[ "$index_amd64" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$index_arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
           if [ "$existing_tag" = false ]; then
-            test "$index_amd64" = "$amd64"
-            test "$index_arm64" = "$arm64"
+            test "$index_amd64" = "$source_amd64"
+            test "$index_arm64" = "$source_arm64"
           fi
           amd64=$index_amd64
           arm64=$index_arm64

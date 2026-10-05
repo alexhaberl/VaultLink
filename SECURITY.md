@@ -7,14 +7,14 @@ operational requirements, advisory exceptions, and vulnerability reporting.
 
 ## Supported versions
 
-Release line: `0.7.2` is unreleased development. The currently supported release is `0.7.1`. Its native packages cover Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Versions `0.7.0` and `0.6.0` are superseded and no longer supported. The withdrawn `v0.5.0` archive remains unsupported; unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported. [`release/release-state.json`](release/release-state.json) is authoritative for lifecycle state and immutable release evidence.
+Release line: The currently supported release is `0.7.2`. Its native packages cover Debian 13 and Ubuntu 24.04/26.04 LTS on amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch Linux snapshot on x86_64. Versions `0.7.1`, `0.7.0` and `0.6.0` are superseded and no longer supported. The withdrawn `v0.5.0` archive remains unsupported; unlisted versions, derivatives, Arch Linux ARM, archive installs, and Windows hosts are unsupported. [`release/release-state.json`](release/release-state.json) is authoritative for lifecycle state and immutable release evidence.
 
 ## TLS security update in 0.7.1
 
 [VaultLink 0.7.1](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1)
 was published on 2026-09-22 from qualified commit
 `efdbea07d0e77f9bd89cbde7fd1a706055739e36`. Its immutable native packages
-include rustls 0.23.45 and rustls-webpki 0.103.15. Install 0.7.1 for new
+include rustls 0.23.45 and rustls-webpki 0.103.15. The fix is retained in 0.7.2. Install 0.7.2 for new
 deployments and upgrade existing supported-platform native installations.
 
 The immutable 0.7.0 packages were built at `0af4612bd3c32a995b19de4cd19ca05ac4fd4855`
@@ -26,7 +26,9 @@ covers rustls 0.23.13 through 0.23.44 accepting TLS 1.3 handshake messages
 across encryption-level boundaries. The upstream description does not establish
 a denial-of-service or authentication bypass in VaultLink.
 
-The updater now discovers 0.7.1 through GitHub's latest stable release.
+The updater now discovers 0.7.2 through GitHub's latest stable release.
+For an existing 0.7.1 IP-only proxy configuration, first follow the
+[one-time authenticated proxy migration](docs/PROXY-MIGRATION-071.md).
 Follow the [verified native-package upgrade](docs/UPGRADE-ROLLBACK.md);
 the update takes effect only after the new package is installed and activated.
 Retain historical signed packages for authenticated rollback; never replace

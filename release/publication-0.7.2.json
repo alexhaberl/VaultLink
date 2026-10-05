@@ -1,0 +1,270 @@
+{
+  "version": "0.7.2",
+  "tag": "v0.7.2",
+  "tag_object_sha": "d43cb4340fd200a41395f98ea67cd27fd590e883",
+  "commit_sha": "eef652c9d5bb6e7f9420a5a915a01458a54dd94f",
+  "release_id": 403609213,
+  "release_url": "https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.2",
+  "published_at": "2026-10-05T10:44:04Z",
+  "verified_at": "2026-10-05T10:44:38.494838+00:00",
+  "immutable": true,
+  "latest": true,
+  "asset_count": 21,
+  "tag_verification": {
+    "verified": true,
+    "reason": "valid",
+    "verified_at": "2026-10-05T10:39:47Z"
+  },
+  "release_workflow": {
+    "run_id": 37298002953,
+    "run_attempt": 1,
+    "conclusion": "success",
+    "url": "https://github.com/alexhaberl/VaultLink/actions/runs/37298002953"
+  },
+  "signature_verification": "All ten Minisign signatures verified by the exact-commit release workflow before and after the GitHub draft upload.",
+  "public_asset_digests_verified": true,
+  "checksum_manifest_verified": true,
+  "soak_binary_sha256_verified": "a3684bb24255a2ee6d7f47398a401733f8a3cf08bfb0f2bcaeeff356da8ad3b2",
+  "effective_qualification_artifact": "effective-qualification-eef652c9d5bb6e7f9420a5a915a01458a54dd94f-37298002953-1",
+  "unsigned_preflight_bytes_verified": true,
+  "pre_publish_audit": {
+    "commit": "eef652c9d5bb6e7f9420a5a915a01458a54dd94f",
+    "lock_sha256": "9ca9730642e5c89dcaeee7589faa52a9e1ab8043b63650ad85a10047b499d438",
+    "database_commit": "ef6173cbc5c50ec8166f9a5b28f07834144373ee",
+    "audit_version": "0.22.2",
+    "started_at": "2026-10-05T10:43:59Z",
+    "finished_at": "2026-10-05T10:44:03Z",
+    "exit_code": "0"
+  },
+  "pre_publish_audit_artifact": {
+    "id": 11339478745,
+    "name": "pre-publish-audit-eef652c9d5bb6e7f9420a5a915a01458a54dd94f-37298002953-1",
+    "digest": "sha256:c5fa8059ac4f062ff30973b88645840670afa5b61c923abe2d57893d4fdad1c4"
+  },
+  "assets": [
+    {
+      "name": "SHA256SUMS",
+      "size": 1027,
+      "sha256": "9ead219bbfa014a0a1fb101a3f18d611e4efe23f02f9f1c94e72f20fbe225e81",
+      "github_asset_id": 612270534
+    },
+    {
+      "name": "SHA256SUMS.minisig",
+      "size": 305,
+      "sha256": "727acfb04840cdd53ab60514a58fd2dbd78a39baa60a12e3c995ae34191609f2",
+      "github_asset_id": 612270530
+    },
+    {
+      "name": "vaultlink-0.7.2-1-x86_64.pkg.tar.zst",
+      "size": 8754800,
+      "sha256": "af1f15e9bf7b530f014d86c3357adda37cf2a73633850f02d43b13a89beb4360",
+      "github_asset_id": 612270532
+    },
+    {
+      "name": "vaultlink-0.7.2-1-x86_64.pkg.tar.zst.minisig",
+      "size": 331,
+      "sha256": "c7898b2820fa59aed80a11a894e78b68640e3b04cf21d00b2c0b7e9e886dfb79",
+      "github_asset_id": 612270535
+    },
+    {
+      "name": "vaultlink-0.7.2-1.fc44.aarch64.rpm",
+      "size": 6902819,
+      "sha256": "556c5d716cbf357aa5edc38262ce106b76b4078ef5c43c20ef40ca359b72194d",
+      "github_asset_id": 612270533
+    },
+    {
+      "name": "vaultlink-0.7.2-1.fc44.aarch64.rpm.minisig",
+      "size": 329,
+      "sha256": "4f0d5b0286e81bea66d9b4a6aae19f7013fb83c672703d58e957cfbd65770932",
+      "github_asset_id": 612270552
+    },
+    {
+      "name": "vaultlink-0.7.2-1.fc44.x86_64.rpm",
+      "size": 7199007,
+      "sha256": "d515f12e065e496cc5fd9ee79da67ef8a8a47a848b75a9b059c63978872430aa",
+      "github_asset_id": 612270551
+    },
+    {
+      "name": "vaultlink-0.7.2-1.fc44.x86_64.rpm.minisig",
+      "size": 328,
+      "sha256": "3d1dcb3ae93b474ae94e261d0beda67068ff208edf5658fb7de1e4127bd96b2a",
+      "github_asset_id": 612270555
+    },
+    {
+      "name": "vaultlink-0.7.2-sbom-bundle.json",
+      "size": 2499000,
+      "sha256": "7c3dedbf8bea60b63674b1c88a0e58e13ed1f2db6b5650b207323d4985039af5",
+      "github_asset_id": 612270573
+    },
+    {
+      "name": "vaultlink_0.7.2-1+deb13_amd64.deb",
+      "size": 6519992,
+      "sha256": "3e76313a44245811665789c4704ba5a5867f6d2e387ee1f44337924ad7906ee9",
+      "github_asset_id": 612270577
+    },
+    {
+      "name": "vaultlink_0.7.2-1+deb13_amd64.deb.minisig",
+      "size": 328,
+      "sha256": "9d21313ede65924996de5851ad5f6e09f1aac4ac04a228f2e314f863bcd35a50",
+      "github_asset_id": 612270579
+    },
+    {
+      "name": "vaultlink_0.7.2-1+deb13_arm64.deb",
+      "size": 5829420,
+      "sha256": "19feda8e6aa984ad0e08f141767829e94e37e081df8ba3b141fa14d68d556fb6",
+      "github_asset_id": 612270582
+    },
+    {
+      "name": "vaultlink_0.7.2-1+deb13_arm64.deb.minisig",
+      "size": 328,
+      "sha256": "db5f57917375eaeb245d03c070021c8dfd670682f0782345f15450a8944e173c",
+      "github_asset_id": 612270607
+    },
+    {
+      "name": "vaultlink_0.7.2-1+ubuntu24.04_amd64.deb",
+      "size": 6492124,
+      "sha256": "94043bfc918ed408647125b2daa04fa2739db7cf94f3f3c77b3304de7e6e3b83",
+      "github_asset_id": 612270608
+    },
+    {
+      "name": "vaultlink_0.7.2-1+ubuntu24.04_amd64.deb.minisig",
+      "size": 334,
+      "sha256": "c3826c3db42c7f6ec7dbf700f693301174ac7485706c2ec73ff362ae60ce1ae1",
+      "github_asset_id": 612270620
+    },
+    {
+      "name": "vaultlink_0.7.2-1+ubuntu24.04_arm64.deb",
+      "size": 5818596,
+      "sha256": "48ab51a550d5b06e779d954ec3120e4fa73f6679abd8e7117e58ce2d11b19d6a",
+      "github_asset_id": 612270623
+    },
+    {
+      "name": "vaultlink_0.7.2-1+ubuntu24.04_arm64.deb.minisig",
+      "size": 334,
+      "sha256": "0a28a3ce085a2d77566ff372a97d066ff90fdd90242faa3197cbf55e17615f5b",
+      "github_asset_id": 612270631
+    },
+    {
+      "name": "vaultlink_0.7.2-1+ubuntu26.04_amd64.deb",
+      "size": 6538508,
+      "sha256": "90c3119d23f41a55e74611f700ca2d1bddacc6c45e3832c0b6753b5157dd7d9a",
+      "github_asset_id": 612270640
+    },
+    {
+      "name": "vaultlink_0.7.2-1+ubuntu26.04_amd64.deb.minisig",
+      "size": 334,
+      "sha256": "87efbdc6f39c3f3acf67597b782850440029aa3091cbc982e494cd3a5f1e800f",
+      "github_asset_id": 612270642
+    },
+    {
+      "name": "vaultlink_0.7.2-1+ubuntu26.04_arm64.deb",
+      "size": 5887864,
+      "sha256": "76534f11398c515fd854c90cf9852ff72d19085d8e2fc5610c097e114f5a8882",
+      "github_asset_id": 612270662
+    },
+    {
+      "name": "vaultlink_0.7.2-1+ubuntu26.04_arm64.deb.minisig",
+      "size": 334,
+      "sha256": "4751778c73ec462ebf4e553295ab6428b758b77d2db259e07840dae47b6553b1",
+      "github_asset_id": 612270670
+    }
+  ],
+  "docker_qualification": {
+    "architectures": {
+      "amd64": {
+        "artifact_id": 11198480342,
+        "artifact_name": "docker-qualification-amd64-eef652c9d5bb6e7f9420a5a915a01458a54dd94f-36934159808-1",
+        "artifact_sha256": "c36dd5433816a7494f4c320580c9acb835ca4150a31d2961e36d97562e65095c",
+        "binary_sha256": "a3684bb24255a2ee6d7f47398a401733f8a3cf08bfb0f2bcaeeff356da8ad3b2",
+        "repository": "alexhaberl/VaultLink",
+        "run_attempt": 1,
+        "run_id": 36934159808,
+        "workflow_sha": "eef652c9d5bb6e7f9420a5a915a01458a54dd94f"
+      },
+      "arm64": {
+        "artifact_id": 11198366204,
+        "artifact_name": "docker-qualification-arm64-eef652c9d5bb6e7f9420a5a915a01458a54dd94f-36934159808-1",
+        "artifact_sha256": "36a4a97338f2efe92274f60d1c3601bc839e847469b47dce51556e8772b46cf1",
+        "binary_sha256": "d734fc835e8a926e2124af6b25d2a9130813ae45cdaace4e11d8bc9441f2247b",
+        "repository": "alexhaberl/VaultLink",
+        "run_attempt": 1,
+        "run_id": 36934159808,
+        "workflow_sha": "eef652c9d5bb6e7f9420a5a915a01458a54dd94f"
+      }
+    },
+    "commit": "eef652c9d5bb6e7f9420a5a915a01458a54dd94f",
+    "repository": "alexhaberl/VaultLink",
+    "run_attempt": 1,
+    "run_id": 36934159808,
+    "schema_version": 1,
+    "version": "0.7.2",
+    "workflow": ".github/workflows/docker-runtime.yml"
+  },
+  "docker_publication": {
+    "run_id": 37298461737,
+    "run_attempt": 2,
+    "conclusion": "success",
+    "url": "https://github.com/alexhaberl/VaultLink/actions/runs/37298461737",
+    "image_reference": "ghcr.io/alexhaberl/vaultlink@sha256:05dec2be0c87d06a4a5e3df5d157f0d7ac6a1a4e6e6e85bcfa17b12f25cca54f",
+    "proof_artifact": {
+      "id": 11341075237,
+      "node_id": "MDg6QXJ0aWZhY3QxMTM0MTA3NTIzNw==",
+      "name": "docker-release-proof-v0.7.2-37298461737-2",
+      "size_in_bytes": 694,
+      "url": "https://api.github.com/repos/alexhaberl/VaultLink/actions/artifacts/11341075237",
+      "archive_download_url": "https://api.github.com/repos/alexhaberl/VaultLink/actions/artifacts/11341075237/zip",
+      "expired": false,
+      "digest": "sha256:b556fa75e9a2949a50d302fe109f53e4c1dc164a3b1e3aebab98ae6424f4c719",
+      "created_at": "2026-10-05T10:53:45Z",
+      "updated_at": "2026-10-05T10:53:45Z",
+      "expires_at": "2027-01-03T10:51:48Z",
+      "workflow_run": {
+        "id": 37298461737,
+        "repository_id": 1291468377,
+        "head_repository_id": 1291468377,
+        "head_branch": "main",
+        "head_sha": "eef652c9d5bb6e7f9420a5a915a01458a54dd94f"
+      }
+    },
+    "proof": {
+      "architectures": {
+        "amd64": {
+          "child_digest": "sha256:deb7bf58363df07818dc1d2550e381e56af1e72e25c76e925e150dd87664aa9b",
+          "published_binary_sha256": "a3684bb24255a2ee6d7f47398a401733f8a3cf08bfb0f2bcaeeff356da8ad3b2",
+          "qualification_artifact_sha256": "c36dd5433816a7494f4c320580c9acb835ca4150a31d2961e36d97562e65095c",
+          "qualified_binary_sha256": "a3684bb24255a2ee6d7f47398a401733f8a3cf08bfb0f2bcaeeff356da8ad3b2"
+        },
+        "arm64": {
+          "child_digest": "sha256:193dabddd7c6874af2e5a5c31439216953a0eca63439290898ec1be6b5eca1b7",
+          "published_binary_sha256": "d734fc835e8a926e2124af6b25d2a9130813ae45cdaace4e11d8bc9441f2247b",
+          "qualification_artifact_sha256": "36a4a97338f2efe92274f60d1c3601bc839e847469b47dce51556e8772b46cf1",
+          "qualified_binary_sha256": "d734fc835e8a926e2124af6b25d2a9130813ae45cdaace4e11d8bc9441f2247b"
+        }
+      },
+      "commit": "eef652c9d5bb6e7f9420a5a915a01458a54dd94f",
+      "index_digest": "sha256:05dec2be0c87d06a4a5e3df5d157f0d7ac6a1a4e6e6e85bcfa17b12f25cca54f",
+      "qualification_attempt": 1,
+      "qualification_run": 36934159808,
+      "repository": "alexhaberl/VaultLink",
+      "schema_version": 1,
+      "tag": "v0.7.2"
+    },
+    "initial_attempt": {
+      "conclusion": "failure",
+      "reason": "The initial publish compared attested per-architecture index digests with flattened platform-manifest digests. Attempt 2 verified the already-published version tag without replacing it and passed both public architecture checks."
+    }
+  },
+  "soak_summary": {
+    "duration_seconds": 259200,
+    "full_load_profiles": 12,
+    "metric_samples": 864,
+    "max_metadata_p95_seconds": 0.264701,
+    "max_range_ttfb_p95_seconds": 0.613012,
+    "max_load_rss_kib": 48088,
+    "warm_rss_median_kib": 39756,
+    "late_rss_median_kib": 45728,
+    "final_rss_median_kib": 46328,
+    "restarts": 0,
+    "integrity": "ok"
+  }
+}

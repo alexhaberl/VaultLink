@@ -1,11 +1,26 @@
 # v0.7.2 native-package release checklist
 
-Status: **unreleased development**. VaultLink 0.7.1 remains the supported,
-immutable release. [`release/release-state.json`](../release/release-state.json)
-is authoritative for lifecycle state. This checklist and the
-[qualification ledger](../release/qualification-0.7.2.json) track work for the
-next candidate. The planned UTC release date is 2026-10-05; the final candidate
-has not yet been frozen.
+Status: **published, supported and immutable** on 2026-10-05.
+[`release/release-state.json`](../release/release-state.json) is authoritative
+for lifecycle state. The signed tag `v0.7.2` points to frozen commit `eef652c9d5bb6e7f9420a5a915a01458a54dd94f`.
+The release contains 21 verified assets. The [publication receipt](../release/publication-0.7.2.json)
+records all public hashes, the final audit and the verified GHCR image.
+
+The full 72-hour soak ended on 2026-10-05 at 07:25:50 UTC with twelve successful
+100/40/10 profiles, 864 metric samples and zero restarts. Maximum metadata p95
+was 0.264701 seconds, range-TTFB p95 0.613012 seconds and load RSS 48088 KiB.
+Transfer hashes and SQLite integrity passed; warm/late/final RSS medians were
+39756/45728/46328 KiB and remained within both growth bounds.
+
+The [evidence preflight](https://github.com/alexhaberl/VaultLink/actions/runs/37297489467),
+[signed native publication](https://github.com/alexhaberl/VaultLink/actions/runs/37298002953)
+and [public Docker qualification](https://github.com/alexhaberl/VaultLink/actions/runs/37298461737)
+all succeeded for the same commit. The final audit finished at 10:44:03 UTC;
+native publication followed at 10:44:04 UTC.
+
+The committed qualification ledger remains unchanged: effective evidence/tag
+artifacts resolve PERF-001 and QUAL-006 after verifying the actual DEB binary.
+The completed checklist below records the release procedure retrospectively.
 
 The [0.7.1 checklist](RELEASE-CHECKLIST-0.7.1.md) and its publication evidence
 remain historical records. The comparative 19-metric performance test is retired
@@ -14,21 +29,21 @@ The full-load and soak requirements still apply.
 
 ## Prepare build inputs and freeze
 
-- [ ] Review changes since v0.7.1, including schema 11 and 12 migrations,
+- [x] Review changes since v0.7.1, including schema 11 and 12 migrations,
   NixOS 26.05 support, the OCI runtime image, Cargo.lock, and all build inputs.
-- [ ] Reconfirm the [threat model](../THREAT_MODEL.md) against the final candidate,
+- [x] Reconfirm the [threat model](../THREAT_MODEL.md) against the final candidate,
   including upload operation IDs, directory quotas, authenticated proxy
   transport, and new deployment paths. Resolve its candidate residual conditions
   before qualification.
-- [ ] Complete any required builder, QEMU, and nine-guest image refreshes before
+- [x] Complete any required builder, QEMU, and nine-guest image refreshes before
   qualification. A Dockerfile frontend change requires all eleven images.
   Verify provenance, architectures, package inventories, generated manifest,
   all four QEMU locks, and the Debian-amd64 signing-image pin. Review and merge
   the pin PR before the final candidate is frozen.
-- [ ] Finish source, documentation, version, and pin changes. Record the exact
+- [x] Finish source, documentation, version, and pin changes. Record the exact
   `main` commit and package, binary, builder, guest, and orchestration hashes.
   Treat any subsequent commit as a new candidate.
-- [ ] Review and resolve open findings in the
+- [x] Review and resolve open findings in the
   [0.7.2 ledger](../release/qualification-0.7.2.json), with a fresh audit of the
   committed Cargo.lock. Keep final qualification evidence tied to one commit.
   PERF-001 and QUAL-006 remain open through the candidate and soak-start phases.
@@ -37,29 +52,29 @@ The full-load and soak requirements still apply.
 
 ## Qualify the exact candidate
 
-- [ ] Run native amd64/arm64 CI, nine packages, and both complete fuzz campaigns.
+- [x] Run native amd64/arm64 CI, nine packages, and both complete fuzz campaigns.
   Run the NixOS and Docker amd64/arm64 gates for the same commit.
-- [ ] After packages pass, run reproducibility and distro VMs. After native,
+- [x] After packages pass, run reproducibility and distro VMs. After native,
   package, and fuzz gates pass, run the release dry run, then candidate preflight.
   Validate each gate's workflow path, event, successful conclusion, and commit.
-- [ ] Install the final Debian-amd64 package on the staging VM. Match its payload,
+- [x] Install the final Debian-amd64 package on the staging VM. Match its payload,
   running executable, health version, service unit, and all seven orchestration
   files to the frozen commit. Verify at least eight CPUs, 16 GiB provisioned RAM
   and at least 15 GiB Linux MemTotal, storage, quotas, and preserved archives.
-- [ ] Start the 72-hour soak through `soak-start.yml` only after its exact gates
+- [x] Start the 72-hour soak through `soak-start.yml` only after its exact gates
   and fresh audit pass. Enable the collector and verify the active VM monitor,
   commit, binary SHA, and start/end times.
-- [ ] Collect at least 72 hours and twelve 100/40/10 profiles. Verify p95 under
+- [x] Collect at least 72 hours and twelve 100/40/10 profiles. Verify p95 under
   two seconds, RSS bounds, transfers and hashes, SQLite integrity, and zero
   restarts. Run the collection audit and final evidence preflight.
 
 ## Publish only after qualification
 
-- [ ] Keep `main` frozen through qualification. A commit, including a date or
+- [x] Keep `main` frozen through qualification. A commit, including a date or
   documentation change, requires fresh gates and a new 72-hour soak.
-- [ ] Verify the signed tag and nine native packages plus required release
+- [x] Verify the signed tag and nine native packages plus required release
   assets against the exact commit. Run the final audit immediately before
   publication and record the publication receipt. Publish the OCI image only
   through its follow-on workflow and verify public multiarch pulls.
-- [ ] After publication is verified, update the supported-version status and
+- [x] After publication is verified, update the supported-version status and
   installation guidance without rewriting the frozen candidate evidence.

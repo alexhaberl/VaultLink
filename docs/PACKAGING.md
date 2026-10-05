@@ -1,22 +1,23 @@
 # Native package support
 
-This document describes the **supported 0.7.1 package contract**.
-The immutable [release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1)
-was published on 2026-09-22 after completing the
-[release checklist](RELEASE-CHECKLIST-0.7.1.md). Use the
+This document describes the **supported 0.7.2 package contract**.
+The immutable [release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.2)
+was published on 2026-10-05 after completing the
+[release checklist](RELEASE-CHECKLIST-0.7.2.md). Use the
 [installation guide](INSTALLATION.md) to verify and install the signed packages.
 
-VaultLink releases are distributed only as native, signed operating-system
-packages. GitHub's automatically generated source archives are source material,
+The GitHub release assets are native, signed operating-system packages.
+NixOS uses the signed tag; container deployments use the separately published
+GHCR image. GitHub's automatically generated source archives are source material,
 not supported installation artifacts. VaultLink does not publish a package
 repository, a standalone binary, or a project tar archive.
 
-This describes the immutable 0.7.1 release. The next release also plans a
+The immutable 0.7.2 release also supports a
 [NixOS 26.05 repository-flake deployment](NIXOS.md), built by users from the
 signed release tag. NixOS does not add a GitHub release asset, native package
 target, package marker or native updater. Its own amd64 and arm64 build and
 booted local/SMB tests must pass before that target is marked supported.
-The next release also plans [Docker Engine](DOCKER.md),
+Version 0.7.2 also supports [Docker Engine](DOCKER.md),
 [rootless Docker](DOCKER-ROOTLESS.md) and [Kubernetes](KUBERNETES.md)
 deployments using one digest-addressed GHCR multiarch image. Its native amd64
 and arm64 runtime gates include all three deployment modes and must pass on
@@ -41,25 +42,9 @@ than repeat target lists in workflow YAML.
 | Fedora 44 | x86_64, aarch64 | RPM |
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
-For the published 0.7.1 release, the manifest defines these packages:
+For the published 0.7.2 release, the manifest defines these packages:
 
 | Target | Release asset |
-| --- | --- |
-| Debian 13 amd64 | `vaultlink_0.7.1-1+deb13_amd64.deb` |
-| Debian 13 arm64 | `vaultlink_0.7.1-1+deb13_arm64.deb` |
-| Ubuntu 24.04 amd64 | `vaultlink_0.7.1-1+ubuntu24.04_amd64.deb` |
-| Ubuntu 24.04 arm64 | `vaultlink_0.7.1-1+ubuntu24.04_arm64.deb` |
-| Ubuntu 26.04 amd64 | `vaultlink_0.7.1-1+ubuntu26.04_amd64.deb` |
-| Ubuntu 26.04 arm64 | `vaultlink_0.7.1-1+ubuntu26.04_arm64.deb` |
-| Fedora 44 x86_64 | `vaultlink-0.7.1-1.fc44.x86_64.rpm` |
-| Fedora 44 aarch64 | `vaultlink-0.7.1-1.fc44.aarch64.rpm` |
-| Arch Linux x86_64 | `vaultlink-0.7.1-1-x86_64.pkg.tar.zst` |
-
-The unreleased 0.7.2 checkout renders these **candidate asset names** from the
-same nine-target manifest. They are not published packages; keep using 0.7.1
-for installation until 0.7.2 completes qualification and publication.
-
-| Target | Candidate asset |
 | --- | --- |
 | Debian 13 amd64 | `vaultlink_0.7.2-1+deb13_amd64.deb` |
 | Debian 13 arm64 | `vaultlink_0.7.2-1+deb13_arm64.deb` |
@@ -144,7 +129,7 @@ an unbound markerless installation.
 ### Trusted staging and DEB initial-install boundary
 
 First create a new root-owned mode-`0700` staging directory with
-`sudo mktemp -d /var/tmp/vaultlink-release-0.7.1.XXXXXXXX`; never reuse a fixed
+`sudo mktemp -d /var/tmp/vaultlink-release-0.7.2.XXXXXXXX`; never reuse a fixed
 or pre-existing path. Copy the package, its direct signature, `SHA256SUMS`, its
 signature, and the separately trusted public key into it. Bind the staged key
 to SHA-256
@@ -165,7 +150,7 @@ The Fedora full-system gate exercises that exact path and requires no
 VaultLink-related AVC denials plus final package/runtime parity.
 
 For Debian and Ubuntu, read `Depends` from that exact verified, root-owned DEB
-with `dpkg-deb -f`. Version 0.7.1 requires the exact field
+with `dpkg-deb -f`. Version 0.7.2 requires the exact field
 `ca-certificates, curl, libc6, libgcc-s1, mawk, minisign, sqlite3, systemd`.
 Before running `dpkg -i`, query every one of those package names with
 `dpkg-query` and require the state `installed`; this is an offline preflight
@@ -419,7 +404,7 @@ built and boot-tested against the release-date snapshot; a weekly read-only
 job checks the current rolling image without changing published support claims.
 
 
-The v0.7.1 qualification sequence is exact-commit package/VM qualification,
+The v0.7.2 qualification sequence is exact-commit package/VM qualification,
 candidate preflight, a fresh security audit, soak start, and final evidence/tag
 verification. The comparative 19-metric performance test is retired for all
 releases from 0.7.0 onward; no baseline lock or `vaultlink/performance` artifact
@@ -427,5 +412,5 @@ is required. Final phases re-download the immutable 72-hour soak artifact,
 verify the actual package binary and archive effective qualification without
 modifying the candidate. All existing load, latency, RSS, integrity, and transfer
 gates remain mandatory. See the [performance policy](../release/performance/README.md)
-and the [0.7.1 checklist](RELEASE-CHECKLIST-0.7.1.md)
+and the [0.7.2 checklist](RELEASE-CHECKLIST-0.7.2.md)
 for the publication and subsequent support transition.

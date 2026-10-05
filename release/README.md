@@ -1,26 +1,23 @@
 # Release signing and immutable package inputs
 
-Lifecycle state and already-published evidence come exclusively from
-[`release-state.json`](release-state.json). Version 0.7.1 is the supported
-immutable release, published on 2026-09-22 with the TLS fix described in
-[SECURITY.md](../SECURITY.md#tls-security-update-in-071). Its signed tag,
-public asset digests and final audit are recorded in
-[`publication-0.7.1.json`](publication-0.7.1.json).
-Versions 0.7.0 and 0.6.0 are superseded and unsupported, with their immutable
-evidence and signed packages retained for authenticated rollback.
+Lifecycle state and published evidence come exclusively from
+[`release-state.json`](release-state.json). Version 0.7.2 is the supported,
+immutable release, published on 2026-10-05 from exact commit
+`eef652c9d5bb6e7f9420a5a915a01458a54dd94f`. Its signed tag, 21 public asset
+digests, final audit and separately published GHCR multiarch image are recorded
+in [`publication-0.7.2.json`](publication-0.7.2.json).
+Versions 0.7.1, 0.7.0 and 0.6.0 are superseded and unsupported; retain their
+signed native packages and paired state backups for authenticated rollback.
 `development_version` identifies the checkout; `supported_version` changes only
 after verification of the newly published immutable release.
 
-The current checkout is unreleased 0.7.2 development. Its
-[checklist](../docs/RELEASE-CHECKLIST-0.7.2.md),
-[qualification ledger](qualification-0.7.2.json), and
-[finding inventory](qualification-findings-0.7.2.json) track the next candidate.
-Build-input and image-pin review precedes final qualification. No 0.7.2 gate or
-72-hour soak result is claimed by the published 0.7.1 evidence.
-The [pre-freeze review](preparation-0.7.2.md) records the completed image-pin
-and source security checks. PERF-001 stays open in the committed ledger while
-the candidate and soak-start phases run. Only a verified 72-hour soak resolves
-it in the evidence and tag phases, without changing the frozen commit.
+The [0.7.2 checklist](../docs/RELEASE-CHECKLIST-0.7.2.md) records completed
+qualification and publication. Its [source ledger](qualification-0.7.2.json)
+and [finding inventory](qualification-findings-0.7.2.json) retain the frozen
+pre-publication state. PERF-001 and QUAL-006 were resolved by binary-bound
+72-hour evidence in the effective qualification artifacts, without changing
+the candidate commit. The [pre-freeze review](preparation-0.7.2.md) preserves
+the reviewed build inputs and image pins.
 
 The [0.7.1 checklist](../docs/RELEASE-CHECKLIST-0.7.1.md),
 [`qualification-0.7.1.json`](qualification-0.7.1.json), and independent
@@ -55,13 +52,13 @@ The VaultLink release workflow publishes only the nine native packages declared 
 archives or standalone binaries. GitHub's automatic source archives are
 unsupported source material.
 
-The next release's NixOS 26.05 support is distributed through the signed tag
+Version 0.7.2's NixOS 26.05 support is distributed through the signed tag
 and committed `flake.lock`; it does not alter the nine-package, 21-asset
 contract. Both `vaultlink/nixos-amd64` and `vaultlink/nixos-arm64` must be
 successful for the exact frozen commit in release preflights and before the
 72-hour soak starts. Historical 0.7.1 evidence remains unchanged. See
 [the NixOS deployment guide](../docs/NIXOS.md).
-The next release also publishes a multiarch OCI runtime image to GHCR
+Version 0.7.2 also publishes a multiarch OCI runtime image to GHCR
 after the immutable signed native release succeeds. Its exact frozen commit
 must first pass `vaultlink/docker-amd64` and `vaultlink/docker-arm64` in the
 same preflights and before the soak. Its BuildKit image and Syft SBOM scanner

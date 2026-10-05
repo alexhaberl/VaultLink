@@ -2,11 +2,11 @@
 
 [Back to README](../README.md)
 
-For the upcoming repository-flake installation on NixOS 26.05, see the
-[NixOS guide](NIXOS.md). The signed 0.7.1 release described below contains
-only native distribution packages.
+For the signed-tag repository-flake installation on NixOS 26.05, see the
+[NixOS guide](NIXOS.md). For the separately published GHCR runtime image, see
+the [Docker guide](DOCKER.md). This guide covers the nine native packages.
 
-This guide installs the supported **VaultLink 0.7.1** native packages,
+This guide installs the supported **VaultLink 0.7.2** native packages,
 including the TLS handshake-validation fix described in the
 [security notice](../SECURITY.md#tls-security-update-in-071).
 Start with [configuration and storage](CONFIGURATION.md) to prepare the mounted
@@ -19,7 +19,7 @@ Follow [package verification and installation](#native-package-deployment), then
 
 ## Native package deployment
 
-VaultLink 0.7.1 supports only the exact native packages listed in
+VaultLink 0.7.2 supports only the exact native packages listed in
 [docs/PACKAGING.md](../docs/PACKAGING.md): Debian 13 and Ubuntu 24.04/26.04 on
 amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch snapshot on
 x86_64. Install the matching package from the GitHub release after verifying
@@ -65,7 +65,7 @@ if VaultLink will provision or mount SMB storage.
 
 ### Download the package and verification files
 
-From the [supported release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1),
+From the [supported release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.2),
 download the package for your host, its matching `.minisig`, `SHA256SUMS`, and
 `SHA256SUMS.minisig` into one directory. Obtain `minisign.pub` through a
 separately trusted copy of this repository; its key ID is `EC6AEC772F7CDDEC`.
@@ -73,10 +73,10 @@ Open a terminal in the download directory and set these two values:
 
 ```sh
 # Replace this Debian 13 amd64 example with the exact asset for your host:
-# vaultlink_0.7.1-1+ubuntu24.04_arm64.deb,
-# vaultlink-0.7.1-1.fc44.x86_64.rpm, or
-# vaultlink-0.7.1-1-x86_64.pkg.tar.zst.
-PACKAGE=vaultlink_0.7.1-1+deb13_amd64.deb
+# vaultlink_0.7.2-1+ubuntu24.04_arm64.deb,
+# vaultlink-0.7.2-1.fc44.x86_64.rpm, or
+# vaultlink-0.7.2-1-x86_64.pkg.tar.zst.
+PACKAGE=vaultlink_0.7.2-1+deb13_amd64.deb
 PUBLIC_KEY=/path/to/trusted/minisign.pub
 ```
 
@@ -96,27 +96,27 @@ PUBLIC_KEY=$2
 case "$ID:${VERSION_ID:-}" in
   debian:13)
     FORMAT=deb
-    EXPECTED="vaultlink_0.7.1-1+deb13_$(dpkg --print-architecture).deb"
+    EXPECTED="vaultlink_0.7.2-1+deb13_$(dpkg --print-architecture).deb"
     ;;
   ubuntu:24.04|ubuntu:26.04)
     FORMAT=deb
-    EXPECTED="vaultlink_0.7.1-1+ubuntu${VERSION_ID}_$(dpkg --print-architecture).deb"
+    EXPECTED="vaultlink_0.7.2-1+ubuntu${VERSION_ID}_$(dpkg --print-architecture).deb"
     ;;
   fedora:44)
     FORMAT=rpm
-    EXPECTED="vaultlink-0.7.1-1.fc44.$(uname -m).rpm"
+    EXPECTED="vaultlink-0.7.2-1.fc44.$(uname -m).rpm"
     ;;
   arch:*)
     FORMAT=arch
     test "$(uname -m)" = x86_64
-    EXPECTED=vaultlink-0.7.1-1-x86_64.pkg.tar.zst
+    EXPECTED=vaultlink-0.7.2-1-x86_64.pkg.tar.zst
     ;;
   *) echo 'Unsupported operating system or version' >&2; exit 64 ;;
 esac
 test "$PACKAGE" = "$EXPECTED"
 
 # Freeze every input before verification, then install that same root-owned file.
-STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.7.1.XXXXXXXX)
+STAGE=$(sudo mktemp -d /var/tmp/vaultlink-release-0.7.2.XXXXXXXX)
 test "$(sudo stat -c '%u:%g:%a' "$STAGE")" = 0:0:700
 printf 'Verification and recovery directory: %s\n' "$STAGE"
 sudo install -o root -g root -m 0600 \
@@ -235,7 +235,7 @@ Alternatively, use the command line:
 sudo vaultlink-update check
 sudo vaultlink-update install
 
-# For a 0.7.1 IP-only reverse proxy, first follow docs/PROXY-MIGRATION-071.md.
+# For an existing 0.7.1 IP-only reverse proxy, first follow docs/PROXY-MIGRATION-071.md.
 
 # Optional unattended updates: bootstrap the packaged example once, then review it.
 if sudo test ! -e /etc/vaultlink/update.conf && \
