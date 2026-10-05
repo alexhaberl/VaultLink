@@ -2,15 +2,19 @@
 
 ## 0.7.2 — 2026-10-05
 
-- Prepare [NixOS 26.05 deployment](docs/NIXOS.md) through the repository flake
-  on x86_64 and aarch64, with exact-commit build and boot checks before release.
-- Prepare the first multiarch OCI runtime image for [Docker Engine](docs/DOCKER.md)
-  and [rootless Docker](docs/DOCKER-ROOTLESS.md) on Linux amd64/arm64. Publish
-  its digest-pinned GHCR image only after the signed native release, subject to
-  both Docker architecture gates.
-- Prepare [Kubernetes 1.36 deployment](docs/KUBERNETES.md) using that image and
-  a single pod with separate persistent state and storage volumes. Qualify the
-  manifest on both architectures before marking it supported.
+[Published release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.2),
+qualified with all nine packages, distro VMs, native NixOS and Docker gates,
+and the full 72-hour soak. See the [release checklist](docs/RELEASE-CHECKLIST-0.7.2.md)
+and [publication evidence](release/publication-0.7.2.json).
+
+- Support [NixOS 26.05 deployment](docs/NIXOS.md) through the signed-tag
+  repository flake on x86_64 and aarch64, with exact-commit build and boot checks.
+- Publish the first multiarch OCI runtime image for [Docker Engine](docs/DOCKER.md)
+  and [rootless Docker](docs/DOCKER-ROOTLESS.md) on Linux amd64/arm64 after the
+  signed native release. Both public architecture runtime suites passed.
+- Support [Kubernetes 1.36 deployment](docs/KUBERNETES.md) using that image and
+  a single pod with separate persistent state and storage volumes, qualified
+  on both architectures.
 - Bound per-share public upload directories and add owner-scoped operation IDs
   for safe upload retries before commit. An interrupted commit reports an
   explicit unknown outcome for manual inspection instead of resending the file.
@@ -18,9 +22,9 @@
 - Authenticate reverse-proxy traffic through a private Unix peer-UID boundary
   or mutual TLS, and accept forwarding headers only from a verified proxy.
 - Tighten transfer authorization, upload and setup recovery, and container
-  startup checks before the new deployment targets become supported.
-- Continue the nine signed native packages and the 72-hour soak requirements.
-  Release qualification and publication remain pending.
+  startup checks.
+- Continue the nine signed native packages and complete the 72-hour soak with
+  twelve full load profiles, successful integrity checks and zero restarts.
 
 ## 0.7.1 — 2026-09-22
 
