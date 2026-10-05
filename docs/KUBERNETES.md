@@ -2,10 +2,19 @@
 
 The first official Kubernetes target is Kubernetes 1.36 with one VaultLink pod,
 local ext4 persistent volumes and the same signed, digest-pinned GHCR image as
-Docker Engine. The published 0.7.1 release has no runtime image. The native CI
+Docker Engine. The published 0.7.2 release includes this image. The native CI
 suite tests this manifest in a Kubernetes 1.36 kind cluster on both architectures.
 Do not treat a green Kubernetes control-plane status alone as a VaultLink
 readiness check.
+
+Verified `v0.7.2` multiarch index (Linux amd64 and arm64):
+
+```text
+ghcr.io/alexhaberl/vaultlink@sha256:05dec2be0c87d06a4a5e3df5d157f0d7ac6a1a4e6e6e85bcfa17b12f25cca54f
+```
+
+Public pulls, binary identities and runtime tests for both architectures are
+recorded in [the publication receipt](../release/publication-0.7.2.json).
 
 ## Storage and manifests
 

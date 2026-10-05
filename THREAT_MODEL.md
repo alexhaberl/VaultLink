@@ -2,16 +2,17 @@
 
 | Field | Value |
 | --- | --- |
-| Last reviewed | 2026-09-26 (0.7.2 development source review) |
-| Review baseline | Source at `e71a9bb4fd58d5fbddbda06d115ed4865d59b81a` on `main`; later source changes need review |
-| Applies to | Supported 0.7.1 native packages and the reviewed, unreleased 0.7.2 development design; 0.7.2 release qualification is pending |
+| Last reviewed | 2026-10-05 (0.7.2 publication evidence review; source review on 2026-10-01) |
+| Review baseline | Published source at `eef652c9d5bb6e7f9420a5a915a01458a54dd94f`; preparatory source reviews remain below |
+| Applies to | Supported 0.7.2 native packages, NixOS 26.05 and verified Docker/rootless/Kubernetes deployments |
 | Companion documents | [Security policy](SECURITY.md), [0.7.2 release checklist](docs/RELEASE-CHECKLIST-0.7.2.md), [runner strategy](docs/GITHUB-HOSTED-RUNNERS.md) |
-| Release state | [`release/release-state.json`](release/release-state.json): 0.7.1 supported (published 2026-09-22), 0.7.0 and 0.6.0 superseded, 0.5.0 withdrawn |
+| Release state | [`release/release-state.json`](release/release-state.json): 0.7.2 supported (published 2026-10-05), 0.7.1, 0.7.0 and 0.6.0 superseded, 0.5.0 withdrawn |
 
 This review covers the 0.7.2 changes to uploads, proxy transport, NixOS,
 Docker, Kubernetes, and OCI publication. It records design and source controls;
-the fresh dependency audit, architecture gates, package/VM evidence, and 72-hour
-soak in the [0.7.2 checklist](docs/RELEASE-CHECKLIST-0.7.2.md) remain open.
+the completed fresh audits, architecture gates, package/VM evidence, 72-hour
+soak and public OCI proof are linked in the [0.7.2 checklist](docs/RELEASE-CHECKLIST-0.7.2.md)
+and [publication receipt](release/publication-0.7.2.json).
 
 ## Purpose
 
@@ -71,7 +72,7 @@ The supported deployment trusts the exact Debian, Ubuntu, Fedora, or Arch
 package target named in `docs/PACKAGING.md`, the Linux security primitives used
 by VaultLink, the native package database, the configured TLS endpoint, the
 audited local filesystem, and the operator-managed identities and ACLs
-described in `SECURITY.md`. The proposed 0.7.2 deployments additionally trust
+described in `SECURITY.md`. The 0.7.2 deployments additionally trust
 the reviewed NixOS flake and host module or the OCI runtime, container engine,
 or Kubernetes node and volume administrator. Required kernel primitives include
 `openat2(2)`, `renameat2(2)`, and statx mount IDs. A derivative or different OS
@@ -163,7 +164,7 @@ flowchart LR
 ## Security invariants
 
 These properties are intended to remain true across supported deployments and
-the reviewed 0.7.2 development design where applicable. A change that weakens one
+the reviewed 0.7.2 design where applicable. A change that weakens one
 requires an explicit threat-model review.
 
 | ID | Invariant | Primary enforcement and evidence |
@@ -288,8 +289,9 @@ condition and review trigger. The 0.7.2 candidate must retain those conditions:
 
 ### 0.7.2 candidate residual conditions
 
-These are identified for release review, not evidence that 0.7.2 has passed
-qualification or that a new deployment target is already supported.
+These conditions remain binding for the qualified 0.7.2 release. Its exact-commit
+gates, complete soak and public OCI proof are recorded in the publication receipt;
+qualification does not remove the operational residual conditions below.
 
 | ID | Residual condition | Release review requirement |
 | --- | --- | --- |
@@ -326,9 +328,11 @@ this document alone:
   load, staging, hardware-FIDO2, SMB, and Debian 72-hour soak gates in
   `docs/RELEASE-CHECKLIST-0.7.2.md`.
 
-The 0.7.2 gates and fresh Cargo.lock audit are still open. Passing individual
-CI jobs validates tested controls but does not close unchecked release
-checklist items or accept a candidate residual condition.
+The preparatory 2026-10-01 Cargo.lock audit is recorded in
+`release/preparation-0.7.2.md`. Exact-commit release gates and the separate
+pre-soak, collection, and pre-publication audits succeeded for the published commit. Passing individual
+CI jobs does not close unchecked release checklist items or accept a candidate
+residual condition.
 
 ## Review record
 
@@ -341,6 +345,8 @@ checklist items or accept a candidate residual condition.
 | 2026-09-04 | Unreleased 0.7.0 review-findings implementation | Release-state truth, qualification ledger, workflow linting, security/performance findings, schema 8, and architecture gates | RA-01 through RA-09 and RA-11 through RA-12 reconfirmed for 0.7.0; release remains fail closed until the qualification ledger has no open entry |
 | 2026-09-17 | Unreleased 0.7.1 preparation | TLS dependency fix, published-artifact gap, fresh security audits and release qualification | Schema and feature trust boundaries remain unchanged; the source fix does not repair immutable 0.7.0 packages. Performance and final soak qualification remain open; the existing residual-risk conditions still apply. |
 | 2026-09-26 | `e71a9bb4fd58d5fbddbda06d115ed4865d59b81a` (unreleased 0.7.2 `main`) | Schema-11/12 directory quotas and upload IDs; authenticated Unix/mTLS proxy transport; NixOS, Docker/rootless, Kubernetes, and post-release OCI provenance | Updated TB-11 through TB-13, INV-17 through INV-21, TM-FS-07/08, TM-DATA-06/07, TM-NET-03/04, TM-SC-10/11, TM-OPS-05/06 and CR-01 through CR-03 against source, deployment files, docs, and workflow definitions. Fresh audit and release gates remain open; this source review does not qualify a release. |
+| 2026-10-01 | `8354dcbe1abaf758ffb621dda6f43b8a49b991cf` (unreleased 0.7.2 pre-freeze) | Recheck source and build inputs after the mTLS load-budget and loopback timeout changes, soak admission-holder cleanup, Cargo/Debian dependency refresh, builder pins, and NixOS/Docker documentation updates | Rechecked TB-02 and TB-11 through TB-13, INV-17 through INV-21, TM-OPS-01, TM-SC-04/10/11 and CR-01 through CR-03. The 192 pending-handshake cap remains below the 256 active-connection cap; the 10-second default and loopback-only 180-second maximum bound the TCG exception. The Curl-holder regression test, preliminary PR architecture/package checks, fresh lockfile audit, and reviewed builder artifacts are recorded in `release/preparation-0.7.2.md`. No new residual risk is accepted; exact-commit gates, VM binding, 72-hour soak, and post-release public OCI proof remain required. |
+| 2026-10-05 | `eef652c9d5bb6e7f9420a5a915a01458a54dd94f` (published `v0.7.2`) | Publication evidence reconciliation | Verified all exact-commit native/package/VM/Fuzz/NixOS/Docker gates, full 72-hour soak with twelve full profiles, fresh collection and pre-publication audits, immutable 21-asset release, and both public OCI binary/runtime proofs. CR-01 through CR-03 retain their operational conditions; no new residual risk is accepted. Evidence: `release/publication-0.7.2.json`. |
 
 ## Review triggers
 

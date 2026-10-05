@@ -4,12 +4,12 @@ VaultLink shares files from an existing Linux storage mount through download and
 upload links. Manage files in the web interface and let recipients open their
 links in a browser. Storage can be local or an existing SMB share.
 
-Status: `0.7.2` is unreleased development. The currently supported release is `v0.7.1`.
+Status: The currently supported release is `v0.7.2`.
 See the [changelog](CHANGELOG.md) and [release status](release/release-state.json).
-Published on **2026-09-22** after package and VM qualification and the full
-72-hour soak. Versions 0.7.0 and 0.6.0 are superseded and unsupported.
+Published on **2026-10-05** after package and VM qualification and the full
+72-hour soak. Versions 0.7.1, 0.7.0 and 0.6.0 are superseded and unsupported.
 
-**Security update:** Install or upgrade to 0.7.1 for the rustls 0.23.45
+**Security update:** Install or upgrade to 0.7.2 for the rustls 0.23.45
 TLS handshake-validation fix. See the
 [security notice](SECURITY.md#tls-security-update-in-071).
 
@@ -38,7 +38,7 @@ TLS handshake-validation fix. See the
   built-in TLS, including Let's Encrypt.
 
 These features, monitoring endpoints, service tokens, and GUI update controls
-are available in the supported 0.7.1 release.
+are available in the supported 0.7.2 release.
 
 ## Installation
 
@@ -53,7 +53,7 @@ SMB clients are only needed for optional direct access to an external SMB share.
 | Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
 
 1. The matching packages are recorded in the
-   [published 0.7.1 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1).
+   [published 0.7.2 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.2).
 2. Follow the [verification and installation instructions](docs/INSTALLATION.md#native-package-deployment)
    to verify both the signature and signed checksum before installing.
 3. Prepare the [storage mount and HTTPS configuration](docs/CONFIGURATION.md).
@@ -69,16 +69,15 @@ supported in-place upgrade path; see the [release history](CHANGELOG.md).
 
 For a local development preview, follow the [container setup guide](docs/CONTAINER-SETUP.md).
 Its smoke image includes build tools and is intended for development and testing.
-The next release also plans [Docker Engine](docs/DOCKER.md),
+VaultLink 0.7.2 also supports [Docker Engine](docs/DOCKER.md),
 [rootless Docker](docs/DOCKER-ROOTLESS.md) and
 [Kubernetes](docs/KUBERNETES.md) deployments using one GHCR image for Linux
 amd64 and arm64. Docker Desktop on Windows remains
-a development preview. The immutable 0.7.1 release has no runtime image.
+a development preview. Pin the published GHCR index digest recorded in
+[the publication receipt](release/publication-0.7.2.json).
 
-The development branch also contains a [NixOS 26.05 deployment guide](docs/NIXOS.md)
-and a repository flake for amd64 and arm64. NixOS is not part of the immutable
-0.7.1 release; its first official release requires the new exact-commit NixOS
-build and VM gates.
+The signed 0.7.2 tag includes a [NixOS 26.05 deployment guide](docs/NIXOS.md)
+and repository flake for amd64 and arm64, qualified by native build and VM gates.
 
 ## Configuration and operation
 
@@ -142,12 +141,12 @@ make run
 | [Kubernetes deployment](docs/KUBERNETES.md) | Single pod, local persistent volumes, probes and recovery |
 | [Threat model](THREAT_MODEL.md) | Trust boundaries, security invariants, and accepted risks |
 
-The API, internals, and configuration references in this `main` checkout also
-describe unreleased 0.7.2 changes. For a 0.7.1 installation, use the matching
-[v0.7.1 documentation](https://github.com/alexhaberl/VaultLink/tree/v0.7.1/docs)
-and the configuration examples included in its signed package.
+The API, internals, and configuration references describe 0.7.2. Use the
+[v0.7.2 documentation](https://github.com/alexhaberl/VaultLink/tree/v0.7.2/docs)
+and configuration examples included in its signed package. Older installations
+need their matching version documentation and the documented migration path.
 
-The supported 0.7.1 release uses database schema 10; the superseded 0.6.0 release
+The supported 0.7.2 release uses database schema 12; the superseded 0.6.0 release
 used schema 6. See [data and persistence](docs/INTERNALS.md#data-and-persistence)
 for migration details. Release evidence is linked from
 [release/release-state.json](release/release-state.json), including the supported

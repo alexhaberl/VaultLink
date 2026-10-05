@@ -10,9 +10,8 @@ and read mount identity from inside the running container. The state bind mount
 must remain on a supported local filesystem even when the file store uses SMB.
 
 Choose the storage layout and HTTPS mode before completing
-[installation](INSTALLATION.md). The examples in this checkout follow unreleased
-0.7.2 development. For the supported 0.7.1 release, use the examples shipped
-with its signed package. The configurable `[admission]` section exists since
+[installation](INSTALLATION.md). The examples in this checkout follow the supported
+0.7.2 release. Use the examples shipped with its signed package. The configurable `[admission]` section exists since
 0.7.0.
 
 Known 0.6.0 limitation: CIFS startup can fail with `missing required security
@@ -20,8 +19,8 @@ option "sign"` even when the SMB session is signed and encrypted. That release
 checks for a standalone mountinfo entry that Linux does not emit. Changing only
 the mount command cannot fix the application check. Local ext4 installations
 are unaffected by this defect. The correction was introduced in 0.7.0 and is
-included in the supported 0.7.1 release. Version 0.6.0 is superseded; upgrade
-to 0.7.1.
+included in the supported 0.7.2 release. Version 0.6.0 is superseded; upgrade
+to 0.7.2.
 
 ## Configuration model
 
@@ -35,7 +34,7 @@ Examples:
 Startup rules:
 
 - `development`: loopback only, HTTP, no HSTS.
-- `reverse_proxy`: production, HTTPS `public_base_url`, `reverse_proxy.enabled = true`, and a mandatory authenticated `unix` or `mtls` transport in the 0.7.2 development build. The published 0.7.1 release still accepts IP-only proxy configurations; follow the [migration guide](PROXY-MIGRATION-071.md) before upgrading from one.
+- `reverse_proxy`: production, HTTPS `public_base_url`, `reverse_proxy.enabled = true`, and a mandatory authenticated `unix` or `mtls` transport in 0.7.2. The superseded 0.7.1 release accepts IP-only proxy configurations; follow the [migration guide](PROXY-MIGRATION-071.md) before upgrading from one.
 - `standalone_tls` with `certificate_source = "files"`: production HTTPS, TLS enabled, certificate and key present; optional SIGHUP reload.
 - `standalone_tls` with `certificate_source = "letsencrypt"`: production HTTPS, TLS enabled, reverse proxy disabled, DNS host in `public_base_url`, contact email, and a secure ACME cache below `data_directory`.
 
@@ -54,6 +53,16 @@ expected_mount_source = "/dev/mapper/vaultlink"
 ```
 
 `expected_mount_source` must exactly match the source field in the active `/proc/self/mountinfo` row; a `UUID=` entry in `/etc/fstab` is not automatically the same value. Supported audited local filesystems are ext2/3/4, XFS, Btrfs, F2FS, Bcachefs, and ZFS. The root, internal directory, and data directory belong to the `vaultlink` service user and must not be writable through group/other mode bits or the POSIX ACL mask. SQLite may share that local mount only outside the visible tree. With CIFS/SMB, SQLite must be on a separate local filesystem.
+
+### Access to files below the storage root
+
+The VaultLink application runs as the unprivileged `vaultlink` user, not as root. A VaultLink administrator does not bypass filesystem permissions. For user data below `root_mount_path`, the service user needs:
+
+- Search (`x`) permission on every directory in the path to a file, and read (`r`) permission on the file to download it.
+- Read and search (`r+x`) permission on a directory to list its contents.
+- Write and search (`w+x`) permission on the relevant parent directories to create, upload, rename, or delete entries.
+
+A root-owned file with mode `0600` is therefore inaccessible to VaultLink. Grant only the required access through ownership, group permissions, or ACLs; do not run the application as root to bypass missing permissions. The file browser and shares remain confined to the configured storage root. For CIFS/SMB, the server ACL must also grant the VaultLink SMB service account the required access. When using another mount base, also adjust the packaged service's `ReadWritePaths` as described in the [installation guide](INSTALLATION.md#native-package-deployment).
 
 `public_base_url` uses canonical `http://` or `https://` authority syntax without a trailing slash. Base paths, credentials, query strings, and fragments are unsupported.
 

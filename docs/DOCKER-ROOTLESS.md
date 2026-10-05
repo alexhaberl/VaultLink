@@ -3,7 +3,16 @@
 The official rootless variant runs both the Docker daemon and the VaultLink
 container as unprivileged users. Use the signed release tag, its immutable GHCR
 index digest, and `deploy/docker/compose.rootless.yaml` from that tag. The
-published 0.7.1 release predates this image.
+published 0.7.2 release includes this image and passed native rootless gates.
+
+Verified `v0.7.2` multiarch index (Linux amd64 and arm64):
+
+```text
+ghcr.io/alexhaberl/vaultlink@sha256:05dec2be0c87d06a4a5e3df5d157f0d7ac6a1a4e6e6e85bcfa17b12f25cca54f
+```
+
+Public pulls, binary identities and runtime tests for both architectures are
+recorded in [the publication receipt](../release/publication-0.7.2.json).
 
 ## Host and storage
 

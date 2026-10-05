@@ -1,25 +1,26 @@
 # Upgrade, backup, and rollback
 
-The upcoming NixOS 26.05 flake uses a separate, guided upgrade and recovery
+The signed-tag NixOS 26.05 flake uses a separate, guided upgrade and recovery
 procedure in the [NixOS guide](NIXOS.md#guided-upgrade-and-recovery). The
 native package updater below does not manage NixOS installations.
 
-VaultLink 0.7.1 supports upgrades only between native packages for the exact
+VaultLink 0.7.2 supports upgrades only between native packages for the exact
 same distribution, release, and architecture. There is no supported adoption,
 upgrade, or migration path from the withdrawn 0.5.0 archive installation. A
 markerless or mismatched installation fails closed before package files or
 runtime state are changed.
 
-The supported 0.7.1 binary creates schema 10 and migrates supported schemas
-1 through 9 forward. The 9-to-10 step adds partial Share status indexes and
-expiry/ID indexes in an atomic `IMMEDIATE` transaction. A failed step leaves a
-valid schema-9 database, including its fingerprint and migration history.
-The 0.6.0 binary cannot open schema 10; both 0.7.0 and 0.7.1 use schema 10.
+The supported 0.7.2 binary creates schema 12 and migrates supported schemas
+1 through 11 forward in atomic `IMMEDIATE` transactions. Schema 11 adds
+per-directory upload counters, and schema 12 adds upload operation receipts.
+A failed step rolls back to the validated previous schema and migration history.
+The 0.6.0 binary uses schema 6; both 0.7.0 and 0.7.1 use schema 10 and cannot
+open schema 12.
 Rollback restores the matching pre-upgrade binary, configuration, database
 and keyring backup; never downgrade
 `PRAGMA user_version` in an operational database.
 
-The upcoming upload-ID change advances the development schema from 11 to 12 in
+The 0.7.2 upload-ID change advances the schema from 11 to 12 in
 the same deployment that makes preissued upload IDs mandatory. Older clients
 must request a fresh ID before each logical upload. To return to a binary that
 supports only schema 11 or earlier, restore its matching database and keyring
