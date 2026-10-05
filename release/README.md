@@ -258,6 +258,12 @@ the reviewed VM and QEMU locks. After that recipe pull request lands:
 5. update `VAULTLINK_PACKAGE_SIGNING_IMAGE` to the newly pinned Debian 13 amd64
    builder reference.
 
+During this recipe bootstrap, pull-request package and production Docker jobs
+remain unqualified until the separate builder pin PR. Push and manual gates
+fail closed. Docker qualification and publication select the Debian builder
+from the committed package-target manifest; the local Dockerfile default must
+be updated to the new Debian multiarch builder digest in the pin PR.
+
 The old builder digests must never be copied across a Rust-toolchain change,
 and builder generation remains restricted to the protected `main` workflow.
 

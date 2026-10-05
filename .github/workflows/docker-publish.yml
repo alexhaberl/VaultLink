@@ -122,6 +122,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          builder_image=$(python3 tools/package-targets.py get "debian13-${{ matrix.architecture }}" builder_image)
           builder="vaultlink-docker-${{ matrix.architecture }}"
           docker buildx create --driver docker-container \
             --driver-opt "image=$BUILDKIT_IMAGE" --name "$builder" --use
@@ -130,6 +131,7 @@ jobs:
           docker buildx build \
             --platform 'linux/${{ matrix.architecture }}' \
             --file deploy/docker/Dockerfile.runtime \
+            --build-arg "BUILDER_IMAGE=$builder_image" \
             --build-arg 'VERSION=${{ needs.prepare.outputs.version }}' \
             --build-arg 'VCS_REF=${{ needs.prepare.outputs.commit }}' \
             --metadata-file build-metadata.json \

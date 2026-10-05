@@ -5,7 +5,7 @@ ARG RUNTIME_IMAGE=docker.io/library/debian@sha256:f324c7ff54321e8d9c588493a20244
 FROM ${BUILDER_IMAGE} AS builder
 WORKDIR /work
 COPY . .
-RUN cargo build --release --locked \
+RUN rustup run "$(sh tools/rust-toolchain-channel.sh)" cargo build --release --locked \
     && test -x target/release/vaultlink \
     && test ! -e config.toml \
     && test ! -e .env
