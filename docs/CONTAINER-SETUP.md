@@ -1,9 +1,13 @@
 # Container setup and production listener
 
-This describes the unreleased 0.7.2 container implementation. The supported
-0.7.1 release has no official runtime image.
+This describes setup and listener behavior in the supported **0.7.2** container
+implementation. For production installation, use the published, digest-pinned
+GHCR image and follow the [Docker Engine](DOCKER.md),
+[rootless Docker](DOCKER-ROOTLESS.md) or [Kubernetes](KUBERNETES.md) guide.
+The local smoke image includes build tools and is intended for development and
+testing. The superseded 0.7.1 release has no official runtime image.
 
-The planned official container exposes port `8081`. With incomplete setup, the
+The official container exposes port `8081`. With incomplete setup, the
 entrypoint starts a temporary HTTP bootstrap proxy on that port, the setup UI
 on container loopback `127.0.0.1:8080`, and a separate loopback health listener
 on `127.0.0.1:8082`. The health CLI reports live during setup and not ready.

@@ -1,7 +1,7 @@
 # v0.7.0 native-package release checklist
 
 Status: published on 2026-09-16; superseded and unsupported since 2026-09-22.
-Upgrade to the supported 0.7.1 release. This checklist is a historical record,
+Upgrade to the supported 0.7.2 release. This checklist is a historical record,
 separate from the withdrawn 0.5.0 and superseded 0.6.0 records.
 [`release/release-state.json`](../release/release-state.json) is authoritative
 for lifecycle state, and
