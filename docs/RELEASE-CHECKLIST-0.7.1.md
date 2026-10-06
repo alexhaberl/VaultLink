@@ -1,6 +1,8 @@
 # v0.7.1 native-package release checklist
 
-Status: **published and supported since 2026-09-22 09:35:26 UTC.**
+Status: published on 2026-09-22 at 09:35:26 UTC; **superseded and unsupported
+since 2026-10-05**. Upgrade to the supported 0.7.2 release. This checklist
+preserves the historical qualification and publication record.
 The immutable [v0.7.1 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.1)
 contains 21 verified assets from commit `efdbea07d0e77f9bd89cbde7fd1a706055739e36`.
 The [publication receipt](../release/publication-0.7.1.json) records the verified

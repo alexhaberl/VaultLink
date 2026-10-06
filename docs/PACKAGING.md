@@ -40,7 +40,10 @@ than repeat target lists in workflow YAML.
 | Ubuntu 24.04 LTS | amd64, arm64 | DEB |
 | Ubuntu 26.04 LTS | amd64, arm64 | DEB |
 | Fedora 44 | x86_64, aarch64 | RPM |
-| Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
+| Arch Linux, 2026-08-25 snapshot | x86_64 | `.pkg.tar.zst` |
+
+The Arch snapshot is the manifest's `snapshot_date`, **2026-08-25** for
+VaultLink 0.7.2. It is independent of the release publication date.
 
 For the published 0.7.2 release, the manifest defines these packages:
 
@@ -400,7 +403,7 @@ is present and enabled; every failed or unavailable probe selects TCG.
 Only Debian 13 amd64 runs the 72-hour soak. Its runtime binary must be extracted
 from the exact final DEB and hash-bound to the candidate commit. Every soak
 load profile continues to enforce p95 strictly below two seconds. Arch is
-built and boot-tested against the release-date snapshot; a weekly read-only
+built and boot-tested against the manifest-pinned snapshot; a weekly read-only
 job checks the current rolling image without changing published support claims.
 
 

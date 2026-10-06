@@ -1,7 +1,8 @@
 # Monitoring API
 
-VaultLink **0.7.1** exposes two read-only resources for local monitoring
-clients. These endpoints and service tokens are unavailable in **0.6.0**.
+This reference describes the supported **0.7.2** monitoring API. VaultLink
+exposes two read-only resources for local monitoring clients, available since
+**0.7.0**. These endpoints and service tokens are unavailable in **0.6.0**.
 The intended first client is the separate Home Assistant HACS integration;
 VaultLink itself contains no Home Assistant code.
 
@@ -34,8 +35,8 @@ minutes.
 
 ```json
 {
-  "generated_at": "2026-08-30T12:00:00Z",
-  "version": "0.7.1",
+  "generated_at": "2026-10-06T12:00:00Z",
+  "version": "0.7.2",
   "shares": {
     "total": 10,
     "available": 6,
@@ -45,7 +46,7 @@ minutes.
     "protected": 3
   },
   "transfers": {
-    "month": "2026-08",
+    "month": "2026-10",
     "download": 42,
     "zip_download": 3,
     "preview": 11,
@@ -72,7 +73,7 @@ always sorted by descending Share ID:
 
 ```json
 {
-  "generated_at": "2026-08-30T12:00:00Z",
+  "generated_at": "2026-10-06T12:00:00Z",
   "shares": [
     {
       "id": 17,

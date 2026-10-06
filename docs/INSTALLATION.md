@@ -21,7 +21,7 @@ Follow [package verification and installation](#native-package-deployment), then
 
 VaultLink 0.7.2 supports only the exact native packages listed in
 [docs/PACKAGING.md](../docs/PACKAGING.md): Debian 13 and Ubuntu 24.04/26.04 on
-amd64/arm64, Fedora 44 on x86_64/aarch64, and the release-date Arch snapshot on
+amd64/arm64, Fedora 44 on x86_64/aarch64, and the Arch 2026-08-25 snapshot on
 x86_64. Install the matching package from the GitHub release after verifying
 both its direct Minisign signature and its digest in the signed global
 `SHA256SUMS`.
@@ -48,10 +48,12 @@ sudo dnf install -y \
   grep gzip libgcc minisign rpm sed sqlite systemd tar util-linux
 ```
 
-#### Arch Linux, supported release-date snapshot
+#### Arch Linux, supported 2026-08-25 snapshot
 
-Use repositories and a host synchronized to the supported release-date
-snapshot. Later rolling snapshots are unsupported; do not change snapshots
+Use repositories and a host synchronized to the **2026-08-25** snapshot pinned
+in [the package manifest](../release/package-targets.json). This is the qualified
+snapshot for VaultLink 0.7.2, rather than the publication date of 2026-10-05.
+Later rolling snapshots are unsupported; do not change snapshots
 or perform a partial system upgrade as part of this installation.
 
 ```sh

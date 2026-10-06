@@ -45,12 +45,19 @@ are available in the supported 0.7.2 release.
 VaultLink runs on Linux. Recipients use a browser on Windows, macOS, or Linux;
 SMB clients are only needed for optional direct access to an external SMB share.
 
-| Supported operating system | Architectures | Package |
+| Supported operating system / deployment | Architectures | Installation guide |
 | --- | --- | --- |
-| Debian 13 | amd64, arm64 | DEB |
-| Ubuntu 24.04 / 26.04 LTS | amd64, arm64 | DEB |
-| Fedora 44 | x86_64, aarch64 | RPM |
-| Arch Linux, release-date snapshot | x86_64 | `.pkg.tar.zst` |
+| Debian 13 | amd64, arm64 | [DEB](docs/INSTALLATION.md#native-package-deployment) |
+| Ubuntu 24.04 / 26.04 LTS | amd64, arm64 | [DEB](docs/INSTALLATION.md#native-package-deployment) |
+| Fedora 44 | x86_64, aarch64 | [RPM](docs/INSTALLATION.md#native-package-deployment) |
+| Arch Linux, 2026-08-25 snapshot | x86_64 | [`.pkg.tar.zst`](docs/INSTALLATION.md#native-package-deployment) |
+| NixOS 26.05 | x86_64, aarch64 | [Signed-tag repository flake](docs/NIXOS.md) |
+| Docker Engine on Linux | amd64, arm64 | [GHCR image and Compose](docs/DOCKER.md) |
+| Rootless Docker Engine on Linux | amd64, arm64 | [GHCR image and rootless Compose](docs/DOCKER-ROOTLESS.md) |
+| Kubernetes 1.36 on Linux | amd64, arm64 | [GHCR image and Kubernetes manifests](docs/KUBERNETES.md) |
+
+The following steps install native DEB, RPM or Arch packages. For NixOS and
+container deployments, follow the corresponding guide in the table.
 
 1. The matching packages are recorded in the
    [published 0.7.2 release](https://github.com/alexhaberl/VaultLink/releases/tag/v0.7.2).
@@ -63,8 +70,8 @@ SMB clients are only needed for optional direct access to an external SMB share.
    save the initial TOTP secret, and start the service.
 
 The package leaves the service and automatic updates disabled until configured.
-Only the listed OS versions and architectures are supported. GitHub source
-archives are not installation packages. The withdrawn 0.5.0 archive has no
+Only the listed OS versions, deployments and architectures are supported.
+GitHub source archives are not installation packages. The withdrawn 0.5.0 archive has no
 supported in-place upgrade path; see the [release history](CHANGELOG.md).
 
 For a local development preview, follow the [container setup guide](docs/CONTAINER-SETUP.md).

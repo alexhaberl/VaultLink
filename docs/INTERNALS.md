@@ -79,9 +79,9 @@ VaultLink/
 
 ## Data and persistence
 
-The following table inventory describes the 0.7.0 release schema.
+The following table inventory describes the 0.7.2 release schema (version 12).
 
-SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and crash-safe transactions. WAL is enabled. Core tables include `admins`, `sessions`, `service_tokens`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `public_upload_usage`, `public_upload_reservations`, `runtime_settings`, `audit`, `transfer_monthly_counts`, `transfer_statistics`, `admin_mfa_enrollments`, `admin_webauthn_credentials`, `admin_totp_replay`, `vaultlink_schema`, and `vaultlink_schema_migrations`.
+SQLite provides unique aliases, concurrent sessions, atomic transfer limits, and crash-safe transactions. WAL is enabled. Core tables include `admins`, `sessions`, `service_tokens`, `shares`, `public_unlock_sessions`, `public_preview_sessions`, `public_transfer_grants`, `public_transfer_leases`, `public_upload_usage`, `public_upload_reservations`, `upload_operations`, `runtime_settings`, `audit`, `transfer_monthly_counts`, `transfer_statistics`, `admin_mfa_enrollments`, `admin_webauthn_credentials`, `admin_totp_replay`, `vaultlink_schema`, and `vaultlink_schema_migrations`.
 
 `shares.max_upload_size` is the optional per-file limit; `NULL` uses the global runtime limit. Upload shares also have cumulative `max_upload_total_size` and `max_upload_files` limits, with baseline defaults of 100,000,000,000 bytes and 1,000 fail-closed accounted files. A separate per-share cap permits at most 256 newly created upload directories after the schema-11 migration. The upload finalizer counts missing directory components while holding the storage mutation guard, then books that count with the byte/file quota before creating directories. Existing directories require no directory quota. Byte, file, and directory usage are recorded atomically before visible publication; if publication or directory creation later fails, quota use deliberately remains so a visible file or directory can never be unaccounted. Existing directories at migration time are not backfilled into this counter.
 
