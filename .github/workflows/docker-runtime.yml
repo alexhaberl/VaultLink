@@ -17,6 +17,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare:
+    name: Validate production builder pins
+    runs-on: ubuntu-24.04
+    outputs:
+      provisioned: ${{ steps.builder.outputs.provisioned }}
+      image: ${{ steps.builder.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select the reviewed Debian builder
+        id: builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          provisioned=true
+          if ! python3 tools/package-targets.py validate; then
+            if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
+              echo 'Production builders are not provisioned; refresh and pin them before qualification.' >&2
+              exit 77
+            fi
+            python3 tools/package-targets.py validate --allow-unprovisioned
+            provisioned=false
+            echo '::notice::Builder recipe bootstrap: production Docker qualification awaits the builder pin PR.'
+          fi
+          image=$(python3 tools/package-targets.py get debian13-amd64 builder_image --allow-unprovisioned)
+          printf 'provisioned=%s\nimage=%s\n' "$provisioned" "$image" >>"$GITHUB_OUTPUT"
+
   rootless_probe:
     name: Rootless runner probe (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}
@@ -41,7 +69,8 @@ jobs:
 
   qualify:
     name: Docker runtime (${{ matrix.architecture }})
-    needs: rootless_probe
+    if: needs.prepare.outputs.provisioned == 'true'
+    needs: [prepare, rootless_probe]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     strategy:
@@ -66,6 +95,7 @@ jobs:
           ARCHITECTURE: ${{ matrix.architecture }}
           PLATFORM: ${{ matrix.platform }}
           EXPECTED_UNAME: ${{ matrix.uname }}
+          BUILDER_IMAGE: ${{ needs.prepare.outputs.image }}
         run: |
           set -euo pipefail
           mkdir -p "evidence/$ARCHITECTURE"
@@ -82,6 +112,7 @@ jobs:
               --platform "$PLATFORM" \
               --file deploy/docker/Dockerfile.runtime \
               --tag "vaultlink:runtime-$attempt" \
+              --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
               --build-arg "VERSION=$version" \
               --build-arg "VCS_REF=$GITHUB_SHA" .
             container=$(docker create "vaultlink:runtime-$attempt")
