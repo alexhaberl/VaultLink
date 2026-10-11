@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 
 
@@ -46,7 +48,54 @@ class DockerReleaseProofTests(unittest.TestCase):
     def verify(self) -> dict:
         return proof.create_proof(self.root, "alexhaberl/VaultLink", self.commit,
                                   "v0.7.2", 123, 2, self.hashes,
-                                  self.artifact_hashes)
+                                  self.artifact_hashes, self.children)
+
+    def verify_cli(self, omit=None, changed=None):
+        arguments = [sys.executable, str(Path(__file__).with_name("docker-release-proof.py")),
+                     "--evidence", str(self.root), "--repository", "alexhaberl/VaultLink",
+                     "--commit", self.commit, "--tag", "v0.7.2",
+                     "--qualification-run", "123", "--qualification-attempt", "2"]
+        for architecture in ("amd64", "arm64"):
+            arguments.extend([f"--{architecture}-hash", self.hashes[architecture],
+                              f"--{architecture}-artifact-sha", self.artifact_hashes[architecture]])
+            if architecture != omit:
+                arguments.extend([f"--{architecture}-child-digest",
+                                  "sha256:" + "3" * 64 if architecture == changed
+                                  else self.children[architecture]])
+        return subprocess.run(arguments, capture_output=True, text=True, timeout=5)
+
+    def test_cli_requires_both_trusted_child_digests(self) -> None:
+        for architecture in ("amd64", "arm64"):
+            with self.subTest(architecture=architecture):
+                self.assertNotEqual(self.verify_cli(omit=architecture).returncode, 0)
+                self.assertFalse((self.root / "docker-release-proof.json").exists())
+
+    def test_cli_rejects_wrong_trusted_child(self) -> None:
+        result = self.verify_cli(changed="arm64")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "docker-release-proof.json").exists())
+
+    def test_cli_accepts_matching_trusted_children(self) -> None:
+        result = self.verify_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "docker-release-proof.json").is_file())
+
+    def test_rejects_consistently_substituted_children_with_qualified_binaries(self) -> None:
+        for architecture in ("amd64", "arm64"):
+            with self.subTest(architecture=architecture):
+                original = self.children[architecture]
+                replacement = "sha256:" + "3" * 64
+                self.edit("image-reference.txt", original, replacement)
+                self.edit(f"public-binary-{architecture}.txt", original, replacement)
+                with self.assertRaisesRegex(ValueError, "differs from this build"):
+                    self.verify()
+                self.edit("image-reference.txt", replacement, original)
+                self.edit(f"public-binary-{architecture}.txt", replacement, original)
+
+    def test_rejects_invalid_trusted_child_digest(self) -> None:
+        self.children["amd64"] = "invalid"
+        with self.assertRaises(ValueError):
+            self.verify()
 
     def edit(self, file: str, old: str, new: str) -> None:
         path = self.root / file
