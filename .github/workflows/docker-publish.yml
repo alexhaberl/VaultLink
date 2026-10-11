@@ -161,6 +161,9 @@ jobs:
   publish:
     needs: [prepare, build]
     runs-on: ubuntu-24.04
+    outputs:
+      amd64_child_digest: ${{ steps.index.outputs.amd64_child_digest }}
+      arm64_child_digest: ${{ steps.index.outputs.arm64_child_digest }}
     permissions:
       contents: read
       packages: write
@@ -171,6 +174,7 @@ jobs:
           path: digests
           merge-multiple: true
       - name: Assemble and verify versioned multiarch image
+        id: index
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -198,9 +202,7 @@ jobs:
           [[ "$source_amd64" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$source_arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
           tag="$IMAGE:${{ needs.prepare.outputs.tag }}"
-          existing_tag=false
           if docker buildx imagetools inspect "$tag" >tag-inspection.txt 2>tag-inspection.err; then
-            existing_tag=true
             echo "Versioned GHCR image exists; verifying its immutable digest without replacing it"
           else
             grep -Eiq 'manifest unknown|not found|name unknown' tag-inspection.err || {
@@ -210,7 +212,13 @@ jobs:
             }
             docker buildx imagetools create --tag "$tag" "$IMAGE@$amd64" "$IMAGE@$arm64"
           fi
-          docker buildx imagetools inspect "$tag" --raw >index.json
+          inspection=$(docker buildx imagetools inspect "$tag")
+          printf '%s\n' "$inspection"
+          index_digest=$(printf '%s\n' "$inspection" \
+            | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)
+          [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          # Resolve once, then verify and record the same immutable index.
+          docker buildx imagetools inspect "$IMAGE@$index_digest" --raw >index.json
           jq -r '.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"' index.json \
             | sort -u >platforms.actual
           printf '%s\n' linux/amd64 linux/arm64 >platforms.expected
@@ -219,17 +227,12 @@ jobs:
           index_arm64=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' index.json)
           [[ "$index_amd64" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$index_arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
-          if [ "$existing_tag" = false ]; then
-            test "$index_amd64" = "$source_amd64"
-            test "$index_arm64" = "$source_arm64"
-          fi
+          test "$index_amd64" = "$source_amd64"
+          test "$index_arm64" = "$source_arm64"
+          printf 'amd64_child_digest=%s\narm64_child_digest=%s\n' \
+            "$source_amd64" "$source_arm64" >>"$GITHUB_OUTPUT"
           amd64=$index_amd64
           arm64=$index_arm64
-          inspection=$(docker buildx imagetools inspect "$tag")
-          printf '%s\n' "$inspection"
-          index_digest=$(printf '%s\n' "$inspection" \
-            | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)
-          [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf '%s@%s\n' "$IMAGE" "$index_digest" >image-reference.txt
           printf 'tag=%s\ncommit=%s\namd64=%s\narm64=%s\n' \
             '${{ needs.prepare.outputs.tag }}' '${{ needs.prepare.outputs.commit }}' \
@@ -349,6 +352,8 @@ jobs:
           ARM64_HASH: ${{ needs.prepare.outputs.arm64_hash }}
           AMD64_ARTIFACT_SHA: ${{ needs.prepare.outputs.amd64_artifact_sha }}
           ARM64_ARTIFACT_SHA: ${{ needs.prepare.outputs.arm64_artifact_sha }}
+          AMD64_CHILD_DIGEST: ${{ needs.publish.outputs.amd64_child_digest }}
+          ARM64_CHILD_DIGEST: ${{ needs.publish.outputs.arm64_child_digest }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
@@ -359,7 +364,9 @@ jobs:
             --qualification-attempt "$QUALIFICATION_ATTEMPT" \
             --amd64-hash "$AMD64_HASH" --arm64-hash "$ARM64_HASH" \
             --amd64-artifact-sha "$AMD64_ARTIFACT_SHA" \
-            --arm64-artifact-sha "$ARM64_ARTIFACT_SHA"
+            --arm64-artifact-sha "$ARM64_ARTIFACT_SHA" \
+            --amd64-child-digest "$AMD64_CHILD_DIGEST" \
+            --arm64-child-digest "$ARM64_CHILD_DIGEST"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-release-proof-${{ needs.prepare.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}

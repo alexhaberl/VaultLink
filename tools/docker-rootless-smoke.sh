@@ -18,7 +18,7 @@ command -v dockerd-rootless.sh >/dev/null || {
   test "$fingerprint" = 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
   sudo install -d -m 0755 /etc/apt/keyrings
   sudo install -m 0644 "$docker_key" /etc/apt/keyrings/vaultlink-docker-ci.asc
-  printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: noble\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/vaultlink-docker-ci.asc\n' \
+  printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: noble\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/vaultlink-docker-ci.asc 9DC858229FC7DD38854AE2D88D81803C0EBFCD88\n' \
     "$(dpkg --print-architecture)" \
     | sudo tee /etc/apt/sources.list.d/vaultlink-docker-ci.sources >/dev/null
   sudo apt-get update

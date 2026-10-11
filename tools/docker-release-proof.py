@@ -32,7 +32,8 @@ def fields(path: Path) -> dict[str, str]:
 
 def create_proof(root: Path, repository: str, commit: str, tag: str,
                  run_id: int, run_attempt: int,
-                 hashes: dict[str, str], artifact_hashes: dict[str, str]) -> dict:
+                 hashes: dict[str, str], artifact_hashes: dict[str, str],
+                 child_digests: dict[str, str]) -> dict:
     if repository != "alexhaberl/VaultLink" or not COMMIT.fullmatch(commit):
         raise ValueError("invalid repository or full commit identity")
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
@@ -66,8 +67,11 @@ def create_proof(root: Path, repository: str, commit: str, tag: str,
         if not SHA256.fullmatch(qualified) or not SHA256.fullmatch(artifact):
             raise ValueError(f"invalid {architecture} binary or artifact hash")
         child = image.get(architecture, "")
-        if not DIGEST.fullmatch(child):
+        built_child = child_digests[architecture]
+        if not DIGEST.fullmatch(child) or not DIGEST.fullmatch(built_child):
             raise ValueError(f"invalid {architecture} child digest")
+        if child != built_child:
+            raise ValueError(f"published {architecture} child differs from this build")
         expected[architecture] = child
         expected[f"qualified_{architecture}_sha256"] = qualified
         expected[f"qualified_{architecture}_artifact_sha256"] = artifact
@@ -106,11 +110,14 @@ def main() -> None:
     for architecture in ("amd64", "arm64"):
         parser.add_argument(f"--{architecture}-hash", required=True)
         parser.add_argument(f"--{architecture}-artifact-sha", required=True)
+        parser.add_argument(f"--{architecture}-child-digest", required=True)
     args = parser.parse_args()
     proof = create_proof(args.evidence, args.repository, args.commit, args.tag,
                          args.qualification_run, args.qualification_attempt,
                          {arch: getattr(args, f"{arch}_hash") for arch in ("amd64", "arm64")},
                          {arch: getattr(args, f"{arch}_artifact_sha")
+                          for arch in ("amd64", "arm64")},
+                         {arch: getattr(args, f"{arch}_child_digest")
                           for arch in ("amd64", "arm64")})
     (args.evidence / "docker-release-proof.json").write_text(
         json.dumps(proof, indent=2, sort_keys=True) + "\n", encoding="utf-8")

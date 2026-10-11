@@ -5,6 +5,7 @@ import csv
 import http.server
 import os
 import select
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,23 @@ from test_mtls_fixture import LocalMtlsFixture
 
 
 SCRIPT = Path(os.environ.get("TEST_METADATA_SCRIPT", Path(__file__).with_name("load-metadata.py"))).resolve()
+
+
+def cleanup_process(process):
+    # Descendants may still own pipe writers even after the supervisor exits.
+    # Only tests create this dedicated session; never signal the caller's group.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        for stream in (process.stdout, process.stderr):
+            if stream:
+                stream.close()
+        process.wait(timeout=1)
+        raise
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -92,6 +110,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class MetadataTests(unittest.TestCase):
+    def assert_group_reaped(self, process):
+        with self.assertRaises(ProcessLookupError, msg="supervisor left descendants behind"):
+            os.killpg(process.pid, 0)
+
     @classmethod
     def setUpClass(cls):
         cls.tls = LocalMtlsFixture()
@@ -108,7 +130,7 @@ class MetadataTests(unittest.TestCase):
                                         str(SCRIPT), temporary, "2", "5", "15", "10"],
                 env={**os.environ, **self.tls.environment(),
                      "VAULTLINK_BASE_URL": "https://127.0.0.1:1", "DOWNLOAD_TOKEN": "SECRET_TOKEN"},
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
             try:
                 deadline = time.monotonic() + 5
                 while not (work / "metadata-ready").exists():
@@ -131,12 +153,58 @@ class MetadataTests(unittest.TestCase):
                 for client in range(2):
                     self.assertEqual((work / f"metadata-client-{client}.counts").read_text(), f"{client},0,0,0\n")
                 self.assertNotIn("SECRET", stdout + stderr)
+                for pid in children:
+                    self.assertFalse(Path(f"/proc/{pid}").exists(), f"worker {pid} was not reaped")
             finally:
-                if process.poll() is None:
-                    process.kill()
-                process.communicate()
+                cleanup_process(process)
 
     def test_termination_aborts_inflight_requests_and_retains_attempts(self):
+        self.terminate_inflight(repeated=False)
+
+    def test_cancellation_reaps_stopped_worker_despite_repeated_signals(self):
+        with tempfile.TemporaryDirectory(prefix="vaultlink-metadata-stopped-") as temporary:
+            work = Path(temporary)
+            process = subprocess.Popen(
+                [sys.executable, str(SCRIPT), temporary, "2", "5", "15", "10"],
+                env={**os.environ, **self.tls.environment(),
+                     "VAULTLINK_BASE_URL": "https://127.0.0.1:1", "DOWNLOAD_TOKEN": "SECRET_TOKEN"},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 5
+                while not (work / "metadata-ready").exists():
+                    self.assertIsNone(process.poll())
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+                self.assertEqual(len(children), 2)
+                os.kill(int(children[0]), signal.SIGSTOP)
+                stopped = Path(f"/proc/{children[0]}/status")
+                while not any(line.startswith("State:") and "T" in line for line in stopped.read_text().splitlines()):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                started = time.monotonic()
+                process.terminate()
+                for _ in range(5):
+                    time.sleep(0.05)
+                    self.assertIsNone(process.poll(), "supervisor skipped worker cleanup")
+                    process.terminate()
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 143, stderr)
+                self.assertLess(time.monotonic() - started, 9)
+                for pid in children:
+                    self.assertFalse(Path(f"/proc/{pid}").exists(), f"worker {pid} was not reaped")
+                self.assertNotIn("SECRET", stdout + stderr)
+                # The cooperative worker flushes evidence; the stopped worker
+                # cannot, and cancellation must never masquerade as success.
+                self.assertTrue(any(path.read_text().endswith(",0,0,0\n")
+                                    for path in work.glob("metadata-client-*.counts")))
+            finally:
+                cleanup_process(process)
+
+    def test_repeated_termination_retains_inflight_evidence_and_reaps_workers(self):
+        self.terminate_inflight(repeated=True)
+
+    def terminate_inflight(self, repeated):
         server = Server("blocked", 2)
         self.tls.wrap_server(server)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -149,22 +217,29 @@ class MetadataTests(unittest.TestCase):
                     env={**os.environ, **self.tls.environment(),
                          "VAULTLINK_BASE_URL": f"https://127.0.0.1:{server.server_port}",
                          "DOWNLOAD_TOKEN": "SECRET_TOKEN", "NO_PROXY": "127.0.0.1"},
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
                 try:
                     with server.condition:
                         self.assertTrue(server.condition.wait_for(lambda: len(server.requests) == 2, timeout=5))
+                    children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+                    self.assertEqual(len(children), 2)
                     process.terminate()
-                    stdout, stderr = process.communicate(timeout=5)
+                    if repeated:
+                        for _ in range(5):
+                            time.sleep(0.02)
+                            if process.poll() is None:
+                                process.terminate()
+                    stdout, stderr = process.communicate(timeout=10)
                     self.assertEqual(process.returncode, 143, stderr)
                     for client in range(2):
                         self.assertEqual((work / f"metadata-client-{client}.counts").read_text(), f"{client},1,1,0\n")
                         self.assertIn("curl_exit=42 ", (work / f"transport-metadata-{client}-1.failure").read_text())
                     self.assertEqual(set(server.requests.values()), {1})
                     self.assertNotIn("SECRET", stdout + stderr)
+                    for pid in children:
+                        self.assertFalse(Path(f"/proc/{pid}").exists(), f"worker {pid} was not reaped")
                 finally:
-                    if process.poll() is None:
-                        process.kill()
-                    process.communicate()
+                    cleanup_process(process)
         finally:
             server.release.set()
             server.shutdown()
@@ -180,12 +255,18 @@ class MetadataTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix="vaultlink-metadata-") as temporary:
                 work = Path(temporary)
                 (work / "profile-go").touch()
-                result = subprocess.run(
+                process = subprocess.Popen(
                     [sys.executable, str(SCRIPT), str(work), str(clients), "5", "15", "5"],
                     env={**os.environ, **self.tls.environment(),
                          "VAULTLINK_BASE_URL": f"https://127.0.0.1:{server.server_port}",
                          "DOWNLOAD_TOKEN": "SECRET_TOKEN", "NO_PROXY": "127.0.0.1"},
-                    capture_output=True, text=True, timeout=45)
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+                try:
+                    stdout, stderr = process.communicate(timeout=45)
+                    self.assert_group_reaped(process)
+                    result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+                finally:
+                    cleanup_process(process)
                 files = {path.name: path.read_text() for path in work.iterdir()}
                 self.assertNotIn("SECRET", result.stdout + result.stderr + "".join(files.values()))
                 return result, files, server
@@ -244,7 +325,8 @@ class MetadataTests(unittest.TestCase):
                          "VAULTLINK_BASE_URL": f"https://127.0.0.1:{server.server_port}",
                          "DOWNLOAD_TOKEN": "SECRET_TOKEN", "NO_PROXY": "127.0.0.1",
                          "NOTIFY_FD": str(notify_write), "RELEASE_FD": str(release_read)},
-                    pass_fds=(notify_write, release_read), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    pass_fds=(notify_write, release_read), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, start_new_session=True)
                 self.assertTrue(select.select([notify_read], [], [], 10)[0], "first callback never entered")
                 os.read(notify_read, 1)
                 server.release.set()
@@ -254,13 +336,12 @@ class MetadataTests(unittest.TestCase):
                 os.write(release_write, b'1')
                 stdout, stderr = process.communicate(timeout=10)
                 self.assertEqual(process.returncode, 0, stderr)
+                self.assert_group_reaped(process)
                 self.assertNotIn("SECRET", stdout + stderr)
                 self.assertTrue(independent, "one client's GIL prevented another client from making HTTP progress")
         finally:
-            if process is not None and process.poll() is None:
-                os.write(release_write, b'1')
-                process.kill()
-                process.communicate()
+            if process is not None:
+                cleanup_process(process)
             for fd in (notify_read, notify_write, release_read, release_write):
                 os.close(fd)
             server.release.set()
