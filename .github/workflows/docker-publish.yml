@@ -149,7 +149,7 @@ jobs:
           test "$measured" = "$expected"
           printf '%s\n' "$digest" >'digest-${{ matrix.architecture }}'
           printf '%s\n' "$measured" >'binary-${{ matrix.architecture }}.sha256'
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-release-digest-${{ matrix.architecture }}
           path: |
@@ -241,7 +241,7 @@ jobs:
             '${{ needs.prepare.outputs.qualification_attempt }}' \
             '${{ needs.prepare.outputs.amd64_artifact_sha }}' \
             '${{ needs.prepare.outputs.arm64_artifact_sha }}' >>image-reference.txt
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-release-index-${{ needs.prepare.outputs.tag }}
           path: |
@@ -311,7 +311,7 @@ jobs:
           VAULTLINK_TEST_IMAGE=vaultlink:release-test bash tools/docker-rootless-smoke.sh
           VAULTLINK_TEST_IMAGE=vaultlink:release-test \
           VAULTLINK_TEST_ARCH='${{ matrix.architecture }}' bash tools/kubernetes-runtime-smoke.sh
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-public-binary-${{ matrix.architecture }}-${{ needs.prepare.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: public-binary-${{ matrix.architecture }}.txt
@@ -360,7 +360,7 @@ jobs:
             --amd64-hash "$AMD64_HASH" --arm64-hash "$ARM64_HASH" \
             --amd64-artifact-sha "$AMD64_ARTIFACT_SHA" \
             --arm64-artifact-sha "$ARM64_ARTIFACT_SHA"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-release-proof-${{ needs.prepare.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence/docker-release-proof.json
