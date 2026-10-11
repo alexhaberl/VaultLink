@@ -127,7 +127,7 @@ jobs:
                      "binary_sha256": digest}, sys.stdout, sort_keys=True)
           PY
       - name: Preserve successful qualification receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-qualification-${{ matrix.architecture }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: qualification.json
@@ -135,7 +135,7 @@ jobs:
           retention-days: 90
       - name: Preserve Docker runtime evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: docker-${{ matrix.architecture }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence/

@@ -263,7 +263,7 @@ jobs:
           } >>vm-build/host-storage.txt
       - name: Preserve failed guest serial evidence
         if: ${{ failure() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: distro-vm-failure-${{ inputs.target_id }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -328,7 +328,7 @@ jobs:
           python3 tools/update-package-target-images.py vm vm-image.tsv package-targets.json
           printf 'This is a partial one-target VM lock. Combine all nine reviewed vm-image.tsv files and use --require-complete only after builder and VM provisioning are complete.\n' \
             >>"$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: distro-vm-target-lock-${{ inputs.target_id }}-${{ github.run_id }}
           path: |

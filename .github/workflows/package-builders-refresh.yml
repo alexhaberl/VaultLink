@@ -167,7 +167,7 @@ jobs:
             "$ARCH_SNAPSHOT_DATE" \
             >"builder-digest-$TARGET_ID.tsv"
       - name: Upload platform digest
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-builder-digest-${{ matrix.id }}
           path: |
@@ -258,7 +258,7 @@ jobs:
           printf 'Review the uploaded complete package closures. When reviewed VM locks remain unchanged, pin this generated candidate unchanged, validate it strictly, merge that pinning PR, and only then set VAULTLINK_PACKAGE_SIGNING_IMAGE to its Debian 13 amd64 builder_image; otherwise combine it with all nine refreshed VM locks.\n' \
             >>"$GITHUB_STEP_SUMMARY"
       - name: Upload reviewed target-lock candidate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-builder-target-lock-${{ github.run_id }}
           path: |
