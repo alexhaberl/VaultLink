@@ -95,12 +95,12 @@ jobs:
           ARCHITECTURE: ${{ matrix.architecture }}
           PLATFORM: ${{ matrix.platform }}
           EXPECTED_UNAME: ${{ matrix.uname }}
-          BUILDER_IMAGE: ${{ needs.prepare.outputs.image }}
         run: |
           set -euo pipefail
           mkdir -p "evidence/$ARCHITECTURE"
           printf 'state=failure\n' >"evidence/$ARCHITECTURE.env"
           test "$(uname -m)" = "$EXPECTED_UNAME"
+          BUILDER_IMAGE=$(python3 tools/package-targets.py get "debian13-$ARCHITECTURE" builder_image)
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           builder="vaultlink-qualification-$ARCHITECTURE"
           docker buildx create --driver docker-container \

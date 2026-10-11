@@ -38,3 +38,7 @@ webpki-roots
 # compiled together on one host. Re-evaluate after their parent crates converge.
 hashbrown
 r-efi
+
+# errno, rustix and tempfile use windows-sys 0.52 while Tokio and other platform
+# branches require 0.61. Re-evaluate when their Windows support converges.
+windows-sys
