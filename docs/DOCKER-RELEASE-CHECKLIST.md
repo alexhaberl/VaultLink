@@ -38,6 +38,11 @@ published 0.7.1 release and its 21 assets remain unchanged.
    assembles the
    `vX.Y.Z` multiarch index and
    records the index and child digests as a workflow artifact.
+   A retry may reuse an existing version tag only when both native platform
+   manifest digests equal this attempt's build outputs. Different digests fail
+   publication even if the binaries match; never overwrite the version tag.
+   Final proof generation receives those build digests independently of the
+   published-image receipts and requires exact equality.
 5. Confirm `linux/amd64` and `linux/arm64` on the **top-level** GHCR index.
    The `verify_public` jobs on native amd64 and arm64 runners must pull the
    digest without Registry credentials, verify version and source revision

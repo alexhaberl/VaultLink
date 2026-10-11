@@ -208,7 +208,8 @@ def run_client(work, index, url, library, connect_timeout, request_timeout, read
         curl.option(client.easy, 43, 0)
         curl.option(client.easy, 20219, progress)
         ready[index] = 1
-        go.wait()
+        while not stop.value and not go.value:
+            time.sleep(0.01)
         cpu_started = time.process_time()
         while not stop.value and not client.failed and client.completed < 20:
             delay = client.ready_at - time.monotonic()
@@ -234,12 +235,49 @@ def run_client(work, index, url, library, connect_timeout, request_timeout, read
             encoding="ascii")
 
 
+def join_until(processes, deadline):
+    for process in processes:
+        process.join(timeout=max(0, deadline - time.monotonic()))
+
+
+def stop_clients(processes, stop, go):
+    stop.value = 1
+    go.value = 1
+    # Deadlines are shared across all clients, rather than multiplied by count.
+    join_until(processes, time.monotonic() + 5)
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    join_until(processes, time.monotonic() + 1)
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+    join_until(processes, time.monotonic() + 1)
+    if any(process.is_alive() for process in processes):
+        raise CurlFailure("metadata client could not be reaped after cancellation")
+
+
 def run(work, count, connect_timeout, request_timeout, ready_timeout):
     context = multiprocessing.get_context("fork")
     ready = context.Array("b", count, lock=False)
     stop = context.Value("b", 0, lock=False)
-    go = context.Event()
+    # A stopped/crashed worker must not retain an Event's condition lock and
+    # prevent the supervisor from releasing the barrier during cancellation.
+    go = context.Value("b", 0, lock=False)
     processes = []
+    cancelled = False
+
+    def cancel(_signal, _frame):
+        nonlocal cancelled
+        # Do not raise asynchronously: repeated signals must not interrupt
+        # child registration, barrier release, result flushing or reaping.
+        cancelled = True
+
+    def check_cancelled():
+        if cancelled:
+            raise SystemExit(143)
+
+    previous_handler = signal.signal(signal.SIGTERM, cancel)
     started, cpu_started = time.monotonic(), time.process_time()
     try:
         url = os.environ["VAULTLINK_BASE_URL"] + "/v/" + os.environ["DOWNLOAD_TOKEN"]
@@ -249,6 +287,7 @@ def run(work, count, connect_timeout, request_timeout, ready_timeout):
         if not library:
             raise CurlFailure("libcurl is unavailable")
         for index in range(count):
+            check_cancelled()
             previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
             try:
                 process = context.Process(target=run_client, args=(
@@ -261,41 +300,47 @@ def run(work, count, connect_timeout, request_timeout, ready_timeout):
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         deadline = time.monotonic() + ready_timeout
         while not all(ready):
+            check_cancelled()
             if any(process.exitcode is not None for process in processes):
                 raise CurlFailure("metadata client exited before readiness")
             if time.monotonic() >= deadline:
                 raise CurlFailure("metadata client readiness timed out")
             time.sleep(0.01)
+        check_cancelled()
         (work / "metadata-ready").touch()
         while not (work / "profile-go").exists():
+            check_cancelled()
             if time.monotonic() >= deadline:
                 raise CurlFailure("metadata profile start barrier timed out")
             time.sleep(0.05)
         started, cpu_started = time.monotonic(), time.process_time()
-        go.set()
-        for process in processes:
-            process.join()
-        return int(any(process.exitcode != 0 for process in processes))
+        check_cancelled()
+        go.value = 1
+        while any(process.is_alive() for process in processes):
+            check_cancelled()
+            join_until(processes, time.monotonic() + 0.05)
+        result = int(any(process.exitcode != 0 for process in processes))
     finally:
-        stop.value = 1
-        go.set()
         # In-flight libcurl callbacks observe stop; join before the shell can
         # aggregate partial results. No surviving clients may mutate evidence.
-        for process in processes:
-            process.join()
-        statistics = []
-        for index in range(len(processes)):
-            path = work / f"metadata-generator-{index}.env"
-            if path.exists():
-                statistics.append(dict(line.split("=", 1) for line in path.read_text().splitlines()))
-        cpu = time.process_time() - cpu_started + sum(float(s["cpu_seconds"]) for s in statistics)
-        gap = max((float(s["max_pretransfer_gap_seconds"]) for s in statistics), default=0)
-        (work / "metadata-generator.env").write_text(
-            f"engine=libcurl-processes\nprocesses={len(processes) + 1}\nclients={count}\n"
-            f"requests_per_client=20\ncpu_set={','.join(map(str, sorted(os.sched_getaffinity(0))))}\n"
-            f"fresh_connections=true\nworker_processes={len(processes)}\nthreads_per_client=1\n"
-            f"elapsed_seconds={time.monotonic() - started:.6f}\ncpu_seconds={cpu:.6f}\n"
-            f"max_pretransfer_gap_seconds={gap:.6f}\n", encoding="ascii")
+        try:
+            stop_clients(processes, stop, go)
+            statistics = []
+            for index in range(len(processes)):
+                path = work / f"metadata-generator-{index}.env"
+                if path.exists():
+                    statistics.append(dict(line.split("=", 1) for line in path.read_text().splitlines()))
+            cpu = time.process_time() - cpu_started + sum(float(s["cpu_seconds"]) for s in statistics)
+            gap = max((float(s["max_pretransfer_gap_seconds"]) for s in statistics), default=0)
+            (work / "metadata-generator.env").write_text(
+                f"engine=libcurl-processes\nprocesses={len(processes) + 1}\nclients={count}\n"
+                f"requests_per_client=20\ncpu_set={','.join(map(str, sorted(os.sched_getaffinity(0))))}\n"
+                f"fresh_connections=true\nworker_processes={len(processes)}\nthreads_per_client=1\n"
+                f"elapsed_seconds={time.monotonic() - started:.6f}\ncpu_seconds={cpu:.6f}\n"
+                f"max_pretransfer_gap_seconds={gap:.6f}\n", encoding="ascii")
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+    return 143 if cancelled else result
 
 
 def main():
@@ -316,7 +361,6 @@ def main():
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, lambda _signal, _frame: sys.exit(143))
     try:
         sys.exit(main())
     except (CurlFailure, OSError, KeyError, ValueError, AttributeError, RuntimeError) as error:
