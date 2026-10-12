@@ -923,6 +923,22 @@ else
     fi
 fi
 
+# Production Docker builds must use the committed builder family. A recipe PR
+# may defer qualification while all builders are UNPROVISIONED, but main and
+# manual release gates must reject that state rather than install a toolchain.
+if ! grep -F -q 'python3 tools/package-targets.py validate --allow-unprovisioned' .github/workflows/docker-runtime.yml \
+    || ! grep -F -q '"$GITHUB_EVENT_NAME" != pull_request' .github/workflows/docker-runtime.yml \
+    || ! grep -F -q "if: needs.prepare.outputs.provisioned == 'true'" .github/workflows/docker-runtime.yml \
+    || ! grep -F -q 'python3 tools/package-targets.py get debian13-amd64 builder_image' .github/workflows/docker-runtime.yml \
+    || ! grep -F -q -- '--build-arg "BUILDER_IMAGE=$BUILDER_IMAGE"' .github/workflows/docker-runtime.yml; then
+    report "Docker qualification must use reviewed builder pins and fail closed outside recipe pull requests"
+fi
+if ! grep -F -q 'python3 tools/package-targets.py get "debian13-${{ matrix.architecture }}" builder_image)' .github/workflows/docker-publish.yml \
+    || ! grep -F -q -- '--build-arg "BUILDER_IMAGE=$builder_image"' .github/workflows/docker-publish.yml \
+    || ! grep -F -q 'RUN rustup run "$(sh tools/rust-toolchain-channel.sh)" cargo build --release --locked' deploy/docker/Dockerfile.runtime; then
+    report "Docker publication must select the manifest builder and require its installed committed Rust toolchain"
+fi
+
 for workflow in \
     .github/workflows/ci.yml \
     .github/workflows/fuzz.yml; do

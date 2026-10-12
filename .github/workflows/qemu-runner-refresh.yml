@@ -107,7 +107,7 @@ jobs:
             "$BASE_IMAGE" "$packages_sha256" '${{ matrix.architecture }}' \
             >'qemu-runner-${{ matrix.architecture }}.env'
           printf '%s\n' "$digest" >'digest-${{ matrix.architecture }}'
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qemu-runner-digest-${{ matrix.architecture }}
           path: |
@@ -129,7 +129,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: qemu-runner-digest-*
           path: digests
@@ -182,7 +182,7 @@ jobs:
           cp deploy/docker/qemu-runner-base-image.lock .
           cp deploy/docker/qemu-runner-packages-amd64.lock .
           cp deploy/docker/qemu-runner-packages-arm64.lock .
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qemu-runner-lock-${{ github.run_id }}
           path: |
