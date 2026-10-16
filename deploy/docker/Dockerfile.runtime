@@ -1,5 +1,5 @@
 # syntax=docker.io/docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
-ARG BUILDER_IMAGE=ghcr.io/alexhaberl/vaultlink-package-builder-debian13@sha256:b025294f1c37448d2a9a1e7129946e27d97c874b4260d45039ed637237cea431
+ARG BUILDER_IMAGE=ghcr.io/alexhaberl/vaultlink-package-builder-debian13@sha256:5678edfba362a43af9ebc6acecaf58422ed1287a6332de9ad2577ba54c525a4f
 ARG RUNTIME_IMAGE=docker.io/library/debian@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
 
 FROM ${BUILDER_IMAGE} AS builder
