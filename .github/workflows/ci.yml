@@ -60,6 +60,7 @@ jobs:
           python3 tools/test-architecture.py
           python3 tools/check-architecture.py --root .
           python3 tools/test-release-state.py
+          python3 tools/test-supported-release.py
           python3 tools/test-performance-evidence.py
           python3 tools/test-release-evidence.py
           python3 tools/test-release-security-audit.py
