@@ -83,6 +83,70 @@ def expected_assets(version: str) -> set[str]:
     )
 
 
+def verify_recorded_soak_status(repository: str, commit: str, run_url: str) -> None:
+    # Combined status exposes only the newest status per context. A later
+    # collector may replace its URL without changing the published evidence.
+    for page in range(1, 101):
+        statuses = gh_json(
+            "api", f"repos/{repository}/commits/{commit}/statuses?per_page=100&page={page}"
+        )
+        if not isinstance(statuses, list):
+            fail("remote commit status history is not a list")
+        if any(
+            isinstance(status, dict)
+            and status.get("context") == "vaultlink/72h-soak"
+            and status.get("state") == "success"
+            and status.get("target_url") == run_url
+            for status in statuses
+        ):
+            return
+        if len(statuses) < 100:
+            fail("recorded soak success is missing from remote commit status history")
+    fail("remote commit status history exceeded its pagination bound")
+
+
+def verify_recorded_soak_run(repository: str, commit: str, run_url: str) -> None:
+    prefix = f"https://github.com/{repository}/actions/runs/"
+    match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)", run_url)
+    if match is None:
+        fail("recorded soak URL does not identify a run in this repository")
+    run_id = int(match[1])
+    run = gh_json("api", f"repos/{repository}/actions/runs/{run_id}")
+    if (
+        run.get("id") != run_id
+        or run.get("html_url") != run_url
+        or run.get("head_sha") != commit
+        or run.get("head_branch") != "main"
+        or run.get("repository", {}).get("full_name") != repository
+        or run.get("head_repository", {}).get("full_name") != repository
+        or run.get("path", "").split("@")[0] != ".github/workflows/soak-collect.yml"
+        or run.get("event") not in {"schedule", "workflow_dispatch"}
+        or run.get("status") != "completed"
+        or run.get("conclusion") != "success"
+    ):
+        fail("recorded soak run does not match the successful release-commit collector")
+
+
+def verify_commit_gates(repository: str, supported: dict[str, Any]) -> None:
+    commit = supported["commit_sha"]
+    combined = gh_json("api", f"repos/{repository}/commits/{commit}/status")
+    statuses = [status for status in combined.get("statuses", []) if isinstance(status, dict)]
+    for expected in supported["required_commit_gates"]:
+        current = next(
+            (status for status in statuses if status.get("context") == expected["context"]),
+            None,
+        )
+        # Historical evidence must never hide a current failing/pending gate.
+        if current is None or current.get("state") != "success":
+            fail(f"remote commit gate is not successful: {expected['context']}")
+        if current.get("target_url") != expected["run_url"]:
+            if expected["context"] != "vaultlink/72h-soak":
+                fail(f"remote commit gate does not match release-state: {expected['context']}")
+            verify_recorded_soak_status(repository, commit, expected["run_url"])
+        if expected["context"] == "vaultlink/72h-soak":
+            verify_recorded_soak_run(repository, commit, expected["run_url"])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True, help="GitHub OWNER/REPOSITORY")
@@ -143,16 +207,7 @@ def main() -> int:
         if not isinstance(asset, dict) or not asset.get("digest") or not asset.get("size"):
             fail("remote release contains an asset without digest or content")
 
-    combined = gh_json("api", f"repos/{args.repository}/commits/{supported['commit_sha']}/status")
-    statuses = [status for status in combined.get("statuses", []) if isinstance(status, dict)]
-    for expected in supported["required_commit_gates"]:
-        if not any(
-            actual.get("context") == expected["context"]
-            and actual.get("state") == "success"
-            and actual.get("target_url") == expected["run_url"]
-            for actual in statuses
-        ):
-            fail(f"remote commit gate does not match release-state: {expected['context']}")
+    verify_commit_gates(args.repository, supported)
 
     print(
         f"supported release verified: {tag} {supported['commit_sha']} "
