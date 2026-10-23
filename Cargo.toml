@@ -17,7 +17,8 @@ fuzzing = []
 
 [dependencies]
 argon2 = "0.6"
-askama = "=0.16.1"
+# VaultLink uses built-in template defaults; avoid the unmaintained TOML config parser.
+askama = { version = "=0.16.1", default-features = false, features = ["derive", "std", "urlencode"] }
 axum = { version = "0.8", features = ["multipart"] }
 bytes = "1"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
