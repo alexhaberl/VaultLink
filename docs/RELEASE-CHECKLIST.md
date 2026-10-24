@@ -96,7 +96,7 @@ performing Git-based release checks.
   - Includes `zip_search_preview_paths`, `upload_overwrite_policy`, `upload_request_state`, `share_request_policy`, `file_mutation_policy`, and `multipart_guard`.
 - [ ] `cargo build --release --locked` on amd64 and arm64.
 - [ ] Checksum-pinned Gitleaks 8.30.1 full-history scan is green with redacted output; `.gitleaksignore` contains only the two reviewed RFC 6238 TOTP test-vector fingerprints.
-- [ ] Run `cargo audit --deny warnings --ignore RUSTSEC-2023-0071` against the shared workspace lockfile; consciously re-review the compensated RSA exception and remove it as soon as the dependency permits.
+- [ ] Run `cargo audit --deny warnings --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0387` against the shared workspace lockfile; re-review both narrowly scoped WebAuthn timing exceptions in `SECURITY.md`, run `python3 tools/check-audit-exceptions.py`, and remove each exception as soon as the dependency permits.
 - [ ] `shellcheck deploy/*.sh deploy/docker/*.sh tools/*.sh` and `make policy-check` on amd64 and arm64.
 - [ ] `make docker-smoke` on the final 0.5.0 source on amd64 and arm64.
 - [ ] Weekly/manual reproducibility workflow builds twice per architecture with empty targets and identical `SOURCE_DATE_EPOCH`; binary and archive SHA-256 values match bit-for-bit.
@@ -129,7 +129,7 @@ performing Git-based release checks.
 ## Remaining release gates
 
 - [ ] Fifteen-minute fuzz campaign on amd64 and arm64 for all thirteen targets in `docs/FUZZING.md`, including authentication headers, journal recovery, directory cursors, and real ZIP/preview I/O. Each campaign restores validated corpora, replays inputs, fuzzes every target for 900 seconds, and minimizes the result. The existing `fuzz-600s` status contexts remain the release gates; the longer campaigns exceed that historical minimum. The weekly native matrix uses two workers while private and four when public, with a 180-minute timeout including bounded builds/replays/minimization; the manual final-commit run remains the release gate. Retain both corpus snapshots and inspect the per-target statistics. The separate AMD64 source-coverage report is informational.
-- [ ] Repeat `cargo-audit 0.22.2 --deny warnings --ignore RUSTSEC-2023-0071`, inspect the shared `Cargo.lock`, and confirm no additional exception exists.
+- [ ] Repeat `cargo-audit 0.22.2 --deny warnings --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0387`, inspect the shared `Cargo.lock`, and confirm only the two reviewed WebAuthn timing exceptions exist and their dependency/use restrictions still hold.
 - [ ] GitHub Actions CI green on final `main`.
 - [ ] Locked release dry-run green on GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm`, using exactly the digest-pinned multi-arch Debian 13 builder with no runtime APT/Cargo installation. The tag-only signing and publishing job runs on a fresh `ubuntu-24.04` VM behind the protected `release-signing` environment.
 - [x] Generated a password-protected Minisign Ed25519 key offline, committed only `release/minisign.pub`, and provisioned both signing secrets in the main-restricted `release-signing` environment on 2026-08-09. Do not change keys or builder pins after soak begins.

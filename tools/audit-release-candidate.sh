@@ -18,13 +18,21 @@ case "$commit" in ''|*[!0-9a-f]*) exit 64 ;; esac
 [ ! -e "$report" ] || exit 73
 mkdir -p "$report"
 git show "$commit:Cargo.lock" >"$report/Cargo.lock"
+git show "$commit:Cargo.toml" >"$report/Cargo.toml"
+# Evaluate only frozen data with the trusted checkout's policy. Never execute
+# candidate code or accept the candidate's own audit exceptions.
+if ! python3 tools/check-audit-exceptions.py --root "$report" --dependencies-only \
+    >"$report/exception-policy.log" 2>&1; then
+    cat "$report/exception-policy.log" >&2
+    exit 1
+fi
 lock_sha256=$(sha256sum "$report/Cargo.lock" | awk '{print $1}')
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT HUP INT TERM
 
 result=0
-cargo audit --deny warnings --ignore RUSTSEC-2023-0071 \
+cargo audit --deny warnings --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0387 \
     --db "$work/advisory-db" --file "$report/Cargo.lock" --json \
     >"$report/audit.json" 2>"$report/audit.log" || result=$?
 database_commit=$(git -C "$work/advisory-db" rev-parse HEAD 2>/dev/null || true)

@@ -698,41 +698,11 @@ for tool in 'cargo-cyclonedx --version 0.5.9' 'cargo-audit --version 0.22.2'; do
         || report "native package builder is missing pinned $tool"
 done
 
-audit_exception='--ignore RUSTSEC-2023-0071'
-audit_commands=$(grep -R -h -E 'cargo audit .*--deny warnings' .github/workflows tools/audit-release-candidate.sh || true)
-audit_exceptions=$(printf '%s\n' "$audit_commands" \
-    | grep -o -E -- '--ignore[[:space:]]+RUSTSEC-[0-9-]+' | sort -u || true)
-if [ "$(printf '%s\n' "$audit_commands" | grep -c . || true)" -ne 2 ] \
-    || [ "$(printf '%s\n' "$audit_commands" | grep -F -c -- "$audit_exception" || true)" -ne 2 ] \
-    || [ "$audit_exceptions" != "$audit_exception" ]; then
-    report "RUSTSEC-2023-0071 must be the only explicit cargo-audit exception"
+if ! python3 tools/check-audit-exceptions.py; then
+    report "WebAuthn timing advisory exceptions or reviewed dependency paths changed"
 fi
-if ! python3 - <<'PY'
-import pathlib
-import tomllib
-
-packages = tomllib.loads(pathlib.Path("Cargo.lock").read_text(encoding="utf-8"))["package"]
-by_name = {}
-for package in packages:
-    by_name.setdefault(package["name"], []).append(package)
-assert len(by_name.get("rsa", [])) == 1
-rsa = by_name["rsa"][0]
-assert rsa["version"] == "0.9.10"
-assert len(by_name.get("webauthn_rp", [])) == 1
-webauthn = by_name["webauthn_rp"][0]
-assert webauthn["version"] == "0.3.0"
-assert "rsa" in webauthn.get("dependencies", [])
-assert len(by_name.get("vaultlink", [])) == 1
-assert "webauthn_rp" in by_name["vaultlink"][0].get("dependencies", [])
-parents = sorted(
-    package["name"]
-    for package in packages
-    if any(dependency.split(" ", 1)[0] == "rsa" for dependency in package.get("dependencies", []))
-)
-assert parents == ["webauthn_rp"]
-PY
-then
-    report "RUSTSEC-2023-0071 must remain confined to vaultlink -> webauthn_rp 0.3.0 -> rsa 0.9.10"
+if ! python3 tools/test-audit-exceptions.py; then
+    report "audit exception policy negative tests failed"
 fi
 if [ "$(grep -F -c 'fn registration_never_advertises_the_unpatched_rs256_path()' src/webauthn.rs || true)" -ne 1 ] \
     || [ "$(grep -F -c 'fn authentication_rejects_persisted_rs256_credentials()' src/webauthn.rs || true)" -ne 1 ] \

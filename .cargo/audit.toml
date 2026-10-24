@@ -3,4 +3,9 @@
 # release exists for RUSTSEC-2023-0071. VaultLink never advertises RS256 and,
 # with its fresh-only schema, cannot contain a legacy RSA credential. A unit
 # test pins that compensating control until the dependency can be removed.
-ignore = ["RUSTSEC-2023-0071"]
+# crypto-bigint 0.5.5 is confined to webauthn_rp's P-256/P-384 public-key
+# verification via elliptic-curve 0.13.8. RUSTSEC-2026-0387 concerns timing
+# leakage of secret integers; no authenticator private key enters VaultLink.
+# The fix (>=0.7.6) is incompatible with this dependency line. SECURITY.md
+# records the review; check-audit-exceptions.py pins every consumer and source.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]

@@ -10,7 +10,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BASH = os.environ.get("BASH_BIN") or shutil.which("bash")
-LOCK = 'version = 4\n\n[[package]]\nname = "example"\nversion = "1.0.0"\n'
+LOCK = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+MANIFEST = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
 
 FAKE_CARGO = r'''#!/bin/sh
 set -eu
@@ -28,7 +29,7 @@ while [ "$#" -gt 0 ]; do
         --db) database=$2; shift 2 ;;
         --file) lockfile=$2; shift 2 ;;
         --deny) [ "$2" = warnings ]; shift 2 ;;
-        --ignore) [ "$2" = RUSTSEC-2023-0071 ]; shift 2 ;;
+        --ignore) case "$2" in RUSTSEC-2023-0071|RUSTSEC-2026-0387) ;; *) exit 90 ;; esac; shift 2 ;;
         --json) shift ;;
         *) exit 90 ;;
     esac
@@ -80,7 +81,8 @@ class AuditTests(unittest.TestCase):
         self.repo.mkdir()
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         (self.repo / "Cargo.lock").write_text(LOCK, encoding="utf-8")
-        subprocess.run(["git", "-C", str(self.repo), "add", "Cargo.lock"], check=True)
+        (self.repo / "Cargo.toml").write_text(MANIFEST, encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "Cargo.lock", "Cargo.toml"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test",
                         "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
                         "commit", "-q", "-m", "candidate"], check=True)
@@ -89,6 +91,8 @@ class AuditTests(unittest.TestCase):
         (self.repo / "tools").mkdir()
         shutil.copyfile(ROOT / "tools/audit-release-candidate.sh",
                         self.repo / "tools/audit-release-candidate.sh")
+        shutil.copyfile(ROOT / "tools/check-audit-exceptions.py",
+                        self.repo / "tools/check-audit-exceptions.py")
         self.bin = self.root / "bin"
         self.bin.mkdir()
         for name, script in {
@@ -114,14 +118,38 @@ class AuditTests(unittest.TestCase):
 
     def test_audits_committed_lockfile_not_mutable_checkout(self):
         (self.repo / "Cargo.lock").write_text("changed working copy", encoding="utf-8")
+        (self.repo / "Cargo.toml").write_text("changed working copy", encoding="utf-8")
         result = self.audit()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.report / "Cargo.lock").read_text(encoding="utf-8"), LOCK)
+        self.assertEqual((self.report / "Cargo.toml").read_text(encoding="utf-8"), MANIFEST)
         receipt = (self.report / "receipt.env").read_text(encoding="utf-8")
         self.assertIn(f"commit={self.commit}\n", receipt)
         self.assertRegex(receipt, r"database_commit=[a-f0-9]{40}\n")
         self.assertRegex(receipt, r"lock_sha256=[a-f0-9]{64}\n")
         self.assertIn("exit_code=0\n", receipt)
+
+    def test_only_reviewed_timing_exceptions_are_passed(self):
+        result = self.audit()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = (self.root / "args").read_text(encoding="utf-8").splitlines()
+        self.assertEqual([args[i + 1] for i, arg in enumerate(args) if arg == "--ignore"],
+                         ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"])
+        self.assertIn("warnings", args)
+
+    def test_frozen_candidate_with_another_crypto_consumer_is_rejected(self):
+        expanded = LOCK + '\n[[package]]\nname = "signer"\nversion = "1.0.0"\ndependencies = ["p256"]\n'
+        (self.repo / "Cargo.lock").write_text(expanded, encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "Cargo.lock"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                        "commit", "-q", "-m", "additional consumer"], check=True)
+        commit = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+                                         text=True).strip()
+        result = self.audit(commit=commit)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dependency path changed", result.stderr)
+        self.assertFalse((self.root / "args").exists())
 
     def test_finding_blocks_and_preserves_report(self):
         self.assertNotEqual(self.audit("vulnerability").returncode, 0)

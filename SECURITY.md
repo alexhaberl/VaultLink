@@ -69,11 +69,51 @@ Retain historical signed packages for authenticated rollback; never replace
 
 `webauthn_rp 0.3.0` unconditionally depends on `rsa 0.9.10`, which is affected by `RUSTSEC-2023-0071`. The advisory concerns timing leakage from RSA private-key operations. VaultLink is a WebAuthn relying party: authenticator private keys never enter the server, and VaultLink performs no RSA private-key operation for WebAuthn credentials.
 
-VaultLink nevertheless makes the affected RS256 path unreachable. Registration options never advertise RS256, and one central runtime invariant rejects RSA credential state after registration, while decoding persisted credentials, and immediately before authentication. Regression tests cover each boundary. `RUSTSEC-2023-0071` is the sole explicit `cargo-audit` exception and must be reviewed for every release.
+VaultLink nevertheless makes the affected RS256 path unreachable. Registration options never advertise RS256, and one central runtime invariant rejects RSA credential state after registration, while decoding persisted credentials, and immediately before authentication. Regression tests cover each boundary. `RUSTSEC-2023-0071` is one of the two explicitly reviewed WebAuthn timing exceptions and must be reviewed for every release.
 
 The exception must be removed or reassessed if `webauthn_rp` drops or updates `rsa`, VaultLink enables RS256, a deserialization path bypasses the central check, or VaultLink begins handling RSA private keys. This statement is limited to VaultLink's current relying-party use and does not claim that the affected crate is generally safe.
 
 The exception was re-reviewed for the 0.7.0 development line on 2026-09-04. Policy validation requires the sole dependency path `vaultlink → webauthn_rp 0.3.0 → rsa 0.9.10` and binds the exception to the registration-advertisement and persisted/authentication RS256 negative tests. A changed path or missing test fails the supply-chain gate.
+
+### Reviewed WebAuthn public-integer timing advisory
+
+`RUSTSEC-2026-0387` reports timing variability in `crypto-bigint <0.7.6` when
+operations process secret integers. VaultLink's `crypto-bigint 0.5.5` is used
+only by `elliptic-curve 0.13.8`, through the P-256/P-384 ECDSA verification
+implementation of `webauthn_rp 0.3.0`. The relying party receives public keys,
+signatures, and ceremony data; it never receives authenticator private keys,
+creates ECDSA signatures, or performs ECDH with this dependency chain. Our
+assessment is that the advisory's secret-integer disclosure does not apply
+to this verification-only use. This does not establish general safety of
+the affected crate or rule out unrelated vulnerabilities.
+
+The [upstream advisory/fix](https://github.com/RustCrypto/crypto-bigint/pull/1365)
+requires `crypto-bigint >=0.7.6`. The current WebAuthn dependency requires
+`p256 0.13` / `p384 0.13` and `elliptic-curve 0.13`, whose `crypto-bigint 0.5`
+requirement cannot resolve that fix through a compatible lockfile update.
+The [WebAuthn library's cryptographic-library documentation](https://docs.rs/webauthn_rp/0.3.0/webauthn_rp/#cryptographic-libraries)
+also describes its public-data-only signature verification boundary.
+
+Reviewed on 2026-10-24: `.cargo/audit.toml`, native CI, and the independent
+frozen-candidate audit allow exactly `RUSTSEC-2023-0071` and
+`RUSTSEC-2026-0387`; warnings and all other advisories still fail. The
+supply-chain policy validates both audit entry points and pins every
+incoming dependency edge, version, registry source, and checksum from
+`crypto-bigint`, `elliptic-curve`, `ecdsa`, `primeorder`, `p256`, `p384`,
+`rsa`, and `webauthn_rp` back to VaultLink. The candidate audit applies the
+trusted checkout's dependency checks to the frozen candidate's own manifest
+and lockfile before allowing either exception; candidate code and candidate
+audit settings are never executed or trusted. Negative tests reject extra
+consumers, changed sources/versions/features, and expanded ignore lists.
+The existing RS256 rejection and regression tests remain mandatory.
+
+Re-review both exceptions for every release. Remove this exception when a
+supported WebAuthn dependency can use the fixed bigint implementation, and
+reassess it before changing any reviewed dependency or WebAuthn features,
+adding another bigint/curve consumer, or introducing signing, ECDH, or any
+other secret-integer operation on this path. The affected version remains
+in `Cargo.lock`; this is a scoped non-applicability assessment, not an
+upstream vulnerability fix.
 
 ## Reporting a vulnerability
 
