@@ -200,8 +200,11 @@ Security freshness is checked independently of the 72-hour measurements:
 
 Each invocation fetches into an empty RustSec database and records the commit,
 lockfile SHA-256, database revision, timestamps, tool version, JSON results, and
-exit status as an Actions artifact. `RUSTSEC-2023-0071` remains the sole reviewed
-exception. Scheduled audits publish the independent `vaultlink/security-audit`
+exit status as an Actions artifact. The two reviewed WebAuthn timing exceptions
+(`RUSTSEC-2023-0071` and `RUSTSEC-2026-0387`) are bounded by the dependency and
+public-key-only conditions in [SECURITY.md](../SECURITY.md). The trusted audit
+checks the frozen candidate manifest and lockfile against those paths before
+allowing the exceptions. Scheduled audits publish the independent `vaultlink/security-audit`
 status. A failure does not stop/reset the host monitor, change
 `vaultlink/72h-soak`, or delete its evidence, but the daily collector's Actions
 run can fail even when its separate longevity measurements succeeded.
