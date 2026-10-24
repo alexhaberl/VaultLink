@@ -76,6 +76,21 @@ def check_dependencies(root):
         "version": "=0.3.0", "default-features": False, "features": ["bin", "serde_relaxed"],
     }, "webauthn_rp features changed; review the verification-only exception")
 
+    # Cargo.lock does not record features. Alternate/aliased declarations in
+    # dev, build, workspace, or target tables can otherwise enable new ones
+    # without adding an incoming lockfile edge.
+    protected = {name.replace("_", "-") for name in REVIEWED}
+    contexts = [("root", manifest), ("workspace", manifest.get("workspace", {}))]
+    contexts += [(f"target {target}", tables)
+                 for target, tables in manifest.get("target", {}).items()]
+    for context, tables in contexts:
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for alias, spec in tables.get(section, {}).items():
+                package = spec.get("package", alias) if isinstance(spec, dict) else alias
+                if package.replace("_", "-") in protected:
+                    require((context, section, alias) == ("root", "dependencies", "webauthn_rp"),
+                            "alternate crypto dependency declaration changed; reassess features and secret use")
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

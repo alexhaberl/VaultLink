@@ -127,6 +127,30 @@ class ExceptionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'features changed'):
             POLICY.check_dependencies(self.root)
 
+    def test_alternate_webauthn_features_cannot_bypass_lockfile_edges(self):
+        path = self.root / 'Cargo.toml'
+        original = path.read_text(encoding="utf-8")
+        for section in ['dev-dependencies', 'build-dependencies',
+                        'target.\'cfg(unix)\'.dependencies', 'workspace.dependencies']:
+            with self.subTest(section=section):
+                entry = 'webauthn_rp = { version = "=0.3.0", features = ["custom"] }'
+                header = f'[{section}]'
+                mutated = (original.replace(header, f'{header}\n{entry}') if header in original
+                           else original + f'\n{header}\n{entry}\n')
+                path.write_text(mutated, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, 'alternate crypto dependency'):
+                    POLICY.check_dependencies(self.root)
+
+    def test_aliased_direct_crypto_dependency_is_rejected_even_before_relocking(self):
+        path = self.root / 'Cargo.toml'
+        original = path.read_text(encoding="utf-8")
+        for package in ['p256', 'crypto_bigint']:
+            with self.subTest(package=package):
+                path.write_text(original + f'\n[target.\'cfg(unix)\'.dependencies]\ncrypto = {{ package = "{package}", version = "*" }}\n',
+                                encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, 'alternate crypto dependency'):
+                    POLICY.check_dependencies(self.root)
+
 
 if __name__ == '__main__':
     unittest.main()
