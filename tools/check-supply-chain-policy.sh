@@ -646,7 +646,7 @@ if [ "$(grep -E -c '^[[:space:]]+- (debian13|ubuntu2404|ubuntu2604|fedora44|arch
     report "the VM refresh choice must enumerate the exact nine package targets"
 fi
 
-if [ "$(grep -E -c '^URIs: http://snapshot\.debian\.org/archive/debian(-security)?/[0-9]{8}T[0-9]{6}Z$' "$snapshot_sources" || true)" -ne 2 ] \
+if [ "$(grep -E -c '^URIs: https://snapshot\.debian\.org/archive/debian(-security)?/[0-9]{8}T[0-9]{6}Z$' "$snapshot_sources" || true)" -ne 2 ] \
     || grep -E -q 'deb\.debian\.org' "$snapshot_sources"; then
     report "canonical Debian smoke sources must use immutable main and security snapshots"
 fi

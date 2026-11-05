@@ -34,9 +34,15 @@ find /etc/apt/sources.list.d -mindepth 1 -maxdepth 1 \
     -exec rm -f -- {} +
 install -m 0644 "$snapshot" /etc/apt/sources.list.d/debian.sources
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
+# Snapshot backends can return transient 503/504 responses. Retry individual
+# files with bounded connection waits and without pipelining stalled requests.
+apt-get -o Acquire::Retries=5 \
+    -o Acquire::https::Timeout=30 \
+    -o Acquire::https::Pipeline-Depth=0 --error-on=any update
 grep -E -v '^[[:space:]]*(#|$)' "$lock" \
-    | xargs apt-get install -y --no-install-recommends
+    | xargs apt-get -o Acquire::Retries=5 \
+        -o Acquire::https::Timeout=30 \
+        -o Acquire::https::Pipeline-Depth=0 install -y --no-install-recommends
 
 failed=0
 while IFS='=' read -r package expected; do
