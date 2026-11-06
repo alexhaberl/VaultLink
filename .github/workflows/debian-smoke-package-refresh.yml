@@ -1,0 +1,58 @@
+name: Debian smoke package refresh
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/debian-smoke-package-refresh.yml'
+      - 'deploy/docker/debian-snapshot.sources'
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve Debian smoke lock (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resolve snapshot package closure and verify a fresh install
+        shell: bash
+        env:
+          IMAGE: rust:1.99.1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc
+        run: |
+          set -euo pipefail
+          mkdir -p probe-output
+          cat > "$RUNNER_TEMP/resolve-debian-lock.sh" <<'SCRIPT'
+          set -eu
+          export LC_ALL=C LANG=C DEBIAN_FRONTEND=noninteractive
+          manifest() {
+              dpkg-query -W -f='${db:Status-Abbrev} ${Package}=${Version}\n' | awk '$1 == "ii" { print $2 }' | sort -u
+          }
+          manifest >/tmp/before
+          rm -f /etc/apt/sources.list
+          find /etc/apt/sources.list.d -mindepth 1 -maxdepth 1 \( -name '*.list' -o -name '*.sources' \) -exec rm -f -- {} +
+          cp /work/deploy/docker/debian-snapshot.sources /etc/apt/sources.list.d/debian.sources
+          apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 -o Acquire::https::Pipeline-Depth=0 --error-on=any update
+          sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' -e 's/=.*//' /work/deploy/docker/debian-packages.lock >/tmp/requested
+          xargs apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 -o Acquire::https::Pipeline-Depth=0 install -y --no-install-recommends </tmp/requested
+          manifest >/tmp/after
+          comm -13 /tmp/before /tmp/after >/tmp/changed
+          while IFS= read -r package; do
+              dpkg-query -W -f='${Package}=${Version}\n' "$package"
+          done </tmp/requested >/tmp/direct
+          cat /tmp/direct /tmp/changed | sort -u >/out/debian-packages.lock
+          echo 'BEGIN_RESOLVED_LOCK'
+          cat /out/debian-packages.lock
+          echo 'END_RESOLVED_LOCK'
+          SCRIPT
+          docker run --rm --mount "type=bind,src=$PWD,dst=/work,readonly" --mount "type=bind,src=$PWD/probe-output,dst=/out" "$IMAGE" sh -s < "$RUNNER_TEMP/resolve-debian-lock.sh"
+          docker run --rm --mount "type=bind,src=$PWD,dst=/work,readonly" "$IMAGE" sh /work/tools/install-pinned-debian-packages.sh /work/deploy/docker/debian-snapshot.sources /work/probe-output/debian-packages.lock
