@@ -15,6 +15,12 @@ if [ ! -s "$snapshot" ] || [ ! -s "$lock" ]; then
     exit 66
 fi
 
+apt_download=$(dirname "$0")/retry-apt-download.sh
+if [ ! -s "$apt_download" ]; then
+    echo "APT download retry helper is missing" >&2
+    exit 66
+fi
+
 manifest_work=$(mktemp -d)
 trap 'rm -rf "$manifest_work"' EXIT HUP INT TERM
 installed_manifest() {
@@ -34,15 +40,16 @@ find /etc/apt/sources.list.d -mindepth 1 -maxdepth 1 \
     -exec rm -f -- {} +
 install -m 0644 "$snapshot" /etc/apt/sources.list.d/debian.sources
 export DEBIAN_FRONTEND=noninteractive
-# Snapshot backends can return transient 503/504 responses. Retry individual
-# files with bounded connection waits and without pipelining stalled requests.
-apt-get -o Acquire::Retries=5 \
-    -o Acquire::https::Timeout=30 \
-    -o Acquire::https::Pipeline-Depth=0 --error-on=any update
-grep -E -v '^[[:space:]]*(#|$)' "$lock" \
-    | xargs apt-get -o Acquire::Retries=5 \
-        -o Acquire::https::Timeout=30 \
-        -o Acquire::https::Pipeline-Depth=0 install -y --no-install-recommends
+# Use a fresh process after failures to avoid Debian #1152704's retry-loop
+# memory growth. Download first; package installation must not access the network.
+apt-get --version | head -n 1
+sh "$apt_download" update
+set --
+while IFS= read -r package; do
+    set -- "$@" "$package"
+done <"$manifest_work/locked"
+sh "$apt_download" download -y --no-install-recommends "$@"
+apt-get -o Acquire::Retries=0 --no-download install -y --no-install-recommends "$@"
 
 failed=0
 while IFS='=' read -r package expected; do
