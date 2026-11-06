@@ -215,8 +215,16 @@ jobs:
           persist-credentials: false
       - name: Verify native architecture
         run: test "$(uname -m)" = "${{ matrix.expected_uname }}"
+      - name: Verify runner diagnostic exit codes and signal forwarding
+        run: python3 tools/test-runner-diagnostics.py
       - name: Setup, API, root-helper, soak, upgrade, rollback, and signed-update smokes
-        run: make docker-smoke
+        shell: bash
+        run: |
+          if [[ '${{ matrix.architecture }}' == arm64 ]]; then
+            bash tools/run-with-runner-diagnostics.sh make docker-smoke
+          else
+            make docker-smoke
+          fi
 
   publish_native_gates:
     name: Publish exact-commit native gates
