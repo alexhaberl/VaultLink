@@ -215,6 +215,10 @@ jobs:
           persist-credentials: false
       - name: Verify native architecture
         run: test "$(uname -m)" = "${{ matrix.expected_uname }}"
+      - name: Verify pinned APT download retries
+        run: |
+          shellcheck tools/install-pinned-debian-packages.sh tools/retry-apt-download.sh
+          python3 tools/test-apt-download.py
       - name: Verify runner diagnostic exit codes and signal forwarding
         run: |
           shellcheck tools/run-with-runner-diagnostics.sh
