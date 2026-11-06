@@ -24,6 +24,8 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Resolve snapshot package closure and verify a fresh install
         shell: bash
         env:
@@ -49,10 +51,10 @@ jobs:
           while IFS= read -r package; do
               dpkg-query -W -f='${Package}=${Version}\n' "$package"
           done </tmp/requested >/tmp/direct
-          cat /tmp/direct /tmp/changed | sort -u >/out/debian-packages.lock
+          cat /tmp/direct /tmp/changed | sort -u | sort -t= -k1,1 >/out/debian-packages.lock
           echo 'BEGIN_RESOLVED_LOCK'
           cat /out/debian-packages.lock
           echo 'END_RESOLVED_LOCK'
           SCRIPT
-          docker run --rm --mount "type=bind,src=$PWD,dst=/work,readonly" --mount "type=bind,src=$PWD/probe-output,dst=/out" "$IMAGE" sh -s < "$RUNNER_TEMP/resolve-debian-lock.sh"
+          docker run --rm -i --mount "type=bind,src=$PWD,dst=/work,readonly" --mount "type=bind,src=$PWD/probe-output,dst=/out" "$IMAGE" sh -s < "$RUNNER_TEMP/resolve-debian-lock.sh"
           docker run --rm --mount "type=bind,src=$PWD,dst=/work,readonly" "$IMAGE" sh /work/tools/install-pinned-debian-packages.sh /work/deploy/docker/debian-snapshot.sources /work/probe-output/debian-packages.lock
