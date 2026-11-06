@@ -216,7 +216,9 @@ jobs:
       - name: Verify native architecture
         run: test "$(uname -m)" = "${{ matrix.expected_uname }}"
       - name: Verify runner diagnostic exit codes and signal forwarding
-        run: python3 tools/test-runner-diagnostics.py
+        run: |
+          shellcheck tools/run-with-runner-diagnostics.sh
+          python3 tools/test-runner-diagnostics.py
       - name: Setup, API, root-helper, soak, upgrade, rollback, and signed-update smokes
         shell: bash
         run: |

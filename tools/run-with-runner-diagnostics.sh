@@ -46,6 +46,8 @@ monitor_resources() {
     done
 }
 
+# Invoked indirectly by the EXIT trap; integration tests exercise cleanup.
+# shellcheck disable=SC2317
 finish() {
     local status=$? pid
     trap - EXIT
@@ -65,6 +67,8 @@ finish() {
     exit "$status"
 }
 
+# Invoked indirectly by signal traps; integration tests exercise both signals.
+# shellcheck disable=SC2317
 forward_signal() {
     local signal=$1 status=$2
     trap '' HUP INT TERM
