@@ -223,9 +223,9 @@ jobs:
         shell: bash
         run: |
           if [[ '${{ matrix.architecture }}' == arm64 ]]; then
-            bash tools/run-with-runner-diagnostics.sh make docker-smoke
+            exec bash tools/run-with-runner-diagnostics.sh make docker-smoke
           else
-            make docker-smoke
+            exec make docker-smoke
           fi
 
   publish_native_gates:
