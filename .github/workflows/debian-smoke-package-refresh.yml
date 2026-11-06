@@ -45,12 +45,11 @@ jobs:
           cp /work/deploy/docker/debian-snapshot.sources /etc/apt/sources.list.d/debian.sources
           apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 -o Acquire::https::Pipeline-Depth=0 --error-on=any update
           sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' -e 's/=.*//' /work/deploy/docker/debian-packages.lock >/tmp/requested
-          xargs apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 -o Acquire::https::Pipeline-Depth=0 install -y --no-install-recommends </tmp/requested
-          manifest >/tmp/after
-          comm -13 /tmp/before /tmp/after >/tmp/changed
-          while IFS= read -r package; do
-              dpkg-query -W -f='${Package}=${Version}\n' "$package"
-          done </tmp/requested >/tmp/direct
+          xargs apt-get --simulate --no-install-recommends install </tmp/requested >/tmp/plan
+          cat /tmp/plan
+          awk '/^Inst / { for (i = 3; i <= NF; i++) if (substr($i, 1, 1) == "(") { version = substr($i, 2); print $2 "=" version; break } }' /tmp/plan >/tmp/changed
+          cat /tmp/before /tmp/changed | awk -F= '{ version[$1] = $2 } END { for (package in version) print package "=" version[package] }' >/tmp/resolved
+          awk -F= 'NR == FNR { requested[$1] = 1; next } $1 in requested' /tmp/requested /tmp/resolved >/tmp/direct
           cat /tmp/direct /tmp/changed | sort -u | sort -t= -k1,1 >/out/debian-packages.lock
           echo 'BEGIN_RESOLVED_LOCK'
           cat /out/debian-packages.lock
