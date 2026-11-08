@@ -86,6 +86,9 @@ jobs:
           --repository "$GITHUB_REPOSITORY"
           --run-id "$SOURCE_RUN_ID"
       - name: Measure per-target production coverage
+        env:
+          # Match cargo-fuzz run's ASan defaults for direct coverage replays.
+          ASAN_OPTIONS: detect_odr_violation=0
         run: sh tools/run-fuzz-coverage.sh
       - name: Upload source coverage and logs
         if: always()
