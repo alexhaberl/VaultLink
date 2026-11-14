@@ -155,12 +155,19 @@ async fn cancelled_zip_plan_retains_permits_and_lease_until_blocking_work_finish
 async fn zip_blocking_join_error_releases_transfer_lease_and_admission_once() {
     let _serial = ZIP_ADAPTER_TEST_SERIAL.lock().await;
     for route in [ZipTestRoute::Web, ZipTestRoute::Api] {
-        zip_blocking_join_error_releases_transfer_lease_and_admission_once_for(route).await;
+        for phase in [
+            ZipBlockingTestPhase::Plan,
+            ZipBlockingTestPhase::Materialize,
+        ] {
+            zip_blocking_join_error_releases_transfer_lease_and_admission_once_for(route, phase)
+                .await;
+        }
     }
 }
 
 async fn zip_blocking_join_error_releases_transfer_lease_and_admission_once_for(
     route: ZipTestRoute,
+    phase: ZipBlockingTestPhase,
 ) {
     let root = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -188,7 +195,7 @@ async fn zip_blocking_join_error_releases_transfer_lease_and_admission_once_for(
         .unwrap();
     let hook = Arc::new(ZipBlockingTestHook {
         path: share_path.into(),
-        phase: ZipBlockingTestPhase::Plan,
+        phase,
         panic_after_release: true,
         entered: std::sync::atomic::AtomicUsize::new(0),
         released: std::sync::Mutex::new(false),

@@ -95,3 +95,52 @@ async fn admin_raw_preview_get_head_ranges_limits_and_authorization() {
         StatusCode::PAYLOAD_TOO_LARGE
     );
 }
+
+#[tokio::test]
+async fn admin_media_preview_renders_raw_links_and_rejects_traversal_on_both_routes() {
+    let root = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let state = test_state(root.path(), data.path());
+    state.db().create_admin("admin", "hash", "secret").unwrap();
+    state
+        .db()
+        .create_session("media-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .unwrap();
+    state.db().verify_mfa("media-session").unwrap();
+    std::fs::write(root.path().join("image.png"), b"image").unwrap();
+    std::fs::write(root.path().join("document.pdf"), b"%PDF-fixture").unwrap();
+    let app = router(state.clone());
+    for path in ["image.png", "document.pdf"] {
+        let mut req = request(Method::GET, &format!("/admin/preview?path={path}"), "");
+        req.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=media-session"),
+        );
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state.try_acquire_preview_render(64).is_ok(),
+            "media must not retain the text render budget"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(&format!("/admin/preview/raw?path={}", encoded(path))));
+    }
+    for route in ["/admin/preview", "/admin/preview/raw"] {
+        let mut req = request(
+            Method::GET,
+            &format!("{route}?path=%2E%2E%2Foutside.png"),
+            "",
+        );
+        req.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_static("vaultlink_session=media-session"),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+}

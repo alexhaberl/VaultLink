@@ -63,3 +63,7 @@ mod write_idle_tests;
 #[cfg(test)]
 #[path = "server/tests/scheduler.rs"]
 mod scheduler_tests;
+
+#[cfg(test)]
+#[path = "server/tests/acme_startup.rs"]
+mod acme_startup_tests;
