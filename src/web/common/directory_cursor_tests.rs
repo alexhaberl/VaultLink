@@ -119,7 +119,6 @@ mod directory_cursor_tests {
                 .unwrap();
                 let second_previous = second
                     .previous_cursor
-                    .clone()
                     .expect("second page has a previous cursor");
                 let back_to_first = list_directory_snapshot_cursor_page(
                     &snapshot,

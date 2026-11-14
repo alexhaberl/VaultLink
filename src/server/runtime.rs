@@ -221,7 +221,8 @@ async fn serve_application(
                     .cache(rustls_acme::caches::DirCache::new(cache_dir))
                     .directory_lets_encrypt(!config.tls.letsencrypt_staging)
                     .state();
-                let acceptor = acme_state.axum_acceptor(acme_state.default_rustls_config());
+                let acceptor =
+                    acme_acceptor::AcmeHttpAcceptor::new(acme_state.default_rustls_config());
                 tokio::spawn(async move {
                     while let Some(event) = acme_state.next().await {
                         match event {

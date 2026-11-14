@@ -133,7 +133,7 @@ impl UploadFragmentCleanup {
                         match cleanup_directory_from_file(&child, child_policy) {
                             Ok(mut directory) => {
                                 directory.remove_from =
-                                    Some((current.directory.try_clone()?, name.clone()));
+                                    Some((current.directory.try_clone()?, name));
                                 directory.deletion_root = if starts_deletion_root {
                                     // cleanup_directory_from_file upgrades the
                                     // O_PATH probe to a readable directory FD;

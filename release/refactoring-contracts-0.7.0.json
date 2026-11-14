@@ -134,7 +134,7 @@
         "src/setup/discovery.rs",
         "src/setup/views.rs"
       ],
-      "sha256": "693668076794de1b12635639291932caebb639b7e8bd8852eb8addab930e61c0"
+      "sha256": "1dd0c1fc59e61fd3478256f705a0b5fb4d043ca5f51586e1f17946871d1eeda1"
     },
     {
       "name": "database auth common-admins-mfa-webauthn-sessions",
@@ -191,7 +191,7 @@
         "src/secure_fs/recovery/delete.rs",
         "src/secure_fs/recovery/cleanup.rs"
       ],
-      "sha256": "13bace8ba54683200972c3fbdb2b686ce2bed34e01e3a67e120f9b912c19fefa"
+      "sha256": "b3db910a485de59b0acfa6ddded0e494b5b993be5c662a3c202b6408eb91f952"
     },
     {
       "name": "web file views-mutations-browser-download-preview-upload",

@@ -1,6 +1,8 @@
 #![cfg_attr(all(not(test), not(debug_assertions)), forbid(unsafe_code))]
 #![warn(clippy::cognitive_complexity)]
 
+#[path = "server/acme_acceptor.rs"]
+mod acme_acceptor;
 mod log_safety;
 #[cfg(test)]
 #[path = "test_support.rs"]

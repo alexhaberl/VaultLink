@@ -208,10 +208,7 @@ fn setup_browse_path_allowed(path: &Path, file_kind: Option<&str>, mode: Option<
     } else {
         &["/mnt", "/srv", "/media", "/var/lib/vaultlink"]
     };
-    if !roots.iter().any(|root| path.starts_with(root)) {
-        return false;
-    }
-    true
+    roots.iter().any(|root| path.starts_with(root))
 }
 
 fn setup_picker_file_allowed(path: &Path, file_kind: Option<&str>) -> bool {
