@@ -66,3 +66,49 @@ async fn cancelled_waiter_keeps_owner_until_detached_read_finishes() {
     .unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn descriptor_preview_checks_file_kind_and_media_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let config = crate::config::Config::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/development.toml"),
+    )
+    .unwrap();
+    let mut settings = RuntimeSettings::from_config(&config);
+    settings.max_media_preview_size = 1;
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    std::fs::write(root.path().join("docs/text.txt"), b"preview").unwrap();
+    std::fs::write(root.path().join("docs/image.png"), b"png").unwrap();
+    let secure = crate::secure_fs::SecureRoot::open(root.path()).unwrap();
+    let scope = secure.bind_directory("docs").unwrap();
+    assert!(matches!(
+        read_preview_secure_file(scope.open_file("text.txt").unwrap(), "text.txt", &settings),
+        Ok(PreviewContent::Text(text)) if text == "preview"
+    ));
+    assert!(matches!(
+        read_preview_secure_file(
+            scope.open_file("image.png").unwrap(),
+            "image.png",
+            &settings
+        ),
+        Ok(PreviewContent::TooLarge { size: 3 })
+    ));
+    settings.max_media_preview_size = 3;
+    assert!(matches!(
+        read_preview_secure_file(
+            scope.open_file("image.png").unwrap(),
+            "image.png",
+            &settings
+        ),
+        Ok(PreviewContent::Media {
+            kind: PreviewKind::Image("image/png"),
+            size: 3
+        })
+    ));
+    let directory = std::fs::File::open(root.path()).unwrap();
+    let metadata = directory.metadata().unwrap();
+    let Err(error) = read_preview_opened(directory, &metadata, "directory.txt", &settings) else {
+        panic!("a directory must not become a text preview");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}

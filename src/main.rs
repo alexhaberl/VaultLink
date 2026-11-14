@@ -1,6 +1,8 @@
 #![cfg_attr(all(not(test), not(debug_assertions)), forbid(unsafe_code))]
 #![warn(clippy::cognitive_complexity)]
 
+#[path = "server/acme_acceptor.rs"]
+mod acme_acceptor;
 mod log_safety;
 #[cfg(test)]
 #[path = "test_support.rs"]
@@ -61,3 +63,7 @@ mod write_idle_tests;
 #[cfg(test)]
 #[path = "server/tests/scheduler.rs"]
 mod scheduler_tests;
+
+#[cfg(test)]
+#[path = "server/tests/acme_startup.rs"]
+mod acme_startup_tests;

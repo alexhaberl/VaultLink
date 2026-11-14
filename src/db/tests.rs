@@ -10,6 +10,7 @@ include!("tests/audit.rs");
 include!("tests/admins_mfa.rs");
 include!("tests/schema_fixtures.rs");
 include!("tests/schema_migrations.rs");
+include!("tests/schema_validation_corruption.rs");
 include!("tests/secrets.rs");
 include!("tests/upload_reservations.rs");
 include!("tests/preview_sessions.rs");

@@ -73,6 +73,82 @@ def start_and_shutdown(config: Path, url: str, log: Path) -> None:
     print(f"runtime: readiness and orderly SIGTERM passed ({url.split(':')[0]})")
 
 
+def cli_smoke(config: Path, work: Path, original: str) -> None:
+    def command(*arguments: str, success: bool = True, cwd: Path | None = None) -> subprocess.CompletedProcess:
+        result = subprocess.run([str(BIN), *arguments], capture_output=True, input=b"", timeout=20, cwd=cwd)
+        assert (result.returncode == 0) == success, (arguments, result.stderr.decode(errors="replace"))
+        return result
+
+    version = command("--version").stdout.decode().strip()
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version)
+    command("--version", "unexpected", success=False)
+    command("health-check", "--unknown", success=False)
+    command("health-bootstrap", "unexpected", success=False)
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 8082))
+        occupied.listen()
+        result = command("health-bootstrap", success=False)
+        assert b"Address already in use" in result.stderr
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        address = f"127.0.0.1:{occupied.getsockname()[1]}"
+        result = command("container-proxy", "--listen", address, "--setup-upstream", address,
+                         "--config", str(config), success=False)
+        assert b"Address already in use" in result.stderr
+    target = command("readiness-target", cwd=work).stdout.decode().splitlines()
+    assert len(target) == 3 and target[0].endswith("/api/v2/health/ready")
+    assert target[2] == "0"
+    result = command("init-admin", "--config", str(config), success=False)
+    assert b"--username is required" in result.stderr
+    command("recover-admin", "--config", str(config), "--username", "missing-admin", "--reset-mfa", success=False)
+    command("verify-backup-database", "--database", str(work / "data/data.sqlite"))
+    assert command("revoke-all-service-tokens", "--config", str(config), "--all").stdout.strip() == b"0"
+    command("rotate-secrets", "--config", str(config))
+    command("verify-backup-database", "--database", str(work / "data/data.sqlite"))
+    if os.geteuid() != 0:
+        result = command("provision-cifs", "--source", "//fixture.invalid/share", "--username", "fixture", success=False)
+        assert b"root" in result.stderr
+    invalid_logging = work / "invalid-logging.toml"
+    invalid_logging.write_text(original.replace('level = "info,vaultlink=debug"', 'level = "["'))
+    result = command("init-admin", "--config", str(invalid_logging), success=False)
+    assert b"--username is required" in result.stderr
+    print("runtime: CLI parsing, readiness, recovery guards, token revocation and secret rotation passed")
+
+
+def setup_cancellation_smoke(work: Path) -> None:
+    for mode, successful_exit in [("setup", True), ("setup-once", False)]:
+        config = work / f"{mode}-cancelled.toml"
+        port = unused_port()
+        with (work / f"{mode}-cancelled.log").open("wb") as output:
+            process = subprocess.Popen(
+                [str(BIN), mode, "--config", str(config), "--listen", f"127.0.0.1:{port}"],
+                stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    assert process.poll() is None, f"{mode} exited before accepting setup connections"
+                    try:
+                        with socket.create_connection(("127.0.0.1", port), timeout=1):
+                            break
+                    except OSError:
+                        time.sleep(0.05)
+                else:
+                    raise AssertionError(f"{mode} did not listen")
+                process.send_signal(signal.SIGINT)
+                assert (process.wait(timeout=10) == 0) == successful_exit
+                assert not config.exists(), "cancelled setup wrote a configuration"
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+    print("runtime: cancelled setup modes exit without committing or starting a service")
+
+
 def main() -> None:
     for mode in ("update-control", "update-job"):
         result = subprocess.run([str(BIN), mode, "unexpected"], capture_output=True, timeout=10, check=False)
@@ -100,6 +176,9 @@ def main() -> None:
         start_and_shutdown(config, f"http://127.0.0.1:{port}", work / "restart.log")
         with sqlite3.connect(work / "data/data.sqlite") as database:
             assert database.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        cli_smoke(config, work, original)
+        setup_cancellation_smoke(work)
+        start_and_shutdown(config, f"http://127.0.0.1:{port}", work / "rotated.log")
         with socket.socket() as occupied:
             occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             occupied.bind(("127.0.0.1", port))

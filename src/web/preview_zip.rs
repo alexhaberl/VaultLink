@@ -150,12 +150,10 @@ fn unsatisfied_range_response(length: u64) -> Result<Response> {
         .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response.headers_mut().insert(
         header::CONTENT_RANGE,
-        HeaderValue::from_str(&format!("bytes */{length}")).map_err(|error| {
-            AppError::from(report_internal(
-                InternalOperation::WebRawPreviewUnsatisfiedRangeHeader,
-                error,
-            ))
-        })?,
+        raw_preview_header(
+            &format!("bytes */{length}"),
+            InternalOperation::WebRawPreviewUnsatisfiedRangeHeader,
+        )?,
     );
     Ok(response)
 }
@@ -175,16 +173,10 @@ fn add_raw_preview_headers(response: &mut Response, values: &RawPreviewHeaders<'
         *response.status_mut() = StatusCode::PARTIAL_CONTENT;
         response.headers_mut().insert(
             header::CONTENT_RANGE,
-            HeaderValue::from_str(&format!(
-                "bytes {}-{}/{}",
-                values.start, values.end, values.length
-            ))
-            .map_err(|error| {
-                AppError::from(report_internal(
-                    InternalOperation::WebRawPreviewContentRangeHeader,
-                    error,
-                ))
-            })?,
+            raw_preview_header(
+                &format!("bytes {}-{}/{}", values.start, values.end, values.length),
+                InternalOperation::WebRawPreviewContentRangeHeader,
+            )?,
         );
     }
     let name = Path::new(values.relative_file)
@@ -197,12 +189,10 @@ fn add_raw_preview_headers(response: &mut Response, values: &RawPreviewHeaders<'
         .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response.headers_mut().insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&values.response_length.to_string()).map_err(|error| {
-            AppError::from(report_internal(
-                InternalOperation::WebRawPreviewContentLengthHeader,
-                error,
-            ))
-        })?,
+        raw_preview_header(
+            &values.response_length.to_string(),
+            InternalOperation::WebRawPreviewContentLengthHeader,
+        )?,
     );
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -210,13 +200,9 @@ fn add_raw_preview_headers(response: &mut Response, values: &RawPreviewHeaders<'
     );
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("inline; filename*=UTF-8''{filename}")).map_err(
-            |error| {
-                AppError::from(report_internal(
-                    InternalOperation::WebRawPreviewDispositionHeader,
-                    error,
-                ))
-            },
+        raw_preview_header(
+            &format!("inline; filename*=UTF-8''{filename}"),
+            InternalOperation::WebRawPreviewDispositionHeader,
         )?,
     );
     response.headers_mut().insert(
@@ -225,3 +211,14 @@ fn add_raw_preview_headers(response: &mut Response, values: &RawPreviewHeaders<'
     );
     Ok(())
 }
+
+fn raw_preview_header(value: &str, operation: InternalOperation) -> Result<HeaderValue> {
+    match HeaderValue::from_str(value) {
+        Ok(value) => Ok(value),
+        Err(error) => Err(AppError::from(report_internal(operation, error))),
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/raw_preview_boundary.rs"]
+mod boundary_tests;

@@ -72,6 +72,14 @@ impl ShareSummaryCache {
                 return result;
             }
             if flight.changed().await.is_err() {
+                let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+                if state
+                    .flight
+                    .as_ref()
+                    .is_some_and(|pending| pending.same_channel(&flight))
+                {
+                    state.flight = None;
+                }
                 return Err(Arc::new(DatabaseExecutionError::Operation(
                     rusqlite::Error::InvalidQuery,
                 )));
@@ -84,6 +92,10 @@ impl ShareSummaryCache {
         self.0.lock().unwrap().refreshes
     }
 }
+
+#[cfg(test)]
+#[path = "share_summary_cache_failure_tests.rs"]
+mod failure_tests;
 
 #[cfg(test)]
 mod tests {
