@@ -36,6 +36,20 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@16f94ba7aae399b9f9077c254b6719ec6de7e3e3 # v3.24.2
         with:
           kvm: ${{ matrix.architecture == 'amd64' }}
+      - name: Restore Nix store; save only successful main builds
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ matrix.system }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-prefixes-first-match: |
+            nix-v1-${{ runner.os }}-${{ matrix.system }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml') }}-
+            nix-v1-${{ runner.os }}-${{ matrix.system }}-
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          gc-max-store-size-linux: 4G
+      - name: Verify source identities and fresh VM-test preparation
+        if: matrix.architecture == 'amd64'
+        run: |
+          python3 tools/test-nix-source.py
+          python3 tools/test-nix-qualification.py
       - name: Build twice and boot local and SMB NixOS guests
         id: qualification
         shell: bash
@@ -61,11 +75,17 @@ jobs:
           available_kib=$(df -Pk / | awk 'NR==2 {print $4}')
           test "$available_kib" -ge 4194304
           nix flake check --no-build --all-systems --no-write-lock-file
+          # Dependency closures can be reused, but every VM test must execute.
+          sh tools/prepare-nix-vm-tests.sh "$NIX_SYSTEM"
           printf 'system=%s\ncommit=%s\nacceleration=%s\nfree_kib=%s\n' \
             "$NIX_SYSTEM" "$GITHUB_SHA" "$acceleration" "$available_kib" >"evidence/$ARCHITECTURE.txt"
           for attempt in 1 2; do
             rebuild=()
-            if [[ "$attempt" == 2 ]]; then rebuild=(--rebuild); fi
+            # A cache hit must not turn either of the two builds into a lookup.
+            if [[ "$attempt" == 2 ]] \
+              || nix path-info ".#packages.$NIX_SYSTEM.vaultlink" --no-write-lock-file >/dev/null 2>&1; then
+              rebuild=(--rebuild)
+            fi
             output=$(nix build ".#packages.$NIX_SYSTEM.vaultlink" \
               "${rebuild[@]}" --no-link --print-out-paths --no-write-lock-file)
             test -x "$output/bin/vaultlink"

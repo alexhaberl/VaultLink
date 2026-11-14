@@ -1,5 +1,5 @@
 { lib, makeRustPlatform, rust-bin
-, source ? lib.cleanSource ../.
+, source ? import ./source.nix { inherit lib; root = ../.; }
 , packageVersion ? (builtins.fromTOML (builtins.readFile ../Cargo.toml)).package.version
 , cargoLockFile ? ../Cargo.lock
 }:
