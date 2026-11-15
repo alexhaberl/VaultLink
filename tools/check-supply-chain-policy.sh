@@ -402,6 +402,8 @@ if [ ! -f clippy.toml ] \
     || ! grep -F -q 'python3 tools/test-release-state.py' .github/workflows/ci.yml \
     || ! grep -F -q 'python3 tools/test-performance-evidence.py' .github/workflows/ci.yml \
     || ! grep -F -q 'python3 tools/test-release-evidence.py' .github/workflows/ci.yml \
+    || ! grep -F -q 'python3 tools/test-docker-qualification.py' .github/workflows/ci.yml \
+    || ! grep -F -q 'python3 tools/test-docker-status-gates.py' .github/workflows/ci.yml \
     || ! grep -F -q 'python3 tools/test-refactoring-contracts.py' .github/workflows/ci.yml \
     || ! grep -F -q 'python3 tools/check-refactoring-contracts.py --root .' .github/workflows/ci.yml \
     || ! grep -F -q '$(MAKE) architecture-check performance-evidence-check refactoring-contracts-check' Makefile; then
@@ -1344,7 +1346,9 @@ for architecture in amd64 arm64; do
         report "candidate, soak, tag, and NixOS producer must share exact-commit gate $context"
     fi
     context="vaultlink/docker-$architecture"
-    if ! grep -F -q 'context="vaultlink/docker-$architecture"' .github/workflows/docker-runtime.yml \
+    if ! grep -F -q 'python3 tools/publish-docker-gates.py' .github/workflows/docker-runtime.yml \
+        || ! grep -F -q -- '--output evidence/docker-status.json --publish' .github/workflows/docker-runtime.yml \
+        || ! grep -F -q 'f"context=vaultlink/docker-{architecture}"' tools/publish-docker-gates.py \
         || ! grep -F -q "$context" .github/workflows/release.yml \
         || ! grep -F -q "$context" .github/workflows/soak-start.yml; then
         report "candidate, soak, tag, and Docker producer must share exact-commit gate $context"
@@ -1385,6 +1389,7 @@ if ! grep -F -q 'VAULTLINK_TEST_EXPECT_ROOTLESS=1' tools/docker-rootless-smoke.s
     report 'rootless Docker gate must verify the daemon, not only the container UID'
 fi
 for workflow in \
+    .github/workflows/docker-runtime.yml \
     .github/workflows/packages.yml \
     .github/workflows/reproducibility.yml \
     .github/workflows/distro-vms.yml; do

@@ -186,35 +186,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        continue-on-error: true
-        with:
-          pattern: docker-qualification-*-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: evidence
       - name: Publish independent architecture results
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for architecture in amd64 arm64; do
-            state=failure
-            receipt="evidence/docker-qualification-$architecture-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/qualification.json"
-            if [[ '${{ needs.qualify.result }}' == success && -f "$receipt" ]] && jq -e \
-              --arg arch "$architecture" --arg sha "$GITHUB_SHA" \
-              --arg repo "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" \
-              --argjson attempt "$GITHUB_RUN_ATTEMPT" \
-              --arg version "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" \
-              '.schema_version == 1 and .architecture == $arch and .commit == $sha and
-               .repository == $repo and .run_id == $run and .run_attempt == $attempt and
-               .version == $version and .workflow == ".github/workflows/docker-runtime.yml" and
-               (.event == "push" or .event == "workflow_dispatch") and
-               (.binary_sha256 | test("^[0-9a-f]{64}$"))' "$receipt" >/dev/null; then
-              state=success
-            fi
-            gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-              -f state="$state" \
-              -f context="vaultlink/docker-$architecture" \
-              -f description="Native image, rootless Docker and Kubernetes deployment: $state" \
-              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          done
+          python3 tools/publish-docker-gates.py \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --commit "$GITHUB_SHA" \
+            --version "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)" \
+            --output evidence/docker-status.json --publish

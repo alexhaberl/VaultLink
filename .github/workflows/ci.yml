@@ -71,6 +71,8 @@ jobs:
           python3 tools/test-load-diagnostics.py
           python3 tools/test-load-metadata.py
           python3 tools/test-docker-release-proof.py
+          python3 tools/test-docker-qualification.py
+          python3 tools/test-docker-status-gates.py
           python3 tools/test-docker-publish-index.py
           python3 tools/test-docker-apt-trust.py
           python3 tools/test-refactoring-contracts.py
