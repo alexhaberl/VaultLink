@@ -66,6 +66,8 @@ architecture-check:
 performance-evidence-check:
 	$(PYTHON) tools/test-performance-evidence.py
 	$(PYTHON) tools/test-release-evidence.py
+	$(PYTHON) tools/test-docker-qualification.py
+	$(PYTHON) tools/test-docker-status-gates.py
 
 refactoring-contracts-check:
 	$(PYTHON) tools/test-refactoring-contracts.py

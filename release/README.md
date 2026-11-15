@@ -73,7 +73,13 @@ The status contexts are only selectors. `tools/release-evidence.py docker`
 downloads digest-checked, attempt-bound qualification receipts for both
 architectures from the same successful run and verifies their commit, workflow,
 event, repository, version and binary SHA-256. Both release and soak preflights
-use that verifier. The publication workflow uses the same pinned BuildKit
+use that verifier. After a partial workflow retry, an architecture's receipt
+must match its latest effective native job's execution window and successful
+test/upload steps. The receipt retains its actual producer attempt, which may
+precede a publisher-only retry. A newer failed, cancelled or skipped native job
+cannot reuse an older success. The status publisher evaluates both architectures
+independently and fails the job if either cannot be verified or published.
+The publication workflow uses the same pinned BuildKit
 engine, hashes each newly pushed child image by digest before creating the
 version tag, and hashes each anonymous public pull again. Its final proof joins
 the qualification artifact digests, binary hashes, child digests and index

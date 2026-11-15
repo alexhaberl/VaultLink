@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import importlib.util
 import io
@@ -69,6 +69,18 @@ def positive(value: object, label: str) -> int:
     return value
 
 
+def evidence_time(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise EvidenceError("evidence timestamp must be a string")
+    try:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise EvidenceError("invalid evidence timestamp") from error
+    if result.tzinfo is None:
+        raise EvidenceError("evidence timestamp must include a timezone")
+    return result
+
+
 class GitHub:
     def __init__(self, repository: str):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
@@ -86,7 +98,11 @@ class GitHub:
         for page in range(1, 101):
             separator = "&" if "?" in suffix else "?"
             result = self.request(f"{suffix}{separator}per_page=100&page={page}")
+            if field and (not isinstance(result, dict) or field not in result):
+                raise EvidenceError("GitHub evidence page has invalid metadata")
             items = result[field] if field else result
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                raise EvidenceError("GitHub evidence page must contain objects")
             yield from items
             if len(items) < 100:
                 return
@@ -96,7 +112,10 @@ class GitHub:
             title: str | None = None) -> dict:
         positive(run_id, "run ID")
         run = self.request(f"actions/runs/{run_id}")
-        if (run.get("head_sha") != commit or run.get("head_branch") != "main"
+        if (not isinstance(run, dict) or not isinstance(run.get("path"), str)
+                or not isinstance(run.get("repository"), dict)
+                or not isinstance(run.get("head_repository"), dict)
+                or run.get("head_sha") != commit or run.get("head_branch") != "main"
                 or run.get("status") != "completed" or run.get("conclusion") != "success"
                 or run.get("path", "").split("@")[0] != workflow
                 or run.get("repository", {}).get("full_name") != self.repository
@@ -119,23 +138,28 @@ class GitHub:
             raise EvidenceError("gate does not identify a run in this repository")
         return self.run(int(url[len(prefix):]), commit, workflow, event, title)
 
-    def artifact(self, run: dict, name: str, destination: Path) -> dict:
+    def artifact(self, run: dict, name: str, destination: Path, *,
+                 not_before: datetime | None = None, not_after: datetime | None = None) -> dict:
         artifacts = [item for item in self.pages(f"actions/runs/{run['id']}/artifacts", "artifacts")
                      if item.get("name") == name]
         if len(artifacts) != 1:
             raise EvidenceError("expected exactly one named evidence artifact")
         artifact = artifacts[0]
         digest = artifact.get("digest", "")
-        if artifact.get("expired") is not False or not digest.startswith("sha256:"):
+        if (artifact.get("expired") is not False or not isinstance(digest, str)
+                or not digest.startswith("sha256:")):
             raise EvidenceError("evidence artifact is expired or has no immutable digest")
         PERF._sha256(digest.removeprefix("sha256:"), "artifact digest")
-        if (artifact.get("workflow_run", {}).get("id") != run["id"]
+        if (not isinstance(artifact.get("workflow_run"), dict)
+                or artifact.get("workflow_run", {}).get("id") != run["id"]
                 or artifact.get("workflow_run", {}).get("head_sha") != run["head_sha"]):
             raise EvidenceError("artifact belongs to a different workflow run")
         try:
-            created = datetime.fromisoformat(artifact["created_at"].replace("Z", "+00:00"))
-            started = datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
-            if created.tzinfo is None or started.tzinfo is None or created < started:
+            created = evidence_time(artifact["created_at"])
+            started = evidence_time(run["run_started_at"])
+            earliest = not_before if not_before is not None else started
+            if (created.tzinfo is None or started.tzinfo is None or created < earliest
+                    or (not_after is not None and created >= not_after)):
                 raise EvidenceError("artifact predates the current workflow attempt")
         except (KeyError, TypeError, ValueError) as error:
             raise EvidenceError("artifact does not identify the current workflow attempt") from error
@@ -149,11 +173,105 @@ class GitHub:
                 "artifact_sha256": digest.removeprefix("sha256:")}
 
 
-def docker_qualification(api: GitHub, commit: str, version: str, destination: Path) -> dict:
-    """Bind both qualified binaries to one completed main run and attempt."""
+def docker_run_identity(api: GitHub, run: dict, commit: str) -> None:
+    """Validate Docker producer identity without requiring its publisher to have finished."""
     PERF._commit(commit, "Docker candidate commit")
+    if not isinstance(run, dict):
+        raise EvidenceError("Docker run metadata must be an object")
+    positive(run.get("id"), "Docker run ID")
+    positive(run.get("run_attempt"), "Docker run attempt")
+    if (not isinstance(run.get("path"), str)
+            or not isinstance(run.get("repository"), dict)
+            or not isinstance(run.get("head_repository"), dict)
+            or run.get("head_sha") != commit or run.get("head_branch") != "main"
+            or run.get("path", "").split("@")[0] != DOCKER_WORKFLOW
+            or run.get("repository", {}).get("full_name") != api.repository
+            or run.get("head_repository", {}).get("full_name") != api.repository
+            or run.get("event") not in ("push", "workflow_dispatch")):
+        raise EvidenceError("Docker run does not match the trusted producer identity")
+
+
+def docker_architecture_qualification(api: GitHub, run: dict, commit: str, version: str,
+                                     architecture: str, destination: Path) -> dict:
+    """Resolve the receipt of the latest effective native job, including partial retries."""
+    docker_run_identity(api, run, commit)
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise EvidenceError("invalid Docker candidate version")
+    if architecture not in ("amd64", "arm64"):
+        raise EvidenceError("invalid Docker architecture")
+    jobs = [job for job in api.pages(f"actions/runs/{run['id']}/jobs?filter=latest", "jobs")
+            if job.get("name") == f"Docker runtime ({architecture})"]
+    if len(jobs) != 1:
+        raise EvidenceError("expected one effective native Docker job")
+    job = jobs[0]
+    if job.get("run_id") != run["id"] or job.get("head_sha") != commit:
+        raise EvidenceError("native Docker job belongs to a different run or commit")
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        raise EvidenceError("latest native Docker job did not succeed")
+    if (not isinstance(job.get("steps"), list)
+            or any(not isinstance(step, dict) for step in job["steps"])):
+        raise EvidenceError("native Docker steps have invalid metadata")
+    for name in ("Build and test the native production image", "Preserve successful qualification receipt"):
+        steps = [step for step in job.get("steps", []) if step.get("name") == name]
+        if (len(steps) != 1 or steps[0].get("status") != "completed"
+                or steps[0].get("conclusion") != "success"):
+            raise EvidenceError("native Docker tests or receipt upload did not succeed")
+    try:
+        started = evidence_time(job["started_at"])
+        finished = evidence_time(job["completed_at"])
+        if started.tzinfo is None or finished.tzinfo is None or finished < started:
+            raise ValueError("invalid job interval")
+    except (KeyError, TypeError, ValueError) as error:
+        raise EvidenceError("native Docker job lacks a valid execution interval") from error
+    # The API can label inherited jobs with the publisher's new run_attempt.
+    # Their original execution times remain unchanged. Bind the immutable
+    # artifact to that execution instead of accepting any older success.
+    pattern = re.compile(rf"docker-qualification-{architecture}-{commit}-{run['id']}-([1-9][0-9]*)")
+    candidates = []
+    for item in api.pages(f"actions/runs/{run['id']}/artifacts", "artifacts"):
+        match = pattern.fullmatch(item.get("name", ""))
+        if not match or int(match[1]) > run["run_attempt"]:
+            continue
+        try:
+            created = evidence_time(item["created_at"])
+            # Job timestamps have second precision; artifact timestamps also
+            # include fractions of a second.
+            if created.tzinfo is not None and started <= created < finished + timedelta(seconds=1):
+                candidates.append((item, int(match[1])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(candidates) != 1:
+        raise EvidenceError("expected one receipt from the effective native job execution")
+    candidate, producer_attempt = candidates[0]
+    originals = [entry for entry in api.pages(
+        f"actions/runs/{run['id']}/attempts/{producer_attempt}/jobs", "jobs")
+        if entry.get("name") == job["name"]]
+    execution_fields = ("run_id", "head_sha", "status", "conclusion", "started_at", "completed_at")
+    if (len(originals) != 1
+            or any(originals[0].get(key) != job.get(key) for key in execution_fields)):
+        raise EvidenceError("Docker receipt producer is not the effective native execution")
+    producer = {**run, "run_attempt": producer_attempt}
+    artifact = api.artifact(producer, candidate["name"], destination,
+                            not_before=started, not_after=finished + timedelta(seconds=1))
+    if (artifact["artifact_id"] != candidate["id"]
+            or artifact["artifact_sha256"] != candidate["digest"].removeprefix("sha256:")):
+        raise EvidenceError("Docker receipt changed during verification")
+    document, _ = PERF._read_json(destination / "qualification.json")
+    expected = {"schema_version": 1, "repository": api.repository,
+                "commit": commit, "version": version, "workflow": DOCKER_WORKFLOW,
+                "event": run["event"], "architecture": architecture,
+                "run_id": run["id"], "run_attempt": producer_attempt}
+    if (not isinstance(document, dict) or set(document) != set(expected) | {"binary_sha256"}
+            or any(document[key] != value or type(document[key]) is not type(value)
+                   for key, value in expected.items())):
+        raise EvidenceError("Docker qualification receipt has wrong identity or schema")
+    PERF._sha256(document["binary_sha256"], "qualified Docker binary")
+    return {"binary_sha256": document["binary_sha256"], **artifact}
+
+
+def docker_qualification(api: GitHub, commit: str, version: str, destination: Path) -> dict:
+    """Bind both latest effective native jobs to one completed main workflow run."""
+    PERF._commit(commit, "Docker candidate commit")
     runs = [api.gate(commit, f"vaultlink/docker-{arch}", DOCKER_WORKFLOW)
             for arch in ("amd64", "arm64")]
     if (runs[0]["id"] != runs[1]["id"]
@@ -166,23 +284,8 @@ def docker_qualification(api: GitHub, commit: str, version: str, destination: Pa
               "commit": commit, "version": version, "workflow": DOCKER_WORKFLOW,
               "run_id": run["id"], "run_attempt": run["run_attempt"], "architectures": {}}
     for architecture in ("amd64", "arm64"):
-        name = (f"docker-qualification-{architecture}-{commit}-"
-                f"{run['id']}-{run['run_attempt']}")
-        target = destination / architecture
-        artifact = api.artifact(run, name, target)
-        path = target / "qualification.json"
-        document, _ = PERF._read_json(path)
-        expected = {"schema_version": 1, "repository": api.repository,
-                    "commit": commit, "version": version, "workflow": DOCKER_WORKFLOW,
-                    "event": run["event"], "architecture": architecture,
-                    "run_id": run["id"], "run_attempt": run["run_attempt"]}
-        if not isinstance(document, dict) or set(document) != set(expected) | {"binary_sha256"} or any(
-                document[key] != value or type(document[key]) is not type(value)
-                for key, value in expected.items()):
-            raise EvidenceError("Docker qualification receipt has wrong identity or schema")
-        PERF._sha256(document["binary_sha256"], "qualified Docker binary")
-        result["architectures"][architecture] = {
-            "binary_sha256": document["binary_sha256"], **artifact}
+        result["architectures"][architecture] = docker_architecture_qualification(
+            api, run, commit, version, architecture, destination / architecture)
     return result
 
 

@@ -88,7 +88,15 @@ class FakeDockerGitHub(FakeGitHub):
                          for arch in ("amd64", "arm64")]
         self.archives = {}
         self.artifacts = []
+        self.jobs = []
         for number, arch in enumerate(("amd64", "arm64"), start=900):
+            self.jobs.append({"name": f"Docker runtime ({arch})", "run_id": 789,
+                              "head_sha": COMMIT, "status": "completed", "conclusion": "success",
+                              "started_at": "2026-09-05T12:00:00Z",
+                              "completed_at": "2026-09-05T12:02:00Z",
+                              "steps": [{"name": name, "status": "completed", "conclusion": "success"}
+                                        for name in ("Build and test the native production image",
+                                                     "Preserve successful qualification receipt")]})
             receipt = {"schema_version": 1, "repository": REPO, "commit": COMMIT,
                        "version": "0.7.2", "workflow": EVIDENCE.DOCKER_WORKFLOW,
                        "event": "push", "architecture": arch, "run_id": 789,
@@ -103,12 +111,25 @@ class FakeDockerGitHub(FakeGitHub):
                                    "workflow_run": {"id": 789, "head_sha": COMMIT}})
 
     def request(self, suffix, *, raw=False):
+        if (suffix.startswith("actions/runs/789/jobs?")
+                or suffix.startswith("actions/runs/789/attempts/2/jobs?")):
+            return {"jobs": copy.deepcopy(self.jobs)}
         if raw and suffix.startswith("actions/artifacts/") and suffix.endswith("/zip"):
             return self.archives[int(suffix.split("/")[2])]
         return super().request(suffix, raw=raw)
 
 
 class ReleaseEvidenceTests(unittest.TestCase):
+    def test_docker_consumer_retains_actual_producer_after_publisher_retry(self):
+        api = FakeDockerGitHub()
+        # Only the publisher ran again; the successful native executions and
+        # their immutable receipts still belong to attempt 2.
+        api.run_data.update(run_attempt=3, run_started_at="2026-09-05T12:10:00Z")
+        with tempfile.TemporaryDirectory() as tmp:
+            result = EVIDENCE.docker_qualification(api, COMMIT, "0.7.2", Path(tmp))
+        self.assertEqual(result["run_attempt"], 3)
+        self.assertTrue(all(entry["run_attempt"] == 2 for entry in result["architectures"].values()))
+
     def test_docker_qualification_binds_both_architectures_and_attempt(self):
         api = FakeDockerGitHub()
         def verify():
@@ -118,7 +139,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.assertEqual(set(proof["architectures"]), {"amd64", "arm64"})
         self.assertEqual(proof["run_attempt"], 2)
         for field, bad in (("head_sha", "a" * 40), ("event", "pull_request"),
-                           ("run_attempt", 3), ("conclusion", "failure")):
+                           ("run_attempt", 1), ("conclusion", "failure")):
             with self.subTest(field=field), patch.dict(api.run_data, {field: bad}):
                 self.assertRaises(EVIDENCE.EvidenceError, verify)
         api.statuses.insert(0, {**api.statuses[0], "state": "failure"})
