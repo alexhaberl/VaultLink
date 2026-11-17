@@ -264,9 +264,12 @@ async fn service_token_api_enforces_expiration_boundaries() {
     let (session_cookie, csrf) = api_login(&state, &secret).await;
     let app = crate::web::router(state.clone());
 
-    for (index, expires_at) in [OffsetDateTime::now_utc() - Duration::seconds(1), OffsetDateTime::now_utc()]
-        .into_iter()
-        .enumerate()
+    for (index, expires_at) in [
+        OffsetDateTime::now_utc() - Duration::seconds(1),
+        OffsetDateTime::now_utc(),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let body = serde_json::json!({
             "name": format!("Rejected expiry {index}"),
