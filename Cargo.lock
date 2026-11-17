@@ -474,10 +474,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
- "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2182,7 +2179,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
- "chrono",
  "fallible-iterator",
  "fallible-streaming-iterator",
  "hashlink",
@@ -3001,7 +2997,6 @@ dependencies = [
  "base64",
  "bytes",
  "chacha20poly1305",
- "chrono",
  "crc32fast",
  "data-encoding",
  "futures-util",
@@ -3031,6 +3026,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror",
+ "time",
  "tokio",
  "tokio-util",
  "toml",

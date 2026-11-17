@@ -39,9 +39,6 @@ use audit::enforce_audit_retention;
 #[cfg(test)]
 use transfers::current_utc_month;
 
-#[cfg(test)]
-use chrono::Duration;
-use chrono::{DateTime, Utc};
 use r2d2_sqlite::SqliteConnectionManager;
 #[cfg(test)]
 use rusqlite::{params, TransactionBehavior};
@@ -61,6 +58,9 @@ use std::{
         Arc, Mutex, MutexGuard,
     },
 };
+#[cfg(test)]
+use time::Duration;
+use time::OffsetDateTime;
 
 include!("db/audit_model.rs");
 include!("db/model.rs");

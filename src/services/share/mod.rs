@@ -1,5 +1,7 @@
 use std::borrow::Borrow;
 
+use time::OffsetDateTime;
+
 use crate::{
     config::MAX_UPLOAD_SIZE,
     db::{
@@ -13,9 +15,9 @@ use crate::{
     sensitive::SecretString,
     services::error::{IntoServiceError, ServiceError, ServiceFailure, ServiceInvariant},
     storage_authority::StorageMutationGuard,
+    timestamp::TimestampExt,
     AppState,
 };
-use chrono::{DateTime, Utc};
 
 include!("authority.rs");
 
@@ -56,7 +58,7 @@ pub(crate) struct CreateShareCommand {
     pub(crate) target: ShareTarget,
     pub(crate) permission: Permission,
     pub(crate) alias: Option<String>,
-    pub(crate) expires_at: Option<DateTime<Utc>>,
+    pub(crate) expires_at: Option<OffsetDateTime>,
     pub(crate) max_downloads: Option<u64>,
     pub(crate) max_upload_size: Option<u64>,
     pub(crate) max_upload_total_size: Option<u64>,
@@ -74,7 +76,7 @@ pub(crate) struct PreparedCreateShare {
     is_directory: bool,
     permission: Permission,
     alias: Option<String>,
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<OffsetDateTime>,
     max_downloads: Option<u64>,
     max_upload_size: Option<u64>,
     max_upload_total_size: Option<u64>,
@@ -171,13 +173,13 @@ impl ShareService {
         &self,
         command: CreateShareCommand,
     ) -> Result<ValidatedCreateShare, ShareServiceError> {
-        self.prepare_create_at(command, Utc::now())
+        self.prepare_create_at(command, OffsetDateTime::now_utc())
     }
 
     fn prepare_create_at(
         &self,
         command: CreateShareCommand,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<ValidatedCreateShare, ShareServiceError> {
         let path = self.normalize_target_path(&command.path)?;
         let alias = command.alias.filter(|alias| !alias.trim().is_empty());
@@ -286,8 +288,7 @@ impl ShareService {
             alias.as_deref().unwrap_or(""),
             command
                 .expires_at
-                .as_ref()
-                .map(DateTime::to_rfc3339)
+                .map(OffsetDateTime::to_rfc3339)
                 .unwrap_or_default(),
             optional_number(command.max_downloads),
             optional_number(command.max_upload_size),
@@ -482,7 +483,7 @@ fn optional_number(value: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use time::Duration;
 
     fn settings() -> RuntimeSettings {
         RuntimeSettings {
@@ -518,7 +519,7 @@ mod tests {
             target: ShareTarget::Directory,
             permission: Permission::DownloadUpload,
             alias: Some("documents-2026".into()),
-            expires_at: Some(Utc::now() + Duration::hours(1)),
+            expires_at: Some(OffsetDateTime::now_utc() + Duration::hours(1)),
             max_downloads: Some(10),
             max_upload_size: Some(1_000),
             max_upload_total_size: Some(10_000),
@@ -532,7 +533,7 @@ mod tests {
     #[test]
     fn validates_and_normalizes_path_alias_and_expiration() {
         let service = service(false);
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let mut valid = command();
         valid.path = "documents/./reports".into();
         valid.alias = Some("   ".into());

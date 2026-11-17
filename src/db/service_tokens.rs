@@ -6,9 +6,10 @@ use super::{
     ServiceTokenAuthorizationOutcome, ServiceTokenCreationOutcome, SessionBound,
     TransferMonthlyCounts, MAX_SERVICE_TOKENS,
 };
+use crate::timestamp::{month_key, parse_rfc3339, TimestampExt};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use time::{Duration, OffsetDateTime};
 
 pub(crate) const SERVICE_TOKEN_PREFIX: &str = "vlk_st_v1_";
 pub(crate) const SERVICE_TOKEN_RANDOM_BYTES: usize = 32;
@@ -39,18 +40,16 @@ fn map_service_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceToken> 
 fn parse_optional_timestamp(
     value: Option<String>,
     column: usize,
-) -> rusqlite::Result<Option<DateTime<Utc>>> {
+) -> rusqlite::Result<Option<OffsetDateTime>> {
     value
         .map(|timestamp| {
-            DateTime::parse_from_rfc3339(&timestamp)
-                .map(|parsed| parsed.with_timezone(&Utc))
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        column,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })
+            parse_rfc3339(&timestamp).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
         })
         .transpose()
 }

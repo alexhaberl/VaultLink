@@ -62,7 +62,7 @@ fn mfa_proof(state: &AppState) -> MfaSessionProof {
             TOKEN,
             admin_id,
             "csrf",
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         )
         .unwrap();
     assert!(state.db().verify_mfa(TOKEN).unwrap());

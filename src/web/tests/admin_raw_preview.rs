@@ -6,7 +6,12 @@ async fn admin_raw_preview_get_head_ranges_limits_and_authorization() {
     state.db().create_admin("admin", "hash", "secret").unwrap();
     state
         .db()
-        .create_session("raw-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "raw-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     state.db().verify_mfa("raw-session").unwrap();
     std::fs::write(root.path().join("image.png"), b"raw-preview!").unwrap();
@@ -104,7 +109,12 @@ async fn admin_media_preview_renders_raw_links_and_rejects_traversal_on_both_rou
     state.db().create_admin("admin", "hash", "secret").unwrap();
     state
         .db()
-        .create_session("media-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "media-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     state.db().verify_mfa("media-session").unwrap();
     std::fs::write(root.path().join("image.png"), b"image").unwrap();

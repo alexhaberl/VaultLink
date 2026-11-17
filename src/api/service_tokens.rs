@@ -4,8 +4,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::{
     auth,
@@ -17,6 +17,7 @@ use crate::{
     },
     internal_reporting::{report_internal, InternalOperation},
     sensitive::SecretString,
+    timestamp::{deserialize_optional, parse_rfc3339},
     ServiceTokenRouteState,
 };
 
@@ -37,11 +38,11 @@ struct ServiceTokenResponse {
 }
 
 impl ServiceTokenResponse {
-    fn from_database(token: ServiceToken, now: DateTime<Utc>) -> ApiResult<Self> {
+    fn from_database(token: ServiceToken, now: OffsetDateTime) -> ApiResult<Self> {
         let expired = token
             .expires_at
             .as_deref()
-            .map(DateTime::parse_from_rfc3339)
+            .map(parse_rfc3339)
             .transpose()
             .map_err(|error| {
                 ApiError::from(report_internal(
@@ -77,7 +78,7 @@ pub(super) async fn list_service_tokens(
         database.list_service_tokens()
     })
     .await?;
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let service_tokens = tokens
         .into_iter()
         .map(|token| ServiceTokenResponse::from_database(token, now))
@@ -88,7 +89,8 @@ pub(super) async fn list_service_tokens(
 #[derive(Deserialize)]
 pub(super) struct CreateServiceTokenRequest {
     name: String,
-    expires_at: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "deserialize_optional")]
+    expires_at: Option<OffsetDateTime>,
     current_password: SecretString,
 }
 
@@ -113,7 +115,7 @@ pub(super) async fn create_service_token(
         current_password,
     } = request;
     if !valid_service_token_name(&name)
-        || expires_at.is_some_and(|expires_at| expires_at <= Utc::now())
+        || expires_at.is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
     {
         return Err(ApiError::bad_request("Invalid service token settings"));
     }
@@ -191,7 +193,7 @@ pub(super) async fn create_service_token(
     };
 
     let response = CreatedServiceTokenResponse {
-        metadata: ServiceTokenResponse::from_database(created, Utc::now())?,
+        metadata: ServiceTokenResponse::from_database(created, OffsetDateTime::now_utc())?,
         token: response_token.into_one_time_response(),
     };
     let mut response = (StatusCode::CREATED, Json(response)).into_response();

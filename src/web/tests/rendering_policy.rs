@@ -148,12 +148,20 @@ fn inactive_and_expired_shares_are_unusable() {
         active,
         password_hash: None,
         upload_conflict_strategy: UploadConflictStrategy::Reject,
-        created_at: Utc::now().to_rfc3339(),
+        created_at: OffsetDateTime::now_utc().to_rfc3339(),
         upload_policy_epoch: 0,
     };
     assert!(usable(&share(false, None)).is_err());
-    assert!(usable(&share(true, Some(Utc::now() - Duration::seconds(1)))).is_err());
-    assert!(usable(&share(true, Some(Utc::now() + Duration::hours(1)))).is_ok());
+    assert!(usable(&share(
+        true,
+        Some(OffsetDateTime::now_utc() - Duration::seconds(1))
+    ))
+    .is_err());
+    assert!(usable(&share(
+        true,
+        Some(OffsetDateTime::now_utc() + Duration::hours(1))
+    ))
+    .is_ok());
 }
 
 #[test]
@@ -180,20 +188,20 @@ fn upload_policy_helpers() {
         parse_unit_to_bytes("1.5", GB, "bad").unwrap(),
         1_500_000_000
     );
-    assert_eq!(
-        parse_expiry(Some("2026-07-07T20:32"), Some("-120"))
-            .unwrap()
-            .unwrap()
-            .to_rfc3339(),
-        "2026-07-07T18:32:00+00:00"
-    );
-    assert_eq!(
-        parse_expiry(Some("07.07.2026 20:32"), Some("-120"))
-            .unwrap()
-            .unwrap()
-            .to_rfc3339(),
-        "2026-07-07T18:32:00+00:00"
-    );
+    for (input, expected) in [
+        ("2026-07-07T20:32", "2026-07-07T18:32:00+00:00"),
+        ("2026-07-07T20:32:47", "2026-07-07T18:32:47+00:00"),
+        ("2026-07-07 20:32", "2026-07-07T18:32:00+00:00"),
+        ("7.7.2026 20:32", "2026-07-07T18:32:00+00:00"),
+    ] {
+        assert_eq!(
+            parse_expiry(Some(input), Some("-120"))
+                .unwrap()
+                .unwrap()
+                .to_rfc3339(),
+            expected
+        );
+    }
     assert!(parse_expiry(Some("2026-07-07T20:32"), Some("invalid")).is_err());
     assert!(parse_expiry(Some("2026-07-07T20:32"), Some("1441")).is_err());
 }
@@ -496,7 +504,7 @@ async fn audit_table_sorts_columns_and_keeps_time_descending_by_default() {
             "audit-session",
             1,
             "audit-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("audit-session").unwrap();
@@ -588,7 +596,7 @@ async fn english_locale_covers_main_routes_without_touching_user_values() {
             "locale-session",
             1,
             "locale-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("locale-session").unwrap();
@@ -996,7 +1004,7 @@ async fn request_ids_are_server_generated_and_propagated() {
 #[tokio::test]
 async fn file_time_uses_locale_date_order() {
     let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(60 * 60 * 20 + 32 * 60);
-    let utc = chrono::DateTime::<Utc>::from(time);
+    let utc = OffsetDateTime::from(time);
     let de = i18n::scope(Locale::De, "/".into(), async { format_utc_minute(utc) }).await;
     let en = i18n::scope(Locale::En, "/".into(), async { format_utc_minute(utc) }).await;
     assert_eq!(de, "01.01.1970 20:32 UTC");

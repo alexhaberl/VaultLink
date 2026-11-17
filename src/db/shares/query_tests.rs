@@ -77,7 +77,7 @@ fn share_candidate_matrix_matches_reference_at_100k_and_300k() {
                             cursor,
                             query: query.map(str::to_owned),
                             limit: 100,
-                            now: Utc::now(),
+                            now: OffsetDateTime::now_utc(),
                         };
                         let actual = candidate_ids(&connection, &options, query).unwrap();
                         assert_eq!(actual, reference_ids(&connection, &options),
@@ -107,7 +107,7 @@ fn unsuccessful_status_filters_have_bounded_work_as_the_database_grows() {
                     cursor: Some(count / 2),
                     query: query.map(str::to_owned),
                     limit: 100,
-                    now: Utc::now(),
+                    now: OffsetDateTime::now_utc(),
                 };
                 CANDIDATE_WORK.with(|work| work.set(CandidateWork::default()));
                 assert!(candidate_ids(&connection, &options, query)
@@ -135,7 +135,7 @@ fn unsuccessful_status_filters_have_bounded_work_as_the_database_grows() {
             cursor: None,
             query: None,
             limit: 100,
-            now: Utc::now(),
+            now: OffsetDateTime::now_utc(),
         };
         CANDIDATE_WORK.with(|work| work.set(CandidateWork::default()));
         assert!(candidate_ids(&connection, &options, None)
@@ -165,7 +165,7 @@ fn deep_share_pages_seek_in_both_directions_including_deleted_cursor_and_search(
                     cursor,
                     query: needle.map(str::to_string),
                     limit: 100,
-                    now: Utc::now(),
+                    now: OffsetDateTime::now_utc(),
                 };
                 let sql = direct_candidate_sql(&options, needle.is_some());
                 let mut statement = connection.prepare(&sql).unwrap();

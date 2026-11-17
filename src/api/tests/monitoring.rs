@@ -264,13 +264,16 @@ async fn service_token_api_enforces_expiration_boundaries() {
     let (session_cookie, csrf) = api_login(&state, &secret).await;
     let app = crate::web::router(state.clone());
 
-    for (index, expires_at) in [Utc::now() - Duration::seconds(1), Utc::now()]
-        .into_iter()
-        .enumerate()
+    for (index, expires_at) in [
+        OffsetDateTime::now_utc() - Duration::seconds(1),
+        OffsetDateTime::now_utc(),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let body = serde_json::json!({
             "name": format!("Rejected expiry {index}"),
-            "expires_at": expires_at,
+            "expires_at": expires_at.to_rfc3339_z(),
             "current_password": password,
         })
         .to_string();
@@ -283,11 +286,15 @@ async fn service_token_api_enforces_expiration_boundaries() {
     }
     assert!(state.db().list_service_tokens().unwrap().is_empty());
 
-    let future = Utc::now() + Duration::days(30);
+    let future = OffsetDateTime::now_utc() + Duration::days(30);
     let future_string = future.to_rfc3339();
+    let future_with_offset = future
+        .to_offset(time::macros::offset!(+01:30))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
     let body = serde_json::json!({
         "name": "Expiring monitor",
-        "expires_at": future,
+        "expires_at": future_with_offset,
         "current_password": password,
     })
     .to_string();
@@ -838,7 +845,7 @@ async fn monitoring_summary_keeps_metrics_when_storage_probe_fails() {
     assert_eq!(summary["shares"]["available"], 1);
     assert_eq!(
         summary["transfers"]["month"],
-        Utc::now().format("%Y-%m").to_string()
+        month_key(OffsetDateTime::now_utc())
     );
     assert_eq!(summary["version"], env!("CARGO_PKG_VERSION"));
 }
@@ -901,7 +908,7 @@ async fn monitoring_contract_is_redacted_filtered_and_cursor_paginated() {
             "expired-file",
             false,
             &Permission::DownloadOnly,
-            Some(Utc::now() - Duration::days(1)),
+            Some(OffsetDateTime::now_utc() - Duration::days(1)),
             None,
             None,
             1,
@@ -958,7 +965,7 @@ async fn monitoring_contract_is_redacted_filtered_and_cursor_paginated() {
         .unwrap();
     assert_eq!(summary.status(), StatusCode::OK);
     let summary: serde_json::Value = serde_json::from_str(&response_text(summary).await).unwrap();
-    assert!(DateTime::parse_from_rfc3339(summary["generated_at"].as_str().unwrap()).is_ok());
+    assert!(parse_rfc3339(summary["generated_at"].as_str().unwrap()).is_ok());
     assert_eq!(summary["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(summary["shares"]["total"], 4);
     assert_eq!(summary["shares"]["available"], 1);
@@ -968,12 +975,12 @@ async fn monitoring_contract_is_redacted_filtered_and_cursor_paginated() {
     assert_eq!(summary["shares"]["protected"], 1);
     assert_eq!(
         summary["transfers"]["month"],
-        Utc::now().format("%Y-%m").to_string()
+        month_key(OffsetDateTime::now_utc())
     );
     assert_eq!(summary["transfers"]["download"], 0);
     assert_eq!(summary["transfers"]["zip_download"], 0);
     assert_eq!(summary["transfers"]["preview"], 0);
-    assert!(DateTime::parse_from_rfc3339(
+    assert!(parse_rfc3339(
         summary["transfers"]["statistics_started_at"]
             .as_str()
             .unwrap()

@@ -96,9 +96,9 @@ struct AdminMediaPreviewTemplate {
 }
 
 fn admin_file_time(value: std::time::SystemTime) -> (String, String) {
-    let utc = DateTime::<Utc>::from(value);
+    let utc = OffsetDateTime::from(value);
     (
-        utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+        utc.to_rfc3339_seconds(),
         super::common::format_utc_minute(utc),
     )
 }

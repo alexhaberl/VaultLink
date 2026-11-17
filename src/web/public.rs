@@ -4,8 +4,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Deserialize;
+use time::{Duration, OffsetDateTime};
 
 use crate::{
     auth,
@@ -22,6 +22,7 @@ use crate::{
     path_security,
     policy::{self, ShareAvailability},
     sensitive::SecretString,
+    timestamp::TimestampExt,
     PublicRouteState,
 };
 
@@ -146,9 +147,9 @@ struct PublicShareTemplate {
 }
 
 fn public_file_time(value: std::time::SystemTime) -> (String, String) {
-    let utc = DateTime::<Utc>::from(value);
+    let utc = OffsetDateTime::from(value);
     (
-        utc.to_rfc3339_opts(SecondsFormat::Secs, true),
+        utc.to_rfc3339_seconds(),
         super::common::format_utc_minute(utc),
     )
 }
@@ -217,7 +218,7 @@ fn public_sort_header_view(
 }
 
 pub(super) fn usable(sh: &Share) -> Result<()> {
-    match policy::share_availability(sh, Utc::now()) {
+    match policy::share_availability(sh, OffsetDateTime::now_utc()) {
         ShareAvailability::Available => Ok(()),
         ShareAvailability::Inactive
         | ShareAvailability::Expired
@@ -311,7 +312,8 @@ pub(super) async fn unlock_share(
     let stored_unlock_token = unlock_token.clone();
     let stored_unlock_csrf = unlock_csrf.clone();
     let share_id = share.id;
-    let expires = Utc::now() + Duration::minutes(runtime_settings(&state).share_unlock_minutes);
+    let expires = OffsetDateTime::now_utc()
+        + Duration::minutes(runtime_settings(&state).share_unlock_minutes);
     let audit_context = AuditContext::new("public", enabled_audit_client_ip(&state));
     let created = required_audited_database(state.db().clone(), move |db| {
         db.create_unlock_session_for_verified_password_and_audit_audited(

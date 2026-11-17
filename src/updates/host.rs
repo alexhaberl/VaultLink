@@ -19,7 +19,7 @@ fn failure(message: &str) -> io::Error {
     io::Error::other(message)
 }
 fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
 fn private_directory(path: &Path) -> io::Result<()> {

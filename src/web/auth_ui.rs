@@ -4,8 +4,8 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use chrono::{Duration, Utc};
 use serde::Deserialize;
+use time::{Duration, OffsetDateTime};
 
 use super::{
     common::{decode_security_keys, webauthn_start_response, CsrfForm},
@@ -65,7 +65,8 @@ pub(super) async fn login(
     let (attempted_username, attempted_detail) = auth::failed_login_identity(&form.username);
     let token = auth::random_token(32);
     let csrf = auth::random_token(24);
-    let expires = Utc::now() + Duration::hours(state.config().security.session_hours);
+    let expires =
+        OffsetDateTime::now_utc() + Duration::hours(state.config().security.session_hours);
     let outcome = password_login_admitted(
         &state,
         PasswordLoginCommand {

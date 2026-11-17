@@ -16,7 +16,7 @@ async fn account_totp_mutation_redirects_when_session_is_revoked_before_commit()
             "revoked-account-session",
             1,
             "account-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("revoked-account-session").unwrap();
@@ -41,12 +41,16 @@ async fn account_totp_mutation_redirects_when_session_is_revoked_before_commit()
     // sleep: session lookup refreshes this deliberately stale timestamp before
     // the handler waits for the settings mutation lock.
     let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
-    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    let stale_activity = (OffsetDateTime::now_utc() - Duration::minutes(2)).to_rfc3339();
     probe
         .execute("UPDATE sessions SET last_activity_at=?1", [&stale_activity])
         .unwrap();
     let settings_guard = state.acquire_security_settings_mutation().await;
-    let code = auth::totp_code(&secret, Utc::now().timestamp() as u64 / 30).unwrap();
+    let code = auth::totp_code(
+        &secret,
+        OffsetDateTime::now_utc().unix_timestamp() as u64 / 30,
+    )
+    .unwrap();
     let mut disable = request(
         Method::POST,
         "/admin/account/totp",
@@ -118,7 +122,7 @@ async fn revoked_security_key_finish_preserves_pending_challenge_and_audit() {
             "revoked-registration-session",
             1,
             "registration-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state
@@ -134,7 +138,7 @@ async fn revoked_security_key_finish_preserves_pending_challenge_and_audit() {
     // Hold the first lock in the commit order so the request deterministically
     // completes its initial MFA lookup before revocation wins the DB fence.
     let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
-    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    let stale_activity = (OffsetDateTime::now_utc() - Duration::minutes(2)).to_rfc3339();
     probe
         .execute("UPDATE sessions SET last_activity_at=?1", [&stale_activity])
         .unwrap();
@@ -219,14 +223,14 @@ async fn revoked_security_key_start_does_not_publish_a_pending_challenge() {
             "revoked-registration-start",
             1,
             "registration-start-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("revoked-registration-start").unwrap();
     let webauthn = state.webauthn_snapshot_for_test();
 
     let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
-    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    let stale_activity = (OffsetDateTime::now_utc() - Duration::minutes(2)).to_rfc3339();
     probe
         .execute("UPDATE sessions SET last_activity_at=?1", [&stale_activity])
         .unwrap();
@@ -297,7 +301,7 @@ async fn invalid_security_key_finish_remains_a_bad_request_without_success_audit
             "invalid-registration-session",
             1,
             "registration-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state
@@ -353,7 +357,7 @@ async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compa
             "account-security-session",
             1,
             "account-security-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("account-security-session").unwrap();
@@ -411,7 +415,11 @@ async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compa
     assert!(with_keys.contains(" UTC"));
     assert!(!with_keys.contains(r#"class="vl-field-info""#));
 
-    let code = auth::totp_code(&secret, Utc::now().timestamp() as u64 / 30).unwrap();
+    let code = auth::totp_code(
+        &secret,
+        OffsetDateTime::now_utc().unix_timestamp() as u64 / 30,
+    )
+    .unwrap();
     let mut disable = request(
         Method::POST,
         "/admin/account/totp",
@@ -438,7 +446,7 @@ async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compa
             "key-only-mfa-session",
             1,
             "key-only-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     let mut mfa_page = request(Method::GET, "/mfa", "");
@@ -512,7 +520,7 @@ async fn account_disables_totp_only_with_two_keys_and_keeps_key_management_compa
             "post-key-delete-session",
             1,
             "post-key-delete-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     assert!(state.db().verify_mfa("post-key-delete-session").unwrap());
@@ -553,7 +561,7 @@ async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
             "account-session",
             1,
             "account-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("account-session").unwrap();
@@ -625,7 +633,7 @@ async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
             "account-mfa-session",
             1,
             "account-mfa-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("account-mfa-session").unwrap();
@@ -656,7 +664,7 @@ async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
     );
     assert!(state.db().session("account-mfa-session").unwrap().is_some());
 
-    let current_step = Utc::now().timestamp() as u64 / 30;
+    let current_step = OffsetDateTime::now_utc().unix_timestamp() as u64 / 30;
     let current_code = auth::totp_code(&old_secret, current_step).unwrap();
     let mut start_mfa = request(
             Method::POST,
@@ -725,7 +733,11 @@ async fn account_ui_changes_password_and_confirms_new_mfa_before_activation() {
     );
     assert!(state.db().session("account-mfa-session").unwrap().is_some());
 
-    let new_code = auth::totp_code(&new_secret, Utc::now().timestamp() as u64 / 30).unwrap();
+    let new_code = auth::totp_code(
+        &new_secret,
+        OffsetDateTime::now_utc().unix_timestamp() as u64 / 30,
+    )
+    .unwrap();
     let mut confirm_mfa = request(
         Method::POST,
         "/admin/account/mfa/confirm",
@@ -787,7 +799,7 @@ async fn service_token_ui_requires_mfa_reauth_and_shows_secret_only_once() {
             "service-token-session",
             1,
             "service-token-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     let app = router(state.clone());
@@ -943,7 +955,7 @@ async fn service_token_ui_requires_mfa_reauth_and_shows_secret_only_once() {
             "revoking-admin-session",
             2,
             "revoking-admin-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("revoking-admin-session").unwrap();

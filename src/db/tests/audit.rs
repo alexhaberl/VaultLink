@@ -294,7 +294,10 @@ fn audit_retention_keeps_only_the_newest_rows() {
                     "INSERT INTO audit(
                              occurred_at,actor,action,object_id,detail,client_ip
                          ) VALUES(?1,'test',?2,NULL,NULL,NULL)",
-                    params![Utc::now().to_rfc3339(), format!("event-{index}")],
+                    params![
+                        OffsetDateTime::now_utc().to_rfc3339(),
+                        format!("event-{index}")
+                    ],
                 )
                 .unwrap();
             enforce_audit_retention(&transaction, 3).unwrap();
@@ -370,7 +373,7 @@ fn audit_retention_preserves_security_events_during_routine_volume() {
         .execute(
             "INSERT INTO audit(occurred_at,actor,action,priority)
              VALUES(?1,'local_recovery','admin_recovered',100)",
-            [Utc::now().to_rfc3339()],
+            [OffsetDateTime::now_utc().to_rfc3339()],
         )
         .unwrap();
     for index in 0..4 {
@@ -378,7 +381,10 @@ fn audit_retention_preserves_security_events_during_routine_volume() {
             .execute(
                 "INSERT INTO audit(occurred_at,actor,action,priority)
                  VALUES(?1,'public',?2,0)",
-                params![Utc::now().to_rfc3339(), format!("download-{index}")],
+                params![
+                    OffsetDateTime::now_utc().to_rfc3339(),
+                    format!("download-{index}")
+                ],
             )
             .unwrap();
     }
@@ -403,7 +409,10 @@ fn audit_retention_falls_back_to_fifo_for_security_only_volume() {
             .execute(
                 "INSERT INTO audit(occurred_at,actor,action,priority)
                  VALUES(?1,'admin',?2,100)",
-                params![Utc::now().to_rfc3339(), format!("security-{index}")],
+                params![
+                    OffsetDateTime::now_utc().to_rfc3339(),
+                    format!("security-{index}")
+                ],
             )
             .unwrap();
     }
@@ -497,7 +506,10 @@ fn audit_retention_caps_recent_events() {
             .execute(
                 "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip)
                  VALUES(?1,'test',?2,NULL,NULL,NULL)",
-                params![Utc::now().to_rfc3339(), format!("event-{index}")],
+                params![
+                    OffsetDateTime::now_utc().to_rfc3339(),
+                    format!("event-{index}")
+                ],
             )
             .unwrap();
     }
@@ -528,7 +540,10 @@ fn audit_retention_reports_security_eviction_when_only_security_rows_remain() {
             .execute(
                 "INSERT INTO audit(occurred_at,actor,action,priority)
                  VALUES(?1,'test',?2,100)",
-                params![Utc::now().to_rfc3339(), format!("security-{index}")],
+                params![
+                    OffsetDateTime::now_utc().to_rfc3339(),
+                    format!("security-{index}")
+                ],
             )
             .unwrap();
     }

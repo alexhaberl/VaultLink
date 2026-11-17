@@ -1,6 +1,6 @@
 use std::io;
 
-use chrono::Utc;
+use time::OffsetDateTime;
 use tokio::io::AsyncSeekExt as _;
 
 use crate::{
@@ -112,7 +112,7 @@ impl PublicTransferService {
         token: &str,
     ) -> Result<Share, PublicTransferError> {
         let share = self.find_share(token).await?;
-        match policy::share_availability(&share, Utc::now()) {
+        match policy::share_availability(&share, OffsetDateTime::now_utc()) {
             ShareAvailability::Available | ShareAvailability::LimitReached => Ok(share),
             ShareAvailability::Inactive => Err(PublicTransferError::Inactive),
             ShareAvailability::Expired => Err(PublicTransferError::Expired),
@@ -121,7 +121,7 @@ impl PublicTransferService {
 
     pub(crate) async fn share(&self, token: &str) -> Result<Share, PublicTransferError> {
         let share = self.find_share(token).await?;
-        match policy::share_availability(&share, Utc::now()) {
+        match policy::share_availability(&share, OffsetDateTime::now_utc()) {
             ShareAvailability::Available => Ok(share),
             ShareAvailability::Inactive | ShareAvailability::LimitReached => {
                 Err(PublicTransferError::Inactive)

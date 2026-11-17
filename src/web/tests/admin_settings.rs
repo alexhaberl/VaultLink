@@ -10,7 +10,7 @@ async fn admin_ui_creates_admin_and_updates_runtime_settings() {
             "session-token",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("session-token").unwrap();
@@ -113,7 +113,7 @@ async fn admin_ui_creates_admin_and_updates_runtime_settings() {
             "later-session",
             3,
             "later-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("later-session").unwrap();
@@ -213,7 +213,7 @@ async fn software_updates_reject_unverified_sessions_bad_csrf_and_extra_argument
             "update-session",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     let app = router(state.clone());
@@ -518,7 +518,7 @@ async fn admin_upload_is_csrf_protected_atomic_and_queue_compatible() {
             "session-token",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("session-token").unwrap();
@@ -686,7 +686,12 @@ async fn admin_upload_rechecks_the_exact_mfa_session_before_publish() {
     for token in ["queue-session", "browser-session"] {
         state
             .db()
-            .create_session(token, 1, "csrf-token", Utc::now() + Duration::hours(1))
+            .create_session(
+                token,
+                1,
+                "csrf-token",
+                OffsetDateTime::now_utc() + Duration::hours(1),
+            )
             .unwrap();
         state.db().verify_mfa(token).unwrap();
     }
@@ -936,7 +941,7 @@ async fn admin_upload_operation_replays_receipt_after_file_changes() {
             "admin-operation-session",
             1,
             "admin-operation-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("admin-operation-session").unwrap();

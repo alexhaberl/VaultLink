@@ -8,7 +8,7 @@ impl Database {
         path: &str,
         is_dir: bool,
         permission: &Permission,
-        expires: Option<DateTime<Utc>>,
+        expires: Option<OffsetDateTime>,
         max: Option<u64>,
         upload_max: Option<u64>,
         admin: i64,
@@ -49,7 +49,7 @@ impl Database {
         path: &str,
         is_dir: bool,
         permission: &Permission,
-        expires: Option<DateTime<Utc>>,
+        expires: Option<OffsetDateTime>,
         max: Option<u64>,
         upload_max: Option<u64>,
         upload_total: Option<u64>,
@@ -85,7 +85,7 @@ impl Database {
         path: &str,
         is_dir: bool,
         permission: &Permission,
-        expires: Option<DateTime<Utc>>,
+        expires: Option<OffsetDateTime>,
         max: Option<u64>,
         upload_max: Option<u64>,
         upload_total: Option<u64>,
@@ -123,7 +123,7 @@ impl Database {
         path: &str,
         is_dir: bool,
         permission: &Permission,
-        expires: Option<DateTime<Utc>>,
+        expires: Option<OffsetDateTime>,
         max: Option<u64>,
         upload_max: Option<u64>,
         upload_total: Option<u64>,
@@ -169,7 +169,7 @@ impl Database {
                     max,
                     upload_max,
                     proof.admin_id(),
-                    Utc::now().to_rfc3339(),
+                    OffsetDateTime::now_utc().to_rfc3339(),
                     password_hash,
                     upload_conflict_strategy.as_str(),
                     upload_total,
@@ -202,7 +202,7 @@ impl Database {
         path: &str,
         is_dir: bool,
         permission: &Permission,
-        expires: Option<DateTime<Utc>>,
+        expires: Option<OffsetDateTime>,
         max: Option<u64>,
         upload_max: Option<u64>,
         upload_total: Option<u64>,
@@ -249,7 +249,7 @@ impl Database {
                 max,
                 upload_max,
                 admin,
-                Utc::now().to_rfc3339(),
+                OffsetDateTime::now_utc().to_rfc3339(),
                 password_hash,
                 upload_conflict_strategy.as_str(),
                 upload_total,
@@ -300,15 +300,13 @@ impl Database {
         let exp: Option<String> = r.get(8)?;
         let expires_at = exp
             .map(|value| {
-                DateTime::parse_from_rfc3339(&value)
-                    .map(|parsed| parsed.with_timezone(&Utc))
-                    .map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            8,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })
+                parse_rfc3339(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
             })
             .transpose()?;
         Ok(Share {
@@ -367,7 +365,7 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(shares)
     }
-    pub fn share_summary(&self, now: DateTime<Utc>) -> rusqlite::Result<ShareSummary> {
+    pub fn share_summary(&self, now: OffsetDateTime) -> rusqlite::Result<ShareSummary> {
         self.try_conn()?.query_row(
             "SELECT
                  COALESCE(SUM(active=1 AND (expires_at IS NULL OR expires_at>?1)
@@ -383,7 +381,7 @@ impl Database {
             },
         )
     }
-    pub fn count_available_shares(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
+    pub fn count_available_shares(&self, now: OffsetDateTime) -> rusqlite::Result<usize> {
         self.try_conn()?.query_row(
             "SELECT COUNT(*) FROM shares
              WHERE active=1 AND (expires_at IS NULL OR expires_at>?1)

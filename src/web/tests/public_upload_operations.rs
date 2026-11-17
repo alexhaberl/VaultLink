@@ -12,7 +12,7 @@ async fn public_upload_publish_wins_before_a_waiting_html_policy_change() {
             "html-upload-session",
             1,
             "html-upload-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("html-upload-session").unwrap();

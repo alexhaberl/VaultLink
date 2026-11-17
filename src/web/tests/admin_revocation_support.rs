@@ -20,7 +20,7 @@ async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_adm
             "password-session",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("password-session").unwrap();
@@ -65,7 +65,7 @@ async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_adm
             "mfa-session",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("mfa-session").unwrap();
@@ -108,7 +108,7 @@ async fn admin_upload_revocation_covers_password_mfa_and_expiry_and_releases_adm
             "expiry-session",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("expiry-session").unwrap();
@@ -244,11 +244,11 @@ async fn revoked_admin_file_rename_and_delete_preserve_storage_shares_and_audit(
             "rename-revoked-session",
             1,
             "rename-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("rename-revoked-session").unwrap();
-    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    let stale_activity = (OffsetDateTime::now_utc() - Duration::minutes(2)).to_rfc3339();
     probe
         .execute(
             "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
@@ -289,11 +289,11 @@ async fn revoked_admin_file_rename_and_delete_preserve_storage_shares_and_audit(
             "delete-revoked-session",
             1,
             "delete-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("delete-revoked-session").unwrap();
-    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    let stale_activity = (OffsetDateTime::now_utc() - Duration::minutes(2)).to_rfc3339();
     probe
         .execute(
             "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
@@ -340,7 +340,7 @@ async fn revoked_admin_settings_preserve_sqlite_runtime_webauthn_and_audit() {
             "settings-revoked-session",
             1,
             "settings-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("settings-revoked-session").unwrap();
@@ -349,7 +349,7 @@ async fn revoked_admin_settings_preserve_sqlite_runtime_webauthn_and_audit() {
     let webauthn_before = state.webauthn_snapshot_for_test().instance_id();
 
     let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
-    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    let stale_activity = (OffsetDateTime::now_utc() - Duration::minutes(2)).to_rfc3339();
     probe
         .execute(
             "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
@@ -398,7 +398,7 @@ async fn authorized_settings_publication_finishes_before_waiting_logout_returns(
             "settings-wins-session",
             1,
             "settings-wins-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("settings-wins-session").unwrap();

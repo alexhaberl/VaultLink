@@ -1,27 +1,36 @@
 pub(super) fn format_audit_time(value: &str) -> String {
-    DateTime::parse_from_rfc3339(value)
-        .map(|dt| {
-            let utc = dt.with_timezone(&Utc);
-            match i18n::current_locale() {
-                Locale::De => utc.format("%d.%m.%Y %H:%M:%S").to_string(),
-                Locale::En => utc.format("%Y-%m-%d %H:%M:%S").to_string(),
-            }
+    let format = match i18n::current_locale() {
+        Locale::De => format_description!("[day].[month].[year] [hour]:[minute]:[second]"),
+        Locale::En => format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
+    };
+    parse_rfc3339(value)
+        .map(|utc| {
+            utc.format(format)
+                .expect("a UTC audit time can be formatted")
         })
         .unwrap_or_else(|_| value.to_string())
 }
 
-pub(super) fn format_utc_minute(value: DateTime<Utc>) -> String {
-    match i18n::current_locale() {
-        Locale::De => value.format("%d.%m.%Y %H:%M UTC").to_string(),
-        Locale::En => value.format("%Y-%m-%d %H:%M UTC").to_string(),
-    }
+pub(super) fn format_utc_minute(value: OffsetDateTime) -> String {
+    let format = match i18n::current_locale() {
+        Locale::De => format_description!("[day].[month].[year] [hour]:[minute] UTC"),
+        Locale::En => format_description!("[year]-[month]-[day] [hour]:[minute] UTC"),
+    };
+    value
+        .to_offset(UtcOffset::UTC)
+        .format(format)
+        .expect("a UTC minute can be formatted")
 }
 
-pub(super) fn format_public_date(value: DateTime<Utc>) -> String {
-    match i18n::current_locale() {
-        Locale::De => value.format("%d.%m.%Y").to_string(),
-        Locale::En => value.format("%Y-%m-%d").to_string(),
-    }
+pub(super) fn format_public_date(value: OffsetDateTime) -> String {
+    let format = match i18n::current_locale() {
+        Locale::De => format_description!("[day].[month].[year]"),
+        Locale::En => format_description!("[year]-[month]-[day]"),
+    };
+    value
+        .to_offset(UtcOffset::UTC)
+        .format(format)
+        .expect("a public date can be formatted")
 }
 
 pub(super) fn decode_security_keys(

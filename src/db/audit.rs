@@ -5,10 +5,11 @@ use super::{
     AuditKeysetPosition, AuditPriority, AuditRetentionOutcome, AuditSortColumn, AuditSortDirection,
     Audited, Database, MfaSessionProof, RequiredAuditEvent, SessionBound, MAX_AUDIT_ROWS,
 };
-use chrono::Utc;
+use crate::timestamp::TimestampExt;
 #[cfg(test)]
 use rusqlite::Connection;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use time::OffsetDateTime;
 
 pub(super) fn validate_audit_fields(
     actor: &str,
@@ -74,7 +75,7 @@ pub(super) fn insert_audit_event(
         "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip,priority)
          VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![
-            Utc::now().to_rfc3339(),
+            OffsetDateTime::now_utc().to_rfc3339(),
             actor,
             action.as_str(),
             object_id,
@@ -218,7 +219,7 @@ impl Database {
             "INSERT INTO audit(occurred_at,actor,action,object_id,detail,client_ip,priority)
              VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
-                Utc::now().to_rfc3339(),
+                OffsetDateTime::now_utc().to_rfc3339(),
                 actor,
                 action,
                 object,

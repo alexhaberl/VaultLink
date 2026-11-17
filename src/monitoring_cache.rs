@@ -4,13 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 
 const MONITORING_SUMMARY_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct MonitoringSummarySnapshot {
-    pub(crate) generated_at: DateTime<Utc>,
+    pub(crate) generated_at: OffsetDateTime,
     pub(crate) summary: crate::db::MonitoringSummary,
     pub(crate) storage: Option<crate::disk_stats::DiskStats>,
 }
@@ -86,7 +86,7 @@ mod tests {
 
     fn snapshot(total: u64) -> MonitoringSummarySnapshot {
         MonitoringSummarySnapshot {
-            generated_at: Utc::now(),
+            generated_at: OffsetDateTime::now_utc(),
             summary: MonitoringSummary {
                 total,
                 available: total,

@@ -69,12 +69,17 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
             "authorized-session",
             1,
             "csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     assert!(database.verify_mfa("authorized-session").unwrap());
     database
-        .create_session("other-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "other-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(database.verify_mfa("other-session").unwrap());
     let first = database
@@ -113,7 +118,12 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
     assert_eq!(audit[0].client_ip.as_deref(), Some("203.0.113.40"));
 
     database
-        .create_session("second-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "second-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(database.verify_mfa("second-session").unwrap());
 
@@ -138,7 +148,12 @@ fn security_mutation_webauthn_deletion_consumes_totp_and_audits_atomically() {
         .unwrap();
 
     database
-        .create_session("third-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "third-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(database.verify_mfa("third-session").unwrap());
 
@@ -179,7 +194,12 @@ fn security_mutation_webauthn_deletion_rejects_stale_credentials_and_session() {
         .create_admin("admin", "original-hash", "original-secret")
         .unwrap();
     database
-        .create_session("stale-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "stale-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(database.verify_mfa("stale-session").unwrap());
     let first = database
@@ -251,7 +271,7 @@ fn security_mutation_webauthn_deletion_rejects_stale_credentials_and_session() {
             "replacement-session",
             1,
             "csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     assert!(database.verify_mfa("replacement-session").unwrap());
@@ -283,7 +303,7 @@ fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
             "authorized-session",
             1,
             "csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     assert!(database.verify_mfa("authorized-session").unwrap());
@@ -377,7 +397,7 @@ fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
             "replacement-session",
             1,
             "csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     assert!(database.verify_mfa("replacement-session").unwrap());
@@ -410,7 +430,7 @@ fn totp_setting_requires_two_keys_and_protects_key_only_accounts() {
 fn webauthn_registration_cannot_restore_keys_after_mfa_reset() {
     let database = Database::open(":memory:").unwrap();
     database.create_admin("admin", "hash", "secret").unwrap();
-    let expires = Utc::now() + chrono::Duration::hours(1);
+    let expires = OffsetDateTime::now_utc() + Duration::hours(1);
 
     database
         .create_session("authorized-session", 1, "csrf", expires)

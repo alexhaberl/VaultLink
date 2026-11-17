@@ -13,7 +13,12 @@ fn authenticated_database() -> Database {
         .create_admin("admin", "password-hash", "secret")
         .unwrap();
     database
-        .create_session("admin-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "admin-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(database.verify_mfa("admin-session").unwrap());
     database
@@ -40,7 +45,7 @@ fn create_token(database: &Database, name: &str, seed: u8) -> (String, ServiceTo
                 "password-hash",
                 name,
                 &plaintext,
-                Some(Utc::now() + Duration::days(1)),
+                Some(OffsetDateTime::now_utc() + Duration::days(1)),
                 &context,
             )
             .unwrap(),
@@ -67,7 +72,7 @@ fn service_tokens_store_only_hash_and_touch_at_most_every_five_minutes() {
     assert!(!stored.0.contains(&plaintext));
     assert!(stored.1.is_none());
 
-    let first = Utc::now();
+    let first = OffsetDateTime::now_utc();
     assert_eq!(
         database
             .authorize_service_token_at(
@@ -163,7 +168,7 @@ fn service_token_create_rechecks_live_mfa_session_password_and_capacity() {
          ) VALUES('direct-overflow',?1,1,1,?2)",
         params![
             token_hash(&test_service_token(255)),
-            Utc::now().to_rfc3339()
+            OffsetDateTime::now_utc().to_rfc3339()
         ],
     );
     assert!(direct_insert.is_err());
@@ -213,9 +218,12 @@ fn service_token_mutations_distinguish_session_revocation_from_domain_outcomes()
 fn service_token_expiration_must_be_strictly_in_the_future() {
     let database = authenticated_database();
     let context = AuditContext::new("admin", None);
-    for (index, expires_at) in [Utc::now() - Duration::seconds(1), Utc::now()]
-        .into_iter()
-        .enumerate()
+    for (index, expires_at) in [
+        OffsetDateTime::now_utc() - Duration::seconds(1),
+        OffsetDateTime::now_utc(),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let result = database.create_service_token_for_mfa_session(
             &admin_proof(),
@@ -233,7 +241,7 @@ fn service_token_expiration_must_be_strictly_in_the_future() {
         0
     );
 
-    let future = Utc::now() + Duration::days(1);
+    let future = OffsetDateTime::now_utc() + Duration::days(1);
     let future_string = future.to_rfc3339();
     let outcome = authorized(
         database
@@ -302,7 +310,10 @@ fn unknown_expired_and_insufficient_scope_tokens_are_indistinguishable_or_scoped
         .conn()
         .execute(
             "UPDATE service_tokens SET expires_at=?2 WHERE id=?1",
-            params![token.id, (Utc::now() - Duration::minutes(1)).to_rfc3339()],
+            params![
+                token.id,
+                (OffsetDateTime::now_utc() - Duration::minutes(1)).to_rfc3339()
+            ],
         )
         .unwrap();
     assert_eq!(
@@ -438,7 +449,7 @@ fn revocation_and_required_audit_are_atomic() {
 
 struct MonitoringFixture {
     database: Database,
-    now: chrono::DateTime<Utc>,
+    now: OffsetDateTime,
     available: i64,
     inactive: i64,
     expired: i64,
@@ -447,7 +458,7 @@ struct MonitoringFixture {
 
 fn monitoring_fixture() -> MonitoringFixture {
     let database = authenticated_database();
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let available = database
         .create_share_with_upload_limits(
             "available-share-secret",
@@ -533,7 +544,7 @@ fn monitoring_fixture() -> MonitoringFixture {
              VALUES(?1,'download',42),
                    (?1,'zip_download',3),
                    (?1,'preview',11)",
-            [now.format("%Y-%m").to_string()],
+            [month_key(now)],
         )
         .unwrap();
 
@@ -713,7 +724,12 @@ fn authorized_monitoring_read_may_finish_across_revoke_without_resurrecting_toke
         .create_admin("admin", "password-hash", "secret")
         .unwrap();
     database
-        .create_session("admin-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "admin-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(database.verify_mfa("admin-session").unwrap());
     let (plaintext, token) = create_token(&database, "Race", 70);
@@ -726,7 +742,7 @@ fn authorized_monitoring_read_may_finish_across_revoke_without_resurrecting_toke
         let authorization = authorizing_database.authorize_service_token_at_after_lookup(
             &authorizing_plaintext,
             super::super::SERVICE_TOKEN_SCOPE_MONITORING_READ,
-            Utc::now(),
+            OffsetDateTime::now_utc(),
             || {
                 lookup_sender.send(()).unwrap();
                 release_receiver.recv().unwrap();
@@ -735,7 +751,7 @@ fn authorized_monitoring_read_may_finish_across_revoke_without_resurrecting_toke
         // This models the rest of the already-authorized monitoring
         // handler. Revocation removes future authority, not an in-flight
         // read that has already crossed the authorization boundary.
-        let summary = authorizing_database.monitoring_summary(Utc::now())?;
+        let summary = authorizing_database.monitoring_summary(OffsetDateTime::now_utc())?;
         Ok((authorization, summary))
     });
     lookup_receiver

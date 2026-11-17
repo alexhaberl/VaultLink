@@ -4,10 +4,11 @@ use super::{
     AuditAction, AuditContext, Audited, CommitPublication, Database, MfaSessionProof,
     RequiredAuditEvent, SessionBound,
 };
-use chrono::Utc;
+use crate::timestamp::TimestampExt;
 use rusqlite::params;
 #[cfg(test)]
 use rusqlite::TransactionBehavior;
+use time::OffsetDateTime;
 
 impl Database {
     pub fn runtime_settings(&self) -> rusqlite::Result<Vec<(String, String)>> {
@@ -55,7 +56,7 @@ impl Database {
             context,
             |transaction| {
                 transaction.execute("DELETE FROM runtime_settings", [])?;
-                let updated_at = Utc::now().to_rfc3339();
+                let updated_at = OffsetDateTime::now_utc().to_rfc3339();
                 {
                     let mut statement = transaction.prepare(
                         "INSERT INTO runtime_settings(key,value,updated_by,updated_at)
@@ -93,7 +94,7 @@ impl Database {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM runtime_settings", [])?;
-        let updated_at = Utc::now().to_rfc3339();
+        let updated_at = OffsetDateTime::now_utc().to_rfc3339();
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO runtime_settings(key,value,updated_by,updated_at)

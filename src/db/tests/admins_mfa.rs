@@ -102,7 +102,12 @@ fn combined_admin_recovery_is_atomic_and_revokes_sessions() {
         .create_admin("admin", "old-hash", "old-secret")
         .unwrap();
     database
-        .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "session-token",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     database
         .start_admin_mfa_enrollment(1, "stale-enrollment", "stale-pending-secret")
@@ -160,7 +165,12 @@ fn combined_admin_recovery_rolls_back_all_changes_when_audit_fails() {
         .create_admin("admin", "old-hash", "old-secret")
         .unwrap();
     database
-        .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "session-token",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     database
         .start_admin_mfa_enrollment(1, "pending-token", "pending-secret")
@@ -210,7 +220,12 @@ fn password_change_compare_and_swap_allows_only_one_racing_update() {
         .create_admin("admin", "old-hash", "secret")
         .unwrap();
     database
-        .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "session-token",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let mut workers = Vec::new();
@@ -353,8 +368,8 @@ fn pending_mfa_enrollment_has_a_ttl_and_replaces_the_previous_token() {
     let AdminMfaEnrollmentStartOutcome::Started { expires_at } = first else {
         panic!("known administrator must start an enrollment");
     };
-    let expires_at = DateTime::parse_from_rfc3339(&expires_at).unwrap();
-    let remaining = expires_at.signed_duration_since(Utc::now());
+    let expires_at = parse_rfc3339(&expires_at).unwrap();
+    let remaining = expires_at - OffsetDateTime::now_utc();
     assert!(remaining <= Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS));
     assert!(remaining > Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS - 5));
     assert_eq!(
@@ -398,8 +413,8 @@ fn pending_mfa_enrollment_has_a_ttl_and_replaces_the_previous_token() {
         .conn()
         .execute(
             "UPDATE admin_mfa_enrollments SET expires_at=?1 WHERE admin_id=1",
-            [Utc::now()
-                .checked_sub_signed(Duration::seconds(1))
+            [OffsetDateTime::now_utc()
+                .checked_sub(Duration::seconds(1))
                 .unwrap()
                 .to_rfc3339()],
         )
@@ -418,7 +433,12 @@ fn pending_mfa_activation_is_single_use_and_revokes_sessions() {
         .create_admin("admin", "hash", "old-secret")
         .unwrap();
     database
-        .create_session("session-token", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "session-token",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     database
         .start_admin_mfa_enrollment(1, "enrollment-token", "new-secret")
@@ -510,8 +530,8 @@ fn deactivation_removes_pending_mfa_and_blocks_inactive_account_operations() {
                  ) VALUES(1,?1,1,X'00',?2,?3)",
             params![
                 token_hash("injected-token"),
-                Utc::now().to_rfc3339(),
-                (Utc::now() + Duration::minutes(5)).to_rfc3339()
+                OffsetDateTime::now_utc().to_rfc3339(),
+                (OffsetDateTime::now_utc() + Duration::minutes(5)).to_rfc3339()
             ],
         )
         .unwrap();
@@ -542,10 +562,20 @@ fn concurrent_admin_deactivation_preserves_one_active_admin() {
     database.create_admin("one", "hash", "secret").unwrap();
     database.create_admin("two", "hash", "secret").unwrap();
     database
-        .create_session("one-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "one-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     database
-        .create_session("two-session", 2, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "two-session",
+            2,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let first = {

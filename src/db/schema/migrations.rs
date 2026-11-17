@@ -10,7 +10,7 @@ fn migrate_schema_1_to_2(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(2,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -40,7 +40,7 @@ fn migrate_schema_2_to_3(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(3,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -80,7 +80,7 @@ fn migrate_schema_3_to_4(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(4,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -125,7 +125,7 @@ fn migrate_schema_4_to_5(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(5,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -158,7 +158,7 @@ fn migrate_schema_5_to_6(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(6,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -203,7 +203,7 @@ fn migrate_schema_6_to_7(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(7,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -272,7 +272,7 @@ fn migrate_schema_7_to_8(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(8,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -339,7 +339,7 @@ fn migrate_schema_8_to_9(conn: &mut Connection) -> rusqlite::Result<()> {
     tx.execute_batch(PENDING_TRANSFER_INDEX_SQL)?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(9,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -363,7 +363,7 @@ fn migrate_schema_9_to_10(conn: &mut Connection) -> rusqlite::Result<()> {
     }
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(10,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -388,7 +388,7 @@ fn migrate_schema_10_to_11(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(11,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",
@@ -430,7 +430,7 @@ fn migrate_schema_11_to_12(conn: &mut Connection) -> rusqlite::Result<()> {
     }
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(12,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "UPDATE vaultlink_schema SET fingerprint=?1 WHERE singleton=1",

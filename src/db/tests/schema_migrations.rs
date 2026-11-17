@@ -242,7 +242,7 @@ fn schema_seven_migrates_to_eight_and_backfills_indexed_search() {
             sort: ShareListSort::Newest,
             cursor: None,
             limit: 100,
-            now: Utc::now(),
+            now: OffsetDateTime::now_utc(),
         })
         .unwrap();
     assert_eq!(page.shares.len(), 1);

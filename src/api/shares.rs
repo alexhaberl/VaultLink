@@ -3,8 +3,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::{
     auth,
@@ -28,6 +28,7 @@ use crate::{
             ShareServiceError, ShareTarget, ShareValidationError,
         },
     },
+    timestamp::{deserialize_optional, TimestampExt},
     ShareRouteState,
 };
 
@@ -51,7 +52,7 @@ pub(super) struct ShareResponse {
     path: String,
     is_directory: bool,
     permission: Permission,
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<String>,
     max_downloads: Option<u64>,
     max_upload_size: Option<u64>,
     max_upload_total_size: Option<u64>,
@@ -82,7 +83,7 @@ fn share_response(settings: &RuntimeSettings, share: Share) -> ShareResponse {
         path: share.relative_path,
         is_directory: share.is_directory,
         permission: share.permission,
-        expires_at: share.expires_at,
+        expires_at: share.expires_at.map(OffsetDateTime::to_rfc3339_z),
         max_downloads: share.max_downloads,
         max_upload_size: share.max_upload_size,
         max_upload_total_size: share.max_upload_total_size,
@@ -142,7 +143,7 @@ pub(super) async fn list_shares(
         sort,
         cursor: query.cursor,
         limit,
-        now: Utc::now(),
+        now: OffsetDateTime::now_utc(),
     };
     let settings = runtime_settings(&state);
     let page = database(state.db().clone(), move |db| db.list_share_page(&options)).await?;
@@ -161,7 +162,8 @@ pub(super) struct CreateShareRequest {
     path: String,
     permission: Permission,
     alias: Option<String>,
-    expires_at: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "deserialize_optional")]
+    expires_at: Option<OffsetDateTime>,
     max_downloads: Option<u64>,
     max_upload_size: Option<u64>,
     max_upload_total_size: Option<u64>,

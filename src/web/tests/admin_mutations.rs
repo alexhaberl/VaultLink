@@ -13,7 +13,7 @@ async fn stale_session_cookies_use_revoked_contract_but_missing_cookie_stays_una
             "already-revoked-session",
             1,
             "already-revoked-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("already-revoked-session").unwrap();
@@ -39,7 +39,7 @@ async fn stale_session_cookies_use_revoked_contract_but_missing_cookie_stays_una
             "queue-stale-session",
             1,
             "queue-stale-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("queue-stale-session").unwrap();
@@ -70,7 +70,7 @@ async fn stale_session_cookies_use_revoked_contract_but_missing_cookie_stays_una
             "absolute-expired-session",
             1,
             "absolute-expired-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("absolute-expired-session").unwrap();
@@ -79,7 +79,9 @@ async fn stale_session_cookies_use_revoked_contract_but_missing_cookie_stays_una
         .execute(
             "UPDATE sessions SET expires_at=?1 WHERE csrf_token=?2",
             [
-                (Utc::now() - Duration::seconds(1)).to_rfc3339().as_str(),
+                (OffsetDateTime::now_utc() - Duration::seconds(1))
+                    .to_rfc3339()
+                    .as_str(),
                 "absolute-expired-csrf",
             ],
         )
@@ -104,11 +106,11 @@ async fn stale_session_cookies_use_revoked_contract_but_missing_cookie_stays_una
             "idle-expired-session",
             1,
             "idle-expired-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("idle-expired-session").unwrap();
-    let idle_expired_at = (Utc::now() - Duration::hours(2)).to_rfc3339();
+    let idle_expired_at = (OffsetDateTime::now_utc() - Duration::hours(2)).to_rfc3339();
     probe
         .execute(
             "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
@@ -167,7 +169,7 @@ async fn revoked_api_admin_totp_reset_preserves_credentials_state_and_audit() {
             "target-credential-setup-session",
             2,
             "target-credential-setup-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state
@@ -191,7 +193,7 @@ async fn revoked_api_admin_totp_reset_preserves_credentials_state_and_audit() {
             "admin-reset-revoked-session",
             1,
             "admin-reset-revoked-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state
@@ -213,7 +215,7 @@ async fn revoked_api_admin_totp_reset_preserves_credentials_state_and_audit() {
             },
         )
         .unwrap();
-    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    let stale_activity = (OffsetDateTime::now_utc() - Duration::minutes(2)).to_rfc3339();
     probe
         .execute(
             "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
@@ -277,7 +279,7 @@ async fn cancelled_authorized_to_staged_admin_upload_releases_every_phase_owner(
             "cancelled-staging-session",
             1,
             "cancelled-staging-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("cancelled-staging-session").unwrap();
@@ -346,7 +348,7 @@ async fn cancelled_admin_upload_retains_fence_resources_until_revocation_commits
             "cancelled-admin-upload-session",
             1,
             "cancelled-admin-upload-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state
@@ -471,7 +473,7 @@ async fn cancelled_folder_creation_retains_permits_proof_and_fence_until_commit(
             "cancelled-folder-session",
             1,
             "cancelled-folder-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("cancelled-folder-session").unwrap();
@@ -576,7 +578,7 @@ async fn revoked_admin_folder_upload_creates_no_directory_or_success_audit() {
             "revoked-folder-upload-session",
             1,
             "revoked-folder-upload-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state
@@ -585,7 +587,7 @@ async fn revoked_admin_folder_upload_creates_no_directory_or_success_audit() {
         .unwrap();
 
     let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
-    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    let stale_activity = (OffsetDateTime::now_utc() - Duration::minutes(2)).to_rfc3339();
     probe
         .execute(
             "UPDATE sessions SET last_activity_at=?1 WHERE csrf_token=?2",
@@ -649,7 +651,7 @@ async fn streamed_admin_upload_keeps_storage_and_sqlite_writer_sections_short() 
             "streamed-admin-upload-session",
             1,
             "streamed-admin-upload-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state
@@ -711,7 +713,7 @@ async fn busy_logout_is_retryable_and_never_reports_false_revocation_success() {
             "busy-logout-session",
             1,
             "busy-logout-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("busy-logout-session").unwrap();
@@ -802,7 +804,7 @@ async fn html_admin_create_maps_only_the_unique_constraint_to_conflict() {
             "admin-create-session",
             1,
             "admin-create-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("admin-create-session").unwrap();
@@ -862,7 +864,7 @@ async fn html_share_create_maps_only_the_unique_constraint_to_conflict() {
             "share-create-session",
             1,
             "share-create-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("share-create-session").unwrap();

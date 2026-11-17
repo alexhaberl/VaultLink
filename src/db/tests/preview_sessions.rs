@@ -23,7 +23,7 @@ fn preview_sessions_are_hashed_share_and_path_bound() {
             "preview-owner",
             share_id,
             "folder/image.png",
-            Utc::now() + chrono::Duration::minutes(5),
+            OffsetDateTime::now_utc() + Duration::minutes(5),
         )
         .unwrap();
     assert!(database
@@ -73,7 +73,7 @@ fn preview_sessions_are_expiry_cleaned_and_bounded_per_share_path() {
                 "owner-b",
                 share_id,
                 path,
-                Utc::now() + Duration::minutes(30 + index),
+                OffsetDateTime::now_utc() + Duration::minutes(30 + index),
             )
             .unwrap();
     }
@@ -84,7 +84,7 @@ fn preview_sessions_are_expiry_cleaned_and_bounded_per_share_path() {
                 "owner-a",
                 share_id,
                 path,
-                Utc::now() + Duration::minutes(10 + index),
+                OffsetDateTime::now_utc() + Duration::minutes(10 + index),
             )
             .unwrap();
     }
@@ -99,7 +99,7 @@ fn preview_sessions_are_expiry_cleaned_and_bounded_per_share_path() {
                 share_id,
                 path,
                 token_hash("owner-a"),
-                Utc::now().to_rfc3339()
+                OffsetDateTime::now_utc().to_rfc3339()
             ],
             |row| row.get(0),
         )
@@ -130,7 +130,7 @@ fn preview_sessions_are_expiry_cleaned_and_bounded_per_share_path() {
                 token_hash("expired-preview"),
                 share_id,
                 "folder/expired.png",
-                (Utc::now() - Duration::minutes(1)).to_rfc3339(),
+                (OffsetDateTime::now_utc() - Duration::minutes(1)).to_rfc3339(),
                 token_hash("owner-a")
             ],
         )
@@ -141,14 +141,14 @@ fn preview_sessions_are_expiry_cleaned_and_bounded_per_share_path() {
             "owner-a",
             share_id,
             "folder/other.png",
-            Utc::now() + Duration::minutes(5),
+            OffsetDateTime::now_utc() + Duration::minutes(5),
         )
         .unwrap();
     let expired: u64 = database
         .conn()
         .query_row(
             "SELECT COUNT(*) FROM public_preview_sessions WHERE expires_at<=?1",
-            [Utc::now().to_rfc3339()],
+            [OffsetDateTime::now_utc().to_rfc3339()],
             |row| row.get(0),
         )
         .unwrap();
@@ -186,7 +186,7 @@ fn preview_sessions_are_bounded_per_owner_and_share_without_cross_owner_eviction
             &UploadConflictStrategy::Reject,
         )
         .unwrap();
-    let expires = Utc::now() + Duration::hours(1);
+    let expires = OffsetDateTime::now_utc() + Duration::hours(1);
     assert_eq!(
         database
             .create_preview_session(
@@ -293,7 +293,7 @@ fn preview_sessions_enforce_per_share_capacity_without_cross_share_eviction() {
     };
     let full_share_id = create_share("full-preview-share", "full-folder");
     let isolated_share_id = create_share("isolated-preview-share", "isolated-folder");
-    let expires = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    let expires = (OffsetDateTime::now_utc() + Duration::hours(1)).to_rfc3339();
     {
         let mut connection = database.conn();
         let transaction = connection
@@ -328,7 +328,7 @@ fn preview_sessions_enforce_per_share_capacity_without_cross_share_eviction() {
                 "new-owner",
                 full_share_id,
                 "full-folder/new.png",
-                Utc::now() + Duration::hours(1),
+                OffsetDateTime::now_utc() + Duration::hours(1),
             )
             .unwrap(),
         PreviewSessionCreateOutcome::ShareCapacityReached
@@ -352,7 +352,7 @@ fn preview_sessions_enforce_per_share_capacity_without_cross_share_eviction() {
                 "new-owner",
                 isolated_share_id,
                 "isolated-folder/image.png",
-                Utc::now() + Duration::hours(1),
+                OffsetDateTime::now_utc() + Duration::hours(1),
             )
             .unwrap(),
         PreviewSessionCreateOutcome::Created
@@ -413,7 +413,7 @@ fn preview_sessions_enforce_global_capacity_after_expiry_purge() {
                 .unwrap()
         })
         .collect();
-    let expires = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    let expires = (OffsetDateTime::now_utc() + Duration::hours(1)).to_rfc3339();
     {
         let mut connection = database.conn();
         let transaction = connection
@@ -449,7 +449,7 @@ fn preview_sessions_enforce_global_capacity_after_expiry_purge() {
                 "new-owner",
                 target_share_id,
                 "folder/new.png",
-                Utc::now() + Duration::hours(1),
+                OffsetDateTime::now_utc() + Duration::hours(1),
             )
             .unwrap(),
         PreviewSessionCreateOutcome::GlobalCapacityReached
@@ -467,7 +467,7 @@ fn preview_sessions_enforce_global_capacity_after_expiry_purge() {
         .unwrap();
     assert!(retained_foreign_row);
 
-    let expired = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+    let expired = (OffsetDateTime::now_utc() - Duration::minutes(1)).to_rfc3339();
     let updated = database
         .conn()
         .execute(
@@ -476,7 +476,7 @@ fn preview_sessions_enforce_global_capacity_after_expiry_purge() {
         )
         .unwrap();
     assert_eq!(updated, 1);
-    let now = Utc::now().to_rfc3339();
+    let now = OffsetDateTime::now_utc().to_rfc3339();
     let expired_rows: i64 = database
         .conn()
         .query_row(
@@ -493,7 +493,7 @@ fn preview_sessions_enforce_global_capacity_after_expiry_purge() {
                 "new-owner",
                 target_share_id,
                 "folder/new.png",
-                Utc::now() + Duration::hours(1),
+                OffsetDateTime::now_utc() + Duration::hours(1),
             )
             .unwrap(),
         PreviewSessionCreateOutcome::Created

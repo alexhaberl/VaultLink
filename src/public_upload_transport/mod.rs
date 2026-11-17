@@ -3,9 +3,9 @@ use axum::{
     extract::Multipart,
     http::{header, HeaderMap, StatusCode},
 };
-use chrono::Utc;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::Instrument as _;
 
@@ -224,7 +224,7 @@ async fn get_share(state: &AppState, token: &str) -> Result<Share> {
     })
     .await?
     .ok_or(AppError::new(StatusCode::NOT_FOUND, "Link not found"))?;
-    match policy::share_availability(&share, Utc::now()) {
+    match policy::share_availability(&share, OffsetDateTime::now_utc()) {
         ShareAvailability::Available => Ok(share),
         ShareAvailability::Inactive
         | ShareAvailability::Expired

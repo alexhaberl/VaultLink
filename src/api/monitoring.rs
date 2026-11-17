@@ -3,8 +3,8 @@ use axum::{
     http::HeaderMap,
     Json,
 };
-use chrono::{DateTime, Utc};
 use serde::Serialize;
+use time::OffsetDateTime;
 
 use crate::{
     db::{
@@ -12,6 +12,7 @@ use crate::{
         Permission,
     },
     http_auth::{authorize_monitoring, current_client_limit_key, database},
+    timestamp::TimestampExt,
     MonitoringRouteState,
 };
 
@@ -58,7 +59,7 @@ struct MonitoringStorageResponse {
 
 #[derive(Serialize)]
 pub(super) struct MonitoringSummaryResponse {
-    generated_at: DateTime<Utc>,
+    generated_at: String,
     version: &'static str,
     shares: MonitoringShareCountsResponse,
     transfers: MonitoringTransferResponse,
@@ -68,11 +69,11 @@ pub(super) struct MonitoringSummaryResponse {
 impl MonitoringSummaryResponse {
     fn new(
         summary: MonitoringSummary,
-        generated_at: DateTime<Utc>,
+        generated_at: OffsetDateTime,
         storage: Option<crate::disk_stats::DiskStats>,
     ) -> Self {
         Self {
-            generated_at,
+            generated_at: generated_at.to_rfc3339_z(),
             version: env!("CARGO_PKG_VERSION"),
             shares: MonitoringShareCountsResponse {
                 total: summary.total,
@@ -109,7 +110,7 @@ pub(super) async fn monitoring_summary(
     let storage_root = state.secure_root().display_root().to_path_buf();
     let snapshot = cache
         .get_or_try_insert(|| async move {
-            let generated_at = Utc::now();
+            let generated_at = OffsetDateTime::now_utc();
             let database_future = database(database_handle, move |database| {
                 database.monitoring_summary(generated_at)
             });
@@ -175,7 +176,7 @@ struct MonitoringShareResponse {
     is_directory: bool,
     password_protected: bool,
     created_at: String,
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<String>,
     download_count: u64,
     max_downloads: Option<u64>,
     max_upload_size_bytes: Option<u64>,
@@ -194,7 +195,7 @@ impl From<MonitoringShare> for MonitoringShareResponse {
             is_directory: share.is_directory,
             password_protected: share.password_protected,
             created_at: share.created_at,
-            expires_at: share.expires_at,
+            expires_at: share.expires_at.map(OffsetDateTime::to_rfc3339_z),
             download_count: share.download_count,
             max_downloads: share.max_downloads,
             max_upload_size_bytes: share.max_upload_size_bytes,
@@ -208,7 +209,7 @@ impl From<MonitoringShare> for MonitoringShareResponse {
 
 #[derive(Serialize)]
 pub(super) struct MonitoringSharePageResponse {
-    generated_at: DateTime<Utc>,
+    generated_at: String,
     shares: Vec<MonitoringShareResponse>,
     next_cursor: Option<i64>,
 }
@@ -235,7 +236,7 @@ pub(super) async fn monitoring_share_page(
     }
     let status = MonitoringShareListStatus::parse(query.status.as_deref().unwrap_or("all"))
         .ok_or_else(|| ApiError::bad_request("Monitoring share status is invalid"))?;
-    let generated_at = Utc::now();
+    let generated_at = OffsetDateTime::now_utc();
     let options = MonitoringShareListOptions {
         status,
         cursor: query.cursor,
@@ -247,7 +248,7 @@ pub(super) async fn monitoring_share_page(
     })
     .await?;
     Ok(Json(MonitoringSharePageResponse {
-        generated_at,
+        generated_at: generated_at.to_rfc3339_z(),
         shares: page.shares.into_iter().map(Into::into).collect(),
         next_cursor: page.next_cursor,
     }))

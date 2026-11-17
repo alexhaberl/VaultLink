@@ -10,7 +10,7 @@ mod bug_regressions {
                 "bugs-session",
                 1,
                 "bugs-csrf",
-                Utc::now() + Duration::hours(1),
+                OffsetDateTime::now_utc() + Duration::hours(1),
             )
             .unwrap();
         state.db().verify_mfa("bugs-session").unwrap();
@@ -31,7 +31,7 @@ mod bug_regressions {
                 share.password_hash.as_deref().unwrap(),
                 share.upload_policy_epoch,
                 "bugs-csrf",
-                Utc::now() + Duration::hours(1)
+                OffsetDateTime::now_utc() + Duration::hours(1)
             )
             .unwrap());
         format!("{}={token}", crate::http_auth::unlock_cookie_name(id))
@@ -112,7 +112,7 @@ mod bug_regressions {
                             "bugs-owner",
                             id,
                             path,
-                            Utc::now() + Duration::hours(1),
+                            OffsetDateTime::now_utc() + Duration::hours(1),
                         )
                         .unwrap();
                     uri.push_str("&preview_token=bugs-preview");

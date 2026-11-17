@@ -616,7 +616,7 @@ pub struct Share {
     pub relative_path: String,
     pub is_directory: bool,
     pub permission: Permission,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<OffsetDateTime>,
     pub max_downloads: Option<u64>,
     pub max_upload_size: Option<u64>,
     pub max_upload_total_size: Option<u64>,
@@ -691,7 +691,7 @@ pub struct ShareListOptions {
     pub sort: ShareListSort,
     pub cursor: Option<i64>,
     pub limit: usize,
-    pub now: DateTime<Utc>,
+    pub now: OffsetDateTime,
 }
 
 #[derive(Clone, Debug)]
@@ -791,7 +791,7 @@ pub struct MonitoringShareListOptions {
     pub status: MonitoringShareListStatus,
     pub cursor: Option<i64>,
     pub limit: usize,
-    pub now: DateTime<Utc>,
+    pub now: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -802,7 +802,7 @@ pub struct MonitoringShare {
     pub is_directory: bool,
     pub password_protected: bool,
     pub created_at: String,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<OffsetDateTime>,
     pub download_count: u64,
     pub max_downloads: Option<u64>,
     pub max_upload_size_bytes: Option<u64>,

@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
-use chrono::Utc;
 use std::borrow::Borrow;
+use time::OffsetDateTime;
 
 use crate::{
     db::Share,
@@ -37,7 +37,7 @@ pub(super) async fn get_share(
 }
 
 pub(super) fn usable(share: &Share) -> ApiResult<()> {
-    match policy::share_availability(share, Utc::now()) {
+    match policy::share_availability(share, OffsetDateTime::now_utc()) {
         ShareAvailability::Available => Ok(()),
         ShareAvailability::Inactive => Err(ApiError::new(
             StatusCode::GONE,

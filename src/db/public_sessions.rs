@@ -4,8 +4,9 @@ use super::{
     MAX_ACTIVE_PREVIEW_SESSIONS_PER_OWNER_SHARE, MAX_ACTIVE_PREVIEW_SESSIONS_PER_RESOURCE,
     MAX_ACTIVE_PREVIEW_SESSIONS_PER_SHARE,
 };
-use chrono::{DateTime, Utc};
+use crate::timestamp::TimestampExt;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use time::OffsetDateTime;
 
 impl Database {
     /// Creates an unlock session only while the exact share policy verified by
@@ -20,7 +21,7 @@ impl Database {
         expected_password_hash: &str,
         expected_upload_policy_epoch: i64,
         csrf_token: &str,
-        expires: DateTime<Utc>,
+        expires: OffsetDateTime,
     ) -> rusqlite::Result<bool> {
         self.create_unlock_session_for_verified_password_internal(
             token,
@@ -41,7 +42,7 @@ impl Database {
         expected_password_hash: &str,
         expected_upload_policy_epoch: i64,
         csrf_token: &str,
-        expires: DateTime<Utc>,
+        expires: OffsetDateTime,
         context: &AuditContext,
     ) -> rusqlite::Result<bool> {
         self.create_unlock_session_for_verified_password_internal(
@@ -63,7 +64,7 @@ impl Database {
         expected_password_hash: &str,
         expected_upload_policy_epoch: i64,
         csrf_token: &str,
-        expires: DateTime<Utc>,
+        expires: OffsetDateTime,
         context: &AuditContext,
     ) -> rusqlite::Result<Audited<bool>> {
         self.create_unlock_session_for_verified_password_internal(
@@ -86,10 +87,10 @@ impl Database {
         expected_password_hash: &str,
         expected_upload_policy_epoch: i64,
         csrf_token: &str,
-        expires: DateTime<Utc>,
+        expires: OffsetDateTime,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<bool> {
-        let now = Utc::now().to_rfc3339();
+        let now = OffsetDateTime::now_utc().to_rfc3339();
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
@@ -135,7 +136,7 @@ impl Database {
         Ok(created)
     }
     pub fn unlock_session(&self, token: &str, share_id: i64) -> rusqlite::Result<bool> {
-        self.try_conn()?.query_row("SELECT EXISTS(SELECT 1 FROM public_unlock_sessions WHERE token_hash=?1 AND share_id=?2 AND expires_at>?3)", params![token_hash(token), share_id, Utc::now().to_rfc3339()], |row| row.get(0))
+        self.try_conn()?.query_row("SELECT EXISTS(SELECT 1 FROM public_unlock_sessions WHERE token_hash=?1 AND share_id=?2 AND expires_at>?3)", params![token_hash(token), share_id, OffsetDateTime::now_utc().to_rfc3339()], |row| row.get(0))
     }
     pub fn unlock_session_csrf(
         &self,
@@ -147,7 +148,11 @@ impl Database {
                 "SELECT csrf_token FROM public_unlock_sessions
                  WHERE token_hash=?1 AND share_id=?2 AND expires_at>?3
                    AND csrf_token<>''",
-                params![token_hash(token), share_id, Utc::now().to_rfc3339()],
+                params![
+                    token_hash(token),
+                    share_id,
+                    OffsetDateTime::now_utc().to_rfc3339()
+                ],
                 |row| row.get(0),
             )
             .optional()
@@ -158,9 +163,9 @@ impl Database {
         owner_key: &str,
         share_id: i64,
         relative_path: &str,
-        expires: DateTime<Utc>,
+        expires: OffsetDateTime,
     ) -> rusqlite::Result<PreviewSessionCreateOutcome> {
-        let now = Utc::now().to_rfc3339();
+        let now = OffsetDateTime::now_utc().to_rfc3339();
         let owner_key_hash = token_hash(owner_key);
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -245,7 +250,7 @@ impl Database {
     ) -> rusqlite::Result<bool> {
         self.try_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM public_preview_sessions WHERE token_hash=?1 AND share_id=?2 AND relative_path=?3 AND expires_at>?4)",
-            params![token_hash(token), share_id, relative_path, Utc::now().to_rfc3339()],
+            params![token_hash(token), share_id, relative_path, OffsetDateTime::now_utc().to_rfc3339()],
             |row| row.get(0),
         )
     }

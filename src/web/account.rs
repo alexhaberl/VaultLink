@@ -5,7 +5,6 @@ use axum::{
     response::{Html, Redirect, Response},
 };
 use base64::Engine as _;
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::common::webauthn_start_response;
@@ -30,6 +29,7 @@ use crate::{
     },
     internal_reporting::{report_internal, InternalOperation},
     sensitive::SecretString,
+    timestamp::parse_rfc3339,
     webauthn::WebAuthnServiceError,
     AccountRouteState,
 };
@@ -437,8 +437,8 @@ pub(super) async fn account_page(
         security_keys: security_keys
             .into_iter()
             .map(|key| {
-                let created_at = DateTime::parse_from_rfc3339(&key.created_at)
-                    .map(|value| format_utc_minute(value.with_timezone(&Utc)))
+                let created_at = parse_rfc3339(&key.created_at)
+                    .map(format_utc_minute)
                     .unwrap_or(key.created_at);
                 SecurityKeyView {
                     id: key.id,
@@ -734,8 +734,8 @@ pub(super) async fn start_account_mfa(
             return Err(AppError(StatusCode::UNAUTHORIZED, "Invalid credentials"));
         }
     };
-    let expires_at = DateTime::parse_from_rfc3339(&expires_at)
-        .map(|value| format_utc_minute(value.with_timezone(&Utc)))
+    let expires_at = parse_rfc3339(&expires_at)
+        .map(format_utc_minute)
         .unwrap_or(expires_at);
     let otpauth = otpauth_url(&response_session.username, response_secret.expose_secret());
     let qr = qr_svg(otpauth.expose_secret())?;

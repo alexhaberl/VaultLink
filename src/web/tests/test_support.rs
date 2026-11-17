@@ -29,7 +29,9 @@ use crate::{
     },
     http_auth::{csrf, runtime_settings, try_acquire_client_activity, try_acquire_share_activity},
     i18n::{self, Locale},
-    proxy, AppState,
+    proxy,
+    timestamp::TimestampExt,
+    AppState,
 };
 use askama::Template as _;
 
@@ -45,7 +47,6 @@ use axum::{
     routing::get,
     Router,
 };
-use chrono::{Duration, Utc};
 use futures_util::StreamExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
@@ -54,6 +55,7 @@ use std::{
     path::Path,
     sync::{atomic::Ordering, Arc},
 };
+use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 
 fn test_state(root: &Path, data: &Path) -> AppState {

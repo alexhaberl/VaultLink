@@ -4,8 +4,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use time::OffsetDateTime;
 
 use super::{
     common::{
@@ -43,6 +43,7 @@ use crate::{
             ShareServiceError, ShareTarget, ShareValidationError,
         },
     },
+    timestamp::parse_rfc3339,
     ShareRouteState,
 };
 
@@ -76,7 +77,7 @@ pub(super) fn share_permission_label(permission: &Permission) -> &'static str {
 
 pub(super) fn share_primary_status(share: &Share) -> (&'static str, &'static str) {
     let locale = i18n::current_locale();
-    match policy::share_availability(share, Utc::now()) {
+    match policy::share_availability(share, OffsetDateTime::now_utc()) {
         ShareAvailability::Inactive => (i18n::text(locale, i18n::INACTIVE), "neutral"),
         ShareAvailability::Expired => (i18n::text(locale, i18n::EXPIRED), "warning"),
         ShareAvailability::LimitReached => (i18n::text(locale, i18n::LIMIT_REACHED), "warning"),
@@ -211,7 +212,7 @@ pub(super) async fn share_index_page(
         );
     }
     let settings = runtime_settings(&state);
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let monthly = database(state.db().clone(), |database| {
         database.current_transfer_monthly_counts()
     })
@@ -220,8 +221,8 @@ pub(super) async fn share_index_page(
         database.transfer_statistics_started_at()
     })
     .await?;
-    let statistics_started_label = DateTime::parse_from_rfc3339(&statistics_started_at)
-        .map(|value| format_utc_minute(value.with_timezone(&Utc)))
+    let statistics_started_label = parse_rfc3339(&statistics_started_at)
+        .map(format_utc_minute)
         .unwrap_or(statistics_started_at);
     let query = q.q.as_deref().unwrap_or("").trim().to_string();
     let search_error = crate::share_search::validate_share_search(Some(&query)).err();
