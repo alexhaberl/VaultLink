@@ -10,8 +10,9 @@ use super::{
 };
 #[cfg(test)]
 use super::{AdminMfaEnrollmentStartOutcome, AdminWebauthnCredentialRegistrationOutcome};
-use chrono::{DateTime, Duration, Utc};
+use crate::timestamp::TimestampExt;
 use rusqlite::{params, DropBehavior, OptionalExtension, Transaction, TransactionBehavior};
+use time::{Duration, OffsetDateTime};
 
 use crate::sensitive::SecretString;
 
@@ -24,7 +25,7 @@ struct SessionTimes {
 }
 
 impl Database {
-    fn session_times(&self, now: DateTime<Utc>) -> SessionTimes {
+    fn session_times(&self, now: OffsetDateTime) -> SessionTimes {
         SessionTimes {
             now: now.to_rfc3339(),
             idle_cutoff: (now - Duration::minutes(self.session_idle_minutes())).to_rfc3339(),

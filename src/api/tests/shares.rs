@@ -7,7 +7,7 @@ fn share_mutation_response_snapshots_are_db_owned_required_audit_outputs() {
             "snapshot-session",
             1,
             "csrf",
-            chrono::Utc::now() + chrono::Duration::hours(1),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         )
         .unwrap();
     assert!(database.verify_mfa("snapshot-session").unwrap());
@@ -323,7 +323,7 @@ async fn api_hashes_share_password_before_waiting_for_storage_mutation() {
             "session-token",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("session-token").unwrap();
@@ -358,7 +358,7 @@ async fn api_share_mutation_rechecks_the_exact_session_after_waiting_for_storage
             "queued-api-session",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("queued-api-session").unwrap();
@@ -382,7 +382,7 @@ async fn api_share_mutation_rechecks_the_exact_session_after_waiting_for_storage
     // Make the initial session lookup observable: it refreshes activity before
     // the handler queues on the storage lock. This avoids a timing-only test.
     let probe = rusqlite::Connection::open(data.path().join("data.sqlite")).unwrap();
-    let stale_activity = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    let stale_activity = (OffsetDateTime::now_utc() - Duration::minutes(2)).to_rfc3339();
     probe
         .execute("UPDATE sessions SET last_activity_at=?1", [&stale_activity])
         .unwrap();

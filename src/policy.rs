@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 
 use crate::{
     auth,
@@ -193,7 +193,7 @@ pub enum ShareAvailability {
     LimitReached,
 }
 
-pub fn share_availability(share: &Share, now: DateTime<Utc>) -> ShareAvailability {
+pub fn share_availability(share: &Share, now: OffsetDateTime) -> ShareAvailability {
     if !share.active {
         ShareAvailability::Inactive
     } else if share.expires_at.is_some_and(|expires| expires <= now) {
@@ -343,7 +343,7 @@ mod tests {
         }
     }
 
-    fn share(active: bool, expires_at: Option<DateTime<Utc>>) -> Share {
+    fn share(active: bool, expires_at: Option<OffsetDateTime>) -> Share {
         Share {
             id: 1,
             token: "token".into(),
@@ -369,14 +369,14 @@ mod tests {
 
     #[test]
     fn share_expires_at_the_exact_boundary() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         assert_eq!(
             share_availability(&share(true, Some(now)), now),
             ShareAvailability::Expired
         );
         assert_eq!(
             share_availability(
-                &share(true, Some(now + chrono::Duration::nanoseconds(1))),
+                &share(true, Some(now + time::Duration::nanoseconds(1))),
                 now
             ),
             ShareAvailability::Available

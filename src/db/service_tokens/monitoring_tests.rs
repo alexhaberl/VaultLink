@@ -15,9 +15,10 @@ fn monitoring_deep_pages_use_bounded_keyset_work() {
                 .unwrap();
             let started = std::time::Instant::now();
             let ids = statement
-                .query_map(params![Utc::now().to_rfc3339(), cursor, 101], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_map(
+                    params![OffsetDateTime::now_utc().to_rfc3339(), cursor, 101],
+                    |row| row.get::<_, i64>(0),
+                )
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();

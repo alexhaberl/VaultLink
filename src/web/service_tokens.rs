@@ -4,8 +4,8 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use chrono::{Months, Utc};
 use serde::Deserialize;
+use time::{macros::format_description, OffsetDateTime};
 
 use crate::{
     auth,
@@ -20,6 +20,7 @@ use crate::{
     },
     i18n,
     sensitive::SecretString,
+    timestamp::parse_rfc3339,
     ServiceTokenRouteState,
 };
 
@@ -96,14 +97,14 @@ pub(super) async fn service_tokens_page(
     })
     .await?;
     let locale = i18n::current_locale();
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let rows = tokens
         .into_iter()
         .map(|token| {
             let expired = token
                 .expires_at
                 .as_deref()
-                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .and_then(|value| parse_rfc3339(value).ok())
                 .is_some_and(|expires_at| expires_at <= now);
             ServiceTokenRow {
                 id: token.id,
@@ -202,7 +203,7 @@ pub(super) async fn create_service_token(
             ))?,
         )
     };
-    if expires_at.is_some_and(|value| value <= Utc::now()) {
+    if expires_at.is_some_and(|value| value <= OffsetDateTime::now_utc()) {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
             "Expiration date is in the past",
@@ -320,11 +321,14 @@ pub(super) async fn revoke_service_token(
     Ok(Redirect::to("/admin/service-tokens?notice=revoked"))
 }
 
-fn default_expiry_value(now: chrono::DateTime<Utc>) -> String {
-    now.checked_add_months(Months::new(12))
+fn default_expiry_value(now: OffsetDateTime) -> String {
+    let year = now.year() + 1;
+    let day = now.day().min(now.month().length(year));
+    now.replace_day(day)
+        .and_then(|date| date.replace_year(year))
         .expect("adding twelve months to a supported UI timestamp must succeed")
-        .format("%Y-%m-%dT%H:%M")
-        .to_string()
+        .format(format_description!("[year]-[month]-[day]T[hour]:[minute]"))
+        .expect("a service token expiry can be formatted")
 }
 
 fn no_store_html(html: String) -> Response {
@@ -338,17 +342,17 @@ fn no_store_html(html: String) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use time::macros::datetime;
 
     #[test]
     fn default_expiry_is_one_year_ahead() {
-        let now = Utc.with_ymd_and_hms(2026, 8, 30, 13, 45, 0).unwrap();
+        let now = datetime!(2026-08-30 13:45 UTC);
         assert_eq!(default_expiry_value(now), "2027-08-30T13:45");
     }
 
     #[test]
     fn default_expiry_clamps_a_leap_day_to_the_next_calendar_year() {
-        let now = Utc.with_ymd_and_hms(2024, 2, 29, 13, 45, 0).unwrap();
+        let now = datetime!(2024-02-29 13:45 UTC);
         assert_eq!(default_expiry_value(now), "2025-02-28T13:45");
     }
 

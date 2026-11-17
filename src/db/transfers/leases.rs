@@ -328,7 +328,7 @@ impl Database {
         lease_token: &str,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<TransferLeaseHeartbeatOutcome> {
-        let now_datetime = Utc::now();
+        let now_datetime = OffsetDateTime::now_utc();
         let now = now_datetime.to_rfc3339();
         let rolling_expiry = now_datetime + Duration::seconds(TRANSFER_SESSION_TTL_SECONDS);
         let lease_token_hash = token_hash(lease_token);
@@ -362,24 +362,20 @@ impl Database {
             transaction.commit()?;
             return Ok(TransferLeaseHeartbeatOutcome::NotFound);
         };
-        let created_at = DateTime::parse_from_rfc3339(&created_at)
-            .map(|value| value.with_timezone(&Utc))
-            .map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-        let lease_expires_at = DateTime::parse_from_rfc3339(&lease_expires_at)
-            .map(|value| value.with_timezone(&Utc))
-            .map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    5,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
+        let created_at = parse_rfc3339(&created_at).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        let lease_expires_at = parse_rfc3339(&lease_expires_at).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
         let absolute_expiry = created_at + Duration::seconds(TRANSFER_LEASE_MAX_LIFETIME_SECONDS);
         if absolute_expiry <= now_datetime {
             let outcome = if counted {
@@ -455,7 +451,7 @@ impl Database {
 
     /// Number of distinct, uncounted grants currently reserving a download slot.
     pub fn active_transfer_reservations(&self, share_id: i64) -> rusqlite::Result<u64> {
-        let now = Utc::now().to_rfc3339();
+        let now = OffsetDateTime::now_utc().to_rfc3339();
         self.try_conn()?.query_row(
             "SELECT COUNT(*) FROM public_transfer_grants grants
              WHERE grants.share_id=?1 AND grants.counted=0 AND grants.expires_at>?2

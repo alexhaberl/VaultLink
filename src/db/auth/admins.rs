@@ -16,7 +16,7 @@ impl Database {
         } else {
             transaction.execute(
                 "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active) VALUES(?1,?2,?3,?4,?5,1)",
-                params![username, password_hash, totp_key_id, totp_ciphertext, Utc::now().to_rfc3339()],
+                params![username, password_hash, totp_key_id, totp_ciphertext, OffsetDateTime::now_utc().to_rfc3339()],
             )?;
             InitialAdminOutcome::Created
         };
@@ -43,7 +43,7 @@ impl Database {
             }
             transaction.execute(
                 "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active) VALUES(?1,?2,?3,?4,?5,1)",
-                params![username, password_hash, totp_key_id, totp_ciphertext, Utc::now().to_rfc3339()],
+                params![username, password_hash, totp_key_id, totp_ciphertext, OffsetDateTime::now_utc().to_rfc3339()],
             )?;
             let admin_id = transaction.last_insert_rowid();
             Ok((
@@ -72,7 +72,7 @@ impl Database {
                 password_hash,
                 totp_key_id,
                 totp_ciphertext,
-                Utc::now().to_rfc3339()
+                OffsetDateTime::now_utc().to_rfc3339()
             ],
         )?;
         Ok(())
@@ -88,7 +88,7 @@ impl Database {
     ) -> rusqlite::Result<AdminSummary> {
         let (totp_key_id, totp_ciphertext) = self.encrypt_admin_totp(username, totp_secret)?;
         self.required_transaction(context, |transaction| {
-            let created_at = Utc::now().to_rfc3339();
+            let created_at = OffsetDateTime::now_utc().to_rfc3339();
             transaction.execute(
                 "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active)
                  VALUES(?1,?2,?3,?4,?5,1)",
@@ -122,7 +122,7 @@ impl Database {
     ) -> rusqlite::Result<SessionBound<Audited<AdminSummary>>> {
         let (totp_key_id, totp_ciphertext) = self.encrypt_admin_totp(username, totp_secret)?;
         self.required_transaction_for_mfa_session_audited(proof, context, |transaction| {
-            let created_at = Utc::now().to_rfc3339();
+            let created_at = OffsetDateTime::now_utc().to_rfc3339();
             transaction.execute(
                 "INSERT INTO admins(username,password_hash,totp_key_id,totp_ciphertext,created_at,active)
                  VALUES(?1,?2,?3,?4,?5,1)",

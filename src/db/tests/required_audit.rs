@@ -183,7 +183,12 @@ fn mfa_session_transaction_linearizes_both_race_orders_on_persistent_pool() {
     assert_eq!(database.0.pool.max_size(), 4);
     database.create_admin("admin", "hash", "secret").unwrap();
     database
-        .create_session("live-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "live-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(database.verify_mfa("live-session").unwrap());
     let proof = MfaSessionProof::from_token("live-session", 1);
@@ -258,7 +263,7 @@ fn mfa_session_transaction_linearizes_both_race_orders_on_persistent_pool() {
             "revocation-first",
             1,
             "csrf-2",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     assert!(database.verify_mfa("revocation-first").unwrap());
@@ -318,7 +323,12 @@ fn mfa_session_transaction_linearizes_both_race_orders_on_persistent_pool() {
 
 fn verified_mfa_proof(database: &Database, token: &str, admin_id: i64) -> MfaSessionProof {
     database
-        .create_session(token, admin_id, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            token,
+            admin_id,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(database.verify_mfa(token).unwrap());
     MfaSessionProof::from_token(token, admin_id)
@@ -438,7 +448,7 @@ fn mfa_session_fence_rejects_every_auth_state_revocation_path() {
             "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
             params![
                 token_hash("idle-expiry"),
-                (Utc::now() - Duration::minutes(31)).to_rfc3339()
+                (OffsetDateTime::now_utc() - Duration::minutes(31)).to_rfc3339()
             ],
         )
         .unwrap();
@@ -714,7 +724,7 @@ fn assert_share_mutations_roll_back(db: &Database, share_id: i64, context: &Audi
             share.password_hash.as_deref().unwrap(),
             share.upload_policy_epoch,
             "csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
             context,
         )
         .unwrap_err();
@@ -755,7 +765,7 @@ fn assert_session_and_settings_mutations_roll_back(db: &Database, context: &Audi
             1,
             "old-hash",
             "csrf",
-            Utc::now() + chrono::Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
             context,
         )
         .unwrap_err();

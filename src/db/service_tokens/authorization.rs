@@ -4,14 +4,18 @@ impl Database {
         plaintext_token: &str,
         required_scope_mask: i64,
     ) -> rusqlite::Result<ServiceTokenAuthorizationOutcome> {
-        self.authorize_service_token_at(plaintext_token, required_scope_mask, Utc::now())
+        self.authorize_service_token_at(
+            plaintext_token,
+            required_scope_mask,
+            OffsetDateTime::now_utc(),
+        )
     }
 
     fn authorize_service_token_at(
         &self,
         plaintext_token: &str,
         required_scope_mask: i64,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> rusqlite::Result<ServiceTokenAuthorizationOutcome> {
         self.authorize_service_token_at_after_lookup(
             plaintext_token,
@@ -25,7 +29,7 @@ impl Database {
         &self,
         plaintext_token: &str,
         required_scope_mask: i64,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         after_authorized_lookup: F,
     ) -> rusqlite::Result<ServiceTokenAuthorizationOutcome>
     where

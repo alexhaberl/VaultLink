@@ -6,7 +6,7 @@ fn session_mfa_and_logout_lifecycle() {
         "session-token",
         1,
         "csrf",
-        Utc::now() + chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() + Duration::hours(1),
     )
     .unwrap();
     let session = d.session("session-token").unwrap().unwrap();
@@ -20,14 +20,14 @@ fn session_mfa_and_logout_lifecycle() {
 
 #[test]
 fn admin_session_idle_boundary_touch_coalescing_and_absolute_cap() {
+    // Rows written before the time migration use a numeric UTC offset and grouped fractions.
+    let stored_activity = "2030-01-01T00:00:00.120+00:00";
     let database = Database::open(":memory:").unwrap();
     database.configure_session_idle_timeout(30);
     database
         .create_admin("admin", "password-hash", "JBSWY3DPEHPK3PXP")
         .unwrap();
-    let base = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let base = parse_rfc3339(stored_activity).unwrap();
     database
         .create_session("idle-session", 1, "csrf", base + Duration::hours(12))
         .unwrap();
@@ -35,7 +35,7 @@ fn admin_session_idle_boundary_touch_coalescing_and_absolute_cap() {
         .conn()
         .execute(
             "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
-            params![token_hash("idle-session"), base.to_rfc3339()],
+            params![token_hash("idle-session"), stored_activity],
         )
         .unwrap();
 
@@ -51,7 +51,7 @@ fn admin_session_idle_boundary_touch_coalescing_and_absolute_cap() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(unchanged, base.to_rfc3339());
+    assert_eq!(unchanged, stored_activity);
 
     assert!(database
         .session_at_for_test("idle-session", base + Duration::seconds(61))
@@ -65,7 +65,7 @@ fn admin_session_idle_boundary_touch_coalescing_and_absolute_cap() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(touched, (base + Duration::seconds(61)).to_rfc3339());
+    assert_eq!(touched, "2030-01-01T00:01:01.120+00:00");
 
     database
         .conn()
@@ -73,8 +73,8 @@ fn admin_session_idle_boundary_touch_coalescing_and_absolute_cap() {
             "UPDATE sessions SET last_activity_at=?2,expires_at=?3 WHERE token_hash=?1",
             params![
                 token_hash("idle-session"),
-                base.to_rfc3339(),
-                (base + Duration::hours(1)).to_rfc3339(),
+                stored_activity,
+                "2030-01-01T01:00:00.120+00:00",
             ],
         )
         .unwrap();
@@ -90,7 +90,7 @@ fn admin_session_idle_boundary_touch_coalescing_and_absolute_cap() {
         .conn()
         .execute(
             "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
-            params![token_hash("absolute-session"), base.to_rfc3339()],
+            params![token_hash("absolute-session"), stored_activity],
         )
         .unwrap();
     assert!(database
@@ -110,9 +110,7 @@ fn fresh_session_read_does_not_require_a_write_capable_connection() {
     database
         .create_admin("admin", "password-hash", "JBSWY3DPEHPK3PXP")
         .unwrap();
-    let base = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let base = parse_rfc3339("2030-01-01T00:00:00Z").unwrap();
     database
         .create_session("read-only-session", 1, "csrf", base + Duration::hours(12))
         .unwrap();
@@ -142,9 +140,7 @@ fn concurrent_admin_session_checks_coalesce_activity_without_errors() {
     database
         .create_admin("admin", "password-hash", "JBSWY3DPEHPK3PXP")
         .unwrap();
-    let base = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let base = parse_rfc3339("2030-01-01T00:00:00Z").unwrap();
     let touch_at = base + Duration::seconds(61);
     database
         .create_session("parallel-session", 1, "csrf", base + Duration::hours(12))
@@ -190,8 +186,8 @@ fn mfa_rotation_refreshes_activity_without_extending_absolute_expiry() {
     database
         .create_admin("admin", "password-hash", "JBSWY3DPEHPK3PXP")
         .unwrap();
-    let expires = Utc::now() + Duration::hours(3);
-    let old_activity = Utc::now() - Duration::minutes(10);
+    let expires = OffsetDateTime::now_utc() + Duration::hours(3);
+    let old_activity = OffsetDateTime::now_utc() - Duration::minutes(10);
     database
         .create_session("pre-mfa", 1, "csrf", expires)
         .unwrap();
@@ -215,10 +211,7 @@ fn mfa_rotation_refreshes_activity_without_extending_absolute_expiry() {
         )
         .unwrap();
     assert_eq!(stored_expiry, expires.to_rfc3339());
-    assert!(
-        DateTime::parse_from_rfc3339(&activity).unwrap()
-            > DateTime::parse_from_rfc3339(&old_activity.to_rfc3339()).unwrap()
-    );
+    assert!(parse_rfc3339(&activity).unwrap() > parse_rfc3339(&old_activity.to_rfc3339()).unwrap());
 }
 
 #[test]
@@ -228,7 +221,12 @@ fn session_creation_cleans_idle_rows() {
         .create_admin("admin", "password-hash", "JBSWY3DPEHPK3PXP")
         .unwrap();
     database
-        .create_session("idle", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "idle",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     database
         .conn()
@@ -236,12 +234,17 @@ fn session_creation_cleans_idle_rows() {
             "UPDATE sessions SET last_activity_at=?2 WHERE token_hash=?1",
             params![
                 token_hash("idle"),
-                (Utc::now() - Duration::minutes(31)).to_rfc3339()
+                (OffsetDateTime::now_utc() - Duration::minutes(31)).to_rfc3339()
             ],
         )
         .unwrap();
     database
-        .create_session("fresh", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "fresh",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
 
     assert!(database.session("idle").unwrap().is_none());
@@ -254,7 +257,12 @@ fn totp_step_is_consumed_once_across_racing_sessions() {
     database.create_admin("admin", "hash", "secret").unwrap();
     for token in ["first-session", "second-session"] {
         database
-            .create_session(token, 1, "csrf", Utc::now() + Duration::hours(1))
+            .create_session(
+                token,
+                1,
+                "csrf",
+                OffsetDateTime::now_utc() + Duration::hours(1),
+            )
             .unwrap();
     }
 
@@ -325,7 +333,7 @@ fn verified_password_session_creation_rejects_a_stale_hash_without_a_zombie_sess
                 1,
                 "verified-hash",
                 "csrf",
-                Utc::now() + Duration::hours(1),
+                OffsetDateTime::now_utc() + Duration::hours(1),
             )
             .unwrap(),
         PasswordSessionCreationOutcome::StalePassword
@@ -365,7 +373,7 @@ fn verified_password_session_creation_rejects_an_inactive_admin_without_a_zombie
                 1,
                 "verified-hash",
                 "csrf",
-                Utc::now() + Duration::hours(1),
+                OffsetDateTime::now_utc() + Duration::hours(1),
             )
             .unwrap(),
         PasswordSessionCreationOutcome::AdminInactive
@@ -398,7 +406,7 @@ fn verified_password_session_creation_accepts_the_current_active_hash() {
                 1,
                 "verified-hash",
                 "csrf",
-                Utc::now() + Duration::hours(1),
+                OffsetDateTime::now_utc() + Duration::hours(1),
             )
             .unwrap(),
         PasswordSessionCreationOutcome::Created

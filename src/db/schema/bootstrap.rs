@@ -272,35 +272,35 @@ fn initialize_empty_database(conn: &mut Connection) -> rusqlite::Result<()> {
     tx.execute_batch(INITIAL_SCHEMA_SQL)?;
     tx.execute(
         "INSERT INTO transfer_statistics(singleton,started_at) VALUES(1,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(2,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(3,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(4,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(5,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(6,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(7,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(8,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute_batch(PENDING_TRANSFER_INDEX_SQL)?;
     for (_, sql) in SHARE_FILTER_INDEXES {
@@ -308,19 +308,19 @@ fn initialize_empty_database(conn: &mut Connection) -> rusqlite::Result<()> {
     }
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(9,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(10,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(11,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.execute(
         "INSERT INTO vaultlink_schema_migrations(target_version,applied_at) VALUES(12,?1)",
-        [Utc::now().to_rfc3339()],
+        [OffsetDateTime::now_utc().to_rfc3339()],
     )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     validate_schema_12(&tx)?;

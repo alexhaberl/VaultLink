@@ -26,8 +26,10 @@ pub(crate) struct ShareSummaryCache(Arc<Mutex<State>>);
 
 impl ShareSummaryCache {
     pub(crate) async fn get(&self, database: Database) -> SummaryResult {
-        self.get_with(database, |db| db.share_summary(chrono::Utc::now()))
-            .await
+        self.get_with(database, |db| {
+            db.share_summary(time::OffsetDateTime::now_utc())
+        })
+        .await
     }
 
     async fn get_with<F>(&self, database: Database, operation: F) -> SummaryResult

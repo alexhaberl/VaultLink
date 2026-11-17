@@ -41,7 +41,7 @@ impl Database {
                 label,
                 credential_id,
                 credential_blob.as_ref(),
-                Utc::now().to_rfc3339()
+                OffsetDateTime::now_utc().to_rfc3339()
             ],
         )?;
         Ok(connection.last_insert_rowid())
@@ -91,7 +91,7 @@ impl Database {
         credential_id: &str,
         credential_blob: &(impl AsRef<[u8]> + ?Sized),
     ) -> rusqlite::Result<i64> {
-        let created_at = Utc::now().to_rfc3339();
+        let created_at = OffsetDateTime::now_utc().to_rfc3339();
         transaction.execute(
             "INSERT INTO admin_webauthn_credentials(
                  admin_id,label,credential_id,credential_blob,created_at
@@ -160,7 +160,7 @@ impl Database {
                 id,
                 admin_id,
                 credential_blob.as_ref(),
-                Utc::now().to_rfc3339()
+                OffsetDateTime::now_utc().to_rfc3339()
             ],
         )? == 1)
     }
@@ -256,7 +256,7 @@ impl Database {
         updated_credential_blob: &[u8],
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<bool> {
-        let times = self.session_times(Utc::now());
+        let times = self.session_times(OffsetDateTime::now_utc());
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let credential_updated = transaction.execute(

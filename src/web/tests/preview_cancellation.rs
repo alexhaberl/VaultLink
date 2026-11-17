@@ -210,7 +210,7 @@ fn preview_test_state(root: &Path, data: &Path) -> (AppState, i64) {
             "preview-admin-session",
             1,
             "csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("preview-admin-session").unwrap();

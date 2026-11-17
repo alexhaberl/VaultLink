@@ -6,7 +6,7 @@ impl Database {
         expected_password_hash: &str,
         name: &str,
         plaintext_token: &str,
-        expires_at: Option<DateTime<Utc>>,
+        expires_at: Option<OffsetDateTime>,
         context: &AuditContext,
     ) -> rusqlite::Result<SessionBound<Audited<ServiceTokenCreationOutcome>>> {
         if !valid_service_token_name(name) || !valid_service_token(plaintext_token) {
@@ -14,7 +14,7 @@ impl Database {
         }
 
         self.required_transaction_for_mfa_session_audited(proof, context, |transaction| {
-            let now = Utc::now();
+            let now = OffsetDateTime::now_utc();
             if expires_at.is_some_and(|expires_at| expires_at <= now) {
                 return Err(rusqlite::Error::InvalidQuery);
             }
@@ -108,7 +108,10 @@ impl Database {
         let connection = self.try_conn()?;
         let changed = connection.execute(
             "UPDATE service_tokens SET expires_at=?2 WHERE id=?1",
-            params![id, (Utc::now() - Duration::seconds(1)).to_rfc3339()],
+            params![
+                id,
+                (OffsetDateTime::now_utc() - Duration::seconds(1)).to_rfc3339()
+            ],
         )?;
         if changed != 1 {
             return Err(rusqlite::Error::QueryReturnedNoRows);

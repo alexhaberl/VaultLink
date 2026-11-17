@@ -244,7 +244,7 @@ async fn external_writers_disable_saved_public_overwrite_policy() {
             "external-admin-session",
             1,
             "external-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("external-admin-session").unwrap();
@@ -320,7 +320,7 @@ async fn explicit_external_writer_replace_opt_in_enables_last_writer_wins() {
             "external-replace-admin-session",
             1,
             "external-replace-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state

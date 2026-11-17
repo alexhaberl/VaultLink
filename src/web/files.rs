@@ -5,14 +5,17 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use time::OffsetDateTime;
 use tokio_util::io::ReaderStream;
 use tracing::Instrument as _;
 
-use crate::log_safety::{EscapedLogPath, EscapedLogValue};
+use crate::{
+    log_safety::{EscapedLogPath, EscapedLogValue},
+    timestamp::TimestampExt,
+};
 
 use super::{
     admission::PermitBody,

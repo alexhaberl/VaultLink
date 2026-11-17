@@ -4,8 +4,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use time::{Duration, OffsetDateTime};
 
 use crate::{
     auth,
@@ -17,6 +17,7 @@ use crate::{
     },
     internal_reporting::{report_internal, InternalOperation},
     sensitive::SecretString,
+    timestamp::TimestampExt,
     PublicRouteState,
 };
 
@@ -36,7 +37,7 @@ pub(super) struct PublicShareResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     active: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    expires_at: Option<Option<DateTime<Utc>>>,
+    expires_at: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     download_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,7 +91,7 @@ pub(super) async fn public_share(
         is_directory: Some(share.is_directory),
         permission: Some(share.permission),
         active: Some(share.active),
-        expires_at: Some(share.expires_at),
+        expires_at: Some(share.expires_at.map(OffsetDateTime::to_rfc3339_z)),
         download_count: Some(share.download_count),
         max_downloads: Some(share.max_downloads),
         max_upload_size: Some(share.max_upload_size),
@@ -177,7 +178,8 @@ pub(super) async fn unlock_share(
     let unlock_token = auth::random_token(32);
     let unlock_csrf = auth::random_token(24);
     let share_id = share.id;
-    let expires = Utc::now() + Duration::minutes(runtime_settings(&state).share_unlock_minutes);
+    let expires = OffsetDateTime::now_utc()
+        + Duration::minutes(runtime_settings(&state).share_unlock_minutes);
     let token_for_db = unlock_token.clone();
     let csrf_for_db = unlock_csrf.clone();
     let audit_client_ip = enabled_audit_client_ip(&state);

@@ -27,7 +27,7 @@ fn transfer_authorization_checks_current_unlock_before_resume_grants() {
                 share.password_hash.as_deref().unwrap(),
                 share.upload_policy_epoch,
                 "csrf",
-                Utc::now() + Duration::hours(1)
+                OffsetDateTime::now_utc() + Duration::hours(1)
             )
             .unwrap());
     };
@@ -101,7 +101,7 @@ fn transfer_authorization_checks_current_unlock_before_resume_grants() {
         .unwrap()
         .execute(
             "UPDATE public_unlock_sessions SET expires_at=?1",
-            [(Utc::now() - Duration::seconds(1)).to_rfc3339()],
+            [(OffsetDateTime::now_utc() - Duration::seconds(1)).to_rfc3339()],
         )
         .unwrap();
     assert_eq!(

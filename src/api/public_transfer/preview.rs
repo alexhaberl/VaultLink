@@ -11,8 +11,8 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
-use chrono::{Duration, Utc};
 use futures_util::Stream;
+use time::{Duration, OffsetDateTime};
 
 use crate::{
     auth,
@@ -428,7 +428,7 @@ async fn create_preview_session(
     } else {
         String::new()
     };
-    let expires = Utc::now() + Duration::minutes(5);
+    let expires = OffsetDateTime::now_utc() + Duration::minutes(5);
     let outcome = database(state.db().clone(), move |database| {
         database.create_preview_session(&stored_token, &owner_key, share_id, &path, expires)
     })

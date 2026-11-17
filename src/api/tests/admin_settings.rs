@@ -143,7 +143,7 @@ async fn admin_mutation_and_sessions_roll_back_without_resetting_login_history()
             "ops-session",
             ops_id,
             "ops-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     assert!(state.db().verify_mfa("ops-session").unwrap());

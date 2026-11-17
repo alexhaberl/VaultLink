@@ -6,8 +6,9 @@ use super::{
     UploadReservationCommitOutcome, UploadReservationExtendOutcome, MAX_SQLITE_UNSIGNED,
     TRANSFER_LEASE_MAX_LIFETIME_SECONDS, TRANSFER_SESSION_TTL_SECONDS,
 };
-use chrono::{DateTime, Duration, Utc};
+use crate::timestamp::{month_key, parse_rfc3339, TimestampExt};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use time::{Duration, OffsetDateTime};
 
 const UPLOAD_RESERVATION_TTL_SECONDS: i64 = 15 * 60;
 
@@ -21,13 +22,13 @@ enum TransferAccessState {
 }
 
 fn transfer_deadlines() -> (String, String) {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let expires = now + Duration::seconds(TRANSFER_SESSION_TTL_SECONDS);
     (now.to_rfc3339(), expires.to_rfc3339())
 }
 
 pub(super) fn current_utc_month() -> String {
-    Utc::now().format("%Y-%m").to_string()
+    month_key(OffsetDateTime::now_utc())
 }
 
 fn valid_utc_month(month: &str) -> bool {

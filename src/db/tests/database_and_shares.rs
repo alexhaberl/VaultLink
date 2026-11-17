@@ -127,7 +127,7 @@ fn share_cursor_pages_are_gapless_sorted_and_unicode_searchable() {
         );
     }
     database.set_share_active(ids[3], false).unwrap();
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let mut cursor = None;
     let mut newest_ids = Vec::new();
     loop {
@@ -207,7 +207,7 @@ fn share_search_index_tracks_path_renames_and_deletes_atomically() {
                 sort: ShareListSort::Newest,
                 cursor: None,
                 limit: 100,
-                now: Utc::now(),
+                now: OffsetDateTime::now_utc(),
             })
             .unwrap()
             .shares
@@ -272,7 +272,7 @@ fn share_search_filters_and_limits_before_decrypting_tokens() {
             sort: ShareListSort::Newest,
             cursor: None,
             limit: 1,
-            now: Utc::now(),
+            now: OffsetDateTime::now_utc(),
         })
         .unwrap();
     assert_eq!(page.shares.len(), 1);
@@ -290,7 +290,7 @@ fn share_search_filters_and_limits_before_decrypting_tokens() {
             sort: ShareListSort::Newest,
             cursor: None,
             limit: 1,
-            now: Utc::now(),
+            now: OffsetDateTime::now_utc(),
         })
         .is_err());
     assert_eq!(

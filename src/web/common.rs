@@ -11,8 +11,8 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
+use time::{macros::format_description, Duration, OffsetDateTime, PlainDateTime, UtcOffset};
 
 use super::{
     rendering::{GB, MB},
@@ -31,6 +31,7 @@ use crate::{
     runtime::RuntimeSettings,
     secure_fs::{DirectoryScan, Entry, SecureDirectory, SecureFile, SecureRoot},
     sensitive::SecretString,
+    timestamp::parse_rfc3339,
     webauthn::WebAuthnServiceError,
 };
 
@@ -225,13 +226,26 @@ pub(super) fn parse_unit_to_bytes(value: &str, unit: u64, label: &'static str) -
 pub(super) fn parse_expiry(
     local: Option<&str>,
     offset_minutes: Option<&str>,
-) -> Result<Option<DateTime<Utc>>> {
+) -> Result<Option<OffsetDateTime>> {
     if let Some(value) = local.map(str::trim).filter(|value| !value.is_empty()) {
-        let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M")
-            .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S"))
-            .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M"))
-            .or_else(|_| NaiveDateTime::parse_from_str(value, "%d.%m.%Y %H:%M"))
-            .map_err(|_| AppError(StatusCode::BAD_REQUEST, "Invalid expiration date"))?;
+        let date_formats = [
+            format_description!(
+                version = 2,
+                "[year padding:none]-[month padding:none]-[day padding:none]T[hour padding:none]:[minute padding:none][optional [:[second padding:none]]]"
+            ),
+            format_description!(
+                version = 2,
+                "[year padding:none]-[month padding:none]-[day padding:none] [hour padding:none]:[minute padding:none]"
+            ),
+            format_description!(
+                version = 2,
+                "[day padding:none].[month padding:none].[year padding:none] [hour padding:none]:[minute padding:none]"
+            ),
+        ];
+        let local_datetime = date_formats
+            .iter()
+            .find_map(|format| PlainDateTime::parse(value, *format).ok())
+            .ok_or(AppError(StatusCode::BAD_REQUEST, "Invalid expiration date"))?;
         let offset = offset_minutes
             .unwrap_or("0")
             .trim()
@@ -240,12 +254,11 @@ pub(super) fn parse_expiry(
         if !(-1_440..=1_440).contains(&offset) {
             return Err(AppError(StatusCode::BAD_REQUEST, "Invalid expiration date"));
         }
-        let utc_naive = naive
-            .checked_add_signed(Duration::minutes(offset))
+        let utc = local_datetime
+            .assume_utc()
+            .checked_add(Duration::minutes(offset))
             .ok_or(AppError(StatusCode::BAD_REQUEST, "Invalid expiration date"))?;
-        return Ok(Some(DateTime::<Utc>::from_naive_utc_and_offset(
-            utc_naive, Utc,
-        )));
+        return Ok(Some(utc));
     }
     Ok(None)
 }

@@ -90,8 +90,8 @@ fn monitoring_share_query_for(status: MonitoringShareListStatus, after: bool) ->
 }
 
 impl Database {
-    pub fn monitoring_summary(&self, now: DateTime<Utc>) -> rusqlite::Result<MonitoringSummary> {
-        let month = now.format("%Y-%m").to_string();
+    pub fn monitoring_summary(&self, now: OffsetDateTime) -> rusqlite::Result<MonitoringSummary> {
+        let month = month_key(now);
         let now_string = now.to_rfc3339();
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction()?;

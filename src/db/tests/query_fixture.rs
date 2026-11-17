@@ -10,7 +10,7 @@ impl Database {
                 VALUES(?1,?2,?3,?4,'file.txt','file.txt',0,'download_only',1,?5)",
                 )
                 .unwrap();
-            let now = Utc::now().to_rfc3339();
+            let now = OffsetDateTime::now_utc().to_rfc3339();
             for id in 1..=count {
                 let token = format!("benchmark-share-{id}");
                 let digest = token_hash(&token);

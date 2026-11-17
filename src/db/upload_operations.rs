@@ -1,6 +1,7 @@
-use chrono::{Duration, Utc};
+use crate::timestamp::TimestampExt;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
+use time::{Duration, OffsetDateTime};
 
 use super::{token_hash, Database};
 use crate::auth;
@@ -68,7 +69,7 @@ impl Database {
         if id <= 0 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let now_text = now.to_rfc3339();
         let expires = (now + Duration::hours(RETENTION_HOURS)).to_rfc3339();
         let _write_guard = self.transfer_write_guard()?;
@@ -131,7 +132,7 @@ impl Database {
         let Some((state, expires_at, result_json, fingerprint)) = row else {
             return Ok(None);
         };
-        if expires_at <= Utc::now().to_rfc3339()
+        if expires_at <= OffsetDateTime::now_utc().to_rfc3339()
             && !matches!(state.as_str(), "processing" | "committing")
         {
             return Ok(None);
@@ -164,7 +165,12 @@ impl Database {
             "UPDATE upload_operations SET state='processing'
              WHERE id_hash=?1 AND scope_kind=?2 AND scope_id=?3
                AND state IN ('ready','retryable') AND expires_at>?4",
-            params![token_hash(id_token), kind, id, Utc::now().to_rfc3339()],
+            params![
+                token_hash(id_token),
+                kind,
+                id,
+                OffsetDateTime::now_utc().to_rfc3339()
+            ],
         )?;
         tx.commit()?;
         drop(conn);
@@ -229,7 +235,7 @@ impl Database {
         }
         let _write_guard = self.transfer_write_guard()?;
         let conn = self.try_conn()?;
-        let expires = (Utc::now() + Duration::hours(RETENTION_HOURS)).to_rfc3339();
+        let expires = (OffsetDateTime::now_utc() + Duration::hours(RETENTION_HOURS)).to_rfc3339();
         let result = result
             .map(serde_json::to_string)
             .transpose()
@@ -265,7 +271,7 @@ impl Database {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
-        let expires = (Utc::now() + Duration::hours(RETENTION_HOURS)).to_rfc3339();
+        let expires = (OffsetDateTime::now_utc() + Duration::hours(RETENTION_HOURS)).to_rfc3339();
         for (id_hash, state) in pending {
             if active.contains(&id_hash) {
                 continue;
@@ -289,7 +295,9 @@ impl Database {
                AND (state='committing' OR expires_at>?1)",
         )?;
         let fragments = query
-            .query_map([Utc::now().to_rfc3339()], |row| row.get::<_, String>(0))?
+            .query_map([OffsetDateTime::now_utc().to_rfc3339()], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect();
         fragments
     }

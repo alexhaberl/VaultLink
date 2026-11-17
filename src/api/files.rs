@@ -4,8 +4,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::{
     file_ops,
@@ -21,6 +21,7 @@ use crate::{
             FileValidationError,
         },
     },
+    timestamp::TimestampExt,
     FileRouteState,
 };
 
@@ -175,7 +176,7 @@ pub(super) async fn files(
                 size: (!entry.is_dir).then_some(entry.len),
                 modified: entry
                     .modified
-                    .map(|time| DateTime::<Utc>::from(time).to_rfc3339()),
+                    .map(|modified| OffsetDateTime::from(modified).to_rfc3339()),
                 preview_allowed: !entry.is_dir && preview_allowed(&path, &settings),
             }
         })

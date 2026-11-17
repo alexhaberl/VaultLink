@@ -908,7 +908,7 @@ async fn public_upload_uses_the_policy_that_wins_before_finalization() {
             "policy-session",
             1,
             "policy-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("policy-session").unwrap();
@@ -988,7 +988,7 @@ async fn public_upload_publish_wins_before_a_waiting_policy_change() {
             "policy-session",
             1,
             "policy-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("policy-session").unwrap();
@@ -1073,7 +1073,7 @@ async fn public_upload_uses_the_html_policy_that_wins_before_finalization() {
             "html-policy-session",
             1,
             "html-policy-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("html-policy-session").unwrap();

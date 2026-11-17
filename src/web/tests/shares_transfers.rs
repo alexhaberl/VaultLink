@@ -6,7 +6,12 @@ async fn html_and_api_share_search_validate_original_unicode_and_keep_empty_sear
     state.db().create_admin("admin", "hash", "secret").unwrap();
     state
         .db()
-        .create_session("search-session", 1, "csrf", Utc::now() + Duration::hours(1))
+        .create_session(
+            "search-session",
+            1,
+            "csrf",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     state.db().verify_mfa("search-session").unwrap();
     let app = router(state);
@@ -72,7 +77,7 @@ async fn share_creation_page_uses_browser_selected_path() {
             "session-token",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("session-token").unwrap();
@@ -376,7 +381,7 @@ async fn web_share_creation_ignores_hidden_upload_fields_and_rejects_blank_prote
             "session-token",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("session-token").unwrap();
@@ -434,7 +439,7 @@ async fn web_hashes_share_password_before_waiting_for_storage_mutation() {
             "session-token",
             1,
             "csrf-token",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("session-token").unwrap();

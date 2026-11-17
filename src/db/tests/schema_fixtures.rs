@@ -399,7 +399,7 @@ fn schema_three_fixture() -> (tempfile::TempDir, PathBuf) {
             "schema-three-session",
             1,
             "csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     database

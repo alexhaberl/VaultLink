@@ -151,7 +151,7 @@ mod tests {
                     "INSERT INTO service_tokens(
                          name,token_hash,scope_mask,created_by,created_at
                      ) VALUES(?1,?2,1,1,?3)",
-                    rusqlite::params![name, "0".repeat(64), chrono::Utc::now().to_rfc3339()],
+                    rusqlite::params![name, "0".repeat(64), "2026-01-01T00:00:00+00:00"],
                 )
                 .unwrap(),
             1

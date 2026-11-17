@@ -7,7 +7,7 @@ impl Database {
         token: &str,
         totp_secret: &str,
     ) -> rusqlite::Result<AdminMfaEnrollmentStartOutcome> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let now_string = now.to_rfc3339();
         let expires_at = (now + Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS)).to_rfc3339();
         let enrollment_token_hash = token_hash(token);
@@ -67,7 +67,7 @@ impl Database {
         verified_totp_step: u64,
         context: &AuditContext,
     ) -> rusqlite::Result<AuditedAdminMfaEnrollmentStartOutcome> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let now_string = now.to_rfc3339();
         let expires_at = (now + Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS)).to_rfc3339();
         let enrollment_token_hash = token_hash(token);
@@ -144,7 +144,7 @@ impl Database {
             self.encrypt_enrollment_totp(&enrollment_token_hash, totp_secret)?;
         let admin_id = proof.admin_id();
         self.required_transaction_for_mfa_session_audited(proof, context, |transaction| {
-            let now = Utc::now();
+            let now = OffsetDateTime::now_utc();
             let now_string = now.to_rfc3339();
             let expires_at =
                 (now + Duration::seconds(ADMIN_MFA_ENROLLMENT_TTL_SECONDS)).to_rfc3339();
@@ -191,7 +191,7 @@ impl Database {
         admin_id: i64,
         token: &str,
     ) -> rusqlite::Result<Option<PendingAdminMfaEnrollment>> {
-        let now = Utc::now().to_rfc3339();
+        let now = OffsetDateTime::now_utc().to_rfc3339();
         let enrollment_token_hash = token_hash(token);
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -241,7 +241,7 @@ impl Database {
                 "verified_totp_step".into(),
             ));
         }
-        let now = Utc::now().to_rfc3339();
+        let now = OffsetDateTime::now_utc().to_rfc3339();
         let enrollment_token_hash = token_hash(token);
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -319,7 +319,7 @@ impl Database {
             // Capture time only after BEGIN IMMEDIATE has acquired the writer
             // slot. A request that waited behind another mutation must not
             // activate an enrollment which expired while it was queued.
-            let now = Utc::now().to_rfc3339();
+            let now = OffsetDateTime::now_utc().to_rfc3339();
             cleanup_admin_mfa_enrollments(transaction, &now)?;
             let enrollment = transaction
                 .query_row(
@@ -380,7 +380,7 @@ impl Database {
     pub fn cleanup_expired_admin_mfa_enrollments(&self) -> rusqlite::Result<usize> {
         self.try_conn()?.execute(
             "DELETE FROM admin_mfa_enrollments WHERE expires_at<=?1",
-            [Utc::now().to_rfc3339()],
+            [OffsetDateTime::now_utc().to_rfc3339()],
         )
     }
 

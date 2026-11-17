@@ -8,7 +8,12 @@ async fn html_share_display_benchmark() {
         state.db().create_admin("admin", "hash", "secret").unwrap();
         state
             .db()
-            .create_session("benchmark", 1, "csrf", Utc::now() + Duration::hours(1))
+            .create_session(
+                "benchmark",
+                1,
+                "csrf",
+                OffsetDateTime::now_utc() + Duration::hours(1),
+            )
             .unwrap();
         state.db().verify_mfa("benchmark").unwrap();
         state.db().populate_encrypted_share_fixture(count);
@@ -51,7 +56,7 @@ async fn share_summary_pages_share_display_snapshot_across_mutations() {
             "summary-session",
             1,
             "csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("summary-session").unwrap();

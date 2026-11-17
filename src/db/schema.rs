@@ -1,5 +1,6 @@
-use chrono::Utc;
+use crate::timestamp::TimestampExt;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use time::OffsetDateTime;
 
 pub(super) const SCHEMA_VERSION: i64 = 12;
 pub(super) const SCHEMA_1_FINGERPRINT: &str = "vaultlink-schema-1-encrypted-secrets-2026-07-17";

@@ -11,7 +11,7 @@ fn persistent_secrets_survive_restart_and_key_rotation_without_plaintext_columns
             "rotation-session",
             1,
             "csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     assert!(database.verify_mfa("rotation-session").unwrap());
@@ -292,7 +292,7 @@ fn unlock_sessions_are_hashed_and_cascade_with_share() {
             original_share.password_hash.as_deref().unwrap(),
             original_share.upload_policy_epoch,
             "unlock-csrf",
-            Utc::now() + chrono::Duration::minutes(60),
+            OffsetDateTime::now_utc() + Duration::minutes(60),
         )
         .unwrap());
     assert!(database.unlock_session("unlock-secret", share_id).unwrap());
@@ -321,7 +321,7 @@ fn unlock_sessions_are_hashed_and_cascade_with_share() {
             original_share.password_hash.as_deref().unwrap(),
             original_share.upload_policy_epoch,
             "stale-unlock-csrf",
-            Utc::now() + chrono::Duration::minutes(60),
+            OffsetDateTime::now_utc() + Duration::minutes(60),
         )
         .unwrap());
     assert!(!database
@@ -336,7 +336,7 @@ fn unlock_sessions_are_hashed_and_cascade_with_share() {
             updated_share.password_hash.as_deref().unwrap(),
             updated_share.upload_policy_epoch,
             "new-unlock-csrf",
-            Utc::now() + chrono::Duration::minutes(60),
+            OffsetDateTime::now_utc() + Duration::minutes(60),
         )
         .unwrap());
     database
@@ -352,7 +352,7 @@ fn unlock_sessions_are_hashed_and_cascade_with_share() {
             updated_share.password_hash.as_deref().unwrap(),
             updated_share.upload_policy_epoch,
             "same-hash-stale-csrf",
-            Utc::now() + chrono::Duration::minutes(60),
+            OffsetDateTime::now_utc() + Duration::minutes(60),
         )
         .unwrap());
     database.delete_share(share_id).unwrap();

@@ -218,7 +218,7 @@ fn upload_reservation_batching_validates_targets_and_expiry() {
         .execute(
             "UPDATE public_upload_reservations SET expires_at=?1 WHERE token_hash=?2",
             params![
-                (Utc::now() - Duration::seconds(1)).to_rfc3339(),
+                (OffsetDateTime::now_utc() - Duration::seconds(1)).to_rfc3339(),
                 token_hash("one")
             ],
         )
@@ -659,7 +659,7 @@ fn stale_upload_quota_update_does_not_partially_change_strategy() {
             "UPDATE public_upload_reservations SET expires_at=?2 WHERE token_hash=?1",
             params![
                 token_hash("upload-one"),
-                (Utc::now() - Duration::seconds(1)).to_rfc3339()
+                (OffsetDateTime::now_utc() - Duration::seconds(1)).to_rfc3339()
             ],
         )
         .unwrap();

@@ -501,7 +501,7 @@ fn transfer_heartbeat_cannot_extend_lease_past_absolute_lifetime() {
         .begin_transfer_lease("client", "lease", share_id, "file.bin", "download")
         .unwrap();
     let older_than_absolute_limit =
-        Utc::now() - Duration::seconds(TRANSFER_LEASE_MAX_LIFETIME_SECONDS + 1);
+        OffsetDateTime::now_utc() - Duration::seconds(TRANSFER_LEASE_MAX_LIFETIME_SECONDS + 1);
     {
         let connection = database.conn();
         connection
@@ -573,7 +573,7 @@ fn capped_transfer_heartbeat_rolls_back_with_required_audit_and_derives_grant_ev
         )
         .unwrap();
     let older_than_absolute_limit =
-        Utc::now() - Duration::seconds(TRANSFER_LEASE_MAX_LIFETIME_SECONDS + 1);
+        OffsetDateTime::now_utc() - Duration::seconds(TRANSFER_LEASE_MAX_LIFETIME_SECONDS + 1);
     database
         .conn()
         .execute_batch(&format!(

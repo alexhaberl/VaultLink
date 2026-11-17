@@ -42,7 +42,7 @@ async fn webauthn_mfa_start_is_rate_limited_before_credential_work() {
             "webauthn-pending",
             1,
             "webauthn-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     let app = router(state);
@@ -85,7 +85,7 @@ async fn router_recovers_invalid_runtime_and_webauthn_snapshots_after_poisoning(
             "poison-recovery-session",
             1,
             "poison-recovery-csrf",
-            Utc::now() + Duration::hours(1),
+            OffsetDateTime::now_utc() + Duration::hours(1),
         )
         .unwrap();
     state.db().verify_mfa("poison-recovery-session").unwrap();

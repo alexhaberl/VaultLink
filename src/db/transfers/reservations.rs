@@ -7,7 +7,7 @@ impl Database {
         share_id: i64,
         expected_upload_policy_epoch: i64,
     ) -> rusqlite::Result<UploadReservationBeginOutcome> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let now_text = now.to_rfc3339();
         let expires = (now + Duration::seconds(UPLOAD_RESERVATION_TTL_SECONDS)).to_rfc3339();
         let _write_guard = self.transfer_write_guard()?;
@@ -112,7 +112,7 @@ impl Database {
         if preferred_bytes < minimum_bytes {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let now_text = now.to_rfc3339();
         let expires = (now + Duration::seconds(UPLOAD_RESERVATION_TTL_SECONDS)).to_rfc3339();
         let reservation_hash = token_hash(token);
@@ -250,7 +250,7 @@ impl Database {
         operation_hash: Option<&str>,
     ) -> rusqlite::Result<UploadReservationCommitOutcome> {
         let reservation_hash = token_hash(token);
-        let now_text = Utc::now().to_rfc3339();
+        let now_text = OffsetDateTime::now_utc().to_rfc3339();
         let _write_guard = self.transfer_write_guard()?;
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -374,13 +374,13 @@ impl Database {
              JOIN shares ON shares.id=reservations.share_id
              WHERE reservations.share_id=?1 AND reservations.expires_at>?2
                AND reservations.upload_policy_epoch=shares.upload_policy_epoch",
-            params![share_id, Utc::now().to_rfc3339()],
+            params![share_id, OffsetDateTime::now_utc().to_rfc3339()],
             |row| row.get(0),
         )
     }
     #[cfg(test)]
     pub fn count_download(&self, id: i64) -> rusqlite::Result<bool> {
-        let now = Utc::now().to_rfc3339();
+        let now = OffsetDateTime::now_utc().to_rfc3339();
         let _write_guard = self.transfer_write_guard()?;
         Ok(self.try_conn()?.execute(
             "UPDATE shares

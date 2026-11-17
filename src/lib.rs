@@ -51,6 +51,7 @@ pub mod storage_mount;
 mod template_policy_tests;
 #[cfg(test)]
 mod test_support;
+mod timestamp;
 pub mod tls_files;
 #[doc(hidden)]
 pub mod transport;

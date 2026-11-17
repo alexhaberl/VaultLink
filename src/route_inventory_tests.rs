@@ -10,7 +10,7 @@ use axum::{
     http::{header, HeaderValue, Method, Request, StatusCode},
     response::Response,
 };
-use chrono::{Duration, Utc};
+use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 
 use crate::{
@@ -21,6 +21,7 @@ use crate::{
         AuditContract, AuthContract, BodyContract, CsrfContract, MfaContract, MutationContract,
         RouteMethod, RouteSpec, RouteSurface,
     },
+    timestamp::parse_rfc3339,
     AppState,
 };
 
@@ -418,7 +419,12 @@ fn install_verified_session(state: &AppState, token: &str, csrf: &str) {
     state.db().create_admin("admin", "hash", "secret").unwrap();
     state
         .db()
-        .create_session(token, 1, csrf, Utc::now() + Duration::hours(1))
+        .create_session(
+            token,
+            1,
+            csrf,
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(state.db().verify_mfa(token).unwrap());
 }
@@ -427,11 +433,21 @@ fn install_auth_contract_sessions(state: &AppState) {
     state.db().create_admin("admin", "hash", "secret").unwrap();
     state
         .db()
-        .create_session("pending", 1, "correct", Utc::now() + Duration::hours(1))
+        .create_session(
+            "pending",
+            1,
+            "correct",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     state
         .db()
-        .create_session("verified", 1, "correct", Utc::now() + Duration::hours(1))
+        .create_session(
+            "verified",
+            1,
+            "correct",
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap();
     assert!(state.db().verify_mfa("verified").unwrap());
 }
@@ -925,7 +941,7 @@ fn mfa_enrollment_ttl_starts_after_the_session_fenced_writer_is_admitted() {
     // This exceeds timestamp rounding noise and would consume part of the TTL
     // if it were captured before BEGIN IMMEDIATE admitted the worker.
     std::thread::sleep(std::time::Duration::from_millis(2_500));
-    let writer_released_at = Utc::now();
+    let writer_released_at = OffsetDateTime::now_utc();
     blocker.execute_batch("COMMIT").unwrap();
     let outcome = worker.join().unwrap().unwrap();
     let crate::db::SessionBound::Authorized(outcome) = outcome else {
@@ -936,9 +952,7 @@ fn mfa_enrollment_ttl_starts_after_the_session_fenced_writer_is_admitted() {
     else {
         panic!("verified session must start an MFA enrollment");
     };
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at)
-        .unwrap()
-        .with_timezone(&Utc);
+    let expires_at = parse_rfc3339(&expires_at).unwrap();
     assert!(
         expires_at
             >= writer_released_at

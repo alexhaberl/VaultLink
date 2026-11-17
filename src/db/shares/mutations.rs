@@ -312,7 +312,7 @@ impl Database {
         events: &[RequiredAuditEvent],
     ) -> rusqlite::Result<AuditedShareControlsUpdate> {
         self.required_transaction_for_mfa_session_audited(proof, context, |transaction| {
-            let now = Utc::now().to_rfc3339();
+            let now = OffsetDateTime::now_utc().to_rfc3339();
             transaction.execute(
                 "DELETE FROM public_upload_reservations WHERE expires_at<=?1",
                 [&now],
@@ -415,7 +415,7 @@ impl Database {
     ) -> rusqlite::Result<ShareControlsUpdateOutcome> {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = Utc::now().to_rfc3339();
+        let now = OffsetDateTime::now_utc().to_rfc3339();
         transaction.execute(
             "DELETE FROM public_upload_reservations WHERE expires_at<=?1",
             [&now],

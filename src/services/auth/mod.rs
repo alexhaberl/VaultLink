@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 
 use crate::{
     auth,
@@ -18,7 +18,7 @@ pub(crate) struct PasswordLoginCommand {
     pub(crate) password: SecretString,
     pub(crate) session_token: String,
     pub(crate) csrf_token: String,
-    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) expires_at: OffsetDateTime,
     pub(crate) audit_client_ip: Option<String>,
 }
 
@@ -171,8 +171,8 @@ impl AuthService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
     use std::time::{Duration as StdDuration, Instant};
+    use time::Duration;
 
     fn service() -> (AuthService, String) {
         let database = Database::open(":memory:").unwrap();
@@ -193,7 +193,7 @@ mod tests {
                 password: SecretString::from(password),
                 session_token: "session".into(),
                 csrf_token: "csrf".into(),
-                expires_at: Utc::now() + Duration::hours(1),
+                expires_at: OffsetDateTime::now_utc() + Duration::hours(1),
                 audit_client_ip: Some("192.0.2.1".into()),
             })
             .unwrap();
@@ -219,7 +219,7 @@ mod tests {
                 password: SecretString::from("definitely incorrect"),
                 session_token: "session".into(),
                 csrf_token: "csrf".into(),
-                expires_at: Utc::now() + Duration::hours(1),
+                expires_at: OffsetDateTime::now_utc() + Duration::hours(1),
                 audit_client_ip: None,
             })
             .unwrap();
@@ -236,7 +236,7 @@ mod tests {
                 password: SecretString::from("deliberately incorrect timing password"),
                 session_token: "timing-session".into(),
                 csrf_token: "timing-csrf".into(),
-                expires_at: Utc::now() + Duration::hours(1),
+                expires_at: OffsetDateTime::now_utc() + Duration::hours(1),
                 audit_client_ip: None,
             })
             .unwrap();

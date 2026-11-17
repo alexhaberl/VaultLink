@@ -55,8 +55,8 @@ fn transfer_availability_ignores_orphans_without_cleanup_or_quota_bypass() {
     database
         .begin_transfer_lease("holder", "live", share_id, "file.bin", "download")
         .unwrap();
-    let now = Utc::now().to_rfc3339();
-    let expires = (Utc::now() + Duration::minutes(15)).to_rfc3339();
+    let now = OffsetDateTime::now_utc().to_rfc3339();
+    let expires = (OffsetDateTime::now_utc() + Duration::minutes(15)).to_rfc3339();
     database
         .conn()
         .execute(

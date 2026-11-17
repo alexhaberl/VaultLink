@@ -5,9 +5,9 @@ impl Database {
         token: &str,
         admin_id: i64,
         csrf: &str,
-        expires: DateTime<Utc>,
+        expires: OffsetDateTime,
     ) -> rusqlite::Result<()> {
-        let times = self.session_times(Utc::now());
+        let times = self.session_times(OffsetDateTime::now_utc());
         let c = self.try_conn()?;
         c.execute(
             "DELETE FROM sessions WHERE expires_at<=?1 OR last_activity_at<=?2",
@@ -36,7 +36,7 @@ impl Database {
         admin_id: i64,
         expected_password_hash: &str,
         csrf: &str,
-        expires: DateTime<Utc>,
+        expires: OffsetDateTime,
     ) -> rusqlite::Result<PasswordSessionCreationOutcome> {
         self.create_session_for_verified_password_internal(
             token,
@@ -54,7 +54,7 @@ impl Database {
         admin_id: i64,
         expected_password_hash: &str,
         csrf: &str,
-        expires: DateTime<Utc>,
+        expires: OffsetDateTime,
         context: &AuditContext,
     ) -> rusqlite::Result<PasswordSessionCreationOutcome> {
         self.create_session_for_verified_password_internal(
@@ -73,10 +73,10 @@ impl Database {
         admin_id: i64,
         expected_password_hash: &str,
         csrf: &str,
-        expires: DateTime<Utc>,
+        expires: OffsetDateTime,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<PasswordSessionCreationOutcome> {
-        let times = self.session_times(Utc::now());
+        let times = self.session_times(OffsetDateTime::now_utc());
         let session_token_hash = token_hash(token);
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -132,7 +132,7 @@ impl Database {
     }
 
     pub fn session(&self, token: &str) -> rusqlite::Result<Option<Session>> {
-        self.session_at(token, Utc::now())
+        self.session_at(token, OffsetDateTime::now_utc())
     }
 
     /// Loads and touches the session and, only after the database has verified
@@ -152,7 +152,7 @@ impl Database {
         )))
     }
 
-    fn session_at(&self, token: &str, now: DateTime<Utc>) -> rusqlite::Result<Option<Session>> {
+    fn session_at(&self, token: &str, now: OffsetDateTime) -> rusqlite::Result<Option<Session>> {
         let times = self.session_times(now);
         let session_token_hash = token_hash(token);
         let connection = self.try_conn()?;
@@ -218,7 +218,7 @@ impl Database {
     pub(crate) fn session_at_for_test(
         &self,
         token: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> rusqlite::Result<Option<Session>> {
         self.session_at(token, now)
     }
@@ -229,7 +229,7 @@ impl Database {
             "UPDATE sessions SET expires_at=?2 WHERE token_hash=?1",
             params![
                 token_hash(token),
-                (Utc::now() - Duration::seconds(1)).to_rfc3339()
+                (OffsetDateTime::now_utc() - Duration::seconds(1)).to_rfc3339()
             ],
         )?;
         Ok(())
@@ -319,7 +319,7 @@ impl Database {
         let mut connection = self.try_conn()?;
         let mut transaction =
             connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let times = self.session_times(Utc::now());
+        let times = self.session_times(OffsetDateTime::now_utc());
         if !live_mfa_session(&transaction, proof, &times)? {
             transaction.rollback()?;
             return Ok(SessionBound::SessionUnavailable);
@@ -364,7 +364,7 @@ impl Database {
     {
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let times = self.session_times(Utc::now());
+        let times = self.session_times(OffsetDateTime::now_utc());
         if !live_mfa_session(&transaction, proof, &times)? {
             transaction.rollback()?;
             return Ok(SessionBound::SessionUnavailable);
@@ -425,7 +425,7 @@ impl Database {
         step: u64,
         required_audit: Option<&AuditContext>,
     ) -> rusqlite::Result<bool> {
-        let times = self.session_times(Utc::now());
+        let times = self.session_times(OffsetDateTime::now_utc());
         let session_token_hash = token_hash(old_token);
         let mut connection = self.try_conn()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -489,7 +489,7 @@ impl Database {
 
     #[cfg(test)]
     pub fn verify_mfa(&self, token: &str) -> rusqlite::Result<bool> {
-        let times = self.session_times(Utc::now());
+        let times = self.session_times(OffsetDateTime::now_utc());
         Ok(self.try_conn()?.execute(
             "UPDATE sessions SET mfa_verified=1,last_activity_at=?2
              WHERE token_hash=?1 AND expires_at>?2 AND last_activity_at>?3",
